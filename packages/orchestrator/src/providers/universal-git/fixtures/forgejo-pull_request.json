@@ -1,0 +1,25 @@
+{
+  "action": "opened",
+  "number": 3,
+  "pull_request": {
+    "number": 3,
+    "state": "open",
+    "head": {
+      "ref": "feature-x",
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "repo": { "full_name": "kici-dev/sample-repo" }
+    },
+    "base": {
+      "ref": "main",
+      "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "repo": { "full_name": "kici-dev/sample-repo" }
+    }
+  },
+  "repository": {
+    "owner": { "login": "kici-dev" },
+    "name": "sample-repo",
+    "full_name": "kici-dev/sample-repo",
+    "default_branch": "main"
+  },
+  "sender": { "login": "alice" }
+}

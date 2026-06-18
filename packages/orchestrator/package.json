@@ -1,0 +1,113 @@
+{
+  "name": "@kici-dev/orchestrator",
+  "version": "0.1.19",
+  "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "orchestrator",
+    "self-hosted"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/orchestrator"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json",
+    "installer-image-digests.json"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "kici-admin": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": "./dist/cli.js",
+    "./server": "./dist/server.js",
+    "./standalone": "./dist/standalone.js"
+  },
+  "build": {
+    "entries": {
+      "server.js": "src/server.ts",
+      "standalone.js": "src/standalone.ts",
+      "cli.js": "src/cli/kici-admin.ts",
+      "index.js": "src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "db:migrate": "kysely migrate:latest",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/orchestrator --name @kici-dev/orchestrator"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1064.0",
+    "@aws-sdk/lib-storage": "^3.1064.0",
+    "@aws-sdk/s3-request-presigner": "^3.1064.0",
+    "@hono/node-server": "^2.0.4",
+    "@hono/node-ws": "^1.3.1",
+    "@inquirer/prompts": "^8.5.2",
+    "@kici-dev/engine": "workspace:*",
+    "@kici-dev/shared": "workspace:*",
+    "@octokit/auth-app": "^8.2.0",
+    "@octokit/rest": "^22.0.1",
+    "archiver": "^8.0.0",
+    "commander": "^15.0.0",
+    "croner": "^10.0.1",
+    "dockerode": "^5.0.0",
+    "hashi-vault-js": "^0.5.1",
+    "hono": "^4.12.25",
+    "jsonpath-plus": "^10.4.0",
+    "jszip": "^3.10.1",
+    "kysely": "^0.29.2",
+    "lru-cache": "^11.5.1",
+    "nanoid": "^5.1.11",
+    "pg": "^8.21.0",
+    "picomatch": "^4.0.4",
+    "strip-ansi": "^7.2.0",
+    "tar": "^7.5.16",
+    "ws": "^8.21.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "kici": {
+    "metrics": {
+      "mode": "scrape",
+      "port": 10143,
+      "path": "/metrics",
+      "jobName": "kici-orchestrator"
+    }
+  },
+  "devDependencies": {
+    "@kici-dev/agent": "workspace:*",
+    "@types/archiver": "^8.0.0",
+    "@types/dockerode": "^4.0.1",
+    "kysely-ctl": "^0.21.0"
+  }
+}

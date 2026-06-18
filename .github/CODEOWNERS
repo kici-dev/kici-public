@@ -1,0 +1,8 @@
+# Code owners for kici-dev/kici-public.
+#
+# This repo is a release-time projection of a private upstream monorepo
+# (see CONTRIBUTING.md); accepted PRs are back-ported upstream. The
+# kici-admins team owns review across the whole tree. For CODEOWNERS to
+# take effect, the team must have write access to this repository.
+
+* @kici-dev/kici-admins

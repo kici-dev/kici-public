@@ -1,0 +1,63 @@
+# KiCI bare-metal quickstart — backing-services compose.
+#
+# The bare-metal orchestrator runs as a native systemd service (see
+# docs/user/quickstart/bare-metal.md); this compose runs only the two backing
+# services it can't easily run natively: PostgreSQL 18 and a SeaweedFS object
+# store. Both are published on loopback so they aren't exposed off-box. Bring
+# them up with:
+#
+#   docker compose -f docker-compose.postgres.yaml up -d --wait
+#
+# The DB password defaults to the loopback-only stub `kici-local`; override it
+# by exporting POSTGRES_PASSWORD (or setting it in a sibling .env that compose
+# auto-reads).
+# seaweedfs-s3.json must sit next to this file (download it from the same
+# directory) — it carries the static S3 identity for the kici-cache bucket.
+services:
+  postgres:
+    image: postgres:18.4-trixie
+    environment:
+      POSTGRES_DB: kici
+      POSTGRES_USER: kici
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-kici-local}'
+    # Publish only on loopback so the database isn't reachable off-box.
+    ports:
+      - '127.0.0.1:5432:5432'
+    # Postgres 18+ images expect the bind at /var/lib/postgresql (not
+    # /var/lib/postgresql/data). The image stores data in a major-version
+    # subdirectory beneath it, which lets pg_upgrade --link work across a
+    # major bump without mount-point gymnastics.
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U kici -d kici']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.34
+    # S3 gateway on :8333; the static identity lives in seaweedfs-s3.json and
+    # the kici-cache bucket is created on first write. Required for
+    # `kici run remote` against the native orchestrator on this host.
+    command: 'server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json'
+    volumes:
+      - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - seaweedfs-data:/data
+    # Publish only on loopback — host CLI, orchestrator, and agents all run on
+    # this host and reach it here.
+    ports:
+      - '127.0.0.1:8333:8333'
+    healthcheck:
+      # /status is the unauthenticated liveness endpoint (the S3 root needs
+      # auth → 403). 127.0.0.1 (not localhost): SeaweedFS binds IPv4 only.
+      test: ['CMD-SHELL', 'wget -q -O - http://127.0.0.1:8333/status >/dev/null 2>&1 || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  seaweedfs-data:

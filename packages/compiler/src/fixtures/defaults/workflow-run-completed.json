@@ -1,0 +1,23 @@
+{
+  "action": "completed",
+  "workflow_run": {
+    "id": 1,
+    "name": "CI",
+    "head_branch": "main",
+    "head_sha": "abc123def456",
+    "status": "completed",
+    "conclusion": "success",
+    "event": "push"
+  },
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

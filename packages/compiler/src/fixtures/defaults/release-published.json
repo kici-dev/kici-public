@@ -1,0 +1,23 @@
+{
+  "action": "published",
+  "release": {
+    "id": 1,
+    "tag_name": "v1.0.0",
+    "target_commitish": "main",
+    "name": "v1.0.0",
+    "draft": false,
+    "prerelease": false,
+    "body": "Release notes"
+  },
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

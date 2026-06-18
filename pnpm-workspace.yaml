@@ -1,0 +1,13 @@
+packages:
+  - packages/*
+
+onlyBuiltDependencies:
+  - '@swc/core'
+  - cpu-features
+  - esbuild
+  - protobufjs
+  - ssh2
+
+minimumReleaseAge: 10080 # 7 days
+minimumReleaseAgeExclude:
+  - '@kici-dev/*'

@@ -1,0 +1,32 @@
+name: Question
+description: Ask how to do something with KiCI
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Usage questions are welcome. Please check the
+        [docs](https://github.com/kici-dev/kici-public/tree/main/docs) first —
+        the answer may already be there.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you've tried
+      description: Commands, config, or docs you've already looked at.
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: KiCI version
+      description: Output of `kici --version`, if relevant.
+      placeholder: "0.1.16"
+    validations:
+      required: false

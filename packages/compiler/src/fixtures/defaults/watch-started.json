@@ -1,0 +1,15 @@
+{
+  "action": "started",
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main",
+    "watchers_count": 50
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

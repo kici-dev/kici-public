@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a concrete enhancement to a public KiCI package
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Concrete, scoped proposals land best. If you're not sure whether
+        something is a fit, open it as a question first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do, and where does KiCI get in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should KiCI do instead? API shape, CLI flag, behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you've tried or other designs you weighed.
+    validations:
+      required: false
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you be willing to contribute this?
+      options:
+        - "Maybe, with guidance"
+        - "Yes"
+        - "No"
+    validations:
+      required: false

@@ -1,0 +1,17 @@
+{
+  "ref": "feature/new",
+  "ref_type": "branch",
+  "master_branch": "main",
+  "description": null,
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

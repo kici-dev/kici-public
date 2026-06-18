@@ -1,0 +1,16 @@
+{
+  "ref": "refs/heads/main",
+  "before": "000000",
+  "after": "abc123",
+  "repository": {
+    "name": "test-repo",
+    "full_name": "owner/test-repo",
+    "owner": {
+      "login": "owner"
+    }
+  },
+  "pusher": {
+    "name": "user"
+  },
+  "commits": []
+}

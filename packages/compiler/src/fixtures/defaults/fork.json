@@ -1,0 +1,19 @@
+{
+  "forkee": {
+    "full_name": "forker/test-repo",
+    "owner": {
+      "login": "forker"
+    }
+  },
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "forker"
+  }
+}

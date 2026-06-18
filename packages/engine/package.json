@@ -1,0 +1,118 @@
+{
+  "name": "@kici-dev/engine",
+  "version": "0.1.19",
+  "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "engine"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/engine"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./trigger/trigger-event-type": {
+      "import": "./dist/trigger/trigger-event-type.js",
+      "types": "./dist/trigger/trigger-event-type.d.ts"
+    },
+    "./webhook/signature": {
+      "import": "./dist/webhook/signature.js",
+      "types": "./dist/webhook/signature.d.ts"
+    },
+    "./labels/compile": {
+      "import": "./dist/labels/compile.js",
+      "types": "./dist/labels/compile.d.ts"
+    },
+    "./protocol/dashboard-global-workflows": {
+      "import": "./dist/protocol/dashboard-global-workflows.js",
+      "types": "./dist/protocol/dashboard-global-workflows.d.ts"
+    },
+    "./protocol/dashboard-write-operations": {
+      "import": "./dist/protocol/dashboard-write-operations.js",
+      "types": "./dist/protocol/dashboard-write-operations.d.ts"
+    },
+    "./protocol/analytics-events": {
+      "import": "./dist/protocol/analytics-events.js",
+      "types": "./dist/protocol/analytics-events.d.ts"
+    },
+    "./protocol/cluster-name": {
+      "import": "./dist/protocol/cluster-name.js",
+      "types": "./dist/protocol/cluster-name.d.ts"
+    },
+    "./protocol/messages/oidc-token-relay": {
+      "import": "./dist/protocol/messages/oidc-token-relay.js",
+      "types": "./dist/protocol/messages/oidc-token-relay.d.ts"
+    },
+    "./provenance/schema": {
+      "import": "./dist/provenance/schema.js",
+      "types": "./dist/provenance/schema.d.ts"
+    },
+    "./provenance/dsse": {
+      "import": "./dist/provenance/dsse.js",
+      "types": "./dist/provenance/dsse.d.ts"
+    },
+    "./provenance/bundle": {
+      "import": "./dist/provenance/bundle.js",
+      "types": "./dist/provenance/bundle.d.ts"
+    },
+    "./provenance/verify": {
+      "import": "./dist/provenance/verify.js",
+      "types": "./dist/provenance/verify.d.ts"
+    },
+    "./metrics/catalog": {
+      "import": "./dist/metrics/metric-catalog.generated.js",
+      "types": "./dist/metrics/metric-catalog.generated.d.ts"
+    },
+    "./metrics/catalog-policy": {
+      "import": "./dist/metrics/catalog-policy.js",
+      "types": "./dist/metrics/catalog-policy.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/engine --name @kici-dev/engine"
+  },
+  "dependencies": {
+    "jose": "^6.1.0",
+    "jsonpath-plus": "^10.4.0",
+    "picomatch": "^4.0.4",
+    "safe-regex": "^2.1.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.0",
+    "@types/safe-regex": "^1.1.6"
+  }
+}

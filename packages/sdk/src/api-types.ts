@@ -1,0 +1,107 @@
+/**
+ * Typed KiCI API available to workflows via ctx.kici.
+ *
+ * Each namespace groups related methods. Under the hood, calls are serialized
+ * to { method: 'namespace.method', params } and sent over the agent's WS
+ * connection to the orchestrator. Adding a new API method:
+ *
+ * 1. Add the typed method here (with param + return types)
+ * 2. Register the handler in the orchestrator's AgentApiRegistry
+ */
+
+import {
+  OIDC_TOKEN_REQUEST_METHOD,
+  type OidcTokenResult,
+} from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+
+export type { OidcTokenResult };
+
+// --- Infrastructure API ---
+
+export interface InfrastructureListResult {
+  scalers: Array<{
+    name: string;
+    type: string;
+    labelSets: string[][];
+    /** 'local' for this orchestrator's scalers, peer instanceId for remote. */
+    source: string;
+  }>;
+  agents: Array<{
+    agentId: string;
+    labels: string[];
+    scalerManaged: boolean;
+    /** 'local' for this orchestrator's agents, peer instanceId for remote. */
+    source: string;
+  }>;
+}
+
+export interface InfrastructureApi {
+  /** List available scalers and connected agents. */
+  list(): Promise<InfrastructureListResult>;
+}
+
+// --- OIDC API ---
+
+export interface OidcApi {
+  /**
+   * Request a short-lived OIDC ID token for the current job, bound to
+   * `audience`. The token's identity claims (repository, ref, sha, run/job id)
+   * are derived server-side from the build context and cannot be spoofed by the
+   * workflow. The token is automatically masked in step logs. Only available
+   * inside a running job step (throws otherwise).
+   */
+  token(opts: { audience: string }): Promise<OidcTokenResult>;
+}
+
+// --- Top-level KiCI API ---
+
+export interface KiciApi {
+  /** Query orchestrator infrastructure (scalers, agents). */
+  infrastructure: InfrastructureApi;
+  /** Request short-lived OIDC ID tokens for the current job (build provenance). */
+  oidc: OidcApi;
+}
+
+// --- Transport layer (internal) ---
+
+/**
+ * Low-level transport function used to implement KiciApi.
+ * Maps to sendApiRequest on OrchestratorClient or IPC relay in sandbox.
+ */
+export type KiciApiTransport = (
+  method: string,
+  params?: Record<string, unknown>,
+) => Promise<unknown>;
+
+/**
+ * Build a typed KiciApi proxy from a raw transport function.
+ *
+ * This is the bridge between the typed SDK interface and the untyped WS/IPC
+ * transport. Each method call is mapped to { method: 'namespace.method', params }.
+ *
+ * `jobCtx` carries the per-job execution context (the job the step is running
+ * in). It is supplied by the agent's sandbox step context so `oidc.token()` can
+ * bind its request to that job; the workflow author never supplies it. It is
+ * omitted for contexts with no running job (e.g. DynamicJobFn re-evaluation),
+ * where `oidc.token()` throws rather than silently misattributing a token.
+ */
+export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: string }): KiciApi {
+  return {
+    infrastructure: {
+      list: () => transport('infrastructure.list', {}) as Promise<InfrastructureListResult>,
+    },
+    oidc: {
+      token: (opts) => {
+        if (!jobCtx) {
+          return Promise.reject(
+            new Error('ctx.kici.oidc.token() is only available inside a running job step'),
+          );
+        }
+        return transport(OIDC_TOKEN_REQUEST_METHOD, {
+          jobId: jobCtx.jobId,
+          audience: opts.audience,
+        }) as Promise<OidcTokenResult>;
+      },
+    },
+  };
+}

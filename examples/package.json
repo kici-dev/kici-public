@@ -1,0 +1,15 @@
+{
+  "name": "@kici-dev/examples",
+  "description": "Private collection of runnable KiCI workflow examples. Not published to npm.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@kici-dev/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}

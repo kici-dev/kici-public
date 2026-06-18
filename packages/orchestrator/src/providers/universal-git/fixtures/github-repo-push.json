@@ -1,0 +1,22 @@
+{
+  "ref": "refs/heads/main",
+  "before": "3333333333333333333333333333333333333333",
+  "after": "4444444444444444444444444444444444444444",
+  "repository": {
+    "id": 123,
+    "owner": { "login": "acme" },
+    "name": "widgets",
+    "full_name": "acme/widgets",
+    "default_branch": "main"
+  },
+  "commits": [
+    {
+      "id": "4444444444444444444444444444444444444444",
+      "message": "ci: bump",
+      "added": [".kici/kici.lock.json"],
+      "modified": ["src/main.ts"],
+      "removed": []
+    }
+  ],
+  "sender": { "login": "octocat" }
+}

@@ -1,0 +1,23 @@
+# IDE
+.idea/
+
+# Planning docs (preserve markdown formatting)
+.planning/
+
+# Build outputs
+dist/
+node_modules/
+
+# Auto-generated metric catalog (formatted by scripts/generate-prometheus.ts —
+# prettier rewrap conflicts with --check-stale drift detector)
+packages/engine/src/metrics/metric-catalog.generated.ts
+
+# Lock files
+pnpm-lock.yaml
+
+testing/**/*.yaml
+
+# Claude Code rules (preserve YAML frontmatter)
+.claude/rules/
+
+**/*.enc.yaml

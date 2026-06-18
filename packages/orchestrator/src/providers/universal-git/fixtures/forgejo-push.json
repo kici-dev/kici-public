@@ -1,0 +1,22 @@
+{
+  "ref": "refs/heads/main",
+  "before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "repository": {
+    "id": 42,
+    "owner": { "login": "kici-dev" },
+    "name": "sample-repo",
+    "full_name": "kici-dev/sample-repo",
+    "default_branch": "main"
+  },
+  "commits": [
+    {
+      "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "message": "chore: sample commit",
+      "added": [".kici/kici.lock.json", "src/new.ts"],
+      "modified": ["src/existing.ts"],
+      "removed": ["docs/old.md"]
+    }
+  ],
+  "sender": { "login": "alice" }
+}

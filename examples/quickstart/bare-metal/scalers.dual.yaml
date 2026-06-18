@@ -1,0 +1,44 @@
+# KiCI bare-metal quickstart — dual-scaler configuration.
+#
+# Runs BOTH scaler backends on one host behind a native (bare-metal)
+# orchestrator:
+#   - container:  spawns one-shot agent containers via the host container
+#                 runtime (docker/podman). Good for fully-isolated, image-
+#                 pinned jobs (runsOn includes `container`).
+#   - bare-metal: spawns one-shot agent PROCESSES from the locally-installed
+#                 kici-agent binary. No image pull; shares the host (runsOn
+#                 includes `bare-metal`).
+#
+# globalMaxAgents caps the COMBINED concurrent agents across both scalers.
+version: 1
+globalMaxAgents: 4
+
+scalers:
+  - name: container-default
+    type: container
+    runtime: auto # auto-detects the docker or rootless podman socket
+    maxAgents: 4
+    # Spawned agent containers must reach the native orchestrator on the host.
+    # The in-container `host.docker.internal` alias resolves on Docker Desktop
+    # and Podman 4+; the `extraHosts` line adds the same alias on a plain host.
+    # Alternatively, point this at the host's LAN address.
+    orchestratorUrl: ws://host.docker.internal:4000/ws
+    extraHosts:
+      - 'host.docker.internal:host-gateway'
+    # Per-agent network isolation uses host nftables, which needs NET_ADMIN —
+    # a privilege an unprivileged (user-level) orchestrator process can't
+    # grant. Set false when the orchestrator runs rootless; leave true
+    # (the default) only under a root / NET_ADMIN-capable runtime.
+    networkIsolation: false
+    labelSets:
+      - labels: [linux, container]
+        image: quay.io/kici-dev/kici-agent:latest
+
+  - name: bare-metal-default
+    type: bare-metal
+    maxAgents: 4
+    labelSets:
+      - labels: [linux, bare-metal]
+        # Absolute path to the kici-agent binary. `npm install -g kici-admin`
+        # puts it on PATH — resolve the path with: command -v kici-agent
+        binaryPath: /usr/local/bin/kici-agent

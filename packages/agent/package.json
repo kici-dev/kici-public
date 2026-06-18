@@ -1,0 +1,88 @@
+{
+  "name": "@kici-dev/agent",
+  "version": "0.1.19",
+  "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "agent",
+    "runner"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/agent"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./server": "./dist/server.js"
+  },
+  "build": {
+    "entries": {
+      "server.js": "src/server.ts",
+      "workflow-runner.js": "src/execution/sandbox/workflow-runner.ts",
+      "index.js": "src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/agent --name @kici-dev/agent"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.4",
+    "@kici-dev/core": "workspace:*",
+    "@kici-dev/engine": "workspace:*",
+    "@kici-dev/sdk": "workspace:*",
+    "@kici-dev/shared": "workspace:*",
+    "archiver": "^8.0.0",
+    "dockerode": "^5.0.0",
+    "hono": "^4.12.25",
+    "jose": "^6.1.0",
+    "tar": "^7.5.16",
+    "winston": "^3.19.0",
+    "ws": "^8.21.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "kici": {
+    "metrics": {
+      "mode": "push",
+      "jobName": "kici-agent"
+    }
+  },
+  "devDependencies": {
+    "@types/archiver": "^8.0.0",
+    "@types/dockerode": "^4.0.1"
+  }
+}

@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a defect in a published KiCI package or container image
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. For **security** issues, do not use this form —
+        open a private [Security Advisory](https://github.com/kici-dev/kici-public/security/advisories/new) instead.
+  - type: input
+    id: version
+    attributes:
+      label: KiCI version
+      description: Output of `kici --version`.
+      placeholder: "0.1.16"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Node version, package manager + version, and OS.
+      placeholder: "Node 24.13.0, pnpm 11.3.0, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest workflow file + the exact command you ran.
+      placeholder: |
+        // .kici/workflows/example.ts
+        ...
+
+        $ kici run local push
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Actual vs expected behaviour
+      description: What happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output. Redact any secrets first.
+      render: shell
+    validations:
+      required: false

@@ -1,0 +1,26 @@
+{
+  "state": "success",
+  "context": "ci/test",
+  "sha": "abc123def456",
+  "description": "Build succeeded",
+  "target_url": "https://ci.example.com/builds/1",
+  "branches": [
+    {
+      "name": "main",
+      "commit": {
+        "sha": "abc123def456"
+      }
+    }
+  ],
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "test-user"
+  }
+}

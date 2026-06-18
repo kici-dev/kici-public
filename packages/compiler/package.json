@@ -1,0 +1,85 @@
+{
+  "name": "@kici-dev/compiler",
+  "version": "0.1.19",
+  "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "cli",
+    "compiler"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/compiler"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "bin": {
+    "kici": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "hack/postinstall.mjs",
+    "sbom.spdx.json"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "postbuild": "zx hack/postbuild.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "node hack/postinstall.mjs",
+    "postpublish": "node ../../packages/kici/hack/publish-wrapper.mjs",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/compiler --name @kici-dev/compiler"
+  },
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
+    "@kici-dev/core": "workspace:*",
+    "@kici-dev/engine": "workspace:*",
+    "chokidar": "^5.0.0",
+    "commander": "^15.0.0",
+    "fast-glob": "^3.3.3",
+    "open": "^11.0.0",
+    "picocolors": "^1.1.1",
+    "picomatch": "^4.0.4",
+    "proper-lockfile": "^4.1.2",
+    "tar": "^7.5.16",
+    "typescript": "^6.0.3",
+    "ws": "^8.21.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "peerDependencies": {
+    "@kici-dev/sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/proper-lockfile": "^4.1.4"
+  }
+}

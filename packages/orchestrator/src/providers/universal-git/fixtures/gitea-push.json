@@ -1,0 +1,22 @@
+{
+  "ref": "refs/heads/master",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "cccccccccccccccccccccccccccccccccccccccc",
+  "repository": {
+    "id": 17,
+    "owner": { "login": "gitea-org" },
+    "name": "demo",
+    "full_name": "gitea-org/demo",
+    "default_branch": "master"
+  },
+  "commits": [
+    {
+      "id": "cccccccccccccccccccccccccccccccccccccccc",
+      "message": "feat: initial push",
+      "added": ["README.md", ".kici/kici.lock.json"],
+      "modified": [],
+      "removed": []
+    }
+  ],
+  "sender": { "login": "gitea-bot" }
+}

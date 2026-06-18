@@ -1,0 +1,80 @@
+{
+  "name": "@kici-dev/core",
+  "version": "0.1.19",
+  "description": "Light shared utilities for the KiCI stack (logging, errors, formatting, crypto, zx init, the TypeScript ESM loader hook). No server-side dependencies.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "utilities"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/core"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./ts-loader-hook": {
+      "import": "./dist/ts-loader-hook.js",
+      "types": "./dist/ts-loader-hook.d.ts"
+    },
+    "./package-manager": {
+      "import": "./dist/package-manager.js",
+      "types": "./dist/package-manager.d.ts"
+    },
+    "./package-manager-types": {
+      "import": "./dist/package-manager-types.js",
+      "types": "./dist/package-manager-types.d.ts"
+    },
+    "./idempotency": {
+      "import": "./dist/idempotency.js",
+      "types": "./dist/idempotency.d.ts"
+    },
+    "./tmp-gc": {
+      "import": "./dist/tmp-gc.js",
+      "types": "./dist/tmp-gc.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/core --name @kici-dev/core"
+  },
+  "dependencies": {
+    "oxc-transform": "0.135.0",
+    "picocolors": "^1.1.1",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ]
+}

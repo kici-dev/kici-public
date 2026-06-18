@@ -1,0 +1,35 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 1,
+    "state": "approved",
+    "body": "LGTM",
+    "user": {
+      "login": "reviewer"
+    }
+  },
+  "pull_request": {
+    "number": 42,
+    "title": "Test PR",
+    "state": "open",
+    "head": {
+      "ref": "feature-branch",
+      "sha": "abc123"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "def456"
+    }
+  },
+  "repository": {
+    "name": "test-repo",
+    "full_name": "test-org/test-repo",
+    "owner": {
+      "login": "test-org"
+    },
+    "default_branch": "main"
+  },
+  "sender": {
+    "login": "reviewer"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "name": "@kici-dev/sdk",
+  "version": "0.1.19",
+  "description": "TypeScript SDK for defining KiCI workflows. Import into `.kici/workflows/*.ts` to declare workflows, jobs, steps, triggers, rules, and matrix configurations.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "sdk",
+    "pipeline"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/sdk"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/sdk --name @kici-dev/sdk"
+  },
+  "dependencies": {
+    "@kici-dev/core": "workspace:*",
+    "@kici-dev/engine": "workspace:*",
+    "micromatch": "^4.0.8",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "devDependencies": {
+    "@types/micromatch": "^4.0.10"
+  }
+}

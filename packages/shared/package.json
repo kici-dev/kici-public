@@ -1,0 +1,116 @@
+{
+  "name": "@kici-dev/shared",
+  "version": "0.1.19",
+  "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "utilities"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/shared"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "!dist/**/*.map",
+    "sbom.spdx.json"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./env": {
+      "import": "./dist/env/index.js",
+      "types": "./dist/env/index.d.ts"
+    },
+    "./ts-loader-hook": {
+      "import": "./dist/ts-loader-hook.js",
+      "types": "./dist/ts-loader-hook.d.ts"
+    },
+    "./idempotency": {
+      "import": "./dist/idempotency.js",
+      "types": "./dist/idempotency.d.ts"
+    },
+    "./idempotency-files": {
+      "import": "./dist/idempotency-files.js",
+      "types": "./dist/idempotency-files.d.ts"
+    },
+    "./idempotency-env-diff": {
+      "import": "./dist/idempotency-env-diff.js",
+      "types": "./dist/idempotency-env-diff.d.ts"
+    },
+    "./idempotency-yaml-diff": {
+      "import": "./dist/idempotency-yaml-diff.js",
+      "types": "./dist/idempotency-yaml-diff.d.ts"
+    },
+    "./db-collation": {
+      "import": "./dist/db-collation.js",
+      "types": "./dist/db-collation.d.ts"
+    },
+    "./package-manager": {
+      "import": "./dist/package-manager.js",
+      "types": "./dist/package-manager.d.ts"
+    },
+    "./package-manager-types": {
+      "import": "./dist/package-manager-types.js",
+      "types": "./dist/package-manager-types.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/shared --name @kici-dev/shared"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1064.0",
+    "@kici-dev/core": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.218.0",
+    "@opentelemetry/exporter-prometheus": "^0.218.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.218.0",
+    "@opentelemetry/instrumentation-runtime-node": "^0.31.0",
+    "@opentelemetry/resources": "^2.7.1",
+    "@opentelemetry/sdk-node": "^0.218.0",
+    "@opentelemetry/semantic-conventions": "^1.41.1",
+    "archiver": "^8.0.0",
+    "diff": "^9.0.0",
+    "hono": "^4.12.25",
+    "kysely": "^0.29.2",
+    "oxc-transform": "0.135.0",
+    "pg": "^8.21.0",
+    "picocolors": "^1.1.1",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3",
+    "zx": "^8.8.5"
+  },
+  "devDependencies": {
+    "@opentelemetry/sdk-trace-base": "^2.7.1",
+    "@types/archiver": "^8.0.0"
+  }
+}

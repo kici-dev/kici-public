@@ -1,0 +1,48 @@
+{
+  "name": "kici",
+  "version": "0.1.19",
+  "description": "Developer CLI for the KiCI CI/CD stack. Compile workflows, run them locally, and interact with a remote orchestrator from the command line.",
+  "keywords": [
+    "ci",
+    "cicd",
+    "continuous-integration",
+    "typescript",
+    "workflow",
+    "cli",
+    "devops"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kici-dev/kici-public.git",
+    "directory": "packages/kici"
+  },
+  "bugs": "https://github.com/kici-dev/kici-public/issues",
+  "homepage": "https://kici.dev",
+  "author": {
+    "name": "KiCI",
+    "email": "hello@kici.dev"
+  },
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24"
+  },
+  "type": "module",
+  "bin": {
+    "kici": "./bin/kici.js"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/kici --name kici"
+  },
+  "dependencies": {
+    "@kici-dev/compiler": "workspace:*",
+    "@kici-dev/core": "workspace:*"
+  },
+  "files": [
+    "bin",
+    "sbom.spdx.json"
+  ]
+}
