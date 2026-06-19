@@ -12,7 +12,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '@kici-dev/shared';
-import { isLockStaticJob, materializeFanout, matrixEnvelopeFields } from '@kici-dev/engine';
+import {
+  isLockStaticJob,
+  materializeFanout,
+  matrixEnvelopeFields,
+  partitionMatchers,
+} from '@kici-dev/engine';
 import type { LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 import type { RerunDeps } from './rerun.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
@@ -241,9 +246,14 @@ async function tryRouteViaCoordinator(args: {
 
   const jobsToRoute: JobToRoute[] = materializedJobs.map((mat) => {
     const job = mat.lockJob;
+    const runsOnSel = partitionMatchers(job.runsOn ?? []);
+    const excludeSel = partitionMatchers(job.excludeLabels ?? []);
     return {
       jobName: mat.expandedName,
-      runsOnLabels: [Array.isArray(job.runsOn) ? [...job.runsOn] : [job.runsOn]],
+      runsOnLabels: [runsOnSel.exact],
+      runsOnPatterns: runsOnSel.regex,
+      excludeLabels: excludeSel.exact,
+      excludePatterns: excludeSel.regex,
       jobConfig: buildManualJobConfig(workflow, mat),
       repoUrl,
       ref: '',
@@ -293,11 +303,7 @@ async function tryRouteViaCoordinator(args: {
 
   const dispatchedJobs: DispatchedJobEntry[] = routeResult.localJobs.map((local) => {
     const job = materializedJobs.find((m) => m.expandedName === local.jobName)?.lockJob;
-    const runsOnLabels = job
-      ? Array.isArray(job.runsOn)
-        ? [...job.runsOn]
-        : [job.runsOn]
-      : undefined;
+    const runsOnLabels = job ? partitionMatchers(job.runsOn ?? []).exact : undefined;
     const matrixValues = matrixByName.get(local.jobName);
     return {
       jobId: local.jobId,
@@ -348,12 +354,17 @@ async function dispatchDirectly(args: {
   for (const mat of materializedJobs) {
     const job = mat.lockJob;
     const matrixValues = mat.variantValues;
-    const runsOnLabels = Array.isArray(job.runsOn) ? [...job.runsOn] : [job.runsOn];
+    const runsOnSel = partitionMatchers(job.runsOn ?? []);
+    const excludeSel = partitionMatchers(job.excludeLabels ?? []);
+    const runsOnLabels = runsOnSel.exact;
     const jobInput: QueuedJobInput = {
       runId: newRunId,
       workflowName: workflow.name,
       jobName: mat.expandedName,
       runsOnLabels,
+      runsOnPatterns: runsOnSel.regex,
+      excludeLabels: excludeSel.exact,
+      excludePatterns: excludeSel.regex,
       jobConfig: buildManualJobConfig(workflow, mat),
       repoUrl,
       ref: '',

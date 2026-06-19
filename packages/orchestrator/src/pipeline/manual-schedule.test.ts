@@ -19,7 +19,7 @@ function makeRegistration(overrides: Record<string, unknown> = {}) {
         {
           _type: 'static',
           name: 'beat',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'ping', run: 'echo ok' }],
           needs: [],
         },
@@ -104,7 +104,7 @@ describe('handleManualSchedule', () => {
             {
               _type: 'static',
               name: 'beat',
-              runsOn: 'default',
+              runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'ping', run: 'echo ok' }],
               needs: [],
               matrix: { _type: 'static', values: ['a', 'b'] },

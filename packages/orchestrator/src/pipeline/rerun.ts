@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { createLogger, type ColdStore } from '@kici-dev/shared';
+import { partitionMatchers } from '@kici-dev/engine';
 import type { Kysely, Selectable } from 'kysely';
 import type { Database, ExecutionRunTable } from '../db/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
@@ -510,9 +511,14 @@ async function dispatchRerunJobs(opts: {
   if (deps.coordinator && materializedJobs.length > 0) {
     const jobsToRoute: JobToRoute[] = materializedJobs.map((mat) => {
       const job = mat.lockJob;
+      const runsOnSel = partitionMatchers(job.runsOn ?? []);
+      const excludeSel = partitionMatchers(job.excludeLabels ?? []);
       return {
         jobName: mat.expandedName,
-        runsOnLabels: [Array.isArray(job.runsOn) ? job.runsOn : [job.runsOn]],
+        runsOnLabels: [runsOnSel.exact],
+        runsOnPatterns: runsOnSel.regex,
+        excludeLabels: excludeSel.exact,
+        excludePatterns: excludeSel.regex,
         jobConfig: buildRerunJobConfig(mat),
         repoUrl,
         ref: originalRun.ref,
@@ -559,7 +565,7 @@ async function dispatchRerunJobs(opts: {
         const runsOnLabels = (() => {
           const mat = materializedJobs.find((m) => m.expandedName === local.jobName);
           const job = mat?.lockJob;
-          return job ? (Array.isArray(job.runsOn) ? job.runsOn : [job.runsOn]) : undefined;
+          return job ? partitionMatchers(job.runsOn ?? []).exact : undefined;
         })();
         const matrixValues = matrixByName.get(local.jobName);
         dispatchedJobs.push({
@@ -593,12 +599,17 @@ async function dispatchRerunJobs(opts: {
     for (const mat of materializedJobs) {
       const job = mat.lockJob;
       const matrixValues = mat.variantValues;
-      const runsOnLabels = Array.isArray(job.runsOn) ? job.runsOn : [job.runsOn];
+      const runsOnSel = partitionMatchers(job.runsOn ?? []);
+      const excludeSel = partitionMatchers(job.excludeLabels ?? []);
+      const runsOnLabels = runsOnSel.exact;
       const jobInput: QueuedJobInput = {
         runId: newRunId,
         workflowName: workflow.name,
         jobName: mat.expandedName,
         runsOnLabels,
+        runsOnPatterns: runsOnSel.regex,
+        excludeLabels: excludeSel.exact,
+        excludePatterns: excludeSel.regex,
         jobConfig: buildRerunJobConfig(mat),
         repoUrl,
         ref: originalRun.ref,

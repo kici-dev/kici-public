@@ -141,7 +141,7 @@ const LOCK_FILE = {
         {
           _type: 'static',
           name: 'test',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'run tests', run: 'npm test' }],
           needs: [],
         },
@@ -239,7 +239,7 @@ describe('handleRerun', () => {
             {
               _type: 'static',
               name: 'test',
-              runsOn: 'default',
+              runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'run tests', run: 'npm test' }],
               needs: [],
               matrix: { _type: 'static', values: { variant: ['a', 'b'] } },

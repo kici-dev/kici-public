@@ -50,6 +50,7 @@ import {
   createWorkflowDecision,
   materializeFanout,
   matrixEnvelopeFields,
+  partitionMatchers,
 } from '@kici-dev/engine';
 import type { MaterializedJob } from '@kici-dev/engine';
 import { evaluateInlineFields } from './inline-eval.js';
@@ -471,12 +472,16 @@ function buildJobInput(
   environmentVars: Record<string, string> | undefined,
 ): QueuedJobInput {
   const staticJob = mat.lockJob;
-  const runsOnLabels = Array.isArray(staticJob.runsOn) ? staticJob.runsOn : [staticJob.runsOn];
+  const runsOnSel = partitionMatchers(staticJob.runsOn ?? []);
+  const excludeSel = partitionMatchers(staticJob.excludeLabels ?? []);
   return {
     runId: ctx.runId,
     workflowName: workflow.name,
     jobName: mat.expandedName,
-    runsOnLabels,
+    runsOnLabels: runsOnSel.exact,
+    runsOnPatterns: runsOnSel.regex,
+    excludeLabels: excludeSel.exact,
+    excludePatterns: excludeSel.regex,
     jobConfig: {
       source: workflow.source ?? ctx.fullLockFile.source,
       workflowName: workflow.name,

@@ -2,6 +2,28 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.19 — 2026-06-19
+
+### Features
+
+- Track paid-tier live-log tail-minute usage with a new consumption meter in the web UI.
+
+### Fixes
+
+- Correctly partition workflow label matching across dispatch paths so `runsOn` selectors route jobs to the intended agents.
+- Page through archived event-log history newest-first.
+- Skip fleet bundle logging gracefully when no log directory is configured, instead of erroring.
+- Reject empty provenance subject digests rather than writing an invalid storage key.
+- Keep attestation badges from briefly flashing "unverifiable" while verification keys are still loading in the web UI.
+- Write Firecracker boot-script network configuration with proper newlines so the VM network comes up reliably.
+- Guard job-cancellation messages against closed connections to avoid spurious errors.
+
+### Documentation
+
+- Reworked quickstart: split into "run remote" (compose + bare-metal) and "GitHub" parts, clarified remote-run SDK resolution, and added a Docker Hub rate-limit note.
+- Corrected quickstart details — token prefix, `kici` CLI install step, PostgreSQL 18 on macOS, and an updated SDK version pin.
+- Routine documentation maintenance across security, orchestrator config, engine protocol, and configuration references.
+
 ## v0.1.18 — 2026-06-17
 
 ### Features

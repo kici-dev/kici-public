@@ -38,7 +38,7 @@ To change the default policy:
 
 ## ci_trust RBAC resource
 
-The `ci_trust` resource is one of the 15 RBAC resources and controls CI security permissions:
+The `ci_trust` resource is one of the 16 RBAC resources and controls CI security permissions:
 
 | Level   | Capabilities                                                                 |
 | ------- | ---------------------------------------------------------------------------- |
