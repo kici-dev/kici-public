@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.20 — 2026-06-19
+
+### Documentation
+
+- Refresh the documentation for engine close codes and CLI commands.
+
 ## v0.1.19 — 2026-06-19
 
 ### Features

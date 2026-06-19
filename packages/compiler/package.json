@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/compiler",
-  "version": "0.1.19",
+  "version": "0.1.20",
   "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
   "keywords": [
     "ci",

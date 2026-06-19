@@ -436,7 +436,8 @@ kici login [options]
 | --------------------------- | ------- | ---------------------------------------------- |
 | `--token <key>`             | none    | API key for direct authentication (legacy)     |
 | `--device`                  | false   | Force device authorization flow (headless/SSH) |
-| `--platform-endpoint <url>` | none    | Platform API base URL                          |
+| `--platform-endpoint <url>` | none    | Platform relay URL                             |
+| `--routing-key <key>`       | none    | Routing key for webhook source identification  |
 
 **Environment variables:**
 
@@ -725,11 +726,10 @@ kici approve <run-id> [options]
 
 **Options:**
 
-| Option            | Default | Description                                         |
-| ----------------- | ------- | --------------------------------------------------- |
-| `--job <name>`    | none    | Approve a held job (omit for a workflow-level hold) |
-| `--step <name>`   | none    | Approve a held step (used with `--job`)             |
-| `--reason <text>` | none    | Optional note recorded with the approval            |
+| Option           | Default | Description                                          |
+| ---------------- | ------- | ---------------------------------------------------- |
+| `--job <name>`   | none    | Approve a held job (omit for a workflow-level hold)  |
+| `--step <index>` | none    | Approve a held step by its index (used with `--job`) |
 
 **Examples:**
 
@@ -740,8 +740,8 @@ kici approve abc123
 # Approve a held job
 kici approve abc123 --job deploy-production
 
-# Approve a held step
-kici approve abc123 --job migrate-and-deploy --step apply-migration
+# Approve a held step (steps are addressed by index)
+kici approve abc123 --job migrate-and-deploy --step 1
 ```
 
 You must be eligible for at least one unsatisfied clause (a member of a named team, or a named user) and hold the `environments:write` or `ci_trust:write` permission. The command reports whether the element was released, how many clauses remain, or that it was rejected.
@@ -762,11 +762,11 @@ kici reject <run-id> --reason <text> [options]
 
 **Options:**
 
-| Option            | Default | Description                                        |
-| ----------------- | ------- | -------------------------------------------------- |
-| `--reason <text>` | none    | Required. Reason recorded with the rejection       |
-| `--job <name>`    | none    | Reject a held job (omit for a workflow-level hold) |
-| `--step <name>`   | none    | Reject a held step (used with `--job`)             |
+| Option            | Default | Description                                         |
+| ----------------- | ------- | --------------------------------------------------- |
+| `--reason <text>` | none    | Required. Reason recorded with the rejection        |
+| `--job <name>`    | none    | Reject a held job (omit for a workflow-level hold)  |
+| `--step <index>`  | none    | Reject a held step by its index (used with `--job`) |
 
 **Examples:**
 
@@ -780,14 +780,8 @@ kici reject abc123 --job deploy-production --reason "Wrong release branch"
 List secret contexts available for test runs. Shows context names and key names (not values).
 
 ```bash
-kici secrets list [options]
+kici secrets list
 ```
-
-**Options:**
-
-| Option             | Default | Description               |
-| ------------------ | ------- | ------------------------- |
-| `--endpoint <url>` | none    | Orchestrator URL override |
 
 Each "context" corresponds to an environment configured on the orchestrator. The output lists every environment whose `allowLocalExecution` flag is `true` (the gate that lets CLI-initiated test runs resolve secrets through that environment), along with the secret key names reachable from the environment's bound scopes.
 
@@ -805,10 +799,9 @@ kici types [options]
 
 **Options:**
 
-| Option              | Default | Description               |
-| ------------------- | ------- | ------------------------- |
-| `--kici-dir <path>` | `.kici` | Path to .kici directory   |
-| `--endpoint <url>`  | none    | Orchestrator URL override |
+| Option              | Default | Description             |
+| ------------------- | ------- | ----------------------- |
+| `--kici-dir <path>` | `.kici` | Path to .kici directory |
 
 **Prerequisites:** Must be authenticated via `kici login`.
 
@@ -822,9 +815,6 @@ kici types
 
 # Use custom .kici directory
 kici types --kici-dir packages/app/.kici
-
-# Override orchestrator endpoint
-kici types --endpoint https://my-orchestrator.example.com
 ```
 
 **How it works:**
