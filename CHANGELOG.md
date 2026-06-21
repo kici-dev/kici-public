@@ -10,17 +10,12 @@ Release notes for the public KiCI packages.
 
 ## v0.1.19 — 2026-06-19
 
-### Features
-
-- Track paid-tier live-log tail-minute usage with a new consumption meter in the web UI.
-
 ### Fixes
 
 - Correctly partition workflow label matching across dispatch paths so `runsOn` selectors route jobs to the intended agents.
 - Page through archived event-log history newest-first.
 - Skip fleet bundle logging gracefully when no log directory is configured, instead of erroring.
 - Reject empty provenance subject digests rather than writing an invalid storage key.
-- Keep attestation badges from briefly flashing "unverifiable" while verification keys are still loading in the web UI.
 - Write Firecracker boot-script network configuration with proper newlines so the VM network comes up reliably.
 - Guard job-cancellation messages against closed connections to avoid spurious errors.
 
@@ -54,7 +49,6 @@ Release notes for the public KiCI packages.
 - npm-source upgrades verify the running unit's launch version before proceeding
 - The instance deploy folder is recovered from the init system when needed
 - Invalid input now returns HTTP 400 instead of a server error
-- Web UI: folded stateful-agent groups no longer show a redundant host label
 
 ### Documentation
 
@@ -65,7 +59,6 @@ Release notes for the public KiCI packages.
 - Yarn Berry support
 - Quickstart: bare-metal setup ships a prefilled compose file with a stub local database password, and orchestrator upgrade paths are clarified
 - Operator: npm-source upgrade launch-version verification and embedded deploy-folder marker recovery
-- Documented the paid-tier live-log tail-minute fair-use cap
 - Reorganized the dashboard guide into its own subgroup
 
 ### Other
@@ -87,14 +80,11 @@ Release notes for the public KiCI packages.
 - Yarn Classic is now supported for `.kici` dependency installation (standalone and hoisted layouts), with the agent image bundling yarn 1.22.22
 - Workflow install holds: runs pause on an install gate, resume on approval, and auto-release on wait-timer expiry, with a new held run status
 - New `ctx.kici.oidc.token()` for job-bound OIDC tokens with automatic masking
-- Provenance attestations: `ctx.attestProvenance`, a new `kici verify-attestation` command with trust-root resolution, and an attestations panel with client-side verification in the run detail view
-- Run detail view gains a Graph tab surfacing job dependency edges
+- Provenance attestations: `ctx.attestProvenance` and a new `kici verify-attestation` command with trust-root resolution and client-side verification
 - Agents now report their version, enabling a restart-only upgrade mode for npm-based sources
 
 ### Fixes
 
-- Dashboard environment-list and other org-scoped reads are correctly scoped to the requesting org
-- Schema-invalid dashboard requests now return a structured error, and every forwarded request is guaranteed a response
 - Dynamic matrices materialize correctly on generated jobs
 - Local (`file://`) source provider migration and update handling corrected
 - Restore executable bit on corepack shims for the Node 24.16.0 base image
@@ -161,7 +151,6 @@ Release notes for the public KiCI packages.
 - **Corrupt lock-file handling:** unparseable lock files surface as a typed parse error and a `lockfile_corrupt` event-log status.
 - **Scaler visibility:** scaler status and diagnostics surface the static spawning host and agent host labels.
 - Customer-controlled opt-in settings for support access.
-- New registrations metric with accompanying dashboard panels.
 - `kici login` defaults its OAuth settings to production.
 
 ### Fixes
@@ -177,7 +166,6 @@ Release notes for the public KiCI packages.
 - Agent containers are labeled with the job and run they serve.
 - The agent runtime image installs curl, gzip, and xz so generic-init fetchers and tar pipelines work.
 - Rootless Firecracker cleanup chowns the jailer chroot before removal so disk is freed.
-- The web UI hides the payload tab for runs that never carry a payload.
 - Example workflows repaired, including a tested deploy example.
 
 ### Documentation
