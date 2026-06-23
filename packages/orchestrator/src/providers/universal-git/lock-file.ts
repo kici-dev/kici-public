@@ -41,6 +41,7 @@ import type { SecretResolver } from '../../secrets/secret-resolver.js';
 import type { UniversalGitConfig } from './config.js';
 import { UniversalGitRepoUrlBuilder } from './repo-url.js';
 import { prepareSshAuthSync } from './ssh-auth.js';
+import { parseLockDocument } from '../../lockfile-validate.js';
 
 const execFileP = promisify(execFile);
 const logger = createLogger({ prefix: 'universal-git:lock-file' });
@@ -229,13 +230,7 @@ export class UniversalGitLockFileFetcher implements LockFileFetcher {
       }
 
       const raw = await readFile(lockPath, 'utf-8');
-      const parsed = JSON.parse(raw) as LockFile;
-      if (typeof parsed.schemaVersion !== 'number') {
-        throw new Error(
-          `Universal-git lock file at ${repoIdentifier}: missing or invalid schemaVersion`,
-        );
-      }
-      return parsed;
+      return parseLockDocument(raw, repoIdentifier, resolvedRef ?? 'HEAD');
     } finally {
       try {
         await rm(tempDir, { recursive: true, force: true });

@@ -124,7 +124,7 @@ Peer authentication uses ECDH (X25519) key exchange to establish an encrypted ch
 4. **ECDH handshake** -- the peer and coordinator exchange ephemeral X25519 public keys via `peer.hello` / `peer.hello.response` messages
 5. **Encrypted auth** -- the peer sends the join token in an encrypted `peer.auth.request`. The coordinator validates the token and responds with an encrypted `peer.auth.response` containing a session credential
 6. **Credential persistence** -- the peer saves the issued credential to `KICI_CLUSTER_CREDENTIAL_FILE` (default: `~/.kici/peer-credential`)
-7. **Token consumed** -- the join token is marked as used and cannot be reused
+7. **Token bound to the peer** -- the join token is marked consumed and recorded against the joining peer's instance ID. Until the token expires, the **same** peer instance may present it again to re-acquire a credential (self-healing rejoin after a transient outage); a _different_ instance cannot reuse it
 
 ### Subsequent connections (with credential)
 
@@ -139,7 +139,7 @@ After the first join, the orchestrator uses its persisted credential file for al
 ### Security properties
 
 - **No cleartext auth material** -- all authentication happens over the ECDH-encrypted channel
-- **One-time tokens** -- join tokens are consumed after use
+- **Instance-bound tokens** -- a join token is consumed on first use and bound to the joining peer's instance ID; only that same instance may re-present it (until expiry) to self-heal, so a returning peer recovers without a full cluster redeploy while a leaked token cannot be replayed by a different instance
 - **HMAC credential proof** -- credentials are never sent over the wire; only an HMAC proof is transmitted
 - **Rate limiting** -- failed authentication attempts are rate-limited (5 attempts per IP within 60 seconds)
 - **Post-auth encryption** -- all subsequent messages (heartbeats, reroutes, Raft) use the ECDH-derived session key
@@ -359,11 +359,14 @@ Set the token as an environment variable before starting the orchestrator:
 KICI_CLUSTER_JOIN_TOKEN=kici_join_v1.xxx.yyy
 ```
 
-The orchestrator authenticates with the token on its first connection. After successful authentication, a persistent credential is issued and saved to the credential file. The join token is consumed (one-time use) and no longer needed.
+The orchestrator authenticates with the token on its first connection. After successful authentication, a persistent credential is issued and saved to the credential file. The token is consumed and bound to this peer's instance ID; in normal operation the persisted credential is used from then on, so the token is no longer needed.
+
+If a peer later loses its credential (a transient outage during a token rotation, or a deleted credential file), it falls back to the join token already in its environment. Because the token is reusable by the **same** instance until it expires, the coordinator accepts the reuse and issues a fresh credential — the peer self-heals and rejoins without operator action or a cluster redeploy. A token that has fully expired still requires a new one via `kici-admin peer create-token`.
 
 ### Token security
 
-- Tokens are **one-time use** -- consumed after successful join
+- Tokens are **instance-bound** -- consumed on first use and recorded against the joining peer's instance ID. The same instance may re-present an unexpired token to self-heal; a different instance is rejected as already used
+- Reuse is bounded by both the token's expiry and the consuming instance ID, so a leaked consumed token cannot be replayed as a different peer
 - Token hashes (not plaintext) are stored in the database
 - Auth material is transmitted over an ECDH-encrypted channel (never in cleartext)
 - Tokens carry a role (`coordinator` or `worker`) enforced at join time

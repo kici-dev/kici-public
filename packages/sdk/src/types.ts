@@ -52,7 +52,18 @@ export interface Step<TResult = void> {
   readonly name: string;
   /** Optional Zod schema for runtime output validation. */
   readonly outputs?: OutputSchema;
-  readonly run: (ctx: StepContext) => Promise<TResult>;
+  readonly run: (ctx: StepContext, drift?: any) => Promise<TResult>;
+  /**
+   * Read-only inspection for an idempotent step. Returns a drift value when run()
+   * would change state, or null when the system is already in the desired state.
+   */
+  readonly check?: (ctx: StepContext) => Promise<unknown | null>;
+  /** Required when check is set: human-readable, serializable summary of the drift. */
+  readonly summarize?: (drift: any) => string;
+  /** Optional Zod schema validating the drift value. */
+  readonly drift?: z.ZodTypeAny;
+  /** Optional: produces the step's outputs when check() returns null (already in sync). */
+  readonly whenInSync?: (ctx: StepContext) => Promise<TResult>;
   /** When true, job proceeds even if this step fails (recorded as failed but not fatal). */
   readonly continueOnError?: boolean;
   /** Step-level timeout in milliseconds. Overrides the agent's default (30 minutes). */
@@ -92,11 +103,13 @@ export type StepInput = Step<any> | BareStepFn<any>;
 /** Options for step() factory - simple form (just async function) */
 export type StepRunFn = (ctx: StepContext) => Promise<void>;
 
-/** Options for step() factory - full form with outputs and generic return type */
-export interface StepOptions<TResult = void> {
+/**
+ * Facets shared by both the plain and the check variant of {@link StepOptions}.
+ * These compose unchanged whether or not a step declares a `check` facet.
+ */
+export interface StepOptionsBase {
   /** Optional Zod schema for runtime output validation. */
   outputs?: OutputSchema;
-  run: (ctx: StepContext) => Promise<TResult>;
   /** When true, job proceeds even if this step fails (recorded as failed but not fatal). */
   continueOnError?: boolean;
   /** Step-level timeout in milliseconds. Overrides the agent's default (30 minutes). */
@@ -112,6 +125,47 @@ export interface StepOptions<TResult = void> {
   /** Pause for a manual human approval before this step runs. */
   requireApproval?: RequireApproval;
 }
+
+/**
+ * Plain step options: `run` takes only the context — the existing, fully
+ * backward-compatible shape. No `check` facet.
+ */
+export interface StepOptionsPlain<TResult = void> extends StepOptionsBase {
+  run: (ctx: StepContext) => Promise<TResult>;
+  check?: undefined;
+  summarize?: undefined;
+  drift?: undefined;
+  whenInSync?: undefined;
+}
+
+/**
+ * Idempotent-step options: `check` declares read-only inspection, `run` becomes
+ * the *apply* function and receives the drift value `check` returned. `summarize`
+ * is required. `whenInSync` optionally produces the outputs when already in sync.
+ *
+ * `TDrift` is independent of `TResult` — one output shape per step (whichever of
+ * `run` / `whenInSync` executes), and a separate drift shape that `check` returns.
+ */
+export interface StepOptionsWithCheck<TResult = void, TDrift = unknown> extends StepOptionsBase {
+  /** Read-only inspection. Returns drift when run() would change state, or null when in sync. */
+  check: (ctx: StepContext) => Promise<TDrift | null>;
+  /** Required when check is set: human-readable, serializable summary of the drift. */
+  summarize: (drift: TDrift) => string;
+  /** Optional Zod schema validating the drift value. */
+  drift?: z.ZodTypeAny;
+  /** Apply: runs only when check returned drift (apply mode); receives that drift. */
+  run: (ctx: StepContext, drift: TDrift) => Promise<TResult>;
+  /** Optional: produces the step's outputs when check returned null (already in sync). */
+  whenInSync?: (ctx: StepContext) => Promise<TResult>;
+}
+
+/**
+ * Options for step() factory - full form with outputs and generic return type.
+ * Either the plain shape (`run(ctx)`) or the idempotent shape (`check` + `run(ctx, drift)`).
+ */
+export type StepOptions<TResult = void, TDrift = unknown> =
+  | StepOptionsPlain<TResult>
+  | StepOptionsWithCheck<TResult, TDrift>;
 
 /** Trigger type (config objects returned by pr()/push() factory functions) */
 export type Trigger = TriggerConfig;

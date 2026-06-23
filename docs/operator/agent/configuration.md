@@ -28,6 +28,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_MAX_LOG_SIZE_BYTES`              | no       | 10485760   | number                                  |         |             |
 | `KICI_ORCHESTRATOR_URL`                | yes      |            | string                                  |         |             |
 | `KICI_PORT`                            | no       | 8080       | number                                  |         |             |
+| `KICI_PROPERTIES`                      | no       |            | string                                  |         |             |
 | `KICI_ROLES`                           | no       |            | string                                  |         |             |
 | `KICI_SANDBOX`                         | no       | "false"    | string                                  |         |             |
 | `KICI_SANDBOX_NETWORK`                 | no       | "isolated" | enum:isolated\|host                     |         |             |

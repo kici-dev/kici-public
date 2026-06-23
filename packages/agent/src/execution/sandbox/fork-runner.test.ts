@@ -88,7 +88,7 @@ function createMockExecOptions(overrides: Partial<JobExecutionOptions> = {}): Jo
 
 // --- State machine tests ---
 
-describe('fork-runner cancel state machine', { timeout: 15_000 }, () => {
+describe('fork-runner cancel state machine', () => {
   let mockChild: ReturnType<typeof createMockChild>;
   let mockFork: ReturnType<typeof vi.fn>;
 

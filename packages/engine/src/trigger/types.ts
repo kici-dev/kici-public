@@ -23,7 +23,7 @@ import type { ApproverClause } from '../approval/types.js';
 import { LabelMatcher } from '../labels-match.js';
 
 /** Schema version - increment on breaking changes */
-export const SCHEMA_VERSION = 20 as const;
+export const SCHEMA_VERSION = 21 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler

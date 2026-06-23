@@ -260,6 +260,58 @@ describe('step()', () => {
     });
   });
 
+  describe('idempotent check facet', () => {
+    it('stores the check facet on the Step', () => {
+      const s = step('cfg', {
+        drift: z.object({ want: z.string() }),
+        check: async () => ({ want: 'x' }),
+        summarize: (d) => `would write ${d.want}`,
+        run: async (_ctx, drift) => {
+          void drift;
+          return { done: true };
+        },
+        whenInSync: async () => ({ done: false }),
+      });
+      expect(s.check).toBeDefined();
+      expect(s.summarize?.({ want: 'x' })).toBe('would write x');
+      expect(s.whenInSync).toBeDefined();
+      expect(s.drift).toBeDefined();
+    });
+
+    it('keeps the plain step() signature unchanged when check is absent', () => {
+      const s = step('plain', async () => {});
+      expect(s.check).toBeUndefined();
+      expect(s.summarize).toBeUndefined();
+      expect(s.whenInSync).toBeUndefined();
+      expect(s.drift).toBeUndefined();
+    });
+
+    it('selects the two-arg run only when check is declared', () => {
+      // Type-level: a checked step's run receives the drift as its second arg.
+      const checked = step('checked', {
+        check: async () => ({ n: 1 }),
+        summarize: (d) => `n=${d.n}`,
+        run: async (_ctx, drift) => ({ doubled: drift.n * 2 }),
+      });
+      expect(checked.check).toBeDefined();
+
+      // Type-level: a plain step's run must reject a second argument.
+      step('plain-run', {
+        // @ts-expect-error plain run is single-arg; a drift parameter is not allowed
+        run: async (_ctx, _drift) => {},
+      });
+    });
+
+    it('throws when check is set without summarize', () => {
+      expect(() =>
+        step('bad', {
+          check: async () => ({ want: 'x' }),
+          run: async () => ({ done: true }),
+        } as never),
+      ).toThrow('summarize is required when check is set');
+    });
+  });
+
   describe('Step<TResult> inference', () => {
     it('infers void return type for simple function form', () => {
       const s = step('test', async () => {});

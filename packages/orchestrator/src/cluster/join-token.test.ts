@@ -126,7 +126,9 @@ describe('JoinTokenManager', () => {
       expires_at: new Date(Date.now() - 1000), // expired
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'me')).rejects.toThrow('expired');
+    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-stg')).rejects.toThrow(
+      'expired',
+    );
   });
 
   it('validateAndConsumeToken() rejects already-consumed token', async () => {
@@ -150,7 +152,9 @@ describe('JoinTokenManager', () => {
       expires_at: new Date(Date.now() + 3600_000),
     });
 
-    await expect(manager.validateAndConsumeToken(token, 'me')).rejects.toThrow('already been used');
+    await expect(manager.validateAndConsumeToken(token, 'me', 'win-stg')).rejects.toThrow(
+      'already been used',
+    );
   });
 
   it('validateAndConsumeToken() rejects unknown token (no DB row)', async () => {
@@ -168,7 +172,7 @@ describe('JoinTokenManager', () => {
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
     mocks.selectExecuteTakeFirst.mockResolvedValue(undefined);
 
-    await expect(manager.validateAndConsumeToken(token, 'me')).rejects.toThrow(
+    await expect(manager.validateAndConsumeToken(token, 'me', 'arm-stg')).rejects.toThrow(
       'Invalid join token',
     );
   });
@@ -186,16 +190,18 @@ describe('JoinTokenManager', () => {
     // Atomic claim wins: UPDATE returns numUpdatedRows: 1n.
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 1n });
 
-    const result = await manager.validateAndConsumeToken(token, 'new-orch-instance');
+    const result = await manager.validateAndConsumeToken(token, 'new-orch-instance', 'arm-stg');
     expect(result.routing.orgId).toBe('org-1');
     expect(result.routing.routingKey).toBe('github:42');
     expect(result.keys.encryptionKey).toBeInstanceOf(Buffer);
 
-    // Verify the UPDATE call carried consumed_by and consumed_at.
+    // Verify the UPDATE call carried consumed_by, consumed_at and the joining
+    // peer's instanceId.
     expect(mocks.updateTable).toHaveBeenCalledWith('join_tokens');
     const setCalls = mocks.updateSet.mock.calls;
     expect(setCalls.length).toBe(1);
     expect(setCalls[0][0]).toHaveProperty('consumed_by', 'new-orch-instance');
+    expect(setCalls[0][0]).toHaveProperty('consumed_by_instance', 'arm-stg');
     expect(setCalls[0][0]).toHaveProperty('consumed_at');
     expect(setCalls[0][0].consumed_at).toBeInstanceOf(Date);
 
@@ -232,8 +238,8 @@ describe('JoinTokenManager', () => {
     });
 
     const settled = await Promise.allSettled([
-      manager.validateAndConsumeToken(token, 'coord-A'),
-      manager.validateAndConsumeToken(token, 'coord-B'),
+      manager.validateAndConsumeToken(token, 'coord-A', 'win-stg'),
+      manager.validateAndConsumeToken(token, 'coord-B', 'macos-stg'),
     ]);
     const winners = settled.filter((s) => s.status === 'fulfilled');
     const losers = settled.filter((s) => s.status === 'rejected');
@@ -286,7 +292,86 @@ describe('JoinTokenManager', () => {
 
     mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 1n });
 
-    const result = await manager.validateAndConsumeToken(token, 'me');
+    const result = await manager.validateAndConsumeToken(token, 'me', 'arm-stg');
     expect(result.routing.role).toBe('worker');
+  });
+
+  it('allows the same instanceId to reuse an unexpired consumed token (self-heal)', async () => {
+    const { db, mocks } = createMockDb();
+    const manager = new JoinTokenManager({ db: db as any });
+
+    const token = await manager.createToken({
+      orgId: 'org-1',
+      routingKey: 'github:42',
+      createdBy: 'admin',
+      role: 'worker',
+    });
+
+    // Atomic claim returns 0 rows (already consumed); disambiguation SELECT
+    // returns a row consumed by the SAME instance, still unexpired.
+    mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
+    const parsed = parseToken(token);
+    const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));
+    mocks.selectExecuteTakeFirst.mockResolvedValue({
+      token_hash: keys.validationHash,
+      consumed_at: new Date(),
+      consumed_by_instance: 'arm-stg',
+      expires_at: new Date(Date.now() + 3600_000),
+    });
+
+    const result = await manager.validateAndConsumeToken(token, 'coord-A', 'arm-stg');
+    expect(result.routing.role).toBe('worker');
+    expect(result.routing.routingKey).toBe('github:42');
+    expect(result.keys.encryptionKey).toBeInstanceOf(Buffer);
+  });
+
+  it('rejects reuse by a different instanceId', async () => {
+    const { db, mocks } = createMockDb();
+    const manager = new JoinTokenManager({ db: db as any });
+
+    const token = await manager.createToken({
+      orgId: 'org-1',
+      routingKey: 'github:42',
+      createdBy: 'admin',
+    });
+
+    mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
+    const parsed = parseToken(token);
+    const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));
+    mocks.selectExecuteTakeFirst.mockResolvedValue({
+      token_hash: keys.validationHash,
+      consumed_at: new Date(),
+      consumed_by_instance: 'arm-stg',
+      expires_at: new Date(Date.now() + 3600_000),
+    });
+
+    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'win-stg')).rejects.toThrow(
+      'already been used',
+    );
+  });
+
+  it('rejects reuse of an expired consumed token even by the same instanceId', async () => {
+    const { db, mocks } = createMockDb();
+    const manager = new JoinTokenManager({ db: db as any });
+
+    const token = await manager.createToken({
+      orgId: 'org-1',
+      routingKey: 'github:42',
+      createdBy: 'admin',
+    });
+
+    mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
+    const parsed = parseToken(token);
+    const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));
+    mocks.selectExecuteTakeFirst.mockResolvedValue({
+      token_hash: keys.validationHash,
+      consumed_at: new Date(Date.now() - 7200_000),
+      consumed_by_instance: 'arm-stg',
+      expires_at: new Date(Date.now() - 1000), // expired
+    });
+
+    await expect(manager.validateAndConsumeToken(token, 'coord-A', 'arm-stg')).rejects.toThrow(
+      'expired',
+    );
   });
 });

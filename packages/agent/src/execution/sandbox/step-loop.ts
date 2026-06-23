@@ -15,7 +15,8 @@ import type {
   CacheSpec,
 } from '@kici-dev/sdk';
 import { normalizeCacheSpecs, normalizeRequireApproval } from '@kici-dev/sdk';
-import { ExecutionStepStatus } from '@kici-dev/engine';
+import { ExecutionStepStatus, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
+import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
 import type { SandboxStepResult } from './types.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
@@ -35,6 +36,11 @@ export interface JobHooks {
 /** Options for the step execution loop. */
 export interface StepLoopOptions {
   steps: Step[];
+  /**
+   * Run mode for idempotent steps. `apply` (default) converges; `check` /
+   * `check-fail-on-drift` preview drift and never invoke a checked step's apply.
+   */
+  checkMode?: CheckMode;
   /** Factory that creates a StepContext for a given step index and name. */
   createStepContext: (stepIndex: number, stepName: string) => StepContext;
   sendIpc: (msg: RunnerToAgentMessage) => void;
@@ -126,6 +132,76 @@ interface StepLoopResult {
   failureReason?: string;
 }
 
+/** Structured result of running a step under a given check mode. */
+interface CheckPhaseResult {
+  /** Idempotent outcome, set only when the run carried a non-default check mode
+   *  or the step has a check facet. Undefined for the plain apply-mode path. */
+  checkOutcome?: CheckStepOutcome;
+  /** Step status mapped from the outcome (or the plain success path). */
+  status: 'success' | 'skipped';
+  /** Step outputs (from run / whenInSync). Undefined when nothing executed. */
+  outputs: unknown;
+  /** Drift summary (`summarize(drift)`), present when drift was detected. */
+  driftSummary?: string;
+  /** Structured drift value, present when drift was detected. */
+  drift?: unknown;
+}
+
+/**
+ * Run one step honoring the run-level {@link CheckMode}, reusing the
+ * `runIdempotentStep` primitive for checked steps (never hand-rolled branching).
+ *
+ * - Plain step (no `check`): in apply mode, runs as today; in any check mode it
+ *   is skipped with `no_check` (a side-effecting step can't be safely previewed).
+ * - Checked step: adapted into an `IdempotentStep` and driven by the primitive
+ *   with `dryRun` set in check mode (so `apply`/`run` never fires) and `yes: true`
+ *   (v0 has no mid-run confirm). On drift the summary is emitted as a log line.
+ */
+async function runStepWithCheckMode(
+  step: Step,
+  stepIndex: number,
+  ctx: StepContext,
+  checkMode: CheckMode,
+  sendFn: (msg: RunnerToAgentMessage) => void,
+): Promise<CheckPhaseResult> {
+  if (!step.check) {
+    if (checkMode !== CheckMode.enum.apply) {
+      return {
+        checkOutcome: CheckStepOutcome.enum.no_check,
+        status: 'skipped',
+        outputs: undefined,
+      };
+    }
+    // Unchanged plain-step apply path: run with only the context, no outcome tag.
+    return { status: 'success', outputs: await step.run(ctx) };
+  }
+
+  const adapted: IdempotentStep<unknown, unknown, unknown> = {
+    name: step.name,
+    check: () => step.check!(ctx),
+    summarize: step.summarize!,
+    apply: (drift) => step.run(ctx, drift),
+    whenInSync: step.whenInSync ? () => step.whenInSync!(ctx) : undefined,
+  };
+  const res = await runIdempotentStep(adapted, {
+    dryRun: checkMode !== CheckMode.enum.apply,
+    yes: true,
+    log: (line) => sendFn({ type: 'log.line', stepIndex, line }),
+  });
+
+  const driftSummary = res.drift != null ? step.summarize!(res.drift) : undefined;
+  const status = res.outcome === CheckStepOutcome.enum.applied ? 'success' : 'skipped';
+  // dry-run is a successful preview (status success), distinct from in-sync skip.
+  const mappedStatus = res.outcome === CheckStepOutcome.enum['dry-run'] ? 'success' : status;
+  return {
+    checkOutcome: res.outcome as CheckStepOutcome,
+    status: mappedStatus,
+    outputs: res.result,
+    ...(driftSummary !== undefined && { driftSummary }),
+    ...(res.drift != null && { drift: res.drift }),
+  };
+}
+
 /**
  * Execute a single step with timeout enforcement.
  *
@@ -141,6 +217,7 @@ async function executeStepInLoop(
   getSecretsAccessLog?: () => string[],
   getSecretMountRecords?: () => StepSecretMountRecord[],
   jobDeadlineSignal?: AbortSignal,
+  checkMode: CheckMode = CheckMode.enum.apply,
 ): Promise<SandboxStepResult> {
   sendFn({ type: 'step.start', stepIndex, stepName: step.name });
 
@@ -149,8 +226,8 @@ async function executeStepInLoop(
   const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
 
   try {
-    const result = await Promise.race([
-      step.run(ctx),
+    const phase = await Promise.race([
+      runStepWithCheckMode(step, stepIndex, ctx, checkMode, sendFn),
       new Promise<never>((_, reject) => {
         abortController.signal.addEventListener('abort', () => {
           reject(new Error(`Step '${step.name}' timed out after ${timeoutMs}ms`));
@@ -174,7 +251,8 @@ async function executeStepInLoop(
     clearTimeout(timeoutId);
     const durationMs = Date.now() - startTime;
 
-    const outputsPayload = result != null ? (result as Record<string, unknown>) : undefined;
+    const outputsPayload =
+      phase.outputs != null ? (phase.outputs as Record<string, unknown>) : undefined;
     if (outputsPayload) {
       outputsMap.set(step.name, outputsPayload);
     }
@@ -182,19 +260,27 @@ async function executeStepInLoop(
     const secretsAccessed = getSecretsAccessLog?.();
     emitSecretMountEvents(getSecretMountRecords?.(), stepIndex, sendFn);
 
+    const stepStatus =
+      phase.status === 'skipped'
+        ? ExecutionStepStatus.enum.skipped
+        : ExecutionStepStatus.enum.success;
+
     sendFn({
       type: 'step.complete',
       stepIndex,
-      status: ExecutionStepStatus.enum.success,
+      status: stepStatus,
       durationMs,
       ...(outputsPayload && { outputs: outputsPayload }),
       ...(secretsAccessed !== undefined && { secretsAccessed }),
+      ...(phase.checkOutcome !== undefined && { checkOutcome: phase.checkOutcome }),
+      ...(phase.driftSummary !== undefined && { driftSummary: phase.driftSummary }),
+      ...(phase.drift !== undefined && { drift: phase.drift }),
     });
 
     return {
       name: step.name,
       stepIndex,
-      status: ExecutionStepStatus.enum.success,
+      status: stepStatus,
       durationMs,
       ...(outputsPayload && { outputs: outputsPayload }),
     };
@@ -501,6 +587,7 @@ async function runStepIteration(
         opts.getSecretsAccessLog,
         opts.getSecretMountRecords,
         opts.jobDeadlineSignal,
+        opts.checkMode ?? CheckMode.enum.apply,
       );
     } finally {
       await opts.afterStepApplyEnvFiles?.();

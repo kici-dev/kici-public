@@ -9,6 +9,7 @@ import {
   setJobOutputsMap as setJobOutputsMapLocal,
 } from '@kici-dev/sdk';
 import type { OutputsMap, StepRefMap } from '@kici-dev/sdk';
+import type { CheckStepOutcome } from '@kici-dev/engine';
 import { createStepContext } from './step-context.js';
 import { createRuleContext, evaluateRules } from './rule-evaluator.js';
 import { formatter } from './output-formatter.js';
@@ -59,10 +60,14 @@ async function resolveSdkSetters(kiciDir?: string): Promise<SdkOutputSetters> {
 
 export interface StepResult {
   name: string;
-  status: 'success' | 'failure';
+  status: 'success' | 'failure' | 'skipped';
   durationMs: number;
   error?: Error;
   outputs?: Record<string, unknown>;
+  /** Idempotent per-step outcome under a non-default check mode. */
+  checkOutcome?: CheckStepOutcome;
+  /** Human-readable drift summary, present when drift was detected. */
+  driftSummary?: string;
 }
 
 export interface JobResult {

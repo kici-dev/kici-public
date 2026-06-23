@@ -686,3 +686,215 @@ describe('executeStepLoop step-approval gate', () => {
     expect(result.status).toBe('success');
   });
 });
+
+describe('executeStepLoop check mode', () => {
+  /** Build a checked (idempotent) step with spy-able check / run / whenInSync. */
+  function makeCheckStep(opts: {
+    name: string;
+    drift: unknown | null;
+    runSpy?: ReturnType<typeof vi.fn>;
+    whenInSyncSpy?: ReturnType<typeof vi.fn>;
+    checkThrows?: boolean;
+    continueOnError?: boolean;
+  }): Step {
+    return {
+      _tag: 'Step',
+      name: opts.name,
+      check: async () => {
+        if (opts.checkThrows) throw new Error('check boom');
+        return opts.drift;
+      },
+      summarize: (d: any) => `would change: ${JSON.stringify(d)}`,
+      run: (opts.runSpy ?? vi.fn(async () => ({ applied: true }))) as any,
+      ...(opts.whenInSyncSpy && { whenInSync: opts.whenInSyncSpy }),
+      ...(opts.continueOnError !== undefined && { continueOnError: opts.continueOnError }),
+      result: {} as any,
+    } as Step;
+  }
+
+  function findStepComplete(
+    messages: RunnerToAgentMessage[],
+  ): Extract<RunnerToAgentMessage, { type: 'step.complete' }> {
+    const m = messages.find((x) => x.type === 'step.complete');
+    if (!m || m.type !== 'step.complete') throw new Error('no step.complete emitted');
+    return m;
+  }
+
+  it('apply mode + drift => applied; run called with drift', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeCheckStep({ name: 'cfg', drift: { want: 'x' }, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(runSpy.mock.calls[0][1]).toEqual({ want: 'x' });
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('success');
+    expect(sc.checkOutcome).toBe('applied');
+  });
+
+  it('apply mode + null => skipped; whenInSync called, run NOT called', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const whenInSyncSpy = vi.fn(async () => ({ applied: false }));
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeCheckStep({ name: 'cfg', drift: null, runSpy, whenInSyncSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(whenInSyncSpy).toHaveBeenCalledTimes(1);
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('skipped');
+    expect(sc.checkOutcome).toBe('skipped');
+  });
+
+  it('check mode + drift => dry-run; run NOT called', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeCheckStep({ name: 'cfg', drift: { want: 'x' }, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'check',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).not.toHaveBeenCalled();
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('success');
+    expect(sc.checkOutcome).toBe('dry-run');
+    expect(sc.driftSummary).toContain('would change');
+    expect(sc.drift).toEqual({ want: 'x' });
+  });
+
+  it('check mode + null => skipped; run NOT called', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeCheckStep({ name: 'cfg', drift: null, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'check',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).not.toHaveBeenCalled();
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('skipped');
+    expect(sc.checkOutcome).toBe('skipped');
+  });
+
+  it('check mode + plain step (no check fn) => no_check; run NOT called', async () => {
+    const runSpy = vi.fn(async () => {});
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeStep('plain', runSpy as any)],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'check',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).not.toHaveBeenCalled();
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('skipped');
+    expect(sc.checkOutcome).toBe('no_check');
+  });
+
+  it('apply mode + plain step (no check fn) => run called, no checkOutcome', async () => {
+    const runSpy = vi.fn(async () => {});
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeStep('plain', runSpy as any)],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('success');
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('success');
+    expect(sc.checkOutcome).toBeUndefined();
+  });
+
+  it('check() throwing => failed', async () => {
+    const { messages, sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [makeCheckStep({ name: 'cfg', drift: { want: 'x' }, checkThrows: true })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+    });
+    expect(result.status).toBe('failed');
+    const sc = findStepComplete(messages);
+    expect(sc.status).toBe('failed');
+  });
+
+  it('check() throwing with continueOnError => loop continues past the failed step', async () => {
+    const secondRun = vi.fn(async () => {});
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [
+        makeCheckStep({
+          name: 'cfg',
+          drift: { want: 'x' },
+          checkThrows: true,
+          continueOnError: true,
+        }),
+        makeStep('after', secondRun as any),
+      ],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+    });
+    // continueOnError lets the loop reach the next step; the failed step is still
+    // recorded (the job-runner layer applies the "don't fail the job" semantic).
+    expect(secondRun).toHaveBeenCalledTimes(1);
+    expect(result.stepResults[0].status).toBe('failed');
+    expect(result.stepResults[1].status).toBe('success');
+  });
+});

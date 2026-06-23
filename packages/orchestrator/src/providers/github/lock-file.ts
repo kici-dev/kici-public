@@ -10,6 +10,7 @@
 
 import { LockFileParseError, type LockFileFetcher, type LockFile } from '@kici-dev/engine';
 import { createInstallationOctokit, type GitHubAppConfig, type GitHubCredentials } from './auth.js';
+import { parseLockDocument } from '../../lockfile-validate.js';
 
 /**
  * GitHub-specific implementation of LockFileFetcher.
@@ -70,27 +71,7 @@ export class GitHubLockFileFetcher implements LockFileFetcher {
     }
 
     const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
-    let lockFile: LockFile;
-    try {
-      lockFile = JSON.parse(decoded) as LockFile;
-    } catch (err) {
-      throw new LockFileParseError(
-        repoIdentifier,
-        ref,
-        `Lock file at ${repoIdentifier} ref=${ref} is not valid JSON: ${(err as Error).message}`,
-      );
-    }
-
-    // Basic shape validation
-    if (typeof lockFile.schemaVersion !== 'number') {
-      throw new LockFileParseError(
-        repoIdentifier,
-        ref,
-        `Invalid lock file at ${repoIdentifier}: missing or invalid schemaVersion`,
-      );
-    }
-
-    return lockFile;
+    return parseLockDocument(decoded, repoIdentifier, ref);
   }
 }
 

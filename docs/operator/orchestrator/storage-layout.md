@@ -222,6 +222,16 @@ When `KICI_STORAGE_TYPE` is unset (no S3), step logs are written to a local dire
 
 Source: `packages/orchestrator/src/reporting/s3-log-storage.ts`, `packages/orchestrator/src/webhook/event-log.ts`, `packages/orchestrator/src/cold-store/orchestrator-cold-store.ts`.
 
+## Worker terminal-status outbox
+
+A worker-mode orchestrator (`KICI_CLUSTER_ROLE=worker`) holds no database, so it keeps a small durable on-disk outbox of **terminal job statuses** awaiting acknowledgement from its owning coordinator. When a rerouted job reaches a terminal state, the worker writes the status to this outbox before sending it over the peer connection, replays unacknowledged records to the coordinator on every (re)connect, and removes a record once the coordinator acknowledges it. See [coordinator/worker topology](../../architecture/clustering/coordinator-worker.md#reliable-terminal-status-relay) for the relay protocol.
+
+| Path                              | Description                                                                                                                                                                                    | Source                                            |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| `<data-dir>/worker-outbox/*.json` | One `fsync`'d JSON record per unacknowledged terminal job status, keyed by `(coordinator URL, runId, jobId)`. Pruned after a 24-hour retention window so the outbox cannot grow without bound. | `packages/orchestrator/src/worker/peer-outbox.ts` |
+
+`<data-dir>` is the worker's data root, resolved the same way as the filesystem step-log store: `KICI_DATA_DIR` if set, otherwise `/var/lib/kici` when writable (system-level install), otherwise `${XDG_STATE_HOME:-$HOME/.local/state}/kici` (user-level install), with a tmpdir fallback. A user-level worker therefore keeps its outbox under its own home directory rather than failing on the root-owned `/var/lib/kici`.
+
 ## Provenance attestations
 
 When a workflow step calls `ctx.attestProvenance`, the agent uploads the signed provenance bundle to the cache storage backend under `provenance/{runId}/{jobId}/{subjectDigest}.kici.json` (see the cache [Prefixes](#prefixes) table), and the orchestrator records one row in the `attestations` table so the dashboard can list and fetch attestations per run/job.

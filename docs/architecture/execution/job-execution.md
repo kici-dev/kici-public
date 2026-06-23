@@ -168,6 +168,8 @@ Steps execute sequentially within a job. Each step receives a full `StepContext`
 
 Each step runs inside a `Promise.race` against a timeout. The timeout is configured per-step (`step.timeout`) or falls back to the agent's default (`KICI_DEFAULT_STEP_TIMEOUT_MS`, default 30 minutes).
 
+A run carries a **check mode** (`apply` | `check` | `check-fail-on-drift`) that threads from the CLI through dispatch to the step loop. For a step that declares a `check` facet, the loop reuses the shared check / apply primitive: in apply mode it converges (drift ⇒ apply ⇒ `applied`; null ⇒ in-sync skip), and in check mode it previews drift without applying (`would change`). A plain step under check mode is skipped (`no_check`). Under `check-fail-on-drift`, any previewed drift makes the run terminal status `failed`. See [Idempotent steps and check mode](../../user/idempotent-steps.md).
+
 > See `packages/agent/src/execution/sandbox/workflow-runner.ts` for the implementation.
 
 **Step lifecycle:**

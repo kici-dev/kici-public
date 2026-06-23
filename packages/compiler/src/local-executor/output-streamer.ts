@@ -127,6 +127,8 @@ interface LocalJsonOutput {
         status: string;
         durationMs: number;
         error?: string;
+        checkOutcome?: string;
+        driftSummary?: string;
       }>;
       ruleResults?: Array<{
         label: string;
@@ -172,6 +174,8 @@ export function formatLocalJsonResult(results: WorkflowExecutionResult[]): strin
           status: step.status,
           durationMs: step.durationMs,
           ...(step.error && { error: step.error.message }),
+          ...(step.checkOutcome && { checkOutcome: step.checkOutcome }),
+          ...(step.driftSummary && { driftSummary: step.driftSummary }),
         })),
         ...(job.ruleResults &&
           job.ruleResults.length > 0 && {

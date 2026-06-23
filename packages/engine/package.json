@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",

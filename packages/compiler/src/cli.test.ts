@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { execSync } from 'node:child_process';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isMainEntryPoint } from './cli.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,6 +148,66 @@ describe('version banner', () => {
       // preAction hook has already decided whether to print.
       const result = runCli('run remote --quiet');
       expect(result.stdout).not.toContain('kici v');
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+});
+
+describe('isMainEntryPoint (symlink-tolerant entry-point guard)', () => {
+  it('returns true when argv[1] is the real module path', () => {
+    expect(isMainEntryPoint(CLI_PATH, pathToFileURL(CLI_PATH).href)).toBe(true);
+  });
+
+  it('returns true when argv[1] is a SYMLINK to the module (the .bin/kici case)', () => {
+    // node_modules/.bin/kici is a symlink to the compiler's dist/cli.js.
+    // Executing the symlink sets process.argv[1] to the symlink path; the guard
+    // must still recognise the module as the entry point.
+    const dir = mkdtempSync(path.join(tmpdir(), 'kici-cli-guard-'));
+    const link = path.join(dir, 'kici');
+    try {
+      symlinkSync(CLI_PATH, link);
+      expect(isMainEntryPoint(link, pathToFileURL(CLI_PATH).href)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns false when argv[1] points at a different file (imported, not entry)', () => {
+    expect(isMainEntryPoint(__filename, pathToFileURL(CLI_PATH).href)).toBe(false);
+  });
+
+  it('returns false when argv[1] is absent', () => {
+    expect(isMainEntryPoint(undefined, pathToFileURL(CLI_PATH).href)).toBe(false);
+  });
+
+  it('falls back to resolve() comparison when argv[1] does not exist on disk', () => {
+    // A non-existent argv[1] makes realpathSync throw; the fallback compares
+    // resolved paths. Identical non-existent paths still match.
+    const ghost = path.join(tmpdir(), 'does-not-exist-kici-cli.js');
+    expect(isMainEntryPoint(ghost, pathToFileURL(ghost).href)).toBe(true);
+    expect(isMainEntryPoint(ghost, pathToFileURL(CLI_PATH).href)).toBe(false);
+  });
+});
+
+describe('CLI invoked through a bin symlink', () => {
+  it(
+    'runs (prints version) when launched via a symlink to dist/cli.js',
+    () => {
+      // Reproduces the staging canary failure: `node <symlink-to-cli.js> ...`.
+      // Before the symlink-tolerant guard, the main-module check failed and the
+      // CLI silently exited 0 with no output (no command ran).
+      const dir = mkdtempSync(path.join(tmpdir(), 'kici-cli-binlink-'));
+      const link = path.join(dir, 'kici');
+      try {
+        symlinkSync(CLI_PATH, link);
+        const stdout = execSync(`node "${link}" --version`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        expect(stdout.trim().length).toBeGreaterThan(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
     SPAWN_TIMEOUT_MS,
   );

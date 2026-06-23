@@ -3,7 +3,9 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import {
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
+  ExecutionJobStatus,
   type JobReroute,
+  type JobProgressAck,
   type PeerHeartbeat,
 } from '@kici-dev/engine';
 import {
@@ -14,6 +16,7 @@ import {
 } from './peer-crypto.js';
 import { chunkBuffer } from '@kici-dev/shared';
 import { PeerClient, type PeerClientOptions } from './peer-client.js';
+import { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 import { PeerRegistry } from './peer-registry.js';
 
 // ── Hoisted mock state ──────────────────────────────────────────────
@@ -79,14 +82,14 @@ vi.mock('./peer-credentials.js', async (importOriginal) => {
   };
 });
 
-// ── Mock fs.unlinkSync (used by credential-file self-heal) ──────────
-const mockUnlinkSync = vi.fn();
+// ── Mock fs/promises.unlink (used by the coordinator's credential delete) ──
+const mockUnlink = vi.fn().mockResolvedValue(undefined);
 
-vi.mock('node:fs', async (importOriginal) => {
-  const mod = await importOriginal<typeof import('node:fs')>();
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('node:fs/promises')>();
   return {
     ...mod,
-    unlinkSync: (...args: Parameters<typeof mod.unlinkSync>) => mockUnlinkSync(...args),
+    unlink: (...args: Parameters<typeof mod.unlink>) => mockUnlink(...args),
   };
 });
 
@@ -134,15 +137,28 @@ function makeLocalInventory(): Omit<PeerHeartbeat, 'type'> {
   };
 }
 
+function makeCoordinator(
+  credentialFile: string,
+  instanceId: string,
+  joinToken?: string,
+): PeerAuthCoordinator {
+  return new PeerAuthCoordinator({ credentialFile, instanceId, joinToken });
+}
+
 function createPeerClient(overrides: Partial<PeerClientOptions> = {}): {
   client: PeerClient;
   registry: PeerRegistry;
 } {
   const registry = new PeerRegistry();
+  const credentialFile = overrides.credentialFile ?? '/tmp/test-credential';
+  const instanceId = overrides.instanceId ?? 'local-orch';
+  const joinToken = 'joinToken' in overrides ? overrides.joinToken : 'kici_join_v1.test.token';
   const client = new PeerClient({
     url: 'ws://192.168.1.10:8080/peer',
     joinToken: 'kici_join_v1.test.token',
     credentialFile: '/tmp/test-credential',
+    authCoordinator:
+      overrides.authCoordinator ?? makeCoordinator(credentialFile, instanceId, joinToken),
     instanceId: 'local-orch',
     peerRegistry: registry,
     getLocalInventory: makeLocalInventory,
@@ -228,7 +244,8 @@ beforeEach(() => {
   mockConstructorArgs.length = 0;
   mockReadCredentialFile.mockResolvedValue(null);
   mockWriteCredentialFile.mockResolvedValue(undefined);
-  mockUnlinkSync.mockReset();
+  mockUnlink.mockReset();
+  mockUnlink.mockResolvedValue(undefined);
   vi.useFakeTimers();
 });
 
@@ -567,31 +584,75 @@ describe('PeerClient', () => {
       { reason: 'Invalid proof' },
       { reason: 'Unknown credential' },
       { reason: 'Credential revoked' },
-    ])('deletes credential file when server rejects with reason="$reason"', async ({ reason }) => {
-      const { client } = createPeerClient({ credentialFile: '/tmp/test-cred-stale' });
+    ])(
+      'delegates to the coordinator and deletes a genuinely-stale credential file (reason="$reason")',
+      async ({ reason }) => {
+        // The on-disk credential matches the one this client proved with, so the
+        // coordinator deletes it (no sibling refreshed it) before reconnecting.
+        mockReadCredentialFile.mockResolvedValue({
+          instanceId: 'local-orch',
+          credential: 'still-current',
+          role: 'coordinator',
+          issuedAt: '2026-03-22T00:00:00Z',
+        });
+        const { client } = createPeerClient({ credentialFile: '/tmp/test-cred-stale' });
+        client.connect();
+        const mock = getLatestMock();
+        simulateOpen(mock);
+
+        const { sessionKey } = simulateServerHandshake(mock);
+        await vi.advanceTimersByTimeAsync(0);
+
+        mock.emit(
+          'message',
+          encryptMessage(
+            JSON.stringify({ type: 'peer.auth.response', accepted: false, reason }),
+            sessionKey,
+          ),
+        );
+
+        // Coordinator's reportRejection runs async, then the close fires.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mockUnlink).toHaveBeenCalledWith('/tmp/test-cred-stale');
+        expect(mock.closeCode).toBe(1000);
+      },
+    );
+
+    it('does NOT delete a credential file a sibling refreshed (non-destructive rejection)', async () => {
+      // The on-disk credential is FRESHER than the one this client proved with:
+      // a sibling rewrote it. The coordinator must keep it and retry-credential.
+      mockReadCredentialFile.mockResolvedValue({
+        instanceId: 'local-orch',
+        credential: 'fresh-from-sibling',
+        role: 'coordinator',
+        issuedAt: '2026-03-22T00:00:00Z',
+      });
+      const { client } = createPeerClient({ credentialFile: '/tmp/test-cred-fresh' });
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
 
       const { sessionKey } = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
+      // Sibling rewrote the file AFTER this client computed its proof.
+      mockReadCredentialFile.mockResolvedValue({
+        instanceId: 'local-orch',
+        credential: 'even-fresher',
+        role: 'coordinator',
+        issuedAt: '2026-03-23T00:00:00Z',
+      });
 
       mock.emit(
         'message',
         encryptMessage(
-          JSON.stringify({
-            type: 'peer.auth.response',
-            accepted: false,
-            reason,
-          }),
+          JSON.stringify({ type: 'peer.auth.response', accepted: false, reason: 'Invalid proof' }),
           sessionKey,
         ),
       );
 
-      // Self-heal: unlinkSync called against the credential path before
-      // the close fires the reconnect schedule.
-      expect(mockUnlinkSync).toHaveBeenCalledTimes(1);
-      expect(mockUnlinkSync).toHaveBeenCalledWith('/tmp/test-cred-stale');
+      await vi.advanceTimersByTimeAsync(0);
+      // File is NOT deleted — the sibling's refreshed credential is preserved.
+      expect(mockUnlink).not.toHaveBeenCalled();
       expect(mock.closeCode).toBe(1000);
     });
 
@@ -600,8 +661,14 @@ describe('PeerClient', () => {
       { reason: 'Missing auth method' },
       { reason: 'Unsupported protocol version: 0 < 1' },
     ])(
-      'does NOT delete credential file on config-error rejection (reason="$reason")',
+      'does NOT touch the credential file on config-error rejection (reason="$reason")',
       async ({ reason }) => {
+        mockReadCredentialFile.mockResolvedValue({
+          instanceId: 'local-orch',
+          credential: 'still-current',
+          role: 'coordinator',
+          issuedAt: '2026-03-22T00:00:00Z',
+        });
         const { client } = createPeerClient({ credentialFile: '/tmp/test-cred-cfg' });
         client.connect();
         const mock = getLatestMock();
@@ -613,26 +680,29 @@ describe('PeerClient', () => {
         mock.emit(
           'message',
           encryptMessage(
-            JSON.stringify({
-              type: 'peer.auth.response',
-              accepted: false,
-              reason,
-            }),
+            JSON.stringify({ type: 'peer.auth.response', accepted: false, reason }),
             sessionKey,
           ),
         );
 
-        // Config errors don't trigger deletion — operator must intervene.
-        expect(mockUnlinkSync).not.toHaveBeenCalled();
+        // Config errors skip the coordinator entirely — operator must intervene.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(mockUnlink).not.toHaveBeenCalled();
         expect(mock.closeCode).toBe(1000);
       },
     );
 
-    it('tolerates ENOENT when credential file is already gone', async () => {
-      mockUnlinkSync.mockImplementationOnce(() => {
+    it('tolerates ENOENT when the credential file is already gone', async () => {
+      mockReadCredentialFile.mockResolvedValue({
+        instanceId: 'local-orch',
+        credential: 'still-current',
+        role: 'coordinator',
+        issuedAt: '2026-03-22T00:00:00Z',
+      });
+      mockUnlink.mockImplementationOnce(() => {
         const err = new Error('ENOENT') as NodeJS.ErrnoException;
         err.code = 'ENOENT';
-        throw err;
+        return Promise.reject(err);
       });
       const { client } = createPeerClient({ credentialFile: '/tmp/test-cred-missing' });
       client.connect();
@@ -642,21 +712,16 @@ describe('PeerClient', () => {
       const { sessionKey } = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Should not throw despite the ENOENT
-      expect(() => {
-        mock.emit(
-          'message',
-          encryptMessage(
-            JSON.stringify({
-              type: 'peer.auth.response',
-              accepted: false,
-              reason: 'Invalid proof',
-            }),
-            sessionKey,
-          ),
-        );
-      }).not.toThrow();
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({ type: 'peer.auth.response', accepted: false, reason: 'Invalid proof' }),
+          sessionKey,
+        ),
+      );
 
+      // The coordinator swallows ENOENT and the connection still closes cleanly.
+      await vi.advanceTimersByTimeAsync(0);
       expect(mock.closeCode).toBe(1000);
     });
   });
@@ -835,6 +900,53 @@ describe('PeerClient', () => {
 
       expect(onAgentTokenRevoke).toHaveBeenCalledTimes(1);
       expect(onAgentTokenRevoke).toHaveBeenCalledWith(revoke);
+    });
+
+    it('dispatches job.progress.ack to onJobProgressAck', () => {
+      const onJobProgressAck = vi.fn();
+      const { client } = createPeerClient({ onJobProgressAck });
+      const ack: JobProgressAck = {
+        type: 'job.progress.ack',
+        runId: 'r1',
+        jobId: 'j1',
+        state: ExecutionJobStatus.enum.success,
+      };
+      // routeMessage is private; exercise it via a typed test seam.
+      (client as unknown as { routeMessage(m: unknown): void }).routeMessage(ack);
+      expect(onJobProgressAck).toHaveBeenCalledWith(ack);
+    });
+  });
+
+  describe('onConnected callback', () => {
+    it('fires with this peer URL once the client reaches the connected state', async () => {
+      const onConnected = vi.fn();
+      const { client } = createPeerClient({ onConnected });
+      await authenticateClient(client);
+
+      expect(client.state).toBe('connected');
+      expect(onConnected).toHaveBeenCalledTimes(1);
+      expect(onConnected).toHaveBeenCalledWith('ws://192.168.1.10:8080/peer');
+    });
+
+    it('does not fire on rejected auth response', async () => {
+      const onConnected = vi.fn();
+      const { client } = createPeerClient({ onConnected });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+
+      const { sessionKey } = simulateServerHandshake(mock);
+      await vi.advanceTimersByTimeAsync(0);
+
+      mock.emit(
+        'message',
+        encryptMessage(
+          JSON.stringify({ type: 'peer.auth.response', accepted: false, reason: 'Invalid token' }),
+          sessionKey,
+        ),
+      );
+
+      expect(onConnected).not.toHaveBeenCalled();
     });
   });
 

@@ -92,6 +92,50 @@ describe('admin source routes', () => {
     });
   });
 
+  describe('GET /sources/github-webhook-url (manifest pre-flight)', () => {
+    it('returns the resolved webhook url', async () => {
+      const sourceStore = createMockSourceStore();
+      const app = createSourceRoutes({
+        sourceStore,
+        resolveGithubWebhookUrl: vi
+          .fn()
+          .mockResolvedValue({ webhookUrl: 'https://api.kici.dev/webhook/org_x/github' }),
+      });
+
+      const res = await app.request('/sources/github-webhook-url');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { webhookUrl: string | null };
+      expect(body.webhookUrl).toBe('https://api.kici.dev/webhook/org_x/github');
+    });
+
+    it('returns null + note when no public base is resolvable', async () => {
+      const sourceStore = createMockSourceStore();
+      const app = createSourceRoutes({
+        sourceStore,
+        resolveGithubWebhookUrl: vi
+          .fn()
+          .mockResolvedValue({ webhookUrl: null, webhookNote: 'platform-no-public-url' }),
+      });
+
+      const res = await app.request('/sources/github-webhook-url');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { webhookUrl: string | null; webhookNote?: string };
+      expect(body.webhookUrl).toBeNull();
+      expect(body.webhookNote).toBe('platform-no-public-url');
+    });
+
+    it('returns null + note when no resolver is wired', async () => {
+      const sourceStore = createMockSourceStore();
+      const app = createSourceRoutes({ sourceStore });
+
+      const res = await app.request('/sources/github-webhook-url');
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { webhookUrl: string | null; webhookNote?: string };
+      expect(body.webhookUrl).toBeNull();
+      expect(body.webhookNote).toBe('resolver-unavailable');
+    });
+  });
+
   describe('GET /sources', () => {
     it('includes customerId in the list response', async () => {
       const sourceStore = createMockSourceStore({

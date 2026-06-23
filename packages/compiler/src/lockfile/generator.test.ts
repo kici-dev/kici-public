@@ -408,14 +408,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 20', () => {
+  it('schemaVersion is 21', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(20);
-    expect(SCHEMA_VERSION).toBe(20);
+    expect(lockFile.schemaVersion).toBe(21);
+    expect(SCHEMA_VERSION).toBe(21);
   });
 });
 
@@ -1560,6 +1560,42 @@ describe('generator - hook flags', () => {
       if (lockJob._type === 'static') {
         expect(lockJob.steps[0]).not.toHaveProperty('hasRules');
         expect(lockJob.steps[0]).not.toHaveProperty('rules');
+      }
+    });
+  });
+
+  describe('step-level check facet flags', () => {
+    it('sets hasCheck and hasWhenInSync for a checked step', () => {
+      const s = step('cfg', {
+        drift: sdk.z.object({ want: sdk.z.string() }),
+        check: async () => ({ want: 'x' }),
+        summarize: (d) => `would write ${d.want}`,
+        run: async (_ctx, drift) => {
+          void drift;
+        },
+        whenInSync: async () => {},
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].hasCheck).toBe(true);
+        expect(lockJob.steps[0].hasWhenInSync).toBe(true);
+      }
+    });
+
+    it('omits check flags for a plain step', () => {
+      const s = step('simple', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0]).not.toHaveProperty('hasCheck');
+        expect(lockJob.steps[0]).not.toHaveProperty('hasWhenInSync');
       }
     });
   });

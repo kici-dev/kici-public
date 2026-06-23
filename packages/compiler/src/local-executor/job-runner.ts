@@ -10,7 +10,7 @@
 
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { Job, Step, Workflow, Rule, OutputsMap, StepRefMap } from '@kici-dev/sdk';
+import type { Job, Step, Workflow, Rule, OutputsMap, StepRefMap, StepContext } from '@kici-dev/sdk';
 import {
   expandMatrix,
   applyIncludeExclude,
@@ -19,8 +19,9 @@ import {
   setStepRefMap as setStepRefMapLocal,
   setJobOutputsMap as setJobOutputsMapLocal,
 } from '@kici-dev/sdk';
-import { formatMatrixSuffix } from '@kici-dev/engine';
+import { formatMatrixSuffix, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import type { SimulatedEvent, MatrixValues } from '@kici-dev/engine';
+import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
 import type { EventPayload } from '@kici-dev/sdk';
 import { ensureTsLoaderHook } from '../execution/ts-loader.js';
 import { toEventPayload } from './to-event-payload.js';
@@ -46,6 +47,8 @@ export interface JobExecutionContext {
   execDir: string;
   jobOutputsMap: OutputsMap;
   signal: AbortSignal;
+  /** Run mode for idempotent steps. Defaults to `apply` when unset. */
+  checkMode?: CheckMode;
 }
 
 /**
@@ -93,6 +96,63 @@ function resolveNeedName(need: NonNullable<Job['needs']>[number]): string {
   if ('name' in need) return (need as { name: string }).name;
   if ('group' in need) return `__group:${(need as { group: string }).group}`;
   return (need as Job).name;
+}
+
+/** Outcome of running one local step under a given {@link CheckMode}. */
+interface LocalCheckPhaseResult {
+  /** Idempotent outcome; undefined for the plain apply-mode path. */
+  checkOutcome?: CheckStepOutcome;
+  /** Mapped step status. */
+  status: 'success' | 'skipped';
+  /** Step outputs (run / whenInSync). */
+  outputs: unknown;
+  /** Drift summary, present when drift was detected. */
+  driftSummary?: string;
+}
+
+/**
+ * Run one local step honoring the run-level {@link CheckMode}, reusing the
+ * `runIdempotentStep` primitive for checked steps (never hand-rolled branching).
+ * Mirrors the agent step loop's check phase so `kici run local --check` and a
+ * remote check run produce identical per-step outcomes.
+ */
+async function runLocalStepWithCheckMode(
+  step: Step,
+  ctx: StepContext,
+  checkMode: CheckMode,
+): Promise<LocalCheckPhaseResult> {
+  if (!step.check) {
+    if (checkMode !== CheckMode.enum.apply) {
+      return {
+        checkOutcome: CheckStepOutcome.enum.no_check,
+        status: 'skipped',
+        outputs: undefined,
+      };
+    }
+    return { status: 'success', outputs: await step.run(ctx) };
+  }
+
+  const adapted: IdempotentStep<unknown, unknown, unknown> = {
+    name: step.name,
+    check: () => step.check!(ctx),
+    summarize: step.summarize!,
+    apply: (drift) => step.run(ctx, drift),
+    whenInSync: step.whenInSync ? () => step.whenInSync!(ctx) : undefined,
+  };
+  const res = await runIdempotentStep(adapted, {
+    dryRun: checkMode !== CheckMode.enum.apply,
+    yes: true,
+    log: (line) => ctx.log.info(line),
+  });
+  const driftSummary = res.drift != null ? step.summarize!(res.drift) : undefined;
+  const status = res.outcome === CheckStepOutcome.enum.applied ? 'success' : 'skipped';
+  const mappedStatus = res.outcome === CheckStepOutcome.enum['dry-run'] ? 'success' : status;
+  return {
+    checkOutcome: res.outcome as CheckStepOutcome,
+    status: mappedStatus,
+    outputs: res.result,
+    ...(driftSummary !== undefined && { driftSummary }),
+  };
 }
 
 /** A matrix outputs envelope as exposed to a downstream `needs:` consumer. */
@@ -163,6 +223,12 @@ export async function resolveJobs(
         kici: {
           infrastructure: {
             list: () => Promise.resolve({ scalers: [], agents: [] }),
+          },
+          inventory: {
+            // The host roster is orchestrator-cluster state; local execution
+            // has no cluster, so it reports an empty roster.
+            query: () => Promise.resolve([]),
+            get: () => Promise.resolve(null),
           },
           oidc: {
             // OIDC ID tokens require the orchestrator->Platform mint relay,
@@ -421,15 +487,19 @@ async function executeResolvedJobInner(
     const stepStart = Date.now();
 
     try {
-      const outputs = await normalizedStep.run(stepCtx);
+      const checkMode = context.checkMode ?? CheckMode.enum.apply;
+      const phase = await runLocalStepWithCheckMode(normalizedStep, stepCtx, checkMode);
+      const outputs = phase.outputs;
       const stepDuration = Date.now() - stepStart;
       formatter.logStepComplete(expandedName, normalizedStep.name, stepDuration);
 
       const stepResult: StepResult = {
         name: normalizedStep.name,
-        status: 'success',
+        status: phase.status,
         durationMs: stepDuration,
         outputs: outputs as Record<string, unknown> | undefined,
+        ...(phase.checkOutcome !== undefined && { checkOutcome: phase.checkOutcome }),
+        ...(phase.driftSummary !== undefined && { driftSummary: phase.driftSummary }),
       };
 
       // Store outputs in map for .result proxy resolution

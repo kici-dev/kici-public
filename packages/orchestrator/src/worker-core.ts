@@ -34,6 +34,7 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import {
   hostname as osHostname,
   release,
@@ -74,7 +75,7 @@ const WORKER_ENGINE_BUNDLE_HASH =
   typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown';
 import { AgentRegistry } from './agent/registry.js';
 import { Dispatcher } from './agent/dispatcher.js';
-import { PeerClient, PeerRegistry } from './cluster/index.js';
+import { PeerClient, PeerRegistry, PeerAuthCoordinator } from './cluster/index.js';
 import { TERMINAL_JOB_STATES, WS_CLOSE_DISPATCH_ACK_TIMEOUT } from '@kici-dev/engine';
 import { InMemoryExecutionTracker } from './worker/in-memory-execution-tracker.js';
 import { InMemoryJobQueue } from './worker/in-memory-job-queue.js';
@@ -98,6 +99,10 @@ import { FLEET_NODE_TIMEOUT_MS } from './diagnostics/fleet-constants.js';
 import { makeFleetCollectResponder, type FleetRuntime } from './diagnostics/fleet-wiring.js';
 import { createWorkerStatusHandler, createWorkerDrainHandler } from './worker/worker-status.js';
 import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
+import { resolveDataDir } from './data-dir.js';
+import { PeerOutbox } from './worker/peer-outbox.js';
+import { buildTerminalJobProgress, replayPending } from './worker/worker-outbox-relay.js';
+import { join } from 'node:path';
 import type { PeerJobCancel, JobReroute, JobProgress } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'worker' });
@@ -436,6 +441,23 @@ export async function bootstrapWorker(
     port: config.port,
   });
 
+  // Crash diagnostics. A worker must never exit silently — the
+  // graceful-shutdown error handlers (enabled below) log an uncaught JS
+  // exception / unhandled rejection through Winston before exiting, and Node's
+  // diagnostic report captures fatal errors that bypass JS handlers (e.g. a
+  // native fault) as a JSON file carrying the native + JS stack. Both land in
+  // the worker's data dir / log stream so a crash in, say, the microVM teardown
+  // path is diagnosable instead of a bare systemd restart.
+  try {
+    const reportDir = join(resolveDataDir(config.dataDir), 'crash-reports');
+    mkdirSync(reportDir, { recursive: true });
+    process.report.directory = reportDir;
+    process.report.reportOnFatalError = true;
+    process.report.reportOnUncaughtException = true;
+  } catch (err) {
+    logger.warn('Failed to enable Node diagnostic reports', { error: toErrorMessage(err) });
+  }
+
   // 2. Initialize worker-only subsystems
   const observerRegistry = new ObserverRegistry();
   const stepLogBuffer = new StepLogBuffer();
@@ -455,6 +477,15 @@ export async function bootstrapWorker(
   // on terminal job state.
   const peerClients = new Map<string, PeerClient>();
   const jobOwnership = new Map<string, string>();
+
+  // Durable outbox: terminal job statuses are persisted here before the
+  // best-effort live send, replayed to the owning coord on every (re)connect,
+  // and pruned when the coord ACKs. Keyed by the same coord URL that
+  // jobOwnership/peerClients use (the raw coordUrls entry).
+  const outbox = new PeerOutbox(join(resolveDataDir(config.dataDir), 'worker-outbox'));
+  await outbox.loadFromDisk();
+  await outbox.prune(24 * 60 * 60 * 1000);
+
   const sendToOwningCoord = (jobId: string, msg: unknown): void => {
     const ownerUrl = jobOwnership.get(jobId);
     if (!ownerUrl) {
@@ -476,6 +507,28 @@ export async function bootstrapWorker(
   };
   const executionTracker = new InMemoryExecutionTracker({
     onStatusForward: (update) => {
+      const ownerUrl = jobOwnership.get(update.jobId);
+      const terminal = buildTerminalJobProgress(update);
+      // Persist a terminal job status durably BEFORE the best-effort live
+      // send. The record carries its own coordUrl, so it survives a dropped
+      // socket and is replayed on reconnect / pruned on ack.
+      //
+      // Synchronous + fsynced so the record is on disk before this callback
+      // returns. A fire-and-forget async enqueue can lose its un-flushed write
+      // if the worker process is killed moments later — exactly the failure
+      // when a worker orchestrator crashes during microVM teardown right after
+      // the job completes: the terminal `success` was never durably buffered,
+      // so it could not be replayed on reconnect and the run was orphan-failed.
+      if (terminal && ownerUrl) {
+        try {
+          outbox.enqueueSync(ownerUrl, terminal);
+        } catch (err) {
+          logger.error('Failed to persist terminal job status to outbox', {
+            jobId: update.jobId,
+            error: toErrorMessage(err),
+          });
+        }
+      }
       // `kind` is the discriminator the owning coord uses to route the
       // update to the right ExecutionTracker call. Job updates feed the
       // run-level state machine (onJobStatus), step updates only persist
@@ -658,6 +711,16 @@ export async function bootstrapWorker(
   };
   const workerFleetResponder = makeFleetCollectResponder(workerFleetRuntime);
 
+  // One coordinator shared by every sibling peer-client of this orchestrator:
+  // it owns the credential file and serializes token-joins so a reconnect storm
+  // never cascades credential revocations across the siblings.
+  const workerCredentialFile = config.cluster.credentialFile.replace(/^~/, process.env.HOME ?? '~');
+  const peerAuthCoordinator = new PeerAuthCoordinator({
+    credentialFile: workerCredentialFile,
+    instanceId: config.cluster.instanceId,
+    joinToken: config.cluster.joinToken,
+  });
+
   const createPeerClientForCoord = (rawUrl: string): PeerClient => {
     const baseUrl = rawUrl.replace(/^https?:\/\//, 'ws://');
     const wsUrl = baseUrl.endsWith('/ws/peer') ? baseUrl : baseUrl + '/ws/peer';
@@ -666,12 +729,23 @@ export async function bootstrapWorker(
       url: wsUrl,
       onLogsCollectRequest: (msg, send) => workerFleetResponder(msg, send),
       joinToken: config.cluster.joinToken,
-      credentialFile: config.cluster.credentialFile.replace(/^~/, process.env.HOME ?? '~'),
+      credentialFile: workerCredentialFile,
+      authCoordinator: peerAuthCoordinator,
       instanceId: config.cluster.instanceId,
       role: 'worker',
       peerRegistry,
       heartbeatIntervalMs: config.cluster.peerHeartbeatIntervalMs,
       maxReconnectDelayMs: config.cluster.peerMaxReconnectDelayMs,
+
+      // On every (re)connect, replay every pending terminal job status for
+      // this coord. The outbox is keyed by `rawUrl` (the same key
+      // jobOwnership/peerClients use), NOT the transformed wsUrl that the
+      // hook passes as `url` — so we key replay and ack on `rawUrl`.
+      onConnected: () => replayPending(outbox, (m) => client.send(m), rawUrl),
+      // Coord ACKed a terminal job status — prune the matching outbox record.
+      onJobProgressAck: (ack) => {
+        void outbox.ack(rawUrl, ack.runId, ack.jobId);
+      },
 
       getLocalInventory,
 
@@ -1003,11 +1077,28 @@ export async function bootstrapWorker(
   });
   heartbeatMonitor.start();
 
+  // Periodic outbox re-send while connected. Covers a dropped-but-not-closed
+  // socket where no `onConnected` fires: every 30s, replay each connected
+  // client's pending terminal job statuses. Acks prune them, so a delivered
+  // record is not re-sent.
+  const outboxResendInterval = setInterval(() => {
+    for (const [rawUrl, client] of peerClients.entries()) {
+      if (client.state !== 'connected') continue;
+      replayPending(outbox, (m) => client.send(m), rawUrl);
+    }
+  }, 30_000);
+  outboxResendInterval.unref();
+
   // 9. Register graceful shutdown with drain support
   setupGracefulShutdown({
     logger,
     timeoutMs: DRAIN_TIMEOUT_MS + 30_000, // drain timeout + 30s buffer
-    skipErrorHandlers: true,
+    // Install uncaughtException / unhandledRejection handlers so a worker
+    // crash is logged (with stack) through Winston before exit instead of
+    // dying silently to stderr. Worker mode runs in its own process (standalone
+    // returns before bootstrapping the coordinator), so there is no double
+    // registration with orchestrator-core's handlers.
+    skipErrorHandlers: false,
     steps: [
       {
         name: 'Draining in-flight jobs',
@@ -1026,6 +1117,10 @@ export async function bootstrapWorker(
       {
         name: 'Stopping heartbeat monitor',
         fn: () => heartbeatMonitor.stop(),
+      },
+      {
+        name: 'Stopping outbox re-send interval',
+        fn: () => clearInterval(outboxResendInterval),
       },
       {
         name: 'Broadcasting peer.leaving to all coordinators',

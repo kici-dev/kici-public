@@ -47,6 +47,10 @@ import * as m039 from './migrations/039_host_roster.js';
 import * as m040 from './migrations/040_runsonall_pin.js';
 import * as m041 from './migrations/041_wave_gated.js';
 import * as m042 from './migrations/042_dispatch_queue_patterns.js';
+import * as m043 from './migrations/043_rerouted_to_peer.js';
+import * as m044 from './migrations/044_check_mode.js';
+import * as m045 from './migrations/045_host_properties.js';
+import * as m046 from './migrations/046_join_token_consumed_by_instance.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -94,6 +98,10 @@ export function createMigrationProvider(): MigrationProvider {
         '040_runsonall_pin': m040,
         '041_wave_gated': m041,
         '042_dispatch_queue_patterns': m042,
+        '043_rerouted_to_peer': m043,
+        '044_check_mode': m044,
+        '045_host_properties': m045,
+        '046_join_token_consumed_by_instance': m046,
       };
     },
   };

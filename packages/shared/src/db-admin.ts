@@ -2305,6 +2305,22 @@ export async function createJoinTokenDirect(
 }
 
 /**
+ * Delete join_tokens rows by `created_by` (orchestrator DB). Used by cluster
+ * E2E tests to clean up test-provisioned tokens between runs.
+ */
+export async function deleteJoinTokensByCreatedByDirect(
+  databaseUrl: string,
+  opts: { createdBy: string },
+): Promise<void> {
+  const pool = createPool(databaseUrl);
+  try {
+    await pool.query(`DELETE FROM join_tokens WHERE created_by = $1`, [opts.createdBy]);
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
  * Update the routing_key on `sources` rows for a given provider. Used by
  * cluster e2e to swap the staging routing key for an isolated test key
  * (and to restore it on teardown).

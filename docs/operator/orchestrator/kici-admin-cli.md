@@ -953,6 +953,9 @@ kici-admin secret purge --confirm --database-url $URL --yes    # Offline mode
 
 ```bash
 # GitHub App sources
+# One-click setup: create AND configure a brand-new GitHub App via the App Manifest flow
+kici-admin source add github --name <name> --manifest [--github-org <slug>] [--no-browser] [--json]
+# Manual: store credentials for a GitHub App you already created
 kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
 kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin]
 kici-admin source get-webhook-secret <routingKey>
@@ -978,7 +981,18 @@ kici-admin source install-hook <id> [--repo <path>]
 kici-admin source list [--org <orgId>] [--include-deleted]
 ```
 
-**Secret input modes** (for private keys and webhook secrets):
+**One-click manifest setup** (`--manifest`): the recommended path for a brand-new App. The CLI builds a pre-filled GitHub App manifest (permissions, events, webhook URL), opens GitHub for you to click **"Create GitHub App"** once, captures the returned credentials, stores them encrypted on the orchestrator, and walks you through installing the App on your repos. It always creates a **new** App on GitHub. Flags:
+
+| Flag                  | Description                                                                                                  |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`) |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                  |
+| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin |
+| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                   |
+
+See the [GitHub provider guide](../../user/providers/github.md) for the full one-click walkthrough. The manifest flow resolves the App's webhook URL from the orchestrator's Platform connection, so it requires a **platform** or **hybrid** orchestrator. **Independent-mode** orchestrators have no Platform connection (and therefore no GitHub-App ingress), so the pre-flight returns no webhook URL and the flow aborts — use a generic webhook source there instead.
+
+**Secret input modes** (for private keys and webhook secrets — the manual path):
 
 | Mode                 | Example                             |
 | -------------------- | ----------------------------------- |

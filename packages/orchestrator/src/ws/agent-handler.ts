@@ -919,6 +919,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             // Snapshot the token's lifecycle class for the host roster's
             // `lifecycle_class`. Null when auth mode is `none`.
             tokenAgentType: toLifecycleClass(regEntry.tokenAgentType),
+            // Agent-reported typed host-vars, shallow-merged into the roster's
+            // host_properties (agent keys win over operator-declared keys).
+            properties: parsed.data.properties,
           },
         );
         wsToAgentId.set(ws, agentId);

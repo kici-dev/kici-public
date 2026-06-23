@@ -16,7 +16,8 @@
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes, randomUUID } from 'node:crypto';
 
 import { createLogger, sha256 } from '@kici-dev/shared';
-import type { Kysely } from 'kysely';
+import { Kysely, PostgresDialect } from 'kysely';
+import pg from 'pg';
 
 const joinTokenLogger = createLogger({ prefix: 'join-token' });
 
@@ -113,27 +114,42 @@ export class JoinTokenManager {
    * `peer_credentials_active_uniq` partial unique index).
    *
    * On a 0-row claim, a follow-up SELECT disambiguates not-found / expired
-   * / already-used so callers can branch on the specific reason — the
-   * recovery path in peer-handler.ts keys on the "already used" string
-   * specifically. The follow-up only fires on the unhappy path.
+   * / already-used / reusable-by-same-instance so callers can branch on the
+   * specific reason — the recovery path in peer-handler.ts keys on the
+   * "already used" string specifically. The follow-up only fires on the
+   * unhappy path.
+   *
+   * Self-healing reuse: a join token is re-consumable by the same joining
+   * peer (`peerInstanceId`) until its `expires_at`. A peer that lost its
+   * credential (transient outage / deleted credential file) re-presents the
+   * still-valid join token already in its env; the coordinator accepts the
+   * reuse and issues a fresh credential — no operator action, no cluster
+   * redeploy. Reuse is bounded by BOTH `expires_at` AND the consuming
+   * instanceId, so it never widens a leaked token's usefulness beyond the
+   * instance that first consumed it.
    */
   async validateAndConsumeToken(
     token: string,
     consumedBy: string,
+    peerInstanceId: string,
   ): Promise<{ routing: TokenRouting; keys: DerivedKeys }> {
     const parsed = parseToken(token);
     const keys = deriveKeys(Buffer.from(parsed.secretHex, 'hex'));
 
     const updateResult = await this.deps.db
       .updateTable('join_tokens' as any)
-      .set({ consumed_at: new Date(), consumed_by: consumedBy })
+      .set({
+        consumed_at: new Date(),
+        consumed_by: consumedBy,
+        consumed_by_instance: peerInstanceId,
+      })
       .where('token_hash', '=', keys.validationHash)
       .where('consumed_at', 'is', null)
       .where('expires_at', '>', new Date())
       .executeTakeFirst();
 
     if (Number((updateResult as { numUpdatedRows?: bigint })?.numUpdatedRows ?? 0n) > 0) {
-      joinTokenLogger.info('Consumed join token', { consumedBy });
+      joinTokenLogger.info('Consumed join token', { consumedBy, peerInstanceId });
       return { routing: parsed.routing, keys };
     }
 
@@ -148,13 +164,56 @@ export class JoinTokenManager {
     if (!row) {
       throw new Error('Invalid join token');
     }
+
+    // Expired is checked before the consumed/reuse branch so an
+    // expired-and-consumed token is rejected with the expiry message
+    // regardless of which instance presents it.
+    const expired = new Date((row as any).expires_at).getTime() <= Date.now();
+    if (expired) {
+      throw new Error(
+        'Join token has expired. Generate a new token with: kici admin create-join-token',
+      );
+    }
+
     if ((row as any).consumed_at) {
+      // Reuse path: a returning peer that lost its credential re-presents its
+      // still-valid join token. Allow it iff the SAME instance is presenting
+      // it — bounded by expires_at — so the peer self-heals without a redeploy.
+      if ((row as any).consumed_by_instance === peerInstanceId) {
+        joinTokenLogger.info('Re-validated join token for returning instance', {
+          consumedBy,
+          peerInstanceId,
+        });
+        return { routing: parsed.routing, keys };
+      }
       throw new Error(TOKEN_ALREADY_USED_MESSAGE);
     }
-    throw new Error(
-      'Join token has expired. Generate a new token with: kici admin create-join-token',
-    );
+
+    // Unconsumed but the atomic claim still failed (e.g. lost an expiry race
+    // between the UPDATE and this SELECT) — treat as invalid.
+    throw new Error('Invalid join token');
   }
+}
+
+/**
+ * Build a JoinTokenManager backed by its own connection pool to the given
+ * orchestrator database URL. Mirrors `createPeerCredentialStoreFromUrl`;
+ * consumed by E2E tests that need to exercise token validation/reuse against
+ * the real cluster DB.
+ */
+export function createJoinTokenManagerFromUrl(
+  databaseUrl: string,
+  opts?: { maxConnections?: number },
+): { manager: JoinTokenManager; dispose: () => Promise<void> } {
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: opts?.maxConnections ?? 3 });
+  const db = new Kysely<any>({ dialect: new PostgresDialect({ pool }) });
+  const manager = new JoinTokenManager({ db });
+  return {
+    manager,
+    dispose: async () => {
+      await db.destroy();
+    },
+  };
 }
 
 /**

@@ -31,6 +31,14 @@ interface SourceRouteDeps {
     provider: string;
     sourceId: string;
   }) => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
+  /**
+   * Resolve the org-scoped GitHub webhook URL for the manifest setup flow
+   * BEFORE any App exists. The GitHub webhook URL is org-scoped
+   * (`<base>/webhook/<orgId>/github`), not app-scoped, so it can be computed
+   * up front and baked into the App manifest. Returns null + a note when the
+   * orchestrator cannot yet resolve a public base or its org id.
+   */
+  resolveGithubWebhookUrl?: () => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
 }
 
 type AdminSourcesEnv = {
@@ -112,6 +120,26 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
     } catch (err) {
       logger.error('Failed to add source', { error: toErrorMessage(err) });
       return c.json({ error: toErrorMessage(err) }, 500);
+    }
+  });
+
+  // GET /api/v1/admin/sources/github-webhook-url -- manifest pre-flight.
+  // Resolves the org-scoped GitHub webhook URL so the manifest setup flow can
+  // bake it into the App before the App exists. Registered before the
+  // parameterized routes so the static segment wins.
+  app.get('/sources/github-webhook-url', async (c) => {
+    try {
+      if (!deps.resolveGithubWebhookUrl) {
+        return c.json({ webhookUrl: null, webhookNote: 'resolver-unavailable' });
+      }
+      const resolved = await deps.resolveGithubWebhookUrl();
+      return c.json({
+        webhookUrl: resolved.webhookUrl,
+        ...(resolved.webhookNote && { webhookNote: resolved.webhookNote }),
+      });
+    } catch (err) {
+      logger.error('Failed to resolve github webhook url', { error: toErrorMessage(err) });
+      return c.json({ webhookUrl: null, webhookNote: 'resolve-failed' });
     }
   });
 

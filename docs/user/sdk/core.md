@@ -229,6 +229,28 @@ const build = step('build', {
 
 **StepRunFn type:** `(ctx: StepContext) => Promise<void>`
 
+**With a check facet (idempotent step):**
+
+Add a `check` function to describe _desired state_ instead of a fixed action. When
+`check` is present, `run` becomes the _apply_ function and receives the drift value
+`check` returned; `summarize` (required) renders that drift for logs and the
+dashboard; `whenInSync` optionally produces the step's outputs when already in sync.
+
+```typescript
+const configureNginx = step('configure-nginx', {
+  check: async (ctx) => ((await inSync(ctx)) ? null : { want: DESIRED }),
+  summarize: (drift) => `would rewrite nginx.conf (${drift.want.length} bytes)`,
+  run: async (ctx, drift) => {
+    await writeConfig(drift.want);
+    return { reloaded: true };
+  },
+  whenInSync: async () => ({ reloaded: false }),
+});
+```
+
+A checked step can run in apply mode (converge) or `--check` preview mode (report
+drift, change nothing). See [Idempotent steps and check mode](../idempotent-steps.md).
+
 ### Per-job resources
 
 `options.resources` declares the CPU and memory the job needs. The orchestrator's auto-scaler uses these numbers to:

@@ -270,6 +270,19 @@ export const jobProgressSchema = z.object({
   data: z.record(z.string(), z.unknown()).optional(),
 });
 
+/**
+ * Acknowledgement sent coordinator -> worker once the coordinator has applied
+ * a terminal `job.progress` (kind='job') to its run/job DB rows. The worker
+ * uses it to prune the matching record from its durable outbox. Carries
+ * `state` for debuggability; `(runId, jobId)` is the dedup key.
+ */
+export const jobProgressAckSchema = z.object({
+  type: z.literal('job.progress.ack'),
+  runId: z.string(),
+  jobId: z.string(),
+  state: ExecutionJobStatus,
+});
+
 /** Request to cancel a job on a peer orchestrator. */
 export const peerJobCancelSchema = z.object({
   type: z.literal('peer.job.cancel'),
@@ -470,6 +483,7 @@ export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
   jobRerouteSchema,
   jobRerouteAckSchema,
   jobProgressSchema,
+  jobProgressAckSchema,
   peerJobCancelSchema,
   raftVoteRequestSchema,
   raftVoteResponseSchema,
@@ -497,6 +511,7 @@ export const peerFromPeerMessageSchema = z.discriminatedUnion('type', [
   jobRerouteSchema,
   jobRerouteAckSchema,
   jobProgressSchema,
+  jobProgressAckSchema,
   peerJobCancelSchema,
   raftVoteRequestSchema,
   raftVoteResponseSchema,
@@ -521,6 +536,7 @@ export type ScalerCapacitySummary = z.infer<typeof scalerCapacitySummarySchema>;
 export type PeerHeartbeat = z.infer<typeof peerHeartbeatSchema>;
 export type JobReroute = z.infer<typeof jobRerouteSchema>;
 export type JobProgress = z.infer<typeof jobProgressSchema>;
+export type JobProgressAck = z.infer<typeof jobProgressAckSchema>;
 export type PeerScalerEvent = z.infer<typeof peerScalerEventSchema>;
 export type PeerJobCancel = z.infer<typeof peerJobCancelSchema>;
 export type RaftVoteRequest = z.infer<typeof raftVoteRequestSchema>;

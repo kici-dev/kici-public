@@ -30,4 +30,28 @@ describe('buildKiciApi', () => {
     );
     expect(transport).not.toHaveBeenCalled();
   });
+
+  it('inventory.query relays the selector (and an empty object when omitted)', async () => {
+    const transport = vi.fn().mockResolvedValue([]);
+    const api = buildKiciApi(transport, { jobId: 'job-1' });
+    const selector = { include: [[{ kind: 'exact', value: 'role:db' }]] } as const;
+    await api.inventory.query(selector);
+    expect(transport).toHaveBeenCalledWith('inventory.query', selector);
+    await api.inventory.query();
+    expect(transport).toHaveBeenLastCalledWith('inventory.query', {});
+  });
+
+  it('inventory.get relays the agentId', async () => {
+    const transport = vi.fn().mockResolvedValue(null);
+    const api = buildKiciApi(transport, { jobId: 'job-1' });
+    await api.inventory.get('box-1');
+    expect(transport).toHaveBeenCalledWith('inventory.get', { agentId: 'box-1' });
+  });
+
+  it('inventory works without a job context (dynamic-job re-eval path)', async () => {
+    const transport = vi.fn().mockResolvedValue([]);
+    const api = buildKiciApi(transport); // no jobCtx
+    await api.inventory.query();
+    expect(transport).toHaveBeenCalledWith('inventory.query', {});
+  });
 });

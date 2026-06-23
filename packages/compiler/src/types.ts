@@ -397,6 +397,15 @@ export interface LockStep {
   readonly hasOnCancel?: boolean;
   /** Whether this step has a cleanup hook. */
   readonly hasCleanup?: boolean;
+  /**
+   * Whether this step declares an idempotent `check` facet. When true the
+   * orchestrator knows the step is check-capable and a run can be dispatched in
+   * check mode. The check/apply closures themselves are never serialized — the
+   * agent re-evaluates the real workflow TypeScript.
+   */
+  readonly hasCheck?: boolean;
+  /** Whether this step declares a `whenInSync` facet (produces outputs when in sync). */
+  readonly hasWhenInSync?: boolean;
   /** Normalized approval gate; when set the step pauses for a human approval. */
   readonly approval?: LockApproval;
 }

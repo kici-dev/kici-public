@@ -125,6 +125,9 @@ export * from './state-machine/index.js';
 // --- Provider interfaces ---
 export * from './provider/index.js';
 
+// --- Webhook URL format (browser-safe; org-scoped route shape) ---
+export { githubWebhookPath } from './webhook/webhook-url-format.js';
+
 // --- WebSocket types ---
 export type { WsLike } from './ws/ws-like.js';
 
@@ -173,6 +176,9 @@ export {
   compileRegexMatcher,
 } from './labels-match.js';
 
+// --- Host inventory (canonical queryable roster schema) ---
+export * from './inventory.js';
+
 // --- Scaler types ---
 export * from './scaler/scaler-backend-type.js';
 export * from './scaler/resource-types.js';
@@ -199,3 +205,6 @@ export { formatMatrixSuffix, formatExpandedJobName } from './matrix/format.js';
 
 // --- Fanout materialization (matrix jobs -> N dispatchable children) ---
 export * from './fanout/materialize.js';
+
+// --- Check mode (idempotent run mode + per-step outcome) ---
+export * from './check-mode.js';

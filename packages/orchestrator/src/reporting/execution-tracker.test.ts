@@ -355,6 +355,52 @@ describe('ExecutionTracker', () => {
       expect(runInsert!.values).not.toHaveProperty('workflow_timeout_ms');
     });
 
+    it('persists check_mode when provided', async () => {
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+        undefined, // routingKey
+        undefined, // dispatchedContexts
+        undefined, // triggerEvent
+        undefined, // commitMessage
+        undefined, // parentRunId
+        undefined, // triggeredBy
+        undefined, // originalRunId
+        undefined, // concurrency
+        undefined, // workflowTimeoutMs
+        'check', // checkMode
+      );
+
+      const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
+      expect(runInsert!.values.check_mode).toBe('check');
+    });
+
+    it('omits check_mode when not provided', async () => {
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+      );
+
+      const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
+      expect(runInsert!.values).not.toHaveProperty('check_mode');
+    });
+
     it('inserts execution_jobs rows in DB', async () => {
       await tracker.onExecutionStarted(
         'run-1',
@@ -900,6 +946,57 @@ describe('ExecutionTracker', () => {
       expect(tracker.getRunStatus('run-1')).toBe(ExecutionRunStatus.enum.failed);
     });
 
+    /** Start a single-job run in the given check mode, report a step, complete the job. */
+    async function setupCheckModeRun(checkMode: string, stepCheckOutcome: string): Promise<void> {
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'deploy' }],
+        undefined, // routingKey
+        undefined, // dispatchedContexts
+        undefined, // triggerEvent
+        undefined, // commitMessage
+        undefined, // parentRunId
+        undefined, // triggeredBy
+        undefined, // originalRunId
+        undefined, // concurrency
+        undefined, // workflowTimeoutMs
+        checkMode,
+      );
+      await tracker.onStepStatus(
+        'run-1',
+        'job-1',
+        0,
+        'cfg',
+        ExecutionStepStatus.enum.success,
+        Date.now(),
+        { durationMs: 5, checkOutcome: stepCheckOutcome },
+      );
+      await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+    }
+
+    it('check-fail-on-drift with a dry-run step -> failed', async () => {
+      await setupCheckModeRun('check-fail-on-drift', 'dry-run');
+      expect(tracker.getRunStatus('run-1')).toBe(ExecutionRunStatus.enum.failed);
+    });
+
+    it('plain check with a dry-run step -> success (report-only)', async () => {
+      await setupCheckModeRun('check', 'dry-run');
+      expect(tracker.getRunStatus('run-1')).toBe(ExecutionRunStatus.enum.success);
+    });
+
+    it('check-fail-on-drift with no drift (applied) -> success', async () => {
+      await setupCheckModeRun('check-fail-on-drift', 'applied');
+      expect(tracker.getRunStatus('run-1')).toBe(ExecutionRunStatus.enum.success);
+    });
+
     it('returns running for incomplete run', async () => {
       await tracker.onExecutionStarted(
         'run-1',
@@ -1202,6 +1299,43 @@ describe('ExecutionTracker', () => {
       expect(stepInsert!.values.status).toBe(ExecutionStepStatus.enum.running);
       expect(stepInsert!.values.log_path).toBe('executions/run-1/job-test/step-0.log');
       expect(stepInsert!.values.started_at).toBeDefined();
+    });
+
+    it('persists check_outcome / drift_summary / drift from step data', async () => {
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+
+      await tracker.onStepStatus(
+        'run-1',
+        'job-1',
+        0,
+        'cfg',
+        ExecutionStepStatus.enum.success,
+        Date.now(),
+        {
+          durationMs: 5,
+          checkOutcome: 'dry-run',
+          driftSummary: 'would rewrite config',
+          drift: { want: 'x' },
+        },
+      );
+
+      const stepRow = [...mockDb.inserts, ...mockDb.updates].find(
+        (r) => r.table === 'execution_steps' && r.values.step_name === 'cfg',
+      );
+      expect(stepRow!.values.check_outcome).toBe('dry-run');
+      expect(stepRow!.values.drift_summary).toBe('would rewrite config');
+      expect(stepRow!.values.drift).toBe(JSON.stringify({ want: 'x' }));
     });
 
     it('updates step row for existing step', async () => {

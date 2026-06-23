@@ -2,7 +2,11 @@ import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/shared/env';
-import { KNOWN_ROLES, validateNoReservedLabels } from '@kici-dev/engine';
+import {
+  KNOWN_ROLES,
+  parseHostPropertyAssignments,
+  validateNoReservedLabels,
+} from '@kici-dev/engine';
 
 /** Execution mode for the agent's sandbox backend. Mirrors the runtime enum. */
 export const ExecutionMode = z.enum(['container', 'bare-metal', 'firecracker']);
@@ -15,6 +19,14 @@ const configSchema = z.object({
     .string()
     .default('')
     .transform((s) => s.split(',').filter(Boolean)),
+  // Typed host-vars reported at registration (the inventory `properties` bag),
+  // shallow-merged into the orchestrator's host roster. Comma-separated
+  // key=value pairs; values are typed (true/false ⇒ boolean, numeric ⇒ number,
+  // otherwise string). e.g. "region=eu,cores=8,gpu=true".
+  properties: z
+    .string()
+    .default('')
+    .transform((s) => parseHostPropertyAssignments(s.split(',').filter(Boolean))),
   roles: z
     .string()
     .optional()
@@ -99,6 +111,7 @@ export const envDef = defineEnv({
     orchestratorUrl: 'KICI_ORCHESTRATOR_URL',
     agentId: 'KICI_AGENT_ID',
     labels: 'KICI_LABELS',
+    properties: 'KICI_PROPERTIES',
     roles: 'KICI_ROLES',
     port: 'KICI_PORT',
     logLevel: 'KICI_LOG_LEVEL',
@@ -127,6 +140,7 @@ export const envDef = defineEnv({
  * - KICI_ORCHESTRATOR_URL (required)
  * - KICI_AGENT_ID (optional, auto-generated from hostname-uuid8)
  * - KICI_LABELS (comma-separated, e.g. "linux,docker"). Labels with 'kici-' prefix are reserved.
+ * - KICI_PROPERTIES (comma-separated key=value host-vars, e.g. "region=eu,cores=8,gpu=true"). Typed (bool/number/string), reported into the host roster.
  * - KICI_ROLES (comma-separated agent roles, e.g. "builder,init-runner". undefined=all, empty=execution-only)
  * - KICI_PORT (default: 8080)
  * - KICI_LOG_LEVEL (default: info)
@@ -182,6 +196,7 @@ export function agentClientConnectionOptions(config: AppConfig) {
     url: config.orchestratorUrl,
     agentId: config.agentId,
     labels: config.labels,
+    properties: config.properties,
     scalerManaged: config.scalerManaged,
     token: config.agentToken,
   };

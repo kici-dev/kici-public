@@ -18,7 +18,7 @@ import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { logger } from '@kici-dev/core';
 import pc from 'picocolors';
-import { matchAllWorkflows } from '@kici-dev/engine';
+import { matchAllWorkflows, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import type { SimulatedEvent } from '@kici-dev/engine';
 import type { Workflow } from '@kici-dev/sdk';
 import { compileCommand } from '../commands/compile.js';
@@ -223,6 +223,7 @@ async function runWorkflowBody(
           execDir: ctx.execDir,
           jobOutputsMap,
           signal,
+          checkMode: options.checkMode,
         });
       },
       isSuccess: (result) => result.status === 'success' || result.status === 'skipped',
@@ -412,6 +413,21 @@ export async function executeLocal(options: RunLocalOptions): Promise<boolean> {
       displayLocalSummary(workflowResults);
     }
 
+    // check-fail-on-drift: exit non-zero (2) when any step reported drift
+    // (terraform -detailed-exitcode style). Plain `check` is report-only.
+    if (options.checkMode === CheckMode.enum['check-fail-on-drift'] && hasDrift(workflowResults)) {
+      if (!isQuiet) {
+        logger.info(
+          pc.yellow('Drift detected in check mode (--fail-on-drift): exiting with code 2'),
+        );
+      }
+      // Clean up the tmp checkout before the hard exit (the finally won't run).
+      if (materialized && !options.keep) {
+        await materialized.cleanup();
+      }
+      process.exit(2);
+    }
+
     return allSucceeded;
   } finally {
     // Cleanup policy: remove the tmp checkout on success; keep it on failure
@@ -424,6 +440,18 @@ export async function executeLocal(options: RunLocalOptions): Promise<boolean> {
       }
     }
   }
+}
+
+/**
+ * True when any step across all workflows reported drift (`dry-run` outcome) —
+ * the signal `check-fail-on-drift` uses to exit non-zero.
+ */
+function hasDrift(results: WorkflowExecutionResult[]): boolean {
+  return results.some((wf) =>
+    wf.jobs.some((job) =>
+      (job.steps ?? []).some((s) => s.checkOutcome === CheckStepOutcome.enum['dry-run']),
+    ),
+  );
 }
 
 /**

@@ -49,7 +49,7 @@ const otelSdk = initTelemetry({
 });
 
 const { loadConfig } = await import('./config.js');
-const { PeerClient } = await import('./cluster/index.js');
+const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
@@ -95,13 +95,27 @@ await guardStartup(logger, async () => {
     onSecretsInitialized: undefined,
 
     onSubsystemsReady: async (sub) => {
+      // One coordinator shared by every sibling peer-client of this
+      // orchestrator: it owns the credential file and serializes token-joins so
+      // a reconnect storm never cascades credential revocations across siblings.
+      const peerCredentialFile = config.cluster.credentialFile.replace(
+        /^~/,
+        process.env.HOME ?? '~',
+      );
+      const peerAuthCoordinator = new PeerAuthCoordinator({
+        credentialFile: peerCredentialFile,
+        instanceId: config.instanceId,
+        joinToken: config.cluster.joinToken,
+      });
+
       // Create PeerClient instances for statically configured peers
       for (const peerAddr of config.cluster.peers) {
         const peerUrl = peerAddr.replace(/^https?:\/\//, 'ws://') + '/ws/peer';
         const client = new PeerClient({
           url: peerUrl,
           joinToken: config.cluster.joinToken,
-          credentialFile: config.cluster.credentialFile.replace(/^~/, process.env.HOME ?? '~'),
+          credentialFile: peerCredentialFile,
+          authCoordinator: peerAuthCoordinator,
           instanceId: config.instanceId,
           peerRegistry: sub.peerRegistry,
           getLocalInventory: () => ({
@@ -147,7 +161,7 @@ await guardStartup(logger, async () => {
               reason: result.reason,
             });
           },
-          onJobProgress: (msg) => sub.coordinator.onPeerJobProgress(msg),
+          onJobProgress: (msg, reply) => sub.coordinator.onPeerJobProgress(msg, reply),
           onJobCancel: (msg) => {
             if (!msg.jobId) return;
             const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);
@@ -216,6 +230,12 @@ await guardStartup(logger, async () => {
             params.provider === 'github'
               ? { webhookUrl: null, webhookNote: 'github-ingress-platform-only' }
               : { webhookUrl: null, webhookNote: 'unsupported-provider' },
+          // Independent mode has no GitHub-App webhook ingress (Platform-only),
+          // so the manifest setup flow's pre-flight returns an honest note.
+          resolveGithubWebhookUrl: async () => ({
+            webhookUrl: null,
+            webhookNote: 'github-ingress-platform-only',
+          }),
         },
 
         configReloaderExtras: {

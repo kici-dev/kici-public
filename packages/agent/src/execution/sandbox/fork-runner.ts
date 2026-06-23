@@ -9,7 +9,7 @@
 import { fork, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { JobDispatch } from '@kici-dev/engine';
+import type { JobDispatch, CheckMode } from '@kici-dev/engine';
 import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
 import type { JobExecutionOptions, JobExecutionResult } from './types.js';
 import type {
@@ -142,6 +142,7 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
     checkout: (jobConfig.checkout as boolean | undefined) ?? true,
     isTestRun: (jobConfig.isTestRun as boolean | undefined) ?? false,
     fullRepo: (jobConfig.fullRepo as boolean | undefined) ?? false,
+    checkMode: jobConfig.checkMode as CheckMode | undefined,
 
     tarballUrl: jobConfig.tarballUrl as string | undefined,
     cliPublicKey: jobConfig.cliPublicKey as string | undefined,
@@ -703,6 +704,9 @@ function relayChildIpcMessage(
           ...(msg.error && { error: msg.error }),
           ...(msg.secretsAccessed && { secretsAccessed: msg.secretsAccessed }),
           ...(msg.step_type && { step_type: msg.step_type }),
+          ...(msg.checkOutcome !== undefined && { checkOutcome: msg.checkOutcome }),
+          ...(msg.driftSummary !== undefined && { driftSummary: msg.driftSummary }),
+          ...(msg.drift !== undefined && { drift: msg.drift }),
           ...(msg.data && msg.data),
         },
       );

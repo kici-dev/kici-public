@@ -13,7 +13,6 @@
 
 import WebSocket from 'ws';
 import { createHmac, randomUUID } from 'node:crypto';
-import { unlinkSync } from 'node:fs';
 import {
   createLogger,
   getReconnectDelay,
@@ -29,6 +28,7 @@ import {
   type PeerToPeerMessage,
   type JobReroute,
   type JobProgress,
+  type JobProgressAck,
   type PeerJobCancel,
   type PeerLogChunk,
   type PeerCacheUploadRequest,
@@ -50,7 +50,8 @@ import {
   encryptMessage,
   decryptMessage,
 } from './peer-crypto.js';
-import { readCredentialFile, writeCredentialFile } from './peer-credentials.js';
+import type { CredentialFileData } from './peer-credentials.js';
+import type { PeerAuthCoordinator } from './peer-auth-coordinator.js';
 
 const logger = createLogger({ prefix: 'peer-client' });
 
@@ -72,6 +73,8 @@ export interface PeerClientOptions {
   joinToken?: string;
   /** Path to the credential file for reconnection. */
   credentialFile: string;
+  /** Shared per-orchestrator coordinator that owns the credential file. */
+  authCoordinator: PeerAuthCoordinator;
   /** This orchestrator's instance ID. */
   instanceId: string;
   /** Peer registry to update on heartbeats from remote peer. */
@@ -85,7 +88,14 @@ export interface PeerClientOptions {
   /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
   /** Callback when a job progress update is received from peer. */
-  onJobProgress: (msg: JobProgress) => void;
+  onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
+  /**
+   * Callback invoked once this client reaches the `connected` state (initial
+   * connect AND every reconnect). Carries this client's peer URL.
+   */
+  onConnected?: (url: string) => void;
+  /** Callback when a coordinator ACKs a terminal job.progress this worker sent. */
+  onJobProgressAck?: (msg: JobProgressAck) => void;
   /** This orchestrator's role. Default: 'coordinator'. */
   role?: 'coordinator' | 'worker';
   /** Callback when a job cancel request is received from peer. */
@@ -190,8 +200,13 @@ export class PeerClient {
   private readonly logsCollectWaiters = new ChunkRequestWaiter();
 
   private readonly url: string;
-  private readonly joinToken?: string;
-  private readonly credentialFile: string;
+  private readonly authCoordinator: PeerAuthCoordinator;
+  /** Set true between deciding token-join and receiving the auth response. */
+  private isJoiner = false;
+  /** complete() callback for the in-flight token-join, if this client is joiner. */
+  private joinComplete: ((issued: CredentialFileData | null) => void) | null = null;
+  /** The credential string this client last built an HMAC proof with. */
+  private lastProvedCredential: string | null = null;
   private readonly instanceId: string;
   private readonly role: 'coordinator' | 'worker';
   private readonly peerRegistry: PeerRegistry;
@@ -199,7 +214,9 @@ export class PeerClient {
   private readonly heartbeatIntervalMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly onJobReroute: (msg: JobReroute) => Promise<void>;
-  private readonly onJobProgress: (msg: JobProgress) => void;
+  private readonly onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
+  private readonly onConnected?: (url: string) => void;
+  private readonly onJobProgressAck?: (msg: JobProgressAck) => void;
   private readonly onJobCancel: (msg: PeerJobCancel) => void;
   private readonly onPeerLogChunk?: (chunk: PeerLogChunk) => void;
   private readonly onPeerCacheUploadRequest?: (
@@ -222,8 +239,7 @@ export class PeerClient {
 
   constructor(options: PeerClientOptions) {
     this.url = options.url;
-    this.joinToken = options.joinToken;
-    this.credentialFile = options.credentialFile;
+    this.authCoordinator = options.authCoordinator;
     this.instanceId = options.instanceId;
     this.role = options.role ?? 'coordinator';
     this.peerRegistry = options.peerRegistry;
@@ -232,6 +248,8 @@ export class PeerClient {
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
     this.onJobReroute = options.onJobReroute;
     this.onJobProgress = options.onJobProgress;
+    this.onConnected = options.onConnected;
+    this.onJobProgressAck = options.onJobProgressAck;
     this.onJobCancel = options.onJobCancel;
     this.onPeerLogChunk = options.onPeerLogChunk;
     this.onPeerCacheUploadRequest = options.onPeerCacheUploadRequest;
@@ -585,19 +603,18 @@ export class PeerClient {
         this._state = 'connected';
         this.reconnectAttempts = 0;
 
-        // Persist credential if issued (first join)
-        if (msg.sessionCredential) {
-          writeCredentialFile(this.credentialFile, {
+        // Persist credential if issued (first join). The coordinator owns the
+        // shared file; if this client is the joiner it writes via complete().
+        if (msg.sessionCredential && this.isJoiner && this.joinComplete) {
+          this.joinComplete({
             instanceId: this.instanceId,
             credential: msg.sessionCredential,
             role: msg.role ?? 'coordinator',
             issuedAt: new Date().toISOString(),
-          }).catch((err) => {
-            logger.error('Failed to persist credential file', {
-              error: toErrorMessage(err),
-            });
           });
         }
+        this.isJoiner = false;
+        this.joinComplete = null;
 
         // Register peer in registry
         this.peerRegistry.addPeer({
@@ -634,42 +651,9 @@ export class PeerClient {
         }
 
         this.startHeartbeat();
+        this.onConnected?.(this.url);
       } else {
-        logger.error('Peer auth rejected', { reason: msg.reason });
-
-        // Defensive self-heal: if the server rejected our credential-based
-        // proof (DB / file divergence — admin revoke, partial-write, any
-        // future cause), delete the credential file so the next reconnect
-        // falls back to token-based auth. The server's recovery branch in
-        // peer-handler.ts then re-issues a fresh credential. Skip on
-        // config-error rejections (role mismatch, missing auth method,
-        // protocol-version) where deletion would not help. Use unlinkSync
-        // so the file is gone before scheduleReconnect fires via the close
-        // event listener — async unlink would race the 1s initial backoff.
-        if (
-          msg.reason === 'Invalid proof' ||
-          msg.reason === 'Unknown credential' ||
-          msg.reason === 'Credential revoked'
-        ) {
-          try {
-            unlinkSync(this.credentialFile);
-            logger.warn('Deleted stale credential file after server rejection', {
-              reason: msg.reason,
-            });
-          } catch (err) {
-            const code = (err as NodeJS.ErrnoException).code;
-            if (code !== 'ENOENT') {
-              logger.warn('Failed to delete stale credential file', {
-                error: toErrorMessage(err),
-                path: this.credentialFile,
-              });
-            }
-          }
-        }
-
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.close(1000, 'Auth rejected');
-        }
+        this.handleAuthRejected(msg.reason);
       }
       return;
     }
@@ -703,6 +687,63 @@ export class PeerClient {
   }
 
   /**
+   * Handle a rejected peer.auth.response. For the three credential-divergence
+   * reasons, delegate to the coordinator (which deletes the shared file only if
+   * no sibling has refreshed it, preventing a revocation cascade). A failed
+   * token-join releases the in-flight join so siblings can retry. Config-error
+   * reasons (role mismatch / missing auth method / protocol version) skip the
+   * coordinator entirely — deletion would not help.
+   */
+  private handleAuthRejected(reason: string | undefined): void {
+    logger.error('Peer auth rejected', { reason });
+
+    const wasJoiner = this.isJoiner;
+    const joinComplete = this.joinComplete;
+    const provedCredential = this.lastProvedCredential;
+    this.isJoiner = false;
+    this.joinComplete = null;
+    this.lastProvedCredential = null;
+
+    const credentialDivergence =
+      reason === 'Invalid proof' ||
+      reason === 'Unknown credential' ||
+      reason === 'Credential revoked';
+
+    const finish = (): void => {
+      // A failed token-join must release the in-flight join so siblings retry.
+      if (wasJoiner && joinComplete) joinComplete(null);
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.close(1000, 'Auth rejected');
+      }
+    };
+
+    if (!credentialDivergence) {
+      finish();
+      return;
+    }
+
+    // Delegate the file decision to the coordinator before closing, so the
+    // file operation completes before scheduleReconnect fires via the close
+    // event listener (no sync-I/O race with the reconnect backoff).
+    void (async () => {
+      try {
+        const action = await this.authCoordinator.reportRejection(
+          provedCredential,
+          reason as string,
+        );
+        logger.info('Coordinator rejection action', { reason, action });
+      } catch (err) {
+        logger.warn('Coordinator rejection handling failed', {
+          error: toErrorMessage(err),
+          reason,
+        });
+      } finally {
+        finish();
+      }
+    })();
+  }
+
+  /**
    * Determine auth method and send encrypted auth request.
    *
    * Credentials are **identity-scoped**, not URL-scoped. A single orchestrator
@@ -713,61 +754,67 @@ export class PeerClient {
    * connecting to any peer can use the same credential, as long as the
    * `instanceId` on disk matches ours.
    *
-   * (4-coordinator mesh) bug history: the previous gate was
-   * `cred.coordinatorUrl === this.coordinatorUrl`, which broke the moment a
-   * second peer-client on the same orchestrator tried to authenticate to a
-   * different peer URL — it would see the first peer-client's credential,
-   * reject it (URL mismatch), fall through to the join token, and get
-   * permanently rejected because the token had already been consumed by the
-   * first peer-client. The Option B fix (commit 79f93da4) keyed the match on
-   * `instanceId`; this follow-up (Plan 04 Task 1 cleanup) drops the
-   * `coordinatorUrl` field from the credential file schema entirely because
-   * it was dead weight once the match switched to identity scope.
+   * The auth-method decision is delegated to the shared `PeerAuthCoordinator`,
+   * which serializes sibling peer-clients so exactly one token-joins per
+   * reconnect storm (the rest reuse the freshly-written credential). This
+   * client never reads or writes the credential file directly.
    */
   private async sendAuthRequest(nonce: Buffer): Promise<void> {
     if (!this.sessionKey || !this.ws) return;
 
-    // Try to read existing credential file (shared across all peer-clients
-    // for this orchestrator).
-    const cred = await readCredentialFile(this.credentialFile);
+    const decision = await this.authCoordinator.decideAuth();
 
-    if (cred && cred.instanceId === this.instanceId) {
-      // Credential-based auth (reconnection OR sibling peer-client reuse).
-      // The credential is matched on our own instanceId, not the target peer
-      // URL — see method doc above.
+    if (decision.mode === 'credential') {
+      const cred = decision.credential;
       const credentialHash = sha256(cred.credential);
       const nonceB64 = nonce.toString('base64');
       const proof = createHmac('sha256', Buffer.from(credentialHash, 'hex'))
         .update(nonceB64 + ':' + this.instanceId)
         .digest('hex');
-
-      const authRequest = {
-        type: 'peer.auth.request',
-        instanceId: this.instanceId,
-        protocolVersion: PROTOCOL_VERSION,
-        proof,
-        softwareVersion: SOFTWARE_VERSION,
-        role: this.role,
-      };
+      this.lastProvedCredential = cred.credential;
+      this.isJoiner = false;
+      this.joinComplete = null;
 
       logger.info('Sending credential-based auth request', {
         targetUrl: this.url,
         credentialInstanceId: cred.instanceId,
       });
-      this.ws.send(encryptMessage(JSON.stringify(authRequest), this.sessionKey));
-    } else if (this.joinToken) {
-      // Token-based auth (first join)
-      const authRequest = {
-        type: 'peer.auth.request',
-        instanceId: this.instanceId,
-        protocolVersion: PROTOCOL_VERSION,
-        token: this.joinToken,
-        softwareVersion: SOFTWARE_VERSION,
-        role: this.role,
-      };
+      this.ws.send(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.request',
+            instanceId: this.instanceId,
+            protocolVersion: PROTOCOL_VERSION,
+            proof,
+            softwareVersion: SOFTWARE_VERSION,
+            role: this.role,
+          }),
+          this.sessionKey,
+        ),
+      );
+    } else if (decision.mode === 'token-join') {
+      this.isJoiner = true;
+      this.joinComplete = decision.complete;
+      this.lastProvedCredential = null;
 
-      logger.info('Sending token-based auth request');
-      this.ws.send(encryptMessage(JSON.stringify(authRequest), this.sessionKey));
+      logger.info('Sending token-based auth request', {
+        targetUrl: this.url,
+        instanceId: this.instanceId,
+        reason: 'no-credential-file',
+      });
+      this.ws.send(
+        encryptMessage(
+          JSON.stringify({
+            type: 'peer.auth.request',
+            instanceId: this.instanceId,
+            protocolVersion: PROTOCOL_VERSION,
+            token: decision.token,
+            softwareVersion: SOFTWARE_VERSION,
+            role: this.role,
+          }),
+          this.sessionKey,
+        ),
+      );
     } else {
       logger.error('No auth method available: no credential file and no join token');
       if (this.ws.readyState === WebSocket.OPEN) {
@@ -809,7 +856,12 @@ export class PeerClient {
       }
 
       case 'job.progress': {
-        this.onJobProgress(msg);
+        this.onJobProgress(msg, (out) => this.send(out));
+        break;
+      }
+
+      case 'job.progress.ack': {
+        this.onJobProgressAck?.(msg);
         break;
       }
 

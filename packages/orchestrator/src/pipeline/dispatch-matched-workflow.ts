@@ -51,7 +51,7 @@ import type {
   ResolvedHostAgent,
   UpstreamSnapshot,
 } from '@kici-dev/engine';
-import { HostStatus, type MatchedHost } from '../agent/host-roster.js';
+import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/host-roster.js';
 import type { Database } from '../db/types.js';
 import { parseOutputsCell } from '../orchestrator-core.js';
 import { AgentJobFailedError } from '../cache/agent-job-failed-error.js';
@@ -968,6 +968,31 @@ export function runsOnSelectorsForLockJob(lockJob: {
     excludeLabels: exclude.exact,
     excludePatterns: exclude.regex,
   };
+}
+
+/**
+ * Resolve a generated job's single bare-`agentId` `runsOn` into a host pin.
+ *
+ * The documented inventory fan-out pattern is `runsOn: [h.agentId]`. A bare
+ * agentId is not a label any agent advertises, so the normal label path leaves
+ * the job `queued-no-backend`. When the single exact label names a known roster
+ * host, resolve it to a `pinnedAgentId` dispatch (+ the host's coordinator for
+ * cross-cluster reroute) — exact parity with how `runsOnAll` children pin. Any
+ * other shape (multi-label, a regex pattern, a non-roster label, or no roster
+ * store) returns null and the caller keeps normal label routing.
+ */
+export async function resolveRosterAgentPin(args: {
+  runsOnLabels: string[];
+  runsOnPatterns: LabelMatcher[];
+  hostRosterStore: HostRosterStore | undefined;
+}): Promise<{ pinnedAgentId: string; connectedInstanceId: string | null } | null> {
+  const { runsOnLabels, runsOnPatterns, hostRosterStore } = args;
+  if (!hostRosterStore) return null;
+  if (runsOnLabels.length !== 1 || runsOnPatterns.length > 0) return null;
+  const candidate = runsOnLabels[0];
+  const row = await hostRosterStore.get(candidate);
+  if (!row) return null;
+  return { pinnedAgentId: candidate, connectedInstanceId: row.connected_instance_id ?? null };
 }
 
 /**
@@ -3138,7 +3163,7 @@ function startDeferredInitDispatch(args: {
 // Phase J — deferred dynamic dispatch
 // ---------------------------------------------------------------------------
 
-interface GeneratedJobConfig {
+export interface GeneratedJobConfig {
   /**
    * The generated lock job with its `name` and `needs` rewritten to expanded
    * matrix-child names (identical to the base job for non-matrix generated
@@ -3153,8 +3178,31 @@ interface GeneratedJobConfig {
   excludeLabels: string[];
   /** Regex matchers that disqualify an agent (JS post-filter). */
   excludePatterns: LabelMatcher[];
+  /** Host-fanout pin: when runsOn resolved to a roster host, route only to it. */
+  pinnedAgentId?: string;
+  /** The host's current coordinator (cross-cluster reroute hint); null = not connected. */
+  connectedInstanceId?: string | null;
   /** The matrix combination for this child; absent for non-matrix generated jobs. */
   matrixValues?: Record<string, unknown>;
+}
+
+/**
+ * Split generated configs into pinned (host-pin dispatch) and unpinned (normal
+ * label routing). A pinned config always rides the dispatcher pin path because
+ * the coordinator's `JobToRoute` shape carries no pin field — routing it via the
+ * coordinator would silently drop the pin.
+ */
+export function partitionGeneratedConfigsByPin(configs: readonly GeneratedJobConfig[]): {
+  pinnedConfigs: GeneratedJobConfig[];
+  unpinnedConfigs: GeneratedJobConfig[];
+} {
+  const pinnedConfigs: GeneratedJobConfig[] = [];
+  const unpinnedConfigs: GeneratedJobConfig[] = [];
+  for (const c of configs) {
+    if (c.pinnedAgentId) pinnedConfigs.push(c);
+    else unpinnedConfigs.push(c);
+  }
+  return { pinnedConfigs, unpinnedConfigs };
 }
 
 async function dispatchEvalJob(args: {
@@ -3451,13 +3499,24 @@ async function resolveGeneratedJobConfigs(args: {
         },
       };
       const genSel = runsOnSelectorsForLockJob(genJob);
+      const pin = await resolveRosterAgentPin({
+        runsOnLabels: genSel.runsOnLabels,
+        runsOnPatterns: genSel.runsOnPatterns,
+        hostRosterStore: deps.hostRosterStore,
+      });
       out.push({
         genJob: { ...genJob, name: envelope.name, needs: expandedNeeds },
         genJobConfig,
-        runsOnLabels: genSel.runsOnLabels,
-        runsOnPatterns: genSel.runsOnPatterns,
+        // A pin targets the agent directly — clear routing labels (parity with
+        // runsOnAll children, which carry no routing). A miss keeps normal routing.
+        runsOnLabels: pin ? [] : genSel.runsOnLabels,
+        runsOnPatterns: pin ? [] : genSel.runsOnPatterns,
         excludeLabels: genSel.excludeLabels,
         excludePatterns: genSel.excludePatterns,
+        ...(pin && {
+          pinnedAgentId: pin.pinnedAgentId,
+          connectedInstanceId: pin.connectedInstanceId,
+        }),
         ...(envelope.matrixValues && { matrixValues: envelope.matrixValues }),
       });
     } catch (err) {
@@ -3583,6 +3642,8 @@ async function directDispatchGeneratedJobs(args: {
     excludeLabels,
     excludePatterns,
     matrixValues,
+    pinnedAgentId,
+    connectedInstanceId,
   } of configs) {
     try {
       const genJobInput: QueuedJobInput = {
@@ -3606,6 +3667,8 @@ async function directDispatchGeneratedJobs(args: {
         depsUrl: buildPrep.depsUrl,
         depsHash: buildPrep.depsHash,
         requestId: getRequestContext().requestId,
+        ...(pinnedAgentId && { pinnedAgentId }),
+        ...(connectedInstanceId !== undefined && { connectedInstanceId }),
       };
       const genResult = await setup.dispatcher.dispatch(genJobInput);
       if (genResult.status !== 'rejected' && deps.executionTracker) {
@@ -3642,7 +3705,20 @@ async function routeRootGeneratedJobs(args: {
   const { ctx, setup, buildPrep, rootGeneratedConfigs } = args;
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
   if (rootGeneratedConfigs.length === 0) return;
-  const generatedJobsToRoute: JobToRoute[] = rootGeneratedConfigs.map(
+
+  const { pinnedConfigs, unpinnedConfigs } = partitionGeneratedConfigsByPin(rootGeneratedConfigs);
+
+  // Pinned generated jobs always go through the dispatcher pin path: JobToRoute
+  // (the coordinator label-routing shape) carries no pin field, so routing a
+  // pinned job through it would lose the pin. The dispatcher's dispatchPinned
+  // handles local dispatch / queue-with-pin and the cross-cluster reroute the
+  // same way runsOnAll children are dispatched.
+  if (pinnedConfigs.length > 0) {
+    await directDispatchGeneratedJobs({ ctx, setup, buildPrep, configs: pinnedConfigs });
+  }
+  if (unpinnedConfigs.length === 0) return;
+
+  const generatedJobsToRoute: JobToRoute[] = unpinnedConfigs.map(
     ({ genJob, genJobConfig, runsOnLabels, runsOnPatterns, excludeLabels, excludePatterns }) => ({
       jobName: genJob.name,
       runsOnLabels: [runsOnLabels],
@@ -3670,7 +3746,7 @@ async function routeRootGeneratedJobs(args: {
       ctx,
       setup,
       buildPrep,
-      configs: rootGeneratedConfigs,
+      configs: unpinnedConfigs,
     });
     return;
   }
@@ -3721,13 +3797,13 @@ async function routeRootGeneratedJobs(args: {
       ctx,
       setup,
       buildPrep,
-      configs: rootGeneratedConfigs,
+      configs: unpinnedConfigs,
     });
     return;
   }
   for (const local of routeResult.localJobs) {
     if (deps.executionTracker) {
-      const matchingConfig = rootGeneratedConfigs.find((c) => c.genJob.name === local.jobName);
+      const matchingConfig = unpinnedConfigs.find((c) => c.genJob.name === local.jobName);
       deps.executionTracker
         .addJobsToRun(runId, [
           {

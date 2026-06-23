@@ -38,7 +38,7 @@ function createMockWorkflow(name: string, jobs: any[] = []) {
             {
               _type: 'static' as const,
               name: 'test-job',
-              runsOn: 'default',
+              runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'echo', run: 'echo hello' }],
               needs: [],
               rules: [],
@@ -158,7 +158,7 @@ describe('processTestTrigger', () => {
       {
         _type: 'static' as const,
         name: 'test-job',
-        runsOn: 'default',
+        runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'echo', run: 'echo hello' }],
         needs: [],
         rules: [],
@@ -400,7 +400,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -443,7 +443,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -486,7 +486,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -629,7 +629,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'test-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'echo', run: 'echo hi' }],
           needs: [],
           rules: [],
@@ -732,7 +732,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -793,7 +793,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'impure-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -852,7 +852,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'broken-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -932,7 +932,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
@@ -988,7 +988,7 @@ describe('processTestTrigger', () => {
         {
           _type: 'static' as const,
           name: 'deploy-job',
-          runsOn: 'default',
+          runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],

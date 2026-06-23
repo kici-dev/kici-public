@@ -39,6 +39,7 @@ function staleJob(overrides?: Record<string, unknown>) {
     job_name: 'test',
     agent_id: 'agent-1',
     last_heartbeat_at: new Date(Date.now() - 300_000), // 5 min ago
+    rerouted_to_peer: null,
     workflow_name: 'ci',
     repo_identifier: 'owner/repo',
     sha: 'abc123',
@@ -74,7 +75,20 @@ function createDeps() {
     get: vi.fn().mockReturnValue({ agentId: 'agent-1' }),
   };
 
-  return { executionTracker, checkRunReporter, scalerManager, dispatcher, registry };
+  // Default registry has no peers connected, so the rerouted-job guard is a
+  // no-op for local jobs (rerouted_to_peer === null) — existing behavior.
+  const peerRegistry = {
+    getPeer: vi.fn().mockReturnValue(undefined),
+  };
+
+  return {
+    executionTracker,
+    checkRunReporter,
+    scalerManager,
+    dispatcher,
+    registry,
+    peerRegistry,
+  };
 }
 
 /**
@@ -115,6 +129,7 @@ function makeDeps(
     scalerManager: mocks.scalerManager as unknown as StaleRunDetectorDeps['scalerManager'],
     dispatcher: mocks.dispatcher as unknown as StaleRunDetectorDeps['dispatcher'],
     registry: mocks.registry as unknown as StaleRunDetectorDeps['registry'],
+    peerRegistry: mocks.peerRegistry as unknown as StaleRunDetectorDeps['peerRegistry'],
     staleThresholdMs: 120_000,
     scanIntervalMs: 60_000,
   };
@@ -182,6 +197,110 @@ describe('StaleRunDetector', () => {
 
     // Verify completeRunIfAllJobsTerminal called for the affected run
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
+  });
+
+  it('scan() defers failing a job rerouted to a still-connected worker peer', async () => {
+    const mocks = createDeps();
+    // The job's worker peer is currently connected.
+    mocks.peerRegistry.getPeer.mockReturnValue({ connected: true });
+    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [job] }, // Sub-scan A returns the rerouted job
+        { executeResult: [] }, // Sub-scan B
+        { executeResult: [] }, // Sub-scan C
+      ],
+      updates: [],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    // Deferred -> no timed_out_stale transition, no Platform forward.
+    expect(db.updateTable).not.toHaveBeenCalled();
+    expect(mocks.executionTracker.updateInMemoryJob).not.toHaveBeenCalled();
+    expect(mocks.executionTracker.forwardJobTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  it('scan() still fails a job rerouted to a DISCONNECTED worker peer', async () => {
+    const mocks = createDeps();
+    // No peer named 'arm-stg' is connected — a dead worker must not hang the job.
+    mocks.peerRegistry.getPeer.mockReturnValue(undefined);
+    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [job] }, // Sub-scan A
+        { executeResult: [] }, // Sub-scan B
+        { executeResult: [] }, // Sub-scan C
+      ],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }], // markJobStale
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
+      'run-1',
+      'job-1',
+      'timed_out_stale',
+    );
+  });
+
+  it('scan() defers a job whose rerouted peer is flapping (disconnected but recently seen)', async () => {
+    const mocks = createDeps();
+    // Peer-WS flap during a coordinator restart: the worker peer is marked
+    // disconnected but its last heartbeat is recent, so it will reconnect and
+    // replay the job's buffered terminal status. The run must NOT be failed.
+    mocks.peerRegistry.getPeer.mockReturnValue({ connected: false, lastHeartbeatAt: Date.now() });
+    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [job] }, // Sub-scan A returns the rerouted job
+        { executeResult: [] }, // Sub-scan B
+        { executeResult: [] }, // Sub-scan C
+      ],
+      updates: [],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    // Deferred -> no timed_out_stale transition, no Platform forward.
+    expect(db.updateTable).not.toHaveBeenCalled();
+    expect(mocks.executionTracker.updateInMemoryJob).not.toHaveBeenCalled();
+    expect(mocks.executionTracker.forwardJobTerminalStatus).not.toHaveBeenCalled();
+  });
+
+  it('scan() still fails a job whose rerouted peer has been gone past the flap-grace window', async () => {
+    const mocks = createDeps();
+    // Disconnected and last heartbeat is well beyond the grace window: the
+    // worker is treated as dead, so the job is timed out (it cannot hang).
+    mocks.peerRegistry.getPeer.mockReturnValue({
+      connected: false,
+      lastHeartbeatAt: Date.now() - 10 * 60 * 1000,
+    });
+    const job = staleJob({ rerouted_to_peer: 'arm-stg' });
+
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [job] }, // Sub-scan A
+        { executeResult: [] }, // Sub-scan B
+        { executeResult: [] }, // Sub-scan C
+      ],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }], // markJobStale
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
+      'run-1',
+      'job-1',
+      'timed_out_stale',
+    );
   });
 
   it('scan() emits a held_run.expire audit row per expired hold', async () => {

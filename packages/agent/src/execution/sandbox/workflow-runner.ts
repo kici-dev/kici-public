@@ -2407,6 +2407,7 @@ async function main(): Promise<void> {
   const jobStartTime = Date.now();
   const loopResult = await executeStepLoop({
     steps: normalizedSteps,
+    checkMode: request.checkMode,
     createStepContext: createStepCtxWithCapture,
     sendIpc: maskedSend,
     defaultTimeoutMs,

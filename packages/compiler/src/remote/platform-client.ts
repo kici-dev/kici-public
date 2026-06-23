@@ -12,6 +12,7 @@
  */
 
 import { toErrorMessage } from '@kici-dev/core';
+import type { CheckMode } from '@kici-dev/engine';
 
 // --- Error types ---
 
@@ -107,6 +108,12 @@ export interface PlatformTriggerInput {
   secrets?: Record<string, string>;
   encryptedSecrets?: string;
   encryptedSecretsKey?: string;
+  /**
+   * Run mode for the dispatched run (`apply` | `check` | `check-fail-on-drift`).
+   * The Platform relays it onto the dispatch event so the orchestrator runs the
+   * agent step loop in the requested mode. Omitted means `apply`.
+   */
+  checkMode?: CheckMode;
 }
 
 export interface PlatformTriggerResponse {

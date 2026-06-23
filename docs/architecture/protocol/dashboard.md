@@ -402,6 +402,17 @@ The `kind` discriminator decides which `ExecutionTracker` call the receiver make
 | timestamp | number                  | Yes      | Unix timestamp (milliseconds)                                                                                                |
 | data      | Record<string, unknown> | No       | Optional state-specific data                                                                                                 |
 
+#### job.progress.ack
+
+Sent by the coordinator back to the worker once it has applied a **terminal** job-level `job.progress` (`kind: "job"`) to its run/job rows. The worker uses it to prune the matching record from its durable terminal-status outbox, so a status that has been durably observed by the coordinator is delivered exactly once. `(runId, jobId)` is the dedup key; `state` is carried for debuggability.
+
+| Field | Type                 | Required | Description                                              |
+| ----- | -------------------- | -------- | -------------------------------------------------------- |
+| type  | `"job.progress.ack"` | Yes      | Message discriminator                                    |
+| runId | string               | Yes      | Execution run identifier                                 |
+| jobId | string               | Yes      | Job identifier (matches the acknowledged `job.progress`) |
+| state | enum                 | Yes      | The applied `ExecutionJobStatus`                         |
+
 #### peer.job.cancel
 
 Sent by the coordinator to a worker to cancel a rerouted job. Used for fail-fast propagation and user-initiated cancellation.

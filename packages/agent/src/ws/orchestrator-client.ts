@@ -49,6 +49,12 @@ export interface OrchestratorClientOptions {
   agentId: string;
   /** Agent's label set for job routing. */
   labels: string[];
+  /**
+   * Agent-reported typed host-vars (the `KICI_PROPERTIES` bag). Reported at
+   * registration and shallow-merged into the orchestrator's host roster.
+   * Omitted / empty ⇒ no properties reported.
+   */
+  properties?: Record<string, string | number | boolean>;
   /** Callback invoked when a job.dispatch message is received. */
   onJobDispatch: (dispatch: JobDispatch) => void;
   /** Callback invoked when a job.cancel message is received. */
@@ -178,6 +184,7 @@ export class OrchestratorClient {
   private readonly url: string;
   private readonly agentId: string;
   private readonly labels: string[];
+  private readonly properties: Record<string, string | number | boolean>;
   private readonly onJobDispatch: (dispatch: JobDispatch) => void;
   private readonly onJobCancel: (cancel: JobCancel) => void;
   private readonly token?: string;
@@ -213,6 +220,7 @@ export class OrchestratorClient {
     this.url = options.url;
     this.agentId = options.agentId;
     this.labels = options.labels;
+    this.properties = options.properties ?? {};
     this.onJobDispatch = options.onJobDispatch;
     this.onJobCancel = options.onJobCancel;
     this.token = options.token;
@@ -1372,6 +1380,9 @@ export class OrchestratorClient {
     };
     if (inFlightJobs.length > 0) {
       msg.inFlightJobs = inFlightJobs;
+    }
+    if (Object.keys(this.properties).length > 0) {
+      msg.properties = this.properties;
     }
     this.ws!.send(JSON.stringify(msg));
   }

@@ -13,6 +13,18 @@ import { encrypt, decrypt, type EncryptedValue } from './crypto.js';
 import type { AuditLogger } from './audit-logger.js';
 
 /**
+ * Thrown by `renameScope` when the named scope has no secret rows and no
+ * environment binding — i.e. there is nothing to rename. Consumers map this to
+ * a 404 (admin HTTP route) or a structured not-found response (dashboard path).
+ */
+export class SecretScopeNotFoundError extends Error {
+  constructor(public readonly scope: string) {
+    super(`Secret scope '${scope}' not found`);
+    this.name = 'SecretScopeNotFoundError';
+  }
+}
+
+/**
  * PostgreSQL secret store with AES-256-GCM encryption.
  * Uses scoped_secrets table keyed by (org_id, scope, key).
  */
@@ -300,7 +312,7 @@ export class PgSecretStore implements SecretStore {
         .where('scope_pattern', '=', oldScope)
         .execute();
       if (rows.length === 0 && bindings.length === 0) {
-        throw new Error(`Secret scope '${oldScope}' not found`);
+        throw new SecretScopeNotFoundError(oldScope);
       }
 
       for (const row of rows) {

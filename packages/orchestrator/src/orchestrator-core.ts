@@ -1992,7 +1992,7 @@ function initializeCluster(
         uploadUrl,
       };
     },
-    onJobProgress: (msg) => coordinator.onPeerJobProgress(msg),
+    onJobProgress: (msg, reply) => coordinator.onPeerJobProgress(msg, reply),
     onPeerScalerEvent: (msg) => coordinator.onPeerScalerEvent(msg),
     onJobCancel: (msg) => {
       if (!msg.jobId) return;
@@ -3418,6 +3418,7 @@ export async function bootstrapOrchestrator(
     scalerManager: scalerManager ?? undefined,
     dispatcher,
     registry: agentRegistry,
+    peerRegistry: cluster.peerRegistry,
     staleThresholdMs: config.jobHeartbeatIntervalMs * config.staleDetectorThresholdMultiplier,
     scanIntervalMs: config.staleDetectorScanIntervalMs,
     // Approval-hold expiry: the held-run store (so overdue holds are expired)

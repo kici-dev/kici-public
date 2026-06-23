@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 import { Command, Argument, Option } from 'commander';
 import pc from 'picocolors';
@@ -119,6 +120,8 @@ export function buildProgram(): Command {
       'Always retain the isolated tmp checkout (default: keep only on failure)',
       false,
     )
+    .option('--check', 'Run in check mode: report drift, change nothing', false)
+    .option('--fail-on-drift', 'In check mode, exit non-zero if any step reports drift', false)
     .action(async (event, options) => {
       if (options.pick && options.workflow) {
         console.error('Error: --pick is mutually exclusive with --workflow.');
@@ -129,8 +132,17 @@ export function buildProgram(): Command {
         process.exit(2);
       }
       const { runLocalCommand } = await import('./commands/index.js');
+      const { resolveCheckMode } = await import('./commands/check-mode.js');
+      let checkMode;
+      try {
+        checkMode = resolveCheckMode({ check: options.check, failOnDrift: options.failOnDrift });
+      } catch (err) {
+        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(2);
+      }
       const success = await runLocalCommand({
         event,
+        checkMode,
         pick: options.pick,
         workflow: options.workflow,
         job: options.job,
@@ -182,9 +194,23 @@ export function buildProgram(): Command {
       (val: string, prev: string[]) => [...prev, val],
       [] as string[],
     )
+    .option('--check', 'Run in check mode: report drift, change nothing', false)
+    .option('--fail-on-drift', 'In check mode, exit non-zero if any step reports drift', false)
     .action(async (fixture, options) => {
       const { runRemoteCommand } = await import('./commands/index.js');
-      const success = await runRemoteCommand(fixture, { ...options, envFlags: options.env });
+      const { resolveCheckMode } = await import('./commands/check-mode.js');
+      let checkMode;
+      try {
+        checkMode = resolveCheckMode({ check: options.check, failOnDrift: options.failOnDrift });
+      } catch (err) {
+        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+        process.exit(2);
+      }
+      const success = await runRemoteCommand(fixture, {
+        ...options,
+        checkMode,
+        envFlags: options.env,
+      });
       process.exit(success ? 0 : 1);
     });
 
@@ -613,9 +639,32 @@ export function runCli(argv: string[] = process.argv): void {
   buildProgram().parse(argv);
 }
 
+/**
+ * Decide whether this module is the process entry point, tolerating a
+ * symlinked `argv[1]`. A `node_modules/.bin/kici` entry is a symlink, and when
+ * it points at this compiled `cli.js` (the compiler package declares a `kici`
+ * bin), `process.argv[1]` is the symlink path while `import.meta.url` is the
+ * real file. A plain `resolve()` comparison sees two different paths and never
+ * matches, silently skipping `runCli()` — so `kici compile` (and every other
+ * subcommand) becomes a no-op when invoked through the bin symlink.
+ * Dereference both sides with `realpathSync` so a symlinked invocation is
+ * correctly recognised as the entry point. Falls back to a plain `resolve()`
+ * comparison when `argv[1]` doesn't resolve to a real file (e.g. a virtual
+ * entry point), preserving the previous behaviour for that edge case.
+ */
+export function isMainEntryPoint(argv1: string | undefined, importMetaUrl: string): boolean {
+  if (!argv1) return false;
+  const modulePath = fileURLToPath(importMetaUrl);
+  try {
+    return realpathSync(argv1) === realpathSync(modulePath);
+  } catch {
+    return resolve(argv1) === resolve(modulePath);
+  }
+}
+
 // Only parse argv when this module is the process entry point. The published
 // bin shim imports `runCli` and calls it explicitly; importing the module
 // (e.g. the surface registry building the command tree) must NOT parse/exit.
-if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+if (isMainEntryPoint(process.argv[1], import.meta.url)) {
   runCli();
 }

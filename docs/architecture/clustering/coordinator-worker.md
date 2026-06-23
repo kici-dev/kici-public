@@ -78,6 +78,29 @@ The coordinator tracks NAK count per peer with backoff. After repeated NAKs from
 
 If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the worker fails the job and reports failure to the coordinator. No return-for-rerouting after ACK.
 
+## Reliable terminal-status relay
+
+A worker holds no database, so a job's terminal status (success, failed, cancelled, …) exists only in the worker's memory until the coordinator records it. To survive a connection drop between "the job finished on the worker" and "the coordinator wrote the result", the worker keeps a durable on-disk outbox of terminal job statuses.
+
+The flow for a job-level terminal `job.progress`:
+
+1. **Persist before send.** When a rerouted job reaches a terminal state, the worker writes the terminal `job.progress` to its outbox (an `fsync`'d file under the worker's data directory) **before** sending it over the peer connection. The record is keyed by `(coordinator URL, runId, jobId)`.
+2. **Send live.** The worker sends the `job.progress` to the owning coordinator.
+3. **Coordinator acknowledges.** Once the coordinator has applied the terminal status to its run/job rows, it replies with a `job.progress.ack` carrying the same `(runId, jobId)`.
+4. **Prune on ACK.** On receiving the ACK, the worker removes the matching outbox record. A record that is never acknowledged stays on disk.
+5. **Replay on reconnect.** Every time the worker (re)connects to a coordinator, it replays all outbox records destined for that coordinator. The coordinator applies each terminal status idempotently (`(runId, jobId)` is the dedup key) and acknowledges it, so a status is delivered at least once over the wire and applied exactly once.
+
+Records that are never acknowledged — for example because the coordinator was permanently replaced — are pruned after a 24-hour retention window so the outbox cannot grow without bound. Only **terminal job-level** statuses are relayed this way; step-level progress and log chunks remain fire-and-forget real-time relay.
+
+## Rerouted-job recovery guard
+
+The coordinator's `execution_jobs` table marks every job dispatched to a remote worker with a `rerouted_to_peer` column (the worker peer's instance id; `NULL` for locally dispatched jobs). Run-recovery — both orphan recovery and stale-run detection — reads this marker so it does not race the durable relay above:
+
+- While the owning worker peer is **connected**, a rerouted job's in-flight status is left alone. Its terminal status may still arrive (or be replayed from the worker's outbox), so failing it early would discard a result that is on its way.
+- Once the owning worker peer **disconnects**, the deferral ends and the rerouted job is failed like any other orphan, so a job on a dead worker can never hang indefinitely.
+
+Locally dispatched jobs (`rerouted_to_peer = NULL`) are never deferred — recovery handles them immediately.
+
 ## Log relay
 
 Workers relay log chunks to the coordinator in real-time:
@@ -145,7 +168,7 @@ On eviction:
 
 - Worker marked as disconnected in peer registry
 - No further jobs routed to the evicted worker
-- In-flight jobs on the evicted worker handled by orphan recovery (Raft leader detects runs whose coordinator/worker is gone)
+- In-flight rerouted jobs on the evicted worker are failed by run-recovery once the worker disconnects (see [rerouted-job recovery guard](#rerouted-job-recovery-guard)); while the worker is still connected, recovery defers to the durable terminal-status relay
 
 ## Worker identity
 

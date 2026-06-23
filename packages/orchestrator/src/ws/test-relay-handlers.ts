@@ -136,6 +136,7 @@ export async function handleTestTrigger(
       workflowName: msg.workflowName,
       inlineLockFile: msg.inlineLockFile,
       fullRepo: msg.fullRepo,
+      checkMode: msg.checkMode,
       requestId: msg.requestId,
     },
     deps,

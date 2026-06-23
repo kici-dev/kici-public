@@ -488,3 +488,82 @@ describe('executeResolvedJob', () => {
     expect(lastCall[2]).toBe('/tmp/kici-run-abcdef');
   });
 });
+
+describe('executeResolvedJob check mode', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(evaluateRules).mockResolvedValue({ allPassed: true, results: [] } as any);
+  });
+
+  function makeCheckStep(opts: {
+    name: string;
+    drift: unknown | null;
+    runSpy?: ReturnType<typeof vi.fn>;
+    whenInSyncSpy?: ReturnType<typeof vi.fn>;
+  }): Step {
+    return {
+      _tag: 'Step' as const,
+      name: opts.name,
+      check: vi.fn().mockResolvedValue(opts.drift),
+      summarize: (d: any) => `would change: ${JSON.stringify(d)}`,
+      run: opts.runSpy ?? vi.fn().mockResolvedValue({ applied: true }),
+      ...(opts.whenInSyncSpy && { whenInSync: opts.whenInSyncSpy }),
+    } as unknown as Step;
+  }
+
+  async function runOne(step: Step, checkMode: import('@kici-dev/engine').CheckMode) {
+    const job = makeJob({ name: 'test', steps: [step] });
+    const resolved: ResolvedJob = {
+      job,
+      expandedName: 'test',
+      matrixValues: {},
+      resolvedNeeds: [],
+    };
+    return executeResolvedJob(resolved, makeContext({ checkMode }));
+  }
+
+  it('apply + drift => applied, run called with drift', async () => {
+    const runSpy = vi.fn().mockResolvedValue({ applied: true });
+    const result = await runOne(
+      makeCheckStep({ name: 'cfg', drift: { want: 'x' }, runSpy }),
+      'apply',
+    );
+    expect(result.steps[0].status).toBe('success');
+    expect(result.steps[0].checkOutcome).toBe('applied');
+    expect(runSpy).toHaveBeenCalledWith(expect.anything(), { want: 'x' });
+  });
+
+  it('check + drift => dry-run, run NOT called, sentinel not written', async () => {
+    const runSpy = vi.fn().mockResolvedValue({ applied: true });
+    const result = await runOne(
+      makeCheckStep({ name: 'cfg', drift: { want: 'x' }, runSpy }),
+      'check',
+    );
+    expect(result.steps[0].status).toBe('success');
+    expect(result.steps[0].checkOutcome).toBe('dry-run');
+    expect(result.steps[0].driftSummary).toContain('would change');
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it('apply + null => skipped, whenInSync called, run NOT called', async () => {
+    const runSpy = vi.fn().mockResolvedValue({ applied: true });
+    const whenInSyncSpy = vi.fn().mockResolvedValue({ applied: false });
+    const result = await runOne(
+      makeCheckStep({ name: 'cfg', drift: null, runSpy, whenInSyncSpy }),
+      'apply',
+    );
+    expect(result.steps[0].status).toBe('skipped');
+    expect(result.steps[0].checkOutcome).toBe('skipped');
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(whenInSyncSpy).toHaveBeenCalledOnce();
+  });
+
+  it('check + plain step => no_check, run NOT called', async () => {
+    const runSpy = vi.fn().mockResolvedValue(undefined);
+    const plain = { _tag: 'Step' as const, name: 'plain', run: runSpy } as unknown as Step;
+    const result = await runOne(plain, 'check');
+    expect(result.steps[0].status).toBe('skipped');
+    expect(result.steps[0].checkOutcome).toBe('no_check');
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+});

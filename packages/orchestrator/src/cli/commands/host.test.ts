@@ -148,4 +148,39 @@ describe('kici-admin host', () => {
     );
     expect(stdout).toContain('Declared static host: web-09');
   });
+
+  it('host declare parses repeatable --prop into a typed properties bag', async () => {
+    mockDeclareStatic.mockResolvedValue(undefined);
+    await runCommand([
+      'host',
+      'declare',
+      '--agent-id',
+      'db-01',
+      '--prop',
+      'region=eu',
+      '--prop',
+      'cores=8',
+      '--prop',
+      'gpu=true',
+    ]);
+    expect(mockDeclareStatic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'db-01',
+        properties: { region: 'eu', cores: 8, gpu: true },
+      }),
+    );
+  });
+
+  it('host declare rejects a malformed --prop value', async () => {
+    const { exitCode, stderr } = await runCommand([
+      'host',
+      'declare',
+      '--agent-id',
+      'db-01',
+      '--prop',
+      'noequals',
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('Invalid property');
+  });
 });

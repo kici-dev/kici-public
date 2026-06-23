@@ -22,18 +22,21 @@ const mockSandboxInstance = vi.hoisted(() => ({
   teardown: vi.fn() as Mock,
 }));
 
+// Hoisted so individual tests can assert on the module-level logger.
+const loggerMock = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
+
 // --- Mocks ---
 
 // Mock @kici-dev/shared (createLogger + getRequestContext + createMeter)
 vi.mock('@kici-dev/shared', () => {
   const noopInstrument = { add: vi.fn(), record: vi.fn() };
   return {
-    createLogger: vi.fn().mockReturnValue({
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    }),
+    createLogger: vi.fn().mockReturnValue(loggerMock),
     getRequestContext: vi.fn().mockReturnValue({ runId: 'run-1', requestId: 'req-1' }),
     createMeter: vi.fn().mockReturnValue({
       createCounter: vi.fn().mockReturnValue(noopInstrument),
@@ -318,6 +321,57 @@ describe('JobRunner', () => {
     };
     expect(failedStatus).toBeDefined();
     expect(failedStatus.data?.stepResults).toHaveLength(2);
+  });
+
+  it('failed init phase (stepCount 0): logs the job-level cause in the failure line', async () => {
+    resetSandboxMocks({
+      status: 'failed',
+      stepResults: [],
+      durationMs: 25572,
+      error: 'init[1] mise provision failed: mise: command failed (exit 1)',
+    });
+
+    const deps = makeDeps();
+    const runner = new JobRunner(deps);
+
+    await runner.execute(makeDispatch());
+
+    const failLog = loggerMock.error.mock.calls.find(
+      ([msg]) => msg === 'Sandbox returned failed result',
+    );
+    expect(failLog).toBeDefined();
+    expect(failLog![1]).toMatchObject({
+      stepCount: 0,
+      error: 'init[1] mise provision failed: mise: command failed (exit 1)',
+    });
+  });
+
+  it('failed steps: lists each failed step error as stepErrors in the failure line', async () => {
+    resetSandboxMocks({
+      status: 'failed',
+      stepResults: [
+        {
+          name: 'build',
+          stepIndex: 0,
+          status: 'failed',
+          durationMs: 50,
+          error: { message: 'build failed' },
+        },
+        { name: 'test', stepIndex: 1, status: 'success', durationMs: 100 },
+      ],
+      durationMs: 150,
+    });
+
+    const deps = makeDeps();
+    const runner = new JobRunner(deps);
+
+    await runner.execute(makeDispatch());
+
+    const failLog = loggerMock.error.mock.calls.find(
+      ([msg]) => msg === 'Sandbox returned failed result',
+    );
+    expect(failLog).toBeDefined();
+    expect(failLog![1]).toMatchObject({ stepErrors: 'build: build failed' });
   });
 
   it('sandbox error: executeJob throws, running -> failed with error message', async () => {

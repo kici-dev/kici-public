@@ -29,6 +29,7 @@ import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
 import { LocalSourceConfigSchema } from '../../providers/local/local-source-config.js';
 import { buildLocalTriggerRequest, readRepoHead, sendLocalTrigger } from './local-trigger.js';
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
+import { runGithubManifestSetup } from './source-manifest.js';
 
 /** Default orchestrator base URL for the webhook trigger route, matching the
  *  kici-admin global `--url` default. */
@@ -288,14 +289,41 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .command('github')
     .description('Add a new GitHub App source')
     .requiredOption('--name <name>', 'Human-readable source name')
-    .requiredOption('--app-id <id>', 'GitHub App ID')
+    .option('--app-id <id>', 'GitHub App ID (omit when using --manifest)')
     .option('--private-key <pathOrValue>', 'Private key (prefix with @ for file path)')
     .option('--webhook-secret <secret>', 'Webhook secret')
     .option('--from-env <varName>', 'Read private key from environment variable')
     .option('--stdin', 'Read private key from stdin')
+    .option(
+      '--manifest',
+      'One-click setup: create and configure a new GitHub App via the App Manifest flow',
+    )
+    .option('--no-browser', 'Headless manifest setup: print a URL and paste the setup code back')
+    .option(
+      '--github-org <slug>',
+      'Create the App under a GitHub org instead of your personal account',
+    )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
+      // One-click manifest setup creates AND configures the App for the
+      // operator; the manual path below only stores already-created credentials.
+      if (opts.manifest) {
+        try {
+          await runGithubManifestSetup(
+            { name: opts.name, noBrowser: !opts.browser, githubOrg: opts.githubOrg },
+            getClient(),
+          );
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+        return;
+      }
       try {
+        if (!opts.appId) {
+          console.error('Error: --app-id is required (or use --manifest for one-click setup)');
+          process.exit(1);
+        }
         const privateKey = await resolveSecret({
           value: opts.privateKey,
           stdin: opts.stdin,

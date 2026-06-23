@@ -31,7 +31,82 @@ forge side looks like:
 Use the App when you can; the `github-repo` preset is a fallback for
 repos where you can't install an App.
 
-## Create the GitHub App on GitHub's side
+## One-click setup (recommended)
+
+`kici-admin source add github --manifest` creates **and** configures the
+GitHub App for you via GitHub's App Manifest flow. KiCI builds a manifest
+with the exact permissions, events, webhook URL, and webhook secret baked
+in, so you never pick permissions, paste a URL, generate a secret, or
+download a `.pem` by hand — the App is correct by construction.
+
+```bash
+kici-admin --url http://<orchestrator-host>:4000 --token $KICI_BOOTSTRAP_ADMIN_TOKEN \
+  source add github --manifest --name my-org --github-org my-org
+```
+
+`--github-org <slug>` creates the App under a GitHub **organization** (the
+`<slug>` is the org's `github.com/<slug>` URL slug, not its display name) — the
+recommended default, since org-owned Apps can be installed across the org. Drop
+the flag only when you deliberately want a personal-account App, which can be
+installed solely on repos you own. You need permission to create Apps in that
+org (be an org owner, or have the org allow member App creation).
+
+What happens:
+
+1. The CLI resolves your org's webhook URL and opens GitHub with a
+   pre-filled App manifest. You click **"Create GitHub App"** once — the
+   only manual step.
+2. GitHub redirects back to a localhost callback; the CLI exchanges the
+   returned setup code for the App's id, private key, and webhook secret.
+   **The private key is exchanged and stored only on your orchestrator
+   host — it never transits the KiCI Platform.**
+3. The CLI stores the credentials encrypted under `KICI_SECRET_KEY` and
+   registers the routing key `github:<appId>`, reusing the same storage
+   path as the manual flow.
+4. It opens the App's install page so you can pick repos, then verifies
+   end-to-end: it waits for the installation, mints an installation token,
+   and confirms repo access before declaring success.
+
+```
+$ kici-admin source add github --manifest --name my-org --github-org my-org
+→ Opening GitHub to create your App…
+→ ✓ App created (id 12345), credentials captured
+→ ✓ Stored on orchestrator (encrypted), registered as github:12345
+→ Install the App on your repos: https://github.com/apps/my-org/installations/new
+→ ✓ Installation detected (account my-org)
+→ ✓ Credentials verified (3 repositories reachable)
+
+GitHub App "my-org" is live.
+  Webhook: https://<platform-host>/webhook/<orgId>/github
+```
+
+**Flags:**
+
+| Flag                  | Effect                                                                                                                                                                                                              |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--name <name>`       | The App name on GitHub (required).                                                                                                                                                                                  |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account.                                                                                                                                        |
+| `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it. |
+
+The manifest flow always creates a **new** App on GitHub. If a source for
+that App id already exists on the orchestrator, the command refuses — use
+`source update` to rotate an existing App's credentials.
+
+If any step after App creation fails (e.g. storage), the CLI prints the
+captured App id and writes the private key to a `0600` file, then tells
+you how to finish with the manual `source add github` command — so a
+created App is never orphaned.
+
+Independent-mode orchestrators have no GitHub-App ingress (it is
+Platform-relayed), so the manifest flow is unavailable there; use a
+generic webhook source instead.
+
+## Manual setup (fallback)
+
+When you'd rather create the App by hand — or your environment can't run
+the manifest flow — follow these steps.
+
+### Create the GitHub App on GitHub's side
 
 1. **Decide the App scope.** User-owned Apps can only be installed on
    repos you own; organization-owned Apps can be installed anywhere in
@@ -107,7 +182,7 @@ repos where you can't install an App.
    KiCI runs. Re-install to add repos later — this is live and
    revocable without redeploying the App.
 
-## Register the App with the orchestrator
+### Register the App with the orchestrator
 
 With the App ID, private key `.pem`, and webhook secret in hand:
 

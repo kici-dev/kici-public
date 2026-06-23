@@ -10,16 +10,17 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 1. **General** -- displays the organization name (editable by owners via inline click-to-edit) and the organization ID
 2. **Members** -- team management with invite, role assignment, and member removal
 3. **Roles** -- custom role management with granular permission matrix
-4. **API keys** -- API key creation and revocation for dashboard/programmatic access
-5. **Orchestrator keys** -- orchestrator API key management for Platform WebSocket connections
-6. **Sources** -- read-only list of registered webhook sources (see below)
-7. **Billing** -- plan and payment management
-8. **CI trust** -- trust policy configuration for CI runs (visible with `ci_trust:read` permission)
-9. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
-10. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
-11. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
-12. **Security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
-13. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
+4. **Teams** -- named groups of members whose granted roles are inherited by every member (visible with `teams:read`; managed with `teams:admin`)
+5. **API keys** -- API key creation and revocation for dashboard/programmatic access
+6. **Orchestrator keys** -- orchestrator API key management for Platform WebSocket connections
+7. **Sources** -- read-only list of registered webhook sources (see below)
+8. **Billing** -- plan and payment management
+9. **CI trust** -- trust policy configuration for CI runs (visible with `ci_trust:read` permission)
+10. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
+11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
+12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
+13. **Security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
+14. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
 
 Audit-log-style entries are not a settings tab; they live on the dedicated **Activity** page accessible from the sidebar.
 

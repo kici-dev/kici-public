@@ -2,6 +2,35 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.21 — 2026-06-23
+
+### Features
+
+- `runsOn: [agentId]` now pins a generated job to a specific host, dispatching it directly to that agent.
+- Host inventory: agents report typed host properties at registration (declarable with `kici-admin host declare --prop`), queryable from workflows via `ctx.kici.inventory.query` / `get`.
+- Idempotent steps with check mode: `step()` gains an idempotent check facet, and `kici run --check` / `--fail-on-drift` report or fail a run on configuration drift.
+- One-click GitHub App setup: `source add github --manifest` runs a guided manifest flow that builds, installs, and verifies the App.
+- Reusable, instance-bound join tokens enable self-healing peer rejoin within the token's expiry.
+- Incompatible-schema or malformed lock files are now rejected at the cache with recompile guidance.
+- More reliable remote-worker terminal-status relay: terminal job statuses are durably persisted, acknowledged, and replayed across worker reconnects and peer flaps.
+
+### Fixes
+
+- The CLI main-module guard now tolerates being invoked through a symlink.
+- `corepack prepare` is retried to survive transient registry hiccups.
+- Workflow validation throws a clear error when a `runsOn` element is not a valid matcher.
+- The local runner and executor now provide a `ctx.kici.inventory` mock for local testing.
+- The sandbox-failed agent log line now includes the underlying failure cause.
+
+### Documentation
+
+- Document one-click `--manifest` GitHub App setup as the primary path.
+- Document host inventory query API and host properties.
+- Document idempotent steps and check mode.
+- Document self-healing peer rejoin via reusable join tokens.
+- Document that schema-mismatched locks are rejected with recompile guidance.
+- Quote `push-*` glob examples so the shell does not expand them.
+
 ## v0.1.20 — 2026-06-19
 
 ### Documentation

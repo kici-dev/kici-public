@@ -67,9 +67,18 @@ export class JoinHandler {
       //    parseToken first so the consumedBy label carries the routing key
       //    even before the DB claim succeeds.
       const previewRouting = parseToken(request.token).routing;
+      // The config-bundle bootstrap join.request carries no peer instanceId on
+      // the wire — it is a one-shot fetch of the encrypted config bundle keyed
+      // by the join token, not the ongoing per-peer mesh auth. Use the joiner
+      // routing-key label as both the consumedBy and the consuming instanceId so
+      // a joiner that retries the same bootstrap token (same routing key) is
+      // allowed the same self-healing reuse, while a different routing key is
+      // rejected as already-used.
+      const joinerLabel = `joiner:${previewRouting.routingKey}`;
       const { routing, keys } = await this.tokenManager.validateAndConsumeToken(
         request.token,
-        `joiner:${previewRouting.routingKey}`,
+        joinerLabel,
+        joinerLabel,
       );
 
       // 2. Build config bundle

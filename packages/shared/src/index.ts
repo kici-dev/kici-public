@@ -63,6 +63,7 @@ export {
   isSchemaCurrentFromFilesDirect,
   storeMigrationContentHashInTableDirect,
   createJoinTokenDirect,
+  deleteJoinTokensByCreatedByDirect,
   updateSourceRoutingKeyDirect,
   prunePeerCredentialsDirect,
   waitForPlatformRegistrationsDirect,

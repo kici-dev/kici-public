@@ -76,7 +76,7 @@ function createMockTokenManager(overrides: Partial<Record<string, unknown>> = {}
 
 function createMockCredentialStore() {
   return {
-    save: vi.fn().mockResolvedValue(undefined),
+    save: vi.fn().mockResolvedValue({ revokedCount: 0 }),
     findByCredentialHash: vi.fn().mockResolvedValue(null),
     findByInstanceId: vi.fn().mockResolvedValue(null),
     updateLastSeen: vi.fn().mockResolvedValue(undefined),
@@ -240,11 +240,13 @@ describe('PeerHandler', () => {
 
       const { sessionKey } = await authenticateWithToken(handler, ws);
 
-      // Atomic validate+consume should have fired with the token + this
-      // coordinator's instance ID as the consumedBy attribution.
+      // Atomic validate+consume should have fired with the token, this
+      // coordinator's instance ID as the consumedBy attribution, and the
+      // joining peer's instanceId recorded as consumed_by_instance.
       expect(tokenManager.validateAndConsumeToken).toHaveBeenCalledWith(
         'kici_join_v1.test.token',
         'handler-orch',
+        'remote-peer',
       );
       // Credential should have been saved
       expect(credentialStore.save).toHaveBeenCalledWith(
@@ -281,6 +283,51 @@ describe('PeerHandler', () => {
       expect(authResponse.sessionCredential.length).toBe(64); // 32 bytes hex
       expect(authResponse.role).toBe('coordinator');
       expect(authResponse.instanceId).toBe('handler-orch');
+    });
+
+    it('accepts a returning peer re-presenting its own consumed token with no prior credential', async () => {
+      // Self-heal lockout recovery: a peer lost its credential (transient
+      // outage / deleted credential file) and re-presents its still-valid
+      // join token. The token manager now accepts the same-instance reuse
+      // (returns routing instead of throwing), so the primary path issues a
+      // fresh credential — no recovery branch, no redeploy. findByInstanceId
+      // returns null (the credential is gone), proving the issuance comes
+      // from the primary token path, not the credential-match recovery branch.
+      const { handler, tokenManager, credentialStore } = createTestHandler();
+      credentialStore.findByInstanceId.mockResolvedValue(null);
+      const ws = new MockPeerWs();
+
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      // The manager was asked to validate with the joining peer's instanceId.
+      expect(tokenManager.validateAndConsumeToken).toHaveBeenCalledWith(
+        'kici_join_v1.test.token',
+        'handler-orch',
+        'remote-peer',
+      );
+      // A fresh credential was issued via the primary path.
+      expect(credentialStore.save).toHaveBeenCalledWith(
+        expect.objectContaining({ instanceId: 'remote-peer', role: 'coordinator' }),
+      );
+      // The recovery branch's credential lookup never fired on the happy path.
+      expect(credentialStore.findByInstanceId).not.toHaveBeenCalled();
+
+      let authResponse: any = null;
+      for (const msg of ws.sentMessages.slice(1)) {
+        try {
+          const parsed = JSON.parse(decryptMessage(msg, sessionKey));
+          if (parsed.type === 'peer.auth.response') {
+            authResponse = parsed;
+            break;
+          }
+        } catch {
+          /* not this message */
+        }
+      }
+      expect(authResponse).not.toBeNull();
+      expect(authResponse.accepted).toBe(true);
+      expect(authResponse.sessionCredential).toBeDefined();
+      expect(authResponse.sessionCredential.length).toBe(64);
     });
 
     it('rejects invalid join token', async () => {

@@ -286,6 +286,77 @@ describeDb('HostRosterStore', () => {
       expect(host.lifecycleClass).toBe('ephemeral');
     });
   });
+
+  describe('host properties + inventory', () => {
+    const grace = 5 * 60_000;
+    const baseUpsert = (over: Partial<Parameters<HostRosterStore['upsert']>[0]>) => ({
+      agentId: 'h1',
+      tokenId: null,
+      lifecycleClass: 'static' as const,
+      labels: ['role:db'],
+      hostname: 'h1',
+      platform: 'linux',
+      arch: 'x64',
+      instanceId: 'orch-A',
+      ...over,
+    });
+
+    it('upsert stores properties; a second upsert shallow-merges (agent keys win)', async () => {
+      await store.upsert(baseUpsert({ properties: { region: 'eu', cores: 4 } }));
+      await store.upsert(baseUpsert({ properties: { cores: 8, gpu: true } }));
+      const row = await store.get('h1');
+      // region preserved (operator/earlier key the second report omits), cores
+      // overwritten by the second report, gpu added.
+      expect(row?.host_properties).toEqual({ region: 'eu', cores: 8, gpu: true });
+    });
+
+    it('declareStatic sets properties to the provided bag (default {})', async () => {
+      await store.declareStatic({
+        agentId: 'd1',
+        labels: ['role:db'],
+        properties: { region: 'us' },
+      });
+      expect((await store.get('d1'))?.host_properties).toEqual({ region: 'us' });
+      await store.declareStatic({ agentId: 'd2', labels: [] });
+      expect((await store.get('d2'))?.host_properties).toEqual({});
+    });
+
+    it('findMatching exposes parsed properties on MatchedHost', async () => {
+      await store.upsert(baseUpsert({ properties: { region: 'eu', cores: 8 } }));
+      const [host] = await store.findMatching([[exact('role:db')]], [], grace);
+      expect(host.properties).toEqual({ region: 'eu', cores: 8 });
+    });
+
+    it('queryInventory(undefined) returns every host as a HostInventoryEntry', async () => {
+      await store.upsert(baseUpsert({ agentId: 'inv-a', properties: { region: 'eu' } }));
+      await store.declareStatic({ agentId: 'inv-b', labels: ['role:web'] });
+      const all = await store.queryInventory(undefined, grace);
+      expect(all.map((h) => h.agentId).sort()).toEqual(['inv-a', 'inv-b']);
+      const a = all.find((h) => h.agentId === 'inv-a')!;
+      expect(a.properties).toEqual({ region: 'eu' });
+      expect(a.labels).toEqual(['role:db']);
+      expect(a.status).toBe(HostStatus.ready);
+      expect(a.lifecycleClass).toBe('static');
+      expect(typeof a.lastSeen).toBe('string');
+      const b = all.find((h) => h.agentId === 'inv-b')!;
+      expect(b.status).toBe(HostStatus.unreachable);
+    });
+
+    it('queryInventory(selector) filters by label', async () => {
+      await store.upsert(baseUpsert({ agentId: 'db-1', labels: ['role:db'] }));
+      await store.upsert(baseUpsert({ agentId: 'web-1', labels: ['role:web'] }));
+      const dbs = await store.queryInventory({ include: [[exact('role:db')]] }, grace);
+      expect(dbs.map((h) => h.agentId)).toEqual(['db-1']);
+    });
+
+    it('getInventory returns the entry or null', async () => {
+      await store.upsert(baseUpsert({ agentId: 'g1', properties: { gpu: true } }));
+      const entry = await store.getInventory('g1', grace);
+      expect(entry?.agentId).toBe('g1');
+      expect(entry?.properties).toEqual({ gpu: true });
+      expect(await store.getInventory('missing', grace)).toBeNull();
+    });
+  });
 });
 
 // deriveHostStatus is a pure function — test it without a DB.

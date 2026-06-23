@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CheckMode, CheckStepOutcome } from '../../check-mode.js';
 import { actorPrincipalSchema } from './actor.js';
 import { kiciBundleSchema } from '../../provenance/bundle.js';
 import {
@@ -62,6 +63,10 @@ const dashboardStepDetailSchema = z.object({
   stepType: z.string().optional(),
   /** Secret context names accessed by this step. null = tracking not available. */
   secretsAccessed: z.array(z.string()).nullable().optional(),
+  /** Idempotent per-step outcome under a check mode. null/absent for non-check runs. */
+  checkOutcome: CheckStepOutcome.nullable().optional(),
+  /** Human-readable drift summary, present when the step reported drift. */
+  driftSummary: z.string().nullable().optional(),
 });
 
 /** Job detail within a run detail response. */
@@ -1757,6 +1762,8 @@ export const testRelayTriggerRequestSchema = z.object({
   cliPublicKey: z.string().optional(),
   inlineLockFile: z.string().optional(),
   fullRepo: z.boolean().optional(),
+  /** Run mode for idempotent steps; relayed onto the dispatch event. Omitted = apply. */
+  checkMode: CheckMode.optional(),
   secrets: z.record(z.string(), z.string()).optional(),
   encryptedSecrets: z.string().optional(),
   encryptedSecretsKey: z.string().optional(),
@@ -2119,6 +2126,8 @@ export type RegistrationItem = z.infer<typeof registrationItemSchema>;
 export const dashboardRunDetailApiResponseSchema = z.object({
   jobs: z.array(dashboardJobDetailSchema),
   trustContext: trustContextSchema.optional(),
+  /** Run mode for idempotent steps. A non-apply value labels the run a check-mode preview. */
+  checkMode: CheckMode.nullable().optional(),
   /**
    * Structured init-failure signal for runs that never started a step. Set
    * when the run row was created via `recordInitFailureRun()` on the

@@ -22,6 +22,7 @@ import {
   type PeerToPeerMessage,
   type JobReroute,
   type JobProgress,
+  type JobProgressAck,
   type PeerScalerEvent,
   type PeerJobCancel,
   type PeerLogChunk,
@@ -88,7 +89,7 @@ export interface PeerHandlerDeps {
   /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
   /** Callback when a job progress update is received from peer. */
-  onJobProgress: (msg: JobProgress) => void;
+  onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
   /** Callback when a scaler provisioning event is forwarded by a worker peer. */
   onPeerScalerEvent?: (msg: PeerScalerEvent) => void;
   /** Callback when a job cancel request is received from peer. */
@@ -353,7 +354,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'job.progress': {
-        onJobProgress(msg);
+        onJobProgress(msg, (out) => sendEncryptedMessage(conn.ws, conn.sessionKey, out));
         break;
       }
 
@@ -790,7 +791,17 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         // branch below. The atomicity is what keeps multiple coordinators
         // from each issuing their own credential for the same instanceId
         // off a single join token.
-        const result = await tokenManager.validateAndConsumeToken(authMsg.token, instanceId);
+        //
+        // The joining peer's instanceId (authMsg.instanceId) is recorded as
+        // consumed_by_instance so the SAME peer can re-present its still-valid
+        // join token after losing its credential (transient outage / deleted
+        // credential file) and self-heal without a redeploy. `instanceId` here
+        // is the local coordinator's own id (the consumedBy / consumer).
+        const result = await tokenManager.validateAndConsumeToken(
+          authMsg.token,
+          instanceId,
+          authMsg.instanceId,
+        );
 
         // Enforce role
         if (!acceptedRoles.includes(result.routing.role)) {
@@ -815,12 +826,23 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         const credentialHash = sha256(credential);
 
         // Save credential to DB
-        await credentialStore.save({
+        const saveResult = await credentialStore.save({
           instanceId: authMsg.instanceId,
           credentialHash,
           role: result.routing.role,
           routingKeys: [result.routing.routingKey],
           sourceTokenHash: result.keys.validationHash,
+        });
+
+        // A token-join issues a fresh credential and revokes the prior active
+        // one for this instanceId. Because that credential is shared across the
+        // joining orchestrator's sibling peer-clients, a revokedCount > 0 here
+        // invalidates those siblings' in-flight proofs — log it so a
+        // revoke-driven sibling cascade is visible.
+        logger.info('Peer credential issued via token join', {
+          peerInstanceId: authMsg.instanceId,
+          trigger: 'token-join',
+          revokedPriorCredentials: saveResult.revokedCount,
         });
 
         // Get local inventory for auth response
@@ -879,7 +901,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
 
               const credential = randomBytes(32).toString('hex');
               const credentialHash = sha256(credential);
-              await credentialStore.save({
+              const retrySave = await credentialStore.save({
                 instanceId: authMsg.instanceId,
                 credentialHash,
                 role: parsed.routing.role,
@@ -890,6 +912,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
               logger.info('Peer idempotent token retry accepted', {
                 peerInstanceId: authMsg.instanceId,
                 sourceTokenHash: presentedHash,
+                trigger: 'idempotent-token-retry',
+                revokedPriorCredentials: retrySave.revokedCount,
               });
 
               const inventory = getLocalInventory();
@@ -933,7 +957,14 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       const stored = await credentialStore.findByInstanceId(authMsg.instanceId);
 
       if (!stored) {
-        logger.warn('Peer credential not found', { peerInstanceId: authMsg.instanceId });
+        // A peer presented an HMAC proof but no active credential row exists
+        // for its instanceId — typically because a sibling/self token-join just
+        // revoked the shared credential. The peer will delete its credential
+        // file and fall back to its join token on reconnect.
+        logger.warn('Peer credential not found', {
+          peerInstanceId: authMsg.instanceId,
+          authPath: 'credential-proof',
+        });
         sendEncryptedMessage(ws, sessionKey, {
           type: 'peer.auth.response',
           accepted: false,
@@ -946,7 +977,11 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       if (stored.revokedAt) {
-        logger.warn('Peer credential revoked', { peerInstanceId: authMsg.instanceId });
+        logger.warn('Peer credential revoked', {
+          peerInstanceId: authMsg.instanceId,
+          authPath: 'credential-proof',
+          revokedAt: stored.revokedAt.toISOString(),
+        });
         sendEncryptedMessage(ws, sessionKey, {
           type: 'peer.auth.response',
           accepted: false,
@@ -971,7 +1006,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         proofBuffer.length !== expectedProof.length ||
         !timingSafeEqual(proofBuffer, expectedProof)
       ) {
-        logger.warn('Peer HMAC proof invalid', { peerInstanceId: authMsg.instanceId });
+        logger.warn('Peer HMAC proof invalid', {
+          peerInstanceId: authMsg.instanceId,
+          authPath: 'credential-proof',
+        });
         sendEncryptedMessage(ws, sessionKey, {
           type: 'peer.auth.response',
           accepted: false,

@@ -37,7 +37,9 @@ This model also enables fully self-hosted deployment: all three tiers can run on
 
 ### Platform
 
-The Platform tier is a thin webhook router. It verifies inbound webhook signatures, relays the payload to the correct orchestrator over WebSocket, and writes a delivery row to its event log. It does not process, store, or execute any customer code. Multi-tenant SaaS specifics (Stripe-driven billing, dashboard surface, identity provider integration) are documented in the internal docs.
+The Platform is KiCI's hosted, multi-tenant control plane. It provides the hosted dashboard (run listing, run detail, live log streaming, settings), identity and authentication (OIDC, personal access tokens, API keys, JWTs), multi-tenant organization / team / role-based access management, billing, and webhook ingestion -- verifying inbound signatures (HMAC-SHA256, timing-safe) and relaying payloads to the correct orchestrator over WebSocket. It aggregates execution telemetry and status forwarded by orchestrators, registers sources, and matchmakes peers for clustering.
+
+The Platform never processes, stores, or executes customer code, and never sees customer secrets. It routes webhook payloads and aggregates execution status; the code itself only ever lives on the customer's orchestrator and agent tiers. In the execution path the Platform is deliberately thin -- it does not run jobs -- but functionally it is a full platform, not merely a relay. The hosted Platform is EU-sovereign.
 
 ### Orchestrator (`@kici-dev/orchestrator`)
 
@@ -72,7 +74,7 @@ The agent is the execution worker. It runs on customer infrastructure and has fu
 
 Shared business logic used by all three tiers. Single source of truth for cross-tier concerns. Has no internal `@kici-dev/*` dependencies -- only a handful of third-party libraries.
 
-- Protocol message schemas (Zod-based, direction-specific unions including dashboard REST-over-WS, browser live streaming, test run lifecycle, observer channel, log pull, run events, peer-to-peer, cluster join, and source registration)
+- Protocol message schemas (Zod-based, direction-specific unions including dashboard REST-over-WS, browser live streaming, the test-relay control plane, log pull, run events, peer-to-peer, cluster join, and source registration)
 - Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, CloneTokenProvider, RepoUrlBuilder, ContributorResolver, CheckStatusPoster)
 - Trigger matching engine (branch, path, event evaluation)
 - Execution state machine (11 states, 16 events, pure functions)

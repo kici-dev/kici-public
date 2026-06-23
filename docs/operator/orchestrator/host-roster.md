@@ -16,6 +16,7 @@ One row per agent, keyed by its agent id:
 - **Connected instance** — which orchestrator instance currently holds the agent's live connection, or empty when the agent is disconnected. In a cluster this is the shared liveness signal: every instance agrees on a host's status because it derives from this shared column, not from any one instance's in-memory registry.
 - **Last seen** — a coarse heartbeat timestamp (updated on register, on a throttled cadence while connected, and cleared of ownership on disconnect).
 - **Hostname / platform / arch** — metadata reported by the agent.
+- **Properties** — a typed host-vars bag (`string | number | boolean` values), the place for facts like `region`, `cores`, or `gpu`. Distinct from labels: labels are the flat-string grouping/targeting dimension, properties are typed key/value host-vars. Reported by the agent (`KICI_PROPERTIES`) and/or pre-declared by the operator (`host declare --prop`), shallow-merged on each registration so agent-reported keys win and operator-set keys the agent does not report are preserved.
 
 The roster lives in the orchestrator's shared cluster database (one table, all instances read and write it).
 
@@ -93,6 +94,14 @@ kici-admin host get --agent-id web-01 --json
 # dials in, the host reads `unreachable` — the "expected but not yet here"
 # state for bootstrapping a metal box.
 kici-admin host declare --agent-id web-09 --labels role:web --hostname web-09
+
+# Pre-declare with typed properties (repeatable --prop key=value).
+kici-admin host declare --agent-id db-01 --labels role:db \
+  --prop region=eu --prop cores=8 --prop gpu=true
 ```
 
 A pre-declared static host is the bootstrap path: you record that a box _should_ exist (with its labels) before it has ever connected, so its absence is visible from the moment it is declared rather than only after it has connected once.
+
+### Host properties
+
+`--prop key=value` is repeatable and the value is **typed**: `true` / `false` become booleans, an integer or decimal literal becomes a number, and everything else stays a string. The declared properties seed the roster row's property bag; when the agent later connects and reports its own `KICI_PROPERTIES`, the two are shallow-merged (agent-reported keys win, operator-set keys the agent does not report are preserved). Properties are queryable from workflows via `ctx.kici.inventory` — see the [SDK runtime reference](../../user/sdk/runtime.md) for the inventory query API and the dynamic-job fan-out pattern.

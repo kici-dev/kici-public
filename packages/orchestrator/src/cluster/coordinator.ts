@@ -16,6 +16,7 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
   JobReroute,
   JobProgress,
+  JobProgressAck,
   PeerScalerEvent,
   PeerJobCancel,
   PeerToPeerMessage,
@@ -434,7 +435,7 @@ export class RunCoordinator {
    * this split, every job-level event was silently funnelled into
    * `onStepStatus` and the run stayed in `running` forever.
    */
-  onPeerJobProgress(msg: JobProgress): void {
+  onPeerJobProgress(msg: JobProgress, reply?: (m: JobProgressAck) => void): void {
     if (this.executionTracker) {
       const trackerCall =
         msg.kind === 'job'
@@ -456,14 +457,45 @@ export class RunCoordinator {
               msg.data,
             );
 
-      trackerCall.catch((err) => {
-        logger.error('Failed to track peer job progress', {
-          error: toErrorMessage(err),
-          runId: msg.runId,
-          jobId: msg.jobId,
-          kind: msg.kind,
+      trackerCall
+        .then(async () => {
+          // Re-assert the durable `rerouted_to_peer` marker now that the
+          // worker's status has created the execution_jobs row. The
+          // reroute-time markJobReroutedToPeer UPDATE (in trackReroutedJob)
+          // ran before the row existed — a rerouted job's row is created
+          // lazily by the worker's FIRST status update, which arrives seconds
+          // after the reroute ACK — so that UPDATE matched zero rows and the
+          // marker was silently dropped. Without the marker the run-recovery
+          // sweepers' defer guard cannot see that the job belongs to a worker
+          // peer and force-fail it the moment its heartbeat goes stale.
+          // Idempotent and cheap; skipped on terminal updates (the marker is
+          // moot once the job is done, and reroutedJobs is cleared below).
+          const tracked = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
+          if (tracked && this.executionTracker && !TERMINAL_JOB_STATES.has(msg.state)) {
+            await this.executionTracker.markJobReroutedToPeer(msg.runId, msg.jobId, tracked.peerId);
+          }
+
+          // ACK a terminal job-level update back to the worker only after the
+          // tracker apply resolves. The worker uses this to prune its durable
+          // outbox. Replayed terminals (already-applied) still resolve and so
+          // still ack, which lets the worker prune after a coordinator restart.
+          if (msg.kind === 'job' && TERMINAL_JOB_STATES.has(msg.state)) {
+            reply?.({
+              type: 'job.progress.ack',
+              runId: msg.runId,
+              jobId: msg.jobId,
+              state: msg.state,
+            });
+          }
+        })
+        .catch((err) => {
+          logger.error('Failed to track peer job progress', {
+            error: toErrorMessage(err),
+            runId: msg.runId,
+            jobId: msg.jobId,
+            kind: msg.kind,
+          });
         });
-      });
     }
 
     // Clean up rerouted-job tracking on terminal job-level updates so
@@ -773,7 +805,12 @@ export class RunCoordinator {
         // Track rerouted job under the *allocated* jobId (not the wire
         // messageId) so cancel propagation and the onPeerJobProgress
         // residual-cleanup path see the same key the worker reports back.
-        this.trackReroutedJob(runContext.runId, allocatedJobId, peer.instanceId, job.jobName);
+        // This records the in-memory reroute mapping; the durable
+        // `rerouted_to_peer` marker is (re)asserted in onPeerJobProgress once
+        // the worker's first status creates the execution_jobs row (the row
+        // does not exist yet at reroute-ACK time, so a marker write here would
+        // be a no-op UPDATE).
+        await this.trackReroutedJob(runContext.runId, allocatedJobId, peer.instanceId, job.jobName);
 
         logger.info('Job rerouted to peer', {
           runId: runContext.runId,
@@ -849,15 +886,26 @@ export class RunCoordinator {
   }
 
   /**
-   * Track a rerouted job for cancel propagation.
+   * Track a rerouted job for cancel propagation, and durably tag the projected
+   * `execution_jobs` row with the owning worker peer so run-recovery sweepers
+   * do not force-fail the job while its worker is connected.
    */
-  private trackReroutedJob(runId: string, jobId: string, peerId: string, jobName: string): void {
+  private async trackReroutedJob(
+    runId: string,
+    jobId: string,
+    peerId: string,
+    jobName: string,
+  ): Promise<void> {
     let runJobs = this.reroutedJobs.get(runId);
     if (!runJobs) {
       runJobs = new Map();
       this.reroutedJobs.set(runId, runJobs);
     }
     runJobs.set(jobId, { peerId, jobName });
+
+    if (this.executionTracker) {
+      await this.executionTracker.markJobReroutedToPeer(runId, jobId, peerId);
+    }
   }
 }
 

@@ -329,7 +329,18 @@ export class Dispatcher {
       ) {
         // No backend AND no registered agent. Job stays queued (will expire on
         // timeout) but signal queued-no-backend so the coordinator can try peer
-        // rerouting while the local entry serves as fallback.
+        // rerouting while the local entry serves as fallback. Log WHY (required
+        // selectors vs every registered agent's labels/capacity) so the outcome
+        // is diagnosable without re-running — distinguishes a label/value
+        // mismatch from at-capacity from no-agent-connected.
+        logger.warn('Job has no matching backend (queued-no-backend)', {
+          runId: job.runId,
+          jobName: job.jobName,
+          requiredLabels: job.runsOnLabels,
+          requiredPatterns: (job.runsOnPatterns ?? []).map((p) => JSON.stringify(p)),
+          excludeLabels: job.excludeLabels ?? [],
+          registeredAgents: this.registry.agentSummaries(),
+        });
         return { status: 'queued-no-backend', jobId };
       }
       // 'spawning': scaler bound the job to the agent it's spawning -- agent
@@ -410,6 +421,23 @@ export class Dispatcher {
     // The pinned agent is absent / busy: queue with the pin and wait. The
     // pin-aware drain (dequeueByPinnedAgent on register / onAgentAvailable)
     // delivers it once the agent is live with capacity.
+    logger.info('Pinned job queued with pin (agent not immediately dispatchable)', {
+      jobName: job.jobName,
+      runId: job.runId,
+      pinnedAgentId: agentId,
+      agentRegistered: !!agent,
+      satisfies: agent
+        ? this.registry.agentSatisfies(
+            agent,
+            job.runsOnLabels,
+            job.runsOnPatterns ?? [],
+            job.excludeLabels ?? [],
+            job.excludePatterns ?? [],
+          )
+        : false,
+      activeJobs: agent?.activeJobs,
+      maxConcurrency: agent?.maxConcurrency,
+    });
     let jobId: string;
     try {
       jobId = await this.queue.enqueue(job);

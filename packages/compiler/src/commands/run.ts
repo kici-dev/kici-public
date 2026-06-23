@@ -497,6 +497,7 @@ async function runSingleFixture(
       // Always fullRepo: the overlay carries the complete local working tree;
       // the orchestrator never clones for a relayed run.
       fullRepo: true,
+      ...(options.checkMode && { checkMode: options.checkMode }),
     });
 
     if (triggerResult.status === 'rejected') {
@@ -772,6 +773,7 @@ async function runDirectWorkflow(
       inlineLockFile: overlay.inlineLockFile,
       // Always fullRepo: the overlay carries the complete local working tree.
       fullRepo: true,
+      ...(options.checkMode && { checkMode: options.checkMode }),
     });
 
     if (!options.quiet) {

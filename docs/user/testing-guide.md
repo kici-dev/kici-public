@@ -66,11 +66,13 @@ kici run remote
 kici run remote push-main
 
 # Run all fixtures matching a glob
-kici run remote push-*
+kici run remote 'push-*'
 
 # Run everything
 kici run remote --all
 ```
+
+The single quotes keep your shell from expanding `push-*` against local files, so the pattern reaches KiCI intact for its own fixture-glob matching.
 
 ## Fixture reference
 
@@ -167,7 +169,7 @@ kici run remote
 kici run remote push-main
 
 # Glob matching -- run all push-related fixtures
-kici run remote push-*
+kici run remote 'push-*'
 
 # Run all fixtures sequentially
 kici run remote --all

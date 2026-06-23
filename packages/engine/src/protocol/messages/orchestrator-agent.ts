@@ -262,6 +262,12 @@ export const agentRegisterSchema = z.object({
   runningAsUser: z.string().optional(),
   /** UID of the OS user running the agent process */
   runningAsUid: z.number().optional(),
+  /**
+   * Agent-reported typed host-vars (the `KICI_PROPERTIES` bag). Values are
+   * `string | number | boolean`; shallow-merged into the host roster's
+   * `host_properties` (agent-reported keys win). Optional — omitted ⇒ none.
+   */
+  properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
 
 /** Periodic agent status update. */

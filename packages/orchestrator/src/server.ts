@@ -22,7 +22,7 @@ import {
   initTelemetry,
   toErrorMessage,
 } from '@kici-dev/shared';
-import { OrchRole } from '@kici-dev/engine';
+import { OrchRole, githubWebhookPath } from '@kici-dev/engine';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // The six workspace dep fingerprints power the SDK drift diagnostic — compare
@@ -81,7 +81,7 @@ const { BindingStore } = await import('./environments/binding-store.js');
 const { handleRerun } = await import('./pipeline/rerun.js');
 const { handleManualSchedule } = await import('./pipeline/manual-schedule.js');
 const { SecretResolver } = await import('./secrets/index.js');
-const { PeerClient } = await import('./cluster/index.js');
+const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { TrustResolver } = await import('./security/trust-resolver.js');
 const { ContributorCache } = await import('./security/contributor-cache.js');
 const { HeldRunStore } = await import('./environments/held-runs.js');
@@ -767,13 +767,27 @@ await guardStartup(logger, async () => {
       // handshake the onAuthenticated callback re-keys the entry from
       // initialKey to the canonical target instanceId so subsequent discovery
       // events dedupe against the same client.
+      // One coordinator shared by every sibling peer-client of this
+      // orchestrator: it owns the credential file and serializes token-joins so
+      // a reconnect storm never cascades credential revocations across siblings.
+      const peerCredentialFile = config.cluster.credentialFile.replace(
+        /^~/,
+        process.env.HOME ?? '~',
+      );
+      const peerAuthCoordinator = new PeerAuthCoordinator({
+        credentialFile: peerCredentialFile,
+        instanceId: config.instanceId,
+        joinToken: config.cluster.joinToken,
+      });
+
       const createOutboundPeerClient = (rawUrl: string, initialKey: string): PeerClientT => {
         const peerUrl = rawUrl.replace(/^https?:\/\//, 'ws://') + '/ws/peer';
         let client: PeerClientT;
         client = new PeerClient({
           url: peerUrl,
           joinToken: config.cluster.joinToken,
-          credentialFile: config.cluster.credentialFile.replace(/^~/, process.env.HOME ?? '~'),
+          credentialFile: peerCredentialFile,
+          authCoordinator: peerAuthCoordinator,
           instanceId: config.instanceId,
           peerRegistry: sub.peerRegistry,
           getLocalInventory: sub.getLocalInventory,
@@ -788,7 +802,7 @@ await guardStartup(logger, async () => {
               reason: result.reason,
             });
           },
-          onJobProgress: (msg) => sub.coordinator.onPeerJobProgress(msg),
+          onJobProgress: (msg, reply) => sub.coordinator.onPeerJobProgress(msg, reply),
           onJobCancel: (msg) => {
             if (!msg.jobId) return;
             const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);
@@ -1517,6 +1531,27 @@ await guardStartup(logger, async () => {
         }
       };
 
+      // Resolve the org-scoped GitHub webhook URL for the manifest setup
+      // pre-flight. The URL is org-scoped (not app-scoped), so it can be
+      // computed before any App exists. The org id comes from the
+      // Platform-identified `remote_sources` anchor; the public base from
+      // `config.webhookPublicUrl`. Returns null + a note when either is
+      // missing so the CLI can surface an honest "not yet available" message.
+      const resolveGithubWebhookUrl = async (): Promise<{
+        webhookUrl: string | null;
+        webhookNote?: string;
+      }> => {
+        const orgId = resolvedOrgContext?.orgId;
+        if (!orgId) {
+          return { webhookUrl: null, webhookNote: 'org-not-identified' };
+        }
+        if (!config.webhookPublicUrl) {
+          return { webhookUrl: null, webhookNote: 'platform-no-public-url' };
+        }
+        const base = config.webhookPublicUrl.replace(/\/$/, '');
+        return { webhookUrl: `${base}${githubWebhookPath(orgId)}` };
+      };
+
       return {
         appDepsExtras: {
           platformClient,
@@ -1527,6 +1562,7 @@ await guardStartup(logger, async () => {
           globalWorkflowPolicy,
           contributorCache,
           resolveSourceWebhookUrl,
+          resolveGithubWebhookUrl,
           // Resume a workflow whose install-gate wait-timer / concurrency hold
           // released (same path as a reviewer approval).
           onWorkflowRelease: (signal: ReleaseSignal) =>

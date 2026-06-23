@@ -159,6 +159,9 @@ export type {
   OutputProxy,
   Step,
   StepOptions,
+  StepOptionsBase,
+  StepOptionsPlain,
+  StepOptionsWithCheck,
   StepRunFn,
   BareStepFn,
   StepInput,
@@ -239,6 +242,9 @@ export type {
   KiciApiTransport,
   InfrastructureApi,
   InfrastructureListResult,
+  InventoryApi,
+  HostInventoryEntry,
+  InventorySelector,
 } from './api-types.js';
 
 // Error types

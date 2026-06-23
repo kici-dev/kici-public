@@ -12,6 +12,10 @@ import { LRUCache } from 'lru-cache';
 import { LockFileParseError, type LockFileFetcher, type LockFile } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { assertLockFileRegexesSafe } from './lockfile-redos-guard.js';
+import {
+  assertLockFileSchemaCompatible,
+  assertLockFileMatchersValid,
+} from './lockfile-validate.js';
 
 const logger = createLogger({ prefix: 'lockfile-cache' });
 
@@ -92,14 +96,19 @@ export class LockFileCache {
       return null;
     }
 
-    // Re-validate every regex matcher for ReDoS before caching or dispatching.
-    // A lock that smuggled a ReDoS-prone pattern past the compile-time gate is a
-    // definitive, non-cacheable failure — surface it like an unparseable lock.
+    // Re-validate the lock before caching or dispatching: schemaVersion
+    // compatibility, well-formed routing matchers, and ReDoS-safe regexes. Any
+    // failure is a definitive, customer-actionable corrupt lock — surface it as
+    // a LockFileParseError so the pipeline records a lockfile_corrupt run.
+    // Ordering matters: matcher-shape rejection runs before the ReDoS check,
+    // which assumes well-formed matchers.
     try {
+      assertLockFileSchemaCompatible(lockFile);
+      assertLockFileMatchersValid(lockFile);
       assertLockFileRegexesSafe(lockFile);
     } catch (error: unknown) {
       const message = toErrorMessage(error);
-      logger.warn('Lock file carries a ReDoS-prone regex matcher', {
+      logger.warn('Lock file failed post-fetch validation', {
         repoIdentifier,
         ref,
         error: message,

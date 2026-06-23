@@ -23,4 +23,25 @@ export {
   PeerCredentialStore,
   createPeerCredentialStoreFromUrl,
   type PeerCredential,
+  type CredentialFileData,
 } from './cluster/peer-credentials.js';
+
+// Peer auth coordinator (consumed by e2e cluster tests)
+export {
+  PeerAuthCoordinator,
+  type AuthDecision,
+  type RejectionAction,
+} from './cluster/peer-auth-coordinator.js';
+
+// Cluster join-token manager (consumed by e2e tests)
+export { JoinTokenManager, createJoinTokenManagerFromUrl } from './cluster/join-token.js';
+
+// Admin API client + GitHub App manifest setup (consumed by e2e tests that
+// drive the one-click setup orchestration against a deployed orchestrator with
+// the GitHub API boundary stubbed).
+export { AdminApiClient } from './cli/api-client.js';
+export {
+  runGithubManifestSetup,
+  type ManifestSetupOptions,
+  type ManifestSetupDeps,
+} from './cli/commands/source-manifest.js';

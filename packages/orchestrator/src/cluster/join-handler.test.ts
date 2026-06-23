@@ -209,9 +209,12 @@ describe('JoinHandler', () => {
     expect(response.success).toBe(true);
     // The atomic claim fires exactly once and is itself the consume step.
     expect(mockTokenMgr.validateAndConsumeToken).toHaveBeenCalledTimes(1);
-    // It must carry a joiner-attribution string for audit.
+    // It must carry a joiner-attribution string for audit, used both as the
+    // consumedBy label and the consuming instanceId (the bootstrap join.request
+    // carries no peer instanceId on the wire).
     expect(mockTokenMgr.validateAndConsumeToken).toHaveBeenCalledWith(
       token,
+      expect.stringMatching(/^joiner:/),
       expect.stringMatching(/^joiner:/),
     );
   });

@@ -11,7 +11,13 @@ WORKDIR /app
 # extracted shims under /usr/lib/nodejs/corepack/dist/*.js land without the
 # executable bit, so the /usr/bin/pnpm symlink fails with exit 126
 # ("Permission denied") when invoked directly. Restore +x after activation.
-RUN corepack enable && corepack prepare pnpm@11.3.0 --activate \
+# Retry corepack prepare: the pnpm tarball download (fetchUrlStream) can fail on
+# a transient registry hiccup, which would otherwise fail the whole image build.
+RUN corepack enable \
+  && { n=0; until corepack prepare pnpm@11.3.0 --activate; do \
+         n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare pnpm failed after $n attempts" >&2; exit 1; }; \
+         echo "corepack prepare pnpm failed (attempt $n), retrying in 5s..." >&2; sleep 5; \
+       done; } \
   && chmod a+x /usr/lib/nodejs/corepack/dist/*.js
 
 # Copy workspace configuration and root package files

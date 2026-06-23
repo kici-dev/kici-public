@@ -350,6 +350,70 @@ const publish = job('publish', {
 - The step never holds platform credentials — the request is relayed through the orchestrator, which mints the token on the step's behalf.
 - Only available inside a running job step; calling it outside one (for example, during local execution) rejects with a clear error.
 
+### ctx.kici.inventory.query(selector?) / .get(agentId)
+
+Query the **host inventory** — the roster of agents in the caller's orchestrator cluster — from inside a workflow. Each host is a `HostInventoryEntry`:
+
+```typescript
+interface HostInventoryEntry {
+  agentId: string;
+  labels: string[]; // flat-string grouping/tags dimension
+  properties: Record<string, string | number | boolean>; // typed host-vars dimension
+  hostname: string | null;
+  platform: string | null;
+  arch: string | null;
+  lifecycleClass: 'static' | 'ephemeral';
+  status: 'ready' | 'unreachable' | 'stale';
+  lastSeen: string; // ISO timestamp
+}
+```
+
+Two dimensions describe a host. **Labels** are flat strings used for grouping and targeting (the same labels `runsOn` / `runsOnAll` match). **Properties** are typed host-vars (`string | number | boolean`) — the place for facts like `region`, `cores`, or `gpu`. A host reports its own properties via the agent's `KICI_PROPERTIES` config, and an operator can pre-declare them with `kici-admin host declare --prop key=value`; the two are shallow-merged (agent-reported keys win).
+
+```typescript
+// All hosts:
+const all = await ctx.kici.inventory.query();
+
+// Server-side label filter (OR-of-AND include groups, plus exclude):
+const dbHosts = await ctx.kici.inventory.query({
+  include: [[{ kind: 'exact', value: 'role:db' }]],
+});
+
+// Property filtering is client-side — plain JS in the workflow:
+const euDbHosts = dbHosts.filter((h) => h.properties.region === 'eu');
+
+// One host by id:
+const host = await ctx.kici.inventory.get('box-1'); // HostInventoryEntry | null
+```
+
+**The label selector is applied server-side** (reusing the same glob/regex matchers as `runsOnAll`). **Property filtering is client-side** — you filter the returned array in plain JavaScript, so there is no query DSL to learn.
+
+**Headline use — dynamic-job fan-out.** A dynamic-job generator can query the inventory and return one job per matching host, fanning a workflow out across a fleet:
+
+```typescript
+const migrate = job('migrate', async (ctx) => {
+  const hosts = await ctx.kici.inventory.query({
+    include: [[{ kind: 'exact', value: 'role:db' }]],
+  });
+  return hosts
+    .filter((h) => h.properties.region === 'eu')
+    .map((h) =>
+      job(`migrate-${h.agentId}`, {
+        runsOn: [h.agentId],
+        run: async (c) => {
+          await c.$`./migrate.sh`;
+        },
+      }),
+    );
+});
+```
+
+A `runsOn` of a single host's `agentId` (as in `runsOn: [h.agentId]` above) **pins the job to that host**: the orchestrator routes it to that agent only, and queues it with the pin if the host is momentarily offline — the same host-pin path `runsOnAll` uses. A `runsOn` with multiple labels or a glob/regex pattern stays ordinary label routing.
+
+`ctx.kici.inventory` is available to **both** steps and dynamic-job generators (unlike `ctx.kici.oidc.token`, which is job-bound — the inventory is cluster-scoped, not job-bound).
+
+**Determinism caveat.** The inventory is **live**: it can change between when a dynamic-job generator first runs (at dispatch) and when it re-evaluates (at agent time). Generating jobs from `inventory.query()` therefore inherits the same non-determinism contract as `infrastructure.list()` — KiCI warns when the re-evaluated job set drifts (a sibling job name changed) and hard-errors when a targeted job vanishes. Prefer stable inputs where you can, and treat a fanned-out job set as a snapshot of the roster at generation time.
+
 ### ctx.attestProvenance({ subject })
 
 Build, sign, and persist a build-provenance attestation for an artifact your step produced. KiCI assembles an in-toto SLSA v1.0 provenance statement whose build identity (`repository`, `ref`, `sha`, run/job ids) comes from the platform — not from the step — so it cannot be spoofed, signs it, and stores a verifiable bundle that the dashboard surfaces and the `kici verify-attestation` CLI checks.

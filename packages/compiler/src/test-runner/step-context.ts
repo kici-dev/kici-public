@@ -187,6 +187,12 @@ export function createStepContext(
       infrastructure: {
         list: () => Promise.resolve({ scalers: [], agents: [] }),
       },
+      inventory: {
+        // The host roster is orchestrator-cluster state; the local test runner
+        // has no cluster, so it reports an empty roster.
+        query: () => Promise.resolve([]),
+        get: () => Promise.resolve(null),
+      },
       oidc: {
         // OIDC ID tokens require the orchestrator->Platform mint relay, which
         // is not available in the local test runner.

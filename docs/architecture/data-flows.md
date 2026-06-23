@@ -5,7 +5,7 @@ description: End-to-end data flows through the KiCI three-tier architecture
 
 This document describes the key data flows through the KiCI architecture: webhook delivery, job execution, developer-initiated remote runs, dependency caching, re-run and cancel, trace ID propagation, internal event routing, and generic webhook ingestion.
 
-> **Lock file schema version:** The lock file uses schema version 17, which widens per-job init to typed presets (`mise` / `{ mise }`) and `auto` detection on top of v16's normalized approval config, v15's per-job init config, v14's declarative cache specs, v11's `LockInlineValue` for pure function inline evaluation, v10's simplified negative patterns (! prefix in repos/paths arrays), v9's global workflow repos matching, and v8's runsOn polymorphic type support.
+> **Lock file schema version:** The lock file uses schema version 21, which adds the `CheckMode` / `CheckStepOutcome` enums for check-mode step execution on top of v20's `LabelMatcher` (exact/regex) selectors for `runsOn`/`runsOnAll`/`excludeLabels`, v19's `maxParallel`/`failFast` fan-out concurrency, v18's `runsOnAll` host fan-out predicate and `onUnreachable` policy, v17's typed init presets (`mise` / `{ mise }`) and `auto` detection, v16's normalized approval config, v15's per-job init config, v14's declarative cache specs, v11's `LockInlineValue` for pure function inline evaluation, v10's simplified negative patterns (! prefix in repos/paths arrays), v9's global workflow repos matching, and v8's runsOn polymorphic type support.
 
 ## Webhook delivery flow
 
@@ -211,7 +211,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 17.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 21.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -250,7 +250,7 @@ Both source and dep caches use `S3CacheStorage` as the sole backend. The `CacheS
 
 Cache keys reflect that source tarballs and deps have different platform characteristics:
 
-- **Source:** `source/{contentHash}.tar.gz` — platform-agnostic. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(schemaVersion + ":" + rawSource [+ "\0" + assetDigest])`).
+- **Source:** `source/{contentHash}.tar.gz` — platform-agnostic. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(COMPILE_SCHEMA_VERSION + ":" + rawSource [+ "\0" + assetDigest])`, where `COMPILE_SCHEMA_VERSION = 5` and line endings are normalized to LF so the hash agrees across platforms).
 - **Deps:** `deps/{platform}-{arch}/{lockfileHash}.tar.gz` (e.g., `deps/linux-arm64/def456.tar.gz`) — platform-specific. Native dependencies in `node_modules` differ across architectures, so each platform/arch combination gets its own cache entry.
 
 The orchestrator derives the target platform/arch for dep cache lookups by probing `AgentRegistry.findAvailable()` with the workflow's first job's `runsOn` labels to find a representative matching agent, then using that agent's platform and arch. Falls back to `linux/x64` if no matching agents are registered.

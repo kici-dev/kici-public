@@ -1,4 +1,5 @@
 import type { MatrixValues, Job } from '@kici-dev/sdk';
+import type { CheckMode } from '@kici-dev/engine';
 import type { JobResult } from '../test-runner/job-executor.js';
 
 /**
@@ -43,6 +44,12 @@ export interface RunLocalOptions {
   inPlace?: boolean;
   /** --keep: always retain the isolated tmp checkout (default: keep only on failure) */
   keep?: boolean;
+  /**
+   * Run mode resolved from --check / --fail-on-drift. Threads to the agent step
+   * loop: `apply` (default) converges, `check` previews drift, `check-fail-on-drift`
+   * previews drift and fails the run if any step reports drift. Defaults to `apply`.
+   */
+  checkMode?: CheckMode;
 }
 
 /**

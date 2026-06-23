@@ -40,6 +40,16 @@ describe('LabelMatcher eval', () => {
     });
   });
 
+  it('partitionMatchers throws on a non-matcher element (stale string-array runsOn)', () => {
+    // A v19 lock stored runsOn as a plain string array; each element has no `kind`.
+    const stale = ['firecracker', 'arm64'] as unknown as LabelMatcher[];
+    expect(() => partitionMatchers(stale)).toThrow(/recompile/i);
+  });
+
+  it('partitionMatchers returns empty partitions for an empty list', () => {
+    expect(partitionMatchers([])).toEqual({ exact: [], regex: [] });
+  });
+
   it('Zod schema rejects an unknown kind', () => {
     expect(LabelMatcher.safeParse({ kind: 'glob', value: 'x' }).success).toBe(false);
   });

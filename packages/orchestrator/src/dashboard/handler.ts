@@ -159,6 +159,8 @@ interface RunDetailStepRow {
   error_message: string | null;
   step_type: string;
   secrets_accessed: string | null;
+  check_outcome: string | null;
+  drift_summary: string | null;
 }
 
 /** Map a step row to the dashboard run-detail step shape. */
@@ -174,7 +176,69 @@ function mapRunDetailStep(step: RunDetailStepRow) {
     errorMessage: step.error_message ?? null,
     ...(step.step_type !== 'step' && { stepType: step.step_type }),
     secretsAccessed: step.secrets_accessed ?? null,
+    ...(step.check_outcome != null && { checkOutcome: step.check_outcome }),
+    ...(step.drift_summary != null && { driftSummary: step.drift_summary }),
   };
+}
+
+/** A run-detail job row as queried by handleRunDetail (warm + cold paths). */
+interface RunDetailJobRow {
+  job_id: string;
+  job_name: string;
+  status: string;
+  matrix_values: unknown;
+  base_job_name: string | null;
+  variant_kind: string | null;
+  variant_label: string | null;
+  started_at: Date | null;
+  completed_at: Date | null;
+  duration_ms: number | null;
+  agent_id: string | null;
+  error_message: string | null;
+  runs_on_labels: unknown;
+  outputs: unknown;
+  init_failure: unknown;
+}
+
+/** Lookups threaded into {@link buildRunDetailJobs} from the per-run batch queries. */
+interface RunDetailJobLookups {
+  stepsByJob: Map<string, RunDetailStepRow[]>;
+  secretKeysByJob: Map<string, string[]>;
+  needsByJob: Map<string, Array<{ upstreamName: string; ifFailed: 'skip' | 'run' }>>;
+}
+
+/** Map queried job + step rows into the dashboard run-detail job DTO shape. */
+function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJobLookups) {
+  const { stepsByJob, secretKeysByJob, needsByJob } = lookups;
+  return jobs.map((job) => {
+    const jobSteps = stepsByJob.get(job.job_id) ?? [];
+    const jobInitFailure = (job.init_failure as InitFailure | null) ?? undefined;
+    return {
+      jobId: job.job_id,
+      jobName: job.job_name,
+      status: job.status,
+      matrixValues: (job.matrix_values as Record<string, unknown> | null) ?? null,
+      baseJobName: job.base_job_name ?? null,
+      variantKind: job.variant_kind ?? null,
+      variantLabel: job.variant_label ?? null,
+      startedAt: job.started_at ? job.started_at.getTime() : null,
+      completedAt: job.completed_at ? job.completed_at.getTime() : null,
+      durationMs: job.duration_ms ?? null,
+      agentId: job.agent_id ?? null,
+      orchestratorId: null,
+      errorMessage: job.error_message ?? null,
+      runsOnLabels: (job.runs_on_labels as string[] | null) ?? null,
+      outputs: job.outputs
+        ? typeof job.outputs === 'string'
+          ? JSON.parse(job.outputs)
+          : job.outputs
+        : null,
+      secretOutputKeys: secretKeysByJob.get(job.job_id) ?? null,
+      ...(jobInitFailure && { initFailure: jobInitFailure }),
+      needs: needsByJob.get(job.job_name) ?? null,
+      steps: jobSteps.map(mapRunDetailStep),
+    };
+  });
 }
 
 export class DashboardHandler {
@@ -396,10 +460,17 @@ export class DashboardHandler {
             lock_file_source: string | null;
             contributor_username: string | null;
             init_failure: InitFailure | null;
+            check_mode: string | null;
           }
         | undefined = await this.db
         .selectFrom('execution_runs')
-        .select(['trust_tier', 'lock_file_source', 'contributor_username', 'init_failure'])
+        .select([
+          'trust_tier',
+          'lock_file_source',
+          'contributor_username',
+          'init_failure',
+          'check_mode',
+        ])
         .where('run_id', '=', msg.runId)
         .executeTakeFirst();
 
@@ -442,6 +513,8 @@ export class DashboardHandler {
           'error_message',
           'step_type',
           'secrets_accessed',
+          'check_outcome',
+          'drift_summary',
         ])
         .where('run_id', '=', msg.runId)
         .orderBy('step_index', 'asc')
@@ -500,34 +573,10 @@ export class DashboardHandler {
       const needsByJob = groupNeedsByJobName(needsRows);
 
       // Build response
-      const responseJobs = jobs.map((job) => {
-        const jobSteps = stepsByJob.get(job.job_id) ?? [];
-        const jobInitFailure = (job.init_failure as InitFailure | null) ?? undefined;
-        return {
-          jobId: job.job_id,
-          jobName: job.job_name,
-          status: job.status,
-          matrixValues: job.matrix_values ?? null,
-          baseJobName: job.base_job_name ?? null,
-          variantKind: job.variant_kind ?? null,
-          variantLabel: job.variant_label ?? null,
-          startedAt: job.started_at ? job.started_at.getTime() : null,
-          completedAt: job.completed_at ? job.completed_at.getTime() : null,
-          durationMs: job.duration_ms ?? null,
-          agentId: job.agent_id ?? null,
-          orchestratorId: null,
-          errorMessage: job.error_message ?? null,
-          runsOnLabels: (job.runs_on_labels as string[] | null) ?? null,
-          outputs: job.outputs
-            ? typeof job.outputs === 'string'
-              ? JSON.parse(job.outputs)
-              : job.outputs
-            : null,
-          secretOutputKeys: secretKeysByJob.get(job.job_id) ?? null,
-          ...(jobInitFailure && { initFailure: jobInitFailure }),
-          needs: needsByJob.get(job.job_name) ?? null,
-          steps: jobSteps.map(mapRunDetailStep),
-        };
+      const responseJobs = buildRunDetailJobs(jobs, {
+        stepsByJob,
+        secretKeysByJob,
+        needsByJob,
       });
 
       // Build trust context if available (PR-triggered runs)
@@ -550,6 +599,7 @@ export class DashboardHandler {
         jobs: responseJobs,
         ...(trustContext && { trustContext }),
         ...(runInitFailure && { initFailure: runInitFailure }),
+        ...(runRow?.check_mode != null && { checkMode: runRow.check_mode }),
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.run.detail response validation failed', {
@@ -588,6 +638,7 @@ export class DashboardHandler {
         jobs: validated.data.jobs,
         ...(validated.data.trustContext && { trustContext: validated.data.trustContext }),
         ...(validated.data.initFailure && { initFailure: validated.data.initFailure }),
+        ...(validated.data.checkMode != null && { checkMode: validated.data.checkMode }),
       });
     } catch (err) {
       logger.error('Error handling dashboard.run.detail', {
@@ -2540,6 +2591,7 @@ export class DashboardHandler {
           lock_file_source: string | null;
           contributor_username: string | null;
           init_failure: InitFailure | null;
+          check_mode: string | null;
         }
       | undefined;
     jobs: Array<{
@@ -2571,6 +2623,8 @@ export class DashboardHandler {
       error_message: string | null;
       step_type: string;
       secrets_accessed: string | null;
+      check_outcome: string | null;
+      drift_summary: string | null;
     }>;
   }> {
     const out = {
@@ -2580,6 +2634,7 @@ export class DashboardHandler {
             lock_file_source: string | null;
             contributor_username: string | null;
             init_failure: InitFailure | null;
+            check_mode: string | null;
           }
         | undefined,
       jobs: [] as Array<{
@@ -2611,6 +2666,8 @@ export class DashboardHandler {
         error_message: string | null;
         step_type: string;
         secrets_accessed: string | null;
+        check_outcome: string | null;
+        drift_summary: string | null;
       }>,
     };
     if (!this.coldStore) return out;
@@ -2655,6 +2712,7 @@ export class DashboardHandler {
         contributor_username:
           typeof r.contributor_username === 'string' ? r.contributor_username : null,
         init_failure: (r.init_failure as InitFailure | null) ?? null,
+        check_mode: typeof r.check_mode === 'string' ? r.check_mode : null,
       };
     }
     out.jobs = jobRows.map((r) => ({
@@ -2688,6 +2746,8 @@ export class DashboardHandler {
       error_message: typeof r.error_message === 'string' ? r.error_message : null,
       step_type: typeof r.step_type === 'string' ? r.step_type : 'step',
       secrets_accessed: typeof r.secrets_accessed === 'string' ? r.secrets_accessed : null,
+      check_outcome: typeof r.check_outcome === 'string' ? r.check_outcome : null,
+      drift_summary: typeof r.drift_summary === 'string' ? r.drift_summary : null,
     }));
     return out;
   }

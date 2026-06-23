@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/orchestrator",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
   "keywords": [
     "ci",

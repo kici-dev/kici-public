@@ -60,6 +60,7 @@ function createMockExecutionTracker() {
     getRunStatus: vi.fn().mockReturnValue('running'),
     updateInMemoryJob: vi.fn(),
     completeRunIfAllJobsTerminal: vi.fn().mockResolvedValue(undefined),
+    markJobReroutedToPeer: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -241,6 +242,31 @@ describe('RunCoordinator', () => {
       expect(result.reroutedJobs[0].peerId).toBe('peer-1');
       expect(result.failedJobs).toHaveLength(0);
       expect(peerClient.sendAndWaitAck).toHaveBeenCalledTimes(1);
+    });
+
+    it('durably tags the rerouted job row with the owning worker peer', async () => {
+      const peer = makePeerInfo({ instanceId: 'peer-1' });
+      const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
+
+      const { coordinator, deps } = createCoordinator();
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+      deps.getPeerClient.mockReturnValue(peerClient);
+
+      const result = await coordinator.routeJobs(makeRunContext({ runId: 'run-7' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+
+      expect(result.reroutedJobs).toHaveLength(1);
+      const reroutedJobId = result.reroutedJobs[0].jobId;
+      // The marker write must land for the rerouted (runId, jobId) so the
+      // run-recovery sweepers do not force-fail the job while its worker peer
+      // is connected.
+      expect(deps.executionTracker.markJobReroutedToPeer).toHaveBeenCalledWith(
+        'run-7',
+        reroutedJobId,
+        'peer-1',
+      );
     });
 
     it('fans out reroutes in parallel for jobs targeting different peers', async () => {
@@ -750,6 +776,170 @@ describe('RunCoordinator', () => {
         undefined,
       );
       expect(deps.executionTracker.onStepStatus).not.toHaveBeenCalled();
+    });
+
+    it('acks a terminal job.progress (kind="job") after applying it', async () => {
+      const { coordinator, deps } = createCoordinator();
+      const reply = vi.fn();
+
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: '',
+          state: 'success',
+          timestamp: 1,
+        },
+        reply,
+      );
+
+      // Drain the microtask queue so the tracker promise resolves and the
+      // ack fires (fake timers are active, so we await pending microtasks).
+      await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+      await vi.waitFor(() =>
+        expect(reply).toHaveBeenCalledWith({
+          type: 'job.progress.ack',
+          runId: 'run-1',
+          jobId: 'job-1',
+          state: 'success',
+        }),
+      );
+    });
+
+    it('does not ack a non-terminal job-level update', async () => {
+      const { coordinator, deps } = createCoordinator();
+      const reply = vi.fn();
+
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        reply,
+      );
+
+      await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+      expect(reply).not.toHaveBeenCalled();
+    });
+
+    it('does not ack a step update', () => {
+      const { coordinator } = createCoordinator();
+      const reply = vi.fn();
+
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'step',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: 'Install deps',
+          state: 'running',
+          timestamp: 1,
+        },
+        reply,
+      );
+
+      expect(reply).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Set up a real reroute so `reroutedJobs` is populated, then return the
+     * coordinator + deps + the allocated jobId for the re-assertion tests.
+     * The reroute-time marker write is a no-op (the execution_jobs row does
+     * not exist yet); the mock is cleared so the re-assertion can be asserted
+     * in isolation.
+     */
+    async function rerouteOne() {
+      const peer = makePeerInfo({ instanceId: 'peer-1' });
+      const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
+      const { coordinator, deps } = createCoordinator();
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
+      deps.getPeerClient.mockReturnValue(peerClient);
+
+      const result = await coordinator.routeJobs(makeRunContext({ runId: 'run-7' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+      const jobId = result.reroutedJobs[0].jobId;
+      deps.executionTracker.markJobReroutedToPeer.mockClear();
+      return { coordinator, deps, jobId };
+    }
+
+    it('re-asserts the rerouted_to_peer marker when the worker first status creates the row', async () => {
+      const { coordinator, deps, jobId } = await rerouteOne();
+
+      coordinator.onPeerJobProgress({
+        type: 'job.progress',
+        kind: 'job',
+        runId: 'run-7',
+        jobId,
+        jobName: 'gpu-job',
+        stepIndex: 0,
+        stepName: '',
+        state: 'running',
+        timestamp: 1,
+      });
+
+      // The marker write lands AFTER the tracker apply resolves (the row now
+      // exists), so the defer guard can see the job belongs to peer-1.
+      await vi.waitFor(() =>
+        expect(deps.executionTracker.markJobReroutedToPeer).toHaveBeenCalledWith(
+          'run-7',
+          jobId,
+          'peer-1',
+        ),
+      );
+    });
+
+    it('does not re-assert the marker on a terminal peer status', async () => {
+      const { coordinator, deps, jobId } = await rerouteOne();
+
+      coordinator.onPeerJobProgress({
+        type: 'job.progress',
+        kind: 'job',
+        runId: 'run-7',
+        jobId,
+        jobName: 'gpu-job',
+        stepIndex: 0,
+        stepName: '',
+        state: 'success',
+        timestamp: 1,
+      });
+
+      await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+      expect(deps.executionTracker.markJobReroutedToPeer).not.toHaveBeenCalled();
+    });
+
+    it('does not re-assert the marker for a job that was not rerouted', async () => {
+      const { coordinator, deps } = createCoordinator();
+
+      coordinator.onPeerJobProgress({
+        type: 'job.progress',
+        kind: 'job',
+        runId: 'run-1',
+        jobId: 'job-1',
+        jobName: 'build',
+        stepIndex: 0,
+        stepName: '',
+        state: 'running',
+        timestamp: 1,
+      });
+
+      await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+      expect(deps.executionTracker.markJobReroutedToPeer).not.toHaveBeenCalled();
     });
   });
 

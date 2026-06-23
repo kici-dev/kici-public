@@ -34,6 +34,8 @@ import type { HeldRunStore, ReleaseSignal } from '../environments/held-runs.js';
 import type { StepApprovalBridge } from '../approvals/step-approval-bridge.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
+import type { PeerRegistry } from '../cluster/peer-registry.js';
+import { shouldDeferReroutedJob } from '../cluster/rerouted-job-guard.js';
 
 const logger = createLogger({ prefix: 'stale-detector' });
 
@@ -44,6 +46,12 @@ export interface StaleRunDetectorDeps {
   scalerManager?: ScalerManager;
   dispatcher: Dispatcher;
   registry: AgentRegistry;
+  /**
+   * Peer registry used to defer failing a job that was rerouted to a remote
+   * worker peer while that peer is still connected — its terminal status may
+   * still be replayed from the worker's durable outbox.
+   */
+  peerRegistry: PeerRegistry;
   /** Threshold in ms after which a job is considered stale. Default: heartbeatIntervalMs * multiplier */
   staleThresholdMs: number;
   /** How often to scan for stale jobs in ms. Default: 60_000 */
@@ -71,6 +79,7 @@ export class StaleRunDetector {
   private readonly scalerManager?: ScalerManager;
   private readonly dispatcher: Dispatcher;
   private readonly registry: AgentRegistry;
+  private readonly peerRegistry: PeerRegistry;
   private readonly staleThresholdMs: number;
   private readonly scanIntervalMs: number;
   private readonly heldRunStore?: HeldRunStore;
@@ -87,6 +96,7 @@ export class StaleRunDetector {
     this.scalerManager = deps.scalerManager;
     this.dispatcher = deps.dispatcher;
     this.registry = deps.registry;
+    this.peerRegistry = deps.peerRegistry;
     this.staleThresholdMs = deps.staleThresholdMs;
     this.scanIntervalMs = deps.scanIntervalMs;
     this.heldRunStore = deps.heldRunStore;
@@ -349,6 +359,7 @@ export class StaleRunDetector {
         'ej.job_name',
         'ej.agent_id',
         'ej.last_heartbeat_at',
+        'ej.rerouted_to_peer',
         'er.workflow_name',
         'er.repo_identifier',
         'er.sha',
@@ -390,6 +401,7 @@ export class StaleRunDetector {
         'ej.job_name',
         'ej.agent_id',
         'ej.last_heartbeat_at',
+        'ej.rerouted_to_peer',
         'ej.created_at',
         'er.workflow_name',
         'er.repo_identifier',
@@ -593,6 +605,7 @@ export class StaleRunDetector {
       job_name: string;
       agent_id: string | null;
       last_heartbeat_at: Date | null;
+      rerouted_to_peer: string | null;
       workflow_name: string;
       repo_identifier: string;
       sha: string;
@@ -602,6 +615,20 @@ export class StaleRunDetector {
     },
     affectedRunIds: Set<string>,
   ): Promise<boolean> {
+    // If this job was rerouted to a worker peer that is connected — or was seen
+    // within the flap-grace window of a transient reconnect — defer failing it:
+    // the worker's terminal status may still be replayed from its durable
+    // outbox. A rerouted job whose worker has been gone past the grace window
+    // is NOT deferred, so a dead worker's job is still timed out.
+    if (shouldDeferReroutedJob(job, this.peerRegistry)) {
+      logger.info('Deferring stale-fail for rerouted job; worker peer connected or recently seen', {
+        runId: job.run_id,
+        jobId: job.job_id,
+        peer: job.rerouted_to_peer,
+      });
+      return false;
+    }
+
     const now = new Date();
     const staleDurationMs = job.last_heartbeat_at
       ? now.getTime() - new Date(job.last_heartbeat_at).getTime()

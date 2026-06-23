@@ -10,7 +10,7 @@
  * - deleteSecret calls delete with correct filters
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
-import { PgSecretStore } from './pg-secret-store.js';
+import { PgSecretStore, SecretScopeNotFoundError } from './pg-secret-store.js';
 import { encrypt, decrypt, deriveKey, type EncryptedValue } from './crypto.js';
 import type { AuditLogger } from './audit-logger.js';
 
@@ -544,6 +544,11 @@ describe('PgSecretStore', () => {
 
       await expect(store.renameScope('org-001', 'missing', 'missing-2')).rejects.toThrow(
         /not found/i,
+      );
+      // The typed error is what consumers (admin HTTP route, dashboard handler)
+      // map to a 404 / structured not-found rather than a generic 500.
+      await expect(store.renameScope('org-001', 'missing', 'missing-2')).rejects.toBeInstanceOf(
+        SecretScopeNotFoundError,
       );
     });
 

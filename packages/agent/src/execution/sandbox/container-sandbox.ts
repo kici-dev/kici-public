@@ -651,6 +651,9 @@ export class ContainerSandbox implements ExecutionSandbox {
           ...(msg.error && { error: msg.error }),
           ...(msg.secretsAccessed && { secretsAccessed: msg.secretsAccessed }),
           ...(msg.step_type && { step_type: msg.step_type }),
+          ...(msg.checkOutcome !== undefined && { checkOutcome: msg.checkOutcome }),
+          ...(msg.driftSummary !== undefined && { driftSummary: msg.driftSummary }),
+          ...(msg.drift !== undefined && { drift: msg.drift }),
           ...(msg.data && msg.data),
         });
 

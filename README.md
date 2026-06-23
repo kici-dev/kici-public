@@ -1,6 +1,6 @@
 # KiCI
 
-> TypeScript-native CI/CD workflow engine. Define your CI in TypeScript, test it locally, run it anywhere.
+> TypeScript-native CI/CD that runs on your infrastructure — define your CI in TypeScript, test it locally, and we never see your source or secrets.
 
 `kici` is the developer CLI for [KiCI](https://kici.dev): scaffold a `.kici/` workflow directory, compile workflows, dry-run them against synthetic or real events, and execute them locally or against a remote orchestrator.
 

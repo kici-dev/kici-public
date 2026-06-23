@@ -157,6 +157,12 @@ interface AgentMetadata {
    * `lifecycle_class`. `null` / undefined when auth mode is `none`.
    */
   tokenAgentType?: 'static' | 'ephemeral' | null;
+  /**
+   * Agent-reported typed host-vars (the `KICI_PROPERTIES` bag), threaded from
+   * the `agent.register` message into the roster upsert (shallow-merged with
+   * any operator-declared properties). Undefined ⇒ the agent reported none.
+   */
+  properties?: Record<string, string | number | boolean>;
 }
 
 /**
@@ -174,6 +180,7 @@ export interface RosterReconciler {
     platform: string;
     arch: string;
     instanceId: string;
+    properties?: Record<string, string | number | boolean>;
   }): Promise<void>;
   markDisconnected(agentId: string, instanceId: string): Promise<void>;
   stampLastSeen(agentId: string, instanceId: string): Promise<void>;
@@ -350,6 +357,7 @@ export class AgentRegistry {
           platform,
           arch,
           instanceId,
+          properties: metadata?.properties,
         })
         .catch((err) =>
           logger.warn('host_roster upsert failed (best-effort)', {
@@ -734,6 +742,31 @@ export class AgentRegistry {
   }
 
   // ── Lookups ───────────────────────────────────────────────────────
+
+  /**
+   * Compact, allocation-cheap snapshot of every registered agent's routing
+   * facts. Used by the dispatcher to log WHY a job found no backend (required
+   * labels vs each agent's labels / capacity), which is otherwise invisible —
+   * a `queued-no-backend` outcome alone doesn't say whether the label set
+   * mismatched, the agent was at capacity, or no agent was connected at all.
+   */
+  agentSummaries(): Array<{
+    agentId: string;
+    labels: string[];
+    platform: string;
+    arch: string;
+    activeJobs: number;
+    maxConcurrency: number;
+  }> {
+    return [...this.agents.values()].map((e) => ({
+      agentId: e.agentId,
+      labels: [...e.labels],
+      platform: e.platform,
+      arch: e.arch,
+      activeJobs: e.activeJobs,
+      maxConcurrency: e.maxConcurrency,
+    }));
+  }
 
   /**
    * Get a single agent entry by ID.

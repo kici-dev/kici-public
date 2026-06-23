@@ -20,6 +20,7 @@ import type { Database } from '../db/types.js';
 import type { RaftNode } from './raft.js';
 import type { PeerRegistry } from './peer-registry.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import { shouldDeferReroutedJob } from './rerouted-job-guard.js';
 
 const logger = createLogger({ prefix: 'orphan-recovery' });
 
@@ -158,7 +159,7 @@ export class OrphanRecovery {
     // Get all jobs for this run
     const jobs = await this.db
       .selectFrom('execution_jobs')
-      .select(['job_id', 'job_name', 'status', 'last_heartbeat_at'])
+      .select(['job_id', 'job_name', 'status', 'last_heartbeat_at', 'rerouted_to_peer'])
       .where('run_id', '=', run.run_id)
       .execute();
 
@@ -196,7 +197,22 @@ export class OrphanRecovery {
         continue;
       }
 
-      // Job is non-terminal (running/pending)
+      // Job is non-terminal (running/pending). If it was rerouted to a worker
+      // peer that is connected — or was seen within the flap-grace window of a
+      // transient reconnect — defer the force-fail: the worker's terminal
+      // status may still be replayed from its durable outbox.
+      if (shouldDeferReroutedJob(job, this.peerRegistry)) {
+        logger.info(
+          'Deferring orphan-fail for rerouted job; worker peer connected or recently seen',
+          {
+            runId: run.run_id,
+            jobId: job.job_id,
+            peer: job.rerouted_to_peer,
+          },
+        );
+        continue;
+      }
+
       // Check if heartbeat is stale
       const lastHeartbeat = job.last_heartbeat_at ? new Date(job.last_heartbeat_at) : new Date(0);
 

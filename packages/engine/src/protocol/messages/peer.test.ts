@@ -8,6 +8,7 @@ import {
   jobRerouteSchema,
   jobRerouteAckSchema,
   jobProgressSchema,
+  jobProgressAckSchema,
   peerScalerEventSchema,
   peerJobCancelSchema,
   raftVoteRequestSchema,
@@ -828,5 +829,27 @@ describe('peerFromPeerMessageSchema', () => {
 
   it('rejects unknown type discriminator', () => {
     expect(() => peerFromPeerMessageSchema.parse({ type: 'unknown', data: 'x' })).toThrow();
+  });
+});
+
+describe('job.progress.ack', () => {
+  const valid = {
+    type: 'job.progress.ack' as const,
+    runId: 'run-1',
+    jobId: 'job-1',
+    state: 'success' as const,
+  };
+
+  it('accepts a well-formed ack', () => {
+    expect(jobProgressAckSchema.parse(valid)).toEqual(valid);
+  });
+
+  it('is routable through both peer unions', () => {
+    expect(peerToPeerMessageSchema.parse(valid)).toEqual(valid);
+    expect(peerFromPeerMessageSchema.parse(valid)).toEqual(valid);
+  });
+
+  it('rejects a non-ExecutionJobStatus state', () => {
+    expect(() => jobProgressAckSchema.parse({ ...valid, state: 'bogus' })).toThrow();
   });
 });

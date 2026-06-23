@@ -13,8 +13,10 @@ import {
   OIDC_TOKEN_REQUEST_METHOD,
   type OidcTokenResult,
 } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import type { HostInventoryEntry, InventorySelector } from '@kici-dev/engine';
 
 export type { OidcTokenResult };
+export type { HostInventoryEntry, InventorySelector };
 
 // --- Infrastructure API ---
 
@@ -53,11 +55,30 @@ export interface OidcApi {
   token(opts: { audience: string }): Promise<OidcTokenResult>;
 }
 
+// --- Inventory API ---
+
+export interface InventoryApi {
+  /**
+   * Query the host roster of the caller's orchestrator cluster. Omit the
+   * selector ⇒ all hosts. Server-side filtering is label-based (reuses the
+   * runsOnAll glob/regex matchers); filter on `properties` client-side in the
+   * workflow. Available to steps and dynamic-job generators — a generator can
+   * fan out one job per matching host. The roster is live, so a dynamic-job
+   * generator inherits the same non-determinism contract as
+   * `infrastructure.list()`.
+   */
+  query(selector?: InventorySelector): Promise<HostInventoryEntry[]>;
+  /** Look up one host by agent id; null when the host is not in the roster. */
+  get(agentId: string): Promise<HostInventoryEntry | null>;
+}
+
 // --- Top-level KiCI API ---
 
 export interface KiciApi {
   /** Query orchestrator infrastructure (scalers, agents). */
   infrastructure: InfrastructureApi;
+  /** Query the host roster / inventory (labels + typed properties). */
+  inventory: InventoryApi;
   /** Request short-lived OIDC ID tokens for the current job (build provenance). */
   oidc: OidcApi;
 }
@@ -89,6 +110,15 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
   return {
     infrastructure: {
       list: () => transport('infrastructure.list', {}) as Promise<InfrastructureListResult>,
+    },
+    inventory: {
+      // `inventory` works without `jobCtx` (unlike `oidc.token`): the roster is
+      // cluster-scoped, not job-bound, so it is available to dynamic-job
+      // re-evaluation as well as steps.
+      query: (selector) =>
+        transport('inventory.query', { ...(selector ?? {}) }) as Promise<HostInventoryEntry[]>,
+      get: (agentId) =>
+        transport('inventory.get', { agentId }) as Promise<HostInventoryEntry | null>,
     },
     oidc: {
       token: (opts) => {

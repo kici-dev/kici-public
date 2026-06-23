@@ -49,6 +49,7 @@ import { registerBlobRoutes } from './storage/blob-routes.js';
 import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { createOidcTokenHandler, deriveHttpBaseFromWsUrl } from './ws/oidc-token-relay.js';
+import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
 import { configureSecureWsServer } from './ws/server-options.js';
 import {
   type CheckRunReporter,
@@ -202,6 +203,11 @@ export interface AppDependencies {
    * Platform client + config are in scope; passed into the admin source routes.
    */
   resolveSourceWebhookUrl?: AdminRouteDeps['resolveSourceWebhookUrl'];
+  /**
+   * Resolves the org-scoped GitHub webhook URL for the manifest setup
+   * pre-flight (before any App exists). Passed into the admin source routes.
+   */
+  resolveGithubWebhookUrl?: AdminRouteDeps['resolveGithubWebhookUrl'];
   /** Config admin API route dependencies. Optional -- mounted when config management is available. */
   configRouteDeps?: ConfigRouteDeps;
   /** Event router for internal event delivery. Optional -- if not set, event routing is inactive. */
@@ -439,6 +445,22 @@ export function createApp(deps: AppDependencies) {
 
     return { scalers, agents, globalUsage, globalResourceCap };
   });
+
+  // Register the host inventory query API (read role). Resolves against this
+  // cluster's roster; available to steps and dynamic-job generators via
+  // ctx.kici.inventory. Only registered when a roster store is present.
+  if (deps.hostRosterStore) {
+    const inventoryDeps = {
+      rosterStore: deps.hostRosterStore,
+      graceMs: deps.config.rosterGraceMs,
+    };
+    agentApiRegistry.register(
+      'inventory.query',
+      'read',
+      createInventoryQueryHandler(inventoryDeps),
+    );
+    agentApiRegistry.register('inventory.get', 'read', createInventoryGetHandler(inventoryDeps));
+  }
 
   // Register the provenance ID-token relay (read role). The relay drives the
   // Platform's token-mint endpoint, so it is only meaningful when this
@@ -1237,6 +1259,7 @@ export function createApp(deps: AppDependencies) {
         ...deps.adminDeps,
         accessLog: deps.accessLogWriter,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
+        resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
       }),
     );
   }

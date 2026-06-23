@@ -9,8 +9,8 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { LockFileFetcher, LockFile } from '@kici-dev/engine';
-import { LockFileParseError } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { parseLockDocument } from '../../lockfile-validate.js';
 
 const logger = createLogger({ prefix: 'local-lock-file' });
 
@@ -73,25 +73,7 @@ export class LocalLockFileFetcher implements LockFileFetcher {
       return null;
     }
 
-    let lockFile: LockFile;
-    try {
-      lockFile = JSON.parse(content) as LockFile;
-    } catch (err) {
-      throw new LockFileParseError(
-        repoIdentifier,
-        ref,
-        `Lock file at ${lockFilePath} is not valid JSON: ${(err as Error).message}`,
-      );
-    }
-
-    // Basic shape validation
-    if (typeof lockFile.schemaVersion !== 'number') {
-      throw new LockFileParseError(
-        repoIdentifier,
-        ref,
-        `Invalid lock file at ${lockFilePath}: missing or invalid schemaVersion`,
-      );
-    }
+    const lockFile = parseLockDocument(content, lockFilePath, ref);
 
     logger.info('Lock file fetched from filesystem', {
       lockFilePath,

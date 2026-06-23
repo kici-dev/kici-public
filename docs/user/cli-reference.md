@@ -265,7 +265,7 @@ kici run remote push-main --org xyz789ghi012
 kici run remote push-main --orchestrator us-east
 
 # Run all push-related fixtures
-kici run remote push-*
+kici run remote 'push-*'
 
 # Run everything
 kici run remote --all

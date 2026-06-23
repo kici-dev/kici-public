@@ -988,6 +988,8 @@ function transformSteps(steps: readonly StepInput[], gitRoot: string): readonly 
         }),
       ...(step.onCancel !== undefined && { hasOnCancel: true }),
       ...(step.cleanup !== undefined && { hasCleanup: true }),
+      ...(step.check !== undefined && { hasCheck: true }),
+      ...(step.whenInSync !== undefined && { hasWhenInSync: true }),
       ...(step.requireApproval !== undefined && {
         approval: toLockApproval(step.requireApproval),
       }),

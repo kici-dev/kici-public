@@ -49,6 +49,33 @@ describe('InMemoryJobQueue', () => {
     expect(job2).toBeNull();
   });
 
+  it('dequeueByPinnedAgent returns null when no job is pinned (the worker default)', async () => {
+    // Regression guard: Dispatcher.onAgentAvailable calls this unconditionally;
+    // when it was undefined the worker crashed with
+    // "this.queue.dequeueByPinnedAgent is not a function" right after a job
+    // completed, taking the terminal status with it.
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput());
+    expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
+    // The non-pinned job is still pending (not consumed).
+    expect(await queue.getDepth()).toBe(1);
+  });
+
+  it('dequeueByPinnedAgent returns and consumes a job pinned to the agent', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput({ pinnedAgentId: 'agent-1' }));
+    const job = await queue.dequeueByPinnedAgent('agent-1', ['linux']);
+    expect(job).not.toBeNull();
+    expect(job!.pinnedAgentId).toBe('agent-1');
+    expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
+  });
+
+  it('dequeueByPinnedAgent ignores a job pinned to a different agent', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput({ pinnedAgentId: 'agent-2' }));
+    expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
+  });
+
   it('getDepth returns count of pending jobs', async () => {
     const queue = new InMemoryJobQueue();
     expect(await queue.getDepth()).toBe(0);

@@ -29,6 +29,24 @@ describe('loadConfig', () => {
     expect(config.labels).toEqual(['linux', 'docker']);
   });
 
+  it('parses KICI_PROPERTIES into a typed host-vars bag', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_PROPERTIES = 'region=eu,cores=8,gpu=true';
+    const config = loadConfig();
+    expect(config.properties).toEqual({ region: 'eu', cores: 8, gpu: true });
+    expect(agentClientConnectionOptions(config).properties).toEqual({
+      region: 'eu',
+      cores: 8,
+      gpu: true,
+    });
+  });
+
+  it('produces empty properties when KICI_PROPERTIES not set', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.properties).toEqual({});
+  });
+
   it('throws with clear error when KICI_ORCHESTRATOR_URL is missing', () => {
     expect(() => loadConfig()).toThrow('Configuration validation failed');
     expect(() => loadConfig()).toThrow('orchestratorUrl');

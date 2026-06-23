@@ -767,13 +767,24 @@ export class JobRunner {
       }
     }
 
-    // Debug: log sandbox result for crash diagnosis
+    // Log the sandbox failure with its actual cause so a remote-agent failure
+    // is diagnosable from the agent log alone (shipped to Loki for persistent
+    // peers, dumped by the E2E run-id grep for ephemeral runs). For an
+    // init-phase failure there are no step results, so result.error is the only
+    // place the cause lives; for step failures we also list each failed step's
+    // error message.
     if (result.status === ExecutionJobStatus.enum.failed) {
+      const stepErrors = result.stepResults
+        .filter((r) => r.error)
+        .map((r) => `${r.name}: ${r.error!.message}`)
+        .join(' | ');
       logger.error('Sandbox returned failed result', {
         durationMs: result.durationMs,
         stepCount: result.stepResults.length,
         steps: result.stepResults.map((r) => `${r.name}:${r.status}`).join(','),
         logStreamerKeys: [...logStreamers.keys()].join(','),
+        ...(result.error && { error: result.error }),
+        ...(stepErrors && { stepErrors }),
       });
     }
 

@@ -20,7 +20,7 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-import { InitFailureCategory, LockFileParseError } from '@kici-dev/engine';
+import { InitFailureCategory, LockFileParseError, SCHEMA_VERSION } from '@kici-dev/engine';
 import { AgentJobFailedError } from '../cache/agent-job-failed-error.js';
 import {
   processWebhook,
@@ -5301,7 +5301,9 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
    */
   function helloFirecrackerLockFile() {
     return {
-      schemaVersion: 1,
+      // A freshly-compiled current lock must carry the engine's SCHEMA_VERSION;
+      // the real LockFileCache now rejects any other version as incompatible.
+      schemaVersion: SCHEMA_VERSION,
       source: { file: '.kici/workflows/hello-firecracker.ts', export: '#default' },
       contentHash: 'fallback-hash',
       workflows: [

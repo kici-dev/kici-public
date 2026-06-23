@@ -167,6 +167,29 @@ describe('formatLocalJsonResult', () => {
 
     expect(parsed.workflows[0].jobs[0]).not.toHaveProperty('matrixValues');
   });
+
+  it('includes checkOutcome and driftSummary when present on a step', () => {
+    const step: StepResult = {
+      name: 'cfg',
+      status: 'success',
+      durationMs: 5,
+      checkOutcome: 'dry-run',
+      driftSummary: 'would rewrite config',
+    };
+    const jobs = [makeJob('deploy', 'success', { steps: [step] })];
+    const results = [makeWorkflowResult('ci', 'success', jobs)];
+
+    const parsed = JSON.parse(formatLocalJsonResult(results));
+    const jsonStep = parsed.workflows[0].jobs[0].steps[0];
+    expect(jsonStep.checkOutcome).toBe('dry-run');
+    expect(jsonStep.driftSummary).toBe('would rewrite config');
+  });
+
+  it('omits check fields for a plain step', () => {
+    const jobs = [makeJob('deploy', 'success', { steps: [makeStep('plain')] })];
+    const parsed = JSON.parse(formatLocalJsonResult([makeWorkflowResult('ci', 'success', jobs)]));
+    expect(parsed.workflows[0].jobs[0].steps[0]).not.toHaveProperty('checkOutcome');
+  });
 });
 
 describe('formatLocalJunitResult', () => {

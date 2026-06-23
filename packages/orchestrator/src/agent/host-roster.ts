@@ -1,6 +1,14 @@
 import { type Kysely, sql } from 'kysely';
-import { type LabelMatcher, matcherSatisfiedBy } from '@kici-dev/engine';
+import {
+  type HostInventoryEntry,
+  type InventorySelector,
+  type LabelMatcher,
+  matcherSatisfiedBy,
+} from '@kici-dev/engine';
 import type { Database, HostRosterRow } from '../db/types.js';
+
+/** Typed host-vars bag carried by roster rows (`string | number | boolean`). */
+export type HostProperties = Record<string, string | number | boolean>;
 
 /**
  * Derived (read-time) status of a roster host. Never a stored mutable column:
@@ -36,6 +44,8 @@ export interface MatchedHost {
   status: HostStatus;
   platform: string | null;
   arch: string | null;
+  /** Typed host-vars bag (parsed from `host_properties`). */
+  properties: HostProperties;
 }
 
 export interface UpsertHostInput {
@@ -47,6 +57,13 @@ export interface UpsertHostInput {
   platform: string;
   arch: string;
   instanceId: string;
+  /**
+   * Agent-reported typed host-vars. Shallow-merged into any existing bag on
+   * conflict (agent-reported keys win; operator-declared keys the agent does
+   * not report are preserved). Omitted ⇒ no change to the stored bag on update,
+   * `{}` on insert.
+   */
+  properties?: HostProperties;
 }
 
 /** Minimal row shape `deriveHostStatus` reads (the store row or the CLI row). */
@@ -73,6 +90,27 @@ export function deriveHostStatus(row: HostStatusRow, nowMs: number, graceMs: num
 }
 
 /**
+ * Normalize a stored `host_properties` value into a typed host-vars bag. The pg
+ * driver returns parsed JSON for a `jsonb` column, but accept a JSON string too
+ * (defensive for non-pg paths / tests). Non-object / null reads back as `{}`.
+ */
+export function parseHostProperties(value: unknown): HostProperties {
+  const parsed = typeof value === 'string' ? safeJsonParse(value) : value;
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed as HostProperties;
+  }
+  return {};
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Durable, cluster-shared roster of every agent the cluster has ever enrolled.
  *
  * The in-memory `AgentRegistry` reconciles into this table on register
@@ -88,6 +126,7 @@ export class HostRosterStore {
   /** Idempotent upsert on agent_id; stamps connected_instance_id + last_seen. */
   async upsert(input: UpsertHostInput): Promise<void> {
     const labelsJson = JSON.stringify(input.labels);
+    const reportedJson = JSON.stringify(input.properties ?? {});
     await this.db
       .insertInto('host_roster')
       .values({
@@ -99,6 +138,7 @@ export class HostRosterStore {
         platform: input.platform,
         arch: input.arch,
         connected_instance_id: input.instanceId,
+        host_properties: reportedJson,
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
@@ -111,6 +151,10 @@ export class HostRosterStore {
           platform: input.platform,
           arch: input.arch,
           connected_instance_id: input.instanceId,
+          // Shallow-merge: existing bag on the left, agent-reported on the
+          // right (right keys win). Operator-declared keys the agent does not
+          // report are preserved.
+          host_properties: sql`COALESCE(host_roster.host_properties, '{}'::jsonb) || ${reportedJson}::jsonb`,
           last_seen: sql`now()`,
           updated_at: sql`now()`,
         }),
@@ -143,6 +187,7 @@ export class HostRosterStore {
     agentId: string;
     labels: string[];
     hostname?: string;
+    properties?: HostProperties;
   }): Promise<void> {
     await this.db
       .insertInto('host_roster')
@@ -153,6 +198,7 @@ export class HostRosterStore {
         labels: JSON.stringify(input.labels),
         hostname: input.hostname ?? null,
         connected_instance_id: null,
+        host_properties: JSON.stringify(input.properties ?? {}),
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
@@ -203,10 +249,62 @@ export class HostRosterStore {
         status: deriveHostStatus(row, now, graceMs),
         platform: row.platform,
         arch: row.arch,
+        properties: parseHostProperties(row.host_properties),
       });
     }
     out.sort((a, b) => a.agentId.localeCompare(b.agentId));
     return out;
+  }
+
+  /**
+   * Map a roster row to the canonical {@link HostInventoryEntry} — the queryable
+   * shape returned by the `inventory.query`/`inventory.get` RPC and typed on the
+   * SDK's `ctx.kici.inventory`. Status is derived the same way `findMatching`
+   * derives it (live + fresh ⇒ ready; declared-but-absent static ⇒ unreachable;
+   * ephemeral past ttl ⇒ stale).
+   */
+  toInventoryEntry(row: HostRosterRow, graceMs: number): HostInventoryEntry {
+    return {
+      agentId: row.agent_id,
+      labels: JSON.parse(row.labels) as string[],
+      properties: parseHostProperties(row.host_properties),
+      hostname: row.hostname,
+      platform: row.platform,
+      arch: row.arch,
+      lifecycleClass: row.lifecycle_class as LifecycleClass,
+      status: deriveHostStatus(row, Date.now(), graceMs),
+      lastSeen: new Date(row.last_seen).toISOString(),
+    };
+  }
+
+  /**
+   * Query the roster as canonical {@link HostInventoryEntry} records. With a
+   * selector, reuses `findMatching`'s label filtering (server-side, glob/regex);
+   * property filtering is done client-side in the workflow. Omit the selector ⇒
+   * every host.
+   */
+  async queryInventory(
+    selector: InventorySelector | undefined,
+    graceMs: number,
+  ): Promise<HostInventoryEntry[]> {
+    if (!selector || (!selector.include && !selector.exclude)) {
+      const rows = await this.listAll();
+      return rows.map((r) => this.toInventoryEntry(r, graceMs));
+    }
+    const matched = await this.findMatching(
+      selector.include ?? [],
+      selector.exclude ?? [],
+      graceMs,
+    );
+    const byId = new Map(matched.map((m) => [m.agentId, m]));
+    const rows = await this.listAll();
+    return rows.filter((r) => byId.has(r.agent_id)).map((r) => this.toInventoryEntry(r, graceMs));
+  }
+
+  /** Single-host inventory lookup; null when the agent is not in the roster. */
+  async getInventory(agentId: string, graceMs: number): Promise<HostInventoryEntry | null> {
+    const row = await this.get(agentId);
+    return row ? this.toInventoryEntry(row, graceMs) : null;
   }
 
   /**

@@ -23,6 +23,8 @@ import {
   type InitFailure,
   ScalerEventType,
   TERMINAL_JOB_STATES,
+  CheckMode,
+  CheckStepOutcome,
 } from '@kici-dev/engine';
 import { executionsTotal, executionDurationSeconds } from '../metrics/prometheus.js';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
@@ -213,6 +215,10 @@ interface RunState {
   triggeredBy?: string | null;
   concurrency?: { cancelInProgress?: boolean; max?: number };
   failureReason?: string;
+  /** Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`). */
+  checkMode?: string;
+  /** Set true once any step reports a `dry-run` outcome (drift detected). */
+  driftDetected?: boolean;
   startedAt: number;
   completedAt?: number;
   jobs: Map<
@@ -338,6 +344,8 @@ export class ExecutionTracker {
     concurrency?: { cancelInProgress?: boolean; max?: number },
     /** Workflow-level wall-clock timeout in ms from the lock file. Sets the run deadline. */
     workflowTimeoutMs?: number,
+    /** Run mode for idempotent steps; non-apply labels the run a check-mode preview. */
+    checkMode?: string,
   ): Promise<void> {
     const now = new Date();
 
@@ -382,6 +390,7 @@ export class ExecutionTracker {
       originalRunId,
       triggeredBy,
       concurrency,
+      ...(checkMode != null && { checkMode }),
       startedAt: now.getTime(),
       jobs: jobMap,
     });
@@ -407,6 +416,7 @@ export class ExecutionTracker {
         ...(originalRunId != null && { original_run_id: originalRunId }),
         ...(triggeredBy != null && { triggered_by: triggeredBy }),
         ...(workflowTimeoutMs != null && { workflow_timeout_ms: workflowTimeoutMs }),
+        ...(checkMode != null && { check_mode: checkMode }),
       })
       .onConflict((oc) => oc.column('run_id').doNothing())
       .execute();
@@ -559,6 +569,21 @@ export class ExecutionTracker {
       .executeTakeFirst();
 
     return row?.job_id;
+  }
+
+  /**
+   * Durably mark the projected `execution_jobs` row so run-recovery sweepers
+   * know this job lives on a remote worker peer and must not be force-failed
+   * while that worker is connected. Called by the owning coordinator right
+   * after a peer ACKs a reroute.
+   */
+  async markJobReroutedToPeer(runId: string, jobId: string, peerId: string): Promise<void> {
+    await this.db
+      .updateTable('execution_jobs')
+      .set({ rerouted_to_peer: peerId })
+      .where('run_id', '=', runId)
+      .where('job_id', '=', jobId)
+      .execute();
   }
 
   /**
@@ -866,6 +891,15 @@ export class ExecutionTracker {
       job = await this.recoverJobFromDispatchQueue(run, runId, jobId);
     }
 
+    // Idempotency guard: a replayed terminal status for a job already in that
+    // same terminal state is a no-op. Re-applying it would re-fire onJobComplete
+    // and re-run finalizeRunCompletion (double-notify). Returning early here
+    // resolves the promise normally, so a coordinator that acks-after-apply
+    // still acks the replay and the worker can prune its durable outbox.
+    if (job && job.status === state && TERMINAL_JOB_STATES.has(state)) {
+      return;
+    }
+
     // Only set started_at on the FIRST running message. Build jobs send
     // multiple running messages (deps_installed, bundle_compiled) which
     // would overwrite started_at to near-completion time, causing
@@ -980,6 +1014,7 @@ export class ExecutionTracker {
         'parent_run_id',
         'original_run_id',
         'triggered_by',
+        'check_mode',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -989,6 +1024,19 @@ export class ExecutionTracker {
       // Skip this job status update entirely; there's nothing to track.
       logger.warn('Run not found in DB, skipping job status update', { runId, jobId, state });
       return null;
+    }
+
+    // Recover drift state for check-fail-on-drift: a restart mid-check-run must
+    // still fail the run if any persisted step already reported drift.
+    let recoveredDriftDetected = false;
+    if (dbRun.check_mode === CheckMode.enum['check-fail-on-drift']) {
+      const driftRow = await this.db
+        .selectFrom('execution_steps')
+        .select('id')
+        .where('run_id', '=', runId)
+        .where('check_outcome', '=', CheckStepOutcome.enum['dry-run'])
+        .executeTakeFirst();
+      recoveredDriftDetected = driftRow != null;
     }
 
     const providerCtx =
@@ -1018,6 +1066,8 @@ export class ExecutionTracker {
       parentRunId: dbRun.parent_run_id ?? undefined,
       originalRunId: dbRun.original_run_id ?? undefined,
       triggeredBy: dbRun.triggered_by ?? undefined,
+      ...(dbRun.check_mode != null && { checkMode: dbRun.check_mode }),
+      ...(recoveredDriftDetected && { driftDetected: true }),
       jobs: new Map(),
       startedAt: new Date(dbRun.started_at).getTime(),
     };
@@ -2314,6 +2364,23 @@ export class ExecutionTracker {
       values.secrets_accessed = JSON.stringify(data.secretsAccessed);
     }
 
+    // Idempotent check-mode per-step fields (forwarded from the agent's
+    // step.complete IPC via step.status.data).
+    if (data?.checkOutcome !== undefined) {
+      values.check_outcome = String(data.checkOutcome);
+      // Track run-level drift for check-fail-on-drift terminal status.
+      if (data.checkOutcome === CheckStepOutcome.enum['dry-run']) {
+        const run = this.runs.get(runId);
+        if (run) run.driftDetected = true;
+      }
+    }
+    if (data?.driftSummary !== undefined) {
+      values.drift_summary = String(data.driftSummary);
+    }
+    if (data?.drift !== undefined) {
+      values.drift = JSON.stringify(data.drift);
+    }
+
     await this.db
       .insertInto('execution_steps')
       .values(values as any)
@@ -3281,6 +3348,11 @@ export class ExecutionTracker {
   ): string | undefined {
     if (status === ExecutionRunStatus.enum.success) return undefined;
 
+    // check-fail-on-drift run that failed solely because drift was detected.
+    if (run.checkMode === CheckMode.enum['check-fail-on-drift'] && run.driftDetected) {
+      return 'Drift detected in check mode (--fail-on-drift)';
+    }
+
     const failedNames: string[] = [];
     for (const job of run.jobs.values()) {
       if (
@@ -3310,6 +3382,12 @@ export class ExecutionTracker {
   private computeRunStatus(
     run: RunState,
   ): Extract<ExecutionRunStatus, 'success' | 'failed' | 'cancelled'> {
+    // check-fail-on-drift (terraform -detailed-exitcode style): any step that
+    // reported drift forces the run to fail, even when every job "succeeded".
+    if (run.checkMode === CheckMode.enum['check-fail-on-drift'] && run.driftDetected) {
+      return ExecutionRunStatus.enum.failed;
+    }
+
     let hasFailed = false;
     let hasCancelled = false;
 

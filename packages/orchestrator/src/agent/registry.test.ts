@@ -97,6 +97,20 @@ describe('AgentRegistry', () => {
       );
     });
 
+    it('threads agent-reported properties into the roster upsert', async () => {
+      const store = makeStore();
+      const reg = new AgentRegistry({ rosterStore: store, instanceId: 'orch-A' });
+      reg.register('a1', mockWs(), ['role:db'], 'linux', 'x64', undefined, 1, {
+        tokenId: 'tok1',
+        tokenAgentType: 'static',
+        properties: { region: 'eu', cores: 8 },
+      });
+      await Promise.resolve();
+      expect(store.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ properties: { region: 'eu', cores: 8 } }),
+      );
+    });
+
     it('defaults lifecycleClass to ephemeral when token agent_type unknown', async () => {
       const store = makeStore();
       const reg = new AgentRegistry({ rosterStore: store, instanceId: 'orch-A' });

@@ -6,7 +6,7 @@ import type { LockFile, LockWorkflow } from '../types.js';
 import { transformTriggers } from '../lockfile/generator.js';
 import { discoverWorkflows, resolveKiciDir } from '../execution/index.js';
 import { buildEventPayload, type PayloadOptions } from '../test-runner/payload-builder.js';
-import { matchAllWorkflows } from '@kici-dev/engine';
+import { matchAllWorkflows, type CheckMode } from '@kici-dev/engine';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import { displayDryRun } from '../test-runner/dry-run.js';
 import { loadSecretsFile, type ParsedSecrets } from '../test-runner/secrets-file.js';
@@ -53,6 +53,12 @@ export interface RemoteRunOptions extends TestOptions {
   org?: string;
   /** Target orchestrator cluster name (overrides the per-org default). */
   orchestrator?: string;
+  /**
+   * Run mode resolved from --check / --fail-on-drift, threaded onto the dispatch
+   * payload so the orchestrator runs the agent step loop in the requested mode.
+   * Defaults to `apply`.
+   */
+  checkMode?: CheckMode;
 }
 
 /** Result of a single remote fixture run */

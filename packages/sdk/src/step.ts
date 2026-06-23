@@ -1,4 +1,11 @@
-import type { Step, StepOptions, StepRunFn, SourceLocation } from './types.js';
+import type {
+  Step,
+  StepOptions,
+  StepOptionsPlain,
+  StepOptionsWithCheck,
+  StepRunFn,
+  SourceLocation,
+} from './types.js';
 import { createStepOutputProxy } from './outputs.js';
 
 /**
@@ -101,40 +108,77 @@ export function step(name: string, run: StepRunFn): Step<void>;
 export function step<TResult = void>(name: string, options: StepOptions<TResult>): Step<TResult>;
 
 /**
+ * Create a named idempotent step with a check facet.
+ *
+ * `check` returns a drift value (or null when in sync); `run` becomes the apply
+ * function and receives that drift; `summarize` renders the drift for logs and
+ * the dashboard. `whenInSync` optionally produces the outputs when already in sync.
+ *
+ * @example
+ * const nginx = step('configure-nginx', {
+ *   check: async (ctx) => (await inSync(ctx)) ? null : { want: DESIRED },
+ *   summarize: (drift) => `would rewrite nginx.conf (${drift.want.length} bytes)`,
+ *   run: async (ctx, drift) => { await writeConfig(drift.want); return { reloaded: true }; },
+ *   whenInSync: async () => ({ reloaded: false }),
+ * });
+ */
+export function step<TResult = void, TDrift = unknown>(
+  name: string,
+  options: StepOptionsWithCheck<TResult, TDrift>,
+): Step<TResult>;
+
+/**
+ * Create an id-less idempotent step with a check facet.
+ */
+export function step<TResult = void, TDrift = unknown>(
+  options: StepOptionsWithCheck<TResult, TDrift>,
+): Step<TResult>;
+
+/**
  * Implementation of step() factory.
  * Discriminates overloads by first arg type:
  * - string => named variant (existing)
  * - function => id-less simple (wrap as { run: fn }, name = '')
  * - object => id-less full options (name = '')
  */
-export function step<TResult = void>(
+export function step<TResult = void, TDrift = unknown>(
   nameOrRunOrOptions:
     | string
     | ((ctx: import('./context.js').StepContext) => Promise<TResult>)
-    | StepOptions<TResult>,
-  runOrOptions?: StepRunFn | StepOptions<TResult>,
+    | StepOptions<TResult, TDrift>,
+  runOrOptions?: StepRunFn | StepOptions<TResult, TDrift>,
 ): Step<TResult> {
   // Capture call-site before any other work
   const _sourceLocation = captureCallSite();
 
   let name: string;
-  let options: StepOptions<TResult>;
+  let options: StepOptions<TResult, TDrift>;
 
   if (typeof nameOrRunOrOptions === 'string') {
     // Named variant: step(name, run) or step(name, options)
     name = nameOrRunOrOptions;
     options =
       typeof runOrOptions === 'function'
-        ? { run: runOrOptions as unknown as StepOptions<TResult>['run'] }
+        ? ({ run: runOrOptions as StepOptionsPlain<TResult>['run'] } as StepOptions<
+            TResult,
+            TDrift
+          >)
         : runOrOptions!;
   } else if (typeof nameOrRunOrOptions === 'function') {
     // Id-less simple: step(run)
     name = '';
-    options = { run: nameOrRunOrOptions as unknown as StepOptions<TResult>['run'] };
+    options = {
+      run: nameOrRunOrOptions as StepOptionsPlain<TResult>['run'],
+    } as StepOptions<TResult, TDrift>;
   } else {
     // Id-less full options: step(options)
     name = '';
     options = nameOrRunOrOptions;
+  }
+
+  // Idempotent invariant: summarize is mandatory whenever a check facet is declared.
+  if (options.check && !options.summarize) {
+    throw new Error('summarize is required when check is set');
   }
 
   return {
@@ -142,6 +186,10 @@ export function step<TResult = void>(
     name,
     outputs: options.outputs,
     run: options.run,
+    ...(options.check !== undefined && { check: options.check }),
+    ...(options.summarize !== undefined && { summarize: options.summarize }),
+    ...(options.drift !== undefined && { drift: options.drift }),
+    ...(options.whenInSync !== undefined && { whenInSync: options.whenInSync }),
     continueOnError: options.continueOnError,
     timeout: options.timeout,
     ...(options.cache !== undefined && { cache: options.cache }),

@@ -77,6 +77,7 @@ export const SCOPE_GROUPS = [
       'account-and-login.md',
       'approvals.md',
       'provenance.md',
+      'idempotent-steps.md',
     ],
   },
   {

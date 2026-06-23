@@ -92,8 +92,14 @@ export interface JoinTokenTable {
   expires_at: Date;
   /** When this token was consumed (null = unused) */
   consumed_at: Date | null;
-  /** Who consumed this token (null = unused) */
+  /** Who consumed this token (null = unused) — the coordinator that processed the claim */
   consumed_by: string | null;
+  /**
+   * The instanceId of the joining peer that consumed this token (null = unused).
+   * Distinct from `consumed_by` (the coordinator). Lets the same peer instance
+   * reuse the token until `expires_at` to self-heal after a transient outage.
+   */
+  consumed_by_instance: string | null;
 }
 
 // Convenience types for join_tokens
@@ -316,6 +322,12 @@ export interface ExecutionRunTable {
   /** When this record was created */
   created_at: Generated<Date>;
   /**
+   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`,
+   * the `CheckMode` enum). NULL means a legacy/apply run. A non-apply value
+   * labels the run a check-mode preview in the dashboard.
+   */
+  check_mode: string | null;
+  /**
    * Set inside the cold-store archive transaction before the row is
    * DELETEd. Survivors carry NULL. Exists so a future
    * "promote-chunk-back-into-PG" path (Phase F) can restore rows with
@@ -398,6 +410,8 @@ export interface ExecutionJobTable {
   wave_max_parallel: number | null;
   /** The fan-out base's `failFast` policy, stamped on every child. NULL = no bounded wave. */
   wave_fail_fast: boolean | null;
+  /** Instance id of the worker peer this job was rerouted to, or null if local. */
+  rerouted_to_peer: string | null;
   /** When this record was created */
   created_at: Generated<Date>;
   /**
@@ -446,6 +460,16 @@ export interface ExecutionStepTable {
   step_type: Generated<string>;
   /** JSON array of secret context names accessed by this step. NULL = tracking not available (old runs). */
   secrets_accessed: string | null;
+  /**
+   * Idempotent per-step outcome (`CheckStepOutcome`: skipped | applied |
+   * declined | dry-run | no_check). NULL when the step ran without a check
+   * mode. Orthogonal to `status`.
+   */
+  check_outcome: string | null;
+  /** Human-readable drift summary (`summarize(drift)`). NULL when no drift. */
+  drift_summary: string | null;
+  /** Structured drift value returned by `check()` (JSONB). NULL when no drift. */
+  drift: ColumnType<unknown | null, unknown, unknown>;
   /** When this record was created */
   created_at: Generated<Date>;
   /**
@@ -1729,6 +1753,18 @@ export interface HostRosterTable {
   arch: string | null;
   /** Which orchestrator instance holds the live WS; null = disconnected. */
   connected_instance_id: string | null;
+  /**
+   * Typed host-vars dimension (jsonb). A `{ [key]: string | number | boolean }`
+   * bag reported by the agent at registration and/or declared by the operator
+   * (`kici-admin host declare --prop`), shallow-merged on upsert. NOT NULL,
+   * defaults to `{}`. pg returns the parsed object on select; accept a
+   * JSON-stringified value on insert/update.
+   */
+  host_properties: ColumnType<
+    Record<string, string | number | boolean>,
+    Record<string, string | number | boolean> | string | undefined,
+    Record<string, string | number | boolean> | string
+  >;
   last_seen: ColumnType<Date, Date | string | undefined, Date | string>;
   created_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;

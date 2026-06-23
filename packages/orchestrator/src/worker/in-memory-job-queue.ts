@@ -80,6 +80,7 @@ export class InMemoryJobQueue {
       runsOnPatterns: input.runsOnPatterns ?? [],
       excludePatterns: input.excludePatterns ?? [],
       routingKey: input.routingKey,
+      pinnedAgentId: input.pinnedAgentId,
     });
     return id;
   }
@@ -137,6 +138,39 @@ export class InMemoryJobQueue {
     this.jobs.delete(jobId);
     this.dispatched.set(jobId, job);
     return job;
+  }
+
+  /**
+   * Dequeue the oldest pending job pinned to a specific agent. Mirrors the
+   * DB-backed `JobQueue.dequeueByPinnedAgent` that `Dispatcher.onAgentAvailable`
+   * calls — host-fanout children pinned to THIS agent drain before the generic
+   * label drain. Like the DB version, a pinned job relaxes the label-subset
+   * gate (the agent is its designated runner) and only the JS regex
+   * post-filter is applied.
+   *
+   * The worker receives jobs via direct P2P dispatch and does not currently
+   * pin jobs to agents, so in practice no in-memory job carries a
+   * `pinnedAgentId` and this returns null — `onAgentAvailable` then falls back
+   * to `dequeueForLabels`. Implementing it (rather than leaving it undefined)
+   * is mandatory: `Dispatcher.onAgentAvailable` invokes it unconditionally, so
+   * its absence threw `TypeError: this.queue.dequeueByPinnedAgent is not a
+   * function` as an unhandled rejection that crashed the worker.
+   */
+  async dequeueByPinnedAgent(agentId: string, agentLabels?: string[]): Promise<QueuedJob | null> {
+    for (const [id, job] of this.jobs) {
+      if (job.status !== DispatchQueueStatus.Pending) continue;
+      if (job.pinnedAgentId !== agentId) continue;
+      if (agentLabels) {
+        const labelSet = new Set(agentLabels);
+        if (!job.runsOnPatterns.every((p) => matcherSatisfiedBy(p, labelSet))) continue;
+        if (job.excludePatterns.some((p) => matcherSatisfiedBy(p, labelSet))) continue;
+      }
+      job.status = DispatchQueueStatus.Dispatched;
+      this.jobs.delete(id);
+      this.dispatched.set(id, job);
+      return job;
+    }
+    return null;
   }
 
   /** Return count of pending jobs. */

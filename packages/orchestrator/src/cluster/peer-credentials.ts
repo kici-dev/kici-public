@@ -55,7 +55,17 @@ export class PeerCredentialStore {
   constructor(private readonly db: Kysely<any>) {}
 
   /**
-   * Save a new peer credential.
+   * Save a new peer credential, revoking any prior active credential for the
+   * same instanceId (the `peer_credentials_active_uniq` partial unique index
+   * permits exactly one active credential per instanceId).
+   *
+   * Returns `{ revokedCount }` — how many previously-active credentials this
+   * save revoked. Because a coordinator's peer-clients share one
+   * identity-scoped credential, a `revokedCount > 0` here means every sibling
+   * peer-client of `instanceId` that was authenticating with the old
+   * credential is now invalidated and will be rejected on its next proof. The
+   * caller logs this so a revoke that cascades sibling rejections is visible in
+   * the orchestrator logs.
    */
   async save(opts: {
     instanceId: string;
@@ -64,20 +74,20 @@ export class PeerCredentialStore {
     routingKeys: string[];
     sourceTokenHash?: string;
     expiryDays?: number;
-  }): Promise<void> {
+  }): Promise<{ revokedCount: number }> {
     const expiryDays = opts.expiryDays ?? DEFAULT_EXPIRY_DAYS;
     const expiresAt = new Date(Date.now() + expiryDays * 24 * 60 * 60 * 1000);
 
-    const runOnce = async (): Promise<void> => {
-      await this.db.transaction().execute(async (trx) => {
+    const runOnce = async (): Promise<number> => {
+      return this.db.transaction().execute(async (trx) => {
         // Revoke old credentials for this instanceId to prevent stale hash buildup.
         // Each reconnection issues a new credential; the old one is no longer valid.
-        await trx
+        const revokeResult = await trx
           .updateTable('peer_credentials' as any)
           .set({ revoked_at: new Date() })
           .where('instance_id', '=', opts.instanceId)
           .where('revoked_at', 'is', null)
-          .execute();
+          .executeTakeFirst();
 
         await trx
           .insertInto('peer_credentials' as any)
@@ -90,6 +100,8 @@ export class PeerCredentialStore {
             expires_at: expiresAt,
           })
           .execute();
+
+        return Number((revokeResult as { numUpdatedRows?: bigint })?.numUpdatedRows ?? 0n);
       });
     };
 
@@ -98,11 +110,10 @@ export class PeerCredentialStore {
     // concurrent saves a TOCTOU loser. The retry's UPDATE now sees the
     // winner's committed row and revokes it before re-inserting. See
     try {
-      await runOnce();
+      return { revokedCount: await runOnce() };
     } catch (err: unknown) {
       if (err instanceof Error && 'code' in err && (err as { code: string }).code === '23505') {
-        await runOnce();
-        return;
+        return { revokedCount: await runOnce() };
       }
       throw err;
     }

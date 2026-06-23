@@ -89,6 +89,11 @@ export interface AdminRouteDeps {
     provider: string;
     sourceId: string;
   }) => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
+  /**
+   * Optional -- resolves the org-scoped GitHub webhook URL for the manifest
+   * setup pre-flight (before any App exists). Wired in platform/hybrid mode.
+   */
+  resolveGithubWebhookUrl?: () => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
   /** Optional -- for DB migration endpoints. */
   db?: Kysely<any>;
   /** Optional -- for DB migration endpoints. */
@@ -591,6 +596,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       createSourceRoutes({
         sourceStore: deps.sourceStore,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
+        resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
       }),
     );
   }

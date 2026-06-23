@@ -3,8 +3,8 @@ import { NeedsEntrySchema, NeedsGroupEntrySchema, SCHEMA_VERSION } from './types
 import type { LockDynamicJobFn, LockStep, LockJob, LockWorkflow } from './types.js';
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 20', () => {
-    expect(SCHEMA_VERSION).toBe(20);
+  it('SCHEMA_VERSION is 21', () => {
+    expect(SCHEMA_VERSION).toBe(21);
   });
 
   it('LockStep/LockJob/LockWorkflow accept an approval block', () => {

@@ -52,7 +52,7 @@ import {
   matrixEnvelopeFields,
   partitionMatchers,
 } from '@kici-dev/engine';
-import type { MaterializedJob } from '@kici-dev/engine';
+import type { MaterializedJob, CheckMode } from '@kici-dev/engine';
 import { evaluateInlineFields } from './inline-eval.js';
 
 const logger = createLogger({ prefix: 'test-pipeline' });
@@ -96,6 +96,12 @@ export interface TestTriggerInput {
   inlineLockFile?: string;
   /** When true, repo has no remote -- skip provider lookup, skip clone. */
   fullRepo?: boolean;
+  /**
+   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`).
+   * Threaded onto each dispatched job's config and persisted on the run.
+   * Omitted means `apply`.
+   */
+  checkMode?: CheckMode;
 }
 
 /**
@@ -502,6 +508,7 @@ function buildJobInput(
         namespacedSecrets: secretBundle.namespaced,
       }),
       ...(input.fullRepo && { fullRepo: true }),
+      ...(input.checkMode && { checkMode: input.checkMode }),
       // Production parity: the fixture's normalized envelope drives rules,
       // ctx.rawPayload and dynamic-function semantics exactly like a real run.
       event: ctx.simulatedEvent,
@@ -628,6 +635,7 @@ async function recordTestExecutionStart(
           }
         : undefined,
       workflow.timeout, // workflowTimeoutMs
+      input.checkMode, // checkMode
     );
     try {
       await (deps.executionTracker as any).db

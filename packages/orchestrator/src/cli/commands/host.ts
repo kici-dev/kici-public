@@ -12,10 +12,16 @@
 import type { Command } from 'commander';
 import type { Kysely } from 'kysely';
 import { toErrorMessage } from '@kici-dev/shared';
+import { parseHostPropertyAssignments } from '@kici-dev/engine';
 
 import { withDb } from './shared/db.js';
 import { deriveHostStatus, HostRosterStore } from '../../agent/host-roster.js';
 import type { Database, HostRosterRow } from '../../db/types.js';
+
+/** Collect a repeatable `--prop key=value` flag into an array. */
+function collectProp(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
 
 /**
  * The CLI reads the roster DB directly (no full orchestrator config load), so
@@ -92,25 +98,35 @@ export function registerHostCommands(program: Command): void {
     .requiredOption('--agent-id <id>', 'Agent id the host will register as')
     .option('--labels <labels>', 'Comma-separated labels', '')
     .option('--hostname <name>', 'Hostname')
-    .action(async (opts: { agentId: string; labels: string; hostname?: string }) => {
-      try {
-        const labels = opts.labels
-          ? String(opts.labels)
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean)
-          : [];
-        await withDb((db) =>
-          new HostRosterStore(db as unknown as Kysely<Database>).declareStatic({
-            agentId: opts.agentId,
-            labels,
-            hostname: opts.hostname,
-          }),
-        );
-        console.log(`Declared static host: ${opts.agentId}`);
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+    .option(
+      '--prop <key=value>',
+      'Typed host property (repeatable; true/false ⇒ boolean, numeric ⇒ number)',
+      collectProp,
+      [],
+    )
+    .action(
+      async (opts: { agentId: string; labels: string; hostname?: string; prop: string[] }) => {
+        try {
+          const labels = opts.labels
+            ? String(opts.labels)
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean)
+            : [];
+          const properties = parseHostPropertyAssignments(opts.prop);
+          await withDb((db) =>
+            new HostRosterStore(db as unknown as Kysely<Database>).declareStatic({
+              agentId: opts.agentId,
+              labels,
+              hostname: opts.hostname,
+              properties,
+            }),
+          );
+          console.log(`Declared static host: ${opts.agentId}`);
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      },
+    );
 }

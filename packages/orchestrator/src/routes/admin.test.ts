@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminRoutes, type AdminRouteDeps } from './admin.js';
 import type { Role } from '../secrets/rbac.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
+import { SecretScopeNotFoundError } from '../secrets/pg-secret-store.js';
 
 /**
  * Create mock admin route dependencies.
@@ -25,6 +26,9 @@ function createMockDeps(overrides?: Partial<AdminRouteDeps>): AdminRouteDeps {
       listScopes: vi.fn(),
       getAllSecrets: vi.fn(),
       rotateKey: vi.fn(),
+      createScope: vi.fn(),
+      renameScope: vi.fn(),
+      deleteScope: vi.fn(),
     } as any,
     auditLogger: {
       log: vi.fn(),
@@ -200,6 +204,43 @@ describe('admin routes', () => {
       });
       expect(res.status).toBe(200);
       expect(deps.secretStore.deleteSecret).toHaveBeenCalledWith('org-1', 'aws/prod', 'MY_KEY');
+    });
+  });
+
+  // ── Scope rename ──────────────────────────────────────────────
+  describe('scope rename', () => {
+    it('renames an existing scope and returns 200', async () => {
+      (deps.secretStore.renameScope as any).mockResolvedValue(undefined);
+
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'aws/prod', newScope: 'aws/production' },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ renamed: true });
+      expect(deps.secretStore.renameScope).toHaveBeenCalledWith('org-1', 'aws/prod', 'aws/production');
+    });
+
+    it('returns 404 (not 500) when renaming a non-existent scope', async () => {
+      (deps.secretStore.renameScope as any).mockRejectedValue(
+        new SecretScopeNotFoundError('does-not-exist'),
+      );
+
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'does-not-exist', newScope: 'does-not-exist-2' },
+      });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Secret scope 'does-not-exist' not found" });
+    });
+
+    it('returns 400 when the request body is malformed (missing newScope)', async () => {
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'aws/prod' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
     });
   });
 

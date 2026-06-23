@@ -1,3 +1,4 @@
+import type { CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import type { SandboxStepResult } from './types.js';
 
 /**
@@ -30,11 +31,11 @@ interface StepStartMessage {
   step_type?: string;
 }
 
-/** A step has completed (success or failure). */
+/** A step has completed (success, failure, or a check-mode skip). */
 interface StepCompleteMessage {
   type: 'step.complete';
   stepIndex: number;
-  status: 'success' | 'failed';
+  status: 'success' | 'failed' | 'skipped';
   durationMs: number;
   error?: {
     message: string;
@@ -53,6 +54,16 @@ interface StepCompleteMessage {
    * pseudo-steps carry `{ cacheOutcome, key, matchedKey?, bytes? }` here.
    */
   data?: Record<string, unknown>;
+  /**
+   * Idempotent per-step outcome (`CheckStepOutcome`). Present only when the run
+   * carried a check mode and the step has a `check` facet (or was a plain step
+   * skipped under check mode). Orthogonal to `status`.
+   */
+  checkOutcome?: CheckStepOutcome;
+  /** Human-readable drift summary (`summarize(drift)`). Present when drift was detected. */
+  driftSummary?: string;
+  /** Structured drift value returned by `check()`. Present when drift was detected. */
+  drift?: unknown;
 }
 
 /** A single log line from step execution. */
@@ -476,6 +487,13 @@ export interface JobExecutionRequest {
   checkout?: boolean;
   /** Whether this job is part of a test run triggered by `kici test`. */
   isTestRun?: boolean;
+  /**
+   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`).
+   * Threaded from the dispatch event. In check / check-fail-on-drift mode the
+   * runner previews drift and never invokes a checked step's apply (`run`).
+   * Defaults to `apply` when unset.
+   */
+  checkMode?: CheckMode;
   /** When true, skip git clone -- use overlay tarball as complete workspace. */
   fullRepo?: boolean;
 

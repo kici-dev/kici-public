@@ -61,7 +61,7 @@ Categories you may see:
 
 - **Secret context resolution failed** — the workflow's secret contexts couldn't be resolved.
 - **Install-secrets resolution rejected** — the .npmrc / install-secrets resolution rejected the dispatch.
-- **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated (corrupt JSON, missing schema version), so the orchestrator records the delivery as a failed run instead of silently skipping it. A repository with no lock file at all is not an error and produces no run.
+- **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated, so the orchestrator records the delivery as a failed run instead of silently skipping it. This covers corrupt JSON, a missing schema version, malformed routing labels, and a **schema-version mismatch**: a lock compiled by a different engine version than the one your orchestrator runs is rejected with a clear "recompile with `kici compile`" message rather than dispatched. The orchestrator and the lock move together (no backward compatibility across schema versions), so the fix is always to recompile the lock against your current toolchain and push again — never to force the old lock through. A repository with no lock file at all is not an error and produces no run.
 - **Build coordination failed** — the build job dispatch was rejected or the build coordinator timed out.
 - **Rejected by environment protection rules** — a protection rule (review / wait timer / branch restriction) rejected the job.
 - **Dynamic / deferred-init evaluation failed** — a dynamic or deferred-init job dispatch failed.

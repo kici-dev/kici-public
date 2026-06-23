@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
 import { handleAdminError } from './admin-errors.js';
 import { PermissionDeniedError } from '../secrets/rbac.js';
+import { SecretScopeNotFoundError } from '../secrets/pg-secret-store.js';
 
 /** Minimal Hono-context stub: records the (body, status) passed to c.json. */
 function makeCtx() {
@@ -40,6 +41,16 @@ describe('handleAdminError', () => {
     const { c, calls } = makeCtx();
     handleAdminError(c as never, new PermissionDeniedError('admin', 'context.read'), makeLogger());
     expect(calls[0]!.status).toBe(403);
+  });
+
+  it('maps a SecretScopeNotFoundError to 404 without logging at error level', () => {
+    const { c, calls } = makeCtx();
+    const logger = makeLogger();
+    handleAdminError(c as never, new SecretScopeNotFoundError('does-not-exist'), logger);
+    expect(calls[0]!.status).toBe(404);
+    expect(calls[0]!.body).toEqual({ error: "Secret scope 'does-not-exist' not found" });
+    // A not-found is a client error, not a server fault.
+    expect(logger.error).not.toHaveBeenCalled();
   });
 
   it('maps a ZodError to 400 with details', () => {
