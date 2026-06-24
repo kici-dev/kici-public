@@ -2,7 +2,7 @@
  * Shared approval requirement + clause types.
  *
  * One normalized `ApprovalRequirement` is produced by both approval triggers —
- * a mandatory environment policy and an explicit SDK `requireApproval` — and is
+ * a mandatory environment policy and an explicit SDK `approval` config — and is
  * consumed identically by the orchestrator gate, the resolver, the held-run
  * store, and the agent step round-trip. Pure Zod (no node built-ins), so this
  * module is safe in the browser-facing engine barrel.

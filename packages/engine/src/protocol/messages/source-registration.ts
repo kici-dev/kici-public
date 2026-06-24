@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DeploymentIdentitySchema } from './deployment-identity.js';
 
 // --- Source registration protocol messages ---
 // Used during WebSocket connection setup: orchestrator pushes its webhook source
@@ -53,6 +54,14 @@ export const sourceRegistrationSchema = z.object({
        * mapping. Required — pre-release, no backward-compat shims.
        */
       subtype: SourceSubtype,
+      /**
+       * GitHub App slug (the URL-safe identifier GitHub assigns, e.g.
+       * `my-kici-app`). Only set for GitHub-App sources, where GitHub is the
+       * source of truth for both the display `name` and the `slug`. Optional —
+       * generic / universal-git / local sources have no slug, and a GitHub
+       * source whose identity fetch hasn't run yet leaves it unset.
+       */
+      slug: z.string().min(1).optional(),
     }),
   ),
   /** Orchestrator cluster instance ID for peer correlation. */
@@ -86,6 +95,13 @@ export const sourceRegistrationSchema = z.object({
   mode: z.enum(['platform', 'hybrid', 'independent']).optional(),
   /** Scaler backends configured on this orchestrator (e.g. ["container", "firecracker"]). */
   scalerBackends: z.array(z.string()).optional(),
+  /**
+   * How the orchestrator process itself was deployed (systemd/launchd/windows/
+   * compose/unknown), used by the dashboard to build the correct kici-admin
+   * invocation. Optional: older orchestrators that haven't been redeployed don't
+   * publish it, in which case the dashboard treats the shape as `unknown`.
+   */
+  deployment: DeploymentIdentitySchema.optional(),
   /** Whether this orchestrator has S3 log storage configured. Used for multi-orch pool validation. */
   s3LogAccess: z.boolean().optional(),
   /** Queue timeout in ms. Platform uses this (with margin) for safety-net GC of stale queued jobs. */

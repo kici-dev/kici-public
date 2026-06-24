@@ -24,10 +24,13 @@ export type CacheRefScope = z.infer<typeof CacheRefScope>;
  *
  * - `jobs` maps an upstream job name to its outputs record.
  * - `groups` maps a dynamic group name to its ordered member job names.
+ * - `statuses` maps an upstream job name to its terminal status, so the
+ *   generator's `ctx.needs.<job>.status` reflects the frozen upstream outcome.
  */
 export const upstreamSnapshotSchema = z.object({
   jobs: z.record(z.string(), z.record(z.string(), z.unknown())),
   groups: z.record(z.string(), z.array(z.string())),
+  statuses: z.record(z.string(), ExecutionJobStatus).optional(),
 });
 export type UpstreamSnapshot = z.infer<typeof upstreamSnapshotSchema>;
 
@@ -112,6 +115,8 @@ export const jobDispatchSchema = z
     runPublicKey: z.string().optional(),
     /** Plain outputs from upstream jobs (keyed by job name, then by step name). Populated for downstream jobs with `needs` dependencies. */
     upstreamJobOutputs: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+    /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). Powers `ctx.needs.<job>.status`. */
+    upstreamJobStatuses: z.record(z.string(), ExecutionJobStatus).optional(),
     /**
      * Structured clone auth for the source repo. Preferred over `token` (which
      * remains as a backward-compat field for same-provider GitHub App flows
@@ -738,12 +743,26 @@ export const StepApprovalOutcome = z.enum(['approved', 'rejected', 'expired']);
 export type StepApprovalOutcome = z.infer<typeof StepApprovalOutcome>;
 
 /**
- * Agent -> Orchestrator: a step carrying `requireApproval` is about to run and
+ * Drift payload carried on a `when: 'drift'` step-approval hold. Captured from
+ * the step's check/summarize: `summaryMarkdown` is the author's `summarize(drift)`
+ * rendering, `drift` is the structured drift blob. Rendered in the dashboard
+ * approval queue + the CLI so the operator sees the computed diff before
+ * approving the apply.
+ */
+export const stepApprovalPayloadSchema = z.object({
+  summaryMarkdown: z.string(),
+  drift: z.unknown(),
+});
+export type StepApprovalPayload = z.infer<typeof stepApprovalPayloadSchema>;
+
+/**
+ * Agent -> Orchestrator: a step carrying an `approval` gate is about to run and
  * the agent is blocking its step loop until the orchestrator resolves the
  * approval. The orchestrator creates a step-scoped `held_runs` row from the
  * normalized requirement and replies with `step.approval-resolved` once the
  * hold is approved, rejected, or expired. The agent keeps heartbeats flowing
- * during the wait so it is not reaped as stale.
+ * during the wait so it is not reaped as stale. For a `when: 'drift'` gate the
+ * request carries the computed drift `payload`.
  *
  * NOT fast-pathed — the `log.chunk` / `heartbeat` manual-validator invariant is
  * untouched by this message.
@@ -757,14 +776,16 @@ export const stepApprovalRequestSchema = z.object({
   stepName: z.string(),
   /** AND-list of approver clauses (empty = any approval-capable member). */
   clauses: z.array(approverClauseSchema),
-  /** Human label for the gate (from the SDK `requireApproval` reason). */
+  /** Human label for the gate (from the SDK `approval` reason). */
   reason: z.string(),
   /**
-   * Per-gate timeout override (seconds) from the SDK `requireApproval.timeout`.
+   * Per-gate timeout override (seconds) from the SDK `approval.timeout`.
    * Absent ⇒ the orchestrator uses the org-default `approval_expiry_seconds`.
    * The orchestrator owns the authoritative `expiresAt` computation.
    */
   timeoutSeconds: z.number().int().positive().optional(),
+  /** Computed drift payload, present only for `when: 'drift'` gates. */
+  payload: stepApprovalPayloadSchema.optional(),
 });
 export type StepApprovalRequest = z.infer<typeof stepApprovalRequestSchema>;
 

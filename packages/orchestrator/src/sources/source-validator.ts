@@ -14,6 +14,8 @@ import { Octokit } from '@octokit/rest';
 export interface ValidationResult {
   valid: boolean;
   appName?: string;
+  /** GitHub App slug (URL-safe identifier) returned by `GET /app`. */
+  slug?: string;
   error?: string;
 }
 
@@ -33,7 +35,7 @@ export async function validateGitHubSource(
       auth: { appId, privateKey },
     });
     const { data } = await octokit.apps.getAuthenticated();
-    return { valid: true, appName: data?.name ?? 'Unknown' };
+    return { valid: true, appName: data?.name ?? 'Unknown', slug: data?.slug };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     return { valid: false, error: `GitHub API validation failed: ${message}` };

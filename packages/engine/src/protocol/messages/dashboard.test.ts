@@ -15,10 +15,46 @@ import {
   browserEventLogPayloadChunkSchema,
   runListResponseSchema,
   diagnosticsInfrastructureResponseSchema,
+  testRelayTriggerRequestSchema,
 } from './dashboard.js';
 import { InitFailureCategory } from './execution-status.js';
 
 const testActor = { type: 'user' as const, sub: 'zsub-test' };
+
+describe('testRelayTriggerRequestSchema — target host narrowing', () => {
+  const base = {
+    type: 'test.relay.trigger' as const,
+    requestId: 'req-t',
+    actor: testActor,
+    routingKey: 'github:1',
+    fixtureId: 'fx',
+    event: { type: 'push', targetBranch: 'main', payload: {} },
+  };
+
+  it('round-trips an optional target selector', () => {
+    const parsed = testRelayTriggerRequestSchema.parse({
+      ...base,
+      target: {
+        values: [{ include: [{ kind: 'exact', value: 'role:web' }], exclude: [] }],
+        allowEmpty: true,
+      },
+    });
+    expect(parsed.target?.values).toHaveLength(1);
+    expect(parsed.target?.allowEmpty).toBe(true);
+  });
+
+  it('accepts a request with no target (webhook parity)', () => {
+    expect(testRelayTriggerRequestSchema.parse(base).target).toBeUndefined();
+  });
+
+  it('rejects a target with an empty values array', () => {
+    const r = testRelayTriggerRequestSchema.safeParse({
+      ...base,
+      target: { values: [], allowEmpty: false },
+    });
+    expect(r.success).toBe(false);
+  });
+});
 
 describe('dashboardRunDetailRequestSchema', () => {
   const valid = {
@@ -170,7 +206,7 @@ describe('dashboardJobDetailSchema (agentId)', () => {
 });
 
 describe('dashboardJobDetailSchema needs', () => {
-  it('accepts a needs array with ifFailed policy', () => {
+  it('accepts a needs array with a runOn status-set', () => {
     const parsed = dashboardJobDetailSchema.parse({
       jobId: 'test-linux',
       jobName: 'test',
@@ -182,9 +218,9 @@ describe('dashboardJobDetailSchema needs', () => {
       agentId: null,
       errorMessage: null,
       steps: [],
-      needs: [{ upstreamName: 'build', ifFailed: 'skip' }],
+      needs: [{ upstreamName: 'build', runOn: ['success'] }],
     });
-    expect(parsed.needs).toEqual([{ upstreamName: 'build', ifFailed: 'skip' }]);
+    expect(parsed.needs).toEqual([{ upstreamName: 'build', runOn: ['success'] }]);
   });
 
   it('treats needs as optional (jobs without upstreams)', () => {
@@ -203,7 +239,7 @@ describe('dashboardJobDetailSchema needs', () => {
     expect(parsed.needs ?? null).toBeNull();
   });
 
-  it('rejects an invalid ifFailed value', () => {
+  it('rejects an invalid runOn status', () => {
     expect(() =>
       dashboardJobDetailSchema.parse({
         jobId: 'x',
@@ -216,7 +252,7 @@ describe('dashboardJobDetailSchema needs', () => {
         agentId: null,
         errorMessage: null,
         steps: [],
-        needs: [{ upstreamName: 'build', ifFailed: 'maybe' }],
+        needs: [{ upstreamName: 'build', runOn: ['maybe'] }],
       }),
     ).toThrow();
   });
@@ -848,6 +884,11 @@ describe('REST response schemas (CLI reuse)', () => {
           queuedJobs: 0,
           pendingLabelGaps: [],
           scalerBackends: [],
+          deployment: {
+            mode: 'compose',
+            containerName: 'kici-orchestrator',
+            containerRuntime: 'podman',
+          },
           statefulAgentCount: 0,
           scalers: [
             {
@@ -877,5 +918,33 @@ describe('REST response schemas (CLI reuse)', () => {
       alerts: [{ type: 'zero-agents', message: 'none', severity: 'warning' }],
     });
     expect(ok.orchestrators[0].agents[0].labels).toContain('linux');
+    expect(ok.orchestrators[0].deployment).toEqual({
+      mode: 'compose',
+      containerName: 'kici-orchestrator',
+      containerRuntime: 'podman',
+    });
+  });
+
+  it('diagnosticsInfrastructureResponseSchema accepts an unknown deployment shape', () => {
+    const ok = diagnosticsInfrastructureResponseSchema.parse({
+      orchestrators: [
+        {
+          connectionId: 'conn-2',
+          routingKeys: [],
+          connected: true,
+          agentCount: 0,
+          runningJobs: 0,
+          queuedJobs: 0,
+          pendingLabelGaps: [],
+          scalerBackends: [],
+          deployment: { mode: 'unknown', containerName: null, containerRuntime: null },
+          statefulAgentCount: 0,
+          scalers: [],
+          agents: [],
+        },
+      ],
+      alerts: [],
+    });
+    expect(ok.orchestrators[0].deployment.mode).toBe('unknown');
   });
 });

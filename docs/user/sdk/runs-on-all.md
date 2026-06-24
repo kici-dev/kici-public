@@ -204,6 +204,32 @@ A held host occupies a wave slot indefinitely while it waits to reconnect, stall
 roll behind an absent box. `skip` (run only reachable hosts) or `fail` (refuse the roll
 if any expected host is down) keep the window moving.
 
+### Narrowing the roster at run time with `--target`
+
+A `runsOnAll` predicate is authored once in the workflow, but you can narrow it for a
+single run with `kici run --target <selector>` — an Ansible-`--limit`-style runtime
+filter. The effective host set becomes `runsOnAll ∩ target`: the selector can only
+_remove_ hosts from the matched roster, never add them. The narrowing is **run-global**
+(it applies to every `runsOnAll` job) and **`runsOnAll`-only** (single `runsOn`-pinned
+jobs are untouched). Repeated `--target` values AND-combine — a host must satisfy every
+selector to survive.
+
+```bash
+# Patch only the role:web subset of whatever role:* hosts the job would match
+kici run remote deploy --target role:web
+
+# Intersect two selectors: hosts must be BOTH role:web AND dc:eu
+kici run remote deploy --target role:web --target dc:eu
+```
+
+When `--target` narrows a `runsOnAll` job to zero hosts, the run **fails** by default
+(a mistyped selector should be loud, not silently no-op). Pass `--target-allow-empty`
+to **skip** the zeroed job instead — it records a `skipped` status, and downstream jobs
+gated with `when: 'on-skip'` (or `when: 'always'`) still run, exactly as for an
+`onUnreachable: 'skip'` zero-host fan-out. See the [CLI reference](/user/cli-reference/#host-narrowing-with---target)
+for the full flag behavior and the [`needs` gating model](./core.md#job-dependencies-needs)
+for how a skipped upstream propagates.
+
 ### Limits (v0)
 
 - Per-host secret scoping is not yet available — all hosts receive the job's resolved

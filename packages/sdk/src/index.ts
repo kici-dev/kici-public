@@ -4,8 +4,13 @@ export { job } from './job.js';
 export { workflow } from './workflow.js';
 
 // Approval gate API
-export { normalizeRequireApproval } from './approval.js';
-export type { RequireApproval, ApproverClause, NormalizedRequireApproval } from './approval.js';
+export { normalizeApproval } from './approval.js';
+export type {
+  ApprovalConfig,
+  ApprovalWhen,
+  ApproverClause,
+  NormalizedApproval,
+} from './approval.js';
 
 // Trigger factories
 export {
@@ -199,6 +204,8 @@ export type {
   ResultAwareDynamicJobConfig,
   ResultAwareDynamicJobFn,
   DynamicJobNeed,
+  NeedsWhen,
+  NeedsWhenInput,
 } from './types.js';
 
 // Result-aware dynamic job generation: ctx.needs builder + snapshot proxy
@@ -243,6 +250,7 @@ export type {
   InfrastructureApi,
   InfrastructureListResult,
   InventoryApi,
+  HostApi,
   HostInventoryEntry,
   InventorySelector,
 } from './api-types.js';
@@ -314,6 +322,10 @@ export type { IdempotentOptions, IdempotentResult } from './idempotent.js';
 // Wait-for helpers
 export { waitFor, waitForStep, WaitForTimeoutError } from './wait-for.js';
 export type { WaitForOptions, WaitForResult } from './wait-for.js';
+
+// Host-restart steps
+export { waitForHostAlive, restartHost } from './host-restart.js';
+export type { WaitForHostAliveOptions, RestartHostOptions } from './host-restart.js';
 
 // Zod re-export for event schema authoring
 export { z } from 'zod';

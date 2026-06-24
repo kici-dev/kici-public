@@ -13,7 +13,11 @@ import type {
   ConcurrencyAckMessage,
 } from './ipc-protocol.js';
 import { executeStepLoop, type StepLoopOptions, type StepLoopResult } from './step-loop.js';
-import { rawPayloadFromEvent, createSandboxStepContext } from './workflow-runner.js';
+import {
+  rawPayloadFromEvent,
+  createSandboxStepContext,
+  buildStepNeedsContext,
+} from './workflow-runner.js';
 import type { JobExecutionRequest } from './ipc-protocol.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -1226,5 +1230,40 @@ describe('createSandboxStepContext - matrix threading', () => {
     const ctx = buildCtx(baseRequest());
     expect(ctx.host).toBeUndefined();
     expect(ctx.agent).toBeUndefined();
+  });
+});
+
+describe('buildStepNeedsContext', () => {
+  it('returns undefined when the job declares no needs', () => {
+    expect(buildStepNeedsContext(undefined, undefined, undefined)).toBeUndefined();
+    expect(buildStepNeedsContext([], {}, {})).toBeUndefined();
+  });
+
+  it('resolves a single upstream to { result, status }', () => {
+    const needs = buildStepNeedsContext(
+      [{ name: 'build', runOn: ['success'] }],
+      { build: { compile: { version: '1.0.0' } } },
+      { build: 'success' },
+    );
+    const entry = needs!.build as { result: any; status: string };
+    expect(entry.status).toBe('success');
+    expect(entry.result.compile.version).toBe('1.0.0');
+  });
+
+  it('exposes a failed upstream status under when:always', () => {
+    const needs = buildStepNeedsContext(['probe'], { probe: {} }, { probe: 'failed' });
+    expect((needs!.probe as { status: string }).status).toBe('failed');
+  });
+
+  it('resolves a matrix fan-out upstream to an ordered array of children', () => {
+    const needs = buildStepNeedsContext(
+      [{ name: 'test', runOn: ['success'] }],
+      { test: { byMatrix: { a: { ok: 1 }, b: { ok: 2 } }, merged: { ok: 2 } } },
+      { 'test (a)': 'success', 'test (b)': 'skipped' },
+    );
+    const arr = needs!.test as Array<{ name: string; result: any; status: string }>;
+    expect(arr.map((e) => e.name)).toEqual(['test (a)', 'test (b)']);
+    expect(arr.map((e) => e.status)).toEqual(['success', 'skipped']);
+    expect(arr.map((e) => e.result.ok)).toEqual([1, 2]);
   });
 });

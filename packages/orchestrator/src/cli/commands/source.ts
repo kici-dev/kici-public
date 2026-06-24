@@ -119,6 +119,31 @@ async function readFromStdin(): Promise<string> {
   return chunks.join('\n');
 }
 
+/** Shape of the `source refresh` route response (one source). */
+interface RefreshResultJson {
+  routingKey: string;
+  changed: boolean;
+  oldName: string;
+  newName: string;
+  oldSlug: string | null;
+  newSlug: string;
+}
+
+/** Print a `source refresh` result, showing old → new for name + slug. */
+function printRefreshResult(r: RefreshResultJson): void {
+  if (!r.changed) {
+    console.log(`${r.routingKey}: up to date (name "${r.newName}", slug "${r.newSlug}")`);
+    return;
+  }
+  console.log(`${r.routingKey}: updated`);
+  if (r.oldName !== r.newName) {
+    console.log(`  name: ${r.oldName} → ${r.newName}`);
+  }
+  if (r.oldSlug !== r.newSlug) {
+    console.log(`  slug: ${r.oldSlug ?? '(none)'} → ${r.newSlug}`);
+  }
+}
+
 /**
  * Format a generic source for display.
  */
@@ -303,6 +328,11 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       '--github-org <slug>',
       'Create the App under a GitHub org instead of your personal account',
     )
+    .option(
+      '--webhook-url <url>',
+      'Advanced/self-hosted: bake this https:// URL into the App webhook verbatim and skip ' +
+        'platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery.',
+    )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
       // One-click manifest setup creates AND configures the App for the
@@ -310,7 +340,12 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       if (opts.manifest) {
         try {
           await runGithubManifestSetup(
-            { name: opts.name, noBrowser: !opts.browser, githubOrg: opts.githubOrg },
+            {
+              name: opts.name,
+              noBrowser: !opts.browser,
+              githubOrg: opts.githubOrg,
+              webhookUrl: opts.webhookUrl,
+            },
             getClient(),
           );
         } catch (err) {
@@ -733,6 +768,55 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           body,
         );
         console.log(`Source updated: ${result.routingKey}`);
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  // -- source refresh <routingKey> --
+  // Re-sync a GitHub source's display name + slug from GitHub. GitHub is the
+  // source of truth: this fetches `GET /app` now and applies any drift, printing
+  // old → new for both fields. With --all, every GitHub source is refreshed.
+  src
+    .command('refresh [routingKey]')
+    .description("Re-sync a GitHub source's name and slug from GitHub (use --all for every source)")
+    .option('--all', 'Refresh every GitHub source')
+    .option('--json', 'Emit raw JSON instead of formatted text')
+    .action(async (routingKey: string | undefined, opts) => {
+      try {
+        if (opts.all) {
+          const res = await getClient().post<{
+            results: Array<RefreshResultJson>;
+            errors: Array<{ routingKey: string; error: string }>;
+          }>('/api/v1/admin/sources/refresh-all', {});
+          if (opts.json) {
+            console.log(JSON.stringify(res, null, 2));
+            return;
+          }
+          for (const r of res.results) printRefreshResult(r);
+          for (const e of res.errors) {
+            console.error(`  ${e.routingKey}: ${e.error}`);
+          }
+          if (res.results.length === 0 && res.errors.length === 0) {
+            console.log('No GitHub sources to refresh.');
+          }
+          return;
+        }
+
+        if (!routingKey) {
+          console.error('Error: provide a <routingKey> or use --all');
+          process.exit(1);
+        }
+        const result = await getClient().post<RefreshResultJson>(
+          `/api/v1/admin/sources/${encodeURIComponent(routingKey)}/refresh`,
+          {},
+        );
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        printRefreshResult(result);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);

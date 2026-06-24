@@ -610,9 +610,9 @@ const test = job('test', { needs: [lint], ... });
 // 2. Reference by string name
 const test = job('test', { needs: ['lint'], ... });
 
-// 3. Object form with per-edge failure policy
+// 3. Object form with a per-edge run condition (`when`)
 const cleanup = job('cleanup', {
-  needs: [{ name: 'build', ifFailed: 'run' }],
+  needs: [{ name: 'build', when: 'always' }],
   ...
 });
 
@@ -623,16 +623,36 @@ const deploy = job('deploy', {
 });
 ```
 
-**Failure policy (`ifFailed`):** controls what happens to a downstream job when an upstream reaches a non-success terminal state (`failed`, `cancelled`, `drift_dropped`).
+**Run condition (`when`):** controls when a downstream edge is satisfied, based on the upstream's terminal status. `when` is keyword sugar (or a raw status-set) that resolves at compile time to the set of upstream terminal statuses that satisfy the edge. The downstream edge is satisfied when the upstream's terminal status is a member of that set.
 
-| Value  | Behavior                                                                                    |
-| ------ | ------------------------------------------------------------------------------------------- |
-| `skip` | (Default) Downstream transitions directly to `skipped`. Failures cascade through the DAG.   |
-| `run`  | Downstream dispatches anyway. Use for cleanup, notification, or "always-run" teardown jobs. |
+| Keyword                  | Satisfied when the upstream is… | Use for                                     |
+| ------------------------ | ------------------------------- | ------------------------------------------- |
+| `'on-success'` (default) | `success`                       | normal dependencies                         |
+| `'always'`               | any terminal status             | cleanup / notification / teardown jobs      |
+| `'on-skip'`              | `success` or `skipped`          | continue when an upstream was narrowed out  |
+| `'on-failure'`           | `failed` or `timed_out_stale`   | error-handler jobs that run only on failure |
 
-String and `Job`-reference entries default to `ifFailed: 'skip'`. To override, use the object form (`{ name, ifFailed }` for static upstreams, `{ group, ifFailed }` for dynamic groups -- `dynamicGroup(name, { ifFailed: 'run' })` produces the latter).
+For full control, pass a raw status-set instead of a keyword: `when: ['skipped', 'failed', 'timed_out_stale']`. The valid members are the terminal job statuses: `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`.
 
-**Dispatch gate:** `needs` is a hard dispatch gate. A job only dispatches after every upstream in its `needs` array reaches a terminal state (success, or failure with `ifFailed: 'run'`). Root jobs (empty `needs`, no dynamic group refs) dispatch immediately. The scheduler is DB-backed and fully recovers across orchestrator restarts.
+String and `Job`-reference entries default to `when: 'on-success'`. To override, use the object form (`{ name, when }` for static upstreams, `{ group, when }` for dynamic groups -- `dynamicGroup(name, { when: 'always' })` produces the latter).
+
+When an upstream's terminal status is **not** in the edge's set, the downstream transitions directly to `skipped`. Because a skipped job is itself terminal, this propagates transitively: each downstream's `when` set governs whether the skip cascades further.
+
+**Dispatch gate:** `needs` is a hard dispatch gate. A job dispatches only after every upstream in its `needs` array reaches a terminal status that satisfies that edge's `when` set. Root jobs (empty `needs`, no dynamic group refs) dispatch immediately. The scheduler is DB-backed and fully recovers across orchestrator restarts.
+
+**Reading an upstream's status in a step:** inside a running job, `ctx.needs.<job>.status` exposes each upstream's terminal status (`success`, `failed`, `skipped`, …) and `ctx.needs.<job>.result` its outputs. A group / matrix / `runsOnAll` fan-out upstream is an ordered array of `{ name, result, status }`, one per child. Use this to branch in TypeScript:
+
+```typescript
+job('report', {
+  needs: [{ name: 'probe', when: 'always' }],
+  run: async (ctx) => {
+    if (ctx.needs.probe.status === 'failed') await fileIncident(ctx.needs.probe.result);
+    else await publish(ctx.needs.probe.result);
+  },
+});
+```
+
+For an arbitrary outcome-based gate that prevents a job from dispatching at all, use a result-aware `dynamicJob` that returns `[]` or `[job]` based on `ctx.needs.<job>.status` — see [Dynamic jobs](../../architecture/execution/dynamic-jobs.md).
 
 **DAG validation:** three-layer cycle detection.
 
@@ -645,7 +665,10 @@ String and `Job`-reference entries default to `ifFailed: 'skip'`. To override, u
 Create a reference to a dynamic job group, for use inside a static job's `needs` array.
 
 ```typescript
-function dynamicGroup(name: string, options?: { ifFailed?: 'skip' | 'run' }): DynamicGroupRef;
+function dynamicGroup(
+  name: string,
+  options?: { when?: 'on-success' | 'always' | 'on-skip' | 'on-failure' | string[] },
+): DynamicGroupRef;
 ```
 
 Use when a static downstream must wait for every generated job tagged with a given group name to complete. If the dynamic group produces zero jobs, the downstream dispatches immediately (empty group satisfies all upstreams).

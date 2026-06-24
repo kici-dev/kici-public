@@ -74,6 +74,26 @@ export interface ResolvedSecretMeta {
 }
 
 /**
+ * The public secret-resolution surface consumed by the dispatch path and the
+ * universal-git provider. `SecretResolver` implements this; the test adapter's
+ * `DecoratingSecretResolver` (CLI-secret overlay) implements it too, so either
+ * can flow through `ProcessingDeps.secretResolver`.
+ */
+export interface SecretResolverApi {
+  resolveForJob(orgId: string, environmentName: string): Promise<Record<string, string>>;
+  resolveNamed(
+    orgId: string,
+    scope: string,
+    key: string,
+    opts?: { store?: string; runId?: string; jobId?: string },
+  ): Promise<string | null>;
+  resolveForJobWithMeta(
+    orgId: string,
+    environmentName: string,
+  ): Promise<Record<string, ResolvedSecretMeta>>;
+}
+
+/**
  * Resolves secrets for a job by matching environment bindings against scoped secrets
  * from multiple backends.
  *
@@ -82,7 +102,7 @@ export interface ResolvedSecretMeta {
  * are matched against binding patterns, and longest-path-wins uses the path AFTER
  * stripping the backend prefix.
  */
-export class SecretResolver {
+export class SecretResolver implements SecretResolverApi {
   private readonly environmentStore: EnvironmentStoreLike;
   private readonly bindingStore: BindingStoreLike;
   private readonly backendStores: Map<string, SecretStoreLike>;

@@ -21,13 +21,14 @@ import { z } from 'zod';
 import type { ProviderType } from '../provider/types.js';
 import type { ApproverClause } from '../approval/types.js';
 import { LabelMatcher } from '../labels-match.js';
+import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
 
 /** Schema version - increment on breaking changes */
-export const SCHEMA_VERSION = 21 as const;
+export const SCHEMA_VERSION = 22 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
- * from an SDK `requireApproval` at any of the three levels; consumed by the
+ * from an SDK `approval` at any of the three levels; consumed by the
  * orchestrator dispatch gate (and the agent step round-trip for step scope).
  */
 export interface LockApproval {
@@ -37,6 +38,11 @@ export interface LockApproval {
   readonly reason?: string;
   /** Per-gate expiry override (seconds); falls back to the org default. */
   readonly timeoutSeconds?: number;
+  /**
+   * When the gate fires. `always` (default) gates before the element; `drift`
+   * gates between a step's check and run on detected drift (step scope only).
+   */
+  readonly when: 'always' | 'drift';
 }
 
 /**
@@ -413,31 +419,60 @@ export function isLockInlineValue(value: unknown): value is LockInlineValue {
 }
 
 /**
- * Per-edge failure policy for a `needs` dependency: `skip` propagates an
- * upstream failure to the downstream job (default), `run` runs the downstream
- * job regardless of the upstream outcome. Single source of truth for this
- * value across lock-file schemas and protocol messages.
+ * Author-facing keyword sugar for a `needs` edge's run condition. Each keyword
+ * resolves (at compile time) to a set of upstream terminal statuses; the
+ * downstream edge is dispatch-satisfied when the upstream's terminal status is
+ * a member of that set.
  */
-export const IfFailedPolicy = z.enum(['skip', 'run']);
-export type IfFailedPolicy = z.infer<typeof IfFailedPolicy>;
+export const NeedsWhen = z.enum(['on-success', 'always', 'on-skip', 'on-failure']);
+export type NeedsWhen = z.infer<typeof NeedsWhen>;
 
 /**
- * Needs entry with per-edge failure policy.
- * Used in lock file needs arrays for explicit ifFailed override.
+ * Normalized, DB-evaluable run condition for a `needs` edge: the non-empty set
+ * of upstream terminal statuses that satisfy the edge. The lock file and the
+ * orchestrator scheduler only ever see this resolved set (never a keyword), so
+ * gating stays a pure status-set membership test.
+ */
+export const NeedsRunOn = z.array(ExecutionJobStatus).nonempty();
+export type NeedsRunOn = z.infer<typeof NeedsRunOn>;
+
+const WHEN_TO_RUN_ON: Record<NeedsWhen, ExecutionJobStatus[]> = {
+  'on-success': [ExecutionJobStatus.enum.success],
+  always: [...TERMINAL_JOB_STATES] as ExecutionJobStatus[],
+  'on-skip': [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped],
+  'on-failure': [ExecutionJobStatus.enum.failed, ExecutionJobStatus.enum.timed_out_stale],
+};
+
+/**
+ * Resolve the author-facing `when` (keyword sugar | raw status-set | unset) to
+ * the normalized status-set. An unset `when` defaults to success-only — the
+ * downstream runs only when the upstream succeeded.
+ */
+export function resolveWhenToRunOn(
+  when: NeedsWhen | ExecutionJobStatus[] | undefined,
+): ExecutionJobStatus[] {
+  if (when === undefined) return [ExecutionJobStatus.enum.success];
+  if (Array.isArray(when)) return when;
+  return WHEN_TO_RUN_ON[when];
+}
+
+/**
+ * Needs entry carrying the normalized run-on status-set.
+ * Used in lock file needs arrays for an explicit per-edge run condition.
  */
 export const NeedsEntrySchema = z.object({
   name: z.string(),
-  ifFailed: IfFailedPolicy.default(IfFailedPolicy.enum.skip),
+  runOn: NeedsRunOn.default([ExecutionJobStatus.enum.success]),
 });
 export type NeedsEntry = z.infer<typeof NeedsEntrySchema>;
 
 /**
- * Needs group entry with per-edge failure policy.
+ * Needs group entry carrying the normalized run-on status-set.
  * Used in lock file needs arrays for dynamic group dependencies.
  */
 export const NeedsGroupEntrySchema = z.object({
   group: z.string(),
-  ifFailed: IfFailedPolicy.default(IfFailedPolicy.enum.skip),
+  runOn: NeedsRunOn.default([ExecutionJobStatus.enum.success]),
 });
 export type NeedsGroupEntry = z.infer<typeof NeedsGroupEntrySchema>;
 

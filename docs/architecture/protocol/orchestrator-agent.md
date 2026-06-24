@@ -512,7 +512,7 @@ Reported when an agent fails to build or stream its mini-bundle.
 
 ## Step approval messages
 
-These messages carry the step-level approval round-trip. When a step declares `requireApproval`, the agent blocks its step loop and sends a `step.approval-request`; the orchestrator creates a step-scoped held-run from the requirement and replies with `step.approval-resolved` once the hold is approved, rejected, or expired. The agent keeps heartbeats flowing during the wait so it is not reaped as stale.
+These messages carry the step-level approval round-trip. When a step declares `approval`, the agent blocks its step loop and sends a `step.approval-request`; the orchestrator creates a step-scoped held-run from the requirement and replies with `step.approval-resolved` once the hold is approved, rejected, or expired. The agent keeps heartbeats flowing during the wait so it is not reaped as stale.
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
 
@@ -520,19 +520,20 @@ These messages carry the step-level approval round-trip. When a step declares `r
 
 #### step.approval-request
 
-A step carrying `requireApproval` is about to run and the agent is blocking until the orchestrator resolves the approval.
+A step carrying `approval` is about to run and the agent is blocking until the orchestrator resolves the approval. For a `when: 'drift'` gate the request carries the computed drift `payload`.
 
-| Field          | Type                      | Required | Description                                                            |
-| -------------- | ------------------------- | -------- | ---------------------------------------------------------------------- |
-| type           | `"step.approval-request"` | Yes      | Message discriminator                                                  |
-| messageId      | string                    | Yes      | Unique message ID (correlated by the resolution's `requestId`)         |
-| runId          | string                    | Yes      | Execution run ID                                                       |
-| jobId          | string                    | Yes      | Job ID within the run                                                  |
-| stepIndex      | number                    | Yes      | Zero-based step index                                                  |
-| stepName       | string                    | Yes      | Human-readable step name                                               |
-| clauses        | ApproverClause[]          | Yes      | AND-list of approver clauses (empty = any approval-capable member)     |
-| reason         | string                    | Yes      | Human label for the gate (from the SDK `requireApproval` reason)       |
-| timeoutSeconds | number                    | No       | Per-gate timeout override; absent falls back to the org-default expiry |
+| Field          | Type                         | Required | Description                                                                                                             |
+| -------------- | ---------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| type           | `"step.approval-request"`    | Yes      | Message discriminator                                                                                                   |
+| messageId      | string                       | Yes      | Unique message ID (correlated by the resolution's `requestId`)                                                          |
+| runId          | string                       | Yes      | Execution run ID                                                                                                        |
+| jobId          | string                       | Yes      | Job ID within the run                                                                                                   |
+| stepIndex      | number                       | Yes      | Zero-based step index                                                                                                   |
+| stepName       | string                       | Yes      | Human-readable step name                                                                                                |
+| clauses        | ApproverClause[]             | Yes      | AND-list of approver clauses (empty = any approval-capable member)                                                      |
+| reason         | string                       | Yes      | Human label for the gate (from the SDK `approval` reason)                                                               |
+| timeoutSeconds | number                       | No       | Per-gate timeout override; absent falls back to the org-default expiry                                                  |
+| payload        | `{ summaryMarkdown, drift }` | No       | Computed drift, present only for a `when: 'drift'` gate; persisted on the hold and rendered in the approval queue + CLI |
 
 ### Orchestrator -> Agent
 

@@ -4,8 +4,9 @@ import {
   detectPackageManagerSync,
   detectYarnFlavorSync,
 } from '@kici-dev/core/package-manager';
-import { validateResourceRequest } from '@kici-dev/engine';
+import { validateResourceRequest, resolveWhenToRunOn } from '@kici-dev/engine';
 import type { LabelMatcher } from '@kici-dev/engine';
+import type { NeedsWhenInput } from '@kici-dev/sdk';
 import {
   normalizeRunsOnToMatchers,
   normalizeRunsOnAllToMatchers,
@@ -32,9 +33,9 @@ import {
   getDynamicJobGroup,
   getDynamicJobNeeds,
   normalizeCacheSpecs,
-  normalizeRequireApproval,
+  normalizeApproval,
 } from '@kici-dev/sdk';
-import type { RequireApproval } from '@kici-dev/sdk';
+import type { ApprovalConfig } from '@kici-dev/sdk';
 import {
   SCHEMA_VERSION,
   type LockFile,
@@ -291,8 +292,10 @@ function transformWorkflow(
       },
     }),
     ...(workflow.timeout !== undefined && { timeout: workflow.timeout }),
-    ...(workflow.requireApproval !== undefined && {
-      approval: toLockApproval(workflow.requireApproval),
+    ...(workflow.approval !== undefined && {
+      approval:
+        (assertNonStepApprovalScope(workflow.approval, 'workflow'),
+        toLockApproval(workflow.approval)),
     }),
   };
 }
@@ -873,7 +876,9 @@ function transformJob(
     ...(job.timeout !== undefined && { timeout: job.timeout }),
     ...(job.resources !== undefined && { resources: job.resources }),
     ...(job.init !== undefined && { init: job.init }),
-    ...(job.requireApproval !== undefined && { approval: toLockApproval(job.requireApproval) }),
+    ...(job.approval !== undefined && {
+      approval: (assertNonStepApprovalScope(job.approval, 'job'), toLockApproval(job.approval)),
+    }),
   };
 }
 
@@ -892,7 +897,8 @@ interface ResolvedNeeds {
 
 /**
  * Resolve needs to lock file format.
- * Handles strings, Job objects, DynamicGroupRef, and object forms with ifFailed policy.
+ * Handles strings, Job objects, DynamicGroupRef, and object forms with a `when`
+ * run condition (normalized to a `runOn` status-set via the engine helper).
  * Uses the UUID-to-renamed-name mapping so that references to id-less jobs
  * resolve to their lock file names (job-N) instead of the original UUIDs.
  */
@@ -914,22 +920,22 @@ function resolveNeedsForLock(
       resolvedNeeds.push(uuidToName?.get(need) ?? need);
     } else if (isDynamicGroupRef(need)) {
       // DynamicGroupRef -> NeedsGroupEntry in lock file + dependsOnGroups
-      resolvedNeeds.push({ group: need.group, ifFailed: need.ifFailed ?? 'skip' });
+      resolvedNeeds.push({ group: need.group, runOn: resolveWhenToRunOn(need.when) });
       groups.push(need.group);
-    } else if ('group' in need && typeof (need as { group: string }).group === 'string') {
-      // Object form { group: string; ifFailed } -> NeedsGroupEntry
-      const g = need as { group: string; ifFailed: 'skip' | 'run' };
-      resolvedNeeds.push({ group: g.group, ifFailed: g.ifFailed ?? 'skip' });
-      groups.push(g.group);
-    } else if ('ifFailed' in need && 'name' in need) {
-      // Object form { name: string; ifFailed } -> NeedsEntry
-      const n = need as { name: string; ifFailed: 'skip' | 'run' };
-      const name = uuidToName?.get(n.name) ?? n.name;
-      resolvedNeeds.push({ name, ifFailed: n.ifFailed });
-    } else {
+    } else if ('_tag' in need && (need as Job)._tag === 'Job') {
       // Job object -> resolve to name string
       const name = (need as Job).name;
       resolvedNeeds.push(uuidToName?.get(name) ?? name);
+    } else if ('group' in need && typeof (need as { group: string }).group === 'string') {
+      // Object form { group: string; when } -> NeedsGroupEntry
+      const g = need as { group: string; when?: NeedsWhenInput };
+      resolvedNeeds.push({ group: g.group, runOn: resolveWhenToRunOn(g.when) });
+      groups.push(g.group);
+    } else {
+      // Object form { name: string; when } -> NeedsEntry
+      const n = need as { name: string; when?: NeedsWhenInput };
+      const name = uuidToName?.get(n.name) ?? n.name;
+      resolvedNeeds.push({ name, runOn: resolveWhenToRunOn(n.when) });
     }
   }
 
@@ -944,14 +950,46 @@ function resolveNeedsForLock(
  * Assigns counter-based IDs to unnamed steps (bare functions and id-less steps).
  * Counter only increments for unnamed entries; named steps keep their names.
  */
-/** Map an SDK `requireApproval` to the normalized lock `approval` block. */
-function toLockApproval(r: RequireApproval): LockApproval {
-  const n = normalizeRequireApproval(r);
+/** Map an SDK `approval` to the normalized lock `approval` block. */
+function toLockApproval(c: ApprovalConfig): LockApproval {
+  const n = normalizeApproval(c);
   return {
     clauses: n.clauses,
     ...(n.reason !== undefined && { reason: n.reason }),
     ...(n.timeoutSeconds !== undefined && { timeoutSeconds: n.timeoutSeconds }),
+    when: n.when,
   };
+}
+
+/**
+ * Validate an approval config at job/workflow scope: `when: 'drift'` is a
+ * step-scope-only gate (it fires between a step's check and run), so it is a
+ * compile error anywhere else.
+ */
+function assertNonStepApprovalScope(c: ApprovalConfig, scope: 'job' | 'workflow'): void {
+  if (normalizeApproval(c).when === 'drift') {
+    throw new Error(`approval.when "drift" is only valid on steps (found at ${scope} scope)`);
+  }
+}
+
+/**
+ * Validate a step's approval config: `when: 'drift'` fires between the step's
+ * check and run, so it requires a `check` facet. A compile error otherwise.
+ */
+function assertStepApprovalCheckFacet(step: {
+  name?: string;
+  approval?: ApprovalConfig;
+  check?: unknown;
+}): void {
+  if (
+    step.approval !== undefined &&
+    normalizeApproval(step.approval).when === 'drift' &&
+    step.check === undefined
+  ) {
+    throw new Error(
+      `step '${step.name || '(unnamed)'}': approval.when "drift" requires a check facet`,
+    );
+  }
 }
 
 function transformSteps(steps: readonly StepInput[], gitRoot: string): readonly LockStep[] {
@@ -990,8 +1028,8 @@ function transformSteps(steps: readonly StepInput[], gitRoot: string): readonly 
       ...(step.cleanup !== undefined && { hasCleanup: true }),
       ...(step.check !== undefined && { hasCheck: true }),
       ...(step.whenInSync !== undefined && { hasWhenInSync: true }),
-      ...(step.requireApproval !== undefined && {
-        approval: toLockApproval(step.requireApproval),
+      ...(step.approval !== undefined && {
+        approval: (assertStepApprovalCheckFacet(step), toLockApproval(step.approval)),
       }),
     };
   });

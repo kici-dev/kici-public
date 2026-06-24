@@ -5,7 +5,7 @@ description: Configure approvers, expiry, and self-approval; manage the dashboar
 
 An approval gate holds a workflow element — a step, a job, or a whole run — until an authorized person approves it. This guide covers the operator side: defining the approvers (teams), the org-level expiry and self-approval settings, the dashboard approval queue, the approve/reject flow, and the agent-occupancy consideration for step-level holds.
 
-Workflow authors declare gates with `requireApproval` (see [Approval gates (user guide)](../user/approvals.md)). The same held-element mechanism also backs the **required reviewers** protection rule on an environment, so everything below applies to both the explicit (author-declared) and mandatory (environment-policy) gates.
+Workflow authors declare gates with `approval` (see [Approval gates (user guide)](../user/approvals.md)). The same held-element mechanism also backs the **required reviewers** protection rule on an environment, so everything below applies to both the explicit (author-declared) and mandatory (environment-policy) gates.
 
 ## Approvers: teams and users
 
@@ -67,7 +67,7 @@ A held-for-approval status check is also posted back to the source provider for 
 
 ## Approving and rejecting
 
-A held element is released the same way regardless of whether it was held by an explicit `requireApproval` gate or a mandatory environment reviewer policy:
+A held element is released the same way regardless of whether it was held by an explicit `approval` gate or a mandatory environment reviewer policy:
 
 - **Dashboard** — approve or reject from the approval queue.
 - **`kici approve` / `kici reject`** — the developer CLI, acting as the authenticated user. See [`kici approve`](../user/approvals.md#approving-from-the-cli).
@@ -86,7 +86,7 @@ Plan capacity accordingly:
 
 ## See also
 
-- [Approval gates (user guide)](../user/approvals.md) — authoring `requireApproval`.
+- [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
 - [Environments](environments.md) — required reviewers and the held-run lifecycle.
 - [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.
 - [kici-admin CLI](orchestrator/kici-admin-cli.md) — the `org-settings approval` subcommand.

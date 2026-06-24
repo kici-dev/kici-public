@@ -37,6 +37,7 @@ function mockDispatcher(): Dispatcher {
     onAgentAvailable: vi.fn().mockResolvedValue(undefined),
     onAgentDisconnect: vi.fn().mockResolvedValue(undefined),
     onJobComplete: vi.fn(),
+    releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
 }
 

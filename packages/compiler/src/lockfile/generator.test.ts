@@ -61,39 +61,91 @@ function makeWorkflowWithSource(
 }
 
 describe('generator - approval config', () => {
-  it('maps step requireApproval into LockStep.approval', () => {
-    const s = step('deploy', { run: async () => {}, requireApproval: [{ team: 'leads' }] });
+  it('maps step approval into LockStep.approval (when defaults to always)', () => {
+    const s = step('deploy', { run: async () => {}, approval: [{ team: 'leads' }] });
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
     const lockJob = lockFile.workflows[0].jobs[0];
     if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].approval).toEqual({ clauses: [{ team: 'leads' }] });
+      expect(lockJob.steps[0].approval).toEqual({ clauses: [{ team: 'leads' }], when: 'always' });
     }
   });
 
-  it('maps job requireApproval into LockJob.approval', () => {
-    const j = job('deploy', { runsOn: 'linux', run: async () => {}, requireApproval: true });
+  it('maps job approval into LockJob.approval', () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {}, approval: true });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
     const lockJob = lockFile.workflows[0].jobs[0];
     if (lockJob._type === 'static') {
-      expect(lockJob.approval).toEqual({ clauses: [] });
+      expect(lockJob.approval).toEqual({ clauses: [], when: 'always' });
     }
   });
 
-  it('maps workflow requireApproval (object form) into LockWorkflow.approval', () => {
+  it('maps workflow approval (object form) into LockWorkflow.approval', () => {
     const j = job('build', { runsOn: 'linux', run: async () => {} });
     const w = workflow('ci', {
       jobs: [j],
-      requireApproval: { approvers: [{ user: 'cto' }], reason: 'prod', timeout: 7200 },
+      approval: { approvers: [{ user: 'cto' }], reason: 'prod', timeout: 7200 },
     });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
     expect(lockFile.workflows[0].approval).toEqual({
       clauses: [{ user: 'cto' }],
       reason: 'prod',
       timeoutSeconds: 7200,
+      when: 'always',
     });
+  });
+
+  it('maps a when:drift check step into LockStep.approval.when === drift', () => {
+    const s = step('deploy', {
+      check: async () => ({ want: 1 }),
+      summarize: () => 'drift',
+      run: async () => {},
+      approval: { when: 'drift', approvers: [{ team: 'ops' }] },
+    });
+    const j = job('build', { runsOn: 'linux', steps: [s] });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0];
+    if (lockJob._type === 'static') {
+      expect(lockJob.steps[0].approval).toEqual({
+        clauses: [{ team: 'ops' }],
+        when: 'drift',
+      });
+    }
+  });
+
+  it('rejects a when:drift step with no check facet at compile time', () => {
+    // The SDK step() factory guards this, so build the step object directly to
+    // prove the compiler is also an authoritative guard.
+    const bareStep = {
+      _tag: 'Step' as const,
+      name: 'deploy',
+      run: async () => {},
+      approval: { when: 'drift' as const },
+      result: undefined as never,
+    };
+    const j = job('build', { runsOn: 'linux', steps: [bareStep as never] });
+    const w = workflow('ci', { jobs: [j] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /approval.when "drift" requires a check facet/,
+    );
+  });
+
+  it('rejects a when:drift gate at job scope at compile time', () => {
+    const j = {
+      _tag: 'Job' as const,
+      name: 'deploy',
+      runsOn: 'linux',
+      steps: [step('s', async () => {})],
+      approval: { when: 'drift' as const },
+      result: undefined as never,
+    };
+    const w = workflow('ci', { jobs: [j as never] });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /approval.when "drift" is only valid on steps/,
+    );
   });
 });
 
@@ -408,14 +460,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 21', () => {
+  it('schemaVersion is 22', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(21);
-    expect(SCHEMA_VERSION).toBe(21);
+    expect(lockFile.schemaVersion).toBe(22);
+    expect(SCHEMA_VERSION).toBe(22);
   });
 });
 
@@ -2221,8 +2273,50 @@ describe('generator - result-aware dynamicJob', () => {
     if (entry?._type !== 'dynamic') throw new Error('expected dynamic entry');
     expect(entry.resultAware).toBe(true);
     expect(entry.group).toBe('reports');
-    // Bare string need stays a bare string; dynamicGroup normalizes to { group, ifFailed }.
-    expect(entry.needs).toEqual(['discover', { group: 'scan', ifFailed: 'skip' }]);
+    // Bare string need stays a bare string; dynamicGroup normalizes to { group, runOn }.
+    expect(entry.needs).toEqual(['discover', { group: 'scan', runOn: ['success'] }]);
+  });
+
+  it('normalizes a when keyword on a needs edge to a runOn status-set', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: [{ name: 'build', when: 'on-failure' }],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    expect(entry.needs).toEqual([{ name: 'build', runOn: ['failed', 'timed_out_stale'] }]);
+  });
+
+  it('normalizes a raw status-set when to a runOn set', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: [{ name: 'build', when: ['skipped', 'failed'] }],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    expect(entry.needs).toEqual([{ name: 'build', runOn: ['skipped', 'failed'] }]);
+  });
+
+  it('keeps a bare-string need as a bare string', () => {
+    const build = job('build', { runsOn: 'linux', run: async () => {} });
+    const report = job('report', {
+      runsOn: 'linux',
+      needs: ['build'],
+      run: async () => {},
+    });
+    const w = workflow('ci', { jobs: [build, report] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
+    if (!entry || entry._type !== 'static') throw new Error('expected static report job');
+    expect(entry.needs).toContain('build');
   });
 
   it('event-only dynamicJob has no needs and no resultAware flag', () => {

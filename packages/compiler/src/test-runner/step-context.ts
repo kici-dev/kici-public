@@ -201,6 +201,14 @@ export function createStepContext(
             new Error('ctx.kici.oidc.token() is not available in the local test runner'),
           ),
       },
+      host: {
+        // Host reboot runs on the agent's own host via the orchestrator; the
+        // local test runner has no host to reboot.
+        requestReboot: () =>
+          Promise.reject(
+            new Error('ctx.kici.host.requestReboot() is not available in the local test runner'),
+          ),
+      },
     },
     cache: {
       // No-op in local test runner -- the user-facing cache requires

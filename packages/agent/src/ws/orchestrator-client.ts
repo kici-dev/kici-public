@@ -690,6 +690,7 @@ export class OrchestratorClient {
         clauses: request.clauses,
         reason: request.reason,
         ...(request.timeoutSeconds !== undefined && { timeoutSeconds: request.timeoutSeconds }),
+        ...(request.payload !== undefined && { payload: request.payload }),
       } as unknown as AgentToOrchestratorMessage);
     });
   }

@@ -359,12 +359,13 @@ export interface AgentWsHandlerDeps {
     msg: { runId: string; jobId: string; group: string; messageId: string },
   ) => Promise<{ action: 'proceed' | 'wait' | 'cancel'; reason?: string }>;
   /**
-   * Optional callback when an agent blocks a `requireApproval` step. The server
-   * creates a step-scoped hold from the carried clauses and returns a promise
-   * that resolves when the hold is approved, rejected, or expired. The handler
-   * relays the resolution back to the originating agent as a
-   * `step.approval-resolved` message. The `agentId` lets the server drop the
-   * pending resolver when the agent disconnects.
+   * Optional callback when an agent blocks an `approval` step. The server
+   * creates a step-scoped hold from the carried clauses (and the drift
+   * `payload` for a `when: 'drift'` gate) and returns a promise that resolves
+   * when the hold is approved, rejected, or expired. The handler relays the
+   * resolution back to the originating agent as a `step.approval-resolved`
+   * message. The `agentId` lets the server drop the pending resolver when the
+   * agent disconnects.
    */
   onStepApproval?: (
     agentId: string,
@@ -376,6 +377,7 @@ export interface AgentWsHandlerDeps {
       clauses: Array<{ team: string } | { user: string }>;
       reason: string;
       timeoutSeconds?: number;
+      payload?: { summaryMarkdown: string; drift: unknown };
     },
   ) => Promise<{ outcome: 'approved' | 'rejected' | 'expired'; reason?: string }>;
   /**
@@ -985,6 +987,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           }
         }
 
+        // Down-then-up release: a static reboot host comes back as a fresh
+        // connection (new WS ⇒ first-register path). Clear any reboot-pending
+        // flag before draining so the held post-restart job is dispatched.
+        await dispatcher.releaseRebootPending(agentId);
+
         // Drain any queued jobs for this agent (no-op if eager dispatch already
         // filled this agent's single slot).
         await dispatcher.onAgentAvailable(agentId);
@@ -1179,6 +1186,10 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             );
           }
 
+          // Down-then-up release: this re-register is a fresh connection after a
+          // reboot cycle, so clear any reboot-pending flag BEFORE draining. The
+          // drain then dispatches the held post-restart job.
+          await dispatcher.releaseRebootPending(msg.agentId);
           await dispatcher.onAgentAvailable(msg.agentId);
           break;
         }
@@ -1424,8 +1435,17 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             if (!accept) break;
           }
 
-          const { messageId, runId, jobId, stepIndex, stepName, clauses, reason, timeoutSeconds } =
-            msg;
+          const {
+            messageId,
+            runId,
+            jobId,
+            stepIndex,
+            stepName,
+            clauses,
+            reason,
+            timeoutSeconds,
+            payload,
+          } = msg;
           logger.info('Step approval requested', { agentId, runId, jobId, stepIndex, stepName });
 
           if (!onStepApproval) {
@@ -1453,6 +1473,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             clauses,
             reason,
             ...(timeoutSeconds !== undefined && { timeoutSeconds }),
+            ...(payload !== undefined && { payload }),
           }).then(
             (resolution) => {
               sendJson(ws, {
@@ -1967,8 +1988,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           }
 
           try {
-            // For now, all agents get 'read' role. Write role is reserved for future use.
-            const allowedRoles: Array<'read' | 'write'> = ['read'];
+            // Every agent may call read AND write methods on its own behalf.
+            // Write methods only ever affect the calling agent's own host
+            // (e.g. host.requestReboot reboots the box the agent runs on), so
+            // there is no cross-agent escalation surface to gate further here.
+            const allowedRoles: Array<'read' | 'write'> = ['read', 'write'];
             const result = await agentApiRegistry.handle(
               agentId,
               msg.method,

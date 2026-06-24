@@ -47,7 +47,9 @@ import {
   resolveJobOutputs,
   normalizeCacheSpecs,
   provenanceSubjectIsPath,
+  buildNeedsContext,
 } from '@kici-dev/sdk';
+import type { UpstreamSnapshot, NeedsContext, DynamicJobNeed } from '@kici-dev/sdk';
 import type {
   OutputsMap,
   StepRefMap,
@@ -628,32 +630,57 @@ function waitForApprovalResolution(requestId: string): Promise<StepApprovalResol
 }
 
 /**
- * Build the `awaitStepApproval` callback the step loop uses to block on a
- * `requireApproval` step. Sends an `approval.request` IPC (relayed by the agent
- * over the WS as a `step.approval-request`) and awaits the matching
- * `approval.resolved`. A relay error is treated as a fail-closed reject.
+ * Send a step-approval `approval.request` IPC (relayed by the agent over the WS
+ * as a `step.approval-request`), await the matching `approval.resolved`, and map
+ * it onto a `StepApprovalResolution`. A relay error is treated as a fail-closed
+ * reject. Shared by the `when: 'always'` and `when: 'drift'` callbacks; the
+ * latter carries a drift `payload`.
+ */
+async function requestStepApproval(req: {
+  stepIndex: number;
+  stepName: string;
+  clauses: Array<{ team: string } | { user: string }>;
+  reason: string;
+  timeoutSeconds?: number;
+  payload?: { summaryMarkdown: string; drift: unknown };
+}): Promise<{ outcome: 'approved' | 'rejected' | 'expired'; reason?: string }> {
+  const requestId = randomUUID();
+  sendMessage({
+    type: 'approval.request',
+    requestId,
+    stepIndex: req.stepIndex,
+    stepName: req.stepName,
+    clauses: req.clauses,
+    reason: req.reason,
+    ...(req.timeoutSeconds !== undefined && { timeoutSeconds: req.timeoutSeconds }),
+    ...(req.payload !== undefined && { payload: req.payload }),
+  });
+  const resolution = await waitForApprovalResolution(requestId);
+  if (resolution.error) {
+    return { outcome: 'rejected', reason: resolution.error };
+  }
+  return {
+    outcome: resolution.outcome ?? 'rejected',
+    ...(resolution.reason !== undefined && { reason: resolution.reason }),
+  };
+}
+
+/**
+ * Build the `awaitStepApproval` callback the step loop uses to block on an
+ * `approval` step (`when: 'always'`).
  */
 function buildAwaitStepApproval(): NonNullable<StepLoopOptions['awaitStepApproval']> {
-  return async (req) => {
-    const requestId = randomUUID();
-    sendMessage({
-      type: 'approval.request',
-      requestId,
-      stepIndex: req.stepIndex,
-      stepName: req.stepName,
-      clauses: req.clauses,
-      reason: req.reason,
-      ...(req.timeoutSeconds !== undefined && { timeoutSeconds: req.timeoutSeconds }),
-    });
-    const resolution = await waitForApprovalResolution(requestId);
-    if (resolution.error) {
-      return { outcome: 'rejected', reason: resolution.error };
-    }
-    return {
-      outcome: resolution.outcome ?? 'rejected',
-      ...(resolution.reason !== undefined && { reason: resolution.reason }),
-    };
-  };
+  return (req) => requestStepApproval(req);
+}
+
+/**
+ * Build the `awaitStepApprovalWithPayload` callback the step loop uses to block
+ * on a `when: 'drift'` step mid-execution, carrying the computed drift payload.
+ */
+function buildAwaitStepApprovalWithPayload(): NonNullable<
+  StepLoopOptions['awaitStepApprovalWithPayload']
+> {
+  return (req) => requestStepApproval(req);
 }
 
 /**
@@ -937,6 +964,84 @@ function createIpcLogger(
 
 // --- StepContext Reconstruction ---
 
+/** A lock needs entry maps to a base name (single/matrix/host) or a group name. */
+function needBaseName(need: unknown): { kind: 'job' | 'group'; key: string } | null {
+  if (typeof need === 'string') return { kind: 'job', key: need };
+  if (need && typeof need === 'object') {
+    if ('group' in need) return { kind: 'group', key: (need as { group: string }).group };
+    if ('name' in need) return { kind: 'job', key: (need as { name: string }).name };
+  }
+  return null;
+}
+
+/**
+ * Build `ctx.needs` for a job's steps from the dispatch envelope. Reconstructs
+ * an {@link UpstreamSnapshot} from `upstreamJobOutputs` (flat per single job;
+ * `byMatrix` / `byHost` envelopes per fan-out) + `upstreamJobStatuses` (keyed by
+ * each upstream job/child name), then resolves the job's declared needs into the
+ * `{ result, status }` / ordered-array shape via the shared SDK builder. Returns
+ * undefined when the job declares no needs.
+ */
+export function buildStepNeedsContext(
+  declaredNeeds: readonly unknown[] | undefined,
+  upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined,
+  upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined,
+): NeedsContext | undefined {
+  if (!declaredNeeds || declaredNeeds.length === 0) return undefined;
+
+  const statuses = upstreamJobStatuses ?? {};
+  const jobs: Record<string, Record<string, unknown>> = {};
+  const groups: Record<string, string[]> = {};
+  const snapStatuses: Record<string, ExecutionJobStatus> = {};
+  const resolvedNeeds: DynamicJobNeed[] = [];
+
+  for (const need of declaredNeeds) {
+    const base = needBaseName(need);
+    if (!base) continue;
+
+    // Child names that fanned out from this base (matrix / host children share
+    // the `${base} (...)` naming) come from the statuses map keyed per-child.
+    const childNames = Object.keys(statuses).filter((n) => n.startsWith(`${base.key} (`));
+
+    if (base.kind === 'group' || childNames.length > 0) {
+      // Group or fanned-out upstream: an ordered array of children.
+      groups[base.key] = [...childNames].sort();
+      const envelope = upstreamJobOutputs?.[base.key];
+      const bySuffix = envelopeChildOutputs(envelope);
+      for (const child of childNames) {
+        // The fan-out child name is `${base} (<suffix>)`; the envelope keys
+        // outputs by `<suffix>`.
+        const suffix = child.slice(base.key.length + 2, -1);
+        jobs[child] = bySuffix[suffix] ?? {};
+        snapStatuses[child] = statuses[child];
+      }
+      resolvedNeeds.push({ group: base.key } as DynamicJobNeed);
+    } else {
+      // Single non-fanned upstream.
+      jobs[base.key] = upstreamJobOutputs?.[base.key] ?? {};
+      if (statuses[base.key]) snapStatuses[base.key] = statuses[base.key];
+      resolvedNeeds.push(base.key);
+    }
+  }
+
+  const snapshot: UpstreamSnapshot = { jobs, groups, statuses: snapStatuses };
+  return buildNeedsContext(snapshot, resolvedNeeds);
+}
+
+/**
+ * Extract per-child output records from a fan-out outputs envelope, keyed by the
+ * combination suffix (matrix `byMatrix`) or hostname (`runsOnAll` `byHost`).
+ * Returns an empty map for a non-envelope value.
+ */
+function envelopeChildOutputs(
+  envelope: Record<string, unknown> | undefined,
+): Record<string, Record<string, unknown>> {
+  if (!envelope) return {};
+  const byMatrix = (envelope as { byMatrix?: Record<string, Record<string, unknown>> }).byMatrix;
+  const byHost = (envelope as { byHost?: Record<string, Record<string, unknown>> }).byHost;
+  return byMatrix ?? byHost ?? {};
+}
+
 /**
  * Build StepSecrets from the job execution request, wired with the per-step
  * file-mount host (used by `ctx.secrets.mountFile` / `exposeFile`).
@@ -1217,6 +1322,15 @@ export function createSandboxStepContext(
     // dispatch time); absent for non-host jobs.
     ...(request.host && { host: request.host }),
     ...(request.agent && { agent: request.agent }),
+    // Upstream needs (result + terminal status) for step-level branching.
+    ...(() => {
+      const needs = buildStepNeedsContext(
+        request.jobNeeds,
+        request.upstreamJobOutputs,
+        request.upstreamJobStatuses,
+      );
+      return needs ? { needs } : {};
+    })(),
   };
 }
 
@@ -2441,6 +2555,7 @@ async function main(): Promise<void> {
     beforeStepEnvFiles: stepEnvHooks.beforeStepEnvFiles,
     afterStepApplyEnvFiles: stepEnvHooks.afterStepApplyEnvFiles,
     awaitStepApproval: buildAwaitStepApproval(),
+    awaitStepApprovalWithPayload: buildAwaitStepApprovalWithPayload(),
   });
 
   // The step loop has returned — disarm the job deadline so a late fire can't

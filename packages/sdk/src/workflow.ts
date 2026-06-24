@@ -102,6 +102,6 @@ export function workflow(name: string, options: WorkflowOptions): Workflow {
     onSuccess: options.onSuccess,
     onFailure: options.onFailure,
     concurrency: options.concurrency,
-    requireApproval: options.requireApproval,
+    approval: options.approval,
   };
 }

@@ -761,7 +761,7 @@ kici-admin org-settings approval set-self-approval true|false --customer-id <id>
 
 Controls how held approval elements (workflow / job / step gates) behave for the org. Both settings have non-null defaults, so there is no "reset to cluster default" — a `set` replaces the current value.
 
-- `set-expiry <seconds>` writes `org_settings.approval_expiry_seconds` (integer, minimum 1; default 86400 — one day). A held element that is not fully approved within this window expires and its run/job/step is rejected. A workflow's own `requireApproval` `timeout` overrides this per element.
+- `set-expiry <seconds>` writes `org_settings.approval_expiry_seconds` (integer, minimum 1; default 86400 — one day). A held element that is not fully approved within this window expires and its run/job/step is rejected. A workflow's own `approval` `timeout` overrides this per element.
 - `set-self-approval true|false` writes `org_settings.allow_self_approval` (default `true`). When `false`, the user who triggered a run may not approve its own held elements, enforcing four-eyes review.
 - `show` prints the effective expiry (seconds) and self-approval flag.
 
@@ -879,7 +879,7 @@ Shows run header (status, repo, ref, SHA, provider, timing, environment, trust t
 | `--include-steps` | Embed the step list inside each job row (default: metadata only) |
 | `--json`          | Output raw JSON instead of a table                               |
 
-Lists the execution jobs for a single run. Cheaper than `runs show` when you only need job-level state (e.g., for polling). Each job row carries its resolved upstream dependency edges in `needs` (an array of `{ upstreamName, ifFailed }`, or `null` when the job has no upstreams) — the same dependency structure the dashboard run-detail graph view renders.
+Lists the execution jobs for a single run. Cheaper than `runs show` when you only need job-level state (e.g., for polling). Each job row carries its resolved upstream dependency edges in `needs` (an array of `{ upstreamName, runOn }`, where `runOn` is the per-edge set of upstream terminal statuses that satisfy the edge, or `null` when the job has no upstreams) — the same dependency structure the dashboard run-detail graph view renders.
 
 **runs ephemeral-key:**
 
@@ -954,10 +954,13 @@ kici-admin secret purge --confirm --database-url $URL --yes    # Offline mode
 ```bash
 # GitHub App sources
 # One-click setup: create AND configure a brand-new GitHub App via the App Manifest flow
-kici-admin source add github --name <name> --manifest [--github-org <slug>] [--no-browser] [--json]
+kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--no-browser] [--json]
 # Manual: store credentials for a GitHub App you already created
 kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
 kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin]
+# Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth)
+kici-admin source refresh <routingKey> [--json]
+kici-admin source refresh --all [--json]
 kici-admin source get-webhook-secret <routingKey>
 kici-admin source remove <routingKey> [--yes]
 
@@ -983,12 +986,15 @@ kici-admin source list [--org <orgId>] [--include-deleted]
 
 **One-click manifest setup** (`--manifest`): the recommended path for a brand-new App. The CLI builds a pre-filled GitHub App manifest (permissions, events, webhook URL), opens GitHub for you to click **"Create GitHub App"** once, captures the returned credentials, stores them encrypted on the orchestrator, and walks you through installing the App on your repos. It always creates a **new** App on GitHub. Flags:
 
-| Flag                  | Description                                                                                                  |
-| --------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`) |
-| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                  |
-| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin |
-| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                   |
+| Flag                  | Description                                                                                                                                                                         |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`)                                                                        |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                                                                                         |
+| `--webhook-url <url>` | Advanced/self-hosted: bake this `https://` URL into the App webhook verbatim and skip platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery |
+| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin                                                                        |
+| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                                                                                          |
+
+**`source refresh`**: re-reads a GitHub source's display name + slug from GitHub (`GET /app`) and updates the orchestrator + dashboard if they drifted (e.g. after renaming the App in GitHub's UI). For GitHub App sources GitHub is the source of truth for the displayed name — `--name` is only the name requested at creation. Pass a `<routingKey>` for one source or `--all` for every GitHub source; the command prints `old → new` for any changed field and is a no-op when GitHub already matches. The orchestrator also runs this refresh automatically once a day (`KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`, default 24h). Non-GitHub routing keys are rejected.
 
 See the [GitHub provider guide](../../user/providers/github.md) for the full one-click walkthrough. The manifest flow resolves the App's webhook URL from the orchestrator's Platform connection, so it requires a **platform** or **hybrid** orchestrator. **Independent-mode** orchestrators have no Platform connection (and therefore no GitHub-App ingress), so the pre-flight returns no webhook URL and the flow aborts — use a generic webhook source there instead.
 

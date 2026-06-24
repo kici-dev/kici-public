@@ -39,6 +39,39 @@ export function matcherSatisfiedBy(m: LabelMatcher, labels: ReadonlySet<string>)
   return false;
 }
 
+export const HostTargetValue = z.object({
+  include: z.array(LabelMatcher),
+  exclude: z.array(LabelMatcher),
+});
+export type HostTargetValue = z.infer<typeof HostTargetValue>;
+
+/**
+ * A runtime host narrowing (`kici run --target`): each repeated value is an AND
+ * set; values AND-combine. Narrow-only — applied as a post-filter over the
+ * runsOnAll-matched roster. `allowEmpty` selects the zero-host outcome: skip
+ * (true) vs fail (false).
+ */
+export const HostTargetSelector = z.object({
+  values: z.array(HostTargetValue).min(1),
+  allowEmpty: z.boolean(),
+});
+export type HostTargetSelector = z.infer<typeof HostTargetSelector>;
+
+/**
+ * True iff the host's labels satisfy EVERY target value: all of a value's
+ * include matchers match and none of its exclude matchers match.
+ */
+export function hostSatisfiesTarget(
+  labels: ReadonlySet<string>,
+  target: HostTargetSelector,
+): boolean {
+  return target.values.every(
+    (v) =>
+      v.include.every((m) => matcherSatisfiedBy(m, labels)) &&
+      !v.exclude.some((m) => matcherSatisfiedBy(m, labels)),
+  );
+}
+
 /** Split a matcher list into exact label strings and the remaining regex matchers. */
 export function partitionMatchers(ms: readonly LabelMatcher[]): {
   exact: string[];

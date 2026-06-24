@@ -50,6 +50,24 @@ describe('AgentApiRegistry', () => {
     expect(result).toEqual({ agentId: 'my-agent' });
   });
 
+  it('handles a write method when the agent dispatch grants read+write', async () => {
+    // The agent-handler's agent.api.request dispatch grants ['read', 'write'] to
+    // every agent (a write method only ever affects the calling agent's own
+    // host, e.g. host.requestReboot). This documents that a write method is
+    // reachable through the agent transport.
+    const registry = new AgentApiRegistry();
+    registry.register('host.requestReboot', 'write', async (agentId, params) => ({
+      agentId,
+      deadlineMs: params.deadlineMs,
+    }));
+
+    const result = await registry.handle('host-1', 'host.requestReboot', { deadlineMs: 600000 }, [
+      'read',
+      'write',
+    ]);
+    expect(result).toEqual({ agentId: 'host-1', deadlineMs: 600000 });
+  });
+
   it('getMethods returns registered method names', () => {
     const registry = new AgentApiRegistry();
     registry.register('a.one', 'read', async () => null);

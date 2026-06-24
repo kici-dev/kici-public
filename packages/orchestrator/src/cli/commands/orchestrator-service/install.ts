@@ -27,6 +27,8 @@ import {
   readKiciVersion,
 } from '../../service/index.js';
 import { selectServerEntry, resolveServiceExecutable } from '../../service/entrypoint.js';
+import { buildDeployEnvLines, upsertDeployEnvLines } from '../../service/deploy-env.js';
+import { detectRuntime } from '../../service/compose.js';
 import type { InstanceManifest, ServiceConfig, ServicePlatform } from '../../service/index.js';
 import { getInstallBase } from '../shared/versioned-upgrade.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -237,6 +239,31 @@ export function registerOrchestratorInstall(orchestrator: Command): void {
           fs.appendFileSync(envFilePath, `\nKICI_DATABASE_URL=${devDbUrl}\n`);
           console.log(`Appended KICI_DATABASE_URL to ${envFilePath}`);
         }
+
+        // Inject the deployment-identity env vars so the running orchestrator
+        // can report its own deployment shape in source.register (drives the
+        // dashboard's per-orchestrator kici-admin command helper). For compose,
+        // resolve the container runtime; a probe failure yields no runtime line
+        // rather than aborting the install. Idempotent: re-install replaces any
+        // existing KICI_DEPLOY_* lines.
+        let composeRuntime: 'podman' | 'docker' | undefined;
+        if (platform === 'compose') {
+          try {
+            composeRuntime = detectRuntime();
+          } catch {
+            composeRuntime = undefined;
+          }
+        }
+        const deployLines = buildDeployEnvLines({
+          platform,
+          serviceName,
+          containerRuntime: composeRuntime,
+        });
+        fs.writeFileSync(
+          envFilePath,
+          upsertDeployEnvLines(fs.readFileSync(envFilePath, 'utf-8'), deployLines),
+          'utf-8',
+        );
 
         // Resolve the run command. With an explicit --binary we run it
         // directly (assumed self-launching). Otherwise we run Node against the

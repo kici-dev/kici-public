@@ -139,6 +139,30 @@ describe('global config management', () => {
       expect(config.defaultClusters).toBeUndefined();
     });
 
+    it('keeps a valid oidcIssuer string', async () => {
+      const kiciDir = path.join(tempDir, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      await fs.writeFile(
+        path.join(kiciDir, 'config'),
+        JSON.stringify({ oidcIssuer: 'https://auth.example.com/realms/kici-internal' }),
+        { mode: 0o600 },
+      );
+
+      const config = await loadGlobalConfig();
+      expect(config.oidcIssuer).toBe('https://auth.example.com/realms/kici-internal');
+    });
+
+    it('drops a non-string oidcIssuer', async () => {
+      const kiciDir = path.join(tempDir, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      await fs.writeFile(path.join(kiciDir, 'config'), JSON.stringify({ oidcIssuer: 12345 }), {
+        mode: 0o600,
+      });
+
+      const config = await loadGlobalConfig();
+      expect(config.oidcIssuer).toBeUndefined();
+    });
+
     it('throws a helpful error on corrupted JSON', async () => {
       const kiciDir = path.join(tempDir, '.kici');
       await fs.mkdir(kiciDir, { recursive: true });

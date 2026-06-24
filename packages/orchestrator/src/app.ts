@@ -460,6 +460,31 @@ export function createApp(deps: AppDependencies) {
       createInventoryQueryHandler(inventoryDeps),
     );
     agentApiRegistry.register('inventory.get', 'read', createInventoryGetHandler(inventoryDeps));
+
+    // Workflow-level host restart (write role). `host.requestReboot` is sent by
+    // the agent's `restartHost()` step before it reboots: it sets a persisted
+    // reboot-pending flag (holding the pinned post-restart job + treating the
+    // imminent disconnect as expected) and resolves, which IS the ack the step
+    // awaits. `host.cancelReboot` clears the flag when the agent's OS reboot
+    // primitive is denied. Both refuse a co-located agent (never reboot the
+    // orchestrator's own host).
+    const hostRosterStore = deps.hostRosterStore;
+    const orchestratorHostAgentId = deps.config.orchestratorHostAgentId;
+    agentApiRegistry.register('host.requestReboot', 'write', async (agentId, params) => {
+      if (orchestratorHostAgentId && agentId === orchestratorHostAgentId) {
+        throw new Error('refusing to reboot the orchestrator host');
+      }
+      const deadlineMs =
+        typeof params.deadlineMs === 'number' && params.deadlineMs > 0
+          ? params.deadlineMs
+          : deps.config.hostRebootDeadlineMs;
+      await hostRosterStore.setRebootPending(agentId, new Date(Date.now() + deadlineMs));
+      return {};
+    });
+    agentApiRegistry.register('host.cancelReboot', 'write', async (agentId) => {
+      await hostRosterStore.clearRebootPending(agentId);
+      return {};
+    });
   }
 
   // Register the provenance ID-token relay (read role). The relay drives the
@@ -967,6 +992,7 @@ export function createApp(deps: AppDependencies) {
                 clauses: msg.clauses,
                 reason: msg.reason,
                 ...(msg.timeoutSeconds !== undefined && { timeoutSeconds: msg.timeoutSeconds }),
+                ...(msg.payload !== undefined && { payload: msg.payload }),
               })
           : undefined,
         onConcurrencyAgentDisconnect,

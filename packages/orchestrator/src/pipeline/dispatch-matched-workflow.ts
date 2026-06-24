@@ -31,8 +31,10 @@ import {
   materializeResolvedHosts,
   matrixEnvelopeFields,
   FanoutError,
+  FanoutCause,
   VariantKind,
   partitionMatchers,
+  hostSatisfiesTarget,
 } from '@kici-dev/engine';
 import type {
   LabelMatcher,
@@ -43,6 +45,7 @@ import type {
   ApproverClause,
   NeedsEntry,
   NeedsGroupEntry,
+  HostTargetSelector,
   SimulatedEvent,
   WorkflowDecision,
   TrustTier,
@@ -97,6 +100,20 @@ import {
 
 const logger = createLogger({ prefix: 'pipeline' });
 
+/** Success-only run-on set: the default for a bare-string or unset needs edge. */
+const SUCCESS_ONLY_RUN_ON_JSON = JSON.stringify([ExecutionJobStatus.enum.success]);
+
+/**
+ * Serialize a lock needs object-form entry's `runOn` status-set to the JSON
+ * column value stored on an execution_job_needs edge. Falls back to the
+ * success-only default when the entry carries no runOn.
+ */
+function needsRunOnJson(entry: { runOn?: ExecutionJobStatus[] }): string {
+  return entry.runOn && entry.runOn.length > 0
+    ? JSON.stringify(entry.runOn)
+    : SUCCESS_ONLY_RUN_ON_JSON;
+}
+
 /**
  * Trusted refs (write+ contributor, default-branch) get the org-shared cache
  * write scope; everyone else (fork PR, unknown/known-but-not-trusted) is
@@ -119,14 +136,14 @@ export function deriveCacheRefScope(trust: TrustResolution | undefined): CacheRe
  * path mints a token of its own at job.dispatch time.
  */
 async function mintCloneTokenForReroute(args: {
-  bundle: ProviderBundle;
+  bundle?: ProviderBundle;
   repoIdentifier: string;
   credentials: Record<string, unknown>;
   runId: string;
   workflowName: string;
 }): Promise<string | undefined> {
   try {
-    const minted = await args.bundle.cloneTokenProvider?.createCloneToken(
+    const minted = await args.bundle?.cloneTokenProvider?.createCloneToken(
       args.repoIdentifier,
       args.credentials,
     );
@@ -158,7 +175,15 @@ async function mintCloneTokenForReroute(args: {
 export interface WorkflowDispatchContext {
   info: WebhookInfo;
   deps: ProcessingDeps;
-  bundle: ProviderBundle;
+  /**
+   * Provider bundle for the matched source. Undefined for local-repo test runs
+   * (`kici run` against an inline lock file with no remote provider): in that
+   * mode there is no clone-url builder / check-status poster / clone-token
+   * provider, and `repoUrl` falls back to `''` (the agent treats a missing url
+   * as a local/`fullRepo` clone). The webhook adapter always passes a defined
+   * bundle, so its dispatch behavior is unchanged.
+   */
+  bundle?: ProviderBundle;
   payload: unknown;
   repoIdentifier: string;
   credentials: Record<string, unknown>;
@@ -203,11 +228,35 @@ export interface WorkflowDispatchContext {
    * correct clone + logging.
    */
   extraJobConfig?: Record<string, unknown>;
+  /**
+   * Test-run provenance. Present only for `kici run` / test-trigger dispatches.
+   * When set, `recordRunStart` stamps `is_test_run = true` and
+   * `fixture_id = testRun.fixtureId` on the `execution_runs` row. Undefined for
+   * webhook runs (the stamp block is skipped).
+   */
+  testRun?: { fixtureId: string };
+  /**
+   * Run-wide flat secrets layered onto EVERY dispatched job's `jobConfig.secrets`
+   * (env-declaring or not). Used by the test path to deliver `kici run --secret`
+   * / `--env` CLI flat secrets, which must reach a job regardless of whether it
+   * declares an `environment:`. Merged UNDER the per-job env-resolved secrets so
+   * the CLI value wins on a key collision (matching the prior B1-env -> A-CLI
+   * precedence). Undefined for webhook runs.
+   */
+  runWideFlatSecrets?: Record<string, string>;
+  /**
+   * Runtime host narrowing from `kici run --target` (Ansible `--limit`). Applied
+   * as a post-filter over each runsOnAll job's matched roster: effective hosts =
+   * runsOnAll ∩ target. Narrow-only. Undefined for webhook runs (no narrowing).
+   */
+  target?: HostTargetSelector;
 }
 
 export interface DispatchMatchedWorkflowResult {
   /** Number of jobs successfully dispatched (non-rejected). */
   dispatchedJobCount: number;
+  /** Execution job ids of every dispatched/tracked job (root, gated, synthetic). */
+  dispatchedJobIds: string[];
   /** True when the workflow install gate paused the dispatch (held run). */
   held?: boolean;
 }
@@ -353,6 +402,12 @@ interface RejectedJob {
   reason: string;
   /** Explicit init-failure category override; inferred from reason when absent. */
   category?: InitFailureCategory;
+  /**
+   * Terminal status to record for this job. Defaults to `failed`. A zeroed
+   * `runsOnAll` that intentionally narrowed to no hosts is recorded as `skipped`
+   * (no init-failure) so its downstreams' `when` sets govern propagation.
+   */
+  terminalStatus?: ExecutionJobStatus;
 }
 
 type BuildJobConfigFn = (mat: MaterializedJob) => Record<string, unknown>;
@@ -504,6 +559,12 @@ async function probeCaches(
   const { deps, workflow, crossSource } = ctx;
   let sourceHit = false;
   let depHit = false;
+  // Local-repo runs (no bundle) carry their source as a working-tree overlay,
+  // not a cacheable provider build — skip the source/dep cache probe entirely so
+  // a stale cached tarball never shadows the overlay.
+  if (!ctx.bundle) {
+    return { sourceHit, depHit };
+  }
   if (!crossSource && contentHash && deps.sourceCache) {
     sourceHit = await deps.sourceCache.has(contentHash);
     if (sourceHit) {
@@ -570,7 +631,7 @@ function buildBuildJobInput(args: {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
     },
-    repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -888,9 +949,10 @@ async function readPostBuildCacheUrls(args: {
  * skip; stale ephemeral hosts are always skipped. Throws {@link FanoutError}
  * when the run can't proceed (fail policy with an absent host, or zero targets).
  */
-async function resolveHostFanoutTargets(
+export async function resolveHostFanoutTargets(
   lockJob: LockJob,
   deps: ProcessingDeps,
+  target?: HostTargetSelector,
 ): Promise<ResolvedHostAgent[]> {
   if (!deps.hostRosterStore) {
     throw new FanoutError(lockJob.name, `runsOnAll for job '${lockJob.name}': roster unavailable`);
@@ -903,9 +965,17 @@ async function resolveHostFanoutTargets(
     deps.rosterGraceMs ?? 300_000,
   );
 
+  // `--target` narrows the runsOnAll-matched roster as a post-filter (never
+  // widens). `matched` is kept intact for the non-target zero-host heuristic
+  // below; only `candidates` is narrowed.
+  const candidates = target
+    ? matched.filter((h) => hostSatisfiesTarget(new Set(h.labels), target))
+    : matched;
+  const targetNarrowedToZero = !!target && matched.length > 0 && candidates.length === 0;
+
   const targets: MatchedHost[] = [];
   const unreachableDurable: MatchedHost[] = [];
-  for (const h of matched) {
+  for (const h of candidates) {
     if (h.status === HostStatus.ready) {
       targets.push(h);
     } else if (h.lifecycleClass === 'ephemeral') {
@@ -915,21 +985,42 @@ async function resolveHostFanoutTargets(
     }
   }
 
+  let skippedUnreachable = false;
   if (unreachableDurable.length > 0) {
     if (onUnreachable === 'fail') {
       throw new FanoutError(
         lockJob.name,
         `runsOnAll '${lockJob.name}': ${unreachableDurable.length} expected host(s) unreachable`,
+        FanoutCause.error,
       );
     }
     if (onUnreachable === 'hold') {
       targets.push(...unreachableDurable); // pin queues + waits for each
+    } else {
+      skippedUnreachable = true; // 'skip' → omit them
     }
-    // 'skip' → omit them
   }
 
   if (targets.length === 0) {
-    throw new FanoutError(lockJob.name, `runsOnAll '${lockJob.name}' matched zero usable hosts`);
+    if (targetNarrowedToZero) {
+      // The roster matched hosts but `--target` removed every one. `allowEmpty`
+      // chooses the synthetic job's terminal state: skipped (downstream `when`
+      // governs) vs failed (fail-loud).
+      throw new FanoutError(
+        lockJob.name,
+        `--target left job '${lockJob.name}' with zero hosts`,
+        target!.allowEmpty ? FanoutCause.narrowedEmpty : FanoutCause.error,
+      );
+    }
+    // A narrow-to-empty caused by the skip policy (or stale-ephemeral-only
+    // matches) is an intentional skip; a genuinely empty roster is a failure.
+    const cause =
+      skippedUnreachable || matched.length > 0 ? FanoutCause.narrowedEmpty : FanoutCause.error;
+    throw new FanoutError(
+      lockJob.name,
+      `runsOnAll '${lockJob.name}' matched zero usable hosts`,
+      cause,
+    );
   }
 
   return targets.map((h) => ({
@@ -1062,9 +1153,10 @@ export function computeWavePlan(materializedJobs: readonly MaterializedJob[]): W
   return { held, policy };
 }
 
-async function materializeStaticJobsSafe(
+export async function materializeStaticJobsSafe(
   staticJobs: readonly LockJob[],
   deps: ProcessingDeps,
+  target?: HostTargetSelector,
 ): Promise<{
   materializedJobs: MaterializedJob[];
   expansionMap: Map<string, readonly string[]>;
@@ -1078,7 +1170,7 @@ async function materializeStaticJobsSafe(
       const result = lockJob.runsOnAll
         ? materializeResolvedHosts(
             lockJob,
-            await resolveHostFanoutTargets(lockJob, deps),
+            await resolveHostFanoutTargets(lockJob, deps, target),
             deps.maxFanoutHosts ?? 1024,
           )
         : materializeFanout([lockJob]);
@@ -1086,14 +1178,17 @@ async function materializeStaticJobsSafe(
       for (const [k, v] of result.expansionMap) expansionMap.set(k, v);
     } catch (err) {
       if (err instanceof FanoutError) {
+        const narrowed = err.cause === FanoutCause.narrowedEmpty;
         matrixFailures.push({
-          jobId: `matrix-failed-${randomUUID()}`,
+          jobId: `matrix-${narrowed ? 'skipped' : 'failed'}-${randomUUID()}`,
           jobName: lockJob.name,
           reason: err.message,
+          ...(narrowed && { terminalStatus: ExecutionJobStatus.enum.skipped }),
         });
-        // The job is not dispatched; downstream needs referencing it resolve to
-        // an empty child list so they fail-propagate via the rejected path.
-        expansionMap.set(lockJob.name, []);
+        // Map the zeroed base to its synthetic terminal job (its own name) so
+        // insertEdgesForRun creates a real edge for downstreams. The synthetic
+        // row's status (skipped vs failed) then governs propagation via `when`.
+        expansionMap.set(lockJob.name, [lockJob.name]);
         continue;
       }
       throw err;
@@ -1134,8 +1229,13 @@ async function prepareCacheAndBuild(
   let buildJobTrackedEarly = false;
   let buildFailed = false;
 
+  // A build job fetches + caches the workflow source from the provider bundle.
+  // A local-repo run (no bundle — `kici run` against an inline lock with the
+  // working tree carried as an overlay) has no remote source to build, so it
+  // skips the build and dispatches its static jobs directly. The webhook path
+  // always has a bundle, so its build behavior is unchanged.
   const cacheInfraAvailable =
-    !crossSource && deps.buildCoordinator && (deps.sourceCache || deps.depCache);
+    !crossSource && !!ctx.bundle && deps.buildCoordinator && (deps.sourceCache || deps.depCache);
   const buildNeeded = cacheInfraAvailable && !sourceHit && !!contentHash;
 
   if (buildNeeded) {
@@ -1260,6 +1360,7 @@ async function prepareCacheAndBuild(
   const { materializedJobs, expansionMap, matrixFailures } = await materializeStaticJobsSafe(
     staticJobs,
     deps,
+    ctx.target,
   );
 
   return {
@@ -1541,12 +1642,12 @@ function buildDeferredInitJob(args: {
       dynamicMatrix: mat.pendingDynamicMatrix === true,
       event,
       timeoutMs: 60_000,
-      ...(workflow.contentHash && { contentHash: workflow.contentHash }),
+      ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
     },
-    repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -1748,7 +1849,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
       holdType: gateResult.holdType,
       reason: gateResult.reason,
     });
-    if (gateResult.holdType === 'security' && bundle.checkStatusPoster) {
+    if (gateResult.holdType === 'security' && bundle?.checkStatusPoster) {
       const holdSummary = buildSecurityHoldSummary(
         'environment_trust',
         trustResolution?.tier ?? 'unknown',
@@ -1934,6 +2035,19 @@ function makeBuildJobConfig(args: {
   cacheRepoId: string;
   /** User-cache write scope for this dispatch (trusted => shared, else isolated). */
   cacheRefScope: CacheRefScope;
+  /**
+   * True for test runs (`kici run`), which ship the workflow body as a
+   * working-tree overlay that may differ from the committed lock. Omitting
+   * `contentHash` tells the agent to skip the lock-vs-source hash check so the
+   * overlaid (uncommitted) source is accepted.
+   */
+  omitContentHash: boolean;
+  /**
+   * Run-wide flat secrets layered onto every job's secrets, UNDER the per-job
+   * env-resolved set so the run-wide value wins on collision (the test path's
+   * CLI `--secret` / `--env` flat secrets). Undefined for webhook runs.
+   */
+  runWideFlatSecrets: Record<string, string> | undefined;
 }): BuildJobConfigFn {
   const {
     workflow,
@@ -1948,11 +2062,19 @@ function makeBuildJobConfig(args: {
     cacheOrgId,
     cacheRepoId,
     cacheRefScope,
+    omitContentHash,
+    runWideFlatSecrets,
   } = args;
   return (mat: MaterializedJob): Record<string, unknown> => {
     const lockJob = mat.lockJob;
     const envData = jobEnvironmentData.get(mat.expandedName);
-    const mergedSecrets = { ...resolvedSecrets, ...(envData?.jobSecrets ?? {}) };
+    // Run-wide CLI flat secrets are spread LAST so they win on a key collision
+    // with the per-job env-resolved set, and so they reach an env-less job too.
+    const mergedSecrets = {
+      ...resolvedSecrets,
+      ...(envData?.jobSecrets ?? {}),
+      ...(runWideFlatSecrets ?? {}),
+    };
     const mergedNamespaced = {
       ...resolvedNamespacedSecrets,
       ...(envData?.jobNamespacedSecrets ?? {}),
@@ -1981,7 +2103,7 @@ function makeBuildJobConfig(args: {
       steps: lockJob.steps,
       needs: lockJob.needs,
       rules: lockJob.rules,
-      ...(workflow.contentHash && { contentHash: workflow.contentHash }),
+      ...(workflow.contentHash && !omitContentHash && { contentHash: workflow.contentHash }),
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
@@ -2036,8 +2158,14 @@ function buildExecutionJobInput(args: {
     runsOnPatterns: selectors.runsOnPatterns,
     excludeLabels: selectors.excludeLabels,
     excludePatterns: selectors.excludePatterns,
-    jobConfig: buildJobConfig(mat),
-    repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+    // Bake ctx.extraJobConfig into the job's config so a needs-gated / wave-held
+    // child carries it too: gated children are stored as a pending context and
+    // re-dispatched later by the needs scheduler through the base dispatcher,
+    // which does NOT re-apply the dispatcher wrapper's extraJobConfig merge.
+    // Without this, a test run's overlay/`fullRepo` provenance would be lost on
+    // the downstream and the agent would try to clone an empty repoUrl.
+    jobConfig: { ...buildJobConfig(mat), ...ctx.extraJobConfig },
+    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -2156,7 +2284,7 @@ async function holdJobForApproval(args: {
   // clauses an approver must satisfy. Step-level holds run inside the agent, so
   // this stays at job granularity. Fire-and-forget: a failed check post must
   // not block the dispatch loop.
-  if (ctx.bundle.checkStatusPoster) {
+  if (ctx.bundle?.checkStatusPoster) {
     const description = summarizeApprovalClauses(hold.requirement.clauses);
     ctx.bundle.checkStatusPoster
       .postCheckStatus(
@@ -2315,7 +2443,7 @@ async function clusterRouteRootJobs(args: {
       runsOnPatterns: sel.runsOnPatterns,
       excludePatterns: sel.excludePatterns,
       jobConfig: buildJobConfig(mj),
-      repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+      repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
       sourceTarUrl: buildPrep.sourceTarUrl,
@@ -2690,6 +2818,7 @@ async function recordRunStart(args: {
     decision,
     trustResolution,
     lockFileSource,
+    testRun,
   } = ctx;
   if (!deps.executionTracker || dispatchedJobs.length === 0) return;
   if (buildPrep.buildJobTrackedEarly) {
@@ -2755,6 +2884,19 @@ async function recordRunStart(args: {
         });
       });
   }
+  if (testRun && deps.db) {
+    deps.db
+      .updateTable('execution_runs')
+      .set({ is_test_run: true, fixture_id: testRun.fixtureId })
+      .where('run_id', '=', runId)
+      .execute()
+      .catch((err) => {
+        logger.error('Failed to set test-run context on execution run', {
+          runId,
+          error: toErrorMessage(err),
+        });
+      });
+  }
 }
 
 function categorizeRejectReason(reason: string): InitFailureCategory {
@@ -2783,21 +2925,29 @@ async function insertEdgesAndMarkRejected(args: {
   }
   if (deps.executionTracker && rejectedJobs.length > 0) {
     const now = Date.now();
-    for (const { jobId, jobName, reason, category } of rejectedJobs) {
+    for (const { jobId, jobName, reason, category, terminalStatus } of rejectedJobs) {
+      const status = terminalStatus ?? ExecutionJobStatus.enum.failed;
+      // A skipped synthetic job (intentionally narrowed-to-empty fan-out) carries
+      // no init-failure; a failed one does.
+      const extra =
+        status === ExecutionJobStatus.enum.skipped
+          ? { error: reason }
+          : {
+              error: reason,
+              initFailure: {
+                scope: 'job' as const,
+                category: category ?? categorizeRejectReason(reason),
+                message: reason,
+                jobName,
+              },
+            };
       deps.executionTracker
-        .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, now, undefined, {
-          error: reason,
-          initFailure: {
-            scope: 'job',
-            category: category ?? categorizeRejectReason(reason),
-            message: reason,
-            jobName,
-          },
-        })
+        .onJobStatus(runId, jobId, status, now, undefined, extra)
         .catch((err) => {
-          logger.error('Failed to mark rejected job as failed', {
+          logger.error('Failed to mark rejected job', {
             runId,
             jobId,
+            status,
             error: toErrorMessage(err),
           });
         });
@@ -2903,7 +3053,7 @@ async function dispatchExecutionAfterInit(args: {
       runsOnPatterns: selectors.runsOnPatterns,
       excludePatterns: selectors.excludePatterns,
       jobConfig: buildJobConfig(mat),
-      repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+      repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
       sourceTarUrl: buildPrep.sourceTarUrl,
@@ -3245,7 +3395,7 @@ async function dispatchEvalJob(args: {
       source: dynamicEntry.source,
       event,
       timeoutMs: 120_000,
-      ...(workflow.contentHash && { contentHash: workflow.contentHash }),
+      ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
@@ -3257,7 +3407,7 @@ async function dispatchEvalJob(args: {
         upstreamSnapshot,
       }),
     },
-    repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+    repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -3398,7 +3548,7 @@ async function resolveGeneratedJobConfigs(args: {
           expanded.push(name);
         }
       } else if (typeof need === 'object' && 'name' in need && !('group' in need)) {
-        const entry = need as { name: string; ifFailed?: string };
+        const entry = need as { name: string; runOn?: ExecutionJobStatus[] };
         for (const name of fanout.expansionMap.get(entry.name) ?? [entry.name]) {
           expanded.push({ ...entry, name });
         }
@@ -3456,6 +3606,10 @@ async function resolveGeneratedJobConfigs(args: {
           }
         }
       }
+      // Run-wide CLI flat secrets win on collision + reach env-less dynamic jobs.
+      if (ctx.runWideFlatSecrets) {
+        genSecrets = { ...genSecrets, ...ctx.runWideFlatSecrets };
+      }
       const hasSecrets = Object.keys(genSecrets).length > 0;
       const hasNamespaced = Object.keys(genNamespacedSecrets).length > 0;
       const expandedNeeds = expandNeeds(genJob.needs);
@@ -3473,7 +3627,7 @@ async function resolveGeneratedJobConfigs(args: {
           baseJobName: envelope.baseJobName,
           matrixValues: envelope.matrixValues,
         }),
-        ...(workflow.contentHash && { contentHash: workflow.contentHash }),
+        ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
         ...(hasSecrets && { secrets: genSecrets }),
         ...(hasNamespaced && { namespacedSecrets: genNamespacedSecrets }),
         ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
@@ -3543,7 +3697,7 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
     run_id: string;
     job_name: string;
     upstream_name: string;
-    if_failed: string;
+    run_on: string;
   }> = [];
   for (const { genJob } of gatedGeneratedConfigs) {
     for (const need of genJob.needs) {
@@ -3552,14 +3706,14 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
           run_id: runId,
           job_name: genJob.name,
           upstream_name: need,
-          if_failed: 'skip',
+          run_on: SUCCESS_ONLY_RUN_ON_JSON,
         });
       } else if (typeof need === 'object' && 'name' in need && !('group' in need)) {
         gatedEdgeRows.push({
           run_id: runId,
           job_name: genJob.name,
           upstream_name: (need as { name: string }).name,
-          if_failed: (need as { ifFailed?: string }).ifFailed ?? 'skip',
+          run_on: needsRunOnJson(need as { runOn?: ExecutionJobStatus[] }),
         });
       }
     }
@@ -3589,7 +3743,7 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
       excludeLabels,
       excludePatterns,
       jobConfig: genJobConfig,
-      repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+      repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
       deliveryId: setup.effectiveDeliveryId,
@@ -3655,7 +3809,7 @@ async function directDispatchGeneratedJobs(args: {
         excludeLabels,
         excludePatterns,
         jobConfig: genJobConfig,
-        repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+        repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
         ref: event.sourceBranch ?? event.targetBranch,
         sha: ref,
         deliveryId: setup.effectiveDeliveryId,
@@ -3725,7 +3879,7 @@ async function routeRootGeneratedJobs(args: {
       runsOnPatterns,
       excludePatterns,
       jobConfig: genJobConfig,
-      repoUrl: bundle.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
+      repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
       sha: ref,
       sourceTarUrl: buildPrep.sourceTarUrl,
@@ -3886,7 +4040,7 @@ async function setGroupNameAndResolveEdges(args: {
       );
       return {
         jobName: j.name,
-        ifFailed: (groupEntry?.ifFailed ?? 'skip') as 'skip' | 'run',
+        runOn: groupEntry?.runOn ?? [ExecutionJobStatus.enum.success],
       };
     });
   if (dependentStaticJobs.length > 0) {
@@ -3909,7 +4063,7 @@ async function insertGeneratedNeedsEdges(
     run_id: string;
     job_name: string;
     upstream_name: string;
-    if_failed: string;
+    run_on: string;
   }> = [];
   for (const genJob of generatedJobs) {
     for (const need of genJob.needs) {
@@ -3918,14 +4072,14 @@ async function insertGeneratedNeedsEdges(
           run_id: runId,
           job_name: genJob.name,
           upstream_name: need,
-          if_failed: 'skip',
+          run_on: SUCCESS_ONLY_RUN_ON_JSON,
         });
       } else if (typeof need === 'object' && 'name' in need && !('group' in need)) {
         genEdgeRows.push({
           run_id: runId,
           job_name: genJob.name,
           upstream_name: (need as { name: string }).name,
-          if_failed: (need as { ifFailed?: string }).ifFailed ?? 'skip',
+          run_on: needsRunOnJson(need as { runOn?: ExecutionJobStatus[] }),
         });
       }
     }
@@ -4101,19 +4255,16 @@ async function registerDeferredEvalJob(args: {
   }
 
   const upstreamNames = [...new Set([...jobNames, ...groupMembers])];
-  const ifFailedByName = new Map<string, string>();
+  const runOnByName = new Map<string, string>();
   for (const need of dynamicEntry.needs ?? []) {
     if (typeof need === 'object' && 'name' in need) {
-      ifFailedByName.set((need as NeedsEntry).name, (need as NeedsEntry).ifFailed ?? 'skip');
+      runOnByName.set((need as NeedsEntry).name, needsRunOnJson(need as NeedsEntry));
     }
   }
-  const groupIfFailed = new Map<string, string>();
+  const groupRunOn = new Map<string, string>();
   for (const need of dynamicEntry.needs ?? []) {
     if (typeof need === 'object' && 'group' in need) {
-      groupIfFailed.set(
-        (need as NeedsGroupEntry).group,
-        (need as NeedsGroupEntry).ifFailed ?? 'skip',
-      );
+      groupRunOn.set((need as NeedsGroupEntry).group, needsRunOnJson(need as NeedsGroupEntry));
     }
   }
 
@@ -4130,11 +4281,11 @@ async function registerDeferredEvalJob(args: {
     run_id: runId,
     job_name: evalJobName,
     upstream_name: upstreamName,
-    if_failed:
-      ifFailedByName.get(upstreamName) ??
-      // group member inherits its group's policy
-      [...groupIfFailed.values()][0] ??
-      'skip',
+    run_on:
+      runOnByName.get(upstreamName) ??
+      // group member inherits its group's run-on set
+      [...groupRunOn.values()][0] ??
+      SUCCESS_ONLY_RUN_ON_JSON,
   }));
   if (edgeRows.length > 0) {
     await deps.db
@@ -4153,16 +4304,17 @@ async function registerDeferredEvalJob(args: {
   // it before our edges existed), so the gate would never fire from a future
   // completion. Recompute now; if already satisfied, fire the ready callback so
   // the gate opens. recomputeNeedsSatisfied returns 'skip' too — for an upstream
-  // that failed with if_failed='skip', surface it as a skipped eval below.
+  // whose terminal status is not in the eval edge's run_on set, surface it as a
+  // skipped eval below.
   const results = await recomputeNeedsSatisfied(deps.db, runId, [evalJobName]);
   for (const result of results) {
     if (result.action === 'dispatch' && deps.executionTracker?.onJobReadyCallback) {
       await deps.executionTracker.onJobReadyCallback(runId, evalJobName);
     } else if (result.action === 'skip') {
-      // An upstream failed and the eval edge is skip-on-failure: the generator
-      // produces nothing. Open the gate anyway so the awaiting task proceeds
-      // with an empty snapshot (the generator decides what an empty/failed
-      // upstream means via ifFailed: 'run').
+      // An upstream's terminal status is not in the eval edge's run_on set: the
+      // generator produces nothing. Open the gate anyway so the awaiting task
+      // proceeds with an empty snapshot (the generator decides what an
+      // empty/failed upstream means via a wider `when` set).
       if (deps.executionTracker?.onJobReadyCallback) {
         await deps.executionTracker.onJobReadyCallback(runId, evalJobName);
       }
@@ -4182,7 +4334,7 @@ async function gatherUpstreamSnapshot(args: {
 }): Promise<UpstreamSnapshot> {
   const { ctx, dynamicEntry } = args;
   const { deps, runId } = ctx;
-  const snapshot: UpstreamSnapshot = { jobs: {}, groups: {} };
+  const snapshot: UpstreamSnapshot = { jobs: {}, groups: {}, statuses: {} };
   if (!deps.db) return snapshot;
   const { jobNames, groupNames } = splitDeclaredNeeds(dynamicEntry.needs);
 
@@ -4206,7 +4358,7 @@ async function gatherUpstreamSnapshot(args: {
   if (allJobNames.length > 0) {
     const rows = await deps.db
       .selectFrom('execution_jobs')
-      .select(['job_name', 'outputs'])
+      .select(['job_name', 'outputs', 'status'])
       .where('run_id', '=', runId)
       .where('job_name', 'in', allJobNames)
       .execute();
@@ -4216,6 +4368,9 @@ async function gatherUpstreamSnapshot(args: {
       // null/empty/unparseable cell simply yields no outputs for that upstream.
       const parsed = parseOutputsCell(row.outputs);
       if (parsed) snapshot.jobs[row.job_name] = parsed;
+      if (row.status && snapshot.statuses) {
+        snapshot.statuses[row.job_name] = row.status as ExecutionJobStatus;
+      }
     }
   }
   return snapshot;
@@ -4526,7 +4681,7 @@ export async function dispatchMatchedWorkflow(
   const setup = await setupDispatchContext(ctx);
   const buildPrep = await prepareCacheAndBuild(ctx, setup);
   if (buildPrep.abort) {
-    return { dispatchedJobCount: 0 };
+    return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
   const secretsResult = await resolveWorkflowSecretsAndKey(ctx);
   if ('skipDispatch' in secretsResult) {
@@ -4536,7 +4691,7 @@ export async function dispatchMatchedWorkflow(
       category: InitFailureCategory.enum.secret_resolution,
       reason: secretsResult.reason,
     });
-    return { dispatchedJobCount: 0 };
+    return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
   const secrets = secretsResult;
   const installResult = await resolveWorkflowInstallSecrets(
@@ -4551,7 +4706,7 @@ export async function dispatchMatchedWorkflow(
       hold: installResult.hold,
       reuseRunId: opts.reuseRunId,
     });
-    return { dispatchedJobCount: 0, held: true };
+    return { dispatchedJobCount: 0, dispatchedJobIds: [], held: true };
   }
   if ('skipDispatch' in installResult && installResult.skipDispatch) {
     await recordInitFailureFromSkip({
@@ -4560,7 +4715,7 @@ export async function dispatchMatchedWorkflow(
       category: InitFailureCategory.enum.install_secrets,
       reason: installResult.reason,
     });
-    return { dispatchedJobCount: 0 };
+    return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
 
   // Resume path: flip the reused held run row off `held` so the resumed
@@ -4583,6 +4738,8 @@ export async function dispatchMatchedWorkflow(
     cacheOrgId: ctx.resolvedOrgId,
     cacheRepoId: ctx.repoIdentifier,
     cacheRefScope: deriveCacheRefScope(ctx.trustResolution),
+    omitContentHash: !!ctx.testRun,
+    runWideFlatSecrets: ctx.runWideFlatSecrets,
   });
 
   const dispatchedJobs: DispatchedJob[] = [];
@@ -4604,12 +4761,18 @@ export async function dispatchMatchedWorkflow(
     dispatchedJobs,
     rejectedJobs,
   });
-  // Jobs whose matrix could not be materialized (cap / zero-combination) are
-  // recorded as failed with the matrix_expansion category. A synthetic
-  // dispatched-job row keeps the run from being considered complete-with-no-jobs.
+  // Jobs whose fan-out could not be materialized (cap / zero-combination /
+  // unreachable hosts) get a synthetic terminal row so the run is not considered
+  // complete-with-no-jobs and downstreams keep a real needs edge. A genuine
+  // failure is recorded as failed with the matrix_expansion category; a
+  // narrowed-to-empty runsOnAll is recorded as skipped (its terminalStatus).
   for (const failure of buildPrep.matrixFailures) {
     dispatchedJobs.push({ jobId: failure.jobId, jobName: failure.jobName });
-    rejectedJobs.push({ ...failure, category: InitFailureCategory.enum.matrix_expansion });
+    rejectedJobs.push(
+      failure.terminalStatus === ExecutionJobStatus.enum.skipped
+        ? failure
+        : { ...failure, category: InitFailureCategory.enum.matrix_expansion },
+    );
   }
   await recordRunStart({
     ctx,
@@ -4693,5 +4856,8 @@ export async function dispatchMatchedWorkflow(
     startDeferredDynamicDispatch({ ctx, setup, buildPrep, secrets });
   }
 
-  return { dispatchedJobCount: dispatchedJobs.length };
+  return {
+    dispatchedJobCount: dispatchedJobs.length,
+    dispatchedJobIds: dispatchedJobs.map((j) => j.jobId),
+  };
 }

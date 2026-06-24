@@ -17,7 +17,14 @@
  */
 
 import type { $ as Shell } from 'zx';
-import type { Job, Step, Logger, DynamicMatrixFn, DynamicMatrixContext } from '@kici-dev/sdk';
+import type {
+  Job,
+  Step,
+  Logger,
+  DynamicMatrixFn,
+  DynamicMatrixContext,
+  NeedsWhenInput,
+} from '@kici-dev/sdk';
 import { isDynamicJobFn, isDynamicGroupRef, isStaticArray, isStaticObject } from '@kici-dev/sdk';
 import type { DynamicGroupRef } from '@kici-dev/sdk';
 import type {
@@ -29,6 +36,7 @@ import type {
   LabelMatcher,
 } from '@kici-dev/engine';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
+import { resolveWhenToRunOn } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
 
 /**
@@ -225,7 +233,8 @@ async function serializeJob(
  * Validates against generatedNames union staticNames union allowedGroups.
  *
  * Returns the lock file representation: strings for concrete refs,
- * NeedsEntry for { name, ifFailed }, NeedsGroupEntry for group refs.
+ * NeedsEntry for { name, when }, NeedsGroupEntry for group refs (each `when`
+ * normalized to a runOn status-set).
  */
 function resolveNeeds(
   needs: Job['needs'],
@@ -261,13 +270,13 @@ function resolveNeeds(
       // Return as NeedsGroupEntry for the lock file
       return {
         group: groupRef.group,
-        ifFailed: groupRef.ifFailed ?? 'skip',
+        runOn: resolveWhenToRunOn(groupRef.when),
       } as NeedsGroupEntry;
     }
 
     // Object with 'group' field (NeedsGroupEntry-like): validate group name
     if (typeof dep === 'object' && dep !== null && 'group' in dep) {
-      const groupDep = dep as { group: string; ifFailed?: 'skip' | 'run' };
+      const groupDep = dep as { group: string; when?: NeedsWhenInput };
       if (!allowedGroups.has(groupDep.group)) {
         throw new Error(
           `Dynamic group '${groupDep.group}' not found in workflow ` +
@@ -276,13 +285,13 @@ function resolveNeeds(
       }
       return {
         group: groupDep.group,
-        ifFailed: groupDep.ifFailed ?? 'skip',
+        runOn: resolveWhenToRunOn(groupDep.when),
       } as NeedsGroupEntry;
     }
 
     // Object with 'name' field (NeedsEntry-like): validate name
     if (typeof dep === 'object' && dep !== null && 'name' in dep && !('steps' in dep)) {
-      const namedDep = dep as { name: string; ifFailed?: 'skip' | 'run' };
+      const namedDep = dep as { name: string; when?: NeedsWhenInput };
       if (!allNames.has(namedDep.name)) {
         throw new Error(
           `Job dependency '${namedDep.name}' not found in workflow jobs ` +
@@ -291,7 +300,7 @@ function resolveNeeds(
       }
       return {
         name: namedDep.name,
-        ifFailed: namedDep.ifFailed ?? 'skip',
+        runOn: resolveWhenToRunOn(namedDep.when),
       } as NeedsEntry;
     }
 

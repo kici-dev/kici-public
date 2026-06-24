@@ -161,6 +161,7 @@ export class SourceManager {
           routingKey: source.routing_key,
           name: source.name,
           subtype: SourceSubtype.enum.github_app,
+          ...(source.slug ? { slug: source.slug } : {}),
         });
       } catch (err) {
         logger.error('Failed to load source, skipping', {

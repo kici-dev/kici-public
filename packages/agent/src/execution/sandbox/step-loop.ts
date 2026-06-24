@@ -14,7 +14,7 @@ import type {
   StepSecretMountRecord,
   CacheSpec,
 } from '@kici-dev/sdk';
-import { normalizeCacheSpecs, normalizeRequireApproval } from '@kici-dev/sdk';
+import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk';
 import { ExecutionStepStatus, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
@@ -104,11 +104,11 @@ export interface StepLoopOptions {
    */
   afterStepApplyEnvFiles?: () => Promise<void>;
   /**
-   * Block a `requireApproval` step pending an orchestrator-side approval hold.
-   * The runner sends the normalized requirement and awaits the resolution; the
-   * agent keeps job heartbeats flowing during the wait so the agent isn't
-   * reaped. Absent ⇒ approvals are not gated (CT / unit harnesses) and steps
-   * run unconditionally.
+   * Block an `approval` step (`when: 'always'`) pending an orchestrator-side
+   * approval hold. The runner sends the normalized requirement and awaits the
+   * resolution; the agent keeps job heartbeats flowing during the wait so the
+   * agent isn't reaped. Absent ⇒ approvals are not gated (CT / unit harnesses)
+   * and steps run unconditionally.
    */
   awaitStepApproval?: (req: {
     stepIndex: number;
@@ -116,6 +116,21 @@ export interface StepLoopOptions {
     clauses: Array<{ team: string } | { user: string }>;
     reason: string;
     timeoutSeconds?: number;
+  }) => Promise<StepApprovalResolution>;
+  /**
+   * Block an `approval: { when: 'drift' }` step mid-execution: after `check()`
+   * returns drift in apply mode, send a payload-bearing step-approval and await
+   * the resolution. The payload carries the computed drift (`summaryMarkdown` +
+   * structured `drift`) so the operator approves the actual diff. Absent ⇒ the
+   * drift gate is not enforced (CT / unit harnesses) and the step applies.
+   */
+  awaitStepApprovalWithPayload?: (req: {
+    stepIndex: number;
+    stepName: string;
+    clauses: Array<{ team: string } | { user: string }>;
+    reason: string;
+    timeoutSeconds?: number;
+    payload: { summaryMarkdown: string; drift: unknown };
   }) => Promise<StepApprovalResolution>;
 }
 
@@ -147,6 +162,14 @@ interface CheckPhaseResult {
   drift?: unknown;
 }
 
+/** Result of a rejected drift gate: the run was declined by a reviewer. */
+class DriftGateRejectedError extends Error {
+  constructor(reason?: string) {
+    super(reason ? `approval rejected: ${reason}` : 'approval rejected');
+    this.name = 'DriftGateRejectedError';
+  }
+}
+
 /**
  * Run one step honoring the run-level {@link CheckMode}, reusing the
  * `runIdempotentStep` primitive for checked steps (never hand-rolled branching).
@@ -154,8 +177,11 @@ interface CheckPhaseResult {
  * - Plain step (no `check`): in apply mode, runs as today; in any check mode it
  *   is skipped with `no_check` (a side-effecting step can't be safely previewed).
  * - Checked step: adapted into an `IdempotentStep` and driven by the primitive
- *   with `dryRun` set in check mode (so `apply`/`run` never fires) and `yes: true`
- *   (v0 has no mid-run confirm). On drift the summary is emitted as a log line.
+ *   with `dryRun` set in check mode (so `apply`/`run` never fires). On drift the
+ *   summary is emitted as a log line. A `approval: { when: 'drift' }` step in
+ *   apply mode passes a `confirm` callback that round-trips a payload-bearing
+ *   step-approval; on reject the gate throws (fail-stop). Any other apply-mode
+ *   step uses `yes: true`.
  */
 async function runStepWithCheckMode(
   step: Step,
@@ -163,6 +189,7 @@ async function runStepWithCheckMode(
   ctx: StepContext,
   checkMode: CheckMode,
   sendFn: (msg: RunnerToAgentMessage) => void,
+  opts: StepLoopOptions,
 ): Promise<CheckPhaseResult> {
   if (!step.check) {
     if (checkMode !== CheckMode.enum.apply) {
@@ -176,16 +203,52 @@ async function runStepWithCheckMode(
     return { status: 'success', outputs: await step.run(ctx) };
   }
 
+  // Capture the structured drift the primitive computes so the payload carries
+  // it (the primitive's confirm/summarize see only the summary string).
+  let lastDrift: unknown = null;
   const adapted: IdempotentStep<unknown, unknown, unknown> = {
     name: step.name,
-    check: () => step.check!(ctx),
+    check: async () => {
+      lastDrift = await step.check!(ctx);
+      return lastDrift;
+    },
     summarize: step.summarize!,
     apply: (drift) => step.run(ctx, drift),
     whenInSync: step.whenInSync ? () => step.whenInSync!(ctx) : undefined,
   };
+
+  const driftGate =
+    step.approval !== undefined &&
+    normalizeApproval(step.approval).when === 'drift' &&
+    checkMode === CheckMode.enum.apply &&
+    opts.awaitStepApprovalWithPayload !== undefined;
+
   const res = await runIdempotentStep(adapted, {
     dryRun: checkMode !== CheckMode.enum.apply,
-    yes: true,
+    ...(driftGate
+      ? {
+          // The primitive calls confirm() only on non-null drift, which is
+          // exactly "gate on drift". It passes its own prompt string; the
+          // author-rendered summary comes from summarize(lastDrift).
+          confirm: async () => {
+            const norm = normalizeApproval(step.approval!);
+            const summaryMarkdown = step.summarize!(lastDrift);
+            const resolution = await opts.awaitStepApprovalWithPayload!({
+              stepIndex,
+              stepName: step.name,
+              clauses: norm.clauses,
+              reason: norm.reason ?? `Approval required for drift in '${step.name}'`,
+              ...(norm.timeoutSeconds !== undefined && { timeoutSeconds: norm.timeoutSeconds }),
+              payload: { summaryMarkdown, drift: lastDrift },
+            });
+            if (resolution.outcome === 'approved') return true;
+            // Reject / expire is a fail-stop: surface a clear error to the loop.
+            throw new DriftGateRejectedError(
+              resolution.outcome === 'expired' ? 'approval expired' : resolution.reason,
+            );
+          },
+        }
+      : { yes: true }),
     log: (line) => sendFn({ type: 'log.line', stepIndex, line }),
   });
 
@@ -214,10 +277,11 @@ async function executeStepInLoop(
   timeoutMs: number,
   sendFn: (msg: RunnerToAgentMessage) => void,
   outputsMap: OutputsMap,
-  getSecretsAccessLog?: () => string[],
-  getSecretMountRecords?: () => StepSecretMountRecord[],
-  jobDeadlineSignal?: AbortSignal,
-  checkMode: CheckMode = CheckMode.enum.apply,
+  getSecretsAccessLog: (() => string[]) | undefined,
+  getSecretMountRecords: (() => StepSecretMountRecord[]) | undefined,
+  jobDeadlineSignal: AbortSignal | undefined,
+  checkMode: CheckMode,
+  opts: StepLoopOptions,
 ): Promise<SandboxStepResult> {
   sendFn({ type: 'step.start', stepIndex, stepName: step.name });
 
@@ -227,7 +291,7 @@ async function executeStepInLoop(
 
   try {
     const phase = await Promise.race([
-      runStepWithCheckMode(step, stepIndex, ctx, checkMode, sendFn),
+      runStepWithCheckMode(step, stepIndex, ctx, checkMode, sendFn, opts),
       new Promise<never>((_, reject) => {
         abortController.signal.addEventListener('abort', () => {
           reject(new Error(`Step '${step.name}' timed out after ${timeoutMs}ms`));
@@ -416,19 +480,23 @@ async function evaluateStepRulesAndMaybeSkip(
 }
 
 /**
- * Manual approval gate for a step. When the step declares `requireApproval`
- * and the harness wired `awaitStepApproval`, block until the orchestrator
- * resolves the hold. Returns a failed `StepIterationOutcome` (breaking the
- * loop) on reject/expired; returns null when approved or when no gate applies.
+ * Pre-step manual approval gate. When the step declares `approval` with
+ * `when: 'always'` and the harness wired `awaitStepApproval`, block until the
+ * orchestrator resolves the hold. A `when: 'drift'` gate is NOT handled here —
+ * it fires mid-execution inside `runStepWithCheckMode` once `check()` returns
+ * drift. Returns a failed `StepIterationOutcome` (breaking the loop) on
+ * reject/expired; returns null when approved or when no gate applies.
  */
 async function maybeGateStepApproval(
   step: Step,
   stepIndex: number,
   opts: StepLoopOptions,
 ): Promise<StepIterationOutcome | null> {
-  if (step.requireApproval === undefined || !opts.awaitStepApproval) return null;
+  if (step.approval === undefined || !opts.awaitStepApproval) return null;
 
-  const normalized = normalizeRequireApproval(step.requireApproval);
+  const normalized = normalizeApproval(step.approval);
+  // Drift gates fire between check and run, not before the step.
+  if (normalized.when === 'drift') return null;
   opts.sendIpc({
     type: 'log.line',
     stepIndex,
@@ -588,6 +656,7 @@ async function runStepIteration(
         opts.getSecretMountRecords,
         opts.jobDeadlineSignal,
         opts.checkMode ?? CheckMode.enum.apply,
+        opts,
       );
     } finally {
       await opts.afterStepApplyEnvFiles?.();

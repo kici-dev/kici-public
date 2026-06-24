@@ -10,9 +10,12 @@ import { dashboardOrchLogsRequestSchema, dashboardOrchLogsResponseSchema } from 
 import { EventLogStatus, PayloadOmittedReason, EventLogSource } from './event-log.js';
 import { initFailureSchema } from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
+import { DeploymentModeSchema, DeploymentContainerRuntimeSchema } from './deployment-identity.js';
 import { ScalerBackendType } from '../../scaler/scaler-backend-type.js';
 import { HoldScope, ApprovalDecision, approverClauseSchema } from '../../approval/types.js';
-import { IfFailedPolicy } from '../../trigger/types.js';
+import { NeedsRunOn, OnUnreachableMode } from '../../trigger/types.js';
+import { HostTargetSelector } from '../../labels-match.js';
+import { HostInventoryEntry } from '../../inventory.js';
 import {
   globalWorkflowsGetRequestSchema,
   globalWorkflowsUpdateRequestSchema,
@@ -101,14 +104,15 @@ export const dashboardJobDetailSchema = z.object({
   /**
    * Upstream dependency edges for this job (one entry per `needs` declaration),
    * resolved by the orchestrator from execution_job_needs. `upstreamName` is the
-   * upstream job name; `ifFailed` is the per-edge failure policy. null/absent when
-   * the job has no upstreams.
+   * upstream job name; `runOn` is the per-edge run-on status-set (the upstream
+   * terminal statuses that satisfy the edge). null/absent when the job has no
+   * upstreams.
    */
   needs: z
     .array(
       z.object({
         upstreamName: z.string(),
-        ifFailed: IfFailedPolicy,
+        runOn: NeedsRunOn,
       }),
     )
     .nullable()
@@ -1246,6 +1250,12 @@ const heldRunsListResponseSchema = z.object({
           })
           .nullable()
           .optional(),
+        // Computed drift payload for a `when: 'drift'` step hold; null/absent
+        // for every other hold. Rendered in the approval queue + the CLI.
+        payload: z
+          .object({ summaryMarkdown: z.string(), drift: z.unknown() })
+          .nullable()
+          .optional(),
         decisions: z
           .array(
             z.object({
@@ -1268,6 +1278,13 @@ export const heldRunApproveRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   heldRunId: z.string(),
+  /**
+   * Set by the `kici run --approve-all` breakglass: the approval was issued by
+   * the run's own dispatcher auto-approving every gate of that run. Eligibility
+   * is still enforced (this only changes the audit action to
+   * `held_run.auto_approve`); it is never a bypass.
+   */
+  autoApprove: z.boolean().optional(),
 });
 
 const heldRunApproveResponseSchema = z.object({
@@ -1301,6 +1318,110 @@ export const dashboardDiagnosticsRequestSchema = z.object({
   /** When false or omitted, agents[] is empty and aggregate fields are populated instead. */
   includeAgents: z.boolean().optional(),
 });
+
+// --- Fleet read protocol (roster, host detail, runsOnAll preview) ---
+
+/** A run pinned to a host, for the host-detail "recent runs" list. */
+export const fleetPinnedRunSchema = z.object({
+  runId: z.string(),
+  workflowName: z.string().nullable(),
+  status: z.string(),
+  createdAt: z.string(),
+});
+export type FleetPinnedRun = z.infer<typeof fleetPinnedRunSchema>;
+
+/** A host matched by a runsOnAll preview, plus how the fan-out would treat it. */
+export const fleetPreviewHostSchema = z.object({
+  entry: HostInventoryEntry,
+  disposition: z.enum(['target', 'unreachable-durable', 'skipped-ephemeral']),
+});
+export type FleetPreviewHost = z.infer<typeof fleetPreviewHostSchema>;
+
+// Requests (Platform -> orch)
+export const dashboardFleetHostsRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.hosts'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+});
+export const dashboardFleetHostRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.host'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  agentId: z.string(),
+});
+export const dashboardFleetPreviewRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.preview'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  workflowName: z.string(),
+});
+
+// Responses (orch -> Platform)
+export const dashboardFleetHostsResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.hosts.response'),
+  requestId: z.string(),
+  hosts: z.array(HostInventoryEntry),
+});
+export const dashboardFleetHostResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.host.response'),
+  requestId: z.string(),
+  host: HostInventoryEntry.nullable(),
+  runs: z.array(fleetPinnedRunSchema),
+});
+export const dashboardFleetPreviewResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.preview.response'),
+  requestId: z.string(),
+  matched: z.array(fleetPreviewHostSchema),
+  onUnreachable: OnUnreachableMode,
+  estimatedChildCount: z.number(),
+});
+
+export type DashboardFleetHostsRequest = z.infer<typeof dashboardFleetHostsRequestSchema>;
+export type DashboardFleetHostRequest = z.infer<typeof dashboardFleetHostRequestSchema>;
+export type DashboardFleetPreviewRequest = z.infer<typeof dashboardFleetPreviewRequestSchema>;
+export type DashboardFleetHostsResponse = z.infer<typeof dashboardFleetHostsResponseSchema>;
+export type DashboardFleetHostResponse = z.infer<typeof dashboardFleetHostResponseSchema>;
+export type DashboardFleetPreviewResponse = z.infer<typeof dashboardFleetPreviewResponseSchema>;
+
+// --- Fleet host writes (Model C: declare / remove) ---
+
+/** Declare a static host into the roster (wraps HostRosterStore.declareStatic). */
+export const fleetHostDeclareRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.host.declare'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  agentId: z.string(),
+  labels: z.array(z.string()),
+  hostname: z.string().optional(),
+  properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+});
+export const fleetHostDeclareResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.host.declare.response'),
+  requestId: z.string(),
+  declared: z.boolean().optional(),
+  error: z.string().optional(),
+});
+
+/** Remove a host from the roster by agent id (HostRosterStore.removeStatic). */
+export const fleetHostRemoveRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.host.remove'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  agentId: z.string(),
+});
+export const fleetHostRemoveResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.host.remove.response'),
+  requestId: z.string(),
+  // false ⇒ no row matched (not-found); the `error` field stays reserved for
+  // internal errors, which the Platform maps to HTTP 500.
+  removed: z.boolean().optional(),
+  error: z.string().optional(),
+});
+
+export type FleetHostDeclareRequest = z.infer<typeof fleetHostDeclareRequestSchema>;
+export type FleetHostDeclareResponse = z.infer<typeof fleetHostDeclareResponseSchema>;
+export type FleetHostRemoveRequest = z.infer<typeof fleetHostRemoveRequestSchema>;
+export type FleetHostRemoveResponse = z.infer<typeof fleetHostRemoveResponseSchema>;
 
 /** Agent info within the diagnostics response. */
 const diagnosticsAgentSchema = z.object({
@@ -1764,6 +1885,11 @@ export const testRelayTriggerRequestSchema = z.object({
   fullRepo: z.boolean().optional(),
   /** Run mode for idempotent steps; relayed onto the dispatch event. Omitted = apply. */
   checkMode: CheckMode.optional(),
+  /**
+   * Runtime host narrowing from `kici run --target`. Intersects each runsOnAll
+   * job's matched roster with this selector. Omitted for webhook runs.
+   */
+  target: HostTargetSelector.optional(),
   secrets: z.record(z.string(), z.string()).optional(),
   encryptedSecrets: z.string().optional(),
   encryptedSecretsKey: z.string().optional(),
@@ -1914,6 +2040,13 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   registrationDeleteRequestSchema,
   // Diagnostics
   dashboardDiagnosticsRequestSchema,
+  // Fleet read (roster, host detail, runsOnAll preview)
+  dashboardFleetHostsRequestSchema,
+  dashboardFleetHostRequestSchema,
+  dashboardFleetPreviewRequestSchema,
+  // Fleet host writes (Model C: declare / remove)
+  fleetHostDeclareRequestSchema,
+  fleetHostRemoveRequestSchema,
   // Scaler capacity
   dashboardScalerCapacityRequestSchema,
   // Scaler agents (on-demand)
@@ -1997,6 +2130,13 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   registrationDeleteResponseSchema,
   // Diagnostics
   dashboardDiagnosticsResponseSchema,
+  // Fleet read (roster, host detail, runsOnAll preview)
+  dashboardFleetHostsResponseSchema,
+  dashboardFleetHostResponseSchema,
+  dashboardFleetPreviewResponseSchema,
+  // Fleet host writes (Model C: declare / remove)
+  fleetHostDeclareResponseSchema,
+  fleetHostRemoveResponseSchema,
   // Scaler capacity
   dashboardScalerCapacityResponseSchema,
   // Scaler agents (on-demand)
@@ -2266,6 +2406,16 @@ const diagnosticsInfraOrchestratorSchema = z.object({
   raftTerm: z.number().nullable().optional(),
   raftLeaderId: z.string().nullable().optional(),
   scalerBackends: z.array(z.string()),
+  /**
+   * Self-reported deployment shape, used by the dashboard to build the correct
+   * per-orchestrator kici-admin invocation. Orchestrators that never reported
+   * it serialize as `mode: 'unknown'` with null container fields.
+   */
+  deployment: z.object({
+    mode: DeploymentModeSchema,
+    containerName: z.string().nullable(),
+    containerRuntime: DeploymentContainerRuntimeSchema.nullable(),
+  }),
   s3LogAccess: z.boolean().nullable().optional(),
   agentCount: z.number(),
   runningJobs: z.number(),

@@ -14,6 +14,12 @@ import { validateGitHubSource } from '../sources/source-validator.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import type { Role } from '../secrets/rbac.js';
+import { fetchGithubAppIdentity } from '../providers/github/manifest.js';
+import {
+  refreshGithubSourceIdentity,
+  type FetchGithubAppIdentity,
+  type RefreshResult,
+} from '../github-app-name-refresher/github-app-name-refresher.js';
 
 const logger = createLogger({ prefix: 'admin-sources' });
 
@@ -39,6 +45,12 @@ interface SourceRouteDeps {
    * orchestrator cannot yet resolve a public base or its org id.
    */
   resolveGithubWebhookUrl?: () => Promise<{ webhookUrl: string | null; webhookNote?: string }>;
+  /**
+   * Fetch a GitHub App's authoritative `{ name, slug }` from GitHub. Injectable
+   * for tests; defaults to the real `fetchGithubAppIdentity`. Used by the
+   * `source refresh` route.
+   */
+  fetchAppIdentity?: FetchGithubAppIdentity;
 }
 
 type AdminSourcesEnv = {
@@ -61,24 +73,33 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
       const denied = requireUnscopedToken(c);
       if (denied) return denied;
       const body = await c.req.json();
-      const { provider, name, appId, privateKey, webhookSecret } = body;
+      const { provider, name, slug, appId, privateKey, webhookSecret } = body;
 
       if (!provider || !name || !appId || !privateKey) {
         return c.json({ error: 'Missing required fields: provider, name, appId, privateKey' }, 400);
       }
 
-      // Validate GitHub credentials before saving
+      // For GitHub sources, GitHub is the source of truth for the stored name +
+      // slug: the credential validation already calls `GET /app`, so adopt its
+      // authoritative name/slug instead of the CLI-supplied `--name`. The
+      // manifest flow passes GitHub's values already; the manual `--app-id`
+      // flow passes only the CLI name, which we replace here.
+      let storedName = name;
+      let storedSlug: string | undefined = slug;
       if (provider === 'github') {
         const validation = await validateGitHubSource(appId, privateKey);
         if (!validation.valid) {
           return c.json({ error: validation.error }, 400);
         }
+        if (validation.appName) storedName = validation.appName;
+        if (validation.slug) storedSlug = validation.slug;
         logger.info(`GitHub App validated: ${validation.appName} (ID: ${appId})`);
       }
 
       const source = await deps.sourceStore.addSource({
         provider,
-        name,
+        name: storedName,
+        slug: storedSlug,
         appId,
         privateKey,
         webhookSecret,
@@ -201,6 +222,58 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
     } catch (err) {
       logger.error('Failed to update source', { error: toErrorMessage(err) });
       return c.json({ error: toErrorMessage(err) }, 500);
+    }
+  });
+
+  const fetchAppIdentity = deps.fetchAppIdentity ?? ((creds) => fetchGithubAppIdentity(creds));
+
+  // POST /api/v1/admin/sources/refresh-all -- re-sync every GitHub source's
+  // name + slug from GitHub. Registered before the parameterized refresh route
+  // so the static `refresh-all` segment wins.
+  app.post('/sources/refresh-all', async (c) => {
+    try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
+      const all = await deps.sourceStore.listSources();
+      const githubKeys = all.filter((s) => s.provider === 'github').map((s) => s.routing_key);
+      const results: RefreshResult[] = [];
+      const errors: Array<{ routingKey: string; error: string }> = [];
+      for (const routingKey of githubKeys) {
+        try {
+          results.push(
+            await refreshGithubSourceIdentity(deps.sourceStore, routingKey, fetchAppIdentity),
+          );
+        } catch (err) {
+          errors.push({ routingKey, error: toErrorMessage(err) });
+        }
+      }
+      return c.json({ results, errors });
+    } catch (err) {
+      logger.error('Failed to refresh all sources', { error: toErrorMessage(err) });
+      return c.json({ error: toErrorMessage(err) }, 500);
+    }
+  });
+
+  // POST /api/v1/admin/sources/:routingKey/refresh -- re-sync one GitHub
+  // source's name + slug from GitHub (`GET /app`). The DB write (when drifted)
+  // fires the `sources_change` trigger, which re-registers to the Platform.
+  app.post('/sources/:routingKey/refresh', async (c) => {
+    try {
+      const routingKey = decodeURIComponent(c.req.param('routingKey'));
+      const denied = enforceRoutingKeyScope(c, routingKey);
+      if (denied) return denied;
+      const result = await refreshGithubSourceIdentity(
+        deps.sourceStore,
+        routingKey,
+        fetchAppIdentity,
+      );
+      return c.json(result);
+    } catch (err) {
+      const message = toErrorMessage(err);
+      // A missing or non-GitHub source is a client error, not a 500.
+      const status = /not found|not a github source/i.test(message) ? 400 : 500;
+      if (status === 500) logger.error('Failed to refresh source', { error: message });
+      return c.json({ error: message }, status);
     }
   });
 

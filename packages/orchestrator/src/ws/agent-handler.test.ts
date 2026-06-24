@@ -27,6 +27,7 @@ function mockDispatcher(): Dispatcher {
     onJobComplete: vi.fn(),
     markJobStarted: vi.fn(),
     onJobRejected: vi.fn().mockResolvedValue(undefined),
+    releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
 }
 

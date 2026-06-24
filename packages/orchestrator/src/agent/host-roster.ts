@@ -325,6 +325,15 @@ export class HostRosterStore {
     return rows.filter((r) => deriveHostStatus(r, now, graceMs) === HostStatus.unreachable).length;
   }
 
+  /** Remove a host from the roster by agent id. Returns rows deleted. */
+  async removeStatic(agentId: string): Promise<number> {
+    const res = await this.db
+      .deleteFrom('host_roster')
+      .where('agent_id', '=', agentId)
+      .executeTakeFirst();
+    return Number(res.numDeletedRows ?? 0n);
+  }
+
   /** Delete ephemeral rows whose last_seen is older than ttl. Returns count. */
   async reapEphemeralPastTtl(ttlMs: number): Promise<number> {
     const res = await this.db
@@ -333,5 +342,53 @@ export class HostRosterStore {
       .where('last_seen', '<', sql<Date>`now() - (${ttlMs}::text || ' milliseconds')::interval`)
       .executeTakeFirst();
     return Number(res.numDeletedRows ?? 0n);
+  }
+
+  /**
+   * Mark a host as about-to-reboot until `until`. Set by the `host.requestReboot`
+   * API handler when an agent's `restartHost()` step runs. While the value is in
+   * the future, the host's disconnect is the expected reboot and its pinned
+   * post-restart job is held.
+   */
+  async setRebootPending(agentId: string, until: Date): Promise<void> {
+    await this.db
+      .updateTable('host_roster')
+      .set({ reboot_pending_until: until, updated_at: sql`now()` })
+      .where('agent_id', '=', agentId)
+      .execute();
+  }
+
+  /** Clear the reboot-pending flag (on reconnect, deadline expiry, or cancel). */
+  async clearRebootPending(agentId: string): Promise<void> {
+    await this.db
+      .updateTable('host_roster')
+      .set({ reboot_pending_until: null, updated_at: sql`now()` })
+      .where('agent_id', '=', agentId)
+      .execute();
+  }
+
+  /** True when the host has a reboot-pending deadline still in the future at `nowMs`. */
+  async isRebootPending(agentId: string, nowMs: number): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('host_roster')
+      .select('reboot_pending_until')
+      .where('agent_id', '=', agentId)
+      .executeTakeFirst();
+    const until = row?.reboot_pending_until ? new Date(row.reboot_pending_until).getTime() : 0;
+    return until > nowMs;
+  }
+
+  /**
+   * Agent ids whose reboot-pending deadline has passed at `nowMs`. The deadline
+   * sweep clears these; the held post-restart job then hits the queue timeout.
+   */
+  async listExpiredRebootPending(nowMs: number): Promise<string[]> {
+    const rows = await this.db
+      .selectFrom('host_roster')
+      .select('agent_id')
+      .where('reboot_pending_until', 'is not', null)
+      .where('reboot_pending_until', '<=', new Date(nowMs))
+      .execute();
+    return rows.map((r) => r.agent_id);
   }
 }

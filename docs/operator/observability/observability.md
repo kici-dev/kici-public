@@ -270,6 +270,7 @@ The KiCI dashboard includes a built-in diagnostics page at `/orgs/:orgId/diagnos
 
 - **Execution metrics** -- 24-hour summary including total runs, success rate, average duration, and active job counts (queued and running)
 - **Infrastructure tree** -- hierarchical view of orchestrators, scaler pools, and connected agents with OS metadata, connection status, and scaler configuration details
+- **Per-orchestrator command helper** -- a command-line icon next to each orchestrator opens a popover showing the correct, copy-ready `kici-admin` invocation for that orchestrator's deployment shape: `<runtime> exec <container> kici-admin …` for a container (compose) deployment, a bare `kici-admin …` for a systemd / launchd install, `kici-admin.exe …` for a Windows service, and a `kici-admin …` plus `KICI_ADMIN_URL` note for a hand-run orchestrator. The snippet never embeds a token — it reminds you to set `KICI_ADMIN_TOKEN` (create one with `kici-admin token create <label> --role owner`).
 - **Secret backends** -- health status of registered secret backends (PostgreSQL and Vault) with sync and connectivity controls
 - **Running user** -- OS user identity of the orchestrator process, with color-coded warnings for root with bare-metal scalers
 

@@ -53,7 +53,7 @@ export default workflow('ci', {
 });
 ```
 
-The `test` and `typecheck` jobs both depend on `lint`, so they run in parallel after lint succeeds. KiCI validates the dependency graph at compile time -- cycles and missing references are caught before you commit. At runtime, jobs are gated on upstream completion: a job only dispatches after every entry in its `needs` array reaches a terminal state. If an upstream fails, downstream jobs skip by default (override per-edge with `ifFailed: 'run'`). See [Job dependencies (`needs`)](../sdk/core.md#job-dependencies-needs) in the SDK reference for the full matrix of `needs` forms (string, `Job` ref, `{ name, ifFailed }`, `dynamicGroup()`) and [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the dispatch semantics.
+The `test` and `typecheck` jobs both depend on `lint`, so they run in parallel after lint succeeds. KiCI validates the dependency graph at compile time -- cycles and missing references are caught before you commit. At runtime, jobs are gated on upstream completion: a job only dispatches after every entry in its `needs` array reaches a terminal status that satisfies the edge. If an upstream fails, downstream jobs skip by default (override per-edge with `when: 'always'`). See [Job dependencies (`needs`)](../sdk/core.md#job-dependencies-needs) in the SDK reference for the full matrix of `needs` forms (string, `Job` ref, `{ name, when }`, `dynamicGroup()`) and [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the dispatch semantics.
 
 **Single-step jobs don't need a `steps` array.** When a job only does one thing, pass `run` to `job()` instead of wrapping it in `steps: [step(...)]`:
 

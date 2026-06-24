@@ -1,7 +1,13 @@
 import { createInterface } from 'node:readline';
 import os from 'node:os';
 import pc from 'picocolors';
-import { mergeGlobalConfig, getConfigPath } from '../remote/config.js';
+import {
+  loadGlobalConfig,
+  saveGlobalConfig,
+  mergeGlobalConfig,
+  getConfigPath,
+  type GlobalConfig,
+} from '../remote/config.js';
 import { pkceFlow, deviceFlow, exchangeTokenForPat } from '../remote/oauth.js';
 import {
   PROD_PLATFORM_URL,
@@ -16,6 +22,8 @@ export interface LoginOptions {
   token?: string;
   /** Platform relay URL */
   platformEndpoint?: string;
+  /** OIDC issuer URL override */
+  oidcIssuer?: string;
   /** Routing key for webhook source identification */
   routingKey?: string;
   /** Force device authorization flow regardless of environment */
@@ -74,9 +82,10 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   // Platforms set them). Resolution stays local — never written to
   // process.env — so the orchestrator's WS reading of KICI_PLATFORM_URL is
   // untouched.
+  const existing = await loadGlobalConfig();
   const platformUrl =
     options.platformEndpoint || process.env.KICI_PLATFORM_URL || PROD_PLATFORM_URL;
-  const issuer = process.env.KICI_OIDC_ISSUER || PROD_OIDC_ISSUER;
+  const issuer = options.oidcIssuer || process.env.KICI_OIDC_ISSUER || PROD_OIDC_ISSUER;
   const clientId = process.env.KICI_OIDC_CLIENT_ID || PROD_OIDC_CLIENT_ID;
 
   // Step 1: Detect environment
@@ -109,16 +118,28 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
 
   // Step 4: Save credentials
   console.log(pc.cyan('\n  Step 4/4: Saving credentials...'));
-  const configUpdate: Record<string, string> = {
+
+  const endpointChanged = existing.platformEndpoint !== platformUrl;
+
+  const next: GlobalConfig = {
+    ...existing,
     pat: patResult.token,
     patId: patResult.id,
     patExpiresAt: patResult.expiresAt,
+    platformEndpoint: platformUrl,
+    oidcIssuer: issuer,
   };
 
-  if (options.platformEndpoint) configUpdate.platformEndpoint = options.platformEndpoint;
-  if (options.routingKey) configUpdate.routingKey = options.routingKey;
+  if (options.routingKey) next.routingKey = options.routingKey;
 
-  await mergeGlobalConfig(configUpdate);
+  // activeOrgId + defaultClusters belong to a specific environment; a new
+  // endpoint invalidates them, so drop them and let `kici org use` re-select.
+  if (endpointChanged) {
+    delete next.activeOrgId;
+    delete next.defaultClusters;
+  }
+
+  await saveGlobalConfig(next);
 
   const configPath = getConfigPath();
   const expiryDate = new Date(patResult.expiresAt).toLocaleDateString();

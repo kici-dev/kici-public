@@ -436,6 +436,108 @@ describe('kici login', () => {
     });
   });
 
+  describe('OAuth endpoint resolution + config reset', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+      vi.mocked(os.homedir).mockReturnValue(tempDir);
+      vi.mocked(os.hostname).mockReturnValue('test-machine');
+      delete process.env.KICI_PLATFORM_URL;
+      delete process.env.KICI_OIDC_ISSUER;
+      delete process.env.KICI_OIDC_CLIENT_ID;
+      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(pkceFlow).mockResolvedValue('tok');
+      vi.mocked(exchangeTokenForPat).mockResolvedValue({
+        id: 'pat-r',
+        token: 'kici_pat_resolved',
+        expiresAt: '2026-07-04T00:00:00Z',
+      });
+    });
+
+    afterEach(() => {
+      delete process.env.KICI_PLATFORM_URL;
+      delete process.env.KICI_OIDC_ISSUER;
+      delete process.env.KICI_OIDC_CLIENT_ID;
+    });
+
+    async function writeConfig(obj: Record<string, unknown>): Promise<void> {
+      const kiciDir = path.join(tempDir, '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+      await fs.writeFile(path.join(kiciDir, 'config'), JSON.stringify(obj), { mode: 0o600 });
+    }
+
+    it('stale config does NOT redirect login — bare login resolves to prod default', async () => {
+      await writeConfig({
+        platformEndpoint: 'https://stg.example.com/kici-stg',
+        oidcIssuer: 'https://auth.stg.example.com/realms/kici-internal',
+      });
+
+      await loginCommand({});
+
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: PROD_OIDC_ISSUER,
+        clientId: PROD_OIDC_CLIENT_ID,
+      });
+      expect(exchangeTokenForPat).toHaveBeenCalledWith({
+        platformUrl: PROD_PLATFORM_URL,
+        accessToken: 'tok',
+        machineName: 'test-machine',
+      });
+    });
+
+    it('flag overrides default for endpoint and issuer', async () => {
+      await loginCommand({
+        platformEndpoint: 'https://flag.example.com',
+        oidcIssuer: 'https://flag-auth.example.com/realms/x',
+      });
+
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: 'https://flag-auth.example.com/realms/x',
+        clientId: PROD_OIDC_CLIENT_ID,
+      });
+      expect(exchangeTokenForPat).toHaveBeenCalledWith(
+        expect.objectContaining({ platformUrl: 'https://flag.example.com' }),
+      );
+    });
+
+    it('always persists resolved endpoint + issuer alongside the PAT', async () => {
+      await loginCommand({});
+
+      const config = await loadGlobalConfig();
+      expect(config.pat).toBe('kici_pat_resolved');
+      expect(config.platformEndpoint).toBe(PROD_PLATFORM_URL);
+      expect(config.oidcIssuer).toBe(PROD_OIDC_ISSUER);
+    });
+
+    it('clears activeOrgId + defaultClusters when the endpoint changes', async () => {
+      await writeConfig({
+        platformEndpoint: 'https://stg.example.com/kici-stg',
+        activeOrgId: 'org_kiciStg00001',
+        defaultClusters: { org_kiciStg00001: 'cluster-5fbb07' },
+      });
+
+      await loginCommand({}); // resolves to PROD_PLATFORM_URL — endpoint changed
+
+      const config = await loadGlobalConfig();
+      expect(config.platformEndpoint).toBe(PROD_PLATFORM_URL);
+      expect(config.activeOrgId).toBeUndefined();
+      expect(config.defaultClusters).toBeUndefined();
+    });
+
+    it('preserves activeOrgId + defaultClusters when the endpoint is unchanged', async () => {
+      await writeConfig({
+        platformEndpoint: PROD_PLATFORM_URL,
+        activeOrgId: 'org_NXho-8YmATbZ',
+        defaultClusters: { 'org_NXho-8YmATbZ': 'cluster-prod' },
+      });
+
+      await loginCommand({}); // resolves to PROD_PLATFORM_URL — endpoint unchanged
+
+      const config = await loadGlobalConfig();
+      expect(config.activeOrgId).toBe('org_NXho-8YmATbZ');
+      expect(config.defaultClusters).toEqual({ 'org_NXho-8YmATbZ': 'cluster-prod' });
+    });
+  });
+
   describe('KICI_CONFIG_DIR env var', () => {
     let customConfigDir: string;
 

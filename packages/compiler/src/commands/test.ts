@@ -59,6 +59,16 @@ export interface RemoteRunOptions extends TestOptions {
    * Defaults to `apply`.
    */
   checkMode?: CheckMode;
+  /** `--target <selector>` values (repeatable), AND-combined into host narrowing. */
+  targets?: string[];
+  /** `--target-allow-empty`: a target that zeroes a runsOnAll job skips it instead of failing. */
+  targetAllowEmpty?: boolean;
+  /**
+   * `--approve-all` (alias `--yes`): auto-approve every approval gate this run
+   * holds on (run-scoped only — the run id this invocation dispatched). The
+   * operator must still be clause-eligible per hold; an ineligible hold blocks.
+   */
+  approveAll?: boolean;
 }
 
 /** Result of a single remote fixture run */

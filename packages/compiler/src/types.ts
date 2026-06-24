@@ -20,16 +20,22 @@ import type {
   RunsOnAllPredicate,
   OnUnreachableMode,
   LabelMatcher,
+  ExecutionJobStatus,
 } from '@kici-dev/engine';
 
 /**
  * Normalized approval config carried in the lock file. Mirrors the engine
- * `LockApproval` type. Produced by the compiler from an SDK `requireApproval`.
+ * `LockApproval` type. Produced by the compiler from an SDK `approval` config.
  */
 export interface LockApproval {
   readonly clauses: ApproverClause[];
   readonly reason?: string;
   readonly timeoutSeconds?: number;
+  /**
+   * When the gate fires. `always` (default) gates before the element; `drift`
+   * gates between a step's check and run on detected drift (step scope only).
+   */
+  readonly when: 'always' | 'drift';
 }
 
 /** Schema version - re-exported from engine as single source of truth */
@@ -437,16 +443,16 @@ export function isLockInlineValue(value: unknown): value is LockInlineValue {
  * (e.g., `kici:role:builder`, `kici:role:init-runner`) are injected by the orchestrator
  * for internal job types (build/init) and are not user-settable.
  */
-/** Needs entry with per-edge failure policy (mirrors engine NeedsEntry). */
+/** Needs entry with per-edge run-on status-set (mirrors engine NeedsEntry). */
 export interface LockNeedsEntry {
   readonly name: string;
-  readonly ifFailed: 'skip' | 'run';
+  readonly runOn: ExecutionJobStatus[];
 }
 
 /** Needs group entry for dynamic group dependencies (mirrors engine NeedsGroupEntry). */
 export interface LockNeedsGroupEntry {
   readonly group: string;
-  readonly ifFailed: 'skip' | 'run';
+  readonly runOn: ExecutionJobStatus[];
 }
 
 export interface LockJob {

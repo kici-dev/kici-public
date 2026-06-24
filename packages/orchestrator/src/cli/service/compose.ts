@@ -28,9 +28,12 @@ type Runtime = 'podman' | 'docker';
  * Detect which container runtime is available.
  * Tries podman compose first, then docker compose.
  *
+ * Exported so the orchestrator installer can resolve the runtime once when
+ * injecting the `KICI_DEPLOY_CONTAINER_RUNTIME` env var for a compose deploy.
+ *
  * @throws When neither runtime is found.
  */
-function detectRuntime(): Runtime {
+export function detectRuntime(): Runtime {
   try {
     execSync('podman compose version', { stdio: 'pipe' });
     return 'podman';

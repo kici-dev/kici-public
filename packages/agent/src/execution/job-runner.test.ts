@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import type { JobDispatch, AgentToOrchestratorMessage } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
-import { JobRunner, type JobRunnerDeps } from './job-runner.js';
+import { JobRunner, type JobRunnerDeps, buildEvalNeedsContext } from './job-runner.js';
 import type { JobExecutionResult } from './sandbox/types.js';
 
 // --- vi.hoisted shared mock state ---
@@ -1106,5 +1106,36 @@ describe('JobRunner', () => {
     expect(finalStatus.state).toBe('failed');
     expect(finalStatus.data?.dynamicFailed).toBe(true);
     expect(finalStatus.data?.initFailure).toBeUndefined();
+  });
+});
+
+describe('buildEvalNeedsContext', () => {
+  it('returns undefined for an event-only generator (no snapshot)', () => {
+    expect(buildEvalNeedsContext({ resultAware: false })).toBeUndefined();
+    expect(buildEvalNeedsContext({ resultAware: true })).toBeUndefined();
+  });
+
+  it('populates ctx.needs.<job>.status from the frozen snapshot', () => {
+    const needs = buildEvalNeedsContext({
+      resultAware: true,
+      declaredNeeds: ['probe'],
+      upstreamSnapshot: {
+        jobs: { probe: { findings: 3 } },
+        groups: {},
+        statuses: { probe: 'failed' },
+      },
+    });
+    const entry = needs!.probe as { result: any; status: string };
+    expect(entry.status).toBe('failed');
+    expect(entry.result.findings).toBe(3);
+  });
+
+  it('defaults status to success when the snapshot omits it', () => {
+    const needs = buildEvalNeedsContext({
+      resultAware: true,
+      declaredNeeds: ['build'],
+      upstreamSnapshot: { jobs: { build: {} }, groups: {} },
+    });
+    expect((needs!.build as { status: string }).status).toBe('success');
   });
 });

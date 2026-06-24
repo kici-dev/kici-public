@@ -18,6 +18,8 @@ export interface HeldRunSummary {
   holdScope?: HeldRunScope;
   stepIndex?: number | null;
   status: string;
+  /** Computed drift payload for a `when: 'drift'` step hold; absent otherwise. */
+  payload?: { summaryMarkdown: string; drift?: unknown } | null;
 }
 
 /** Filters supplied on the command line. */

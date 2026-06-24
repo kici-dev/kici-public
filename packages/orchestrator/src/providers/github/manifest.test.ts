@@ -4,6 +4,7 @@ import {
   convertManifestCode,
   waitForInstallation,
   verifyRepoAccess,
+  validateWebhookUrl,
 } from './manifest.js';
 
 describe('buildGithubAppManifest', () => {
@@ -46,6 +47,33 @@ describe('buildGithubAppManifest', () => {
   it('omits setup_url when not supplied', () => {
     expect(m.setup_url).toBeUndefined();
   });
+
+  it('bakes a supplied --webhook-url verbatim into hook_attributes.url', () => {
+    const overridden = buildGithubAppManifest({
+      name: 'acme-prod',
+      webhookUrl: 'https://my.org/kici-hook',
+      redirectUrl: 'http://127.0.0.1:51823/cb',
+    });
+    expect(overridden.hook_attributes.url).toBe('https://my.org/kici-hook');
+  });
+});
+
+describe('validateWebhookUrl', () => {
+  it('accepts a well-formed absolute https URL and returns it verbatim', () => {
+    expect(validateWebhookUrl('https://my.org/hook')).toBe('https://my.org/hook');
+  });
+
+  it('rejects a non-https URL', () => {
+    expect(() => validateWebhookUrl('http://my.org/hook')).toThrow(/https/i);
+  });
+
+  it('rejects a non-http(s) scheme', () => {
+    expect(() => validateWebhookUrl('ftp://my.org/hook')).toThrow(/https/i);
+  });
+
+  it('rejects a malformed URL', () => {
+    expect(() => validateWebhookUrl('not-a-url')).toThrow(/valid/i);
+  });
 });
 
 describe('convertManifestCode', () => {
@@ -54,6 +82,7 @@ describe('convertManifestCode', () => {
       data: {
         id: 12345,
         slug: 'acme-prod',
+        name: 'Acme Prod',
         pem: '-----BEGIN…',
         webhook_secret: 'deadbeef',
         client_id: 'Iv1.x',
@@ -68,6 +97,7 @@ describe('convertManifestCode', () => {
     expect(creds).toEqual({
       appId: '12345',
       slug: 'acme-prod',
+      name: 'Acme Prod',
       privateKey: '-----BEGIN…',
       webhookSecret: 'deadbeef',
       clientId: 'Iv1.x',

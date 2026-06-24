@@ -13,6 +13,8 @@ export interface GlobalConfig {
   endpoint?: string;
   /** Platform relay URL */
   platformEndpoint?: string;
+  /** OIDC issuer URL the PAT was minted against (provenance; from OAuth login) */
+  oidcIssuer?: string;
   /** Routing key for webhook source identification (e.g., 'github:42') */
   routingKey?: string;
   /** Personal access token (from OAuth login) */
@@ -53,6 +55,9 @@ function sanitizeConfig(raw: unknown): GlobalConfig {
   }
   if (typeof obj.platformEndpoint === 'string') {
     config.platformEndpoint = obj.platformEndpoint;
+  }
+  if (typeof obj.oidcIssuer === 'string') {
+    config.oidcIssuer = obj.oidcIssuer;
   }
   if (typeof obj.routingKey === 'string') {
     config.routingKey = obj.routingKey;

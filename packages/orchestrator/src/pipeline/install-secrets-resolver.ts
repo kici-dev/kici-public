@@ -32,7 +32,7 @@
 
 import type { ApproverClause, LockRegistry, TrustTier } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
-import type { SecretResolver } from '../secrets/secret-resolver.js';
+import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { EnvironmentStore } from '../environments/environment-store.js';
 import { toEnvironment } from '../environments/environment-store.js';
 import {
@@ -87,7 +87,7 @@ export interface ResolveInstallSecretsArgs {
   resolvedOrgId: string;
   trustResolution: TrustResolution | undefined;
   environmentStore: EnvironmentStore | undefined;
-  secretResolver: SecretResolver | undefined;
+  secretResolver: SecretResolverApi | undefined;
   protectionContext: JobDispatchContext;
   /**
    * Resume path: skip the protection-rule gate (already satisfied) and resolve

@@ -144,6 +144,27 @@ The agent exports Prometheus metrics with the `kici_agent_` prefix:
 | `kici_agent_log_bytes_total`        | Counter   | Total log bytes streamed               |
 | `kici_agent_connection_status`      | Gauge     | WebSocket connection (0/1)             |
 
+## Provisioning agents need broad host privileges
+
+Agents used for **host provisioning** — not just CI execution — need broad,
+near-root privileges on the host. Provisioning workflows install packages,
+control services, write system configuration, and reboot the machine, all of
+which require elevated access.
+
+The workflow-level host restart capability (`restartHost()`) is one concrete
+example: the agent must be able to run the OS reboot primitive
+(`systemctl reboot` on Linux, `shutdown -r now` on macOS, `shutdown /r /t 0` on
+Windows). Either run the agent service with reboot privilege, or grant a narrow
+`shutdown` / `systemctl reboot` permission (e.g. a targeted sudoers rule). If
+the reboot primitive is denied, `restartHost()` fails the step with a clear
+privilege error.
+
+This is a deliberate posture: a provisioning agent is a privileged actor on its
+host. Run provisioning agents only on hosts you intend to grant that access, and
+scope each agent's labels so only provisioning workflows target it. Durable
+provisioning hosts must set a stable `KICI_AGENT_ID` so they re-register under
+the same identity after a reboot.
+
 ## Graceful shutdown
 
 The agent handles two shutdown signals:

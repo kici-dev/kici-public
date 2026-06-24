@@ -56,6 +56,21 @@ describe('upstreamSnapshotSchema', () => {
   it('rejects a non-array group membership', () => {
     expect(() => upstreamSnapshotSchema.parse({ jobs: {}, groups: { g: 'x' } })).toThrow();
   });
+
+  it('accepts an optional statuses map keyed by job name', () => {
+    const parsed = upstreamSnapshotSchema.parse({
+      jobs: { build: {} },
+      groups: {},
+      statuses: { build: 'failed' },
+    });
+    expect(parsed.statuses).toEqual({ build: 'failed' });
+  });
+
+  it('rejects an invalid status in the statuses map', () => {
+    expect(() =>
+      upstreamSnapshotSchema.parse({ jobs: {}, groups: {}, statuses: { build: 'nope' } }),
+    ).toThrow();
+  });
 });
 
 describe('jobDispatchSchema', () => {
@@ -109,6 +124,22 @@ describe('jobDispatchSchema', () => {
     expect(parsed.token).toBeUndefined();
     expect(parsed.secrets).toBeUndefined();
     expect(parsed.maxLogSizeBytes).toBeUndefined();
+  });
+
+  it('parses upstreamJobStatuses keyed by upstream job name', () => {
+    const withStatuses = {
+      ...validDispatch,
+      upstreamJobOutputs: { build: { compile: { version: '1.0.0' } } },
+      upstreamJobStatuses: { build: 'success', probe: 'failed' },
+    };
+    const parsed = jobDispatchSchema.parse(withStatuses);
+    expect(parsed.upstreamJobStatuses).toEqual({ build: 'success', probe: 'failed' });
+  });
+
+  it('rejects an invalid upstream status value', () => {
+    expect(() =>
+      jobDispatchSchema.parse({ ...validDispatch, upstreamJobStatuses: { build: 'nope' } }),
+    ).toThrow();
   });
 
   it('coerces maxLogSizeBytes from string to number', () => {

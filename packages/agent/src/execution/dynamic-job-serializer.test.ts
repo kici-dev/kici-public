@@ -441,7 +441,7 @@ describe('serializeJobsToLock', () => {
 
     const allowedGroups = new Set(['test-shards']);
     const result = await serializeJobsToLock(jobs, mockCtx(), new Set(), allowedGroups);
-    expect(result[0].needs).toEqual([{ group: 'test-shards', ifFailed: 'skip' }]);
+    expect(result[0].needs).toEqual([{ group: 'test-shards', runOn: ['success'] }]);
     expect(result[0].dependsOnGroups).toEqual(['test-shards']);
   });
 
@@ -474,18 +474,23 @@ describe('serializeJobsToLock', () => {
     ).rejects.toThrow("Dynamic group 'nonexistent-group' not found in workflow");
   });
 
-  it('resolves { name, ifFailed } needs entry to NeedsEntry', async () => {
+  it('resolves { name, when } needs entry to NeedsEntry', async () => {
     const jobs = [
       job('notify', {
         runsOn: 'linux',
-        needs: [{ name: 'build', ifFailed: 'run' as const }],
+        needs: [{ name: 'build', when: 'always' as const }],
         steps: [step('s1', async () => {})],
       }),
     ];
 
     const staticNames = new Set(['build']);
     const result = await serializeJobsToLock(jobs, mockCtx(), staticNames);
-    expect(result[0].needs).toEqual([{ name: 'build', ifFailed: 'run' }]);
+    expect(result[0].needs).toEqual([
+      {
+        name: 'build',
+        runOn: ['success', 'failed', 'cancelled', 'skipped', 'timed_out_stale', 'drift_dropped'],
+      },
+    ]);
   });
 
   it('produces valid lock output with cross-domain needs', async () => {
@@ -496,14 +501,20 @@ describe('serializeJobsToLock', () => {
     });
     const j2 = job('deploy', {
       runsOn: 'linux',
-      needs: [j1, dynamicGroup('test-shards', { ifFailed: 'run' })],
+      needs: [j1, dynamicGroup('test-shards', { when: 'always' })],
       steps: [step('s1', async () => {})],
     });
 
     const allowedGroups = new Set(['test-shards']);
     const result = await serializeJobsToLock([j1, j2], mockCtx(), new Set(), allowedGroups);
     expect(result).toHaveLength(2);
-    expect(result[1].needs).toEqual(['lint', { group: 'test-shards', ifFailed: 'run' }]);
+    expect(result[1].needs).toEqual([
+      'lint',
+      {
+        group: 'test-shards',
+        runOn: ['success', 'failed', 'cancelled', 'skipped', 'timed_out_stale', 'drift_dropped'],
+      },
+    ]);
     expect(result[1].dependsOnGroups).toEqual(['test-shards']);
   });
 });

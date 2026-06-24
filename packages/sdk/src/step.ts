@@ -7,6 +7,7 @@ import type {
   SourceLocation,
 } from './types.js';
 import { createStepOutputProxy } from './outputs.js';
+import { normalizeApproval } from './approval.js';
 
 /**
  * Capture the call-site source location of step() using the V8 stack trace API.
@@ -181,6 +182,16 @@ export function step<TResult = void, TDrift = unknown>(
     throw new Error('summarize is required when check is set');
   }
 
+  // Drift gate invariant: `approval: { when: 'drift' }` fires between a step's
+  // check and run, so it only makes sense on a step that has a check facet.
+  if (
+    options.approval !== undefined &&
+    normalizeApproval(options.approval).when === 'drift' &&
+    !options.check
+  ) {
+    throw new Error('approval.when "drift" requires a check facet');
+  }
+
   return {
     _tag: 'Step' as const,
     name,
@@ -196,7 +207,7 @@ export function step<TResult = void, TDrift = unknown>(
     rules: options.rules,
     onCancel: options.onCancel,
     cleanup: options.cleanup,
-    ...(options.requireApproval !== undefined && { requireApproval: options.requireApproval }),
+    ...(options.approval !== undefined && { approval: options.approval }),
     _sourceLocation,
     result: createStepOutputProxy(name),
   } as Step<TResult>;

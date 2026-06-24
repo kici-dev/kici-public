@@ -1,6 +1,12 @@
 import type { z } from 'zod';
 import type { $ as Shell } from 'zx';
-import type { ResourceRequest, RunsOnAllInput, OnUnreachableMode } from '@kici-dev/engine';
+import type {
+  ResourceRequest,
+  RunsOnAllInput,
+  OnUnreachableMode,
+  NeedsWhen,
+  ExecutionJobStatus,
+} from '@kici-dev/engine';
 import type { StepContext, Logger } from './context.js';
 import type { TriggerConfig } from './triggers/types.js';
 import type { Rule } from './rules/types.js';
@@ -9,14 +15,23 @@ import type { HookInput } from './hooks/types.js';
 import type { KiciApi } from './api-types.js';
 import type { DynamicGroupRef } from './dynamic-group.js';
 import type { EventPayload } from './events/event-payloads.js';
-import type { RequireApproval } from './approval.js';
+import type { ApprovalConfig } from './approval.js';
 
 export type {
   ResourceRequest,
   ResourceSpec,
   RunsOnAllInput,
   OnUnreachableMode,
+  NeedsWhen,
 } from '@kici-dev/engine';
+
+/**
+ * Author-facing run condition for a `needs` edge: keyword sugar
+ * (`'on-success'` | `'always'` | `'on-skip'` | `'on-failure'`) or a raw set of
+ * upstream terminal statuses. Resolved to a normalized status-set at compile
+ * time; the downstream runs when the upstream's terminal status is a member.
+ */
+export type NeedsWhenInput = NeedsWhen | ExecutionJobStatus[];
 
 /** Source location captured at a step() call site. */
 export interface SourceLocation {
@@ -76,8 +91,8 @@ export interface Step<TResult = void> {
   readonly onCancel?: HookInput;
   /** Always runs after step (success, failure, or cancel). */
   readonly cleanup?: HookInput;
-  /** Pause for a manual human approval before this step runs. */
-  readonly requireApproval?: RequireApproval;
+  /** Pause for a manual human approval (before this step, or on drift). */
+  readonly approval?: ApprovalConfig;
   /** Internal: source location captured at step() call site. Not part of public API. */
   readonly _sourceLocation?: SourceLocation;
   /**
@@ -122,8 +137,8 @@ export interface StepOptionsBase {
   onCancel?: HookInput;
   /** Always runs after step (success, failure, or cancel). */
   cleanup?: HookInput;
-  /** Pause for a manual human approval before this step runs. */
-  requireApproval?: RequireApproval;
+  /** Pause for a manual human approval (before this step, or on drift). */
+  approval?: ApprovalConfig;
 }
 
 /**
@@ -310,8 +325,8 @@ export type DynamicJobNeed =
   | Job
   | string
   | DynamicGroupRef
-  | { name: string; ifFailed?: 'skip' | 'run' }
-  | { group: string; ifFailed?: 'skip' | 'run' };
+  | { name: string; when?: NeedsWhenInput }
+  | { group: string; when?: NeedsWhenInput };
 
 /**
  * Options-object form of {@link dynamicJob}: a result-aware generator that is
@@ -464,8 +479,8 @@ export interface Job {
     | Job
     | string
     | DynamicGroupRef
-    | { name: string; ifFailed: 'skip' | 'run' }
-    | { group: string; ifFailed: 'skip' | 'run' }
+    | { name: string; when?: NeedsWhenInput }
+    | { group: string; when?: NeedsWhenInput }
   >;
   /** Rules for conditional execution */
   readonly rules?: Rule[];
@@ -530,7 +545,7 @@ export interface Job {
   /** Declarative cache: restored before steps, saved after the job on key miss. */
   readonly cache?: import('./cache-types.js').CacheInput;
   /** Pause for a manual human approval before this job dispatches. */
-  readonly requireApproval?: RequireApproval;
+  readonly approval?: ApprovalConfig;
   /**
    * Type-safe proxy for accessing this job's outputs.
    * For multi-step jobs: jobRef.result.stepName.field
@@ -586,8 +601,8 @@ export interface JobOptions {
     | Job
     | string
     | DynamicGroupRef
-    | { name: string; ifFailed: 'skip' | 'run' }
-    | { group: string; ifFailed: 'skip' | 'run' }
+    | { name: string; when?: NeedsWhenInput }
+    | { group: string; when?: NeedsWhenInput }
   >;
   /** Rules that must pass for job to execute */
   rules?: Rule[];
@@ -667,7 +682,7 @@ export interface JobOptions {
   /** Declarative cache: restored before steps, saved after the job on key miss. */
   cache?: import('./cache-types.js').CacheInput;
   /** Pause for a manual human approval before this job dispatches. */
-  requireApproval?: RequireApproval;
+  approval?: ApprovalConfig;
 }
 
 /**
@@ -745,7 +760,7 @@ export interface Workflow {
     readonly max?: number;
   };
   /** Pause for a manual human approval before the whole workflow dispatches. */
-  readonly requireApproval?: RequireApproval;
+  readonly approval?: ApprovalConfig;
 }
 
 /** Options for workflow() factory */
@@ -796,7 +811,7 @@ export interface WorkflowOptions {
     max?: number;
   };
   /** Pause for a manual human approval before the whole workflow dispatches. */
-  requireApproval?: RequireApproval;
+  approval?: ApprovalConfig;
 }
 
 // Re-export trigger and rule types for external use

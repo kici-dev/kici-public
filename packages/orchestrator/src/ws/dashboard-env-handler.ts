@@ -62,6 +62,32 @@ import {
 
 const logger = createLogger({ prefix: 'dashboard-env-handler' });
 
+/**
+ * Normalize a `held_runs.payload` jsonb column into the
+ * `{ summaryMarkdown, drift }` shape the held-runs list response carries. The
+ * Kysely driver may return jsonb already parsed (object) or as a string; both
+ * are coerced. Returns null for an absent payload (every non-drift hold).
+ */
+function normalizeHeldRunPayload(raw: unknown): { summaryMarkdown: string; drift: unknown } | null {
+  if (raw == null) return null;
+  const obj = typeof raw === 'string' ? safeJsonParse(raw) : raw;
+  if (obj && typeof obj === 'object' && 'summaryMarkdown' in obj) {
+    const o = obj as { summaryMarkdown: unknown; drift?: unknown };
+    if (typeof o.summaryMarkdown === 'string') {
+      return { summaryMarkdown: o.summaryMarkdown, drift: o.drift };
+    }
+  }
+  return null;
+}
+
+function safeJsonParse(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 /** Secret store interface (subset of PgSecretStore methods used here). */
 interface SecretStoreForDashboard {
   listScopes(orgId: string): Promise<string[]>;
@@ -1422,6 +1448,7 @@ export class DashboardEnvHandler {
           'held_runs.hold_scope',
           'held_runs.step_index',
           'held_runs.approval_requirement',
+          'held_runs.payload',
           'execution_runs.contributor_username',
           'execution_runs.trust_tier',
         ])
@@ -1518,6 +1545,7 @@ export class DashboardEnvHandler {
                     null,
                 }
               : null,
+          payload: normalizeHeldRunPayload(r.payload),
           decisions: (decisionsByHold.get(r.id) ?? []).map((d) => ({
             approverUserId: d.approver_user_id,
             decision: d.decision as 'approve' | 'reject',
@@ -1581,7 +1609,16 @@ export class DashboardEnvHandler {
       decision === 'approve'
         ? 'dashboard.held-runs.approve.response'
         : 'dashboard.held-runs.reject.response';
-    const auditAction = decision === 'approve' ? 'held_run.approve' : 'held_run.reject';
+    // `--approve-all` breakglass approvals audit as a distinct action so the
+    // trail shows "auto-approved by the dispatcher" vs an interactive approve.
+    const autoApprove =
+      decision === 'approve' && (msg as HeldRunApproveRequest).autoApprove === true;
+    const auditAction =
+      decision === 'approve'
+        ? autoApprove
+          ? 'held_run.auto_approve'
+          : 'held_run.approve'
+        : 'held_run.reject';
     const reason = decision === 'reject' ? (msg as HeldRunRejectRequest).reason : undefined;
 
     const result = await applyDecision(

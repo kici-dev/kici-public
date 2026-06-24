@@ -1889,7 +1889,16 @@ export async function findAnyUserApiKeyIdDirect(
  */
 export async function seedSyntheticGithubSourceDirect(
   databaseUrl: string,
-  opts: { routingKey: string; orgId: string },
+  opts: {
+    routingKey: string;
+    orgId: string;
+    /** Display name pushed by the orchestrator on register. Optional. */
+    name?: string;
+    /** Fine-grained subtype (e.g. 'github_app'). Optional. */
+    subtype?: string;
+    /** GitHub App slug. Optional. */
+    slug?: string;
+  },
 ): Promise<void> {
   const pool = createPool(databaseUrl);
   try {
@@ -1922,10 +1931,11 @@ export async function seedSyntheticGithubSourceDirect(
     );
 
     await pool.query(
-      `INSERT INTO webhook_sources (routing_key, provider, orchestrator_connection_id, org_id)
-       VALUES ($1, 'github', 'e2e-synthetic', $2)
-       ON CONFLICT (routing_key, orchestrator_connection_id) DO UPDATE SET org_id = $2`,
-      [opts.routingKey, opts.orgId],
+      `INSERT INTO webhook_sources (routing_key, provider, orchestrator_connection_id, org_id, name, subtype, slug)
+       VALUES ($1, 'github', 'e2e-synthetic', $2, $3, $4, $5)
+       ON CONFLICT (routing_key, orchestrator_connection_id)
+         DO UPDATE SET org_id = $2, name = $3, subtype = $4, slug = $5`,
+      [opts.routingKey, opts.orgId, opts.name ?? null, opts.subtype ?? null, opts.slug ?? null],
     );
   } finally {
     await pool.end();

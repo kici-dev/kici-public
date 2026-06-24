@@ -21,14 +21,14 @@ describe('validateGitHubSource', () => {
     mockGetAuthenticated.mockReset();
   });
 
-  it('returns { valid: true, appName } on successful validation', async () => {
+  it('returns { valid: true, appName, slug } on successful validation', async () => {
     mockGetAuthenticated.mockResolvedValueOnce({
-      data: { name: 'My KiCI App' },
+      data: { name: 'My KiCI App', slug: 'my-kici-app' },
     });
 
     const result = await validateGitHubSource('12345', 'PEM-KEY-DATA');
 
-    expect(result).toEqual({ valid: true, appName: 'My KiCI App' });
+    expect(result).toEqual({ valid: true, appName: 'My KiCI App', slug: 'my-kici-app' });
   });
 
   it('returns { valid: false, error } on auth failure', async () => {

@@ -331,7 +331,11 @@ describe('admin run routes', () => {
       ]);
       // execution_job_needs query: deploy depends on build (run-anyway policy).
       deps.mockDb.mockExecute.mockResolvedValueOnce([
-        { job_name: 'deploy', upstream_name: 'build', if_failed: 'run' },
+        {
+          job_name: 'deploy',
+          upstream_name: 'build',
+          run_on: JSON.stringify(['failed', 'timed_out_stale']),
+        },
       ]);
       const res = await request(app, '/run-1/jobs', { token: validToken });
       expect(res.status).toBe(200);
@@ -339,7 +343,9 @@ describe('admin run routes', () => {
       const build = body.jobs.find((j: { jobName: string }) => j.jobName === 'build');
       const deploy = body.jobs.find((j: { jobName: string }) => j.jobName === 'deploy');
       expect(build.needs).toBeNull();
-      expect(deploy.needs).toEqual([{ upstreamName: 'build', ifFailed: 'run' }]);
+      expect(deploy.needs).toEqual([
+        { upstreamName: 'build', runOn: ['failed', 'timed_out_stale'] },
+      ]);
     });
 
     it('embeds steps when ?includeSteps=true', async () => {

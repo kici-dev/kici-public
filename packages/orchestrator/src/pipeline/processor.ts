@@ -35,7 +35,7 @@ import type { HostRosterStore } from '../agent/host-roster.js';
 import type { RunCoordinator } from '../cluster/coordinator.js';
 import type { TeamMembershipLookup } from '../approvals/team-membership-lookup.js';
 import type { LogStorage } from '../reporting/log-storage.js';
-import type { SecretResolver } from '../secrets/secret-resolver.js';
+import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { ContributorCache } from '../security/contributor-cache.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type {
@@ -755,7 +755,7 @@ export interface ProcessingDeps {
   /** Run coordinator for multi-orchestrator job routing. Optional -- if not set, all jobs dispatch locally (single-orchestrator mode). */
   coordinator?: RunCoordinator;
   /** Secret resolver for dispatch-time secret resolution. Optional -- if not set, secrets are not resolved. */
-  secretResolver?: SecretResolver;
+  secretResolver?: SecretResolverApi;
   /** Optional callback when source locations are extracted from a lock file workflow. */
   onSourceLocationsExtracted?: (
     workflowName: string,

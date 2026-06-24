@@ -12,7 +12,7 @@
  */
 
 import { toErrorMessage } from '@kici-dev/core';
-import type { CheckMode } from '@kici-dev/engine';
+import type { CheckMode, HostTargetSelector } from '@kici-dev/engine';
 
 // --- Error types ---
 
@@ -114,6 +114,11 @@ export interface PlatformTriggerInput {
    * agent step loop in the requested mode. Omitted means `apply`.
    */
   checkMode?: CheckMode;
+  /**
+   * Host narrowing from `kici run --target`. The Platform relays it verbatim to
+   * the orchestrator, which intersects each runsOnAll roster with it.
+   */
+  target?: HostTargetSelector;
 }
 
 export interface PlatformTriggerResponse {

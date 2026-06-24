@@ -253,6 +253,44 @@ describe('HeldRunStore', () => {
       expect(mocks.insertInto).toHaveBeenCalledWith('held_runs');
       expect(result).toEqual(row);
     });
+
+    it('persists a serialized drift payload when one is supplied', async () => {
+      const payload = { summaryMarkdown: '## drift', drift: { want: 1 } };
+      const row = makeHeldRunRow({ hold_scope: 'step', step_index: 2, payload });
+      const { db, mocks } = createMockDb({ insertedRow: row });
+      const store = new HeldRunStore(db);
+
+      const result = await store.createHold('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        scope: 'step',
+        stepIndex: 2,
+        triggerSource: 'explicit',
+        requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'drift gate' },
+        payload,
+      });
+
+      const insertedValues = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(insertedValues.payload).toBe(JSON.stringify(payload));
+      expect(result).toEqual(row);
+    });
+
+    it('omits the payload key entirely for a non-drift hold', async () => {
+      const row = makeHeldRunRow({ hold_scope: 'job' });
+      const { db, mocks } = createMockDb({ insertedRow: row });
+      const store = new HeldRunStore(db);
+
+      await store.createHold('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        scope: 'job',
+        triggerSource: 'explicit',
+        requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'r' },
+      });
+
+      const insertedValues = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect('payload' in insertedValues).toBe(false);
+    });
   });
 
   describe('recordDecision', () => {

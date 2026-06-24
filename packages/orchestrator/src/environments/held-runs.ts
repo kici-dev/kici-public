@@ -7,6 +7,7 @@ import { sql, type Kysely } from 'kysely';
 import {
   type ApprovalRequirement,
   type ApproverClause,
+  type StepApprovalPayload,
   ApprovalDecision,
   HoldScope,
   TriggerSource,
@@ -60,6 +61,12 @@ export interface CreateHoldData {
    * the automated release sweeps can find their rows.
    */
   holdType?: string;
+  /**
+   * Drift payload `{ summaryMarkdown, drift }` captured for a `when: 'drift'`
+   * step gate; persisted to `held_runs.payload` and surfaced in the dashboard
+   * approval queue + the CLI. Omit for non-drift holds.
+   */
+  payload?: StepApprovalPayload;
 }
 
 /** A single decision to record against a hold. */
@@ -142,6 +149,9 @@ export class HeldRunStore {
         step_index: data.stepIndex ?? null,
         trigger_source: data.triggerSource,
         approval_requirement: data.requirement,
+        // jsonb: serialize explicitly so the driver lands a JSON value rather
+        // than a Postgres composite literal (same pattern as recordDecision).
+        ...(data.payload !== undefined && { payload: JSON.stringify(data.payload) }),
       })
       .returningAll()
       .executeTakeFirstOrThrow();

@@ -18,6 +18,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | Env var                                | Required | Default    | Type                                    | Aliases | Description |
 | -------------------------------------- | -------- | ---------- | --------------------------------------- | ------- | ----------- |
 | `KICI_AGENT_ID`                        | no       |            | string                                  |         |             |
+| `KICI_AGENT_IS_ORCHESTRATOR_HOST`      | no       |            | string                                  |         |             |
 | `KICI_AGENT_TOKEN`                     | no       |            | string                                  |         |             |
 | `KICI_BACKPRESSURE_MODE`               | no       | "pause"    | enum:pause\|drop                        |         |             |
 | `KICI_DEFAULT_STEP_TIMEOUT_MS`         | no       | 1800000    | number                                  |         |             |

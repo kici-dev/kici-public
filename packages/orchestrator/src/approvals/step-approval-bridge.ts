@@ -45,6 +45,8 @@ export interface StepApprovalRequest {
   reason: string;
   /** Per-gate timeout (seconds); falls back to the org default. */
   timeoutSeconds?: number;
+  /** Computed drift payload for a `when: 'drift'` gate; persisted on the hold. */
+  payload?: { summaryMarkdown: string; drift: unknown };
 }
 
 /** Dependencies injected into the bridge. */
@@ -100,6 +102,7 @@ export class StepApprovalBridge {
       stepIndex: req.stepIndex,
       triggerSource: TriggerSource.enum.explicit,
       requirement,
+      ...(req.payload !== undefined && { payload: req.payload }),
     });
 
     // Audit the step-hold creation. The agent requested the hold while

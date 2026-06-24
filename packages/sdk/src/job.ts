@@ -115,7 +115,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     resources: options.resources,
     init: options.init,
     ...(options.cache !== undefined && { cache: options.cache }),
-    ...(options.requireApproval !== undefined && { requireApproval: options.requireApproval }),
+    ...(options.approval !== undefined && { approval: options.approval }),
     result: createJobOutputProxy(name),
   };
 }

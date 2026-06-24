@@ -1,20 +1,24 @@
 /**
- * DB-backed needs-aware dispatch scheduler ( through).
+ * DB-backed needs-aware dispatch scheduler.
  *
- * This module is the core of 's behavioral change: it replaces the
- * "concurrent dispatch" model with event-driven scheduling that gates ALL
- * needs edges (static-to-static, static-to-dyn-group, dyn-to-static, dyn-to-dyn).
+ * Gates ALL needs edges (static-to-static, static-to-dyn-group, dyn-to-static,
+ * dyn-to-dyn) with event-driven scheduling instead of concurrent dispatch.
  *
  * The scheduler is pure DB — no in-memory state. Every scheduling decision is
  * a fresh DB query against execution_jobs + execution_job_needs. This means
  * zero recovery code on orchestrator restart.
+ *
+ * Each edge carries a `run_on` status-set (the upstream terminal statuses that
+ * satisfy the edge). A downstream edge is dispatch-satisfied when the upstream's
+ * terminal status is a member of the edge's run_on set; otherwise the downstream
+ * is skipped. A downstream dispatches only when every edge is satisfied.
  *
  * Entry points:
  * - insertEdgesForRun: called at run start for static-to-static edges
  * - resolveGroupEdges: called on dynamic-eval completion
  * - evaluateDownstreams: called from onJobStatus(terminal)
  * - recomputeNeedsSatisfied: batch recompute after group resolution
- * - checkSchedulerInvariant: Layer 3 defensive check
+ * - checkSchedulerInvariant: defensive stuck-job check
  * - getFailurePropagationTargets: cascade for transitive skip
  */
 
@@ -30,6 +34,10 @@ export interface SchedulerResult {
   reason?: string;
 }
 
+/** The default run-on status-set for a bare-string need (success-only). */
+const SUCCESS_ONLY_RUN_ON: ExecutionJobStatus[] = [ExecutionJobStatus.enum.success];
+const SUCCESS_ONLY_RUN_ON_JSON = JSON.stringify(SUCCESS_ONLY_RUN_ON);
+
 // --- Helpers ---
 
 /** Check if a needs entry is a NeedsEntry object (has 'name' field). */
@@ -42,11 +50,23 @@ function isNeedsGroupEntry(entry: string | NeedsEntry | NeedsGroupEntry): entry 
   return typeof entry === 'object' && 'group' in entry;
 }
 
+/** Parse a persisted `run_on` JSON column into a status-set for membership tests. */
+function parseRunOn(json: string): Set<string> {
+  try {
+    const parsed = JSON.parse(json);
+    if (Array.isArray(parsed) && parsed.length > 0) return new Set(parsed as string[]);
+  } catch {
+    // Malformed value falls through to the success-only default below.
+  }
+  return new Set(SUCCESS_ONLY_RUN_ON);
+}
+
 /**
- * Check if ALL upstreams of a job are satisfied (terminal with correct policy).
- * Returns { satisfied: true, action: 'dispatch' } if all upstreams are terminal
- * and policies are met. Returns { satisfied: true, action: 'skip', reason } if
- * any upstream failed with if_failed='skip'. Returns { satisfied: false } if
+ * Check if ALL upstreams of a job are satisfied.
+ * Returns { satisfied: true, action: 'dispatch' } when every upstream is
+ * terminal and its status is a member of the edge's run_on set. Returns
+ * { satisfied: true, action: 'skip', reason } when an upstream is terminal but
+ * its status is not in the edge's run_on set. Returns { satisfied: false } when
  * any upstream is not yet terminal.
  */
 async function checkAllUpstreamsSatisfied(
@@ -57,7 +77,7 @@ async function checkAllUpstreamsSatisfied(
   // Get all upstream edges for this job
   const edges = await db
     .selectFrom('execution_job_needs')
-    .select(['upstream_name', 'if_failed'])
+    .select(['upstream_name', 'run_on'])
     .where('run_id', '=', runId)
     .where('job_name', '=', jobName)
     .execute();
@@ -84,16 +104,13 @@ async function checkAllUpstreamsSatisfied(
       // Upstream not yet terminal
       return { satisfied: false };
     }
-    // Upstream is terminal — check if it's success or policy allows non-success
-    if (status !== ExecutionJobStatus.enum.success) {
-      if (edge.if_failed === 'skip') {
-        return {
-          satisfied: true,
-          action: 'skip',
-          reason: `upstream_failed: ${edge.upstream_name}`,
-        };
-      }
-      // if_failed='run' — treat non-success as satisfied for dispatch
+    // Upstream is terminal — the edge is satisfied iff its status is in run_on.
+    if (!parseRunOn(edge.run_on).has(status)) {
+      return {
+        satisfied: true,
+        action: 'skip',
+        reason: `upstream_unmet: ${edge.upstream_name} (${status})`,
+      };
     }
   }
 
@@ -126,23 +143,23 @@ export async function insertEdgesForRun(
     run_id: string;
     job_name: string;
     upstream_name: string;
-    if_failed: string;
+    run_on: string;
   }> = [];
 
   const rootJobNames: string[] = [];
 
   for (const job of jobs) {
-    const concreteNeeds: Array<{ upstreamName: string; ifFailed: string }> = [];
+    const concreteNeeds: Array<{ upstreamName: string; runOn: string }> = [];
 
     for (const need of job.lockJob.needs) {
       let baseName: string;
-      let ifFailed: string;
+      let runOn: string;
       if (typeof need === 'string') {
         baseName = need;
-        ifFailed = 'skip';
+        runOn = SUCCESS_ONLY_RUN_ON_JSON;
       } else if (isNeedsEntry(need)) {
         baseName = need.name;
-        ifFailed = need.ifFailed ?? 'skip';
+        runOn = JSON.stringify(need.runOn ?? SUCCESS_ONLY_RUN_ON);
       } else if (isNeedsGroupEntry(need)) {
         // Skip — resolved later via resolveGroupEdges
         continue;
@@ -154,16 +171,16 @@ export async function insertEdgesForRun(
       // A non-fanned upstream maps to a single-element list ([baseName]).
       const upstreamNames = expansionMap.get(baseName) ?? [baseName];
       for (const upstreamName of upstreamNames) {
-        concreteNeeds.push({ upstreamName, ifFailed });
+        concreteNeeds.push({ upstreamName, runOn });
       }
     }
 
-    for (const { upstreamName, ifFailed } of concreteNeeds) {
+    for (const { upstreamName, runOn } of concreteNeeds) {
       edgeRows.push({
         run_id: runId,
         job_name: job.expandedName,
         upstream_name: upstreamName,
-        if_failed: ifFailed,
+        run_on: runOn,
       });
     }
 
@@ -203,16 +220,16 @@ export async function insertEdgesForRun(
  * edge row. Empty groups (0 members) trigger immediate needs_satisfied=true
  * for dependents.
  *
- * CRITICAL: dependentStaticJobs carries per-job ifFailed policy from the
+ * CRITICAL: dependentStaticJobs carries the per-job run_on status-set from the
  * NeedsGroupEntry in the lock file. Without this, all group edges would
- * silently default to 'skip'.
+ * silently default to success-only.
  */
 export async function resolveGroupEdges(
   db: Kysely<Database>,
   runId: string,
   groupName: string,
   memberJobNames: string[],
-  dependentStaticJobs: Array<{ jobName: string; ifFailed: 'skip' | 'run' }>,
+  dependentStaticJobs: Array<{ jobName: string; runOn: ExecutionJobStatus[] }>,
 ): Promise<void> {
   if (memberJobNames.length > 0) {
     // Insert concrete edges: each dependent -> each member
@@ -220,7 +237,7 @@ export async function resolveGroupEdges(
       run_id: string;
       job_name: string;
       upstream_name: string;
-      if_failed: string;
+      run_on: string;
     }> = [];
 
     for (const dep of dependentStaticJobs) {
@@ -229,7 +246,7 @@ export async function resolveGroupEdges(
           run_id: runId,
           job_name: dep.jobName,
           upstream_name: member,
-          if_failed: dep.ifFailed,
+          run_on: JSON.stringify(dep.runOn ?? SUCCESS_ONLY_RUN_ON),
         });
       }
     }
@@ -256,9 +273,10 @@ export async function resolveGroupEdges(
  * Evaluate downstream jobs after an upstream reaches terminal state.
  *
  * This is the core scheduler hook. For each downstream of the completed job:
- * 1. If upstream failed and edge has if_failed='skip', mark downstream as 'skip'
- * 2. Otherwise, check if ALL upstreams are terminal
- * 3. If all satisfied, mark needs_satisfied=true and return for dispatch
+ * 1. If the completed status is not in this edge's run_on set, mark the
+ *    downstream as 'skip' immediately.
+ * 2. Otherwise, check if ALL upstreams are terminal and satisfied.
+ * 3. If all satisfied, mark needs_satisfied=true and return for dispatch.
  */
 export async function evaluateDownstreams(
   db: Kysely<Database>,
@@ -269,7 +287,7 @@ export async function evaluateDownstreams(
   // Find all downstream jobs that depend on the completed job
   const downstreamEdges = await db
     .selectFrom('execution_job_needs')
-    .select(['job_name', 'if_failed'])
+    .select(['job_name', 'run_on'])
     .where('run_id', '=', runId)
     .where('upstream_name', '=', completedJobName)
     .execute();
@@ -279,7 +297,6 @@ export async function evaluateDownstreams(
   }
 
   const results: SchedulerResult[] = [];
-  const isSuccess = completedStatus === ExecutionJobStatus.enum.success;
 
   // De-duplicate downstream job names (a job might have multiple edges from same upstream via groups)
   const seenJobs = new Set<string>();
@@ -288,12 +305,12 @@ export async function evaluateDownstreams(
     if (seenJobs.has(edge.job_name)) continue;
     seenJobs.add(edge.job_name);
 
-    // Quick check: if this specific upstream failed and if_failed='skip', skip immediately
-    if (!isSuccess && edge.if_failed === 'skip') {
+    // Quick check: if this upstream's terminal status is not in run_on, skip immediately.
+    if (!parseRunOn(edge.run_on).has(completedStatus)) {
       results.push({
         jobName: edge.job_name,
         action: 'skip',
-        reason: `upstream_failed: ${completedJobName}`,
+        reason: `upstream_unmet: ${completedJobName} (${completedStatus})`,
       });
       continue;
     }
@@ -431,8 +448,11 @@ export async function checkSchedulerInvariant(
 }
 
 /**
- * cascade: find all transitive downstreams that should be skipped
- * due to failure propagation. Only follows edges where if_failed='skip'.
+ * Failure-propagation cascade: find all transitive downstreams that should be
+ * skipped because a terminal upstream's status is not in their edge's run_on
+ * set. At each hop, the propagating job's actual terminal status decides which
+ * downstream edges propagate (status not in run_on → the downstream skips and
+ * propagates further).
  */
 export async function getFailurePropagationTargets(
   db: Kysely<Database>,
@@ -448,17 +468,30 @@ export async function getFailurePropagationTargets(
     if (visited.has(current)) continue;
     visited.add(current);
 
-    // Find downstream edges with if_failed='skip'
+    // Resolve the propagating job's terminal status (the originating failed job
+    // or a transitively-skipped downstream).
+    const currentJob = await db
+      .selectFrom('execution_jobs')
+      .select(['status'])
+      .where('run_id', '=', runId)
+      .where('job_name', '=', current)
+      .executeTakeFirst();
+    const currentStatus = currentJob?.status;
+
+    // Find downstream edges whose run_on does NOT admit the propagating status.
     const downstreamEdges = await db
       .selectFrom('execution_job_needs')
-      .select(['job_name', 'if_failed'])
+      .select(['job_name', 'run_on'])
       .where('run_id', '=', runId)
       .where('upstream_name', '=', current)
-      .where('if_failed', '=', 'skip')
       .execute();
 
     for (const edge of downstreamEdges) {
-      if (!visited.has(edge.job_name)) {
+      if (visited.has(edge.job_name)) continue;
+      // Without a resolved status (job row not yet written) fall back to the
+      // conservative "propagate" behavior so a missing row never hides a skip.
+      const propagates = currentStatus === undefined || !parseRunOn(edge.run_on).has(currentStatus);
+      if (propagates) {
         targets.push(edge.job_name);
         queue.push(edge.job_name);
       }

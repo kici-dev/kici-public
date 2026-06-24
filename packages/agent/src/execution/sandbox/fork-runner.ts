@@ -170,6 +170,12 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
       | Record<string, Record<string, unknown>>
       | undefined,
 
+    // Terminal statuses + declared needs that shape ctx.needs for steps.
+    upstreamJobStatuses: dispatch.upstreamJobStatuses as
+      | Record<string, import('@kici-dev/engine').ExecutionJobStatus>
+      | undefined,
+    jobNeeds: jobConfig.needs as readonly unknown[] | undefined,
+
     // Private-registry install auth (Phase 4 of private-registry plan).
     npmRegistries: dispatch.npmRegistries,
     installEnvSecrets: dispatch.installEnvSecrets,

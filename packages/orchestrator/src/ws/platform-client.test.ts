@@ -586,6 +586,49 @@ describe('PlatformClient', () => {
       ]);
     });
 
+    it('includes the deployment shape in source.register when configured', () => {
+      const client = createClient({
+        providerSources: [{ provider: 'github', routingKey: 'github:42' }],
+        deployment: {
+          mode: 'compose',
+          containerName: 'kici-orchestrator',
+          containerRuntime: 'podman',
+        },
+      });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      mock.sentMessages = [];
+
+      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+
+      const sent = getSentMessages(mock);
+      const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
+      expect(registerMsg).toBeDefined();
+      expect(registerMsg.deployment).toEqual({
+        mode: 'compose',
+        containerName: 'kici-orchestrator',
+        containerRuntime: 'podman',
+      });
+    });
+
+    it('omits deployment from source.register when not configured', () => {
+      const client = createClient({
+        providerSources: [{ provider: 'github', routingKey: 'github:42' }],
+      });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      mock.sentMessages = [];
+
+      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-123' });
+
+      const sent = getSentMessages(mock);
+      const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
+      expect(registerMsg).toBeDefined();
+      expect(registerMsg.deployment).toBeUndefined();
+    });
+
     it('sends source.register with empty sources when no providerSources configured', () => {
       // A connected orchestrator with zero sources must still announce itself
       // so the Platform records it as connected (writes its
@@ -632,6 +675,58 @@ describe('PlatformClient', () => {
       expect(registerMsg.sources).toHaveLength(2);
       expect(registerMsg.sources[0].routingKey).toBe('github:42');
       expect(registerMsg.sources[1].routingKey).toBe('github:99');
+    });
+
+    it('re-registers a source whose slug changed (same routing key)', () => {
+      const client = createClient({
+        providerSources: [
+          {
+            provider: 'github',
+            routingKey: 'github:42',
+            name: 'My App',
+            subtype: 'github_app',
+            slug: 'old-slug',
+          },
+        ],
+      });
+      const mock = authenticateClient(client);
+      mock.sentMessages = [];
+
+      // Same routing key + name, only the slug changed — must still re-register.
+      client.updateSources([
+        {
+          provider: 'github',
+          routingKey: 'github:42',
+          name: 'My App',
+          subtype: 'github_app',
+          slug: 'new-slug',
+        },
+      ]);
+
+      const sent = getSentMessages(mock);
+      const registerMsg = sent.find((m: any) => m.type === 'source.register') as any;
+      expect(registerMsg).toBeDefined();
+      expect(registerMsg.sources).toHaveLength(1);
+      expect(registerMsg.sources[0].routingKey).toBe('github:42');
+      expect(registerMsg.sources[0].slug).toBe('new-slug');
+    });
+
+    it('does not re-register when name, slug and subtype are unchanged', () => {
+      const src = {
+        provider: 'github' as const,
+        routingKey: 'github:42',
+        name: 'My App',
+        subtype: 'github_app' as const,
+        slug: 'my-app',
+      };
+      const client = createClient({ providerSources: [src] });
+      const mock = authenticateClient(client);
+      mock.sentMessages = [];
+
+      client.updateSources([{ ...src }]);
+
+      const sent = getSentMessages(mock);
+      expect(sent.find((m: any) => m.type === 'source.register')).toBeUndefined();
     });
 
     it('handles source.register.ack with accepted sources', () => {

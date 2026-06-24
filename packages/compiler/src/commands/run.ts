@@ -2,6 +2,8 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import pc from 'picocolors';
 import { formatBytes, logger, toErrorMessage } from '@kici-dev/core';
+import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
+import type { HostTargetSelector } from '@kici-dev/engine';
 import type { RunLocalOptions } from '../local-executor/types.js';
 import { resolveKiciDir } from '../execution/index.js';
 import { loadGlobalConfig, type GlobalConfig } from '../remote/config.js';
@@ -27,10 +29,39 @@ import { formatJsonResult } from '../remote/output/json.js';
 import { formatJunitResult } from '../remote/output/junit.js';
 import { RunHistory } from '../remote/history.js';
 import { buildEncryptedSecrets } from '../remote/secret-upload.js';
+import {
+  resolveHeldRunContext,
+  listHeldRunsForRun,
+  type HeldRunContext,
+} from './held-run-client.js';
+import { handleNewHolds } from './run-hold-watch.js';
+import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './test.js';
 
 /** Terminal run statuses returned by the Platform run-status snapshot. */
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled', 'error']);
+
+/**
+ * Compile `--target` selector strings into a {@link HostTargetSelector}. Each
+ * string becomes one AND value (its own include set); repeated values
+ * AND-combine. Returns undefined when no `--target` is given. Throws when
+ * `--target-allow-empty` is set without at least one `--target`.
+ */
+export function buildTargetSelector(
+  targets: string[] | undefined,
+  allowEmpty: boolean,
+): HostTargetSelector | undefined {
+  if (!targets || targets.length === 0) {
+    if (allowEmpty) {
+      throw new Error('--target-allow-empty requires at least one --target selector');
+    }
+    return undefined;
+  }
+  return {
+    values: targets.map((t) => normalizeRunsOnToMatchers(t, 'kici run --target')),
+    allowEmpty,
+  };
+}
 
 /** Interval between status/log polls while a run is active. */
 const POLL_INTERVAL_MS = 750;
@@ -89,6 +120,10 @@ export async function runRemoteCommand(
   }
 
   try {
+    // Fail fast on an invalid --target / --target-allow-empty combination (and
+    // an unsafe regex / invalid glob) before any compile or dispatch work.
+    buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
+
     // --workflow without a fixture: direct workflow run (bypass triggers)
     if (options.workflow && !fixture && !options.all) {
       return await runDirectWorkflow(options.workflow, options);
@@ -498,6 +533,10 @@ async function runSingleFixture(
       // the orchestrator never clones for a relayed run.
       fullRepo: true,
       ...(options.checkMode && { checkMode: options.checkMode }),
+      ...(() => {
+        const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
+        return target ? { target } : {};
+      })(),
     });
 
     if (triggerResult.status === 'rejected') {
@@ -606,6 +645,10 @@ async function pollRunToCompletion(
 
   try {
     let lastStatus: PlatformRunStatusResponse | null = null;
+    // Holds observed so far (so we prompt / notify once per hold).
+    const seenHolds = new Set<string>();
+    // Resolved lazily on the first hold so a hold-free run pays no cost.
+    let heldCtx: HeldRunContext | null | undefined;
 
     while (!cancelled) {
       const logs = await ctx.client.runLogs(ctx.orgId, runId, cursor, ctx.target);
@@ -623,6 +666,18 @@ async function pollRunToCompletion(
         return finishRun(fixtureId, runId, lastStatus, startTime, tailLines, options);
       }
 
+      // Surface any approval holds for this run: print the (drift) payload and,
+      // in a TTY, prompt approve/reject inline. Reuses the `kici approve` path.
+      if (!terminal && !options.quiet) {
+        await watchRunHolds(
+          runId,
+          seenHolds,
+          () => heldCtx,
+          (c) => (heldCtx = c),
+          options,
+        );
+      }
+
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
 
@@ -635,6 +690,41 @@ async function pollRunToCompletion(
     };
   } finally {
     process.removeListener('SIGINT', cancelHandler);
+  }
+}
+
+/**
+ * Fetch this run's pending holds and surface them to the operator. The held-run
+ * context is resolved lazily (cached across ticks via the getter/setter). A
+ * resolution / fetch failure is swallowed — hold-visibility is best-effort and
+ * must never abort the run watch.
+ */
+async function watchRunHolds(
+  runId: string,
+  seenHolds: Set<string>,
+  getCtx: () => HeldRunContext | null | undefined,
+  setCtx: (c: HeldRunContext | null) => void,
+  options: RemoteRunOptions,
+): Promise<void> {
+  try {
+    let ctx = getCtx();
+    if (ctx === undefined) {
+      ctx = await resolveHeldRunContext();
+      setCtx(ctx);
+    }
+    if (!ctx) return;
+    const holds = await listHeldRunsForRun(ctx, runId);
+    if (holds.length === 0) return;
+    const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    await handleNewHolds({
+      holds,
+      seen: seenHolds,
+      isTty,
+      approveAll: Boolean(options.approveAll),
+      confirm: (message) => inquirerConfirm({ message, default: false }),
+    });
+  } catch {
+    // Best-effort: never let a hold-poll error abort the run watch.
   }
 }
 
@@ -774,6 +864,10 @@ async function runDirectWorkflow(
       // Always fullRepo: the overlay carries the complete local working tree.
       fullRepo: true,
       ...(options.checkMode && { checkMode: options.checkMode }),
+      ...(() => {
+        const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
+        return target ? { target } : {};
+      })(),
     });
 
     if (!options.quiet) {

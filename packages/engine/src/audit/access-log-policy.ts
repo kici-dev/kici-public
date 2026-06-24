@@ -69,6 +69,7 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'diagnostics.read': { kind: 'rate_limit', perMinutePerActor: 1 },
   'scaler.capacity.read': { kind: 'rate_limit', perMinutePerActor: 1 },
   'scaler.agents.read': { kind: 'rate_limit', perMinutePerActor: 1 },
+  'fleet.read': { kind: 'rate_limit', perMinutePerActor: 1 },
 
   // Sensitive reads + every mutation: always recorded.
   'run.payload.read': { kind: 'always' },
@@ -97,6 +98,7 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'secret_scope.rename': { kind: 'always' },
   'secret_scope.delete': { kind: 'always' },
   'held_run.approve': { kind: 'always' },
+  'held_run.auto_approve': { kind: 'always' },
   'held_run.reject': { kind: 'always' },
   'held_run.request': { kind: 'always' },
   'held_run.expire': { kind: 'always' },
@@ -105,6 +107,8 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'backend.sync': { kind: 'always' },
   'backend.sync.one': { kind: 'always' },
   'backend.test': { kind: 'always' },
+  'fleet.host.declare': { kind: 'always' },
+  'fleet.host.remove': { kind: 'always' },
   'global_workflows.update': { kind: 'always' },
   'org_settings.dashboard_write_policy.update': { kind: 'always' },
   'cluster_name.update': { kind: 'always' },

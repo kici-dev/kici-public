@@ -4,6 +4,8 @@ import {
   matcherMatches,
   matcherSatisfiedBy,
   partitionMatchers,
+  hostSatisfiesTarget,
+  HostTargetSelector,
 } from './labels-match.js';
 
 describe('LabelMatcher eval', () => {
@@ -52,5 +54,52 @@ describe('LabelMatcher eval', () => {
 
   it('Zod schema rejects an unknown kind', () => {
     expect(LabelMatcher.safeParse({ kind: 'glob', value: 'x' }).success).toBe(false);
+  });
+});
+
+describe('hostSatisfiesTarget', () => {
+  const exact = (value: string) => ({ kind: 'exact' as const, value });
+
+  it('passes a host whose labels satisfy the single value', () => {
+    const t = HostTargetSelector.parse({
+      values: [{ include: [exact('role:web')], exclude: [] }],
+      allowEmpty: false,
+    });
+    expect(hostSatisfiesTarget(new Set(['role:web', 'dc:eu']), t)).toBe(true);
+    expect(hostSatisfiesTarget(new Set(['role:db']), t)).toBe(false);
+  });
+
+  it('AND-combines repeated values (every value must be satisfied)', () => {
+    const t = HostTargetSelector.parse({
+      values: [
+        { include: [exact('role:web')], exclude: [] },
+        { include: [exact('dc:eu')], exclude: [] },
+      ],
+      allowEmpty: false,
+    });
+    expect(hostSatisfiesTarget(new Set(['role:web', 'dc:eu']), t)).toBe(true);
+    expect(hostSatisfiesTarget(new Set(['role:web', 'dc:us']), t)).toBe(false);
+  });
+
+  it('rejects a host matched by an exclude matcher', () => {
+    const t = HostTargetSelector.parse({
+      values: [{ include: [exact('role:web')], exclude: [exact('canary')] }],
+      allowEmpty: false,
+    });
+    expect(hostSatisfiesTarget(new Set(['role:web', 'canary']), t)).toBe(false);
+    expect(hostSatisfiesTarget(new Set(['role:web']), t)).toBe(true);
+  });
+
+  it('requires every include matcher within a value (AND inside a value)', () => {
+    const t = HostTargetSelector.parse({
+      values: [{ include: [exact('role:web'), exact('dc:eu')], exclude: [] }],
+      allowEmpty: false,
+    });
+    expect(hostSatisfiesTarget(new Set(['role:web', 'dc:eu']), t)).toBe(true);
+    expect(hostSatisfiesTarget(new Set(['role:web']), t)).toBe(false);
+  });
+
+  it('schema requires at least one value', () => {
+    expect(HostTargetSelector.safeParse({ values: [], allowEmpty: false }).success).toBe(false);
   });
 });

@@ -23,6 +23,7 @@ function makeDeps(over?: Partial<ManifestSetupDeps>): ManifestSetupDeps {
     convert: vi.fn().mockResolvedValue({
       appId: '12345',
       slug: 'acme',
+      name: 'Acme Prod',
       privateKey: 'pem',
       webhookSecret: 'w',
       htmlUrl: 'https://github.com/apps/acme',
@@ -55,11 +56,14 @@ describe('runGithubManifestSetup', () => {
     expect(deps.startLoopback).toHaveBeenCalled();
     expect(deps.openBrowser).toHaveBeenCalledWith('http://127.0.0.1:1/');
     expect(deps.convert).toHaveBeenCalledWith('c');
+    // GitHub is the source of truth for the stored name + slug, so the POST
+    // body carries the conversion response's name/slug, not the CLI `--name`.
     expect(client.post).toHaveBeenCalledWith(
       '/api/v1/admin/sources',
       expect.objectContaining({
         provider: 'github',
-        name: 'acme',
+        name: 'Acme Prod',
+        slug: 'acme',
         appId: '12345',
         privateKey: 'pem',
         webhookSecret: 'w',
@@ -127,5 +131,42 @@ describe('runGithubManifestSetup', () => {
         createUrl: 'https://github.com/organizations/acme-inc/settings/apps/new',
       }),
     );
+  });
+
+  it('uses --webhook-url verbatim and skips platform-mode URL resolution', async () => {
+    const get = vi.fn(); // pre-flight resolver must NOT be called
+    const startLoopback = vi.fn().mockResolvedValue({
+      formUrl: 'http://127.0.0.1:1/',
+      redirectUrl: 'http://127.0.0.1:1/cb',
+      waitForCode: vi.fn().mockResolvedValue({ code: 'c', state: 's' }),
+      close: vi.fn(),
+    });
+    const client = makeClient({ get });
+    const deps = makeDeps({ startLoopback });
+
+    await runGithubManifestSetup(
+      { name: 'acme', webhookUrl: 'https://my.org/kici-hook' },
+      client as never,
+      deps,
+    );
+
+    // The platform-mode pre-flight GET was bypassed entirely.
+    expect(get).not.toHaveBeenCalled();
+    // The override URL is baked into the served manifest verbatim.
+    const secondCall = startLoopback.mock.calls[1]?.[0] as { manifestJson: string };
+    expect(secondCall.manifestJson).toContain('https://my.org/kici-hook');
+  });
+
+  it('rejects a non-https --webhook-url before creating anything', async () => {
+    const client = makeClient();
+    const deps = makeDeps();
+    await expect(
+      runGithubManifestSetup(
+        { name: 'acme', webhookUrl: 'http://my.org/hook' },
+        client as never,
+        deps,
+      ),
+    ).rejects.toThrow(/https/i);
+    expect(deps.convert).not.toHaveBeenCalled();
   });
 });

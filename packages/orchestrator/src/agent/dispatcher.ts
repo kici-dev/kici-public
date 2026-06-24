@@ -25,6 +25,19 @@ export interface DispatchMetrics {
 }
 
 /**
+ * Narrow slice of `HostRosterStore` the dispatcher needs for the host-restart
+ * flow. Kept as an interface so the dispatcher doesn't import the full store
+ * (which pulls in engine label matchers) and to make the reboot logic testable
+ * with a tiny in-memory stub.
+ */
+export interface HostRosterRebootStore {
+  /** True when the host's reboot-pending deadline is still in the future. */
+  isRebootPending(agentId: string, nowMs: number): Promise<boolean>;
+  /** Clear the reboot-pending flag (down-then-up release on reconnect). */
+  clearRebootPending(agentId: string): Promise<void>;
+}
+
+/**
  * Result of a dispatch attempt.
  */
 type DispatchResult =
@@ -168,6 +181,9 @@ export class Dispatcher {
     return this.maxReconnectDelayMs * 2;
   }
 
+  /** Host roster store for the reboot-pending gate; undefined ⇒ flow inert. */
+  private readonly rosterStore?: HostRosterRebootStore;
+
   constructor(deps: {
     registry: AgentRegistry;
     queue: JobQueue;
@@ -198,6 +214,14 @@ export class Dispatcher {
     getAckTimeoutMs?: (job: QueuedJob) => Promise<number>;
     /** Cancel + disconnect an agent whose dispatch ack deadline expired. */
     onAckTimeout?: (agentId: string, jobId: string, runId: string) => void;
+    /**
+     * Host roster store, used for the workflow-level host-restart flow: gate the
+     * pinned-drain off for a reboot-pending agent, and treat a reboot-pending
+     * agent's disconnect as the expected reboot (complete its in-flight job
+     * success rather than starting the recovery-fail timer). Omitted ⇒ the
+     * reboot-pending behavior is inert (every host reads not-pending).
+     */
+    rosterStore?: HostRosterRebootStore;
   }) {
     this.registry = deps.registry;
     this.queue = deps.queue;
@@ -209,6 +233,7 @@ export class Dispatcher {
     this.onRecoveryStarted = deps.onRecoveryStarted;
     this.getAckTimeoutMs = deps.getAckTimeoutMs ?? (async () => Dispatcher.DEFAULT_ACK_TIMEOUT_MS);
     this.onAckTimeout = deps.onAckTimeout;
+    this.rosterStore = deps.rosterStore;
   }
 
   /**
@@ -226,12 +251,20 @@ export class Dispatcher {
     if (job.pinnedAgentId) {
       return this.dispatchPinned(job);
     }
-    const available = this.registry.findAvailable(
+    const availableRaw = this.registry.findAvailable(
       job.runsOnLabels,
       job.runsOnPatterns ?? [],
       job.excludeLabels ?? [],
       job.excludePatterns ?? [],
     );
+
+    // Reboot-pending gate (label-routed path): a `restartHost()` workflow pins
+    // the post-restart job to the same host via a `runsOn: 'kici:host:<id>'`
+    // label. That job reaches THIS path (not dispatchPinned) when its `needs`
+    // are satisfied, so exclude any matched agent whose reboot-pending flag is
+    // set — the job then queues (held) until the host reboots back and the
+    // reconnect clears the flag, at which point onAgentAvailable drains it.
+    const available = await this.filterRebootPending(availableRaw);
 
     if (available.length > 0) {
       // Pick the least busy agent (already sorted by findAvailable)
@@ -363,7 +396,15 @@ export class Dispatcher {
   private async dispatchPinned(job: QueuedJobInput): Promise<DispatchResult> {
     const agentId = job.pinnedAgentId!;
     const agent = this.registry.get(agentId);
+    // Reboot-pending gate: a host whose `restart` job just completed is still
+    // connected but about to reboot. Never dispatch its pinned post-restart job
+    // into the about-to-die box — queue it with the pin so the down-then-up
+    // reconnect releases it. (This is the direct-dispatch counterpart of the
+    // same gate in onAgentAvailable; the post-restart job reaches HERE when its
+    // `needs` are satisfied by the restart job completing.)
+    const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
     const dispatchable =
+      !rebootPending &&
       agent &&
       this.registry.agentSatisfies(
         agent,
@@ -506,12 +547,52 @@ export class Dispatcher {
    * Dequeues matching jobs from the queue while the agent has capacity,
    * calling onDispatch for each.
    */
+  /**
+   * Drop agents whose reboot-pending flag is set from a candidate list. Used by
+   * the label-routed dispatch path so a post-restart job is never sent to a host
+   * that is about to reboot. No-op when no roster store is wired.
+   */
+  private async filterRebootPending<T extends { agentId: string }>(agents: T[]): Promise<T[]> {
+    if (!this.rosterStore || agents.length === 0) return agents;
+    const now = Date.now();
+    const out: T[] = [];
+    for (const agent of agents) {
+      if (!(await this.rosterStore.isRebootPending(agent.agentId, now))) out.push(agent);
+    }
+    return out;
+  }
+
+  /**
+   * Release a reboot-pending host on its real reconnect (down-then-up). Clears
+   * the persisted flag so the very next `onAgentAvailable` drain dispatches the
+   * held post-restart job. Call this ONLY from the (re-)register path — a fresh
+   * connection after the box rebooted — never from a still-connected drain
+   * trigger (job completion / agent.status), which must keep the gate closed.
+   */
+  async releaseRebootPending(agentId: string): Promise<void> {
+    if (!this.rosterStore) return;
+    if (await this.rosterStore.isRebootPending(agentId, Date.now())) {
+      await this.rosterStore.clearRebootPending(agentId);
+      logger.info('Reboot-pending host reconnected; cleared flag (down-then-up release)', {
+        agentId,
+      });
+    }
+  }
+
   async onAgentAvailable(agentId: string): Promise<void> {
     const agent = this.registry.get(agentId);
     if (!agent) return;
 
     const agentLabels = [...agent.labels];
     const agentMandatoryLabels = [...agent.mandatoryLabels];
+
+    // Reboot-pending gate: while this host's reboot-pending flag is set it is
+    // still connected but about to reboot. Do NOT dispatch its pinned
+    // post-restart job into the about-to-die box — leave it held. The flag is
+    // cleared on the reconnect (down-then-up) before that reconnect's
+    // onAgentAvailable runs, so the release happens on the real reboot cycle,
+    // not on the brief still-connected window after the restart job completes.
+    const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
 
     if (agent.activeJobs < agent.maxConcurrency) {
       // Claim the slot before the async dequeue. Drain triggers fire
@@ -523,10 +604,14 @@ export class Dispatcher {
       try {
         // Pinned host-fanout children for THIS agent drain first (they can only
         // run here), then fall back to the generic label drain (which excludes
-        // jobs pinned to a different agent).
-        job =
-          (await this.queue.dequeueByPinnedAgent(agentId, agentLabels)) ??
-          (await this.queue.dequeueForLabels(agentLabels, agentMandatoryLabels, agentId));
+        // jobs pinned to a different agent). When reboot-pending, skip the
+        // pinned drain (hold the post-restart job); the generic label drain is
+        // also skipped because dispatching anything to an about-to-reboot host
+        // would be lost.
+        job = rebootPending
+          ? null
+          : ((await this.queue.dequeueByPinnedAgent(agentId, agentLabels)) ??
+            (await this.queue.dequeueForLabels(agentLabels, agentMandatoryLabels, agentId)));
       } finally {
         if (!job) this.registry.decrementActiveJobs(agentId);
       }
@@ -791,9 +876,25 @@ export class Dispatcher {
     const scalerManaged = this.registry.get(agentId)?.scalerManaged ?? false;
     const jobIds = this.agentJobs.get(agentId);
     if (!jobIds || jobIds.size === 0) {
-      // No in-flight jobs -- clean disconnect
+      // No in-flight jobs -- clean disconnect. (The common reboot case: the
+      // restart job already reported success before the box went down, so there
+      // is nothing in-flight; the reboot-pending flag's job here is the
+      // drain-gate + clear-on-reconnect, handled elsewhere.)
       this.registry.unregister(agentId);
       this.cleanupGraceEntriesForAgent(agentId);
+      await this.updateQueueDepthMetric();
+      return [];
+    }
+
+    // Reboot-pending disconnect: this disconnect IS the expected reboot. Do not
+    // start the recovery→fail timer; instead complete any in-flight started job
+    // as success (the safety net for the rare case where the restart job's
+    // success report did not flush before the box went down).
+    const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
+    if (rebootPending && !scalerManaged) {
+      await this.completeInFlightForReboot(agentId, [...jobIds]);
+      this.cleanupGraceEntriesForAgent(agentId);
+      this.registry.unregister(agentId);
       await this.updateQueueDepthMetric();
       return [];
     }
@@ -806,6 +907,35 @@ export class Dispatcher {
     this.registry.unregister(agentId);
     await this.updateQueueDepthMetric();
     return failedJobIds;
+  }
+
+  /**
+   * Reboot-pending agent disconnected: complete its in-flight started job(s) as
+   * success (the restart job, which already reported success, may already be
+   * terminal — `markCompleted` is a no-op / guarded in that case). Never starts
+   * a recovery timer. Untracks the jobs so the reconnect does not reconcile a
+   * phantom in-flight set.
+   */
+  private async completeInFlightForReboot(agentId: string, jobIds: string[]): Promise<void> {
+    for (const jobId of jobIds) {
+      this.resolvePendingAck(jobId);
+      const started = this.startedJobs.has(jobId);
+      this.untrackJob(agentId, jobId);
+      if (!started) continue;
+      try {
+        await this.queue.markCompleted(jobId);
+        logger.info('Reboot-pending agent disconnected; completed in-flight job as success', {
+          agentId,
+          jobId,
+        });
+      } catch (err) {
+        logger.warn('Failed to complete in-flight job on reboot disconnect (may be terminal)', {
+          agentId,
+          jobId,
+          error: toErrorMessage(err),
+        });
+      }
+    }
   }
 
   /** Drop grace-window entries owned by an agent. */

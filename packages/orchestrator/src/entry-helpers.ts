@@ -23,6 +23,13 @@ export interface ProviderSource {
   routingKey: string;
   name: string;
   subtype: SourceSubtype;
+  /**
+   * GitHub App slug (URL-safe identifier GitHub assigns). Only set for
+   * GitHub-App sources, where it propagates orchestrator → Platform → dashboard
+   * alongside the display `name`. Undefined for generic / universal-git / local
+   * sources, and for a GitHub source whose identity fetch hasn't run yet.
+   */
+  slug?: string;
 }
 
 /**

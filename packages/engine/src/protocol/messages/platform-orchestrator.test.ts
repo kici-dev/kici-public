@@ -385,6 +385,23 @@ describe('sourceRegistrationSchema', () => {
     expect(sourceRegistrationSchema.parse(msg)).toEqual(msg);
   });
 
+  it('round-trips an optional deployment shape', () => {
+    const msg = {
+      ...validRegistration,
+      deployment: {
+        mode: 'compose' as const,
+        containerName: 'kici-orchestrator',
+        containerRuntime: 'podman' as const,
+      },
+    };
+    expect(sourceRegistrationSchema.parse(msg).deployment).toEqual(msg.deployment);
+  });
+
+  it('rejects an invalid deployment mode', () => {
+    const msg = { ...validRegistration, deployment: { mode: 'kubernetes' } };
+    expect(() => sourceRegistrationSchema.parse(msg)).toThrow();
+  });
+
   it('validates all provider enum values', () => {
     for (const provider of ['github', 'gitlab', 'bitbucket']) {
       const msg = {

@@ -163,7 +163,7 @@ Required reviewers: alice, bob
 
 When reviewers are required, the job enters a "held" state. Reviewers can approve or reject via the dashboard, the [`kici approve`](cli-reference.md#kici-approve) command, or the API. Held runs expire after a configurable timeout.
 
-This operator-set rule is the **mandatory** form of an approval gate. Workflow authors can also declare gates in code with `requireApproval` at step, job, or workflow level — see [Approval gates](approvals.md). Both forms use the same held-element mechanism and the same queue.
+This operator-set rule is the **mandatory** form of an approval gate. Workflow authors can also declare gates in code with `approval` at step, job, or workflow level — see [Approval gates](approvals.md). Both forms use the same held-element mechanism and the same queue.
 
 ### Wait timer
 

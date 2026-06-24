@@ -129,4 +129,24 @@ export function registerHostCommands(program: Command): void {
         }
       },
     );
+
+  host
+    .command('remove')
+    .description('Remove a host from the roster')
+    .requiredOption('--agent-id <id>', 'Agent id to remove')
+    .action(async (opts: { agentId: string }) => {
+      try {
+        const deleted = await withDb((db) =>
+          new HostRosterStore(db as unknown as Kysely<Database>).removeStatic(opts.agentId),
+        );
+        if (deleted === 0) {
+          console.error(`No host found: ${opts.agentId}`);
+          process.exit(1);
+        }
+        console.log(`Removed host: ${opts.agentId}`);
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
 }

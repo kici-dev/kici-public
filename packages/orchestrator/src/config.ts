@@ -148,6 +148,10 @@ const baseSchema = z.object({
   staleDetectorScanIntervalMs: z.coerce.number().default(60_000),
   staleDetectorThresholdMultiplier: z.coerce.number().default(2),
   jobHeartbeatIntervalMs: z.coerce.number().default(60_000),
+  // GitHub App name/slug refresh — how often the orchestrator re-fetches every
+  // GitHub source's display name + slug from GitHub (`GET /app`) and re-registers
+  // it if it drifted. Default: 24h.
+  githubAppNameRefreshIntervalMs: z.coerce.number().default(86_400_000),
   // Secrets management (optional -- enables encrypted secret store + admin API)
   secretKey: z.string().optional(), // KICI_SECRET_KEY (hex-encoded or base64 32-byte key)
   secretKeyFile: z.string().optional(), // KICI_SECRET_KEY_FILE (path to key file)
@@ -165,6 +169,16 @@ const baseSchema = z.object({
   // Host roster (declared inventory) timing knobs (cluster-wide defaults)
   rosterGraceMs: z.coerce.number().int().min(1000).default(300_000), // 5 min — static grace before unreachable
   rosterTtlMs: z.coerce.number().int().min(1000).default(1_800_000), // 30 min — ephemeral GC ttl
+  // Cluster-wide default deadline for a workflow-initiated host reboot to
+  // complete its down-then-up cycle. Replaces the short recovery window for a
+  // reboot-pending host; the held post-restart job fails on expiry. Authors
+  // override per-restart via `restartHost({ deadlineMs })`.
+  hostRebootDeadlineMs: z.coerce.number().int().min(1000).default(900_000), // 15 min
+  // Co-located guard for workflow-level host restart: the agentId of an agent
+  // that shares this orchestrator's host. A `restartHost()` request from that
+  // agent is refused so the orchestrator can never reboot its own box. Empty =
+  // no co-located agent.
+  orchestratorHostAgentId: z.string().optional(),
   maxFanoutHosts: z.coerce.number().int().min(1).default(1024), // cap on runsOnAll per-host children
   // Event router
   eventRouterMaxChainDepth: z.coerce.number().default(10),
@@ -463,6 +477,7 @@ export const envDef = defineEnv({
     staleDetectorScanIntervalMs: 'KICI_STALE_DETECTOR_SCAN_INTERVAL_MS',
     staleDetectorThresholdMultiplier: 'KICI_STALE_DETECTOR_THRESHOLD_MULTIPLIER',
     jobHeartbeatIntervalMs: 'KICI_JOB_HEARTBEAT_INTERVAL_MS',
+    githubAppNameRefreshIntervalMs: 'KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS',
     secretKey: 'KICI_SECRET_KEY',
     secretKeyFile: 'KICI_SECRET_KEY_FILE',
     secretKeyOld: 'KICI_SECRET_KEY_OLD',
@@ -473,6 +488,8 @@ export const envDef = defineEnv({
     agentTokenTtlMs: 'KICI_AGENT_TOKEN_TTL_MS',
     rosterGraceMs: 'KICI_ROSTER_GRACE_MS',
     rosterTtlMs: 'KICI_ROSTER_TTL_MS',
+    hostRebootDeadlineMs: 'KICI_HOST_REBOOT_DEADLINE_MS',
+    orchestratorHostAgentId: 'KICI_ORCHESTRATOR_HOST_AGENT_ID',
     maxFanoutHosts: 'KICI_MAX_FANOUT_HOSTS',
     eventRouterMaxChainDepth: 'KICI_EVENT_ROUTER_MAX_CHAIN_DEPTH',
     eventRouterRateLimitPerWorkflowPerMinute:
@@ -582,6 +599,19 @@ const COLD_STORE_ENV_VARS = [
   'KICI_COLD_STORE_EVENT_LOG_ENABLED',
 ];
 
+/**
+ * Deployment-identity env vars injected by the installer (and the staging
+ * deploy) so the orchestrator can report its own deployment shape in
+ * `source.register`. Read directly from `process.env` by the deployment reader,
+ * not threaded through the AppConfig schema — registered here so the
+ * unknown-KICI_* validator at boot doesn't reject them.
+ */
+const DEPLOY_IDENTITY_ENV_VARS = [
+  'KICI_DEPLOY_MODE',
+  'KICI_DEPLOY_CONTAINER',
+  'KICI_DEPLOY_CONTAINER_RUNTIME',
+];
+
 export function loadConfig(): AppConfig {
   const data = envDef.parse();
 
@@ -592,6 +622,7 @@ export function loadConfig(): AppConfig {
     ...envDef.listKnownEnvVars(),
     ...LOGGER_ENV_VARS,
     ...COLD_STORE_ENV_VARS,
+    ...DEPLOY_IDENTITY_ENV_VARS,
   ]);
 
   // Use cluster instanceId if provided, otherwise generate one

@@ -32,12 +32,12 @@ The squashed baseline migration `001_initial` provides:
 
 ### Edge table: `execution_job_needs`
 
-| Column          | Type                           | Description                               |
-| --------------- | ------------------------------ | ----------------------------------------- |
-| `run_id`        | `UUID NOT NULL`                | Execution run ID                          |
-| `job_name`      | `TEXT NOT NULL`                | Downstream job name                       |
-| `upstream_name` | `TEXT NOT NULL`                | Upstream job name                         |
-| `if_failed`     | `TEXT NOT NULL DEFAULT 'skip'` | Per-edge failure policy (`skip` or `run`) |
+| Column          | Type                                  | Description                                                                         |
+| --------------- | ------------------------------------- | ----------------------------------------------------------------------------------- |
+| `run_id`        | `UUID NOT NULL`                       | Execution run ID                                                                    |
+| `job_name`      | `TEXT NOT NULL`                       | Downstream job name                                                                 |
+| `upstream_name` | `TEXT NOT NULL`                       | Upstream job name                                                                   |
+| `run_on`        | `TEXT NOT NULL DEFAULT '["success"]'` | Per-edge run-on set: JSON array of upstream terminal statuses that satisfy the edge |
 
 Primary key: `(run_id, job_name, upstream_name)`
 
@@ -57,11 +57,11 @@ The scheduler is event-driven from `onJobStatus(terminal)`. No polling, no LISTE
 onJobStatus(runId, jobName, terminal_state)
   -> find downstream edges in execution_job_needs WHERE upstream_name = jobName
   -> for each downstream:
-     if upstream failed AND edge.if_failed = 'skip':
-       return { action: 'skip', reason: 'upstream_failed: <name>' }
+     if upstream's terminal status NOT IN edge.run_on:
+       return { action: 'skip', reason: 'upstream_unmet: <name> (<status>)' }
      else:
        check ALL upstreams of this downstream (not just the one that triggered)
-       if all terminal and policies satisfied:
+       if all terminal and every status is in its edge's run_on:
          SET needs_satisfied = true, ready_at = NOW()
          return { action: 'dispatch' }
        else:
@@ -94,11 +94,20 @@ If a `dynamicJob()` returns `[]`, zero edges are inserted. The static downstream
 
 ## Failure propagation
 
-Default behavior: when an upstream reaches a non-success terminal state (`failed`, `drift_dropped`, `cancelled`), downstreams with `if_failed = 'skip'` (the default) transition to `skipped`.
+Default behavior: each edge's `run_on` set defaults to `["success"]`, so when an upstream reaches a non-success terminal status (`failed`, `drift_dropped`, `cancelled`, `skipped`, `timed_out_stale`), the downstream transitions to `skipped`.
 
-Per-edge override: `if_failed = 'run'` allows dispatch even when the upstream failed. Use for cleanup or notification jobs.
+Per-edge override: a wider `run_on` set (authored via the SDK `when` keyword, e.g. `'always'`, `'on-skip'`, `'on-failure'`, or a raw status array) allows dispatch on the listed upstream statuses. Use `'always'` for cleanup or notification jobs, `'on-failure'` for error-handler jobs.
 
-`getFailurePropagationTargets` performs BFS traversal following only `if_failed = 'skip'` edges to find all transitive downstreams that should be skipped.
+The keyword → `run_on` mapping is:
+
+| `when`       | `run_on` set                    |
+| ------------ | ------------------------------- |
+| `on-success` | `["success"]`                   |
+| `always`     | every terminal status           |
+| `on-skip`    | `["success", "skipped"]`        |
+| `on-failure` | `["failed", "timed_out_stale"]` |
+
+`getFailurePropagationTargets` performs a BFS traversal following edges whose `run_on` set does **not** admit the propagating upstream's terminal status, finding all transitive downstreams that should be skipped.
 
 ## Cycle detection
 

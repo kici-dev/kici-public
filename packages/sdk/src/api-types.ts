@@ -72,6 +72,23 @@ export interface InventoryApi {
   get(agentId: string): Promise<HostInventoryEntry | null>;
 }
 
+// --- Host API ---
+
+export interface HostApi {
+  /**
+   * Signal the orchestrator that the host this job runs on is about to reboot,
+   * and resolve once the orchestrator acks (which sets a persisted
+   * reboot-pending flag holding the pinned post-restart job). After this
+   * resolves, the agent issues the OS reboot once the current step completes.
+   *
+   * Used by the SDK `restartHost()` step. `deadlineMs` overrides the
+   * orchestrator's default host-reboot deadline. Only meaningful inside a
+   * running job step on an agent; a local `kici run` rejects (no orchestrator
+   * to ack, and a local run cannot reboot a remote host).
+   */
+  requestReboot(opts?: { deadlineMs?: number }): Promise<void>;
+}
+
 // --- Top-level KiCI API ---
 
 export interface KiciApi {
@@ -81,6 +98,8 @@ export interface KiciApi {
   inventory: InventoryApi;
   /** Request short-lived OIDC ID tokens for the current job (build provenance). */
   oidc: OidcApi;
+  /** Host-lifecycle operations on the agent's own host (e.g. reboot). */
+  host: HostApi;
 }
 
 // --- Transport layer (internal) ---
@@ -132,6 +151,12 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
           audience: opts.audience,
         }) as Promise<OidcTokenResult>;
       },
+    },
+    host: {
+      requestReboot: (opts) =>
+        transport('host.requestReboot', {
+          ...(opts?.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
+        }) as Promise<void>,
     },
   };
 }

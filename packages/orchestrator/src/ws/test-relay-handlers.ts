@@ -27,14 +27,17 @@ import type { CacheStorage } from '../storage/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { initTestUpload } from '../routes/uploads.js';
-import { processTestTrigger, type TestPipelineDeps } from '../pipeline/test-pipeline.js';
+import { processTestTrigger } from '../pipeline/test-pipeline.js';
+import type { ProcessingDeps } from '../pipeline/processor.js';
 
 /** Terminal execution-run states for the relay status/logs `done` flag. */
 const TERMINAL_RUN_STATES = new Set(['success', 'failed', 'cancelled']);
 
 /** Dependencies shared by all five test-relay handlers. */
-export interface TestRelayHandlerDeps extends TestPipelineDeps {
+export interface TestRelayHandlerDeps extends ProcessingDeps {
   db: Kysely<Database>;
+  /** Agent registry — required here: the cancel handler resolves the job's agent. */
+  agentRegistry: NonNullable<ProcessingDeps['agentRegistry']>;
   cacheStorage?: CacheStorage;
   logStorage?: LogStorage;
   accessLog?: AccessLogWriter;
@@ -137,6 +140,7 @@ export async function handleTestTrigger(
       inlineLockFile: msg.inlineLockFile,
       fullRepo: msg.fullRepo,
       checkMode: msg.checkMode,
+      target: msg.target,
       requestId: msg.requestId,
     },
     deps,

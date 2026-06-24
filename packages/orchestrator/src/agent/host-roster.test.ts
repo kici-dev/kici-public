@@ -176,6 +176,45 @@ describeDb('HostRosterStore', () => {
     expect((await store.get('web-09'))?.connected_instance_id).toBe('orch-A');
   });
 
+  it('removeStatic deletes the row and returns the count', async () => {
+    await store.declareStatic({ agentId: 'h1', labels: ['role:db'] });
+    expect(await store.removeStatic('h1')).toBe(1);
+    expect(await store.get('h1')).toBeNull();
+    expect(await store.removeStatic('nope')).toBe(0);
+  });
+
+  describe('reboot-pending flag', () => {
+    it('set / clear / isRebootPending round-trips with the deadline', async () => {
+      await store.declareStatic({ agentId: 'h1', labels: [] });
+      const now = Date.now();
+      await store.setRebootPending('h1', new Date(now + 600_000));
+      expect(await store.isRebootPending('h1', now)).toBe(true);
+      // Past the deadline ⇒ no longer pending.
+      expect(await store.isRebootPending('h1', now + 700_000)).toBe(false);
+      await store.clearRebootPending('h1');
+      expect(await store.isRebootPending('h1', now)).toBe(false);
+    });
+
+    it('listExpiredRebootPending returns only hosts past their deadline', async () => {
+      await store.declareStatic({ agentId: 'expired', labels: [] });
+      await store.declareStatic({ agentId: 'live', labels: [] });
+      await store.declareStatic({ agentId: 'none', labels: [] });
+      const now = Date.now();
+      await store.setRebootPending('expired', new Date(now - 1));
+      await store.setRebootPending('live', new Date(now + 600_000));
+      // 'none' never set ⇒ NULL ⇒ excluded.
+      const expired = await store.listExpiredRebootPending(now);
+      expect(expired).toContain('expired');
+      expect(expired).not.toContain('live');
+      expect(expired).not.toContain('none');
+    });
+
+    it('isRebootPending is false for a host with no flag set', async () => {
+      await store.declareStatic({ agentId: 'h1', labels: [] });
+      expect(await store.isRebootPending('h1', Date.now())).toBe(false);
+    });
+  });
+
   describe('findMatching', () => {
     const grace = 5 * 60_000;
 

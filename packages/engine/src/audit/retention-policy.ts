@@ -69,6 +69,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'diagnostics.read': 30,
   'scaler.capacity.read': 30,
   'scaler.agents.read': 30,
+  'fleet.read': 30,
 
   // 180 days — sensitive reads
   'event_log.detail.read': 180,
@@ -94,6 +95,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'source_override.delete': 180,
   'env_binding.set': 180,
   'held_run.approve': 180,
+  'held_run.auto_approve': 180,
   'held_run.reject': 180,
   'held_run.request': 180,
   'held_run.expire': 180,
@@ -102,6 +104,8 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'backend.sync': 180,
   'backend.sync.one': 180,
   'backend.test': 180,
+  'fleet.host.declare': 180,
+  'fleet.host.remove': 180,
   'global_workflows.update': 180,
   'org_settings.dashboard_write_policy.update': 180,
   'cluster_name.update': 180,
@@ -395,6 +399,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'diagnostics.read': 30,
   'scaler.capacity.read': 30,
   'scaler.agents.read': 30,
+  'fleet.read': 30,
 
   // 730 days — sensitive reads
   'event_log.detail.read': 730,
@@ -420,6 +425,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'source_override.delete': 730,
   'env_binding.set': 730,
   'held_run.approve': 730,
+  'held_run.auto_approve': 730,
   'held_run.reject': 730,
   'held_run.request': 730,
   'held_run.expire': 730,
@@ -428,6 +434,8 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'backend.sync': 730,
   'backend.sync.one': 730,
   'backend.test': 730,
+  'fleet.host.declare': 730,
+  'fleet.host.remove': 730,
   'global_workflows.update': 730,
   'org_settings.dashboard_write_policy.update': 730,
   'cluster_name.update': 730,

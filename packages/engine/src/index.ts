@@ -54,6 +54,9 @@ export {
 // --- Protocol: Execution status (orchestrator -> Platform, in main union) ---
 export * from './protocol/messages/execution-status.js';
 
+// --- Protocol: Orchestrator deployment identity (browser-safe, pure Zod) ---
+export * from './protocol/messages/deployment-identity.js';
+
 // --- Protocol: Scaler lifecycle event types (emitted by all scaler backends) ---
 export * from './protocol/messages/scaler-event.js';
 
@@ -174,6 +177,9 @@ export {
   matcherSatisfiedBy,
   partitionMatchers,
   compileRegexMatcher,
+  HostTargetValue,
+  HostTargetSelector,
+  hostSatisfiesTarget,
 } from './labels-match.js';
 
 // --- Host inventory (canonical queryable roster schema) ---

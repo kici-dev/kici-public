@@ -286,7 +286,7 @@ function determineExecutionMode(
  * Build the result-aware `ctx.needs` for a dynamic eval from its frozen upstream
  * snapshot. Returns undefined for an event-only generator (no snapshot).
  */
-function buildEvalNeedsContext(config: {
+export function buildEvalNeedsContext(config: {
   resultAware?: boolean;
   declaredNeeds?: readonly unknown[];
   upstreamSnapshot?: import('@kici-dev/engine').UpstreamSnapshot;

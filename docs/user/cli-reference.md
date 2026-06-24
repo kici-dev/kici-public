@@ -246,6 +246,8 @@ kici run remote [fixture] [options]
 | `--history`                 | `false` | Show table of recent test runs                                                                    |
 | `--context <ctx.key=value>` | none    | Inject a namespaced context secret, uploaded encrypted (repeatable)                               |
 | `--env <KEY=VALUE>`         | none    | Provide a per-run secret, uploaded encrypted (repeatable) — see [testing guide](testing-guide.md) |
+| `--target <selector>`       | none    | Narrow `runsOnAll` jobs to hosts matching this label selector (repeatable, AND-combined)          |
+| `--target-allow-empty`      | `false` | A `--target` that narrows a `runsOnAll` job to zero hosts skips it instead of failing             |
 | `--debug`                   | `false` | Verbose internals                                                                                 |
 | `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                           |
 
@@ -284,7 +286,43 @@ kici run remote push-main --no-wait
 
 # View recent test run history
 kici run remote --history
+
+# Narrow runsOnAll jobs to a subset of the host roster
+kici run remote deploy --target role:web
+
+# AND-combine repeated --target values (hosts must match every selector)
+kici run remote deploy --target role:web --target dc:eu
+
+# Skip a runsOnAll job instead of failing it when the target matches no host
+kici run remote deploy --target role:gpu --target-allow-empty
 ```
+
+#### Host narrowing with `--target`
+
+`--target <selector>` is a runtime narrowing for `runsOnAll` jobs, analogous to
+Ansible's `--limit`. A `runsOnAll` job normally fans out to **every** roster host
+matching its predicate, one pinned execution per host. `--target` intersects that
+matched roster with a label selector, so the effective host set is
+`runsOnAll ∩ target`:
+
+- **Narrow-only.** `--target` can only _remove_ hosts from the matched set, never
+  add them. The widening dimension (OR across host groups) lives in the workflow's
+  `runsOnAll`; `--target` only subtracts.
+- **Run-global, `runsOnAll`-only.** A single `--target` applies to every
+  `runsOnAll` job in the run. Jobs pinned to a single host with `runsOn` are
+  untouched.
+- **Repeatable and AND-combined.** Each `--target` value is its own selector; a
+  host must satisfy **all** of them to survive the narrowing. Use a single value
+  for an OR-style match within one selector and repeated values for AND.
+- **Selector syntax** matches `runsOn`: an exact label (`role:web`), a glob
+  (`role:*`), or a regex (`/^box-0[1-3]$/`).
+
+When `--target` narrows a `runsOnAll` job to zero hosts, the default is to **fail**
+the run (fail-loud — a typo in the selector shouldn't silently skip work). Pass
+`--target-allow-empty` to **skip** the zeroed job instead; the job records a
+`skipped` status, and any downstream job that needs it with `when: 'on-skip'` (or
+`when: 'always'`) still runs. See [Job dependencies](./sdk/core.md#job-dependencies-needs)
+for the `when` gating model.
 
 **Exit codes:**
 
@@ -426,18 +464,21 @@ By default, `kici login` opens your browser for OIDC authentication using PKCE. 
 
 After OAuth, the CLI exchanges the OIDC token for a personal access token (PAT) stored in the config directory (`~/.kici/config` by default, overridable with `KICI_CONFIG_DIR`).
 
+`kici login` targets the hosted KiCI Platform by default. To authenticate against another environment (a self-hosted Platform, for example), pass `--platform-endpoint` / `--oidc-issuer` or set `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
+
 ```bash
 kici login [options]
 ```
 
 **Options:**
 
-| Option                      | Default | Description                                    |
-| --------------------------- | ------- | ---------------------------------------------- |
-| `--token <key>`             | none    | API key for direct authentication (legacy)     |
-| `--device`                  | false   | Force device authorization flow (headless/SSH) |
-| `--platform-endpoint <url>` | none    | Platform relay URL                             |
-| `--routing-key <key>`       | none    | Routing key for webhook source identification  |
+| Option                      | Default | Description                                         |
+| --------------------------- | ------- | --------------------------------------------------- |
+| `--token <key>`             | none    | API key for direct authentication (legacy)          |
+| `--device`                  | false   | Force device authorization flow (headless/SSH)      |
+| `--platform-endpoint <url>` | none    | Platform relay URL                                  |
+| `--oidc-issuer <url>`       | none    | OIDC issuer URL (selects a non-default environment) |
+| `--routing-key <key>`       | none    | Routing key for webhook source identification       |
 
 **Environment variables:**
 
@@ -463,7 +504,8 @@ kici login --device
 kici login --token kici_sk_abc123...
 
 # Log in against a self-hosted Platform
-kici login --platform-endpoint https://platform.example.com
+kici login --platform-endpoint https://platform.example.com \
+  --oidc-issuer https://auth.example.com/realms/kici-internal
 
 # Suppress browser opening (print authorize URL to stdout)
 KICI_BROWSER_CMD=none kici login

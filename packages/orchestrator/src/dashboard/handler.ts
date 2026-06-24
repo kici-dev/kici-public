@@ -45,6 +45,7 @@ import type {
   RunRerunRequest,
   RunCancelRequest,
   ManualScheduleRequest,
+  ExecutionJobStatus,
 } from '@kici-dev/engine';
 import {
   AccessLogAction as AccessLogActionEnum,
@@ -204,7 +205,7 @@ interface RunDetailJobRow {
 interface RunDetailJobLookups {
   stepsByJob: Map<string, RunDetailStepRow[]>;
   secretKeysByJob: Map<string, string[]>;
-  needsByJob: Map<string, Array<{ upstreamName: string; ifFailed: 'skip' | 'run' }>>;
+  needsByJob: Map<string, Array<{ upstreamName: string; runOn: ExecutionJobStatus[] }>>;
 }
 
 /** Map queried job + step rows into the dashboard run-detail job DTO shape. */
@@ -567,7 +568,7 @@ export class DashboardHandler {
       // enforced — dynamic-group edges are already concrete job-name edges here.
       const needsRows = await this.db
         .selectFrom('execution_job_needs')
-        .select(['job_name', 'upstream_name', 'if_failed'])
+        .select(['job_name', 'upstream_name', 'run_on'])
         .where('run_id', '=', msg.runId)
         .execute();
       const needsByJob = groupNeedsByJobName(needsRows);

@@ -49,7 +49,7 @@ describe('validateConfig cross-domain DAG validation', () => {
     expect(result.valid).toBe(true);
   });
 
-  it('resolves ifFailed needs to correct name', () => {
+  it('resolves when needs to correct name', () => {
     const buildJob = job('build', {
       runsOn: 'linux',
       steps: [dummyStep],
@@ -58,7 +58,7 @@ describe('validateConfig cross-domain DAG validation', () => {
     const testJob = job('test', {
       runsOn: 'linux',
       steps: [dummyStep],
-      needs: [{ name: 'build', ifFailed: 'run' }],
+      needs: [{ name: 'build', when: 'always' }],
     });
 
     const w = workflow('ci', {
@@ -93,7 +93,7 @@ describe('validateConfig cross-domain DAG validation', () => {
     const deployJob = job('deploy', {
       runsOn: 'linux',
       steps: [dummyStep],
-      needs: [{ group: 'tests', ifFailed: 'run' }],
+      needs: [{ group: 'tests', when: 'always' }],
     });
 
     const w = workflow('ci', {

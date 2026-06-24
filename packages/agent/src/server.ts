@@ -43,6 +43,7 @@ import { createHealthRoutes } from './routes/health.js';
 import { MetricsReporter } from './metrics/metrics-reporter.js';
 import { verifyNpmAvailable } from './execution/npm-resolver.js';
 import { gcStaleAgentTmpDirs } from './execution/tmp-gc.js';
+import { issueReboot } from './execution/reboot.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
@@ -172,6 +173,12 @@ await guardStartup(logger, async () => {
   let isDraining = false;
   let idleShutdownTimer: NodeJS.Timeout | undefined;
 
+  // Workflow-level host restart: a `restartHost()` step's `host.requestReboot`
+  // API call sets this intent (the orchestrator has already acked + set its
+  // reboot-pending flag). After the job completes, the post-job hook issues the
+  // OS reboot. Cleared after firing so a follow-up job does not re-reboot.
+  let rebootIntent = false;
+
   // 3. Create OrchestratorClient (declared early so JobRunner can reference it)
   // We need a forward reference for the client since JobRunner and client reference each other.
   let client: OrchestratorClient;
@@ -194,13 +201,26 @@ await guardStartup(logger, async () => {
     // Concurrency protocol: relay concurrency report to orchestrator and wait for ack
     sendConcurrencyReport: (runId, jobId, group) =>
       client.sendConcurrencyReport(runId, jobId, group),
-    // Agent private API: relay typed KiCI API calls to orchestrator via WS
-    sendApiRequest: (method, params) => client.sendApiRequest(method, params ?? {}),
+    // Agent private API: relay typed KiCI API calls to orchestrator via WS.
+    // host.requestReboot is special: refuse locally when co-located with the
+    // orchestrator, and record the reboot intent on a successful ack so the
+    // post-job hook can issue the OS reboot after the step completes.
+    sendApiRequest: async (method, params) => {
+      if (method === 'host.requestReboot') {
+        if (config.isOrchestratorHost) {
+          throw new Error('refusing to reboot the orchestrator host');
+        }
+        const result = await client.sendApiRequest(method, params ?? {});
+        rebootIntent = true;
+        return result;
+      }
+      return client.sendApiRequest(method, params ?? {});
+    },
     // User-facing cache: relay ctx.cache restore/save to orchestrator via WS
     requestUserCache: (jobId, request) => client.requestUserCache(jobId, request),
     // Provenance: relay ctx.attestProvenance bundle uploads to orchestrator via WS
     relayProvenance: (jobId, request) => client.relayProvenance(jobId, request),
-    // Step-level approvals: relay a requireApproval step's hold to the
+    // Step-level approvals: relay an approval step's hold to the
     // orchestrator and await its resolution via WS.
     sendStepApproval: (runId, jobId, request) => client.sendStepApproval(runId, jobId, request),
   });
@@ -321,6 +341,24 @@ await guardStartup(logger, async () => {
 
               // After job completes, send agent.status with updated counts
               sendAgentStatus();
+
+              // Workflow-level host restart: a `restartHost()` step recorded the
+              // intent (and the orchestrator already holds the pinned
+              // post-restart job). Now that the job is fully reported, issue the
+              // OS reboot. On failure (privilege denied), ask the orchestrator
+              // to clear its reboot-pending flag so the host is not stuck — the
+              // deadline sweep is the backstop.
+              if (rebootIntent) {
+                rebootIntent = false;
+                issueReboot().catch((err) => {
+                  logger.error('Host reboot failed; cancelling reboot-pending flag', {
+                    error: toErrorMessage(err),
+                  });
+                  client.sendApiRequest('host.cancelReboot', {}).catch(() => {
+                    /* best-effort; the deadline sweep clears the flag otherwise */
+                  });
+                });
+              }
 
               // Scaler-managed agents auto-shutdown after all jobs complete.
               // Brief idle timeout allows the orchestrator to dispatch follow-up jobs

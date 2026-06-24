@@ -22,7 +22,7 @@ import {
   initTelemetry,
   toErrorMessage,
 } from '@kici-dev/shared';
-import { OrchRole, githubWebhookPath } from '@kici-dev/engine';
+import { OrchRole, githubWebhookPath, type ActorPrincipal } from '@kici-dev/engine';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // The six workspace dep fingerprints power the SDK drift diagnostic — compare
@@ -70,11 +70,15 @@ const { buildPlatformProviderSources } = await import('./sources/build-platform-
 const { DashboardEnvHandler } = await import('./ws/dashboard-env-handler.js');
 const { DashboardRegistrationsHandler } = await import('./ws/dashboard-registrations-handler.js');
 const { DashboardBackendsHandler } = await import('./ws/dashboard-backends-handler.js');
+const { DashboardFleetWriteHandler } = await import('./ws/dashboard-fleet-write-handler.js');
 const { DashboardGlobalWorkflowsHandler, isDashboardGlobalWorkflowsMessage } =
   await import('./ws/dashboard-global-workflows-handler.js');
 const { guardedDashboardDispatch } = await import('./ws/dashboard-dispatch-guard.js');
 const { handleDiagnosticsRequest, handleScalerCapacityRequest, handleScalerAgentsRequest } =
   await import('./ws/dashboard-diagnostics-handler.js');
+const { handleFleetHostsRequest, handleFleetHostRequest, handleFleetPreviewRequest } =
+  await import('./ws/dashboard-fleet-handler.js');
+const { resolveWorkflowRunsOnAll } = await import('./ws/fleet-runs-on-all.js');
 const { EnvironmentStore } = await import('./environments/environment-store.js');
 const { VariableStore } = await import('./environments/variable-store.js');
 const { BindingStore } = await import('./environments/binding-store.js');
@@ -98,6 +102,7 @@ const { getDashboardWritePolicy, dashboardWritePolicyEvents } =
 import type { IdentityLink, PermissionLevel } from './security/trust-resolver.js';
 import type { ProcessingDeps } from './pipeline/processor.js';
 import { provisionRemoteSource } from './pipeline/remote-source-store.js';
+import { readDeploymentIdentity } from './deployment/deployment-identity.js';
 import { dispatchTestRelay } from './ws/test-relay-handlers.js';
 import type { ReleaseSignal } from './environments/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
@@ -759,6 +764,16 @@ await guardStartup(logger, async () => {
         db: sub.db,
       });
 
+      // Fleet host writes (Model C: declare / remove). Policy-gated via
+      // enforcePolicy + access-log audit; mirrors dashboardBackendsHandler.
+      let dashboardFleetWriteSendFn: ((msg: unknown) => void) | null = null;
+      const dashboardFleetWriteHandler = new DashboardFleetWriteHandler({
+        send: (msg) => dashboardFleetWriteSendFn?.(msg),
+        rosterStore: sub.hostRosterStore!,
+        accessLog: sub.accessLogWriter,
+        db: sub.db,
+      });
+
       // Outbound PeerClient factory shared by Platform-mediated discovery
       // (onPeerDiscover) and the static dial loop driven by config.cluster.peers.
       // The initialKey argument is the placeholder under which the caller
@@ -858,6 +873,50 @@ await guardStartup(logger, async () => {
         return client;
       };
 
+      // Fleet read-relay (roster, host detail, runsOnAll preview). Each read
+      // answers from the host roster store and writes a platform_proxy
+      // access-log row, mirroring onDashboardDiagnostics.
+      const buildFleetDeps = () => ({
+        db: sub.db,
+        rosterStore: sub.hostRosterStore!,
+        rosterGraceMs: config.rosterGraceMs,
+        resolveRunsOnAll: (workflowName: string) => resolveWorkflowRunsOnAll(sub.db, workflowName),
+      });
+      const runFleetRead = async (
+        requestId: string,
+        actor: ActorPrincipal,
+        targetId: string,
+        run: () => Promise<{ type: string; requestId: string }>,
+      ): Promise<void> => {
+        try {
+          const response = await run();
+          void sub.accessLogWriter?.record({
+            orgId: resolvedOrgContext?.orgId ?? null,
+            routingKey: resolvedOrgContext?.routingKey ?? null,
+            actor,
+            action: 'fleet.read',
+            target: { type: 'fleet', id: targetId },
+            requestId,
+            source: 'platform_proxy',
+            outcome: 'allowed',
+          });
+          platformClient!.sendRaw(response);
+        } catch (err) {
+          void sub.accessLogWriter?.record({
+            orgId: resolvedOrgContext?.orgId ?? null,
+            routingKey: resolvedOrgContext?.routingKey ?? null,
+            actor,
+            action: 'fleet.read',
+            target: { type: 'fleet', id: targetId },
+            requestId,
+            source: 'platform_proxy',
+            outcome: 'error',
+            errorMessage: toErrorMessage(err),
+          });
+          throw err;
+        }
+      };
+
       // Create PlatformClient
       const clusterName = await getClusterName(sub.db);
       const clusterId = await getClusterId(sub.db);
@@ -874,6 +933,7 @@ await guardStartup(logger, async () => {
         scalerBackends: sub.scalerManager
           ? sub.scalerManager.getStatus().backends.map((b) => b.type)
           : [],
+        deployment: readDeploymentIdentity(),
         s3LogAccess: !!sub.cacheStorage,
         queueTimeoutMs: config.queueTimeoutMs,
         orchCapabilities: { orchRole: OrchRole.enum.coordinator },
@@ -895,23 +955,17 @@ await guardStartup(logger, async () => {
           // upload / cancel internals) and relay the response over the WS.
           try {
             const response = await dispatchTestRelay(msg, {
+              // The full ProcessingDeps bag the webhook entry uses, so the test
+              // dispatch path runs through the same shared core (needs-DAG, host
+              // fan-out, deferred init/dynamic). coordinator is left in for
+              // parity; in the single-orch test path it is simply unused.
+              ...buildProcessingDeps(),
               db: sub.db,
+              agentRegistry: sub.agentRegistry,
               cacheStorage: sub.cacheStorage,
-              logStorage: sub.logStorage,
               accessLog: sub.accessLogWriter,
               orgId: resolvedOrgContext?.orgId ?? null,
               routingKey: resolvedOrgContext?.routingKey ?? null,
-              lockFileCache: sub.lockFileCache,
-              dispatcher: sub.dispatcher,
-              executionTracker: sub.executionTracker,
-              checkRunReporter: sub.checkRunReporter,
-              sourceCache: sub.sourceCache,
-              buildCoordinator: sub.buildCoordinator,
-              depCache: sub.depCache,
-              pendingBuilds: sub.pendingBuilds,
-              secretResolver: sub.secretResolver ?? undefined,
-              agentRegistry: sub.agentRegistry,
-              providerRegistry: sub.providerRegistry,
             });
             platformClient.sendRaw(response);
           } catch (err) {
@@ -998,6 +1052,21 @@ await guardStartup(logger, async () => {
             });
             throw err;
           }
+        },
+        onFleetHosts: async (msg) => {
+          await runFleetRead(msg.requestId, msg.actor, 'hosts', () =>
+            handleFleetHostsRequest(buildFleetDeps(), msg.requestId),
+          );
+        },
+        onFleetHost: async (msg) => {
+          await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
+            handleFleetHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
+          );
+        },
+        onFleetPreview: async (msg) => {
+          await runFleetRead(msg.requestId, msg.actor, msg.workflowName, () =>
+            handleFleetPreviewRequest(buildFleetDeps(), msg.requestId, msg.workflowName),
+          );
         },
         onDashboardScalerCapacity: (msg) => {
           try {
@@ -1095,6 +1164,13 @@ await guardStartup(logger, async () => {
                   dm.type === 'dashboard.backends.test'
                 ) {
                   await dashboardBackendsHandler.handleMessage(dm);
+                  return true;
+                }
+                if (
+                  dm.type === 'dashboard.fleet.host.declare' ||
+                  dm.type === 'dashboard.fleet.host.remove'
+                ) {
+                  await dashboardFleetWriteHandler.handleMessage(dm);
                   return true;
                 }
                 if (dm.type === 'dashboard.event-log.list') {
@@ -1273,6 +1349,7 @@ await guardStartup(logger, async () => {
               // Global-workflows is org-scoped: only customer_id matters.
               dashboardGlobalWorkflowsHandler.setOrgId(resolved.customer_id);
               dashboardBackendsHandler.setOrgContext(resolved.customer_id, resolved.routing_key);
+              dashboardFleetWriteHandler.setOrgContext(resolved.customer_id, resolved.routing_key);
               dashboardHandler.setOrgContext(resolved.customer_id, resolved.routing_key);
               resolvedOrgContext = {
                 orgId: resolved.customer_id,
@@ -1445,6 +1522,9 @@ await guardStartup(logger, async () => {
 
       // Bind DashboardBackendsHandler send to platformClient.sendRaw
       dashboardBackendsSendFn = (msg) => platformClient.sendRaw(msg);
+
+      // Bind DashboardFleetWriteHandler send to platformClient.sendRaw
+      dashboardFleetWriteSendFn = (msg) => platformClient.sendRaw(msg);
 
       // Bind DashboardGlobalWorkflowsHandler send to platformClient.sendRaw
       dashboardGlobalWorkflowsSendFn = (msg) => platformClient.sendRaw(msg);

@@ -36,6 +36,26 @@ export interface GithubAppManifest {
   default_events: string[];
 }
 
+/**
+ * Validate a self-hosted webhook URL supplied via `source add github
+ * --webhook-url`. Must be a well-formed absolute `https://` URL. Returns the URL
+ * verbatim on success; throws a clear error otherwise. The validated URL is
+ * baked into `manifest.hook_attributes.url` as-is — KiCI adds no ingress and
+ * does not receive events at it; the operator owns delivery.
+ */
+export function validateWebhookUrl(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`--webhook-url must be a valid absolute URL: ${value}`);
+  }
+  if (url.protocol !== 'https:') {
+    throw new Error(`--webhook-url must be an https:// URL (got ${url.protocol}//…)`);
+  }
+  return value;
+}
+
 export function buildGithubAppManifest(input: GithubManifestInput): GithubAppManifest {
   return {
     name: input.name,
@@ -59,6 +79,8 @@ export function buildGithubAppManifest(input: GithubManifestInput): GithubAppMan
 export interface GithubAppCredentials {
   appId: string;
   slug: string;
+  /** GitHub's display name for the App (the authoritative stored name). */
+  name: string;
   privateKey: string;
   webhookSecret: string;
   clientId?: string;
@@ -80,6 +102,7 @@ export async function convertManifestCode(
   const d = data as {
     id: number;
     slug: string;
+    name: string;
     pem: string;
     webhook_secret: string | null;
     client_id?: string;
@@ -95,6 +118,7 @@ export async function convertManifestCode(
   return {
     appId: String(d.id),
     slug: d.slug,
+    name: d.name,
     privateKey: d.pem,
     webhookSecret: d.webhook_secret,
     clientId: d.client_id,
@@ -108,6 +132,25 @@ function appOctokitFor(creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>
     authStrategy: createAppAuth,
     auth: { appId: creds.appId, privateKey: creds.privateKey },
   });
+}
+
+/**
+ * Ask GitHub who this App is (`GET /app`, authenticated as the App via its
+ * JWT) and return its authoritative display `name` + `slug`. This is the single
+ * "fetch the App's identity from GitHub" helper, reused at source creation, by
+ * the daily refresher, and by `kici-admin source refresh`.
+ *
+ * GitHub is the source of truth: a rename in the GitHub UI changes the value
+ * `GET /app` returns, which is what keeps the dashboard name fresh.
+ */
+export async function fetchGithubAppIdentity(
+  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  deps: { appOctokit?: Pick<Octokit, 'request'> } = {},
+): Promise<{ name: string; slug: string }> {
+  const octokit = deps.appOctokit ?? appOctokitFor(creds);
+  const { data } = await octokit.request('GET /app');
+  const d = data as { name: string; slug: string };
+  return { name: d.name, slug: d.slug };
 }
 
 /**

@@ -1,58 +1,45 @@
 /**
- * Test pipeline processor for CLI-initiated test runs.
+ * Test-trigger adapter for CLI-initiated runs (`kici run`).
  *
- * Reuses the existing webhook processing pipeline steps (lock file fetch,
- * trigger matching, job dispatch) but injects a synthetic event instead
- * of processing a real webhook. This avoids the anti-pattern of calling
- * processWebhook() directly (which expects WebhookInfo from a real webhook).
+ * Resolves the lock file, matched decisions, and fixture-specific concerns
+ * (inline-vs-provider lock, decision selection, fixture-payload storage, the
+ * `allow_local_execution` environment gate, CLI-secret overlay, in-memory
+ * test-run marking), then dispatches each matched workflow through the SAME
+ * shared core as webhooks (`dispatchMatchedWorkflow`). The test path is a thin
+ * adapter — needs-DAG scheduling, `expansionMap` fan-out edges, `runsOnAll`
+ * host fan-out, and deferred init/dynamic dispatch all come from the core.
  *
- * Key differences from processWebhook():
- * - Skips dedup check (test runs are always unique)
- * - Skips webhook normalization (event is already in SimulatedEvent shape)
- * - Skips repo extraction from payload (routing key is provided directly)
- * - deliveryId has `test:` prefix for identification
- * - Execution runs are marked with is_test_run=true and fixture_id
- * - Supports direct workflow execution (bypass trigger matching)
+ * Differences from a webhook run:
+ * - the synthetic event is injected directly (no provider normalization/dedup);
+ * - the lock file may be inline (local repos have no remote provider, so
+ *   `bundle` is undefined);
+ * - `deliveryId` carries a `test:` prefix;
+ * - the run is stamped `is_test_run = true` + `fixture_id` (via the core's
+ *   `testRun` meta) and marked in-memory for live-log broadcast to the CLI;
+ * - CLI-uploaded local secrets win over orchestrator env secrets (the
+ *   decorating secret resolver), and the fixture's `secrets` context mapping
+ *   resolves into namespaced secrets;
+ * - direct workflow execution (bypass trigger matching) is supported.
  */
 
 import { randomUUID } from 'node:crypto';
 import { createLogger, toErrorMessage, decryptJson } from '@kici-dev/shared';
-import { resolveOrgId } from './processor.js';
-import type { LockFileCache } from '../lockfile-cache.js';
-import type { Dispatcher } from '../agent/dispatcher.js';
-import type { QueuedJobInput } from '../queue/job-queue.js';
-import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
-import type { ExecutionTracker } from '../reporting/execution-tracker.js';
-import type { AgentRegistry } from '../agent/registry.js';
+import { resolveOrgId, type ProcessingDeps } from './processor.js';
+import { dispatchMatchedWorkflow } from './dispatch-matched-workflow.js';
+import type { WorkflowDispatchContext } from './dispatch-matched-workflow.js';
+import { DecoratingSecretResolver } from './decorating-secret-resolver.js';
+import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderRegistry } from '../provider-registry.js';
-import type { SourceCache } from '../cache/index.js';
-import type { BuildCoordinator } from '../cache/index.js';
-import type { DepCache } from '../cache/index.js';
-import type { PendingBuildTracker } from '../cache/index.js';
-import type { SecretResolver } from '../secrets/secret-resolver.js';
-import type { EnvironmentStore } from '../environments/environment-store.js';
-import { toEnvironment } from '../environments/environment-store.js';
-import type { VariableStore } from '../environments/variable-store.js';
-import type { LogStorage } from '../reporting/log-storage.js';
-import type { Kysely } from 'kysely';
-import type { Database } from '../db/types.js';
 import type {
   LockFile as FullLockFile,
   LockJob,
   LockWorkflow,
+  ProviderType,
   SimulatedEvent,
   WorkflowDecision,
 } from '@kici-dev/engine';
-import {
-  isLockInlineValue,
-  isLockStaticJob,
-  matchAllWorkflows,
-  createWorkflowDecision,
-  materializeFanout,
-  matrixEnvelopeFields,
-  partitionMatchers,
-} from '@kici-dev/engine';
-import type { MaterializedJob, CheckMode } from '@kici-dev/engine';
+import { isLockStaticJob, matchAllWorkflows, createWorkflowDecision } from '@kici-dev/engine';
+import type { CheckMode, HostTargetSelector } from '@kici-dev/engine';
 import { evaluateInlineFields } from './inline-eval.js';
 
 const logger = createLogger({ prefix: 'test-pipeline' });
@@ -102,6 +89,11 @@ export interface TestTriggerInput {
    * Omitted means `apply`.
    */
   checkMode?: CheckMode;
+  /**
+   * Runtime host narrowing from `kici run --target`. Threaded onto the dispatch
+   * context, where it post-filters each runsOnAll job's matched roster.
+   */
+  target?: HostTargetSelector;
 }
 
 /**
@@ -118,45 +110,12 @@ interface TestTriggerResult {
   jobIds: string[];
 }
 
-/**
- * Dependencies for the test pipeline processor.
- * All injected for testability.
- */
-export interface TestPipelineDeps {
-  lockFileCache: LockFileCache;
-  dispatcher: Dispatcher;
-  executionTracker?: ExecutionTracker;
-  checkRunReporter?: CheckRunReporter;
-  sourceCache?: SourceCache;
-  buildCoordinator?: BuildCoordinator;
-  depCache?: DepCache;
-  pendingBuilds?: PendingBuildTracker;
-  secretResolver?: SecretResolver;
-  agentRegistry: AgentRegistry;
-  providerRegistry: ProviderRegistry;
-  /** Log storage for persisting test fixture payloads. Optional -- if not set, payload storage is skipped. */
-  logStorage?: LogStorage;
-  /** Database connection for environment protection checks. Optional. */
-  db?: Kysely<Database>;
-  /** Environment store for resolving environment ids in test dispatch parity. Optional. */
-  environmentStore?: EnvironmentStore;
-  /** Variable store for resolving environment variables in test dispatch parity. Optional. */
-  variableStore?: VariableStore;
-}
-
 type ProviderBundle = ReturnType<ProviderRegistry['getByRoutingKey']>;
 
 interface ResolvedLockFile {
   fullLockFile: FullLockFile;
   bundle: ProviderBundle | undefined;
   repoIdentifier: string;
-}
-
-interface DispatchedJobRef {
-  jobId: string;
-  jobName: string;
-  matrixValues?: Record<string, unknown>;
-  runsOnLabels?: string[];
 }
 
 /**
@@ -166,7 +125,7 @@ interface DispatchedJobRef {
  */
 async function resolveLockFileForTest(
   input: TestTriggerInput,
-  deps: TestPipelineDeps,
+  deps: ProcessingDeps,
   runId: string,
 ): Promise<ResolvedLockFile | { rejected: string }> {
   if (input.inlineLockFile) {
@@ -246,10 +205,9 @@ function selectMatchedDecisions(
   return matched;
 }
 
-/** Per-job dynamic fields resolved once per test run and shared by the gate, secret resolution, and dispatch. */
+/** Per-job dynamic fields resolved once per test run; consumed by the env gate. */
 interface ResolvedJobFields {
   environmentName?: string;
-  jobEnv?: Record<string, string>;
 }
 
 /** Key: `${workflowName}:${jobName}` composite (see resolvedFieldsKey). */
@@ -260,12 +218,12 @@ function resolvedFieldsKey(workflowName: string, jobName: string): string {
 }
 
 /**
- * Resolve each matched static job's environment and env once, evaluating pure
- * inline expressions against the fixture's simulated event (the normalized
- * envelope — the same argument production dispatch passes). Impure dynamic
- * fields (marker set, no inline value) stay unresolved: test runs dispatch no
- * init jobs. Inline evaluation failures reject the run (no fallback), matching
- * production's immediate-failure semantics.
+ * Resolve each matched static job's environment once, evaluating pure inline
+ * expressions against the fixture's simulated event (the normalized envelope —
+ * the same argument production dispatch passes). Impure dynamic fields (marker
+ * set, no inline value) stay unresolved: the environment gate only covers what
+ * can be statically known. Inline evaluation failures reject the run (no
+ * fallback), matching production's immediate-failure semantics.
  */
 function resolveJobFieldsForRun(
   fullLockFile: FullLockFile,
@@ -291,10 +249,6 @@ function resolveJobFieldsForRun(
         inline.inlineEnvironmentName ??
         (typeof lockJob.environment === 'string' ? lockJob.environment : undefined);
       if (environmentName) fields.environmentName = environmentName;
-      const jobEnv =
-        inline.inlineEnv ??
-        (lockJob.env && !isLockInlineValue(lockJob.env) ? lockJob.env : undefined);
-      if (jobEnv) fields.jobEnv = jobEnv;
       map.set(resolvedFieldsKey(workflow.name, lockJob.name), fields);
     }
   }
@@ -309,17 +263,14 @@ function resolveJobFieldsForRun(
  * The gate covers static string environments AND pure inline environments
  * resolved against the fixture's simulated event (via `resolvedFields`).
  * Impure dynamic environments (marker set, no inline value) are skipped
- * because the test pipeline dispatches static jobs only (no init jobs).
+ * because the gate only enforces what can be statically known.
  *
  * The environments lookup is scoped by `org_id` + `name` so a tenant's
  * environment can only match its own org's row (a name-only filter would let
  * org A match org B's same-named environment).
- *
- * Build jobs (__build__) are automatically skipped for test runs
- * because the test pipeline dispatches static jobs only.
  */
 async function enforceEnvironmentProtection(
-  deps: TestPipelineDeps,
+  deps: ProcessingDeps,
   fullLockFile: FullLockFile,
   matchedDecisions: WorkflowDecision[],
   orgId: string,
@@ -359,7 +310,7 @@ async function enforceEnvironmentProtection(
  */
 async function storeFixturePayload(
   input: TestTriggerInput,
-  deps: TestPipelineDeps,
+  deps: ProcessingDeps,
   runId: string,
 ): Promise<void> {
   if (!deps.logStorage) return;
@@ -372,22 +323,6 @@ async function storeFixturePayload(
       error: toErrorMessage(err),
     });
   }
-}
-
-interface DispatchContext {
-  runId: string;
-  deliveryId: string;
-  bundle: ProviderBundle | undefined;
-  repoIdentifier: string;
-  fullLockFile: FullLockFile;
-  simulatedEvent: SimulatedEvent;
-  resolvedFields: ResolvedFieldsMap;
-}
-
-/** Resolved secrets for a dispatched test job: flat env + per-context namespaces. */
-interface TestSecretBundle {
-  flat: Record<string, string>;
-  namespaced: Record<string, Record<string, string>>;
 }
 
 /**
@@ -410,35 +345,19 @@ function decryptCliSecrets(input: TestTriggerInput): {
 }
 
 /**
- * Resolve the secrets a dispatched test job should receive, merging two
- * sources with CLI-wins precedence:
- *
- * - Source B (orchestrator-stored): B1 resolves the job's own declared
- *   environment into flat secrets; B2 resolves each fixture `secrets` mapping
- *   entry `{ contextName: environmentName }` into a namespaced context. Both
- *   only consider environments flagged `allow_local_execution = true`.
- * - Source A (CLI-uploaded): decrypts the developer's local secrets and
- *   overwrites the baseline (flat overwrites flat; contexts overwrite
- *   namespaced per-context).
- *
- * Fail-closed: if a fixture maps a context to an environment that does not
- * exist or has `allow_local_execution = false`, the run is rejected.
+ * Resolve the fixture's `secrets` context mapping `{ contextName: envName }`
+ * into namespaced secrets, fail-closed on non-test-allowed environments, then
+ * overlay the CLI-uploaded contexts (CLI wins per-context). Keyed by the
+ * fixture context name (e.g. `db`), not the env name — the run carries these
+ * verbatim on every dispatched job via `extraJobConfig.namespacedSecrets`.
  */
-async function resolveTestRunSecrets(
+async function resolveFixtureNamespacedSecrets(
   input: TestTriggerInput,
-  deps: TestPipelineDeps,
+  deps: ProcessingDeps,
   orgId: string,
-  jobEnvironment: string | undefined,
-): Promise<TestSecretBundle | { rejected: string }> {
-  const flat: Record<string, string> = {};
+): Promise<{ namespaced: Record<string, Record<string, string>> } | { rejected: string }> {
   const namespaced: Record<string, Record<string, string>> = {};
 
-  // B1 — the job's own declared environment (test-allowed gate already ran upstream).
-  if (jobEnvironment && deps.secretResolver) {
-    Object.assign(flat, await deps.secretResolver.resolveForJob(orgId, jobEnvironment));
-  }
-
-  // B2 — fixture mapping { contextName: environmentName }, fail-closed on non-test envs.
   for (const [ctxName, envName] of Object.entries(input.secrets ?? {})) {
     if (deps.db) {
       const env = await deps.db
@@ -458,218 +377,95 @@ async function resolveTestRunSecrets(
     }
   }
 
-  // A — CLI-uploaded local secrets win on collision.
+  // CLI-uploaded contexts win on collision (per-context merge).
   const cli = decryptCliSecrets(input);
-  Object.assign(flat, cli.flat);
   for (const [ctxName, vals] of Object.entries(cli.contexts)) {
     namespaced[ctxName] = { ...(namespaced[ctxName] ?? {}), ...vals };
   }
 
-  return { flat, namespaced };
+  return { namespaced };
 }
 
-function buildJobInput(
-  workflow: LockWorkflow,
-  mat: MaterializedJob,
-  ctx: DispatchContext,
+/** The provenance fields merged onto every dispatched job's jobConfig. */
+function buildExtraJobConfig(
   input: TestTriggerInput,
-  secretBundle: TestSecretBundle,
-  fields: ResolvedJobFields | undefined,
-  environmentVars: Record<string, string> | undefined,
-): QueuedJobInput {
-  const staticJob = mat.lockJob;
-  const runsOnSel = partitionMatchers(staticJob.runsOn ?? []);
-  const excludeSel = partitionMatchers(staticJob.excludeLabels ?? []);
+  namespacedSecrets: Record<string, Record<string, string>>,
+): Record<string, unknown> {
   return {
-    runId: ctx.runId,
-    workflowName: workflow.name,
-    jobName: mat.expandedName,
-    runsOnLabels: runsOnSel.exact,
-    runsOnPatterns: runsOnSel.regex,
-    excludeLabels: excludeSel.exact,
-    excludePatterns: excludeSel.regex,
-    jobConfig: {
-      source: workflow.source ?? ctx.fullLockFile.source,
-      workflowName: workflow.name,
-      ...matrixEnvelopeFields(mat),
-      steps: staticJob.steps,
-      needs: staticJob.needs,
-      rules: staticJob.rules,
-      isTestRun: true,
-      fixtureId: input.fixtureId,
-      ...(input.uploadId && { tarballUploadId: input.uploadId }),
-      ...(input.resolvedOverlay && {
-        tarballUrl: input.resolvedOverlay.tarballUrl,
-        cliPublicKey: input.resolvedOverlay.cliPublicKey,
-        orchestratorPrivateKey: input.resolvedOverlay.orchestratorPrivateKey,
-      }),
-      ...(Object.keys(secretBundle.flat).length > 0 && { secrets: secretBundle.flat }),
-      ...(Object.keys(secretBundle.namespaced).length > 0 && {
-        namespacedSecrets: secretBundle.namespaced,
-      }),
-      ...(input.fullRepo && { fullRepo: true }),
-      ...(input.checkMode && { checkMode: input.checkMode }),
-      // Production parity: the fixture's normalized envelope drives rules,
-      // ctx.rawPayload and dynamic-function semantics exactly like a real run.
-      event: ctx.simulatedEvent,
-      ...(fields?.environmentName && { environment: fields.environmentName }),
-      ...(environmentVars && { environmentVars }),
-      ...(fields?.jobEnv && { jobEnv: fields.jobEnv }),
-    } as QueuedJobInput['jobConfig'],
-    repoUrl: input.fullRepo
-      ? ''
-      : (ctx.bundle?.repoUrlBuilder?.buildCloneUrl(ctx.repoIdentifier) ?? ''),
-    ref: ctx.simulatedEvent.sourceBranch ?? ctx.simulatedEvent.targetBranch,
-    sha: 'HEAD',
-    deliveryId: ctx.deliveryId,
-    provider: input.routingKey.split(':')[0] ?? 'test',
-    providerContext: {},
-    routingKey: input.routingKey,
-    requestId: input.requestId,
+    isTestRun: true,
+    fixtureId: input.fixtureId,
+    ...(input.uploadId && { tarballUploadId: input.uploadId }),
+    ...(input.resolvedOverlay && {
+      tarballUrl: input.resolvedOverlay.tarballUrl,
+      cliPublicKey: input.resolvedOverlay.cliPublicKey,
+      orchestratorPrivateKey: input.resolvedOverlay.orchestratorPrivateKey,
+    }),
+    ...(input.fullRepo && { fullRepo: true }),
+    ...(input.checkMode && { checkMode: input.checkMode }),
+    ...(Object.keys(namespacedSecrets).length > 0 && { namespacedSecrets }),
   };
 }
 
-async function dispatchStaticJobsForWorkflow(
-  workflow: LockWorkflow,
-  ctx: DispatchContext,
-  input: TestTriggerInput,
-  deps: TestPipelineDeps,
-  orgId: string,
-): Promise<{ dispatched: DispatchedJobRef[] } | { rejected: string }> {
-  const dispatched: DispatchedJobRef[] = [];
-  const staticJobs = workflow.jobs.filter(isLockStaticJob);
-  const materializedJobs = materializeFanout(staticJobs).jobs;
-  // Platform detection from agents is deferred until per-job dispatch.
-
-  for (const mat of materializedJobs) {
-    // Environment fields are resolved per base job (matrix children share them).
-    const fields = ctx.resolvedFields.get(resolvedFieldsKey(workflow.name, mat.baseName));
-    const bundle = await resolveTestRunSecrets(input, deps, orgId, fields?.environmentName);
-    if ('rejected' in bundle) {
-      return { rejected: bundle.rejected };
-    }
-
-    // Production parity (dispatch-matched-workflow.applyEnvironmentRulesAndSecrets):
-    // match the job's resolved environment, then resolve its variables against
-    // the environment id + routing key.
-    let environmentVars: Record<string, string> | undefined;
-    if (fields?.environmentName && deps.environmentStore && deps.variableStore) {
-      const envConfig = await deps.environmentStore.matchEnvironment(orgId, fields.environmentName);
-      if (envConfig) {
-        const vars = await deps.variableStore.getResolvedVars(
-          orgId,
-          toEnvironment(envConfig).id,
-          input.routingKey,
-        );
-        if (Object.keys(vars).length > 0) environmentVars = vars;
-      }
-    }
-
-    const jobInput = buildJobInput(workflow, mat, ctx, input, bundle, fields, environmentVars);
-    const result = await deps.dispatcher.dispatch(jobInput);
-    if (result.status !== 'rejected') {
-      dispatched.push({
-        jobId: result.jobId,
-        jobName: jobInput.jobName,
-        ...(mat.variantValues && { matrixValues: mat.variantValues }),
-        runsOnLabels: jobInput.runsOnLabels,
-      });
-    }
-
-    logger.info('Test job dispatched', {
-      runId: ctx.runId,
-      workflow: workflow.name,
-      job: jobInput.jobName,
-      status: result.status,
-      fixtureId: input.fixtureId,
-    });
-  }
-  return { dispatched };
+/** Inputs shared by every per-decision dispatch context the adapter builds. */
+interface TestDispatchShared {
+  input: TestTriggerInput;
+  testDeps: ProcessingDeps;
+  bundle: ProviderBundle | undefined;
+  repoIdentifier: string;
+  fullLockFile: FullLockFile;
+  simulatedEvent: SimulatedEvent;
+  deliveryId: string;
+  resolvedOrgId: string;
+  info: WebhookInfo;
+  extraJobConfig: Record<string, unknown>;
+  /** CLI `--secret` / `--env` flat secrets, layered onto every dispatched job. */
+  runWideFlatSecrets: Record<string, string>;
 }
 
-/**
- * Record the execution-start row + test-run markers. MUST be awaited so the
- * execution_runs row exists before the agent reports completion (race with
- * fast internal provider).
- */
-async function recordTestExecutionStart(
+/** Assemble a `WorkflowDispatchContext` for one matched workflow decision. */
+function buildTestDispatchContext(
+  shared: TestDispatchShared,
   workflow: LockWorkflow,
   decision: WorkflowDecision,
-  dispatched: DispatchedJobRef[],
-  ctx: DispatchContext,
-  input: TestTriggerInput,
-  deps: TestPipelineDeps,
-): Promise<void> {
-  if (!deps.executionTracker || dispatched.length === 0) return;
-
-  // Mark run as test run in memory for observer broadcasting (before async DB ops).
-  deps.executionTracker.markTestRun(ctx.runId);
-  try {
-    await deps.executionTracker.onExecutionStarted(
-      ctx.runId,
-      workflow.name,
-      input.routingKey.split(':')[0] ?? 'test',
-      input.routingKey,
-      ctx.simulatedEvent.targetBranch,
-      'HEAD',
-      ctx.deliveryId,
-      {},
-      {
-        workflowName: decision.workflowName,
-        matched: decision.matched,
-        summary: decision.summary,
-        checksCount: decision.checks.length,
-      },
-      dispatched,
-      input.routingKey,
-      undefined, // contexts
-      undefined, // triggerEvent
-      undefined, // commitMessage
-      undefined, // parentRunId
-      undefined, // triggeredBy
-      undefined, // originalRunId
-      workflow.concurrency
-        ? {
-            cancelInProgress: workflow.concurrency.cancelInProgress,
-            max: workflow.concurrency.max,
-          }
-        : undefined,
-      workflow.timeout, // workflowTimeoutMs
-      input.checkMode, // checkMode
-    );
-    try {
-      await (deps.executionTracker as any).db
-        .updateTable('execution_runs')
-        .set({
-          is_test_run: true,
-          fixture_id: input.fixtureId,
-        })
-        .where('run_id', '=', ctx.runId)
-        .execute();
-    } catch (err) {
-      logger.error('Failed to mark execution as test run', {
-        runId: ctx.runId,
-        error: toErrorMessage(err),
-      });
-    }
-  } catch (err) {
-    logger.error('Failed to record test execution start', {
-      runId: ctx.runId,
-      error: toErrorMessage(err),
-    });
-  }
+  runId: string,
+): WorkflowDispatchContext {
+  return {
+    info: shared.info,
+    deps: shared.testDeps,
+    bundle: shared.bundle,
+    payload: shared.simulatedEvent.payload,
+    repoIdentifier: shared.repoIdentifier,
+    credentials: {},
+    event: shared.simulatedEvent,
+    eventWithFiles: shared.simulatedEvent,
+    ref: shared.simulatedEvent.sourceBranch ?? shared.simulatedEvent.targetBranch,
+    fullLockFile: shared.fullLockFile,
+    resolvedOrgId: shared.resolvedOrgId,
+    workflow,
+    decision,
+    runId,
+    trustResolution: undefined,
+    lockFileSource: undefined,
+    crossSource: false,
+    extraJobConfig: shared.extraJobConfig,
+    testRun: { fixtureId: shared.input.fixtureId },
+    ...(shared.input.target && { target: shared.input.target }),
+    ...(Object.keys(shared.runWideFlatSecrets).length > 0 && {
+      runWideFlatSecrets: shared.runWideFlatSecrets,
+    }),
+  };
 }
 
 /**
- * Process a test trigger through the existing pipeline.
+ * Process a test trigger through the shared dispatch core.
  *
- * Reuses pipeline steps starting from lock file fetch, skipping webhook
- * normalization and dedup. Supports both trigger-matched and direct
- * workflow execution modes.
+ * Resolves the lock file + matched decisions + fixture concerns, then builds a
+ * `WorkflowDispatchContext` per matched workflow and calls
+ * `dispatchMatchedWorkflow` — the same core the webhook path uses.
  */
 export async function processTestTrigger(
   input: TestTriggerInput,
-  deps: TestPipelineDeps,
+  deps: ProcessingDeps,
 ): Promise<TestTriggerResult> {
   const runId = randomUUID();
   const deliveryId = `test:${randomUUID()}`;
@@ -706,57 +502,83 @@ export async function processTestTrigger(
   // Resolve the tenant the SAME way the webhook pipeline does
   // (sources -> generic_webhook_sources -> '__default__'). A wrong org id would
   // resolve another tenant's environments/secrets, so this MUST match the real
-  // path. Resolved ONCE here and shared by both the environment-protection gate
-  // and the per-job secret resolution below.
-  const orgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
+  // path. Resolved ONCE here and shared by the environment gate, the fixture
+  // namespaced-secret resolution, and the dispatch core.
+  const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
 
   const fieldsResult = resolveJobFieldsForRun(fullLockFile, matchedDecisions, simulatedEvent);
   if ('rejected' in fieldsResult) {
     return { runId, status: 'rejected', reason: fieldsResult.rejected, jobIds: [] };
   }
-  const resolvedFields = fieldsResult.resolved;
 
   const protectionRejection = await enforceEnvironmentProtection(
     deps,
     fullLockFile,
     matchedDecisions,
-    orgId,
-    resolvedFields,
+    resolvedOrgId,
+    fieldsResult.resolved,
   );
   if (protectionRejection) {
     return { runId, status: 'rejected', reason: protectionRejection, jobIds: [] };
   }
 
+  const namespacedResult = await resolveFixtureNamespacedSecrets(input, deps, resolvedOrgId);
+  if ('rejected' in namespacedResult) {
+    return { runId, status: 'rejected', reason: namespacedResult.rejected, jobIds: [] };
+  }
+
   await storeFixturePayload(input, deps, runId);
 
-  const ctx: DispatchContext = {
-    runId,
+  // CLI-secret overlay: the core resolves per-job env secrets through this
+  // decorator, so CLI flat secrets win over orchestrator env secrets.
+  const cliSecrets = decryptCliSecrets(input);
+  const testDeps: ProcessingDeps = deps.secretResolver
+    ? { ...deps, secretResolver: new DecoratingSecretResolver(deps.secretResolver, cliSecrets) }
+    : deps;
+
+  // Mark the run in-memory BEFORE dispatch so the live-log observer broadcasts
+  // to the waiting CLI (independent of the async is_test_run column write the
+  // core performs from the testRun meta).
+  deps.executionTracker?.markTestRun(runId);
+
+  const provider = (input.routingKey.split(':')[0] ?? 'local') as ProviderType;
+  const info: WebhookInfo = {
+    routingKey: input.routingKey,
     deliveryId,
+    event: input.event.type,
+    action: input.event.action ?? null,
+    provider,
+    payload: input.event.payload,
+  };
+
+  const shared: TestDispatchShared = {
+    input,
+    testDeps,
     bundle,
     repoIdentifier,
     fullLockFile,
     simulatedEvent,
-    resolvedFields,
+    deliveryId,
+    resolvedOrgId,
+    info,
+    extraJobConfig: buildExtraJobConfig(input, namespacedResult.namespaced),
+    // CLI `--secret` / `--env` flat secrets reach EVERY job (env-declaring or
+    // not), winning over a job's env-resolved secret on a key collision.
+    runWideFlatSecrets: cliSecrets.flat,
   };
 
-  const allJobIds: string[] = [];
+  const jobIds: string[] = [];
   for (const decision of matchedDecisions) {
     const workflow = fullLockFile.workflows.find(
       (w: LockWorkflow) => w.name === decision.workflowName,
     );
     if (!workflow) continue;
-
-    const dispatchResult = await dispatchStaticJobsForWorkflow(workflow, ctx, input, deps, orgId);
-    if ('rejected' in dispatchResult) {
-      return { runId, status: 'rejected', reason: dispatchResult.rejected, jobIds: [] };
-    }
-    const dispatched = dispatchResult.dispatched;
-    for (const d of dispatched) allJobIds.push(d.jobId);
-
-    await recordTestExecutionStart(workflow, decision, dispatched, ctx, input, deps);
+    const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
+    const result = await dispatchMatchedWorkflow(ctx);
+    jobIds.push(...result.dispatchedJobIds);
   }
 
-  if (allJobIds.length === 0) {
+  if (jobIds.length === 0) {
     return {
       runId,
       status: 'rejected',
@@ -766,5 +588,5 @@ export async function processTestTrigger(
     };
   }
 
-  return { runId, status: 'accepted', jobIds: allJobIds };
+  return { runId, status: 'accepted', jobIds };
 }

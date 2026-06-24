@@ -6,28 +6,31 @@
  *
  * Usage in workflow definition:
  *   needs: [dynamicGroup('test-shards')]
- *   needs: [dynamicGroup('test-shards', { ifFailed: 'run' })]
+ *   needs: [dynamicGroup('test-shards', { when: 'always' })]
  */
+
+import type { NeedsWhenInput } from './types.js';
 
 const DYNAMIC_GROUP_TAG = Symbol.for('kici:dynamicGroup');
 
 export interface DynamicGroupRef {
   readonly [DYNAMIC_GROUP_TAG]: true;
   readonly group: string;
-  readonly ifFailed?: 'skip' | 'run';
+  /** Run condition for the edge: keyword sugar or a raw upstream-status set. */
+  readonly when?: NeedsWhenInput;
 }
 
 /**
  * Create a reference to a dynamic job group for use in a static job's `needs` array.
  *
  * @param name - The group name (must match the name used in `dynamicJob(name, fn)`)
- * @param opts - Optional failure policy override
+ * @param opts - Optional run condition for the edge
  */
-export function dynamicGroup(name: string, opts?: { ifFailed?: 'skip' | 'run' }): DynamicGroupRef {
+export function dynamicGroup(name: string, opts?: { when?: NeedsWhenInput }): DynamicGroupRef {
   return {
     [DYNAMIC_GROUP_TAG]: true,
     group: name,
-    ...(opts?.ifFailed && { ifFailed: opts.ifFailed }),
+    ...(opts?.when !== undefined && { when: opts.when }),
   };
 }
 

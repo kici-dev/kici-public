@@ -1,11 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import crypto from 'node:crypto';
 import { encryptJson } from '@kici-dev/shared';
-import {
-  processTestTrigger,
-  type TestTriggerInput,
-  type TestPipelineDeps,
-} from './test-pipeline.js';
+import { processTestTrigger, type TestTriggerInput } from './test-pipeline.js';
+import type { ProcessingDeps } from './processor.js';
 
 // --- Mock helpers ---
 
@@ -47,7 +44,7 @@ function createMockWorkflow(name: string, jobs: any[] = []) {
   };
 }
 
-function createMockDeps(overrides: Partial<TestPipelineDeps> = {}): TestPipelineDeps {
+function createMockDeps(overrides: Partial<ProcessingDeps> = {}): ProcessingDeps {
   return {
     lockFileCache: {
       get: vi.fn().mockResolvedValue(null),
@@ -87,7 +84,7 @@ function createMockInput(overrides: Partial<TestTriggerInput> = {}): TestTrigger
 }
 
 describe('processTestTrigger', () => {
-  let deps: TestPipelineDeps;
+  let deps: ProcessingDeps;
 
   beforeEach(() => {
     deps = createMockDeps();
@@ -97,12 +94,28 @@ describe('processTestTrigger', () => {
     const lockFile = createMockLockFile([createMockWorkflow('ci')]);
     (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
 
+    const setCalls: Array<Record<string, unknown>> = [];
+    // The is_test_run / fixture_id stamp now happens inside the shared core
+    // (recordRunStart) via deps.db, driven by the testRun meta the adapter sets.
     const mockDb = {
+      // resolveOrgId chain → no source row → '__default__'.
+      selectFrom: vi.fn(() => ({
+        select: vi.fn(() => ({
+          where: vi.fn(() => ({ executeTakeFirst: vi.fn().mockResolvedValue(undefined) })),
+        })),
+      })),
+      insertInto: vi.fn(() => ({
+        values: vi.fn(() => ({
+          onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+          execute: vi.fn().mockResolvedValue(undefined),
+        })),
+      })),
       updateTable: vi.fn().mockReturnValue({
-        set: vi.fn().mockReturnValue({
-          where: vi.fn().mockReturnValue({
-            execute: vi.fn().mockResolvedValue(undefined),
-          }),
+        set: vi.fn().mockImplementation((payload: Record<string, unknown>) => {
+          setCalls.push(payload);
+          return {
+            where: vi.fn().mockReturnValue({ execute: vi.fn().mockResolvedValue(undefined) }),
+          };
         }),
       }),
     };
@@ -110,10 +123,10 @@ describe('processTestTrigger', () => {
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
       markTestRun: vi.fn(),
-      db: mockDb,
     };
 
     deps.executionTracker = executionTracker as any;
+    deps.db = mockDb as any;
     const input = createMockInput();
 
     const result = await processTestTrigger(input, deps);
@@ -122,15 +135,19 @@ describe('processTestTrigger', () => {
     expect(result.runId).toBeDefined();
     expect(result.jobIds.length).toBeGreaterThan(0);
 
-    // Verify execution tracker was called
+    // The in-memory test-run marker fires before dispatch.
+    expect(executionTracker.markTestRun).toHaveBeenCalledWith(result.runId);
+    // Verify execution tracker registered the run.
     expect(executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
     const trackerArgs = executionTracker.onExecutionStarted.mock.calls[0];
     expect(trackerArgs[0]).toBe(result.runId); // runId
     expect(trackerArgs[1]).toBe('ci'); // workflowName
 
-    // Wait for the async is_test_run update
+    // Wait for the async is_test_run stamp (fire-and-forget UPDATE in the core).
     await vi.waitFor(() => {
-      expect(mockDb.updateTable).toHaveBeenCalledWith('execution_runs');
+      expect(setCalls.some((p) => p.is_test_run === true && p.fixture_id === 'push-main')).toBe(
+        true,
+      );
     });
   });
 
@@ -177,6 +194,192 @@ describe('processTestTrigger', () => {
     expect(byName['test-job (a)'].jobConfig.matrixValues).toEqual({ variant: 'a' });
     expect(byName['test-job (a)'].jobConfig.baseJobName).toBe('test-job');
     expect(byName['test-job (a)'].jobConfig.matrix).toBeUndefined();
+  });
+
+  it('honors the needs DAG: only the root job is dispatched, the downstream stays gated', async () => {
+    const needsWorkflow = createMockWorkflow('ci', [
+      {
+        _type: 'static' as const,
+        name: 'build',
+        runsOn: [{ kind: 'exact', value: 'default' }],
+        steps: [{ name: 'b', run: 'echo build' }],
+        needs: [],
+        rules: [],
+      },
+      {
+        _type: 'static' as const,
+        name: 'deploy',
+        runsOn: [{ kind: 'exact', value: 'default' }],
+        steps: [{ name: 'd', run: 'echo deploy' }],
+        needs: ['build'],
+        rules: [],
+      },
+    ]);
+    (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([needsWorkflow]));
+
+    const dispatchSpy = deps.dispatcher.dispatch as any;
+    const result = await processTestTrigger(createMockInput(), deps);
+
+    expect(result.status).toBe('accepted');
+    // Only the root `build` reaches the dispatcher; `deploy` is gated by the
+    // needs scheduler until `build` completes (the webhook-path behavior, now
+    // shared by kici run via the unified core).
+    const dispatchedNames = dispatchSpy.mock.calls.map((c: any[]) => c[0].jobName);
+    expect(dispatchedNames).toEqual(['build']);
+  });
+
+  it('fans out a runsOnAll job into one pinned child per matching roster host', async () => {
+    const fanWorkflow = createMockWorkflow('ci', [
+      {
+        _type: 'static' as const,
+        name: 'fan',
+        runsOnAll: { include: [[{ kind: 'exact', value: 'kici:os:linux' }]], exclude: [] },
+        steps: [{ name: 's', run: 'echo go' }],
+        needs: [],
+        rules: [],
+      },
+    ]);
+    const matchedHosts = [
+      {
+        agentId: 'a1',
+        host: 'h1',
+        labels: ['kici:os:linux'],
+        lifecycleClass: 'static',
+        connectedInstanceId: 'inst-1',
+        status: 'ready',
+        platform: 'linux',
+        arch: 'amd64',
+        properties: {},
+      },
+      {
+        agentId: 'a2',
+        host: 'h2',
+        labels: ['kici:os:linux'],
+        lifecycleClass: 'static',
+        connectedInstanceId: 'inst-1',
+        status: 'ready',
+        platform: 'linux',
+        arch: 'amd64',
+        properties: {},
+      },
+    ];
+    deps.hostRosterStore = { findMatching: vi.fn().mockResolvedValue(matchedHosts) } as any;
+    deps.maxFanoutHosts = 1024;
+    (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([fanWorkflow]));
+
+    const dispatchSpy = deps.dispatcher.dispatch as any;
+    const result = await processTestTrigger(createMockInput(), deps);
+
+    expect(result.status).toBe('accepted');
+    const dispatchedNames = dispatchSpy.mock.calls.map((c: any[]) => c[0].jobName).sort();
+    // One pinned execution per host (the kici run analog of the webhook-only
+    // runsonall fan-out).
+    expect(dispatchedNames).toEqual(['fan (h1)', 'fan (h2)']);
+  });
+
+  it('narrows a runsOnAll fan-out to hosts matching input.target', async () => {
+    const fanWorkflow = createMockWorkflow('ci', [
+      {
+        _type: 'static' as const,
+        name: 'fan',
+        runsOnAll: { include: [[{ kind: 'regex', source: '^role:', flags: '' }]], exclude: [] },
+        steps: [{ name: 's', run: 'echo go' }],
+        needs: [],
+        rules: [],
+      },
+    ]);
+    const matchedHosts = [
+      {
+        agentId: 'a1',
+        host: 'web-01',
+        labels: ['role:web'],
+        lifecycleClass: 'static',
+        connectedInstanceId: 'inst-1',
+        status: 'ready',
+        platform: 'linux',
+        arch: 'amd64',
+        properties: {},
+      },
+      {
+        agentId: 'a2',
+        host: 'db-01',
+        labels: ['role:db'],
+        lifecycleClass: 'static',
+        connectedInstanceId: 'inst-1',
+        status: 'ready',
+        platform: 'linux',
+        arch: 'amd64',
+        properties: {},
+      },
+    ];
+    deps.hostRosterStore = { findMatching: vi.fn().mockResolvedValue(matchedHosts) } as any;
+    deps.maxFanoutHosts = 1024;
+    (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([fanWorkflow]));
+
+    const dispatchSpy = deps.dispatcher.dispatch as any;
+    const result = await processTestTrigger(
+      createMockInput({
+        target: {
+          values: [{ include: [{ kind: 'exact', value: 'role:web' }], exclude: [] }],
+          allowEmpty: false,
+        },
+      }),
+      deps,
+    );
+
+    expect(result.status).toBe('accepted');
+    // Only the role:web host produces a pinned execution; role:db is narrowed out.
+    const dispatchedNames = dispatchSpy.mock.calls.map((c: any[]) => c[0].jobName).sort();
+    expect(dispatchedNames).toEqual(['fan (web-01)']);
+  });
+
+  it('stamps isTestRun + fixtureId on every dispatched job and marks the run in-memory', async () => {
+    (deps.lockFileCache.get as any).mockResolvedValue(
+      createMockLockFile([createMockWorkflow('ci')]),
+    );
+    const markTestRun = vi.fn();
+    deps.executionTracker = {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      markTestRun,
+      db: {
+        updateTable: vi.fn(() => ({
+          set: vi.fn(() => ({
+            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+          })),
+        })),
+      },
+    } as any;
+
+    const dispatchSpy = deps.dispatcher.dispatch as any;
+    const result = await processTestTrigger(createMockInput(), deps);
+
+    expect(result.status).toBe('accepted');
+    const jobConfig = dispatchSpy.mock.calls[0][0].jobConfig;
+    expect(jobConfig.isTestRun).toBe(true);
+    expect(jobConfig.fixtureId).toBe('push-main');
+    expect(markTestRun).toHaveBeenCalledWith(result.runId);
+  });
+
+  it('accepts the full ProcessingDeps bag (hostRosterStore + maxFanoutHosts) and dispatches', async () => {
+    // The test path now receives the same ProcessingDeps the webhook entry
+    // builds, so the host/init/dynamic deps are present (single-orch: no
+    // coordinator). This proves the type migration: a ProcessingDeps carrying
+    // hostRosterStore/maxFanoutHosts is a valid input to processTestTrigger.
+    const procDeps = createMockDeps({
+      hostRosterStore: { findMatching: vi.fn().mockResolvedValue([]) } as any,
+      maxFanoutHosts: 1024,
+      pendingInits: {} as any,
+      pendingDynamics: {} as any,
+    });
+    (procDeps.lockFileCache.get as any).mockResolvedValue(
+      createMockLockFile([createMockWorkflow('ci')]),
+    );
+
+    const result = await processTestTrigger(createMockInput(), procDeps);
+
+    expect(result.status).toBe('accepted');
+    expect(procDeps.hostRosterStore).toBeDefined();
+    expect(procDeps.maxFanoutHosts).toBe(1024);
   });
 
   it('with workflowName bypasses trigger matching', async () => {
@@ -549,10 +752,12 @@ describe('processTestTrigger', () => {
   describe('test-scoped secret resolution', () => {
     const TEST_ORG = 'org-secret-test';
 
-    // Build a db mock that answers both resolveOrgId (sources lookup) and the
-    // environments lookup in resolveTestRunSecrets, keyed on the table name.
+    // Build a db mock that answers resolveOrgId (sources lookup), the env gate +
+    // fixture-namespaced env lookups, and the core's env-rules concurrency query,
+    // keyed on the table name.
     function makeSecretDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
+        fn: { countAll: () => ({ as: () => ({}) }) },
         selectFrom: vi.fn((table: string) => ({
           select: vi.fn(() => {
             // Capture the env name from the chained `.where('name', '=', X)`.
@@ -562,17 +767,23 @@ describe('processTestTrigger', () => {
                 if (col === 'name') envName = val;
                 return chain;
               }),
+              innerJoin: vi.fn(() => chain),
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: TEST_ORG };
                 if (table === 'generic_webhook_sources') return undefined;
                 if (table === 'environments') return envName ? envRows[envName] : undefined;
+                if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
               }),
             };
             return chain;
           }),
-          // execution_runs marker update path used by recordTestExecutionStart.
-          updateTable: vi.fn(),
+        })),
+        insertInto: vi.fn(() => ({
+          values: vi.fn(() => ({
+            onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+            execute: vi.fn().mockResolvedValue(undefined),
+          })),
         })),
         updateTable: vi.fn(() => ({
           set: vi.fn(() => ({
@@ -582,7 +793,39 @@ describe('processTestTrigger', () => {
       };
     }
 
-    function captureDispatchedJobConfig(deps: TestPipelineDeps): () => any {
+    /** Env store whose matchEnvironment returns a full row (no protection rules). */
+    function makeTestEnvStore(name: string) {
+      return {
+        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+          n === name
+            ? {
+                id: `env-${name}`,
+                org_id: TEST_ORG,
+                name,
+                type: 'deployment',
+                glob_pattern: null,
+                branch_restrictions: null,
+                trigger_type_filters: null,
+                repo_patterns: null,
+                concurrency_limit: null,
+                concurrency_strategy: null,
+                concurrency_timeout_ms: null,
+                required_reviewers: null,
+                wait_timer_seconds: null,
+                hold_expiry_seconds: null,
+                minimum_trust: null,
+                allow_local_execution: true,
+                enabled: true,
+                created_at: new Date(),
+                updated_at: new Date(),
+                created_by: null,
+              }
+            : null,
+        ),
+      } as any;
+    }
+
+    function captureDispatchedJobConfig(deps: ProcessingDeps): () => any {
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -641,6 +884,7 @@ describe('processTestTrigger', () => {
         ['test-database', { KICI_DATABASE_URL: 'shared' }],
       ]);
       deps.db = makeSecretDb({ 'test-database': { allow_local_execution: true } }) as any;
+      deps.environmentStore = makeTestEnvStore('test-database');
       deps.secretResolver = {
         resolveForJob: vi.fn(async (_org: string, env: string) => perEnv.get(env) ?? {}),
       } as any;
@@ -698,6 +942,7 @@ describe('processTestTrigger', () => {
     // environments lookup keyed on the env name.
     function makeInlineDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
+        fn: { countAll: () => ({ as: () => ({}) }) },
         selectFrom: vi.fn((table: string) => ({
           select: vi.fn(() => {
             let envName: string | undefined;
@@ -706,15 +951,23 @@ describe('processTestTrigger', () => {
                 if (col === 'name') envName = val;
                 return chain;
               }),
+              innerJoin: vi.fn(() => chain),
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: INLINE_ORG };
                 if (table === 'generic_webhook_sources') return undefined;
                 if (table === 'environments') return envName ? envRows[envName] : undefined;
+                if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
               }),
             };
             return chain;
           }),
+        })),
+        insertInto: vi.fn(() => ({
+          values: vi.fn(() => ({
+            onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+            execute: vi.fn().mockResolvedValue(undefined),
+          })),
         })),
         updateTable: vi.fn(() => ({
           set: vi.fn(() => ({
@@ -722,6 +975,38 @@ describe('processTestTrigger', () => {
           })),
         })),
       };
+    }
+
+    /** Env store whose matchEnvironment returns a full row (no protection rules). */
+    function makeInlineEnvStore(name: string) {
+      return {
+        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+          n === name
+            ? {
+                id: `env-${name}`,
+                org_id: INLINE_ORG,
+                name,
+                type: 'deployment',
+                glob_pattern: null,
+                branch_restrictions: null,
+                trigger_type_filters: null,
+                repo_patterns: null,
+                concurrency_limit: null,
+                concurrency_strategy: null,
+                concurrency_timeout_ms: null,
+                required_reviewers: null,
+                wait_timer_seconds: null,
+                hold_expiry_seconds: null,
+                minimum_trust: null,
+                allow_local_execution: true,
+                enabled: true,
+                created_at: new Date(),
+                updated_at: new Date(),
+                created_by: null,
+              }
+            : null,
+        ),
+      } as any;
     }
 
     const inlineEnvExpression =
@@ -763,6 +1048,7 @@ describe('processTestTrigger', () => {
       const lockFile = createMockLockFile([inlineEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeInlineDb({ 'test-db': { allow_local_execution: true } }) as any;
+      deps.environmentStore = makeInlineEnvStore('test-db');
 
       const resolveForJob = vi.fn(async (_org: string, env: string) =>
         env === 'test-db' ? { DB_URL: 'x' } : {},
@@ -884,6 +1170,7 @@ describe('processTestTrigger', () => {
     // environments gate lookup keyed on the env name.
     function makeParityDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
+        fn: { countAll: () => ({ as: () => ({}) }) },
         selectFrom: vi.fn((table: string) => ({
           select: vi.fn(() => {
             let envName: string | undefined;
@@ -892,15 +1179,25 @@ describe('processTestTrigger', () => {
                 if (col === 'name') envName = val;
                 return chain;
               }),
+              innerJoin: vi.fn(() => chain),
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: ORG };
                 if (table === 'generic_webhook_sources') return undefined;
                 if (table === 'environments') return envName ? envRows[envName] : undefined;
+                // execution_jobs running-count query → no concurrent jobs.
+                if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
               }),
             };
             return chain;
           }),
+          insertInto: vi.fn(),
+        })),
+        insertInto: vi.fn(() => ({
+          values: vi.fn(() => ({
+            onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+            execute: vi.fn().mockResolvedValue(undefined),
+          })),
         })),
         updateTable: vi.fn(() => ({
           set: vi.fn(() => ({
@@ -910,7 +1207,7 @@ describe('processTestTrigger', () => {
       };
     }
 
-    function captureDispatchedJobConfig(deps: TestPipelineDeps): () => any {
+    function captureDispatchedJobConfig(deps: ProcessingDeps): () => any {
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -918,11 +1215,34 @@ describe('processTestTrigger', () => {
       return () => dispatch.mock.calls[0]?.[0]?.jobConfig;
     }
 
-    /** Env store whose matchEnvironment returns a row with the given id. */
+    /** Env store whose matchEnvironment returns a full row (no protection rules). */
     function makeEnvironmentStore(name: string, id: string) {
       return {
         matchEnvironment: vi.fn(async (_org: string, n: string) =>
-          n === name ? { id, org_id: ORG, name } : null,
+          n === name
+            ? {
+                id,
+                org_id: ORG,
+                name,
+                type: 'deployment',
+                glob_pattern: null,
+                branch_restrictions: null,
+                trigger_type_filters: null,
+                repo_patterns: null,
+                concurrency_limit: null,
+                concurrency_strategy: null,
+                concurrency_timeout_ms: null,
+                required_reviewers: null,
+                wait_timer_seconds: null,
+                hold_expiry_seconds: null,
+                minimum_trust: null,
+                allow_local_execution: true,
+                enabled: true,
+                created_at: new Date(),
+                updated_at: new Date(),
+                created_by: null,
+              }
+            : null,
         ),
       } as any;
     }

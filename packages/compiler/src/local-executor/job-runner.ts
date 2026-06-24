@@ -238,6 +238,14 @@ export async function resolveJobs(
                 new Error('ctx.kici.oidc.token() is not available during local execution'),
               ),
           },
+          host: {
+            // Host reboot runs on the agent's own host via the orchestrator;
+            // local execution has no host to reboot.
+            requestReboot: () =>
+              Promise.reject(
+                new Error('ctx.kici.host.requestReboot() is not available during local execution'),
+              ),
+          },
         },
       };
       const generatedJobs = await jobOrFn(dynamicContext);

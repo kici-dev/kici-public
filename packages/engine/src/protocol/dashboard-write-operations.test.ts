@@ -13,8 +13,8 @@ import {
 } from './dashboard-write-operations.js';
 
 describe('DashboardWriteOperation enum', () => {
-  it('has 24 values', () => {
-    expect(DashboardWriteOperation.options).toHaveLength(24);
+  it('has 26 values', () => {
+    expect(DashboardWriteOperation.options).toHaveLength(26);
   });
 
   it('matches DASHBOARD_WRITE_OPERATION_VALUES exactly', () => {

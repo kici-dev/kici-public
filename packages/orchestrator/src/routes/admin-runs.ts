@@ -386,10 +386,10 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
 
       // Resolved dependency edges for the run, grouped by downstream job_name.
       // Surfaced so operators (and the dashboard DAG view) see what each job
-      // depended on, with the per-edge failure policy.
+      // depended on, with the per-edge run-on status-set.
       const needsRows = await deps.db
         .selectFrom('execution_job_needs')
-        .select(['job_name', 'upstream_name', 'if_failed'])
+        .select(['job_name', 'upstream_name', 'run_on'])
         .where('run_id', '=', runId)
         .execute();
       const needsByJob = groupNeedsByJobName(needsRows);

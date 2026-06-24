@@ -22,6 +22,7 @@ import {
   convertManifestCode,
   waitForInstallation,
   verifyRepoAccess,
+  validateWebhookUrl,
   type GithubAppCredentials,
 } from '../../providers/github/manifest.js';
 import { manifestCreateUrl } from '../../providers/github/manifest-form.js';
@@ -41,6 +42,14 @@ export interface ManifestSetupOptions {
   name: string;
   noBrowser?: boolean;
   githubOrg?: string;
+  /**
+   * Self-hosted webhook URL override. When set, it is baked verbatim into the
+   * App manifest's `hook_attributes.url` and the platform-mode webhook-URL
+   * resolution is skipped — so the flow works even where the auto-resolved KiCI
+   * platform URL is unavailable. KiCI adds no ingress at this URL; the operator
+   * owns delivery. Advanced/self-hosted only.
+   */
+  webhookUrl?: string;
 }
 
 /** Injectable boundary so unit tests can stub GitHub + the browser + stdin. */
@@ -138,9 +147,12 @@ async function storeAndRegister(
   creds: GithubAppCredentials,
 ): Promise<{ routingKey: string }> {
   try {
+    // GitHub is the source of truth for the stored name + slug — the conversion
+    // response carries both. `opts.name` was only the *requested* manifest name.
     return await client.post<{ routingKey: string; name: string }>('/api/v1/admin/sources', {
       provider: 'github',
-      name: opts.name,
+      name: creds.name,
+      slug: creds.slug,
       appId: creds.appId,
       privateKey: creds.privateKey,
       webhookSecret: creds.webhookSecret,
@@ -165,8 +177,13 @@ export async function runGithubManifestSetup(
   client: AdminApiClient,
   deps: ManifestSetupDeps = realManifestSetupDeps,
 ): Promise<void> {
-  // 1. Resolve the webhook URL BEFORE creating anything on GitHub.
-  const webhookUrl = await resolveWebhookUrl(client);
+  // 1. Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
+  //    --webhook-url is the operator asserting "I own delivery": it is used
+  //    verbatim and decouples the flow from platform-mode URL resolution (so it
+  //    works even where the auto-resolved platform URL is unavailable).
+  const webhookUrl = opts.webhookUrl
+    ? validateWebhookUrl(opts.webhookUrl)
+    : await resolveWebhookUrl(client);
 
   // 2. Generate the CSRF state. (GitHub generates the webhook secret itself.)
   const state = randomBytes(16).toString('hex');

@@ -2744,24 +2744,28 @@ describe('DashboardHandler', () => {
 });
 
 describe('groupNeedsByJobName', () => {
-  it('groups edges by downstream job_name and normalizes if_failed', () => {
+  it('groups edges by downstream job_name and parses run_on', () => {
     const grouped = groupNeedsByJobName([
-      { job_name: 'test', upstream_name: 'build', if_failed: 'skip' },
-      { job_name: 'deploy', upstream_name: 'test', if_failed: 'run' },
-      { job_name: 'deploy', upstream_name: 'lint', if_failed: 'skip' },
+      { job_name: 'test', upstream_name: 'build', run_on: JSON.stringify(['success']) },
+      {
+        job_name: 'deploy',
+        upstream_name: 'test',
+        run_on: JSON.stringify(['failed', 'timed_out_stale']),
+      },
+      { job_name: 'deploy', upstream_name: 'lint', run_on: JSON.stringify(['success']) },
     ]);
-    expect(grouped.get('test')).toEqual([{ upstreamName: 'build', ifFailed: 'skip' }]);
+    expect(grouped.get('test')).toEqual([{ upstreamName: 'build', runOn: ['success'] }]);
     expect(grouped.get('deploy')).toEqual([
-      { upstreamName: 'test', ifFailed: 'run' },
-      { upstreamName: 'lint', ifFailed: 'skip' },
+      { upstreamName: 'test', runOn: ['failed', 'timed_out_stale'] },
+      { upstreamName: 'lint', runOn: ['success'] },
     ]);
   });
 
-  it('defaults an unknown if_failed to skip', () => {
+  it('defaults a malformed run_on to success-only', () => {
     const grouped = groupNeedsByJobName([
-      { job_name: 'a', upstream_name: 'b', if_failed: 'weird' },
+      { job_name: 'a', upstream_name: 'b', run_on: 'not-json' },
     ]);
-    expect(grouped.get('a')).toEqual([{ upstreamName: 'b', ifFailed: 'skip' }]);
+    expect(grouped.get('a')).toEqual([{ upstreamName: 'b', runOn: ['success'] }]);
   });
 
   it('returns an empty map for no rows', () => {

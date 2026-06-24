@@ -1,77 +1,129 @@
 import { describe, it, expect } from 'vitest';
-import { NeedsEntrySchema, NeedsGroupEntrySchema, SCHEMA_VERSION } from './types.js';
+import {
+  NeedsEntrySchema,
+  NeedsGroupEntrySchema,
+  SCHEMA_VERSION,
+  resolveWhenToRunOn,
+} from './types.js';
+import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
 import type { LockDynamicJobFn, LockStep, LockJob, LockWorkflow } from './types.js';
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 21', () => {
-    expect(SCHEMA_VERSION).toBe(21);
+  it('SCHEMA_VERSION is 22', () => {
+    expect(SCHEMA_VERSION).toBe(22);
   });
 
   it('LockStep/LockJob/LockWorkflow accept an approval block', () => {
     const step: LockStep = {
       name: 's',
       hasOutputs: false,
-      approval: { clauses: [{ team: 'leads' }], reason: 'gate', timeoutSeconds: 3600 },
+      approval: {
+        clauses: [{ team: 'leads' }],
+        reason: 'gate',
+        timeoutSeconds: 3600,
+        when: 'always',
+      },
     };
-    const jobApproval: LockJob['approval'] = { clauses: [] };
-    const wfApproval: LockWorkflow['approval'] = { clauses: [{ user: 'cto' }] };
+    const jobApproval: LockJob['approval'] = { clauses: [], when: 'always' };
+    const wfApproval: LockWorkflow['approval'] = { clauses: [{ user: 'cto' }], when: 'always' };
     expect(step.approval?.clauses).toHaveLength(1);
     expect(jobApproval?.clauses).toHaveLength(0);
     expect(wfApproval?.clauses[0]).toEqual({ user: 'cto' });
   });
 });
 
+describe('resolveWhenToRunOn', () => {
+  it('defaults to success-only', () => {
+    expect(resolveWhenToRunOn(undefined)).toEqual([ExecutionJobStatus.enum.success]);
+  });
+  it('maps on-success to success-only', () => {
+    expect(resolveWhenToRunOn('on-success')).toEqual([ExecutionJobStatus.enum.success]);
+  });
+  it('maps on-failure to failed + timed_out_stale', () => {
+    expect(resolveWhenToRunOn('on-failure').sort()).toEqual(
+      [ExecutionJobStatus.enum.failed, ExecutionJobStatus.enum.timed_out_stale].sort(),
+    );
+  });
+  it('maps on-skip to success + skipped', () => {
+    expect(resolveWhenToRunOn('on-skip').sort()).toEqual(
+      [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped].sort(),
+    );
+  });
+  it('maps always to every terminal status', () => {
+    expect(resolveWhenToRunOn('always').sort()).toEqual([...TERMINAL_JOB_STATES].sort());
+  });
+  it('passes a raw status-set through', () => {
+    expect(resolveWhenToRunOn([ExecutionJobStatus.enum.skipped])).toEqual([
+      ExecutionJobStatus.enum.skipped,
+    ]);
+  });
+});
+
 describe('NeedsEntrySchema', () => {
-  it('parses { name: "build", ifFailed: "skip" }', () => {
-    const result = NeedsEntrySchema.parse({ name: 'build', ifFailed: 'skip' });
+  it('parses { name: "build", runOn: ["success"] }', () => {
+    const result = NeedsEntrySchema.parse({
+      name: 'build',
+      runOn: [ExecutionJobStatus.enum.success],
+    });
     expect(result.name).toBe('build');
-    expect(result.ifFailed).toBe('skip');
+    expect(result.runOn).toEqual([ExecutionJobStatus.enum.success]);
   });
 
-  it('parses { name: "build", ifFailed: "run" }', () => {
-    const result = NeedsEntrySchema.parse({ name: 'build', ifFailed: 'run' });
-    expect(result.name).toBe('build');
-    expect(result.ifFailed).toBe('run');
+  it('parses a multi-status runOn set', () => {
+    const result = NeedsEntrySchema.parse({
+      name: 'build',
+      runOn: [ExecutionJobStatus.enum.failed, ExecutionJobStatus.enum.timed_out_stale],
+    });
+    expect(result.runOn).toEqual([
+      ExecutionJobStatus.enum.failed,
+      ExecutionJobStatus.enum.timed_out_stale,
+    ]);
   });
 
-  it('defaults ifFailed to "skip" when omitted', () => {
+  it('defaults runOn to [success] when omitted', () => {
     const result = NeedsEntrySchema.parse({ name: 'build' });
-    expect(result.ifFailed).toBe('skip');
+    expect(result.runOn).toEqual([ExecutionJobStatus.enum.success]);
   });
 
-  it('rejects invalid ifFailed value', () => {
-    expect(() => NeedsEntrySchema.parse({ name: 'build', ifFailed: 'invalid' })).toThrow();
+  it('rejects an invalid runOn status', () => {
+    expect(() => NeedsEntrySchema.parse({ name: 'build', runOn: ['nope'] })).toThrow();
+  });
+
+  it('rejects an empty runOn set', () => {
+    expect(() => NeedsEntrySchema.parse({ name: 'build', runOn: [] })).toThrow();
   });
 
   it('rejects missing name', () => {
-    expect(() => NeedsEntrySchema.parse({ ifFailed: 'skip' })).toThrow();
+    expect(() => NeedsEntrySchema.parse({ runOn: [ExecutionJobStatus.enum.success] })).toThrow();
   });
 });
 
 describe('NeedsGroupEntrySchema', () => {
-  it('parses { group: "tests", ifFailed: "run" }', () => {
-    const result = NeedsGroupEntrySchema.parse({ group: 'tests', ifFailed: 'run' });
+  it('parses { group: "tests", runOn: ["success", "skipped"] }', () => {
+    const result = NeedsGroupEntrySchema.parse({
+      group: 'tests',
+      runOn: [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped],
+    });
     expect(result.group).toBe('tests');
-    expect(result.ifFailed).toBe('run');
+    expect(result.runOn).toEqual([
+      ExecutionJobStatus.enum.success,
+      ExecutionJobStatus.enum.skipped,
+    ]);
   });
 
-  it('parses { group: "tests", ifFailed: "skip" }', () => {
-    const result = NeedsGroupEntrySchema.parse({ group: 'tests', ifFailed: 'skip' });
-    expect(result.group).toBe('tests');
-    expect(result.ifFailed).toBe('skip');
-  });
-
-  it('defaults ifFailed to "skip" when omitted', () => {
+  it('defaults runOn to [success] when omitted', () => {
     const result = NeedsGroupEntrySchema.parse({ group: 'tests' });
-    expect(result.ifFailed).toBe('skip');
+    expect(result.runOn).toEqual([ExecutionJobStatus.enum.success]);
   });
 
-  it('rejects invalid ifFailed value', () => {
-    expect(() => NeedsGroupEntrySchema.parse({ group: 'tests', ifFailed: 'invalid' })).toThrow();
+  it('rejects an invalid runOn status', () => {
+    expect(() => NeedsGroupEntrySchema.parse({ group: 'tests', runOn: ['invalid'] })).toThrow();
   });
 
   it('rejects missing group', () => {
-    expect(() => NeedsGroupEntrySchema.parse({ ifFailed: 'skip' })).toThrow();
+    expect(() =>
+      NeedsGroupEntrySchema.parse({ runOn: [ExecutionJobStatus.enum.success] }),
+    ).toThrow();
   });
 });
 

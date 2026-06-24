@@ -22,15 +22,33 @@ export enum VariantKind {
 }
 
 /**
- * Thrown when a job's matrix cannot be materialized into dispatchable children:
- * zero combinations after exclude, or more combinations than {@link MAX_FANOUT_JOBS}.
- * Callers map this onto the `matrix_expansion` init-failure category.
+ * Why a fan-out produced no dispatchable children. Drives whether the zeroed
+ * job's synthetic terminal row is recorded as a failure or a skip:
+ *
+ * - `error` — a genuine failure: invalid matrix (zero combinations / over the
+ *   cap), an unavailable roster, or `onUnreachable: 'fail'` with an absent host.
+ *   The synthetic job is `failed`.
+ * - `narrowed-empty` — the fan-out intentionally resolved to zero usable hosts
+ *   (e.g. `onUnreachable: 'skip'` skipped every unreachable host). The synthetic
+ *   job is `skipped`.
+ */
+export enum FanoutCause {
+  error = 'error',
+  narrowedEmpty = 'narrowed-empty',
+}
+
+/**
+ * Thrown when a job's fan-out cannot be materialized into dispatchable children:
+ * an invalid matrix, an unavailable / zeroed host roster. The `cause` discriminates
+ * a genuine failure from an intentional narrow-to-empty so the caller can record
+ * the zeroed job's synthetic row as `failed` or `skipped` accordingly.
  */
 export class FanoutError extends Error {
   override readonly name = 'FanoutError';
   constructor(
     readonly jobName: string,
     message: string,
+    readonly cause: FanoutCause = FanoutCause.error,
   ) {
     super(message);
     Object.setPrototypeOf(this, FanoutError.prototype);

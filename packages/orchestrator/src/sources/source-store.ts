@@ -24,6 +24,8 @@ export interface AddSourceParams {
   provider: string;
   /** Human-readable source name */
   name: string;
+  /** GitHub App slug (the authoritative URL-safe identifier). Optional. */
+  slug?: string;
   /** App ID for the provider (used to build routing key) */
   appId: string;
   /** Private key (PEM format for GitHub Apps) */
@@ -81,6 +83,7 @@ export class SourceStore {
         name: params.name,
         routing_key: routingKey,
         config: configJson,
+        slug: params.slug ?? null,
         ...(params.customerId ? { customer_id: params.customerId } : {}),
       })
       .returningAll()
@@ -149,6 +152,8 @@ export class SourceStore {
     routingKey: string,
     updates: {
       name?: string;
+      /** New GitHub App slug. `null` clears it; `undefined` leaves it unchanged. */
+      slug?: string | null;
       privateKey?: string;
       webhookSecret?: string;
       config?: Record<string, unknown>;
@@ -165,6 +170,7 @@ export class SourceStore {
     // Build DB update set
     const dbUpdates: Record<string, unknown> = { updated_at: sql`now()` };
     if (updates.name) dbUpdates.name = updates.name;
+    if (updates.slug !== undefined) dbUpdates.slug = updates.slug;
     if (updates.customerId) dbUpdates.customer_id = updates.customerId;
     if (updates.config) {
       const existingConfig =

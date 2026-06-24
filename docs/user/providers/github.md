@@ -82,11 +82,12 @@ GitHub App "my-org" is live.
 
 **Flags:**
 
-| Flag                  | Effect                                                                                                                                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--name <name>`       | The App name on GitHub (required).                                                                                                                                                                                  |
-| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account.                                                                                                                                        |
-| `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it. |
+| Flag                  | Effect                                                                                                                                                                                                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--name <name>`       | The App name you _request_ on GitHub (required). GitHub assigns the final name + slug; the stored, displayed name always comes from GitHub (see [Display name and slug](#display-name-and-slug)).                                                                                     |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account.                                                                                                                                                                                                          |
+| `--webhook-url <url>` | **Advanced / self-hosted.** Bake this `https://` URL into the App's webhook verbatim and skip the platform-mode webhook-URL resolution (so it works even where the auto-resolved KiCI Platform URL is unavailable). See [Self-hosted webhook URL](#self-hosted-webhook-url-override). |
+| `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it.                                                                   |
 
 The manifest flow always creates a **new** App on GitHub. If a source for
 that App id already exists on the orchestrator, the command refuses — use
@@ -249,6 +250,53 @@ If you install the same App across multiple KiCI orgs, each org has
 its own source record and the orchestrator looks up the right one by
 combining the URL's `<orgId>` with the App ID from the
 `X-GitHub-Hook-Installation-Target-ID` header.
+
+## Display name and slug
+
+For a GitHub App source, **GitHub is the source of truth for the displayed
+name**. `--name` is only the name you _request_ when the App is created;
+GitHub assigns the final display name and a URL-safe **slug**
+(`my-org` → `my-org-1` if the name was taken). KiCI captures both at creation
+and shows them in the dashboard **Sources** tab — the display name prominently,
+with the slug as dimmed secondary text.
+
+If you later rename the App in GitHub's UI, KiCI keeps the displayed name in
+sync two ways:
+
+- **Automatically**, on a daily schedule. The orchestrator re-reads each GitHub
+  source's name + slug from GitHub and updates the dashboard if they changed.
+  The interval is configurable via `KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`
+  (default 24h).
+- **On demand**, with `source refresh`:
+
+  ```bash
+  kici-admin source refresh github:<appId>   # one source
+  kici-admin source refresh --all            # every GitHub source
+  ```
+
+  It prints `old → new` for any name or slug that changed, and is a no-op when
+  GitHub already matches what KiCI has stored. Non-GitHub routing keys are
+  rejected — name/slug sync applies only to GitHub App sources.
+
+## Self-hosted webhook URL override
+
+By default the manifest flow bakes the KiCI Platform webhook endpoint
+(`https://<platform-host>/webhook/<orgId>/github`) into the App. If you run
+your own ingress and want GitHub to deliver events to it instead, pass
+`--webhook-url` when creating the App:
+
+```bash
+kici-admin source add github --manifest --name my-org \
+  --webhook-url https://hooks.my-infra.example/github
+```
+
+The supplied URL must be an absolute `https://` URL; it is written into the
+App's webhook configuration **verbatim**. This is the operator asserting "I own
+webhook delivery": KiCI adds **no** ingress at this URL and does **not** receive
+events there — your own infrastructure is responsible for accepting GitHub's
+deliveries and routing them onward. Supplying the flag also decouples App
+creation from platform-mode URL resolution, so it works even in a configuration
+where the auto-resolved KiCI Platform URL is unavailable.
 
 ## Global workflows
 

@@ -206,33 +206,36 @@ Multiple CLI clients can observe the same run simultaneously.
 
 Test runs share most of the production pipeline but differ in key ways:
 
-| Aspect              | Production run               | Test run                                    |
-| ------------------- | ---------------------------- | ------------------------------------------- |
-| Trigger source      | GitHub webhook               | `POST /api/v1/test/trigger`                 |
-| Event normalization | Provider-specific normalizer | Synthetic event from fixture                |
-| Trigger matching    | Lock file triggers           | Same pipeline (or bypass with `--workflow`) |
-| Repo state          | Exact commit from webhook    | Clone + overlay of local changes            |
-| Secret access       | All contexts                 | Only `allowLocalExecution: true` contexts   |
-| Tracking            | `execution_runs` table       | Same table with `is_test_run = true`        |
-| Delivery ID         | Provider-assigned            | `test:` prefix + UUID                       |
-| Observer streaming  | Not available                | WS observer channel                         |
-| `ctx.isTestRun`     | `false`                      | `true`                                      |
+| Aspect              | Production run                   | Test run                                            |
+| ------------------- | -------------------------------- | --------------------------------------------------- |
+| Trigger source      | GitHub webhook                   | `POST /api/v1/test/trigger`                         |
+| Event normalization | Provider-specific normalizer     | Synthetic event from fixture                        |
+| Trigger matching    | Lock file triggers               | Same pipeline (or bypass with `--workflow`)         |
+| Dispatch core       | Shared `dispatchMatchedWorkflow` | Same shared core (needs DAG, host fan-out, dynamic) |
+| Repo state          | Exact commit from webhook        | Clone + overlay of local changes                    |
+| Secret access       | All contexts                     | Only `allowLocalExecution: true` contexts           |
+| Tracking            | `execution_runs` table           | Same table with `is_test_run = true`                |
+| Delivery ID         | Provider-assigned                | `test:` prefix + UUID                               |
+| Observer streaming  | Not available                    | WS observer channel                                 |
+| `ctx.isTestRun`     | `false`                          | `true`                                              |
 
-### Pipeline reuse
+### One dispatch core, two adapters
 
-Test runs inject into the existing webhook processing pipeline. The `processTestTrigger()` function:
+There is a single dispatch core (`dispatchMatchedWorkflow`) and two thin adapters that feed it: the webhook adapter (real provider event) and the test adapter (`processTestTrigger`, for `kici run` / `kici test`). The webhook-only preamble — delivery dedup, Platform relay, provider normalization, source registration — runs in the caller, not inside the core, so the test adapter reaches the same core without it.
 
-1. Constructs a synthetic `WebhookInfo` from the fixture's event
-2. Skips webhook signature verification (CLI authentication replaces it)
-3. Skips provider normalization (event is already in normalized form)
-4. Feeds into the same lock file fetch -> trigger match -> dispatch pipeline
-5. Marks the execution as `isTestRun` for observer broadcasting and secret gating
+The test adapter:
 
-This means test runs exercise the same trigger matching, cache resolution, job dispatch, and step execution as production -- maximizing confidence that what works in test will work in production.
+1. Resolves the lock file (inline for a local repo with no remote, or the same provider-driven fetch the webhook uses).
+2. Selects matched workflow decisions (normal trigger matching, or a direct `--workflow` bypass).
+3. Enforces the `allowLocalExecution` environment gate and stores the fixture payload.
+4. Builds a dispatch context per matched workflow — a synthetic `WebhookInfo`, the test provenance fields, and a CLI-secret overlay that wins over orchestrator env secrets — and calls the shared core.
+5. Marks the execution as `isTestRun` for observer broadcasting and secret gating.
+
+Because the test adapter calls the same core, a `kici run` exercises the full dispatch behavior — needs-DAG scheduling, `runsOnAll` host fan-out, matrix and fan-out edge wiring, and deferred init/dynamic job dispatch — exactly as a webhook does. A multi-job `needs` workflow run via `kici run` honors the dependency DAG (a downstream job dispatches only after its upstream reaches a matching state), and a `runsOnAll` job fans out to one pinned execution per matching roster host.
 
 ### Dispatch parity
 
-A test-run `job.dispatch` carries the same execution-shaping fields as a production dispatch, all derived from the fixture's simulated event: the normalized event envelope (`{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }`), the resolved job `env`, the resolved environment name, and that environment's variables. Dynamic functions evaluate against this envelope exactly as they do in production. A **pure inline** `environment` expression is evaluated at the orchestrator and the resolved name is gated through `allowLocalExecution` like a static string, so its environment-scoped secrets and variables participate in the run. Impure dynamic environments require an init job, which test runs do not dispatch; supply such a job's secrets via a fixture `secrets:` mapping instead.
+A test-run `job.dispatch` carries the same execution-shaping fields as a production dispatch, all derived from the fixture's simulated event: the normalized event envelope (`{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }`), the resolved job `env`, the resolved environment name, and that environment's variables. Dynamic functions evaluate against this envelope exactly as they do in production. A **pure inline** `environment` expression is evaluated at the orchestrator and the resolved name is gated through `allowLocalExecution` like a static string, so its environment-scoped secrets and variables participate in the run. Because the test adapter routes through the shared core, an **impure dynamic** field (a `__init__` job) and a dynamic job generator (`__dynamic__`) both dispatch for a test run too, and a fixture `secrets:` mapping supplies additional namespaced secret contexts.
 
 ## Upload storage
 

@@ -1,10 +1,17 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { HostRosterStore } from './host-roster.js';
+import { RebootDeadlineSweep } from '../stale-detector/reboot-deadline-sweep.js';
 
 const logger = createLogger({ prefix: 'host-roster-reaper' });
 
 export interface HostRosterReaperOptions {
-  store: Pick<HostRosterStore, 'reapEphemeralPastTtl' | 'countStaticUnreachable'>;
+  store: Pick<
+    HostRosterStore,
+    | 'reapEphemeralPastTtl'
+    | 'countStaticUnreachable'
+    | 'listExpiredRebootPending'
+    | 'clearRebootPending'
+  >;
   ttlMs: number;
   /** Grace window for the connected-but-stale case in `countStaticUnreachable`. */
   graceMs: number;
@@ -35,6 +42,7 @@ export class HostRosterReaper {
   private readonly graceMs: number;
   private readonly scanIntervalMs: number;
   private readonly setUnreachableGauge: (value: number) => void;
+  private readonly rebootSweep: RebootDeadlineSweep;
   private timer: ReturnType<typeof setInterval> | null = null;
   private isLeader = false;
 
@@ -44,6 +52,7 @@ export class HostRosterReaper {
     this.graceMs = opts.graceMs;
     this.scanIntervalMs = opts.scanIntervalMs;
     this.setUnreachableGauge = opts.setUnreachableGauge;
+    this.rebootSweep = new RebootDeadlineSweep({ rosterStore: opts.store });
   }
 
   onBecomeLeader(): void {
@@ -90,5 +99,9 @@ export class HostRosterReaper {
     const unreachable = await this.store.countStaticUnreachable(this.graceMs);
     this.setUnreachableGauge(unreachable);
     if (unreachable > 0) logger.warn('Declared hosts unreachable', { count: unreachable });
+
+    // Clear any reboot-pending flag whose deadline has passed (host never
+    // returned). The held post-restart job then fails via the queue timeout.
+    await this.rebootSweep.scan();
   }
 }

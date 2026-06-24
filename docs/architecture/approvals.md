@@ -11,12 +11,12 @@ For authoring gates see [Approval gates (user guide)](../user/approvals.md); for
 
 Two independent sources can hold an element. They differ only in **what triggers** the hold and **where the approver requirement comes from** — both funnel into the same held-element mechanism.
 
-| Source        | Trigger                                   | Requirement source                                   | Granularity           |
-| ------------- | ----------------------------------------- | ---------------------------------------------------- | --------------------- |
-| **Mandatory** | element targets a protected environment   | environment policy (required reviewers)              | job                   |
-| **Explicit**  | author wrote `requireApproval` in the SDK | the clauses in code, resolved against operator teams | step / job / workflow |
+| Source        | Trigger                                 | Requirement source                                   | Granularity           |
+| ------------- | --------------------------------------- | ---------------------------------------------------- | --------------------- |
+| **Mandatory** | element targets a protected environment | environment policy (required reviewers)              | job                   |
+| **Explicit**  | author wrote `approval` in the SDK      | the clauses in code, resolved against operator teams | step / job / workflow |
 
-The explicit `requireApproval` declaration is compiled into the lock file's `approval` block (at the matching step, job, or workflow node). The mandatory requirement is resolved at dispatch time from the environment's reviewer policy. Both normalize to one shape before the gate evaluates them:
+The explicit `approval` declaration is compiled into the lock file's `approval` block (at the matching step, job, or workflow node). The mandatory requirement is resolved at dispatch time from the environment's reviewer policy. Both normalize to one shape before the gate evaluates them:
 
 ```
 ApprovalRequirement = {
@@ -35,7 +35,7 @@ A requirement is satisfied when **all** of its clauses are satisfied:
 
 - `{ team: T }` is satisfied once any member of team `T` approves.
 - `{ user: U }` is satisfied once `U` approves.
-- An empty clause list (`requireApproval: true`) is satisfied by a single approval from any approval-capable member.
+- An empty clause list (`approval: true`) is satisfied by a single approval from any approval-capable member.
 
 Clauses are a flat AND list; one qualifying approver may satisfy several clauses at once (an approver who is both in team `leads` and is user `cto` satisfies both clauses with one decision). Any single rejection rejects the whole element; an expired hold is treated as a rejection.
 
@@ -93,7 +93,7 @@ Because a step-level hold keeps an agent and workspace occupied for the whole wa
 
 ## See also
 
-- [Approval gates (user guide)](../user/approvals.md) — authoring `requireApproval`.
+- [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the queue, expiry, self-approval.
 - [Execution state machine](execution/state-machine.md) — the `held` state and its transitions.
 - [Orchestrator ↔ Agent messages](protocol/orchestrator-agent.md) — the protocol channel the step round-trip rides.

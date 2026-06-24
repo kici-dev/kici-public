@@ -27,9 +27,13 @@ import {
   type DashboardDiagnosticsRequest,
   type DashboardScalerCapacityRequest,
   type DashboardScalerAgentsRequest,
+  type DashboardFleetHostsRequest,
+  type DashboardFleetHostRequest,
+  type DashboardFleetPreviewRequest,
   type JoinRequest,
   type JoinResponse,
   type SourceRegistration,
+  type DeploymentIdentity,
   ORCH_CAPABILITIES,
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
@@ -87,6 +91,7 @@ function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEn
     routingKey: source.routingKey,
     name: source.name,
     subtype: source.subtype,
+    ...(source.slug ? { slug: source.slug } : {}),
   };
 }
 
@@ -123,6 +128,8 @@ export interface PlatformClientOptions {
   mode?: string;
   /** Scaler backends configured (e.g. ["container", "firecracker"]). Sent in source.register for diagnostics. */
   scalerBackends?: string[];
+  /** How the orchestrator process was deployed. Sent in source.register so the dashboard can build the correct kici-admin invocation. */
+  deployment?: DeploymentIdentity;
   /** Whether this orchestrator has S3 log storage configured. Sent in source.register for pool validation. */
   s3LogAccess?: boolean;
   /** Queue timeout in ms. Sent in source.register for Platform safety-net GC. */
@@ -197,6 +204,12 @@ export interface PlatformClientOptions {
   onDashboardScalerCapacity?: (msg: DashboardScalerCapacityRequest) => void;
   /** Optional callback for dashboard scaler agents requests from Platform. */
   onDashboardScalerAgents?: (msg: DashboardScalerAgentsRequest) => void;
+  /** Optional callback for fleet roster requests from Platform. */
+  onFleetHosts?: (msg: DashboardFleetHostsRequest) => void;
+  /** Optional callback for fleet host-detail requests from Platform. */
+  onFleetHost?: (msg: DashboardFleetHostRequest) => void;
+  /** Optional callback for fleet runsOnAll-preview requests from Platform. */
+  onFleetPreview?: (msg: DashboardFleetPreviewRequest) => void;
   /** Optional callback for trust policy updates pushed from Platform. */
   onTrustPolicyUpdate?: (msg: TrustPolicyUpdate) => void;
   /** Optional callback for stale check run cleanup requests from Platform. */
@@ -266,6 +279,7 @@ export class PlatformClient {
   private readonly version?: string;
   private readonly mode?: string;
   private readonly scalerBackends?: string[];
+  private readonly deployment?: DeploymentIdentity;
   private readonly s3LogAccess?: boolean;
   private readonly queueTimeoutMs?: number;
   private readonly heartbeatIntervalMs: number;
@@ -291,6 +305,9 @@ export class PlatformClient {
   private readonly onDashboardDiagnostics?: PlatformClientOptions['onDashboardDiagnostics'];
   private readonly onDashboardScalerCapacity?: PlatformClientOptions['onDashboardScalerCapacity'];
   private readonly onDashboardScalerAgents?: PlatformClientOptions['onDashboardScalerAgents'];
+  private readonly onFleetHosts?: PlatformClientOptions['onFleetHosts'];
+  private readonly onFleetHost?: PlatformClientOptions['onFleetHost'];
+  private readonly onFleetPreview?: PlatformClientOptions['onFleetPreview'];
   private readonly onTrustPolicyUpdate?: PlatformClientOptions['onTrustPolicyUpdate'];
   private readonly onStaleCheckrunCleanup?: PlatformClientOptions['onStaleCheckrunCleanup'];
   private readonly onJoinRequest?: PlatformClientOptions['onJoinRequest'];
@@ -327,6 +344,7 @@ export class PlatformClient {
     this.version = options.version;
     this.mode = options.mode;
     this.scalerBackends = options.scalerBackends;
+    this.deployment = options.deployment;
     this.s3LogAccess = options.s3LogAccess;
     this.queueTimeoutMs = options.queueTimeoutMs;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
@@ -353,6 +371,9 @@ export class PlatformClient {
     this.onDashboardDiagnostics = options.onDashboardDiagnostics;
     this.onDashboardScalerCapacity = options.onDashboardScalerCapacity;
     this.onDashboardScalerAgents = options.onDashboardScalerAgents;
+    this.onFleetHosts = options.onFleetHosts;
+    this.onFleetHost = options.onFleetHost;
+    this.onFleetPreview = options.onFleetPreview;
     this.onTrustPolicyUpdate = options.onTrustPolicyUpdate;
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
@@ -575,6 +596,7 @@ export class PlatformClient {
       ...(this.version && { version: this.version }),
       ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
       ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
+      ...(this.deployment && { deployment: this.deployment }),
       ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
     });
   }
@@ -612,15 +634,20 @@ export class PlatformClient {
     }
 
     // Register added or *changed* sources. The diff key is no longer just
-    // routingKey: a rename (name change) or subtype change with the same
-    // routing_key still needs to flow to Platform so the dashboard reflects
-    // it. The Platform-side `onConflict.doUpdateSet` covers the upsert
+    // routingKey: a rename (name change), slug change, or subtype change with
+    // the same routing_key still needs to flow to Platform so the dashboard
+    // reflects it. The Platform-side `onConflict.doUpdateSet` covers the upsert
     // semantics on the receiver, so re-sending an already-registered source
     // is safe and idempotent.
     const changedSources = newSources.filter((s) => {
       const prev = oldByKey.get(s.routingKey);
       if (!prev) return true; // added
-      return prev.provider !== s.provider || prev.name !== s.name || prev.subtype !== s.subtype;
+      return (
+        prev.provider !== s.provider ||
+        prev.name !== s.name ||
+        prev.subtype !== s.subtype ||
+        prev.slug !== s.slug
+      );
     });
     if (changedSources.length > 0) {
       this.send({
@@ -634,6 +661,7 @@ export class PlatformClient {
         ...(this.version && { version: this.version }),
         ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
         ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
+        ...(this.deployment && { deployment: this.deployment }),
         ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
         ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
       });
@@ -653,6 +681,7 @@ export class PlatformClient {
         ...(this.version && { version: this.version }),
         ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
         ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
+        ...(this.deployment && { deployment: this.deployment }),
         ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
         ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
       });
@@ -1027,6 +1056,26 @@ export class PlatformClient {
         this.onDashboardDiagnostics?.(msg);
         break;
 
+      // Fleet read (roster, host detail, runsOnAll preview)
+      case 'dashboard.fleet.hosts':
+        logger.debug('Dashboard fleet hosts request received', { requestId: msg.requestId });
+        this.onFleetHosts?.(msg);
+        break;
+      case 'dashboard.fleet.host':
+        logger.debug('Dashboard fleet host request received', {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+        });
+        this.onFleetHost?.(msg);
+        break;
+      case 'dashboard.fleet.preview':
+        logger.debug('Dashboard fleet preview request received', {
+          requestId: msg.requestId,
+          workflowName: msg.workflowName,
+        });
+        this.onFleetPreview?.(msg);
+        break;
+
       // Scaler capacity
       case 'dashboard.scaler.capacity':
         logger.debug('Dashboard scaler capacity request received', {
@@ -1096,6 +1145,11 @@ export class PlatformClient {
       case 'dashboard.backends.test':
       case 'dashboard.global-workflows.get':
       case 'dashboard.global-workflows.update':
+      // Fleet host writes (Model C: declare / remove) ride the same generic
+      // forwarding shape — the policy-gated DashboardFleetWriteHandler answers
+      // them inside guardedDashboardDispatch.
+      case 'dashboard.fleet.host.declare':
+      case 'dashboard.fleet.host.remove':
         logger.debug('Dashboard environment message received', {
           type: msg.type,
           requestId: msg.requestId,
@@ -1170,6 +1224,7 @@ export class PlatformClient {
       ...(this.version && { version: this.version }),
       ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
       ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
+      ...(this.deployment && { deployment: this.deployment }),
       ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
       ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
     });

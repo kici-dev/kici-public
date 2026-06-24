@@ -2,6 +2,20 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.22 — 2026-06-24
+
+### Features
+
+- Documentation site now includes a Changelog page with released notes and an Unreleased section.
+- Approval gates can now fire on drift. A per-step `approval: { when: 'drift' }` gate pauses a check/apply step mid-job when its `check()` finds drift in apply mode, shows the computed drift in the dashboard approval queue and the CLI, and applies only on approval — Terraform's plan→apply, per step. The unified `approval` config replaces `requireApproval` and adds a run-scoped `kici run --approve-all` breakglass.
+- Workflows can now reboot a bare-metal host mid-run and wait for it to come back. New SDK steps `restartHost` and `waitForHostAlive` (plus `ctx.kici.host.requestReboot`) request a reboot; the orchestrator holds further dispatch to that host until it reconnects, treats the expected disconnect as success, and sweeps hosts that miss their reboot deadline. The agent records the reboot intent and executes the reboot across operating systems.
+- GitHub sources now capture the GitHub App's display name and slug at creation and refresh them from GitHub daily, with `kici-admin source refresh` to re-sync on demand. You can also override the GitHub App webhook URL when registering a source via `--webhook-url`.
+- `kici-admin host remove` removes a statically-declared host from the orchestrator's host roster.
+
+### Fixes
+
+- `kici login` now persists the endpoint and OIDC issuer it authenticated against, and resets stale active-org and default-cluster state when you log in against a different endpoint, so a re-login no longer leaves the CLI pointed at the previous environment's selections. A new `--oidc-issuer` flag lets you override the issuer used for the login flow.
+
 ## v0.1.21 — 2026-06-23
 
 ### Features

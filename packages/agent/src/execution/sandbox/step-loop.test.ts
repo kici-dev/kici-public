@@ -582,7 +582,7 @@ describe('executeStepLoop step-approval gate', () => {
     return {
       _tag: 'Step',
       name,
-      requireApproval: [{ team: 'leads' }],
+      approval: [{ team: 'leads' }],
       run: async () => {
         ran.value = true;
       },
@@ -683,6 +683,165 @@ describe('executeStepLoop step-approval gate', () => {
     });
 
     expect(ran.value).toBe(true);
+    expect(result.status).toBe('success');
+  });
+
+  it('does not pre-step gate a when:drift step (the drift gate owns it)', async () => {
+    const ran = { value: false };
+    const outputsMap: OutputsMap = new Map();
+    const { sendIpc } = collectMessages();
+    const awaitStepApproval = vi.fn().mockResolvedValue({ outcome: 'approved' as const });
+
+    const driftStep: Step = {
+      _tag: 'Step',
+      name: 'cfg',
+      check: async () => null, // in sync ⇒ no drift ⇒ no gate, step skips
+      summarize: () => 'x',
+      approval: { when: 'drift' } as any,
+      run: async () => {
+        ran.value = true;
+      },
+      result: {} as any,
+    } as Step;
+
+    const result = await executeStepLoop({
+      steps: [driftStep],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap,
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+      awaitStepApproval,
+    });
+
+    // The pre-step gate must NOT fire for a when:drift step.
+    expect(awaitStepApproval).not.toHaveBeenCalled();
+    expect(result.status).toBe('success');
+  });
+});
+
+describe('executeStepLoop drift-approval gate', () => {
+  function makeDriftStep(opts: {
+    name: string;
+    drift: unknown | null;
+    runSpy?: ReturnType<typeof vi.fn>;
+  }): Step {
+    return {
+      _tag: 'Step',
+      name: opts.name,
+      check: async () => opts.drift,
+      summarize: (d: any) => `would change: ${JSON.stringify(d)}`,
+      approval: { when: 'drift', approvers: [{ team: 'ops' }], reason: 'prod patch' } as any,
+      run: (opts.runSpy ?? vi.fn(async () => ({ applied: true }))) as any,
+      result: {} as any,
+    } as Step;
+  }
+
+  it('apply mode + drift => requests approval with payload; applies on approve', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { sendIpc } = collectMessages();
+    const awaitStepApprovalWithPayload = vi
+      .fn()
+      .mockResolvedValue({ outcome: 'approved' as const });
+
+    const result = await executeStepLoop({
+      steps: [makeDriftStep({ name: 'cfg', drift: { want: 'x' }, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+      awaitStepApprovalWithPayload,
+    });
+
+    expect(awaitStepApprovalWithPayload).toHaveBeenCalledOnce();
+    const req = awaitStepApprovalWithPayload.mock.calls[0][0];
+    expect(req).toMatchObject({
+      stepIndex: 0,
+      stepName: 'cfg',
+      clauses: [{ team: 'ops' }],
+      reason: 'prod patch',
+    });
+    expect(req.payload.summaryMarkdown).toBe('would change: {"want":"x"}');
+    expect(req.payload.drift).toEqual({ want: 'x' });
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(runSpy.mock.calls[0][1]).toEqual({ want: 'x' });
+    expect(result.status).toBe('success');
+  });
+
+  it('apply mode + drift => fail-stop when rejected; run NOT called', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { sendIpc } = collectMessages();
+    const awaitStepApprovalWithPayload = vi
+      .fn()
+      .mockResolvedValue({ outcome: 'rejected' as const, reason: 'nope' });
+
+    const result = await executeStepLoop({
+      steps: [makeDriftStep({ name: 'cfg', drift: { want: 'x' }, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+      awaitStepApprovalWithPayload,
+    });
+
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(result.status).toBe('failed');
+  });
+
+  it('in-sync (no drift) => no approval requested; step skips', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { sendIpc } = collectMessages();
+    const awaitStepApprovalWithPayload = vi.fn();
+
+    const result = await executeStepLoop({
+      steps: [makeDriftStep({ name: 'cfg', drift: null, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'apply',
+      startTime: Date.now(),
+      awaitStepApprovalWithPayload,
+    });
+
+    expect(awaitStepApprovalWithPayload).not.toHaveBeenCalled();
+    expect(runSpy).not.toHaveBeenCalled();
+    expect(result.status).toBe('success');
+  });
+
+  it('check mode never gates on drift (preview only)', async () => {
+    const runSpy = vi.fn(async () => ({ applied: true }));
+    const { sendIpc } = collectMessages();
+    const awaitStepApprovalWithPayload = vi.fn();
+
+    const result = await executeStepLoop({
+      steps: [makeDriftStep({ name: 'cfg', drift: { want: 'x' }, runSpy })],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      checkMode: 'check',
+      startTime: Date.now(),
+      awaitStepApprovalWithPayload,
+    });
+
+    expect(awaitStepApprovalWithPayload).not.toHaveBeenCalled();
+    expect(runSpy).not.toHaveBeenCalled();
     expect(result.status).toBe('success');
   });
 });

@@ -1,6 +1,11 @@
 import type { ColumnType, Generated, Insertable, Selectable, Updateable } from 'kysely';
 
-import type { ApprovalRequirement, ApproverClause, InitFailure } from '@kici-dev/engine';
+import type {
+  ApprovalRequirement,
+  ApproverClause,
+  InitFailure,
+  StepApprovalPayload,
+} from '@kici-dev/engine';
 
 /**
  * PostgreSQL-only database types.
@@ -510,8 +515,13 @@ export interface ExecutionJobNeedsTable {
   job_name: string;
   /** Upstream job name (the job that must complete first) */
   upstream_name: string;
-  /** Per-edge failure policy: 'skip' (default) or 'run' */
-  if_failed: Generated<string>;
+  /**
+   * Per-edge run-on status-set: a JSON-encoded array of upstream terminal
+   * statuses (ExecutionJobStatus[]) that satisfy the edge. Default
+   * `'["success"]'`. The downstream dispatches when the upstream's terminal
+   * status is a member of this set.
+   */
+  run_on: Generated<string>;
 }
 
 // Convenience types for execution_job_needs
@@ -740,7 +750,7 @@ export interface HeldRunsTable {
   step_index: number | null;
   /**
    * What created the hold: 'environment' (mandatory env policy) | 'explicit'
-   * (SDK `requireApproval`). Engine `TriggerSource`.
+   * (SDK `approval`). Engine `TriggerSource`.
    */
   trigger_source: Generated<string>;
   /**
@@ -751,6 +761,15 @@ export interface HeldRunsTable {
     ApprovalRequirement | null,
     ApprovalRequirement | string | null | undefined,
     ApprovalRequirement | string | null
+  >;
+  /**
+   * Drift payload `{ summaryMarkdown, drift }` captured when a `when: 'drift'`
+   * step-approval gate fires. Null for every non-drift hold.
+   */
+  payload: ColumnType<
+    StepApprovalPayload | null,
+    StepApprovalPayload | string | null | undefined,
+    StepApprovalPayload | string | null
   >;
 }
 
@@ -1317,6 +1336,12 @@ export interface SourcesTable {
   routing_key: string;
   /** JSONB config (non-sensitive, e.g. { appId: '12345' }) */
   config: string;
+  /**
+   * GitHub App slug (the URL-safe identifier GitHub assigns, e.g.
+   * `my-kici-app`). NULL until the GitHub identity fetch populates it. GitHub
+   * is the source of truth for both `name` and `slug` on GitHub-App sources.
+   */
+  slug: string | null;
   /** Customer/org identifier for secret and environment scoping */
   customer_id: Generated<string>;
   /** When this source was created */
@@ -1766,6 +1791,13 @@ export interface HostRosterTable {
     Record<string, string | number | boolean> | string
   >;
   last_seen: ColumnType<Date, Date | string | undefined, Date | string>;
+  /**
+   * Reboot-pending flag for workflow-level host restart. When set to a future
+   * timestamp, the host's imminent disconnect is an expected reboot (not a
+   * recovery-fail) and its pinned post-restart job is held until the host
+   * reconnects (down-then-up). NULL = no reboot pending.
+   */
+  reboot_pending_until: ColumnType<Date | null, Date | string | null, Date | string | null>;
   created_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
 }

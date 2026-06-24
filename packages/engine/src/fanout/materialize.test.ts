@@ -4,6 +4,7 @@ import {
   materializeResolvedHosts,
   hostEnvelopeFields,
   FanoutError,
+  FanoutCause,
   MAX_FANOUT_JOBS,
   VariantKind,
   type ResolvedHostAgent,
@@ -66,6 +67,13 @@ describe('materializeFanout', () => {
         }),
       ]),
     ).toThrow(FanoutError);
+  });
+
+  it('defaults FanoutError cause to error and accepts a narrowed-empty cause', () => {
+    const err = new FanoutError('fan', 'msg');
+    expect(err.cause).toBe(FanoutCause.error);
+    const narrowed = new FanoutError('fan', 'msg', FanoutCause.narrowedEmpty);
+    expect(narrowed.cause).toBe(FanoutCause.narrowedEmpty);
   });
 
   it('throws FanoutError above the cap', () => {

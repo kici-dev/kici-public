@@ -79,8 +79,13 @@ interface MockEdgeRow {
   run_id: string;
   job_name: string;
   upstream_name: string;
-  if_failed: string;
+  run_on: string;
 }
+
+/** Success-only run-on set (the default gate). */
+const RUN_ON_SUCCESS = JSON.stringify([ExecutionJobStatus.enum.success]);
+/** All-terminal run-on set (when:'always'). */
+const RUN_ON_ALWAYS = JSON.stringify([...TERMINAL_JOB_STATES]);
 
 function createMockDb(jobRows: MockJobRow[], edgeRows: MockEdgeRow[]) {
   // Track state mutably so tests can observe updates
@@ -237,7 +242,7 @@ describe('needs-scheduler', () => {
             group_name: null,
           },
         ],
-        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', if_failed: 'skip' }],
+        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'lint', ExecutionJobStatus.enum.success);
       expect(result).toEqual([{ jobName: 'deploy', action: 'dispatch' }]);
@@ -272,15 +277,15 @@ describe('needs-scheduler', () => {
           },
         ],
         [
-          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', if_failed: 'skip' },
-          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', if_failed: 'skip' },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS },
         ],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'lint', ExecutionJobStatus.enum.success);
       expect(result).toEqual([]);
     });
 
-    it('skips downstream when upstream failed and if_failed=skip', async () => {
+    it('skips downstream when upstream failed and run_on is success-only', async () => {
       const db = createMockDb(
         [
           {
@@ -300,7 +305,7 @@ describe('needs-scheduler', () => {
             group_name: null,
           },
         ],
-        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', if_failed: 'skip' }],
+        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'test', ExecutionJobStatus.enum.failed);
       expect(result).toHaveLength(1);
@@ -308,7 +313,7 @@ describe('needs-scheduler', () => {
       expect(result[0].reason).toContain('test');
     });
 
-    it('dispatches downstream when upstream failed and if_failed=run', async () => {
+    it('dispatches downstream when upstream failed and run_on includes failed', async () => {
       const db = createMockDb(
         [
           {
@@ -328,10 +333,63 @@ describe('needs-scheduler', () => {
             group_name: null,
           },
         ],
-        [{ run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', if_failed: 'run' }],
+        [{ run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', run_on: RUN_ON_ALWAYS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'test', ExecutionJobStatus.enum.failed);
       expect(result).toEqual([{ jobName: 'notify', action: 'dispatch' }]);
+    });
+
+    it('dispatches downstream when upstream skipped and run_on includes skipped (on-skip)', async () => {
+      const onSkip = JSON.stringify([
+        ExecutionJobStatus.enum.success,
+        ExecutionJobStatus.enum.skipped,
+      ]);
+      const db = createMockDb(
+        [
+          { ...jobRow('gather'), status: ExecutionJobStatus.enum.skipped, needs_satisfied: true },
+          jobRow('report'),
+        ],
+        [{ run_id: RUN_ID, job_name: 'report', upstream_name: 'gather', run_on: onSkip }],
+      );
+      const result = await evaluateDownstreams(
+        db,
+        RUN_ID,
+        'gather',
+        ExecutionJobStatus.enum.skipped,
+      );
+      expect(result).toEqual([{ jobName: 'report', action: 'dispatch' }]);
+    });
+
+    it('skips downstream when upstream skipped and run_on is success-only', async () => {
+      const db = createMockDb(
+        [
+          { ...jobRow('gather'), status: ExecutionJobStatus.enum.skipped, needs_satisfied: true },
+          jobRow('report'),
+        ],
+        [{ run_id: RUN_ID, job_name: 'report', upstream_name: 'gather', run_on: RUN_ON_SUCCESS }],
+      );
+      const result = await evaluateDownstreams(
+        db,
+        RUN_ID,
+        'gather',
+        ExecutionJobStatus.enum.skipped,
+      );
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({ jobName: 'report', action: 'skip' });
+    });
+
+    it('skips downstream when upstream failed and run_on is skipped-only (on-failure mismatch)', async () => {
+      const skippedOnly = JSON.stringify([ExecutionJobStatus.enum.skipped]);
+      const db = createMockDb(
+        [
+          { ...jobRow('probe'), status: ExecutionJobStatus.enum.failed, needs_satisfied: true },
+          jobRow('handler'),
+        ],
+        [{ run_id: RUN_ID, job_name: 'handler', upstream_name: 'probe', run_on: skippedOnly }],
+      );
+      const result = await evaluateDownstreams(db, RUN_ID, 'probe', ExecutionJobStatus.enum.failed);
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({ jobName: 'handler', action: 'skip' });
     });
   });
 
@@ -371,7 +429,7 @@ describe('needs-scheduler', () => {
         RUN_ID,
         'tests',
         ['shard-1', 'shard-2'],
-        [{ jobName: 'deploy', ifFailed: 'skip' }],
+        [{ jobName: 'deploy', runOn: [ExecutionJobStatus.enum.success] }],
       );
       // Should have inserted 2 edges: deploy -> shard-1, deploy -> shard-2
       const deployEdges = db._edges.filter((e) => e.job_name === 'deploy');
@@ -393,12 +451,18 @@ describe('needs-scheduler', () => {
         ],
         [],
       );
-      await resolveGroupEdges(db, RUN_ID, 'tests', [], [{ jobName: 'deploy', ifFailed: 'skip' }]);
+      await resolveGroupEdges(
+        db,
+        RUN_ID,
+        'tests',
+        [],
+        [{ jobName: 'deploy', runOn: [ExecutionJobStatus.enum.success] }],
+      );
       // No edges should be inserted
       expect(db._edges).toHaveLength(0);
     });
 
-    it('correctly propagates ifFailed policy from dependent static jobs to each edge row', async () => {
+    it('correctly propagates runOn from dependent static jobs to each edge row', async () => {
       const db = createMockDb(
         [
           {
@@ -434,14 +498,14 @@ describe('needs-scheduler', () => {
         'tests',
         ['shard-1'],
         [
-          { jobName: 'deploy', ifFailed: 'skip' },
-          { jobName: 'notify', ifFailed: 'run' },
+          { jobName: 'deploy', runOn: [ExecutionJobStatus.enum.success] },
+          { jobName: 'notify', runOn: [...TERMINAL_JOB_STATES] as any },
         ],
       );
       const deployEdges = db._edges.filter((e) => e.job_name === 'deploy');
       const notifyEdges = db._edges.filter((e) => e.job_name === 'notify');
-      expect(deployEdges[0].if_failed).toBe('skip');
-      expect(notifyEdges[0].if_failed).toBe('run');
+      expect(deployEdges[0].run_on).toBe(RUN_ON_SUCCESS);
+      expect(notifyEdges[0].run_on).toBe(RUN_ON_ALWAYS);
     });
   });
 
@@ -486,7 +550,7 @@ describe('needs-scheduler', () => {
       expect(db._edges).toHaveLength(3);
     });
 
-    it('correctly handles NeedsEntry objects (extracts name and if_failed)', async () => {
+    it('correctly handles NeedsEntry objects (extracts name and runOn)', async () => {
       const db = createMockDb(
         [
           {
@@ -510,12 +574,12 @@ describe('needs-scheduler', () => {
       );
       const { jobs, expansionMap } = combine(
         mat({ name: 'test' }),
-        mat({ name: 'notify', needs: [{ name: 'test', ifFailed: 'run' as const }] }),
+        mat({ name: 'notify', needs: [{ name: 'test', runOn: [...TERMINAL_JOB_STATES] as any }] }),
       );
       await insertEdgesForRun(db, RUN_ID, jobs, expansionMap);
       const notifyEdges = db._edges.filter((e) => e.job_name === 'notify');
       expect(notifyEdges).toHaveLength(1);
-      expect(notifyEdges[0].if_failed).toBe('run');
+      expect(notifyEdges[0].run_on).toBe(RUN_ON_ALWAYS);
     });
 
     it('marks root jobs (no needs) as needs_satisfied=true', async () => {
@@ -598,7 +662,7 @@ describe('needs-scheduler', () => {
       expect(db._edges.every((e) => e.upstream_name === 'lint')).toBe(true);
     });
 
-    it('copies the ifFailed policy onto every expanded matrix edge', async () => {
+    it('copies the runOn set onto every expanded matrix edge', async () => {
       const db = createMockDb([jobRow('test (a)'), jobRow('test (b)'), jobRow('notify')], []);
       const upstream = materializeFanout([
         {
@@ -612,7 +676,7 @@ describe('needs-scheduler', () => {
       ]);
       const downstream = mat({
         name: 'notify',
-        needs: [{ name: 'test', ifFailed: 'run' as const }],
+        needs: [{ name: 'test', runOn: [...TERMINAL_JOB_STATES] as any }],
       });
       const jobs = [...upstream.jobs, ...downstream.jobs];
       const expansionMap = new Map<string, readonly string[]>([
@@ -622,7 +686,7 @@ describe('needs-scheduler', () => {
       await insertEdgesForRun(db, RUN_ID, jobs, expansionMap);
       const notifyEdges = db._edges.filter((e) => e.job_name === 'notify');
       expect(notifyEdges).toHaveLength(2);
-      expect(notifyEdges.every((e) => e.if_failed === 'run')).toBe(true);
+      expect(notifyEdges.every((e) => e.run_on === RUN_ON_ALWAYS)).toBe(true);
     });
   });
 
@@ -656,12 +720,12 @@ describe('needs-scheduler', () => {
           },
         ],
         [
-          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', if_failed: 'skip' },
-          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', if_failed: 'run' },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_ALWAYS },
         ],
       );
       const results = await recomputeNeedsSatisfied(db, RUN_ID, ['deploy']);
-      // lint=success (ok), test=failed but if_failed=run (ok) => all satisfied
+      // lint=success (ok), test=failed but run_on=always admits it (ok) => all satisfied
       expect(results).toHaveLength(1);
       expect(results[0]).toMatchObject({ jobName: 'deploy', action: 'dispatch' });
     });
@@ -688,7 +752,7 @@ describe('needs-scheduler', () => {
             group_name: null,
           },
         ],
-        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', if_failed: 'skip' }],
+        [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS }],
       );
       const stuck = await checkSchedulerInvariant(db, RUN_ID);
       expect(stuck).toContain('deploy');
@@ -725,15 +789,15 @@ describe('needs-scheduler', () => {
           },
         ],
         [
-          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', if_failed: 'skip' },
-          { run_id: RUN_ID, job_name: 'notify', upstream_name: 'deploy', if_failed: 'skip' },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS },
+          { run_id: RUN_ID, job_name: 'notify', upstream_name: 'deploy', run_on: RUN_ON_SUCCESS },
         ],
       );
       const targets = await getFailurePropagationTargets(db, RUN_ID, 'test');
       expect(targets.sort()).toEqual(['deploy', 'notify']);
     });
 
-    it('stops propagation at if_failed=run edges', async () => {
+    it('stops propagation at run_on edges that admit the status', async () => {
       const db = createMockDb(
         [
           {
@@ -762,12 +826,12 @@ describe('needs-scheduler', () => {
           },
         ],
         [
-          { run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', if_failed: 'run' },
-          { run_id: RUN_ID, job_name: 'cleanup', upstream_name: 'notify', if_failed: 'skip' },
+          { run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', run_on: RUN_ON_ALWAYS },
+          { run_id: RUN_ID, job_name: 'cleanup', upstream_name: 'notify', run_on: RUN_ON_SUCCESS },
         ],
       );
       const targets = await getFailurePropagationTargets(db, RUN_ID, 'test');
-      // notify has if_failed=run so it's not skipped, cleanup depends on notify not test
+      // notify's run_on admits the failed status so it's not skipped; cleanup depends on notify not test
       expect(targets).toEqual([]);
     });
   });

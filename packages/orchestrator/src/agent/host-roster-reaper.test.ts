@@ -4,6 +4,8 @@ import { HostRosterReaper } from './host-roster-reaper.js';
 const makeStore = () => ({
   reapEphemeralPastTtl: vi.fn().mockResolvedValue(0),
   countStaticUnreachable: vi.fn().mockResolvedValue(0),
+  listExpiredRebootPending: vi.fn().mockResolvedValue([]),
+  clearRebootPending: vi.fn().mockResolvedValue(undefined),
 });
 
 const makeReaper = (
@@ -69,6 +71,17 @@ describe('HostRosterReaper', () => {
     reaper.onBecomeLeader();
     await reaper.tick();
     expect(setGauge).toHaveBeenCalledWith(0);
+    reaper.stop();
+  });
+
+  it('clears expired reboot-pending flags on each leader tick', async () => {
+    const store = makeStore();
+    store.listExpiredRebootPending.mockResolvedValue(['rebooted-too-long']);
+    const reaper = makeReaper({ store });
+    reaper.onBecomeLeader();
+    await reaper.tick();
+    expect(store.listExpiredRebootPending).toHaveBeenCalled();
+    expect(store.clearRebootPending).toHaveBeenCalledWith('rebooted-too-long');
     reaper.stop();
   });
 

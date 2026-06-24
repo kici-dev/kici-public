@@ -112,4 +112,12 @@ describe('context types', () => {
       expectTypeOf<StepContext['secrets']>().toEqualTypeOf<StepSecrets>();
     });
   });
+
+  describe('StepContext.needs', () => {
+    it('exposes an optional needs map', () => {
+      expectTypeOf<StepContext['needs']>().toEqualTypeOf<
+        import('./needs-context.js').NeedsContext | undefined
+      >();
+    });
+  });
 });

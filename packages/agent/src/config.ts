@@ -89,6 +89,13 @@ const configSchema = z.object({
   // after receiving `{ action: 'wait' }`. Default 1 hour. Inherited by the
   // workflow-runner child process via env.
   concurrencyWaitTimeoutMs: z.coerce.number().int().min(1000).default(3_600_000),
+  // Co-located guard for workflow-level host restart: when true, this agent
+  // shares its host with the orchestrator, so a `restartHost()` request is
+  // refused locally (the orchestrator also refuses it). Defaults to false.
+  isOrchestratorHost: z
+    .string()
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 /**
@@ -116,6 +123,7 @@ export const envDef = defineEnv({
     port: 'KICI_PORT',
     logLevel: 'KICI_LOG_LEVEL',
     agentToken: 'KICI_AGENT_TOKEN',
+    isOrchestratorHost: 'KICI_AGENT_IS_ORCHESTRATOR_HOST',
     githubToken: 'KICI_GITHUB_TOKEN',
     maxLogSizeBytes: 'KICI_MAX_LOG_SIZE_BYTES',
     defaultStepTimeoutMs: 'KICI_DEFAULT_STEP_TIMEOUT_MS',

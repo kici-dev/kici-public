@@ -51,6 +51,10 @@ import * as m043 from './migrations/043_rerouted_to_peer.js';
 import * as m044 from './migrations/044_check_mode.js';
 import * as m045 from './migrations/045_host_properties.js';
 import * as m046 from './migrations/046_join_token_consumed_by_instance.js';
+import * as m047 from './migrations/047_needs_run_on.js';
+import * as m048 from './migrations/048_host_reboot_pending.js';
+import * as m049 from './migrations/049_held_runs_payload.js';
+import * as m050 from './migrations/050_sources_slug.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -102,6 +106,10 @@ export function createMigrationProvider(): MigrationProvider {
         '044_check_mode': m044,
         '045_host_properties': m045,
         '046_join_token_consumed_by_instance': m046,
+        '047_needs_run_on': m047,
+        '048_host_reboot_pending': m048,
+        '049_held_runs_payload': m049,
+        '050_sources_slug': m050,
       };
     },
   };

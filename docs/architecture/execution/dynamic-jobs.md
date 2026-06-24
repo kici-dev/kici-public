@@ -308,7 +308,7 @@ By default, when an upstream job fails, all downstreams are skipped (matching Gi
 ```typescript
 const cleanup = job('cleanup', {
   runsOn: 'linux',
-  needs: [{ name: 'build', ifFailed: 'run' }],
+  needs: [{ name: 'build', when: 'always' }],
   steps: [
     step('cleanup', async ({ $ }) => {
       await $`echo "Cleaning up..."`;
@@ -322,7 +322,7 @@ For dynamic groups:
 ```typescript
 const notify = job('notify', {
   runsOn: 'linux',
-  needs: [dynamicGroup('tests', { ifFailed: 'run' })],
+  needs: [dynamicGroup('tests', { when: 'always' })],
   steps: [
     step('notify', async ({ $ }) => {
       await $`echo "Notifying..."`;
@@ -331,7 +331,7 @@ const notify = job('notify', {
 });
 ```
 
-Values: `'skip'` (default), `'run'` (dispatch even if upstream failed).
+Keywords: `'on-success'` (default), `'always'` (dispatch on any terminal status), `'on-skip'`, `'on-failure'`; or a raw status-set array.
 
 ### Empty group semantics
 
@@ -385,9 +385,9 @@ export default workflow('fan-out', {
 });
 ```
 
-- `ctx.needs.<jobName>` (a static / named-job need) is an `OutputProxy` with the same shape as `jobRef.result` (`ctx.needs.<job>.result.<step>.<field>`; single-step `run` jobs flatten to `ctx.needs.<job>.result.<field>`).
-- `ctx.needs.<group>` (a `dynamicGroup(...)` need) is an **ordered array** of `{ name, result }`, one entry per group member in the group's deterministic eval order.
-- `needs` accepts the same edge shapes as `JobOptions.needs`, including the `{ name, ifFailed }` and `dynamicGroup('g', { ifFailed })` object forms.
+- `ctx.needs.<jobName>` (a static / named-job need) is `{ result, status }`: `result` is an `OutputProxy` with the same shape as `jobRef.result` (`ctx.needs.<job>.result.<step>.<field>`; single-step `run` jobs flatten to `ctx.needs.<job>.result.<field>`), and `status` is the upstream's terminal status.
+- `ctx.needs.<group>` (a `dynamicGroup(...)` need) is an **ordered array** of `{ name, result, status }`, one entry per group member in the group's deterministic eval order.
+- `needs` accepts the same edge shapes as `JobOptions.needs`, including the `{ name, when }` and `dynamicGroup('g', { when })` object forms.
 
 ### Deferred-eval dispatch flow
 
@@ -406,7 +406,7 @@ A result-aware generator's eval job becomes a deferred, needs-gated job in the r
 
 - Same-run result-aware generation and cross-workflow [`jobComplete()`](../../user/sdk/triggers.md) chaining are complementary: use result-aware generation for "this run needs more jobs based on what just ran", and `jobComplete()` for "a different workflow should react to this one finishing".
 - The max-100-generated-jobs cap stays per eval invocation; chained result-aware tiers are each independently capped at 100.
-- The generator's `needs` reuse the existing edge failure semantics: default `skip` (an upstream failure skips the generator, so its group is empty) and `ifFailed: 'run'` (run on upstream failure, where upstream outputs may be partial).
+- The generator's `needs` reuse the same `when` run-condition semantics as any edge: default `on-success` (an upstream failure skips the generator, so its group is empty) and a wider set like `when: 'always'` (run on any terminal upstream status, where upstream outputs may be partial). Because the generator's frozen snapshot carries each upstream's `status`, a result-aware generator under `when: 'always'` / `'on-failure'` can branch on `ctx.needs.<job>.status` and return `[]` or `[job]` — the arbitrary outcome-based dispatch gate.
 
 ## Current limitations
 

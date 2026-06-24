@@ -196,6 +196,22 @@ export function buildProgram(): Command {
     )
     .option('--check', 'Run in check mode: report drift, change nothing', false)
     .option('--fail-on-drift', 'In check mode, exit non-zero if any step reports drift', false)
+    .option(
+      '--target <selector>',
+      'Narrow runsOnAll jobs to hosts matching this label selector (repeatable, AND-combined)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
+    .option(
+      '--target-allow-empty',
+      'A --target that narrows a runsOnAll job to zero hosts skips it instead of failing',
+      false,
+    )
+    .option(
+      '--approve-all, --yes',
+      'Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)',
+      false,
+    )
     .action(async (fixture, options) => {
       const { runRemoteCommand } = await import('./commands/index.js');
       const { resolveCheckMode } = await import('./commands/check-mode.js');
@@ -210,6 +226,9 @@ export function buildProgram(): Command {
         ...options,
         checkMode,
         envFlags: options.env,
+        targets: options.target,
+        targetAllowEmpty: options.targetAllowEmpty,
+        approveAll: options.approveAll,
       });
       process.exit(success ? 0 : 1);
     });
@@ -303,6 +322,10 @@ export function buildProgram(): Command {
     .option('--token <key>', 'API key for direct authentication (legacy)')
     .option('--device', 'Force device authorization flow (for headless/SSH environments)')
     .option('--platform-endpoint <url>', 'Platform relay URL')
+    .option(
+      '--oidc-issuer <url>',
+      'OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another)',
+    )
     .option('--routing-key <key>', 'Routing key for webhook source identification')
     .addHelpText(
       'after',
@@ -321,6 +344,7 @@ Environment variables:
         token: options.token,
         device: options.device,
         platformEndpoint: options.platformEndpoint,
+        oidcIssuer: options.oidcIssuer,
         routingKey: options.routingKey,
       });
       process.exit(success ? 0 : 1);

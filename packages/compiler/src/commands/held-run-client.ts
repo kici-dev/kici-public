@@ -66,9 +66,19 @@ export async function listHeldRunsForRun(
   return data.heldRuns ?? [];
 }
 
-/** POST an approve decision for a held run. Returns true on success. */
-export async function postApprove(ctx: HeldRunContext, heldRunId: string): Promise<boolean> {
-  const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs/${heldRunId}/approve`;
+/**
+ * POST an approve decision for a held run. Returns true on success. When
+ * `autoApprove` is set, marks the approval as a `kici run --approve-all`
+ * breakglass so the orchestrator audits it as `held_run.auto_approve`
+ * (eligibility is still enforced server-side — never a bypass).
+ */
+export async function postApprove(
+  ctx: HeldRunContext,
+  heldRunId: string,
+  autoApprove = false,
+): Promise<boolean> {
+  const query = autoApprove ? '?auto=1' : '';
+  const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs/${heldRunId}/approve${query}`;
   const response = await fetch(url, { method: 'POST', headers: authHeaders(ctx.token) });
   if (!response.ok) {
     logger.error(pc.red(await describeError(response)));

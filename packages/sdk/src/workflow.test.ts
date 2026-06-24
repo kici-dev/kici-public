@@ -303,15 +303,15 @@ describe('workflow()', () => {
       expect(ref[DYNAMIC_GROUP_TAG]).toBe(true);
     });
 
-    it('creates a DynamicGroupRef with ifFailed option', () => {
-      const ref = dynamicGroup('test-shards', { ifFailed: 'run' });
+    it('creates a DynamicGroupRef with when option', () => {
+      const ref = dynamicGroup('test-shards', { when: 'always' });
       expect(ref.group).toBe('test-shards');
-      expect(ref.ifFailed).toBe('run');
+      expect(ref.when).toBe('always');
     });
 
-    it('omits ifFailed when not specified', () => {
+    it('omits when when not specified', () => {
       const ref = dynamicGroup('test-shards');
-      expect(ref.ifFailed).toBeUndefined();
+      expect(ref.when).toBeUndefined();
     });
 
     it('isDynamicGroupRef identifies DynamicGroupRef objects', () => {
@@ -501,5 +501,34 @@ describe('workflow()', () => {
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('shard-1');
     });
+  });
+});
+
+describe('needs when field', () => {
+  it('accepts a when keyword on a needs edge', () => {
+    const b = job('b', {
+      runsOn: 'linux',
+      needs: [{ name: 'a', when: 'on-failure' }],
+      run: async () => {},
+    });
+    expect(b.needs?.[0]).toEqual({ name: 'a', when: 'on-failure' });
+  });
+
+  it('accepts a raw status-set on a needs edge', () => {
+    const b = job('b', {
+      runsOn: 'linux',
+      needs: [{ name: 'a', when: ['skipped', 'failed'] }],
+      run: async () => {},
+    });
+    expect(b.needs?.[0]).toMatchObject({ name: 'a', when: ['skipped', 'failed'] });
+  });
+
+  it('accepts a when keyword on a group needs edge', () => {
+    const b = job('b', {
+      runsOn: 'linux',
+      needs: [{ group: 'shards', when: 'on-skip' }],
+      run: async () => {},
+    });
+    expect(b.needs?.[0]).toEqual({ group: 'shards', when: 'on-skip' });
   });
 });

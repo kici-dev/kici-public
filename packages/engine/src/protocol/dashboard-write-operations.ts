@@ -53,6 +53,9 @@ export const DashboardWriteOperation = z.enum([
   'backends.sync',
   'backends.sync_one',
   'backends.test',
+  // Fleet — host inventory writes (declare / remove); config that affects the fleet.
+  'fleet.host.declare',
+  'fleet.host.remove',
 ]);
 
 export type DashboardWriteOperation = z.infer<typeof DashboardWriteOperation>;
@@ -83,6 +86,8 @@ export const DASHBOARD_WRITE_OPERATION_VALUES: readonly DashboardWriteOperation[
   'backends.sync',
   'backends.sync_one',
   'backends.test',
+  'fleet.host.declare',
+  'fleet.host.remove',
 ]);
 
 export const DashboardWriteCategory = z.enum([
@@ -94,6 +99,7 @@ export const DashboardWriteCategory = z.enum([
   'DLQ',
   'Registrations',
   'Topology',
+  'Fleet',
 ]);
 export type DashboardWriteCategory = z.infer<typeof DashboardWriteCategory>;
 
@@ -314,6 +320,22 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin backend test',
     },
+    {
+      name: 'fleet.host.declare',
+      wireMessageType: 'dashboard.fleet.host.declare',
+      category: 'Fleet',
+      label: 'Declare a static host',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin host declare',
+    },
+    {
+      name: 'fleet.host.remove',
+      wireMessageType: 'dashboard.fleet.host.remove',
+      category: 'Fleet',
+      label: 'Remove a host from the roster',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin host remove',
+    },
   ]);
 
 /** O(1) lookup of a descriptor by operation name. */
@@ -383,7 +405,7 @@ export function isDashboardWriteOperationEnabled(
 
 /**
  * Expand a (possibly sparse) policy map into the full effective state
- * for all 24 operations. Operations the policy doesn't mention come
+ * for all 26 operations. Operations the policy doesn't mention come
  * back as `true` (permissive). Used by the orch HTTP admin response,
  * the WS `orch.capabilities` broadcast, and the dashboard's policy
  * page so consumers see the full picture, not the sparse storage shape.

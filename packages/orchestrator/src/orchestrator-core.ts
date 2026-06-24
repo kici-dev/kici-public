@@ -133,6 +133,8 @@ import {
 import { extractRepoIdentifier } from './entry-helpers.js';
 import { runMigrations } from './db/migrator.js';
 import { SourceStore, SourceManager } from './sources/index.js';
+import { GithubAppNameRefresher } from './github-app-name-refresher/github-app-name-refresher.js';
+import { fetchGithubAppIdentity } from './providers/github/manifest.js';
 import {
   loadMasterKey,
   loadOldMasterKey,
@@ -935,6 +937,25 @@ export function buildUpstreamOutputsByBase(
 }
 
 /**
+ * Build the downstream `upstreamJobStatuses` map keyed by each upstream job
+ * row's name. A single non-fanned upstream is keyed by its base name; a
+ * fanned-out upstream contributes one entry per expanded child name (`base
+ * (child)`). The agent uses this to stamp `ctx.needs.<job>.status` (single) and
+ * the per-child status of group / matrix / host-fanout entries.
+ */
+export function buildUpstreamStatusesByBase(
+  rows: Array<{ job_name: string; status?: string | null }>,
+): Record<string, ExecutionJobStatus> | undefined {
+  let result: Record<string, ExecutionJobStatus> | undefined;
+  for (const r of rows) {
+    if (!r.status) continue;
+    if (!result) result = {};
+    result[r.job_name] = r.status as ExecutionJobStatus;
+  }
+  return result;
+}
+
+/**
  * Fold a `runsOnAll` upstream's host children into the `byHost` envelope
  * `{ byHost: { '<host>': outputs }, summary: { succeededHosts, failedHosts, outputs } }`.
  * Unlike the matrix envelope, `summary.outputs[key]` is an array view across hosts
@@ -1013,12 +1034,14 @@ export async function mergeUpstreamOutputs(
 ): Promise<{
   mergedSecrets: Record<string, string> | undefined;
   upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined;
+  upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined;
 }> {
   let mergedSecrets = dispatchSecrets ? { ...dispatchSecrets } : undefined;
   let upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined;
+  let upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined;
 
   const baseNames = upstreamBaseNamesFromNeeds(needs);
-  if (baseNames.length === 0) return { mergedSecrets, upstreamJobOutputs };
+  if (baseNames.length === 0) return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
 
   try {
     const secretOutputStore = new SecretOutputStore(db);
@@ -1047,9 +1070,11 @@ export async function mergeUpstreamOutputs(
     );
     const upstreamJobs = await query.execute();
 
-    if (upstreamJobs.length === 0) return { mergedSecrets, upstreamJobOutputs };
+    if (upstreamJobs.length === 0)
+      return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
 
     upstreamJobOutputs = buildUpstreamOutputsByBase(baseNames, upstreamJobs);
+    upstreamJobStatuses = buildUpstreamStatusesByBase(upstreamJobs);
 
     const upstreamJobIds = upstreamJobs.map((j) => j.job_id);
     const upstreamSecretOutputs = await secretOutputStore.getUpstreamSecretOutputs(
@@ -1082,7 +1107,7 @@ export async function mergeUpstreamOutputs(
     });
   }
 
-  return { mergedSecrets, upstreamJobOutputs };
+  return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
 }
 
 /**
@@ -1244,7 +1269,7 @@ function buildOnDispatch(
       ),
     );
 
-    const { mergedSecrets, upstreamJobOutputs } = await mergeUpstreamOutputs(
+    const { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses } = await mergeUpstreamOutputs(
       db,
       job.runId,
       job.jobName,
@@ -1285,6 +1310,7 @@ function buildOnDispatch(
           installEnvSecrets: dispatchInstallEnvSecrets,
         }),
       ...(upstreamJobOutputs && { upstreamJobOutputs }),
+      ...(upstreamJobStatuses && { upstreamJobStatuses }),
     };
 
     if (bundle) {
@@ -2861,6 +2887,8 @@ export async function bootstrapOrchestrator(
     onRecoveryStarted: (agentId, jobId) => {
       logger.info('Job entering recovery state', { agentId, jobId });
     },
+    // Reboot-pending gate + disconnect-survival for workflow-level host restart.
+    rosterStore: hostRosterStore,
     getAckTimeoutMs: makeAckTimeoutReader(db, config),
     onAckTimeout: (agentId, jobId, runId) => {
       const entry = agentRegistry.get(agentId);
@@ -3449,6 +3477,24 @@ export async function bootstrapOrchestrator(
     staleThresholdMs: config.jobHeartbeatIntervalMs * config.staleDetectorThresholdMultiplier,
   });
 
+  // 30a. Start the GitHub App name/slug refresher (only when a secret store is
+  // wired — it needs decrypted App credentials to call GitHub). It re-fetches
+  // each GitHub source's display name + slug from GitHub on a daily cadence and
+  // persists a drift; the `sources_change` DB trigger fans the change out to the
+  // Platform + dashboard via the existing SourceManager → updateSources path.
+  let githubAppNameRefresher: GithubAppNameRefresher | null = null;
+  if (sourceStore) {
+    githubAppNameRefresher = new GithubAppNameRefresher({
+      sourceStore,
+      fetchIdentity: (creds) => fetchGithubAppIdentity(creds),
+      scanIntervalMs: config.githubAppNameRefreshIntervalMs,
+    });
+    await githubAppNameRefresher.start();
+    logger.info('GitHub app name refresher started', {
+      scanIntervalMs: config.githubAppNameRefreshIntervalMs,
+    });
+  }
+
   // 30b. Start workflow-deadline detector — enforces the workflow-level run
   // deadline (workflow `timeout`) by cancelling overdue non-terminal runs
   // through the same canonical cancel path the user-initiated cancel uses.
@@ -3641,6 +3687,10 @@ export async function bootstrapOrchestrator(
       {
         name: 'Stopping source manager',
         fn: () => sourceManager.stop(),
+      },
+      {
+        name: 'Stopping GitHub app name refresher',
+        fn: () => githubAppNameRefresher?.stop(),
       },
       {
         name: 'Stopping generic sources change listener',

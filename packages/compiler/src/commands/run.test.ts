@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { logger } from '@kici-dev/core';
-import { runLocalCommand, runRemoteCommand } from './run.js';
+import { runLocalCommand, runRemoteCommand, buildTargetSelector } from './run.js';
 
 // Shared mock PlatformRunClient instance -- all tests configure this
 const mockClient = {
@@ -366,6 +366,72 @@ describe('kici run command', () => {
         expect.anything(),
         expect.objectContaining({ workflowName: 'ci', fixtureId: 'direct:ci' }),
       );
+    });
+
+    it('compiles repeated --target values into an AND-combined host selector', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        targets: ['role:web', 'dc:eu'],
+      });
+
+      expect(result).toBe(true);
+      const body = mockClient.trigger.mock.calls[0][2];
+      expect(body.target).toEqual({
+        values: [
+          { include: [{ kind: 'exact', value: 'role:web' }], exclude: [] },
+          { include: [{ kind: 'exact', value: 'dc:eu' }], exclude: [] },
+        ],
+        allowEmpty: false,
+      });
+    });
+
+    it('omits target from the trigger body when no --target is given', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(mockClient.trigger.mock.calls[0][2].target).toBeUndefined();
+    });
+
+    it('errors when --target-allow-empty is given without --target', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        wait: false,
+        targetAllowEmpty: true,
+      });
+
+      expect(result).toBe(false);
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('buildTargetSelector', () => {
+    it('returns undefined for no targets', () => {
+      expect(buildTargetSelector(undefined, false)).toBeUndefined();
+      expect(buildTargetSelector([], false)).toBeUndefined();
+    });
+
+    it('compiles each target string into one include value, AND-combined', () => {
+      expect(buildTargetSelector(['role:web', 'dc:eu'], true)).toEqual({
+        values: [
+          { include: [{ kind: 'exact', value: 'role:web' }], exclude: [] },
+          { include: [{ kind: 'exact', value: 'dc:eu' }], exclude: [] },
+        ],
+        allowEmpty: true,
+      });
+    });
+
+    it('throws when allowEmpty is set without any targets', () => {
+      expect(() => buildTargetSelector(undefined, true)).toThrow(/--target-allow-empty/);
+      expect(() => buildTargetSelector([], true)).toThrow(/--target-allow-empty/);
     });
   });
 

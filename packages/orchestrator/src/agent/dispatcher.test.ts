@@ -489,6 +489,159 @@ describe('Dispatcher', () => {
     });
   });
 
+  describe('reboot-pending (workflow host restart)', () => {
+    /** In-memory reboot-pending flag store stub matching HostRosterRebootStore. */
+    function rebootStore(pending: Set<string>) {
+      return {
+        isRebootPending: vi.fn(async (agentId: string) => pending.has(agentId)),
+        clearRebootPending: vi.fn(async (agentId: string) => {
+          pending.delete(agentId);
+        }),
+      };
+    }
+
+    it('onAgentDisconnect completes a started in-flight job as success when reboot-pending', async () => {
+      // Realistic order: the restart job dispatches + starts on a non-pending
+      // agent, then the step sets the reboot-pending flag, then the box reboots
+      // (disconnect). So the flag is added AFTER dispatch+start.
+      const pending = new Set<string>();
+      const rosterStore = rebootStore(pending);
+      const queue = mockQueue();
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      const result = await dispatcher.dispatch(makeJobInput({ runId: 'run-1' }));
+      const jobId = (result as { jobId: string }).jobId;
+      dispatcher.markJobStarted(jobId);
+      pending.add('agent-1'); // restartHost() set the reboot-pending flag
+
+      const failedJobIds = await dispatcher.onAgentDisconnect('agent-1');
+
+      expect(failedJobIds).toEqual([]);
+      // Treated as expected reboot: NO recovery timer, completed as success.
+      expect(queue.markRecovering).not.toHaveBeenCalled();
+      expect(queue.markFailed).not.toHaveBeenCalled();
+      expect(queue.markCompleted).toHaveBeenCalledWith(jobId);
+      expect(registry.get('agent-1')).toBeUndefined();
+      dispatcher.stopRecoveryTimers();
+    });
+
+    it('onAgentDisconnect uses the normal recovery path when NOT reboot-pending', async () => {
+      const rosterStore = rebootStore(new Set());
+      const queue = mockQueue();
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      await dispatcher.dispatch(makeJobInput({ runId: 'run-1' }));
+      await dispatcher.onAgentDisconnect('agent-1');
+
+      // Standard path: recovery timer started, no success-completion.
+      expect(queue.markRecovering).toHaveBeenCalledTimes(1);
+      expect(queue.markCompleted).not.toHaveBeenCalled();
+      dispatcher.stopRecoveryTimers();
+    });
+
+    it('dispatch() queues a pinned job (does not dispatch) when the agent is reboot-pending', async () => {
+      const pending = new Set<string>(['agent-1']);
+      const rosterStore = rebootStore(pending);
+      const queue = mockQueue();
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      // A pinned post-restart job arriving via the direct-dispatch path (needs
+      // satisfied) must be held, not dispatched into the about-to-reboot box.
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runId: 'run-1', pinnedAgentId: 'agent-1' }),
+      );
+
+      expect(result.status).toBe('queued');
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(queue.enqueue).toHaveBeenCalled();
+    });
+
+    it('dispatch() queues a label-routed job (does not dispatch) when the only matching agent is reboot-pending', async () => {
+      // A `runsOn: 'kici:host:<id>'` post-restart job is label-routed (no
+      // pinnedAgentId); when its only matching host is reboot-pending it must be
+      // held, not sent into the about-to-reboot box.
+      const pending = new Set<string>(['host-1']);
+      const rosterStore = rebootStore(pending);
+      const queue = mockQueue();
+      registry.register('host-1', mockWs(), ['kici:host:restart-box']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runId: 'run-1', runsOnLabels: ['kici:host:restart-box'] }),
+      );
+
+      expect(result.status).not.toBe('dispatched');
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(queue.enqueue).toHaveBeenCalled();
+    });
+
+    it('dispatch() routes a label-routed job normally when the agent is NOT reboot-pending', async () => {
+      const rosterStore = rebootStore(new Set());
+      const queue = mockQueue();
+      registry.register('host-1', mockWs(), ['kici:host:restart-box']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runId: 'run-1', runsOnLabels: ['kici:host:restart-box'] }),
+      );
+
+      expect(result.status).toBe('dispatched');
+      expect(onDispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('onAgentAvailable holds the pinned drain while reboot-pending', async () => {
+      const pending = new Set<string>(['agent-1']);
+      const rosterStore = rebootStore(pending);
+      const jobs = [makeQueuedJob({ id: 'verify-1', pinnedAgentId: 'agent-1' })];
+      const queue = mockQueue({ dequeueJobs: jobs });
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      // Reboot-pending ⇒ held, not dispatched into the about-to-reboot box.
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(queue.dequeueByPinnedAgent).not.toHaveBeenCalled();
+    });
+
+    it('releaseRebootPending clears the flag so the next drain dispatches the held job', async () => {
+      const pending = new Set<string>(['agent-1']);
+      const rosterStore = rebootStore(pending);
+      const jobs = [makeQueuedJob({ id: 'verify-1', pinnedAgentId: 'agent-1' })];
+      const queue = mockQueue({ dequeueJobs: jobs });
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      // The reconnect path: clear first, then drain.
+      await dispatcher.releaseRebootPending('agent-1');
+      expect(rosterStore.clearRebootPending).toHaveBeenCalledWith('agent-1');
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      expect(onDispatch).toHaveBeenCalledTimes(1);
+      expect(onDispatch).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ id: 'verify-1' }),
+      );
+    });
+
+    it('is inert when no rosterStore is injected', async () => {
+      const jobs = [makeQueuedJob({ id: 'verify-1', pinnedAgentId: 'agent-1' })];
+      const queue = mockQueue({ dequeueJobs: jobs });
+      registry.register('agent-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      await dispatcher.releaseRebootPending('agent-1'); // no-op, no throw
+      await dispatcher.onAgentAvailable('agent-1');
+
+      // No gate ⇒ pinned job dispatches normally.
+      expect(onDispatch).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('onJobComplete', () => {
     it('decrements active jobs and stops tracking', async () => {
       const queue = mockQueue();

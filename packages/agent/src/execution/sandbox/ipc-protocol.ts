@@ -203,8 +203,10 @@ export interface StepApprovalRequestIpc {
   clauses: Array<{ team: string } | { user: string }>;
   /** Human label for the gate. */
   reason: string;
-  /** Per-gate timeout override (seconds) from the SDK `requireApproval.timeout`. */
+  /** Per-gate timeout override (seconds) from the SDK `approval.timeout`. */
   timeoutSeconds?: number;
+  /** Computed drift payload, present only for `when: 'drift'` gates. */
+  payload?: { summaryMarkdown: string; drift: unknown };
 }
 
 /** Which provenance upload operation to relay. */
@@ -536,6 +538,12 @@ export interface JobExecutionRequest {
 
   /** Plain outputs from upstream jobs (keyed by job name, then by step name). For ctx.jobOutputs(). */
   upstreamJobOutputs?: Record<string, Record<string, unknown>>;
+
+  /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). For ctx.needs.<job>.status. */
+  upstreamJobStatuses?: Record<string, import('@kici-dev/engine').ExecutionJobStatus>;
+
+  /** This job's declared upstream needs (normalized lock edges) used to shape ctx.needs for steps. */
+  jobNeeds?: readonly unknown[];
 
   /** Resolved private npm registries for `npm install` auth (token bytes already filled). */
   npmRegistries?: ReadonlyArray<{

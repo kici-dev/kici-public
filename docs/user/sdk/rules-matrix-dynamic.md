@@ -380,10 +380,10 @@ export default workflow('discovery-fan-out', { jobs: [discover, reports] });
 
 `ctx.needs` shape:
 
-| Need form                                               | `ctx.needs[...]` value                                                                                                                                    |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `'jobName'` / `{ name, ifFailed }`                      | `{ result }` — `result` is an `OutputProxy` (`ctx.needs.<job>.result.<step>.<field>`; single-step `run` jobs flatten to `ctx.needs.<job>.result.<field>`) |
-| `dynamicGroup('g')` / `dynamicGroup('g', { ifFailed })` | ordered array of `{ name, result }`, one per group member                                                                                                 |
+| Need form                                           | `ctx.needs[...]` value                                                                                                                                                                                        |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'jobName'` / `{ name, when }`                      | `{ result, status }` — `result` is an `OutputProxy` (`ctx.needs.<job>.result.<step>.<field>`; single-step `run` jobs flatten to `ctx.needs.<job>.result.<field>`); `status` is the upstream's terminal status |
+| `dynamicGroup('g')` / `dynamicGroup('g', { when })` | ordered array of `{ name, result, status }`, one per group member                                                                                                                                             |
 
 `ctx.needs` is deterministic — a snapshot of upstream outputs frozen at first eval and replayed unchanged on re-eval, like `ctx.event`. Use result-aware generation for same-run fan-out from a prior job's result; use [`jobComplete()`](./triggers.md) for cross-workflow reactions to a job finishing. See the architecture deep-dive in [dynamic jobs](../../architecture/execution/dynamic-jobs.md#result-aware-generation).
 

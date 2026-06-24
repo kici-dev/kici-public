@@ -50,6 +50,23 @@ describe('orchestrator loadConfig', () => {
       expect(config.agentMaxReconnectDelayMs).toBe(60_000);
     });
 
+    it('defaults hostRebootDeadlineMs to 900000 (15 min)', () => {
+      const config = loadConfig();
+      expect(config.hostRebootDeadlineMs).toBe(900_000);
+    });
+
+    it('coerces KICI_HOST_REBOOT_DEADLINE_MS', () => {
+      process.env.KICI_HOST_REBOOT_DEADLINE_MS = '120000';
+      const config = loadConfig();
+      expect(config.hostRebootDeadlineMs).toBe(120_000);
+    });
+
+    it('reads KICI_ORCHESTRATOR_HOST_AGENT_ID for the co-located guard', () => {
+      process.env.KICI_ORCHESTRATOR_HOST_AGENT_ID = 'orch-box';
+      const config = loadConfig();
+      expect(config.orchestratorHostAgentId).toBe('orch-box');
+    });
+
     it('parses KICI_SKIP_S3_SENTINEL_VALIDATION=true to true', () => {
       process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
       const config = loadConfig();

@@ -53,6 +53,54 @@ describe('StepApprovalBridge', () => {
     expect(bridge.size()).toBe(0);
   });
 
+  it('passes a drift payload through to createHold', async () => {
+    const { store, createHold } = fakeStore('hold-payload');
+    const bridge = new StepApprovalBridge({
+      store,
+      resolveOrgId: () => 'org-1',
+      resolveExpirySeconds: async () => 3600,
+    });
+    const payload = { summaryMarkdown: '## drift', drift: { want: 1 } };
+
+    const pending = bridge.request({
+      agentId: 'agent-1',
+      runId: 'run-1',
+      jobId: 'deploy',
+      stepIndex: 3,
+      stepName: 'apply',
+      clauses: [{ team: 'ops' }],
+      reason: 'prod patch',
+      payload,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(createHold).toHaveBeenCalledWith('org-1', expect.objectContaining({ payload }));
+    bridge.resolve('hold-payload', 'approved');
+    await expect(pending).resolves.toEqual({ outcome: 'approved' });
+  });
+
+  it('omits payload from createHold for a non-drift hold', async () => {
+    const { store, createHold } = fakeStore('hold-nopayload');
+    const bridge = new StepApprovalBridge({
+      store,
+      resolveOrgId: () => 'org-1',
+      resolveExpirySeconds: async () => 3600,
+    });
+    bridge.request({
+      agentId: 'agent-1',
+      runId: 'r',
+      jobId: 'j',
+      stepIndex: 0,
+      stepName: 's',
+      clauses: [],
+      reason: 'gate',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect('payload' in createHold.mock.calls[0][1]).toBe(false);
+  });
+
   it('resolves with the reject reason', async () => {
     const { store } = fakeStore('hold-2');
     const bridge = new StepApprovalBridge({

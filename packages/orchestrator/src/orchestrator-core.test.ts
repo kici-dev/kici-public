@@ -4,6 +4,7 @@ import {
   buildMatrixOutputsEnvelope,
   buildHostOutputsEnvelope,
   buildUpstreamOutputsByBase,
+  buildUpstreamStatusesByBase,
   internalJobRunsOnSelectors,
 } from './orchestrator-core.js';
 
@@ -51,16 +52,16 @@ describe('upstreamBaseNamesFromNeeds', () => {
   });
 
   it('extracts the name from NeedsEntry objects (fixes the string-assumption bug)', () => {
-    expect(upstreamBaseNamesFromNeeds([{ name: 'test', ifFailed: 'run' }])).toEqual(['test']);
+    expect(upstreamBaseNamesFromNeeds([{ name: 'test', runOn: ['failed'] }])).toEqual(['test']);
   });
 
   it('skips NeedsGroupEntry objects (resolved by the scheduler)', () => {
-    expect(upstreamBaseNamesFromNeeds([{ group: 'deploys', ifFailed: 'skip' }])).toEqual([]);
+    expect(upstreamBaseNamesFromNeeds([{ group: 'deploys', runOn: ['success'] }])).toEqual([]);
   });
 
   it('handles a mix of strings and objects', () => {
     expect(
-      upstreamBaseNamesFromNeeds(['lint', { name: 'test', ifFailed: 'run' }, { group: 'g' }]),
+      upstreamBaseNamesFromNeeds(['lint', { name: 'test', runOn: ['failed'] }, { group: 'g' }]),
     ).toEqual(['lint', 'test']);
   });
 });
@@ -171,5 +172,27 @@ describe('buildUpstreamOutputsByBase', () => {
       ],
     );
     expect(out).toEqual({ test: { byMatrix: { a: { v: '1' } }, merged: { v: '1' } } });
+  });
+});
+
+describe('buildUpstreamStatusesByBase', () => {
+  it('keys each upstream row by job_name', () => {
+    const out = buildUpstreamStatusesByBase([
+      { job_name: 'build', status: 'success' },
+      { job_name: 'probe', status: 'failed' },
+    ]);
+    expect(out).toEqual({ build: 'success', probe: 'failed' });
+  });
+
+  it('records per-child statuses for a fanned-out upstream', () => {
+    const out = buildUpstreamStatusesByBase([
+      { job_name: 'test (a)', status: 'success' },
+      { job_name: 'test (b)', status: 'skipped' },
+    ]);
+    expect(out).toEqual({ 'test (a)': 'success', 'test (b)': 'skipped' });
+  });
+
+  it('skips rows with no status and returns undefined when none have one', () => {
+    expect(buildUpstreamStatusesByBase([{ job_name: 'x', status: null }])).toBeUndefined();
   });
 });

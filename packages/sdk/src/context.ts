@@ -295,4 +295,13 @@ export interface StepContext<TInputs = Record<string, unknown>> {
   attestProvenance(
     opts: import('./provenance-types.js').AttestProvenanceOptions,
   ): Promise<import('./provenance-types.js').AttestProvenanceResult>;
+  /**
+   * Upstream needs resolved for this job, keyed by upstream job or group name.
+   * `ctx.needs.<job>.result` is the upstream's outputs proxy and
+   * `ctx.needs.<job>.status` its terminal status (`success | failed | skipped |
+   * …`). A group / matrix / `runsOnAll` fan-out upstream is an ordered array of
+   * `{ name, result, status }`, one entry per child. Undefined for a job with no
+   * declared `needs`.
+   */
+  needs?: import('./needs-context.js').NeedsContext;
 }
