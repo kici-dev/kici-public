@@ -340,6 +340,16 @@ function serializeSteps(steps: readonly (Step<any> | ((...args: any[]) => any))[
       hasOutputs: !!step.outputs,
       ...(step.continueOnError ? { continueOnError: true } : {}),
       ...(step.timeout ? { timeout: step.timeout } : {}),
+      ...(step.retry
+        ? {
+            retry: {
+              maxAttempts: step.retry.maxAttempts,
+              delayMs: step.retry.delayMs,
+              backoff: step.retry.backoff,
+              maxDelayMs: step.retry.maxDelayMs,
+            },
+          }
+        : {}),
     };
   });
 }

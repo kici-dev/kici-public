@@ -36,8 +36,12 @@ export {
   genericWebhook,
   schedule,
   lifecycle,
+  defineDispatchInputs,
 } from './triggers/index.js';
 export type {
+  DefinedDispatchInputs,
+  InferDispatchInputs,
+  DispatchInputsMap,
   TriggerConfig,
   PrTriggerConfig,
   PushTriggerConfig,
@@ -112,7 +116,7 @@ export { onCancel, cleanup, onSuccess, onFailure, beforeStep, afterStep } from '
 export type { HookConfig, HookFn, HookInput, HookContext, OutcomeMetadata } from './hooks/index.js';
 
 // Rule factories
-export { rule, skip } from './rules/index.js';
+export { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from './rules/index.js';
 export { evaluateRules } from './rules/index.js';
 export { isEventType } from './rules/index.js';
 export type {
@@ -168,6 +172,8 @@ export type {
   StepOptionsPlain,
   StepOptionsWithCheck,
   StepRunFn,
+  RetryConfig,
+  NormalizedRetry,
   BareStepFn,
   StepInput,
   OutputSchema,
@@ -182,6 +188,7 @@ export type {
   ContainerConfig,
   RunsOnSelector,
   RunsOn,
+  RunsOnPick,
   Workflow,
   WorkflowOptions,
   Registry,
@@ -241,6 +248,8 @@ export type {
 } from './context.js';
 
 export { isMatrixJobOutputs, isHostJobOutputs } from './context.js';
+
+export type { FanoutPosition } from './fanout-context.js';
 
 // KiCI API types (agent private API over WS)
 export { buildKiciApi } from './api-types.js';
@@ -316,8 +325,8 @@ export { fixture } from './fixture.js';
 export type { Fixture, FixtureOptions } from './fixture.js';
 
 // Idempotency helpers
-export { idempotent, idempotentStep } from './idempotent.js';
-export type { IdempotentOptions, IdempotentResult } from './idempotent.js';
+export { idempotent, idempotentStep, checkStep } from './idempotent.js';
+export type { IdempotentOptions, IdempotentResult, CheckStepOptions } from './idempotent.js';
 
 // Wait-for helpers
 export { waitFor, waitForStep, WaitForTimeoutError } from './wait-for.js';

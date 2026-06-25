@@ -24,7 +24,7 @@
 
 import { runIdempotentStep } from '@kici-dev/core/idempotency';
 import { step } from './step.js';
-import type { Step } from './types.js';
+import type { Step, StepOptionsBase, StepOptionsWithCheck } from './types.js';
 import type { StepContext } from './context.js';
 
 export interface IdempotentOptions<TDrift, TInSync = void, TApplied = void> {
@@ -112,4 +112,56 @@ export function idempotentStep<TDrift, TInSync = void, TApplied = void>(
         log: (line) => ctx.log.info(line),
       }),
   });
+}
+
+/**
+ * Options for {@link checkStep}. The same shape as `idempotentStep`'s options,
+ * except `apply` and `whenInSync` receive `ctx` first (matching the `step()`
+ * check facet's `run(ctx, drift)` form) so the apply logic has access to
+ * `ctx.$` / `ctx.log` / `ctx.secrets`. The remaining `StepOptionsBase`
+ * passthroughs (`continueOnError`, `timeout`, `rules`, `outputs`, `retry`, …)
+ * are forwarded to the underlying step.
+ */
+export interface CheckStepOptions<TDrift, TInSync = void, TApplied = void> extends Omit<
+  StepOptionsBase,
+  'onCancel' | 'cleanup' | 'approval'
+> {
+  /** Read-only inspection: drift if apply would change state, or null if in sync. */
+  check: (ctx: StepContext) => Promise<TDrift | null>;
+  /** Brings the system to the desired state. Runs only in apply mode (skipped under `kici run --check`). */
+  apply: (ctx: StepContext, drift: TDrift) => Promise<TApplied>;
+  /** Required: human-readable summary of what apply() would do; shown in check-mode drift output. */
+  summarize: (drift: TDrift) => string;
+  /** Runs when check() returns null (already in sync). */
+  whenInSync?: (ctx: StepContext) => Promise<TInSync>;
+}
+
+/**
+ * Factory returning a check-facet SDK Step — the check-mode-aware sibling of
+ * {@link idempotentStep}. Unlike `idempotentStep` (which always applies on
+ * drift), a `checkStep` respects the run-level check mode: `kici run --check`
+ * reports the drift and skips `apply`, while apply mode applies it.
+ *
+ * It desugars to the `step()` check facet
+ * (`run: (ctx, drift) => apply(ctx, drift)`), so it inherits the agent
+ * step-loop and local-executor check-mode drive for free — no engine, agent,
+ * orchestrator, or lockfile change.
+ */
+export function checkStep<TDrift, TInSync = void, TApplied = void>(
+  name: string,
+  options: CheckStepOptions<TDrift, TInSync, TApplied>,
+): Step<TApplied | TInSync> {
+  const checkOptions: StepOptionsWithCheck<TApplied | TInSync, TDrift> = {
+    check: options.check,
+    summarize: options.summarize,
+    run: (ctx: StepContext, drift: TDrift) => options.apply(ctx, drift),
+    ...(options.whenInSync && { whenInSync: options.whenInSync }),
+    ...(options.outputs !== undefined && { outputs: options.outputs }),
+    ...(options.continueOnError !== undefined && { continueOnError: options.continueOnError }),
+    ...(options.timeout !== undefined && { timeout: options.timeout }),
+    ...(options.retry !== undefined && { retry: options.retry }),
+    ...(options.cache !== undefined && { cache: options.cache }),
+    ...(options.rules !== undefined && { rules: options.rules }),
+  };
+  return step<TApplied | TInSync, TDrift>(name, checkOptions);
 }

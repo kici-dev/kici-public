@@ -15,11 +15,11 @@
  */
 import { z } from 'zod';
 import { ActorType } from '../protocol/messages/actor.js';
-import { AccessLogOutcome } from '../protocol/messages/access-log.js';
+import { AccessLogOutcome, AccessLogSource } from '../protocol/messages/access-log.js';
 
 /**
  * Source discriminator on a unified Activity row.
- * NOT to be confused with `AccessLogSource` (platform_proxy / admin_http /
+ * NOT to be confused with `AccessLogSource` (platform_proxy / admin_http / agent /
  * admin_cli) — that field is renamed to `origin` on the unified row to
  * avoid the collision.
  */
@@ -70,12 +70,12 @@ export const activityRowSchema = z.object({
   /** access_log only — request correlation ID. */
   requestId: z.string().nullable().optional(),
   /**
-   * access_log only — origin of the entry (platform_proxy / admin_http /
-   * admin_cli). Renamed from `source` on the access_log row schema so the
-   * unified row's `source` field is unambiguously the audit_log vs.
-   * access_log discriminator.
+   * access_log only — origin of the entry (the AccessLogSource values:
+   * platform_proxy / admin_http / admin_cli / agent). Renamed from `source` on
+   * the access_log row schema so the unified row's `source` field is
+   * unambiguously the audit_log vs. access_log discriminator.
    */
-  origin: z.enum(['platform_proxy', 'admin_http', 'admin_cli']).nullable().optional(),
+  origin: AccessLogSource.nullable().optional(),
 });
 export type ActivityRow = z.infer<typeof activityRowSchema>;
 
@@ -91,7 +91,7 @@ export const activityFilterSchema = z.object({
   /** Free-form: matches access_log AccessLogAction values OR audit_log free-form actions. */
   action: z.string().optional(),
   outcome: AccessLogOutcome.optional(),
-  origin: z.enum(['platform_proxy', 'admin_http', 'admin_cli']).optional(),
+  origin: AccessLogSource.optional(),
   targetType: z.string().optional(),
   targetId: z.string().optional(),
   /** Sugar: maps to targetType='run' + targetId=runId. Both halves of the federation respect it. */

@@ -14,3 +14,5 @@ export {
   matchScopePattern,
   stripScopePrefix,
 } from './scope-resolver.js';
+
+export type { HostFacts } from './host-match.js';

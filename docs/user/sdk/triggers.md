@@ -170,12 +170,72 @@ Create a repository_dispatch trigger. Returns a frozen `DispatchTriggerConfig`.
 function dispatch(config?: DispatchConfigInput): DispatchTriggerConfig;
 ```
 
-**Config options:** `types` (string[]), `description`
+**Config options:** `types` (string[]), `description`, `inputs` (typed dispatch inputs map)
 
 ```typescript
 dispatch(); // Any dispatch
 dispatch({ types: ['deploy', 'rollback'] }); // Specific event types
 ```
+
+#### Typed dispatch inputs
+
+A `dispatch()` trigger can declare a typed `inputs` schema. Operators supply
+values with `kici run --input key=value`; KiCI validates, coerces, defaults, and
+exposes them to steps and rules as `ctx.dispatchInputs`. The values are validated
+on the orchestrator from the compiled lock file — a missing required input or a
+bad value is rejected before any agent runs, without cloning the repository.
+
+```typescript
+import { workflow, job, step, dispatch, defineDispatchInputs, z } from '@kici-dev/sdk';
+
+const inputs = defineDispatchInputs({
+  target: z.string().optional(),
+  skipCveScan: z.boolean().default(false),
+  skipCveScanReason: z.string().min(1).optional(),
+  mode: z.enum(['full', 'edge-only']).default('full'),
+  retries: z.number().int().min(0).max(10).default(3),
+});
+
+export default workflow('deploy-prod', {
+  on: dispatch({ types: ['deploy-prod'], inputs }),
+  jobs: [
+    job('gates', {
+      runsOn: 'kici:group:ops',
+      steps: [
+        step('cve-gate', async (ctx) => {
+          const i = inputs.from(ctx); // fully typed per declared key
+          if (i.skipCveScan) {
+            ctx.log.warn(`CVE gate skipped: ${i.skipCveScanReason ?? '(no reason)'}`);
+            return;
+          }
+          await ctx.$`pnpm scan:cve:gate`;
+        }),
+      ],
+    }),
+  ],
+});
+```
+
+- **`defineDispatchInputs(map)`** is the single declaration site. It returns a
+  handle that `dispatch({ inputs })` accepts and exposes `inputs.from(ctx)` — a
+  typed reader over `ctx.dispatchInputs`, typed per declared key. `dispatch({ inputs })`
+  also accepts a bare `{ name: schema }` map directly when you don't need the reader.
+- **`ctx.dispatchInputs`** is always present (a validated map of
+  `string | number | boolean | null`), distinct from `ctx.inputs` (typed outputs
+  from `needs` dependencies). Rules see the same values via `ctx.dispatchInputs`,
+  so `skipUnless(ctx => !ctx.dispatchInputs.skipCveScan)` works.
+- **Defaults are applied once**, on the orchestrator (the authoritative side); the
+  CLI pre-validates `--input` for fast feedback and forwards the raw operator pairs.
+
+**Allowed input types (closed subset):** `z.string()`, `z.number()`,
+`z.boolean()`, `z.enum([...])`, `z.literal(v)`, with the modifiers `.optional()`,
+`.nullable()`, `.default(v)`, `.min(n)`, `.max(n)`, `.regex(re)`, `.int()`.
+Anything outside this set (`.refine()`, `.transform()`, `.pipe()`, `z.object()`,
+`z.array()`, `z.union()`, `z.record()`, `z.coerce.*`) is a **compile error** —
+the closed set is what guarantees the schema survives the trip to the
+orchestrator's lock file without silently dropping any validation. CLI strings
+are coerced for you (`--input retries=3` becomes the number `3`; booleans accept
+`true`/`false`/`1`/`0`/`yes`/`no`), so author your schema with clean types.
 
 ### create()
 

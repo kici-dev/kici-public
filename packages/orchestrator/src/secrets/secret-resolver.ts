@@ -20,8 +20,11 @@ import {
   matchScopePattern,
   stripScopePrefix,
   type EnvironmentBinding,
+  type HostFacts,
   type ScopedSecret,
 } from '@kici-dev/engine';
+import { hostSpecificity, matchHostPattern } from '@kici-dev/engine/environment/host-match';
+import { substituteScopePattern } from '@kici-dev/engine/environment/scope-template';
 import type { Logger } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
@@ -80,7 +83,11 @@ export interface ResolvedSecretMeta {
  * can flow through `ProcessingDeps.secretResolver`.
  */
 export interface SecretResolverApi {
-  resolveForJob(orgId: string, environmentName: string): Promise<Record<string, string>>;
+  resolveForJob(
+    orgId: string,
+    environmentName: string,
+    hostCtx?: HostFacts,
+  ): Promise<Record<string, string>>;
   resolveNamed(
     orgId: string,
     scope: string,
@@ -90,6 +97,7 @@ export interface SecretResolverApi {
   resolveForJobWithMeta(
     orgId: string,
     environmentName: string,
+    hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>>;
 }
 
@@ -122,9 +130,17 @@ export class SecretResolver implements SecretResolverApi {
    *
    * @param orgId - Organization ID
    * @param environmentName - Environment name to resolve secrets for
+   * @param hostCtx - Optional fan-out child identity for per-host resolution.
+   *   When supplied, each binding is gated by its `host_pattern` and its
+   *   `scope_pattern` is templated per-child; when omitted, only fleet-wide
+   *   (`'**'`) non-templated bindings contribute.
    * @returns Flat map of decrypted secret key-value pairs
    */
-  async resolveForJob(orgId: string, environmentName: string): Promise<Record<string, string>> {
+  async resolveForJob(
+    orgId: string,
+    environmentName: string,
+    hostCtx?: HostFacts,
+  ): Promise<Record<string, string>> {
     // 1. Look up environment by name
     const env = await this.environmentStore.getByName(orgId, environmentName);
     if (!env) {
@@ -149,15 +165,16 @@ export class SecretResolver implements SecretResolverApi {
     // 5. Build a decrypt function that dispatches to the correct backend
     const decryptFn = this.buildDecryptFn();
 
-    // 6. Use engine scope resolver to match and merge (longest-path-wins after prefix strip)
-    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn);
+    // 6. Use engine scope resolver to match and merge (longest-path-wins after prefix strip,
+    //    host-specificity-wins when a hostCtx is supplied)
+    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn, hostCtx);
 
     // 7. Audit log the resolution (include backend name)
     if (Object.keys(resolved).length > 0) {
       // Only record backends that actually contributed resolved secrets
       const backends = new Set<string>();
       for (const key of Object.keys(resolved)) {
-        const winning = this.findWinningSecret(key, bindings, allPrefixedSecrets);
+        const winning = this.findWinningSecret(key, bindings, allPrefixedSecrets, hostCtx);
         if (winning) {
           const colonIdx = winning.scope.indexOf(':');
           if (colonIdx >= 0) backends.add(winning.scope.slice(0, colonIdx));
@@ -284,6 +301,7 @@ export class SecretResolver implements SecretResolverApi {
   async resolveForJobWithMeta(
     orgId: string,
     environmentName: string,
+    hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>> {
     const env = await this.environmentStore.getByName(orgId, environmentName);
     if (!env) return {};
@@ -301,14 +319,14 @@ export class SecretResolver implements SecretResolverApi {
     const decryptFn = this.buildDecryptFn();
 
     // Resolve using engine (returns flat key-value)
-    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn);
+    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn, hostCtx);
 
     // Enrich with metadata: find which secret provided each key
     const meta: Record<string, ResolvedSecretMeta> = {};
 
     for (const key of Object.keys(resolved)) {
       // Find the winning secret for this key (same logic as scope resolver)
-      const winning = this.findWinningSecret(key, bindings, allPrefixedSecrets);
+      const winning = this.findWinningSecret(key, bindings, allPrefixedSecrets, hostCtx);
       if (winning) {
         const colonIdx = winning.scope.indexOf(':');
         meta[key] = {
@@ -423,30 +441,54 @@ export class SecretResolver implements SecretResolverApi {
   }
 
   /**
-   * Find the winning secret for a given key (highest scope depth after prefix strip).
+   * Find the winning secret for a given key, mirroring the engine scope
+   * resolver's host-aware matching and `(host specificity, scope depth)`
+   * precedence so the enriched metadata reports the same secret the flat
+   * resolution selected.
    */
   private findWinningSecret(
     key: string,
     bindings: EnvironmentBinding[],
     secrets: ScopedSecret[],
+    hostCtx?: HostFacts,
   ): ScopedSecret | null {
-    // Replicate the scope resolver's matching and precedence logic
     let best: ScopedSecret | null = null;
     let bestDepth = -1;
+    let bestHostSpec = -1;
 
     for (const binding of bindings) {
+      const scopePattern = this.bindingScopeForHost(binding, hostCtx);
+      if (scopePattern === null) continue;
+      const hostSpec = hostSpecificity(binding.hostPattern);
       for (const secret of secrets) {
         if (secret.key !== key) continue;
-        if (matchScopePattern(secret.scope, binding.scopePattern)) {
-          const depth = stripScopePrefix(secret.scope).split('/').length;
-          if (depth > bestDepth) {
-            best = secret;
-            bestDepth = depth;
-          }
+        if (!matchScopePattern(secret.scope, scopePattern)) continue;
+        const depth = stripScopePrefix(secret.scope).split('/').length;
+        if (hostSpec > bestHostSpec || (hostSpec === bestHostSpec && depth > bestDepth)) {
+          best = secret;
+          bestDepth = depth;
+          bestHostSpec = hostSpec;
         }
       }
     }
 
     return best;
+  }
+
+  /**
+   * Resolve the effective scope pattern a binding contributes for a host,
+   * applying the host gate and per-child scope templating. Mirrors the engine
+   * scope resolver's `bindingScopeForHost`. Returns `null` to skip the binding.
+   */
+  private bindingScopeForHost(
+    binding: EnvironmentBinding,
+    hostCtx: HostFacts | undefined,
+  ): string | null {
+    if (hostCtx) {
+      if (!matchHostPattern(hostCtx, binding.hostPattern)) return null;
+      return substituteScopePattern(binding.scopePattern, hostCtx);
+    }
+    if (binding.hostPattern !== '**' && binding.hostPattern !== '') return null;
+    return binding.scopePattern.includes('${') ? null : binding.scopePattern;
   }
 }

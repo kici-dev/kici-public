@@ -3,6 +3,7 @@ import type { MatrixValues } from './matrix/types.js';
 import type { EventEmitOptions } from './events/types.js';
 import type { StepSecrets } from './secrets.js';
 import type { KiciApi } from './api-types.js';
+import type { FanoutPosition } from './fanout-context.js';
 
 /** Logger interface for step execution */
 export interface Logger {
@@ -150,6 +151,12 @@ export interface StepContext<TInputs = Record<string, unknown>> {
   addPath(dir: string): void;
   /** Typed inputs from dependencies */
   inputs: TInputs;
+  /**
+   * Operator-supplied, validated + coerced workflow-dispatch inputs (from `dispatch({ inputs })`).
+   * Distinct from `inputs` (typed outputs from `needs` dependencies). Empty when none declared.
+   * Prefer the typed `defineDispatchInputs(...).from(ctx)` accessor for per-key types.
+   */
+  dispatchInputs: Readonly<Record<string, string | number | boolean | null>>;
   /** Current workflow metadata */
   workflow: WorkflowInfo;
   /** Current job metadata */
@@ -172,6 +179,12 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    * platform, arch). Set only for jobs that use `runsOnAll`. Undefined otherwise.
    */
   agent?: AgentInfo;
+  /**
+   * Position of this child within its fan-out (a `runsOnAll` host or a matrix
+   * combination), deterministically ordered (host: by `agentId`; matrix: by
+   * variant label). Undefined on a non-fan-out job.
+   */
+  fanout?: FanoutPosition;
   /**
    * Raw webhook payload from the git provider.
    * Contains the full, unmodified payload as received from the webhook.

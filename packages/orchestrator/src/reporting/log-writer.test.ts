@@ -122,4 +122,63 @@ describe('LogWriter', () => {
       ).resolves.not.toThrow();
     });
   });
+
+  describe('drain', () => {
+    it('awaits an in-flight append before resolving', async () => {
+      // A slow append that resolves only when we release it. `appendChunk` is
+      // called fire-and-forget (not awaited) — the way the agent WS handler
+      // calls it — so its storage write is still pending when drain() runs.
+      let releaseAppend: (() => void) | undefined;
+      let appendCompleted = false;
+      (mockStorage.storage.append as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseAppend = () => {
+              appendCompleted = true;
+              resolve();
+            };
+          }),
+      );
+
+      // Fire-and-forget, mirroring onLogChunk: do NOT await the chunk.
+      void writer.appendChunk('run-1', 'test', 0, ['marker:OK'], Date.now());
+      // Let the synchronous portion of appendChunk register the pending append.
+      await Promise.resolve();
+
+      let drained = false;
+      const drainPromise = writer.drain('run-1').then(() => {
+        drained = true;
+      });
+
+      // drain() must still be pending: the append has not been released.
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      expect(appendCompleted).toBe(false);
+
+      releaseAppend?.();
+      await drainPromise;
+      expect(drained).toBe(true);
+      expect(appendCompleted).toBe(true);
+    });
+
+    it('resolves immediately when there are no pending appends for the run', async () => {
+      await expect(writer.drain('unknown-run')).resolves.toBeUndefined();
+    });
+
+    it('forgets a run once its appends have settled', async () => {
+      await writer.appendChunk('run-1', 'test', 0, ['line'], Date.now());
+      // The append already settled (appendChunk awaited it), so the pending set
+      // for run-1 is cleaned up and a later drain is a no-op.
+      await expect(writer.drain('run-1')).resolves.toBeUndefined();
+    });
+
+    it('still drains when an append rejected (ordering, not error propagation)', async () => {
+      (mockStorage.storage.append as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('disk full'),
+      );
+      void writer.appendChunk('run-1', 'test', 0, ['line'], Date.now());
+      await Promise.resolve();
+      await expect(writer.drain('run-1')).resolves.toBeUndefined();
+    });
+  });
 });

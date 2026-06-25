@@ -72,16 +72,27 @@ export async function initTestUpload(
   const publicKeyDer = publicKey.export({ type: 'spki', format: 'der' });
   const privateKeyDer = privateKey.export({ type: 'pkcs8', format: 'der' });
 
+  // Remote test uploads PUT the overlay tarball directly to object storage, so a
+  // presigned URL is mandatory. An orchestrator with no storage configured cannot
+  // serve `kici run remote` — fail loudly with an actionable message rather than
+  // returning an empty signedUrl that surfaces downstream as an opaque
+  // "Failed to parse URL from " fetch error on the developer's machine.
+  if (!deps.cacheStorage) {
+    throw new Error(
+      'This orchestrator has no object storage configured, so `kici run remote` ' +
+        'is unavailable. Configure cache storage on the orchestrator (set ' +
+        'KICI_STORAGE_TYPE to "s3" or "filesystem", plus the matching storage ' +
+        'settings) and restart it to enable remote runs.',
+    );
+  }
+
   const uploadId = randomUUID();
   const sanitizedKey = sanitizeRoutingKey(routingKey);
   const storageKey = `test-uploads/${sanitizedKey}/${sha ?? 'unknown'}/${uploadId}.tar.gz.enc`;
 
-  let signedUrl = '';
-  if (deps.cacheStorage) {
-    signedUrl = params.internal
-      ? await deps.cacheStorage.getInternalUploadUrl(storageKey)
-      : await deps.cacheStorage.getUploadUrl(storageKey);
-  }
+  const signedUrl = params.internal
+    ? await deps.cacheStorage.getInternalUploadUrl(storageKey)
+    : await deps.cacheStorage.getUploadUrl(storageKey);
 
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
   await deps.db

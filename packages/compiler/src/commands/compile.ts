@@ -24,6 +24,12 @@ export interface CompileOptions {
   check: boolean;
   /** Verbose output */
   verbose: boolean;
+  /**
+   * Suppress the success line on stdout (and the auto-types success line) so a
+   * caller emitting machine-readable output keeps stdout pure. Validation
+   * errors are still reported.
+   */
+  quiet?: boolean;
 }
 
 /**
@@ -130,13 +136,15 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     if (!options.check) {
       await fs.writeFile(lockPath, lockJson, 'utf-8');
 
-      logger.info(
-        pc.green('✓') +
-          ` Compiled workflows → .kici/kici.lock.json` +
-          pc.dim(
-            ` (${workflowsWithSource.length} workflow${workflowsWithSource.length !== 1 ? 's' : ''})`,
-          ),
-      );
+      if (!options.quiet) {
+        logger.info(
+          pc.green('✓') +
+            ` Compiled workflows → .kici/kici.lock.json` +
+            pc.dim(
+              ` (${workflowsWithSource.length} workflow${workflowsWithSource.length !== 1 ? 's' : ''})`,
+            ),
+        );
+      }
 
       // Auto-regenerate types when authenticated against the Platform
       // (non-blocking). Requires a token, a Platform endpoint, and an active
@@ -149,7 +157,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
         const hasEndpoint = Boolean(config.platformEndpoint ?? config.endpoint);
         if (hasToken && hasEndpoint && config.activeOrgId) {
           const { typesCommand } = await import('./types.js');
-          await typesCommand({ kiciDir: kiciDir });
+          await typesCommand({ kiciDir: kiciDir, quiet: options.quiet });
         }
       } catch {
         // Non-blocking -- warn and continue
@@ -157,7 +165,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
           pc.yellow('Could not refresh types (Platform unreachable). Compilation succeeded.'),
         );
       }
-    } else {
+    } else if (!options.quiet) {
       logger.info(
         pc.green('✓') +
           ` Workflows are valid` +

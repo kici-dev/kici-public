@@ -76,8 +76,12 @@ const { DashboardGlobalWorkflowsHandler, isDashboardGlobalWorkflowsMessage } =
 const { guardedDashboardDispatch } = await import('./ws/dashboard-dispatch-guard.js');
 const { handleDiagnosticsRequest, handleScalerCapacityRequest, handleScalerAgentsRequest } =
   await import('./ws/dashboard-diagnostics-handler.js');
-const { handleFleetHostsRequest, handleFleetHostRequest, handleFleetPreviewRequest } =
-  await import('./ws/dashboard-fleet-handler.js');
+const {
+  handleFleetHostsRequest,
+  handleFleetHostRequest,
+  handleFleetPreviewRequest,
+  handleFleetWorkflowsForHostRequest,
+} = await import('./ws/dashboard-fleet-handler.js');
 const { resolveWorkflowRunsOnAll } = await import('./ws/fleet-runs-on-all.js');
 const { EnvironmentStore } = await import('./environments/environment-store.js');
 const { VariableStore } = await import('./environments/variable-store.js');
@@ -404,6 +408,7 @@ await guardStartup(logger, async () => {
               orgId: r.org_id,
               environmentId: r.environment_id,
               scopePattern: r.scope_pattern,
+              hostPattern: r.host_pattern,
               createdAt: r.created_at.toISOString(),
             }));
           },
@@ -881,6 +886,7 @@ await guardStartup(logger, async () => {
         rosterStore: sub.hostRosterStore!,
         rosterGraceMs: config.rosterGraceMs,
         resolveRunsOnAll: (workflowName: string) => resolveWorkflowRunsOnAll(sub.db, workflowName),
+        registrationStore: sub.registrationStore,
       });
       const runFleetRead = async (
         requestId: string,
@@ -963,6 +969,7 @@ await guardStartup(logger, async () => {
               db: sub.db,
               agentRegistry: sub.agentRegistry,
               cacheStorage: sub.cacheStorage,
+              logWriter: sub.logWriter,
               accessLog: sub.accessLogWriter,
               orgId: resolvedOrgContext?.orgId ?? null,
               routingKey: resolvedOrgContext?.routingKey ?? null,
@@ -1066,6 +1073,11 @@ await guardStartup(logger, async () => {
         onFleetPreview: async (msg) => {
           await runFleetRead(msg.requestId, msg.actor, msg.workflowName, () =>
             handleFleetPreviewRequest(buildFleetDeps(), msg.requestId, msg.workflowName),
+          );
+        },
+        onFleetWorkflowsForHost: async (msg) => {
+          await runFleetRead(msg.requestId, msg.actor, msg.agentId, () =>
+            handleFleetWorkflowsForHostRequest(buildFleetDeps(), msg.requestId, msg.agentId),
           );
         },
         onDashboardScalerCapacity: (msg) => {

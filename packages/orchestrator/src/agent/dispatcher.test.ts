@@ -207,6 +207,51 @@ describe('Dispatcher', () => {
       expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({ pinnedAgentId: 'a1' }));
     });
 
+    it('picks the lowest-agentId candidate by default (deterministic)', async () => {
+      // Register out of sorted order; default pick must select 'a' regardless.
+      registry.register('c', mockWs(), ['role:db']);
+      registry.register('a', mockWs(), ['role:db']);
+      registry.register('b', mockWs(), ['role:db']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runsOnLabels: ['role:db'], jobConfig: { runsOnPick: 'deterministic' } }),
+      );
+
+      expect(result.status).toBe('dispatched');
+      if (result.status === 'dispatched') expect(result.agentId).toBe('a');
+    });
+
+    it('defaults to deterministic when runsOnPick is absent', async () => {
+      registry.register('c', mockWs(), ['role:db']);
+      registry.register('a', mockWs(), ['role:db']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runsOnLabels: ['role:db'], jobConfig: {} }),
+      );
+
+      expect(result.status).toBe('dispatched');
+      if (result.status === 'dispatched') expect(result.agentId).toBe('a');
+    });
+
+    it('pick:any keeps first-available (registration order) selection', async () => {
+      registry.register('c', mockWs(), ['role:db']);
+      registry.register('a', mockWs(), ['role:db']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runsOnLabels: ['role:db'], jobConfig: { runsOnPick: 'any' } }),
+      );
+
+      expect(result.status).toBe('dispatched');
+      // First registered (insertion order) wins under 'any'.
+      if (result.status === 'dispatched') expect(result.agentId).toBe('c');
+    });
+
     it('queues a pinned job when the pinned agent is not connected', async () => {
       const queue = mockQueue();
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
@@ -1409,10 +1454,10 @@ describe('Dispatcher', () => {
   describe('onJobRejected', () => {
     it('undoes accounting, requeues, and redispatches to another agent', async () => {
       const registry = new AgentRegistry();
-      // idle-agent registered first so findAvailable returns it ahead of the
-      // rejecting agent — the requeued job lands on a different agent.
+      // 'idle-agent' sorts below 'zzz-rejecter', so deterministic selection (the
+      // default) lands the requeued job on the non-rejecting agent.
       registry.register('idle-agent', mockWs(), ['linux']);
-      registry.register('busy-agent', mockWs(), ['linux']);
+      registry.register('zzz-rejecter', mockWs(), ['linux']);
 
       const requeue = vi.fn(async () => 1);
       const fullJob = makeQueuedJob({ id: 'job-1', status: 'pending' });
@@ -1428,14 +1473,14 @@ describe('Dispatcher', () => {
       const onDispatch = vi.fn();
       const dispatcher = new Dispatcher({ registry, queue, metrics: mockMetrics(), onDispatch });
 
-      // Simulate the phantom dispatch: job-1 tracked to busy-agent.
-      registry.incrementActiveJobs('busy-agent');
-      dispatcher.restoreJobForAgent('busy-agent', 'job-1');
+      // Simulate the phantom dispatch: job-1 tracked to the rejecting agent.
+      registry.incrementActiveJobs('zzz-rejecter');
+      dispatcher.restoreJobForAgent('zzz-rejecter', 'job-1');
 
-      await dispatcher.onJobRejected('busy-agent', 'job-1', 'busy');
+      await dispatcher.onJobRejected('zzz-rejecter', 'job-1', 'busy');
 
       expect(requeue).toHaveBeenCalledWith('job-1');
-      expect(registry.get('busy-agent')?.activeJobs).toBe(0);
+      expect(registry.get('zzz-rejecter')?.activeJobs).toBe(0);
       // Redispatched to the idle agent via dispatchBoundJob:
       expect(onDispatch).toHaveBeenCalledWith(
         'idle-agent',

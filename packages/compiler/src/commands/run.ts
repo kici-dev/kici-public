@@ -3,7 +3,12 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { formatBytes, logger, toErrorMessage } from '@kici-dev/core';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
-import type { HostTargetSelector } from '@kici-dev/engine';
+import {
+  parseInputPairs,
+  coerceDispatchInputs,
+  type HostTargetSelector,
+  type InputsDescriptorMap,
+} from '@kici-dev/engine';
 import type { RunLocalOptions } from '../local-executor/types.js';
 import { resolveKiciDir } from '../execution/index.js';
 import { loadGlobalConfig, type GlobalConfig } from '../remote/config.js';
@@ -18,6 +23,8 @@ import {
   type PlatformRunStatusResponse,
 } from '../remote/platform-client.js';
 import { compileFixtures, filterFixtures, type CompiledFixture } from '../fixtures/compiler.js';
+import { describeEvent } from '../fixtures/describe-event.js';
+import { runFixturePicker, FixturePickerCancelledError } from '../fixtures/picker.js';
 import { createOverlayTarball, getSizeWarning, uploadTarball } from '../remote/uploader.js';
 import {
   formatSummary,
@@ -35,6 +42,7 @@ import {
   type HeldRunContext,
 } from './held-run-client.js';
 import { handleNewHolds } from './run-hold-watch.js';
+import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './test.js';
 
@@ -63,8 +71,77 @@ export function buildTargetSelector(
   };
 }
 
+/**
+ * Look up the dispatch-trigger `inputs` descriptor for a workflow from a parsed
+ * inline lock file. When `workflowName` is given, only that workflow's dispatch
+ * triggers are considered; otherwise descriptors across all workflows are merged
+ * (best-effort fast-fail — the orchestrator re-validates against the matched
+ * workflow authoritatively). Returns undefined when no dispatch inputs declared.
+ */
+export function lookupDispatchInputsDescriptor(
+  inlineLockFile: string | undefined,
+  workflowName: string | undefined,
+): InputsDescriptorMap | undefined {
+  if (!inlineLockFile) return undefined;
+  let lock: { workflows?: { name: string; triggers?: { _type: string; inputs?: unknown }[] }[] };
+  try {
+    lock = JSON.parse(inlineLockFile);
+  } catch {
+    return undefined;
+  }
+  const merged: InputsDescriptorMap = {};
+  let found = false;
+  for (const wf of lock.workflows ?? []) {
+    if (workflowName && wf.name !== workflowName) continue;
+    for (const trigger of wf.triggers ?? []) {
+      if (trigger._type === 'dispatch' && trigger.inputs) {
+        Object.assign(merged, trigger.inputs as InputsDescriptorMap);
+        found = true;
+      }
+    }
+  }
+  return found ? merged : undefined;
+}
+
+/**
+ * Validate raw `--input KEY=VALUE` pairs against the (optional) lock descriptor
+ * and return the raw operator pairs verbatim. The CLI fast-fails on malformed /
+ * invalid input for UX, but forwards the **raw** strings — the orchestrator is
+ * authoritative and applies coercion + defaults exactly once.
+ */
+export function buildDispatchInputs(
+  pairs: string[],
+  descriptor: InputsDescriptorMap | undefined,
+): Record<string, string> {
+  if (!pairs.length) return {};
+  const raw = parseInputPairs(pairs);
+  if (descriptor) {
+    const r = coerceDispatchInputs(raw, descriptor);
+    if ('error' in r) throw r.error; // fast-fail UX; orchestrator re-validates authoritatively
+  }
+  return raw;
+}
+
 /** Interval between status/log polls while a run is active. */
 const POLL_INTERVAL_MS = 750;
+
+/**
+ * Recompile `.kici/workflows` → `kici.lock.json` before a remote run, mirroring
+ * `kici run local`. The orchestrator matches triggers and dispatches against the
+ * inline lock, so a stale lock would route an edited or newly-added workflow
+ * incorrectly. Returns false on a compile/validation error so the caller can
+ * abort before any upload or dispatch.
+ */
+async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolean> {
+  return compileCommand({
+    kiciDir: options.kiciDir ?? '.kici',
+    check: false,
+    verbose: options.debug ?? false,
+    // Keep stdout pure for machine-readable runs: --json (and --quiet) must not
+    // carry the compile / auto-types success lines before the JSON result.
+    quiet: Boolean(options.json || options.quiet),
+  });
+}
 
 /**
  * Run a workflow locally using the local executor.
@@ -145,14 +222,26 @@ export async function runRemoteCommand(
     const testsDir = path.join(kiciDir, 'tests');
     const fixtures = await compileFixtures(testsDir);
 
-    // No fixture arg and no --all: list available fixtures
-    if (!fixture && !options.all) {
-      return listFixtures(fixtures);
-    }
-
     // Determine which fixtures to run
     let selected: CompiledFixture[];
-    if (options.all) {
+    if (options.pick) {
+      // No fixtures at all: fall through to the help/empty message.
+      if (fixtures.length === 0) {
+        return listFixtures(fixtures);
+      }
+      try {
+        selected = await runFixturePicker(fixtures);
+      } catch (err) {
+        if (err instanceof FixturePickerCancelledError) {
+          logger.info(pc.gray(err.message));
+          return false;
+        }
+        throw err;
+      }
+    } else if (!fixture && !options.all) {
+      // No fixture arg and no --all: list available fixtures
+      return listFixtures(fixtures);
+    } else if (options.all) {
       selected = fixtures;
     } else {
       selected = filterFixtures(fixtures, fixture!);
@@ -215,18 +304,6 @@ function listFixtures(fixtures: CompiledFixture[]): boolean {
   return true;
 }
 
-/**
- * Describe the event type from a fixture's trigger config.
- */
-function describeEvent(event: unknown): string {
-  if (!event || typeof event !== 'object') return 'unknown';
-  const e = event as Record<string, unknown>;
-  if (e._type === 'push') return 'push';
-  if (e._type === 'pr') return `pr:${(e as Record<string, unknown>).action ?? 'open'}`;
-  if (typeof e._type === 'string') return String(e._type);
-  return 'custom';
-}
-
 /** Resolved Platform context: an authenticated client + the target org/cluster. */
 interface PlatformContext {
   client: PlatformRunClient;
@@ -283,6 +360,8 @@ async function runFixturesRemotely(
   fixtures: CompiledFixture[],
   options: RemoteRunOptions,
 ): Promise<boolean> {
+  if (!(await compileBeforeRemoteRun(options))) return false;
+
   const config = await loadGlobalConfig();
   const ctx = resolvePlatformContext(config, options);
   if (!ctx) return false;
@@ -536,6 +615,14 @@ async function runSingleFixture(
       ...(() => {
         const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
         return target ? { target } : {};
+      })(),
+      ...(() => {
+        const descriptor = lookupDispatchInputsDescriptor(
+          overlay.inlineLockFile,
+          opts.workflowName,
+        );
+        const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
+        return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
       })(),
     });
 
@@ -815,6 +902,8 @@ async function runDirectWorkflow(
   workflowName: string,
   options: RemoteRunOptions,
 ): Promise<boolean> {
+  if (!(await compileBeforeRemoteRun(options))) return false;
+
   const config = await loadGlobalConfig();
   const ctx = resolvePlatformContext(config, options);
   if (!ctx) return false;
@@ -867,6 +956,11 @@ async function runDirectWorkflow(
       ...(() => {
         const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
         return target ? { target } : {};
+      })(),
+      ...(() => {
+        const descriptor = lookupDispatchInputsDescriptor(overlay.inlineLockFile, workflowName);
+        const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
+        return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
       })(),
     });
 

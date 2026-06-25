@@ -122,6 +122,6 @@ describing what would change. The rendering is read-only.
 
 ## See also
 
-- [Idempotent SDK helpers](./sdk/idempotent.md) — the `idempotent()` / `idempotentStep()` convenience wrappers, which always apply on drift inside a single step (no run-level check mode).
+- [Idempotent SDK helpers](./sdk/idempotent.md) — the `idempotent()` / `idempotentStep()` convenience wrappers (always apply on drift), plus `checkStep()`, the clean-shape sibling that respects the run-level check mode.
 - [Core SDK reference](./sdk/core.md) — the `step()`, `job()`, and `workflow()` factories the check facet extends.
 - [Lock file and drift](./lock-file-and-drift.md) — how the lock file carries step capability flags.

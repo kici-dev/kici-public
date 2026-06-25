@@ -441,7 +441,7 @@ These rows fold into the command's exit code (0 pass / 1 warn / 2 fail) like eve
 
 ```bash
 kici-admin environment create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--database-url <url>] [--json]
-kici-admin environment bind --org <id> --env <name> --scope <pattern> [--database-url <url>] [--json]
+kici-admin environment bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
 kici-admin environment set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted|null] [--enabled true|false] [--database-url <url>] [--json]
 kici-admin environment list --org <id> [--database-url <url>] [--json]
 kici-admin environment show --org <id> --name <name> [--database-url <url>] [--json]
@@ -452,7 +452,7 @@ kici-admin environment create-template --org <id> --template <name> [--type temp
 Seeds and mutates environment rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed envs before the orchestrator is up.
 
 - `create` upserts an environment (idempotent by `org + name`). Omit a policy flag to leave it unset. `--glob-pattern` is required when `--type glob` and sets the match pattern that resolves run scopes to this environment; passing it with any other `--type` is an error.
-- `bind` upserts an `environment_bindings` row mapping a scope pattern to an environment.
+- `bind` upserts an `environment_bindings` row mapping a scope pattern to an environment. `--host <pattern>` scopes the binding to a subset of hosts (default `**` = all hosts) — see [Per-host secret scoping](../security/secrets.md#per-host-secret-scoping) for the host dimension, the templating syntax, and precedence.
 - `set-policy` updates only the provided policy fields on an existing environment. Pass `--minimum-trust null` to clear the tier gate.
 - `list` / `show` read back the current state; `show` also returns variables and bindings.
 - `delete` removes an environment and cascades its bindings, variables, and overrides. Reports `deleted=true` on success and exits non-zero if no matching environment exists. Pending held runs block the deletion with a clear error (HTTP mode returns 409) — approve or reject them first; resolved held-run history survives the deletion with its environment reference cleared.

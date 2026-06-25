@@ -169,7 +169,7 @@ export class DashboardFleetWriteHandler {
       return;
     }
     try {
-      await this.deps.rosterStore.declareStatic({
+      const { created } = await this.deps.rosterStore.declareStatic({
         agentId: msg.agentId,
         labels: msg.labels,
         hostname: msg.hostname,
@@ -186,6 +186,7 @@ export class DashboardFleetWriteHandler {
         type: 'dashboard.fleet.host.declare.response',
         requestId: msg.requestId,
         declared: true,
+        created,
       });
     } catch (err) {
       logger.error('Failed to declare host', { agentId: msg.agentId, error: toErrorMessage(err) });

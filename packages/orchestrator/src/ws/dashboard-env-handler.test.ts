@@ -63,9 +63,10 @@ function createMockDeps(): DashboardEnvHandlerDeps & { sent: unknown[] } {
       deleteSourceOverride: vi.fn().mockResolvedValue(undefined),
     } as any,
     bindingStore: {
-      list: vi
-        .fn()
-        .mockResolvedValue([{ scope_pattern: 'aws/prod/**' }, { scope_pattern: 'gcp/**' }]),
+      list: vi.fn().mockResolvedValue([
+        { scope_pattern: 'aws/prod/**', host_pattern: '**' },
+        { scope_pattern: 'gcp/**', host_pattern: 'box-00002' },
+      ]),
       set: vi.fn().mockResolvedValue(undefined),
     } as any,
     secretStore: {
@@ -319,7 +320,28 @@ describe('DashboardEnvHandler', () => {
       expect(deps.bindingStore.list).toHaveBeenCalledWith('org-1', 'env-1');
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.environments.bindings.list.response');
-      expect(resp.scopePatterns).toEqual(['aws/prod/**', 'gcp/**']);
+      expect(resp.bindings).toEqual([
+        { scopePattern: 'aws/prod/**', hostPattern: '**' },
+        { scopePattern: 'gcp/**', hostPattern: 'box-00002' },
+      ]);
+    });
+
+    it('handles dashboard.environments.bindings.set with host patterns', async () => {
+      const handled = await handler.handleMessage({
+        type: 'dashboard.environments.bindings.set',
+        requestId: 'req-b2',
+        environmentId: 'env-1',
+        bindings: [
+          { scopePattern: 'prod/shared/**', hostPattern: '**' },
+          { scopePattern: 'prod/hosts/box-00002/**', hostPattern: 'box-00002' },
+        ],
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      expect(deps.bindingStore.set).toHaveBeenCalledWith('org-1', 'env-1', [
+        { scopePattern: 'prod/shared/**', hostPattern: '**' },
+        { scopePattern: 'prod/hosts/box-00002/**', hostPattern: 'box-00002' },
+      ]);
     });
   });
 

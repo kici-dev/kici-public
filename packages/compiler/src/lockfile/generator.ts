@@ -4,12 +4,17 @@ import {
   detectPackageManagerSync,
   detectYarnFlavorSync,
 } from '@kici-dev/core/package-manager';
-import { validateResourceRequest, resolveWhenToRunOn } from '@kici-dev/engine';
-import type { LabelMatcher } from '@kici-dev/engine';
+import {
+  validateResourceRequest,
+  resolveWhenToRunOn,
+  extractInputsDescriptorMap,
+} from '@kici-dev/engine';
+import type { LabelMatcher, RunsOnPick } from '@kici-dev/engine';
 import type { NeedsWhenInput } from '@kici-dev/sdk';
 import {
   normalizeRunsOnToMatchers,
   normalizeRunsOnAllToMatchers,
+  runsOnPickFromInput,
 } from '@kici-dev/engine/labels/compile';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -395,6 +400,9 @@ function toLockDispatch(t: ExtractTrigger<'DispatchTrigger'>): LockDispatchTrigg
     _type: 'dispatch',
     types: t.types,
     ...reposField(t),
+    ...(t.inputs && {
+      inputs: extractInputsDescriptorMap(t.inputs as Record<string, unknown>),
+    }),
   };
 }
 
@@ -687,12 +695,16 @@ function transformJobs(
 function normalizeRunsOnForLock(
   runsOn: RunsOn,
   jobName: string,
-): { runsOn: LabelMatcher[]; excludeLabels?: LabelMatcher[] } {
+): { runsOn: LabelMatcher[]; excludeLabels?: LabelMatcher[]; runsOnPick: RunsOnPick } {
   const { include, exclude } = normalizeRunsOnToMatchers(
     runsOn as never,
     `job '${jobName}' runsOn`,
   );
-  return { runsOn: include, ...(exclude.length > 0 ? { excludeLabels: exclude } : {}) };
+  return {
+    runsOn: include,
+    ...(exclude.length > 0 ? { excludeLabels: exclude } : {}),
+    runsOnPick: runsOnPickFromInput(runsOn as never),
+  };
 }
 
 /**
@@ -851,6 +863,9 @@ function transformJob(
       ),
     }),
     ...(job.onUnreachable !== undefined && { onUnreachable: job.onUnreachable }),
+    ...(job.includeUninitialized !== undefined && {
+      includeUninitialized: job.includeUninitialized,
+    }),
     ...(job.maxParallel !== undefined && { maxParallel: job.maxParallel }),
     ...(job.failFast !== undefined && { failFast: job.failFast }),
     ...resolveNeedsForLock(job.needs, uuidToName),
@@ -1008,6 +1023,14 @@ function transformSteps(steps: readonly StepInput[], gitRoot: string): readonly 
       hasOutputs: !!step.outputs && Object.keys(step.outputs).length > 0,
       ...(step.continueOnError !== undefined && { continueOnError: step.continueOnError }),
       ...(step.timeout !== undefined && { timeout: step.timeout }),
+      ...(step.retry !== undefined && {
+        retry: {
+          maxAttempts: step.retry.maxAttempts,
+          delayMs: step.retry.delayMs,
+          backoff: step.retry.backoff,
+          maxDelayMs: step.retry.maxDelayMs,
+        },
+      }),
       ...(step.cache !== undefined && { cache: normalizeCacheSpecs(step.cache) }),
       ...(step._sourceLocation && {
         sourceLocation: {

@@ -7,48 +7,63 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-// Canonical public docs host. This generator ships to customers (compiler
-// postbuild + `kici docs llm`) and never sees the KICI_DOCS_* env vars, so it
-// uses a fixed prod base. The docs-site duplicate
-// (docs-site/src/integrations/llm-context.ts) derives its base from those env
-// vars instead, so the deployed site is self-consistent per host; both emit
-// docs.kici.dev for prod.
-const SITE_BASE_URL = 'https://docs.kici.dev';
+// Canonical public docs host used when no base is supplied (the compiler
+// postbuild ships to customers and always emits prod URLs). The docs-site
+// Astro integration passes its own env-derived base instead, so the
+// deployed site is self-consistent per host.
+const DEFAULT_SITE_BASE_URL = 'https://docs.kici.dev';
 
-function docsUrl(slugPath) {
+function docsUrl(slugPath, siteBaseUrl) {
+  const base = siteBaseUrl.replace(/\/$/, '');
   const tail = slugPath.replace(/^\//, '');
-  return `${SITE_BASE_URL}/${tail}`;
+  return tail ? `${base}/${tail}` : `${base}/`;
 }
 
-// Top-level files under docs/user/ that are intentionally NOT included in the
-// LLM bundle. Add a basename here if a doc is e.g. operator-leaning even
-// though it lives under docs/user/, or otherwise inappropriate for the LLM
-// authoring audience. The coverage test in hack/llm-context.test.ts fails
-// the build if a new top-level docs/user/*.md isn't either listed in a
-// SCOPE_GROUPS only: list or in this set — so adding a doc forces an
-// explicit decision about whether it belongs in the bundle.
-export const EXCLUDED_FROM_LLM_BUNDLE = new Set([]);
+// Files/subdirs under docs/user/ intentionally NOT in the LLM authoring
+// bundles. An entry ending in '/' excludes every file beneath that
+// repo-relative directory. docs/user/dashboard/ is dashboard UI-usage
+// documentation and docs/user/quickstart/ is install/deploy guidance — both
+// are user-facing but neither is workflow-authoring content, the audience of
+// these bundles. The deepened coverage check in hack/llm-context.test.ts
+// fails the build if a new docs/user path is neither bundled nor excluded
+// here, forcing an explicit decision about whether it belongs in a bundle.
+export const EXCLUDED_FROM_LLM_BUNDLE = new Set(['docs/user/dashboard/', 'docs/user/quickstart/']);
+
+// Per-task bundle size budget. A task bundle over this is a signal to split
+// the group — keeping each bundle small enough to drop into an LLM context
+// for one task. The full bundle (llms-full.txt) is exempt by design.
+export const MAX_BUNDLE_BYTES = 200_000;
 
 export const SCOPE_GROUPS = [
   {
+    id: 'getting-started',
     label: 'Getting started',
+    purpose: 'Install the SDK, write your first workflow, compile and test locally',
     dir: 'docs/user',
     recurse: false,
     only: ['quickstart.md', 'getting-started.md', 'README.md', 'README-public.md'],
   },
   {
+    id: 'patterns',
     label: 'Workflow patterns',
+    purpose:
+      'Copy-paste workflow recipes: triggers, conditionals, matrix, scheduling, integrations',
     dir: 'docs/user/patterns',
     recurse: true,
   },
   {
+    id: 'sdk',
     label: 'SDK reference',
+    purpose:
+      'Authoring API: workflow/job/step factories, triggers, rules, matrix, runtime, caching',
     dir: 'docs/user/sdk',
     recurse: true,
     extras: [{ dir: 'docs/user', only: ['sdk-reference.md'] }],
   },
   {
+    id: 'cli',
     label: 'CLI and authoring',
+    purpose: 'Running the CLI: compile, test, run local/remote, auth, hooks, lock-file drift',
     dir: 'docs/user',
     recurse: false,
     only: [
@@ -61,7 +76,9 @@ export const SCOPE_GROUPS = [
     ],
   },
   {
+    id: 'features',
     label: 'Workflow features',
+    purpose: 'Workflow features: concurrency, environments, secrets, approvals, provenance, events',
     dir: 'docs/user',
     recurse: false,
     only: [
@@ -81,15 +98,19 @@ export const SCOPE_GROUPS = [
     ],
   },
   {
+    id: 'providers',
     label: 'Providers',
+    purpose: 'Connecting sources: GitHub App, universal-git (Forgejo/Gitea/GitLab), local file://',
     dir: 'docs/user/providers',
     recurse: true,
   },
   {
+    id: 'architecture',
     label: 'Architecture overview',
+    purpose: 'How the runtime works: three-tier relay model, data flows, configuration',
     dir: 'docs/architecture',
     recurse: false,
-    only: ['overview.md', 'design-decisions.md', 'data-flows.md'],
+    only: ['overview.md', 'data-flows.md', 'configuration.md'],
   },
 ];
 
@@ -121,13 +142,149 @@ function relPathToSlug(repoRoot, absPath) {
   return noExt.replace(/\\/g, '/');
 }
 
-function slugToUrl(slug) {
+function slugToUrl(slug, siteBaseUrl) {
   const lower = slug.toLowerCase();
   if (lower.endsWith('/readme')) {
-    return docsUrl(`${lower.slice(0, -'/readme'.length)}/`);
+    return docsUrl(`${lower.slice(0, -'/readme'.length)}/`, siteBaseUrl);
   }
-  if (lower === 'readme') return docsUrl('');
-  return docsUrl(`${lower}/`);
+  if (lower === 'readme') return docsUrl('', siteBaseUrl);
+  return docsUrl(`${lower}/`, siteBaseUrl);
+}
+
+function pageUrl(sourceAbsPath, repoRoot, siteBaseUrl) {
+  return slugToUrl(relPathToSlug(repoRoot, sourceAbsPath), siteBaseUrl);
+}
+
+function rewriteOneTarget(target, sourceAbsPath, repoRoot, siteBaseUrl) {
+  // Split an optional markdown link title: `url "title"`.
+  const spaceIdx = target.search(/\s/);
+  const url = spaceIdx === -1 ? target : target.slice(0, spaceIdx);
+  const rest = spaceIdx === -1 ? '' : target.slice(spaceIdx);
+  let out = url;
+  if (/^(https?:|mailto:|tel:)/i.test(url)) {
+    out = url;
+  } else if (url.startsWith('#')) {
+    out = `${pageUrl(sourceAbsPath, repoRoot, siteBaseUrl)}${url}`;
+  } else if (url.startsWith('/')) {
+    out = `${siteBaseUrl.replace(/\/$/, '')}${url}`;
+  } else {
+    const hashIdx = url.indexOf('#');
+    const pathPart = hashIdx === -1 ? url : url.slice(0, hashIdx);
+    const anchor = hashIdx === -1 ? '' : url.slice(hashIdx);
+    if (/\.(md|mdx)$/.test(pathPart)) {
+      const absTarget = path.resolve(path.dirname(sourceAbsPath), pathPart);
+      out = `${slugToUrl(relPathToSlug(repoRoot, absTarget), siteBaseUrl)}${anchor}`;
+    } else {
+      out = url; // relative non-md target (asset / dir) — leave as-is
+    }
+  }
+  return `${out}${rest}`;
+}
+
+export function rewriteLinks(body, sourceAbsPath, repoRoot, siteBaseUrl) {
+  return body.replace(
+    /\]\(([^)]+)\)/g,
+    (_full, target) => `](${rewriteOneTarget(target, sourceAbsPath, repoRoot, siteBaseUrl)})`,
+  );
+}
+
+export function findRelativeMdLinks(text) {
+  const out = [];
+  const re = /\]\(([^)]+)\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const url = m[1].split(/\s/)[0];
+    if (/^(https?:|mailto:|tel:|#|\/)/i.test(url)) continue;
+    if (/\.(md|mdx)(#.*)?$/.test(url)) out.push(url);
+  }
+  return out;
+}
+
+async function collectAllBundledFiles(repoRoot) {
+  const files = new Set();
+  for (const group of SCOPE_GROUPS) {
+    const primary = await filterFiles(path.join(repoRoot, group.dir), group.recurse, group.only);
+    for (const f of primary) files.add(f);
+    for (const extra of group.extras ?? []) {
+      const extraFiles = await filterFiles(path.join(repoRoot, extra.dir), false, extra.only);
+      for (const f of extraFiles) files.add(f);
+    }
+  }
+  return files;
+}
+
+export async function findDanglingRefs(repoRoot) {
+  const out = [];
+  const files = await collectAllBundledFiles(repoRoot);
+  for (const file of files) {
+    const raw = await fs.readFile(file, 'utf-8');
+    const { body } = stripFrontmatter(raw);
+    for (const target of findRelativeMdLinks(body)) {
+      const pathPart = target.split('#')[0];
+      const absTarget = path.resolve(path.dirname(file), pathPart);
+      try {
+        await fs.access(absTarget);
+      } catch {
+        out.push({ source: path.relative(repoRoot, file), target });
+      }
+    }
+  }
+  return out;
+}
+
+export async function findUncoveredUserDocs(repoRoot) {
+  const bundled = await collectAllBundledFiles(repoRoot);
+  const userDir = path.join(repoRoot, 'docs', 'user');
+  const all = await listMarkdown(userDir, true);
+  // Directory-prefix excludes: any EXCLUDED_FROM_LLM_BUNDLE entry ending in
+  // '/' excludes every file beneath that repo-relative directory.
+  const dirExcludes = [...EXCLUDED_FROM_LLM_BUNDLE].filter((e) => e.endsWith('/'));
+  const out = [];
+  for (const file of all) {
+    if (bundled.has(file)) continue;
+    const rel = path.relative(repoRoot, file).replace(/\\/g, '/');
+    if (EXCLUDED_FROM_LLM_BUNDLE.has(path.basename(file)) || EXCLUDED_FROM_LLM_BUNDLE.has(rel)) {
+      continue;
+    }
+    if (dirExcludes.some((prefix) => rel.startsWith(prefix))) continue;
+    out.push(rel);
+  }
+  return out;
+}
+
+export async function assertBundleQuality(repoRoot, result) {
+  const rendered = [result.index, result.full, ...result.bundles.map((b) => b.content)];
+  for (const text of rendered) {
+    const bad = findRelativeMdLinks(text);
+    if (bad.length > 0) {
+      throw new Error(
+        `llm-context: ${bad.length} relative .md link(s) survived rewriting: ${bad.slice(0, 5).join(', ')}`,
+      );
+    }
+  }
+  for (const b of result.bundles) {
+    if (b.bytes > MAX_BUNDLE_BYTES) {
+      throw new Error(
+        `llm-context: bundle llms-${b.id}.txt is ${b.bytes} bytes > cap ${MAX_BUNDLE_BYTES}; split the "${b.label}" group`,
+      );
+    }
+  }
+  const dangling = await findDanglingRefs(repoRoot);
+  if (dangling.length > 0) {
+    const sample = dangling
+      .slice(0, 5)
+      .map((d) => `${d.source} -> ${d.target}`)
+      .join('; ');
+    throw new Error(
+      `llm-context: ${dangling.length} dangling .md link(s) in source docs: ${sample}`,
+    );
+  }
+  const uncovered = await findUncoveredUserDocs(repoRoot);
+  if (uncovered.length > 0) {
+    throw new Error(
+      `llm-context: docs/user file(s) not in any bundle or EXCLUDED_FROM_LLM_BUNDLE: ${uncovered.join(', ')}`,
+    );
+  }
 }
 
 async function listMarkdown(absDir, recurse) {
@@ -161,17 +318,24 @@ async function filterFiles(absDir, recurse, only) {
   return all.filter((f) => allowed.has(path.basename(f)));
 }
 
-async function loadDoc(filePath, repoRoot) {
+async function loadDoc(filePath, repoRoot, siteBaseUrl) {
   const raw = await fs.readFile(filePath, 'utf-8');
   const { frontmatter, body } = stripFrontmatter(raw);
   const slug = relPathToSlug(repoRoot, filePath);
-  const url = slugToUrl(slug);
+  const url = slugToUrl(slug, siteBaseUrl);
   const title = frontmatter.title || slug;
   const description = frontmatter.description || '';
-  return { slug, url, title, description, body, filePath };
+  return {
+    slug,
+    url,
+    title,
+    description,
+    body: rewriteLinks(body, filePath, repoRoot, siteBaseUrl),
+    filePath,
+  };
 }
 
-async function collectGroupDocs(repoRoot, group) {
+async function collectGroupDocs(repoRoot, group, siteBaseUrl) {
   const seen = new Set();
   const docs = [];
   const dir = path.join(repoRoot, group.dir);
@@ -179,7 +343,7 @@ async function collectGroupDocs(repoRoot, group) {
   for (const file of primary) {
     if (seen.has(file)) continue;
     seen.add(file);
-    docs.push(await loadDoc(file, repoRoot));
+    docs.push(await loadDoc(file, repoRoot, siteBaseUrl));
   }
   if (group.extras) {
     for (const extra of group.extras) {
@@ -188,14 +352,14 @@ async function collectGroupDocs(repoRoot, group) {
       for (const file of extraFiles) {
         if (seen.has(file)) continue;
         seen.add(file);
-        docs.push(await loadDoc(file, repoRoot));
+        docs.push(await loadDoc(file, repoRoot, siteBaseUrl));
       }
     }
   }
   return docs;
 }
 
-function renderIndex(groups) {
+function renderIndex(groups, siteBaseUrl, bundles) {
   const lines = [];
   lines.push('# KiCI');
   lines.push('');
@@ -204,8 +368,21 @@ function renderIndex(groups) {
   );
   lines.push('');
   lines.push(
-    `The full markdown bundle of every page indexed here is available at ${SITE_BASE_URL}/llms-full.txt.`,
+    `The full markdown bundle of every page indexed here is available at ${docsUrl('llms-full.txt', siteBaseUrl)}.`,
   );
+  lines.push('');
+  lines.push('## Bundles');
+  lines.push('');
+  lines.push(
+    'Each bundle below is a self-contained markdown file for one authoring task. Fetch only the one your task needs instead of the full bundle:',
+  );
+  lines.push('');
+  for (const b of bundles) {
+    const kb = (b.bytes / 1024).toFixed(0);
+    lines.push(
+      `- [${b.id}](${docsUrl(`llms-${b.id}.txt`, siteBaseUrl)}) (${kb} KB) — ${b.purpose}`,
+    );
+  }
   lines.push('');
   for (const group of groups) {
     if (group.docs.length === 0) continue;
@@ -246,21 +423,57 @@ function renderFull(groups) {
   return lines.join('\n');
 }
 
-export async function generateLlmContext(repoRoot) {
-  const groups = [];
-  for (const groupSpec of SCOPE_GROUPS) {
-    const docs = await collectGroupDocs(repoRoot, groupSpec);
-    groups.push({ label: groupSpec.label, docs });
+function renderBundle(group) {
+  const lines = [];
+  lines.push(`# KiCI ${group.label}`);
+  lines.push('');
+  lines.push(`This bundle covers: ${group.purpose}.`);
+  lines.push('');
+  for (const doc of group.docs) {
+    lines.push(`## ${doc.title}`);
+    lines.push('');
+    lines.push(`Source: ${doc.url}`);
+    lines.push('');
+    lines.push(doc.body.trim());
+    lines.push('');
+    lines.push('---');
+    lines.push('');
   }
-  const llmsTxt = renderIndex(groups);
-  const llmsFullTxt = renderFull(groups);
-  return { llmsTxt, llmsFullTxt, groups };
+  return lines.join('\n');
 }
 
-export async function writeLlmContext(repoRoot, outDir) {
-  const { llmsTxt, llmsFullTxt } = await generateLlmContext(repoRoot);
+export async function generateLlmContext(repoRoot, opts = {}) {
+  const siteBaseUrl = opts.siteBaseUrl ?? DEFAULT_SITE_BASE_URL;
+  const groups = [];
+  for (const groupSpec of SCOPE_GROUPS) {
+    const docs = await collectGroupDocs(repoRoot, groupSpec, siteBaseUrl);
+    groups.push({ id: groupSpec.id, label: groupSpec.label, purpose: groupSpec.purpose, docs });
+  }
+  const bundles = groups
+    .filter((g) => g.docs.length > 0)
+    .map((g) => {
+      const content = renderBundle(g);
+      return {
+        id: g.id,
+        label: g.label,
+        purpose: g.purpose,
+        content,
+        bytes: Buffer.byteLength(content, 'utf-8'),
+      };
+    });
+  const full = renderFull(groups);
+  const index = renderIndex(groups, siteBaseUrl, bundles);
+  return { index, full, bundles };
+}
+
+export async function writeLlmContext(repoRoot, outDir, opts = {}) {
+  const result = await generateLlmContext(repoRoot, opts);
+  await assertBundleQuality(repoRoot, result);
   await fs.mkdir(outDir, { recursive: true });
-  await fs.writeFile(path.join(outDir, 'llms.txt'), llmsTxt, 'utf-8');
-  await fs.writeFile(path.join(outDir, 'llms-full.txt'), llmsFullTxt, 'utf-8');
-  return { llmsTxt, llmsFullTxt };
+  await fs.writeFile(path.join(outDir, 'llms.txt'), result.index, 'utf-8');
+  await fs.writeFile(path.join(outDir, 'llms-full.txt'), result.full, 'utf-8');
+  for (const b of result.bundles) {
+    await fs.writeFile(path.join(outDir, `llms-${b.id}.txt`), b.content, 'utf-8');
+  }
+  return result;
 }

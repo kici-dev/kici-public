@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pc from 'picocolors';
@@ -15,12 +15,30 @@ export interface DocsOptions {
 }
 
 export interface DocsLlmOptions {
-  /** Print only the llms.txt index instead of the full markdown bundle. */
-  index?: boolean;
+  /** Task bundle id to print. Undefined → the llms.txt index; 'full' → llms-full.txt. */
+  topic?: string;
   /** Override the bundled output destination (overrides default stdout). */
   out?: string;
-  /** Override the directory holding llms.txt + llms-full.txt (test seam). */
+  /** Override the directory holding the llms*.txt files (test seam). */
   bundleDir?: string;
+}
+
+function bundleFilenameForTopic(topic: string | undefined): string {
+  if (!topic) return 'llms.txt';
+  if (topic === 'full') return 'llms-full.txt';
+  return `llms-${topic}.txt`;
+}
+
+async function availableTopics(bundleDir: string): Promise<string[]> {
+  try {
+    const names = await readdir(bundleDir);
+    const ids = names
+      .filter((n) => n.startsWith('llms-') && n.endsWith('.txt') && n !== 'llms-full.txt')
+      .map((n) => n.slice('llms-'.length, -'.txt'.length));
+    return [...ids.sort(), 'full'];
+  } catch {
+    return ['full'];
+  }
 }
 
 /**
@@ -43,28 +61,27 @@ export async function docsCommand(options: DocsOptions = {}): Promise<boolean> {
 }
 
 /**
- * Print the bundled llms.txt or llms-full.txt content to stdout (or a file).
+ * Print a KiCI LLM docs bundle to stdout (or a file).
  *
- * The bundle is generated at build time by hack/postbuild.mjs and shipped at
- * dist/llm-context/{llms.txt,llms-full.txt}. Customer-facing LLM tools can
- * pipe `kici docs llm` straight into an Anthropic / OpenAI context buffer to
- * brief the agent on KiCI authoring conventions without an internet round-trip.
+ * No topic prints the llms.txt index (a router listing every task bundle).
+ * A topic prints that task bundle (e.g. `sdk`, `cli`, `patterns`); `full`
+ * prints the everything-bundle. Pipe straight into a coding agent's context
+ * to brief it on KiCI authoring without an internet round-trip.
  */
 export async function docsLlmCommand(options: DocsLlmOptions = {}): Promise<boolean> {
-  const filename = options.index ? 'llms.txt' : 'llms-full.txt';
+  const filename = bundleFilenameForTopic(options.topic);
   const bundleDir = options.bundleDir ?? path.join(__dirname, '..', 'llm-context');
   const bundlePath = path.join(bundleDir, filename);
+  let content: string;
   try {
-    const content = await readFile(bundlePath, 'utf-8');
-    if (options.out) {
-      await writeFile(options.out, content, 'utf-8');
-      logger.info(pc.gray(`Wrote ${filename} to ${options.out}`));
-      return true;
-    }
-    process.stdout.write(content);
-    if (!content.endsWith('\n')) process.stdout.write('\n');
-    return true;
+    content = await readFile(bundlePath, 'utf-8');
   } catch (error) {
+    if (options.topic && options.topic !== 'full') {
+      const topics = await availableTopics(bundleDir);
+      logger.error(pc.red(`Unknown docs bundle "${options.topic}".`));
+      logger.info(pc.gray(`Available topics: ${topics.join(', ')} (no topic prints the index).`));
+      return false;
+    }
     logger.error(pc.red(`Error reading bundled ${filename}: ${toErrorMessage(error)}`));
     logger.info(
       pc.gray(
@@ -73,4 +90,12 @@ export async function docsLlmCommand(options: DocsLlmOptions = {}): Promise<bool
     );
     return false;
   }
+  if (options.out) {
+    await writeFile(options.out, content, 'utf-8');
+    logger.info(pc.gray(`Wrote ${filename} to ${options.out}`));
+    return true;
+  }
+  process.stdout.write(content);
+  if (!content.endsWith('\n')) process.stdout.write('\n');
+  return true;
 }

@@ -11,11 +11,16 @@ initZx();
 /**
  * Create RuleContext for rule evaluation.
  */
-export function createRuleContext(event: EventPayload, changedFiles: string[] = []): RuleContext {
+export function createRuleContext(
+  event: EventPayload,
+  changedFiles: string[] = [],
+  dispatchInputs: Readonly<Record<string, string | number | boolean | null>> = {},
+): RuleContext {
   return {
     event,
     changedFiles,
     env: { ...process.env } as Record<string, string | undefined>,
+    dispatchInputs,
     $,
   };
 }

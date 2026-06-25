@@ -49,6 +49,20 @@ describe('initTestUpload', () => {
     expect(result.signedUrl).toBe('https://int.example/put');
   });
 
+  it('throws an actionable error when no cache storage is configured', async () => {
+    const { db, insertInto } = mockDb();
+
+    await expect(
+      initTestUpload(
+        { db, cacheStorage: undefined },
+        { routingKey: 'remote:org_1', sha: 'abc', internal: false },
+      ),
+    ).rejects.toThrow(/no object storage configured/i);
+
+    // No upload row is persisted when storage is missing.
+    expect(insertInto).not.toHaveBeenCalled();
+  });
+
   it('records the createdBy actor on the upload row', async () => {
     const { db, values } = mockDb();
     await initTestUpload(

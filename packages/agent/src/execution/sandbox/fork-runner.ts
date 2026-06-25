@@ -125,6 +125,9 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
     agent: jobConfig.agent as
       | { host: string; labels: string[]; platform?: string; arch?: string }
       | undefined,
+    dispatchInputs: jobConfig.dispatchInputs as Record<string, unknown> | undefined,
+    fanoutIndex: jobConfig.fanoutIndex as number | undefined,
+    fanoutTotal: jobConfig.fanoutTotal as number | undefined,
 
     secrets: dispatch.secrets,
     namespacedSecrets: dispatch.namespacedSecrets,

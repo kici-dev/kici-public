@@ -419,6 +419,60 @@ describe('executeResolvedJob', () => {
     expect(step2.run).not.toHaveBeenCalled();
   });
 
+  it('retries a thrown step then succeeds (parity with remote)', async () => {
+    let n = 0;
+    const step = makeStep('flaky');
+    (step.run as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      if (++n < 3) throw new Error('boom');
+      return undefined;
+    });
+    (step as { retry?: unknown }).retry = {
+      maxAttempts: 3,
+      delayMs: 1,
+      backoff: 'fixed',
+      maxDelayMs: 1,
+    };
+    const job = makeJob({ name: 'test', steps: [step] });
+    const resolved: ResolvedJob = {
+      job,
+      expandedName: 'test',
+      matrixValues: {},
+      resolvedNeeds: [],
+    };
+
+    const result = await executeResolvedJob(resolved, makeContext());
+
+    expect(n).toBe(3);
+    expect(result.status).toBe('success');
+  });
+
+  it('fails after exhausting attempts (parity with remote)', async () => {
+    let n = 0;
+    const step = makeStep('always');
+    (step.run as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      n++;
+      throw new Error('boom');
+    });
+    (step as { retry?: unknown }).retry = {
+      maxAttempts: 2,
+      delayMs: 1,
+      backoff: 'fixed',
+      maxDelayMs: 1,
+    };
+    const job = makeJob({ name: 'test', steps: [step] });
+    const resolved: ResolvedJob = {
+      job,
+      expandedName: 'test',
+      matrixValues: {},
+      resolvedNeeds: [],
+    };
+
+    const result = await executeResolvedJob(resolved, makeContext());
+
+    expect(n).toBe(2);
+    expect(result.status).toBe('failure');
+  });
+
   it('includes matrix values in result', async () => {
     const step = makeStep('step-1');
     const job = makeJob({ name: 'test', steps: [step] });
@@ -486,6 +540,44 @@ describe('executeResolvedJob', () => {
     const lastCall = calls[calls.length - 1];
     // Args: workflowInfo, jobInfo, repoRoot, inputs, matrix, secrets, ...
     expect(lastCall[2]).toBe('/tmp/kici-run-abcdef');
+  });
+
+  it('forwards resolved dispatchInputs to createStepContext (10th arg)', async () => {
+    const step = makeStep('step-1');
+    const job = makeJob({ name: 'test', steps: [step] });
+    const resolved: ResolvedJob = {
+      job,
+      expandedName: 'test',
+      matrixValues: {},
+      resolvedNeeds: [],
+    };
+    const ctx = makeContext({ dispatchInputs: { skipCveScan: true, mode: 'full' } });
+
+    await executeResolvedJob(resolved, ctx);
+
+    const calls = vi.mocked(createStepContext).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    // Args: workflowInfo, jobInfo, repoRoot, inputs, matrix, secrets, environment,
+    //       rawPayload, provider, dispatchInputs
+    expect(lastCall[9]).toEqual({ skipCveScan: true, mode: 'full' });
+  });
+
+  it('defaults dispatchInputs to {} when none resolved', async () => {
+    const step = makeStep('step-1');
+    const job = makeJob({ name: 'test', steps: [step] });
+    const resolved: ResolvedJob = {
+      job,
+      expandedName: 'test',
+      matrixValues: {},
+      resolvedNeeds: [],
+    };
+    const ctx = makeContext();
+
+    await executeResolvedJob(resolved, ctx);
+
+    const calls = vi.mocked(createStepContext).mock.calls;
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[9]).toEqual({});
   });
 });
 

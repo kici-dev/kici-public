@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { idempotent, idempotentStep } from './idempotent.js';
+import { checkStep, idempotent, idempotentStep } from './idempotent.js';
 import type { StepContext, Logger } from './context.js';
 
 interface Drift {
@@ -129,5 +129,79 @@ describe('idempotentStep (Step factory)', () => {
     const result = await s.run(ctx);
     expect(result.outcome).toBe('skipped');
     expect(result.result).toEqual({ id: 'existing-2' });
+  });
+});
+
+describe('checkStep (check-facet Step factory)', () => {
+  it('builds a check-facet step (check + summarize + run all wired)', () => {
+    const s = checkStep<Drift>('ensure-x', {
+      check: async () => ({ reason: 'missing' }),
+      apply: async (_ctx, drift) => {
+        void drift;
+      },
+      summarize: (d) => `will fix: ${d.reason}`,
+    });
+    expect(s._tag).toBe('Step');
+    expect(s.name).toBe('ensure-x');
+    // The presence of a check facet is what distinguishes it from idempotentStep
+    // (which builds a plain run-only step that always applies).
+    expect(typeof s.check).toBe('function');
+    expect(typeof s.run).toBe('function');
+    expect(s.summarize?.({ reason: 'missing' } as Drift)).toBe('will fix: missing');
+  });
+
+  it('run(ctx, drift) delegates to apply(ctx, drift)', async () => {
+    const seen: Array<[boolean, unknown]> = [];
+    const s = checkStep<{ n: number }, void, string>('apply-delegates', {
+      check: async () => ({ n: 1 }),
+      apply: async (ctx, drift) => {
+        seen.push([!!ctx, drift]);
+        return 'applied';
+      },
+      summarize: (d) => `n=${d.n}`,
+    });
+    const { ctx } = makeCtx();
+    const out = await s.run(ctx, { n: 1 } as unknown as undefined);
+    expect(out).toBe('applied');
+    expect(seen).toEqual([[true, { n: 1 }]]);
+  });
+
+  it('whenInSync(ctx) is passed through to the underlying step', async () => {
+    const whenInSync = vi.fn<(ctx: StepContext) => Promise<ResourceId>>().mockResolvedValue({
+      id: 'in-sync',
+    });
+    const s = checkStep<Drift, ResourceId, ResourceId>('in-sync-passthrough', {
+      check: async () => null,
+      apply: async () => ({ id: 'applied' }),
+      summarize: (d) => d.reason,
+      whenInSync,
+    });
+    expect(typeof s.whenInSync).toBe('function');
+    const { ctx } = makeCtx();
+    const out = await s.whenInSync!(ctx);
+    expect(out).toEqual({ id: 'in-sync' });
+    expect(whenInSync).toHaveBeenCalledWith(ctx);
+  });
+
+  it('passes through continueOnError + timeout to the underlying step', () => {
+    const s = checkStep<Drift>('passthrough', {
+      check: async () => null,
+      apply: async () => undefined,
+      summarize: (d) => d.reason,
+      continueOnError: true,
+      timeout: 1234,
+    });
+    expect(s.continueOnError).toBe(true);
+    expect(s.timeout).toBe(1234);
+  });
+
+  it('summarize is required (inherited from the check facet invariant)', () => {
+    expect(() =>
+      // @ts-expect-error summarize is mandatory on a check-facet step
+      checkStep<Drift>('no-summarize', {
+        check: async () => null,
+        apply: async () => undefined,
+      }),
+    ).toThrow(/summarize is required/);
   });
 });

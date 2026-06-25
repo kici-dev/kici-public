@@ -132,6 +132,29 @@ describe('serializeJobsToLock', () => {
     });
   });
 
+  it('round-trips the step retry data subset without retryIf', async () => {
+    const jobs = [
+      job('retry-job', {
+        runsOn: 'linux',
+        steps: [
+          step('flaky', {
+            retry: { maxAttempts: 3, retryIf: () => true },
+            run: async () => {},
+          }),
+        ],
+      }),
+    ];
+
+    const result = await serializeJobsToLock(jobs, mockCtx());
+    expect(result[0].steps[0].retry).toEqual({
+      maxAttempts: 3,
+      delayMs: 1000,
+      backoff: 'exponential',
+      maxDelayMs: 30000,
+    });
+    expect(result[0].steps[0].retry).not.toHaveProperty('retryIf');
+  });
+
   it('serializes static array matrix', async () => {
     const jobs = [
       job('matrix-job', {

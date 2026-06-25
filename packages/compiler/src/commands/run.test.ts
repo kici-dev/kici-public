@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { logger } from '@kici-dev/core';
-import { runLocalCommand, runRemoteCommand, buildTargetSelector } from './run.js';
+import {
+  runLocalCommand,
+  runRemoteCommand,
+  buildTargetSelector,
+  buildDispatchInputs,
+  lookupDispatchInputsDescriptor,
+} from './run.js';
 
 // Shared mock PlatformRunClient instance -- all tests configure this
 const mockClient = {
@@ -87,6 +93,10 @@ vi.mock('../remote/history.js', () => ({
 vi.mock('../fixtures/compiler.js', () => ({
   compileFixtures: vi.fn(),
   filterFixtures: vi.fn(),
+}));
+
+vi.mock('./compile.js', () => ({
+  compileCommand: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('../remote/uploader.js', () => ({
@@ -413,6 +423,97 @@ describe('kici run command', () => {
     });
   });
 
+  describe('compiles workflows before a remote run', () => {
+    let compileCommand: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      const compileMod = await import('./compile.js');
+      compileCommand = compileMod.compileCommand as ReturnType<typeof vi.fn>;
+      // Reset to success each test (clearAllMocks keeps implementations, so the
+      // failure test below would otherwise leak into the next case).
+      compileCommand.mockResolvedValue(true);
+    });
+
+    it('compiles before uploading on the fixture path', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(compileCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ kiciDir: '.kici', check: false }),
+      );
+      const compileOrder = compileCommand.mock.invocationCallOrder[0];
+      const overlayOrder = createOverlayTarball.mock.invocationCallOrder[0];
+      expect(compileOrder).toBeLessThan(overlayOrder);
+    });
+
+    it('aborts the run (no upload, no dispatch) when compile fails', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      compileCommand.mockResolvedValue(false);
+
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(result).toBe(false);
+      expect(createOverlayTarball).not.toHaveBeenCalled();
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+    });
+
+    it('compiles before uploading on the --workflow direct path', async () => {
+      await runRemoteCommand(undefined, {
+        kiciDir: '.kici',
+        workflow: 'deploy',
+        wait: false,
+      });
+
+      expect(compileCommand).toHaveBeenCalled();
+      const compileOrder = compileCommand.mock.invocationCallOrder[0];
+      const overlayOrder = createOverlayTarball.mock.invocationCallOrder[0];
+      expect(compileOrder).toBeLessThan(overlayOrder);
+    });
+
+    it('does not compile when listing fixtures or showing history', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      await runRemoteCommand(undefined, { kiciDir: '.kici' }); // list fixtures
+      expect(compileCommand).not.toHaveBeenCalled();
+
+      await runRemoteCommand(undefined, { kiciDir: '.kici', history: true }); // history
+      expect(compileCommand).not.toHaveBeenCalled();
+    });
+
+    it('compiles quietly under --json so stdout stays pure JSON', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', json: true });
+
+      // The compile + auto-types success lines must be suppressed so they never
+      // precede the JSON result on stdout.
+      expect(compileCommand).toHaveBeenCalledWith(expect.objectContaining({ quiet: true }));
+      spy.mockRestore();
+    });
+
+    it('compiles quietly under --quiet', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false, quiet: true });
+
+      expect(compileCommand).toHaveBeenCalledWith(expect.objectContaining({ quiet: true }));
+    });
+
+    it('compiles non-quietly for a plain human run', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(compileCommand).toHaveBeenCalledWith(expect.objectContaining({ quiet: false }));
+    });
+  });
+
   describe('buildTargetSelector', () => {
     it('returns undefined for no targets', () => {
       expect(buildTargetSelector(undefined, false)).toBeUndefined();
@@ -562,6 +663,61 @@ describe('kici run command', () => {
       const infoCalls = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
       expect(infoCalls.some((line) => line.includes('local working tree'))).toBe(true);
       expect(infoCalls.some((line) => line.includes('git steps work'))).toBe(true);
+    });
+  });
+});
+
+describe('buildDispatchInputs', () => {
+  const desc = {
+    skipCveScan: { type: 'boolean' as const, optional: false, nullable: false, default: false },
+  };
+  it('returns raw pairs after validating', () => {
+    expect(buildDispatchInputs(['skipCveScan=true'], desc)).toEqual({ skipCveScan: 'true' });
+  });
+  it('throws on an invalid value', () => {
+    expect(() => buildDispatchInputs(['skipCveScan=maybe'], desc)).toThrow();
+  });
+  it('throws on an unknown key', () => {
+    expect(() => buildDispatchInputs(['nope=1'], desc)).toThrow(/nope/);
+  });
+  it('returns {} for no pairs', () => {
+    expect(buildDispatchInputs([], desc)).toEqual({});
+  });
+  it('skips validation when no descriptor (forwards raw)', () => {
+    expect(buildDispatchInputs(['anything=1'], undefined)).toEqual({ anything: '1' });
+  });
+});
+
+describe('lookupDispatchInputsDescriptor', () => {
+  const lock = JSON.stringify({
+    workflows: [
+      {
+        name: 'deploy-prod',
+        triggers: [
+          {
+            _type: 'dispatch',
+            types: ['deploy-prod'],
+            inputs: { skipCveScan: { type: 'boolean', optional: false, nullable: false } },
+          },
+        ],
+      },
+      { name: 'other', triggers: [{ _type: 'push' }] },
+    ],
+  });
+  it('returns the named workflow dispatch inputs', () => {
+    expect(lookupDispatchInputsDescriptor(lock, 'deploy-prod')).toEqual({
+      skipCveScan: { type: 'boolean', optional: false, nullable: false },
+    });
+  });
+  it('returns undefined for a workflow with no dispatch inputs', () => {
+    expect(lookupDispatchInputsDescriptor(lock, 'other')).toBeUndefined();
+  });
+  it('returns undefined for missing lock', () => {
+    expect(lookupDispatchInputsDescriptor(undefined, 'deploy-prod')).toBeUndefined();
+  });
+  it('merges across workflows when no name given', () => {
+    expect(lookupDispatchInputsDescriptor(lock, undefined)).toEqual({
+      skipCveScan: { type: 'boolean', optional: false, nullable: false },
     });
   });
 });

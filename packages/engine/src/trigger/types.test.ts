@@ -9,8 +9,30 @@ import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/ex
 import type { LockDynamicJobFn, LockStep, LockJob, LockWorkflow } from './types.js';
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 22', () => {
-    expect(SCHEMA_VERSION).toBe(22);
+  it('SCHEMA_VERSION is 26 (LockJob.includeUninitialized)', () => {
+    expect(SCHEMA_VERSION).toBe(26);
+  });
+
+  it('LockJob accepts includeUninitialized alongside runsOnAll', () => {
+    const lockJob: LockJob = {
+      _type: 'static',
+      name: 'converge',
+      runsOnAll: { include: [[{ kind: 'exact', value: 'kici:role:test' }]], exclude: [] },
+      includeUninitialized: true,
+      steps: [],
+      needs: [],
+    };
+    expect(lockJob.includeUninitialized).toBe(true);
+  });
+
+  it('LockStep accepts a retry data subset (no retryIf)', () => {
+    const step: LockStep = {
+      name: 's',
+      hasOutputs: false,
+      retry: { maxAttempts: 3, delayMs: 1000, backoff: 'exponential', maxDelayMs: 30000 },
+    };
+    expect(step.retry?.maxAttempts).toBe(3);
+    expect(step.retry?.backoff).toBe('exponential');
   });
 
   it('LockStep/LockJob/LockWorkflow accept an approval block', () => {

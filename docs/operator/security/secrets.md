@@ -173,6 +173,53 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/<org-id>/production/KICI_DAT
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
 ```
 
+### Environment scope bindings
+
+An environment owns a set of scope-pattern bindings over the secret tree. When a job targets an environment, every secret whose scope matches a binding is resolved into the flat map shipped to the agent (read via `ctx.secrets.get('KEY')`). Bind a scope pattern to an environment with:
+
+```bash
+kici-admin environment bind --org <org-id> --env production --scope "aws/prod/**"
+```
+
+```bash
+curl -X POST $KICI_ADMIN_URL/api/v1/admin/environments/production/bind \
+  -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"orgId": "<org-id>", "scopePattern": "aws/prod/**"}'
+```
+
+### Per-host secret scoping
+
+A binding also carries a **host pattern** (`--host`, default `**` = all hosts). When a job fans out across hosts with `runsOnAll`, the orchestrator resolves secrets **per host**: a binding contributes a secret to host H only when H matches the binding's host pattern. This lets a single fan-out deliver a different value of the same logical secret to each host.
+
+**Match target and selectors.** The host pattern is matched against the union of each fan-out child's identity facts — its agent ID, its hostname, and its labels — using the same selector grammar as `runsOnAll`:
+
+- **Exact:** `box-00002` (matches the agent ID, hostname, or a label verbatim).
+- **Glob:** `box-0000*` (via standard glob wildcards).
+- **Regex:** `/^box-0000[23]$/` (a `/source/flags` pattern).
+
+A loose host pattern delivers the secret to every matched host, so prefer precise patterns.
+
+**Scope-pattern templating (scales to any fleet size).** Binding one host pattern per host is unworkable at scale, so a scope pattern may contain placeholders substituted per host before matching:
+
+- `${agentId}` — the host's agent ID.
+- `${host}` — the host's hostname.
+- `${label:NAME}` — the value of the host's `NAME:<value>` label (e.g. `${label:rack}` → `r12` for a host labelled `rack:r12`).
+
+Each substituted value is inserted as a single literal path segment (sanitized to `[A-Za-z0-9._-]`); a value containing a path separator or glob metacharacter, or a missing label, causes the binding to contribute nothing for that host (fail-safe, never a broad fallback).
+
+```bash
+# Two bindings cover any fleet size:
+kici-admin environment bind --org <org-id> --env production --scope "prod/shared/**"            # fleet-wide
+kici-admin environment bind --org <org-id> --env production --scope 'prod/hosts/${agentId}/**'  # per-host
+```
+
+With a secret tree of `prod/shared` (a fleet-wide `PATRONI_REPL_PASSWORD`) and `prod/hosts/box-00002`, `prod/hosts/box-00003` (each a distinct `WG_PRIVATE_KEY`), a `runsOnAll role:db` job resolves the shared password identically on every host while each host gets only its own `WG_PRIVATE_KEY` — the templated `${agentId}` binding selects each host's own subtree, so growing the fleet adds zero bindings (only secret rows). The workflow author writes the unchanged `await ctx.secrets.get('WG_PRIVATE_KEY')`; the per-host differentiation lives entirely in the binding plus per-host resolution.
+
+The two knobs compose: a templated scope pattern selects each host's own subtree (per-host distinct values), while the host pattern gates which hosts a binding applies to (host-group scoping). `--scope 'prod/db/${agentId}/**' --host role:db` gives each database host its own subtree and non-database hosts nothing.
+
+**Precedence.** When two matching bindings yield the same key, the most specific host pattern wins (an exact host beats a glob/regex, which beats `**`), then the longest scope path. A per-host binding therefore overrides a fleet-wide one for the same key. If no binding provides a key a host requested, `ctx.secrets.get('KEY')` throws at access time (fail-loud) — there is no silent empty value.
+
 ### Token management
 
 **Create a token:**

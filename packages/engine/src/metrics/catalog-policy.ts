@@ -20,6 +20,7 @@
  */
 
 import { MetricNames, MetricService, type MetricName } from './metric-catalog.generated.js';
+import { ExecutionRunStatus } from '../protocol/messages/execution-status.js';
 
 /**
  * Per-label policy: enum-constrained values OR a cardinality cap.
@@ -65,11 +66,12 @@ export const ORCH_PUSHED_METRIC_NAMES: ReadonlySet<MetricName> = new Set(
 const AGENT_SCALER_VALUES = ['stateful', 'container', 'firecracker', 'bare-metal'] as const;
 
 /**
- * Closed enum of scaler values the orchestrator's own resource-usage
- * gauges emit. `__global__` is the orchestrator-wide rollup row; the
- * other four match `AGENT_SCALER_VALUES`.
+ * Closed enum of scaler-backend TYPE values the orchestrator's own
+ * resource-usage gauges carry on their `scalerType` rollup label.
+ * `__global__` is the orchestrator-wide rollup row; the other four match
+ * `AGENT_SCALER_VALUES`. Exported so the policy tests can assert against it.
  */
-const ORCH_SCALER_VALUES = ['__global__', ...AGENT_SCALER_VALUES] as const;
+export const ORCH_SCALER_VALUES = ['__global__', ...AGENT_SCALER_VALUES] as const;
 
 /** Closed enum of the five scheduled jobs the orchestrator runs (mirrors `OrchestratorScheduledJobName`). */
 const ORCH_JOB_VALUES = [
@@ -111,7 +113,10 @@ export const METRIC_LABEL_POLICY: Partial<
     result: { values: ['matched', 'skipped', 'error', 'handled', 'dispatched'] },
   },
   kici_orch_executions_total: {
-    status: { values: ['running', 'success', 'failed', 'cancelled'] },
+    // Derived from the ExecutionRunStatus Zod enum so the policy can never
+    // drift from the statuses the orchestrator actually emits (pending,
+    // running, success, failed, cancelled, cancelling, held).
+    status: { values: ExecutionRunStatus.options },
   },
   kici_orch_steps_total: {
     status: { values: ['running', 'success', 'failed', 'skipped'] },
@@ -127,11 +132,17 @@ export const METRIC_LABEL_POLICY: Partial<
     source: { values: ['sighup', 'http', 'cluster', 'cli'] },
   },
   kici_orch_scaler_cpus_used: {
-    scaler: { values: ORCH_SCALER_VALUES },
+    // `scaler` is the operator-chosen scaler NAME (free-form), with
+    // `__global__` as the orchestrator-wide rollup row — cap it like
+    // `machinePool` rather than enum-constraining it.
+    scaler: { maxUniqueValues: 50 },
+    // `scalerType` is the backend-type rollup dimension (closed enum).
+    scalerType: { values: ORCH_SCALER_VALUES },
     machinePool: { maxUniqueValues: 50 },
   },
   kici_orch_scaler_memory_bytes_used: {
-    scaler: { values: ORCH_SCALER_VALUES },
+    scaler: { maxUniqueValues: 50 },
+    scalerType: { values: ORCH_SCALER_VALUES },
     machinePool: { maxUniqueValues: 50 },
   },
   kici_orch_install_secrets_decisions_total: {

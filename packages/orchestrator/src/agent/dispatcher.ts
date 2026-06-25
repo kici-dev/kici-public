@@ -7,10 +7,28 @@ import {
   type QueuedJobInput,
 } from '../queue/job-queue.js';
 import type { ScaleResult } from '../scaler/types.js';
-import type { ResourceRequest } from '@kici-dev/engine';
+import type { ResourceRequest, RunsOnPick } from '@kici-dev/engine';
+import type { AgentEntry } from './registry.js';
 import { requestContext, createLogger, toErrorMessage } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'dispatcher' });
+
+/**
+ * Pick the single agent to run a label-routed job from the matching candidates.
+ *
+ * `pick` comes from the job's `runsOn.pick` (carried in `jobConfig.runsOnPick`):
+ * - `deterministic` (the default, and any unset value): sort candidates by
+ *   `agentId` and take the lowest, so a run-once-on-one-host job (a migration, a
+ *   dump) lands on the same host across re-runs.
+ * - `any`: take the first available candidate (load spread / current behavior).
+ *
+ * `available` is never empty (callers guard `available.length > 0`).
+ */
+function selectAgent(available: AgentEntry[], jobConfig: Record<string, unknown>): AgentEntry {
+  const pick = jobConfig.runsOnPick as RunsOnPick | undefined;
+  if (pick === 'any') return available[0];
+  return [...available].sort((a, b) => a.agentId.localeCompare(b.agentId))[0];
+}
 
 /**
  * Metrics interface for dispatch operations.
@@ -267,8 +285,9 @@ export class Dispatcher {
     const available = await this.filterRebootPending(availableRaw);
 
     if (available.length > 0) {
-      // Pick the least busy agent (already sorted by findAvailable)
-      const agent = available[0];
+      // Select per the job's runsOn.pick policy (deterministic-by-agentId by
+      // default; `any` keeps first-available).
+      const agent = selectAgent(available, job.jobConfig);
 
       // Claim the slot before the async insert (same race as onAgentAvailable).
       this.registry.incrementActiveJobs(agent.agentId);
@@ -850,7 +869,10 @@ export class Dispatcher {
       job.excludePatterns ?? [],
     );
     if (available.length > 0) {
-      const dispatched = await this.dispatchBoundJob(available[0].agentId, jobId);
+      const dispatched = await this.dispatchBoundJob(
+        selectAgent(available, job.jobConfig).agentId,
+        jobId,
+      );
       if (dispatched) return;
     }
     if (this.onNoMatchingAgent) {

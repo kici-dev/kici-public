@@ -72,6 +72,9 @@ const createEnvironmentSchema = z.object({
 const bindSchema = z.object({
   orgId: z.string().min(1),
   scopePattern: z.string().min(1),
+  // Host selector (exact/glob/regex over a fan-out child's agentId/host/labels).
+  // '**' (the default) matches every host.
+  hostPattern: z.string().min(1).default('**'),
 });
 
 const setPolicySchema = z.object({
@@ -188,6 +191,7 @@ export function createAdminEnvironmentRoutes(deps: AdminEnvironmentRoutesDeps): 
         .where('org_id', '=', body.orgId)
         .where('environment_id', '=', env.id)
         .where('scope_pattern', '=', body.scopePattern)
+        .where('host_pattern', '=', body.hostPattern)
         .executeTakeFirst();
 
       if (existing) {
@@ -200,12 +204,14 @@ export function createAdminEnvironmentRoutes(deps: AdminEnvironmentRoutesDeps): 
           org_id: body.orgId,
           environment_id: env.id,
           scope_pattern: body.scopePattern,
+          host_pattern: body.hostPattern,
         })
         .execute();
       logger.info('environment binding created', {
         orgId: body.orgId,
         name,
         scopePattern: body.scopePattern,
+        hostPattern: body.hostPattern,
       });
       return c.json({ created: true }, 201);
     } catch (err) {
@@ -318,6 +324,7 @@ export function createAdminEnvironmentRoutes(deps: AdminEnvironmentRoutesDeps): 
         })),
         bindings: bindings.map((b) => ({
           scope_pattern: b.scope_pattern,
+          host_pattern: b.host_pattern,
           created_at: b.created_at,
         })),
       });

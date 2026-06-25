@@ -4,7 +4,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { list as tarList } from 'tar';
-import { createOverlayTarball, getSizeWarning, selectOverlayFiles } from './uploader.js';
+import {
+  createOverlayTarball,
+  getSizeWarning,
+  selectOverlayFiles,
+  uploadTarball,
+} from './uploader.js';
 
 /**
  * Helper: create a temp git repo with initial commit and a dummy remote.
@@ -377,6 +382,21 @@ describe('overlay tarball creation', () => {
     it('returns null above error threshold', () => {
       // Above 500MB is an error, not a warning
       expect(getSizeWarning(600 * 1024 * 1024)).toBeNull();
+    });
+  });
+
+  describe('uploadTarball', () => {
+    it('fails fast with an actionable message when the signed URL is empty', async () => {
+      // An empty signedUrl means the orchestrator has no object storage
+      // configured. The guard must reject before fetch('') throws an opaque
+      // "Failed to parse URL from " error.
+      await expect(
+        uploadTarball({
+          tarballPath: '/nonexistent/overlay.tar.gz',
+          signedUrl: '',
+          orchestratorPublicKey: Buffer.alloc(32),
+        }),
+      ).rejects.toThrow(/did not return an upload URL/i);
     });
   });
 });

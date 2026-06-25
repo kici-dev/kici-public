@@ -24,6 +24,8 @@ import { loadWorkflowSource, extractWorkflow } from './workflow-loader.js';
 import { packKiciSource } from './source-packer.js';
 import { restoreSource } from './source-restore.js';
 import { evaluateDynamicFields } from './init-runner.js';
+import { withBootstrapInterception } from '../bootstrap/api-intercept.js';
+import { ensureInitRunner } from '../bootstrap/ensure-init-runner.js';
 import { withTimeout } from './timeout-util.js';
 import { serializeJobsToLock, MatrixExpansionError } from './dynamic-job-serializer.js';
 import { buildKiciApi, buildNeedsContext } from '@kici-dev/sdk';
@@ -446,6 +448,13 @@ export class JobRunner {
       return true;
     }
 
+    // Check for bring-up jobs (init-runner SSH bring-up; no clone, no sandbox).
+    const isBringupOnly = (jobConfig as { bringupOnly?: boolean }).bringupOnly === true;
+    if (isBringupOnly) {
+      await this.handleBringupJob(dispatch);
+      return true;
+    }
+
     // Check for build-only jobs (handled separately from execution jobs)
     const isBuildOnly = (jobConfig as { buildOnly?: boolean }).buildOnly === true;
     if (isBuildOnly) {
@@ -704,7 +713,7 @@ export class JobRunner {
         };
       },
       onApiRequest: this._sendApiRequest
-        ? async (method, params) => this._sendApiRequest!(method, params)
+        ? withBootstrapInterception(async (method, params) => this._sendApiRequest!(method, params))
         : undefined,
       // Wire user-cache relay: sandbox runner -> agent WS -> orchestrator
       onCacheRequest: this._requestUserCache
@@ -807,6 +816,75 @@ export class JobRunner {
       },
       result.secretOutputs,
     );
+  }
+
+  /**
+   * Handle a bring-up job: bring up a temporary init-runner on a declared-but-
+   * un-agented host over SSH (fresh-box bootstrap convergence). The orchestrator
+   * dispatches this synthetic `__bringup__` job to an agent holding the
+   * `kici:capability:ssh-transport` capability; here we run the agent-side
+   * `ensureInitRunner` helper (the privileged resolve is relayed to the
+   * orchestrator, the SSH transport happens in this agent process — never
+   * reaching workflow code). No clone, no sandbox — the init-runner then
+   * connects under the target's agent id and the orchestrator's pinned-hold
+   * drains the target's bootstrap steps onto it.
+   */
+  private async handleBringupJob(dispatch: JobDispatch): Promise<void> {
+    const { runId, jobId, jobConfig } = dispatch;
+    const targetAgentId = String((jobConfig as { bringupTarget?: string }).bringupTarget ?? '');
+
+    logger.info('Starting bring-up job', { jobId, runId, targetAgentId });
+    this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
+    const streamer = this.createStepStreamer(dispatch, 0);
+    this.sendStepStatus(dispatch, 0, 'bring-up', ExecutionStepStatus.enum.running);
+
+    try {
+      if (!targetAgentId) throw new Error('bring-up job missing bringupTarget');
+      if (!this._sendApiRequest) {
+        throw new Error('bring-up job requires an orchestrator API transport');
+      }
+      streamer.addLine(`Bringing up init-runner on ${targetAgentId}…`);
+      // This agent process performs the SSH transport itself (the privileged
+      // resolve is relayed to the orchestrator inside `ensureInitRunner`). Call
+      // the agent-side helper directly with the raw orchestrator transport — do
+      // NOT route through `withBootstrapInterception`, which exists to catch the
+      // method coming FROM a workflow sandbox.
+      const result = await ensureInitRunner(
+        async (method, params) => this._sendApiRequest!(method, params),
+        targetAgentId,
+      );
+      streamer.addLine(
+        result.broughtUp
+          ? `Init-runner brought up on ${targetAgentId}.`
+          : `${targetAgentId} already has a live agent — no bring-up needed.`,
+      );
+      await streamer.flush();
+      this.sendStepStatus(
+        dispatch,
+        0,
+        'bring-up',
+        ExecutionStepStatus.enum.success,
+        undefined,
+        streamer.getTotalBytes(),
+      );
+      streamer.destroy();
+      this.sendJobStatus(dispatch, ExecutionJobStatus.enum.success);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      streamer.addLine(`Bring-up failed: ${message}`);
+      await streamer.flush();
+      this.sendStepStatus(
+        dispatch,
+        0,
+        'bring-up',
+        ExecutionStepStatus.enum.failed,
+        undefined,
+        streamer.getTotalBytes(),
+      );
+      streamer.destroy();
+      this.sendJobStatus(dispatch, ExecutionJobStatus.enum.failed, { error: message });
+      logger.warn('Bring-up job failed', { jobId, runId, targetAgentId, error: message });
+    }
   }
 
   /**
@@ -1435,7 +1513,9 @@ export class JobRunner {
       };
       const kici = buildKiciApi(
         this._sendApiRequest
-          ? (method, params) => this._sendApiRequest!(method, params ?? {})
+          ? withBootstrapInterception((method, params) =>
+              this._sendApiRequest!(method, params ?? {}),
+            )
           : () => Promise.reject(new Error('Agent API not available')),
       );
 

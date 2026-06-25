@@ -10,15 +10,20 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { HostRosterStore, HostStatus } from '../agent/host-roster.js';
+import type { RegistrationStore } from '../registration/registration-store.js';
+import { matcherSatisfiedBy } from '@kici-dev/engine';
 import type {
   DashboardFleetHostsResponse,
   DashboardFleetHostResponse,
   DashboardFleetPreviewResponse,
+  DashboardFleetWorkflowsForHostResponse,
+  FleetHostDisposition,
   FleetPinnedRun,
   FleetPreviewHost,
   LabelMatcher,
   OnUnreachableMode,
 } from '@kici-dev/engine';
+import { extractRunsOnAll } from './fleet-runs-on-all.js';
 
 /** A workflow's resolved runsOnAll predicate, or null when it has none. */
 export interface ResolvedRunsOnAll {
@@ -33,6 +38,8 @@ export interface FleetHandlerDeps {
   rosterGraceMs: number;
   /** Resolve a workflow's runsOnAll predicate + onUnreachable, or null. */
   resolveRunsOnAll: (workflowName: string) => Promise<ResolvedRunsOnAll | null>;
+  /** All registered workflows (for the host-centric workflows-for-host read). */
+  registrationStore: RegistrationStore;
 }
 
 /** Roster: every declared/live host as a `HostInventoryEntry`. */
@@ -129,4 +136,47 @@ export async function handleFleetPreviewRequest(
     onUnreachable: predicate.onUnreachable,
     estimatedChildCount: targetCount,
   };
+}
+
+/**
+ * workflows-for-host: the host-centric inverse of the preview. Resolves this
+ * host's label set once, then tests every registered (non-disabled) workflow's
+ * runsOnAll predicate against it, returning each match with the fan-out's
+ * `onUnreachable` policy and the host's per-workflow disposition.
+ */
+export async function handleFleetWorkflowsForHostRequest(
+  deps: FleetHandlerDeps,
+  requestId: string,
+  agentId: string,
+): Promise<DashboardFleetWorkflowsForHostResponse> {
+  const entry = await deps.rosterStore.getInventory(agentId, deps.rosterGraceMs);
+  if (!entry) {
+    return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
+  }
+  const labelSet = new Set(entry.labels);
+  const workflows: DashboardFleetWorkflowsForHostResponse['workflows'] = [];
+  for (const reg of await deps.registrationStore.getAll()) {
+    if (reg.disabled) continue;
+    const predicate = extractRunsOnAll(reg.lock_entry);
+    if (!predicate) continue;
+    const excluded = predicate.exclude.some((e) => matcherSatisfiedBy(e, labelSet));
+    const included =
+      predicate.include.length === 0 ||
+      predicate.include.some((grp) => grp.every((m) => matcherSatisfiedBy(m, labelSet)));
+    if (excluded || !included) continue;
+
+    let disposition: FleetHostDisposition;
+    if (entry.status === HostStatus.ready) disposition = 'target';
+    else if (entry.lifecycleClass === 'ephemeral') disposition = 'skipped-ephemeral';
+    else disposition = predicate.onUnreachable === 'hold' ? 'target' : 'unreachable-durable';
+
+    workflows.push({
+      workflowName: reg.workflow_name,
+      repoIdentifier: reg.repo_identifier,
+      sourceFile: reg.sourceFile,
+      onUnreachable: predicate.onUnreachable,
+      disposition,
+    });
+  }
+  return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows };
 }

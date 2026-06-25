@@ -50,6 +50,8 @@ import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { createOidcTokenHandler, deriveHttpBaseFromWsUrl } from './ws/oidc-token-relay.js';
 import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
+import { createEnsureInitRunnerHandler, createPreBootSendHandler } from './ws/bringup-api.js';
+import { resolveScalerOrchestratorUrl } from './scaler/manager.js';
 import { configureSecureWsServer } from './ws/server-options.js';
 import {
   type CheckRunReporter,
@@ -485,6 +487,39 @@ export function createApp(deps: AppDependencies) {
       await hostRosterStore.clearRebootPending(agentId);
       return {};
     });
+
+    // Register the bootstrap bring-up API (write role). `kici.ensureInitRunner`
+    // / `kici.preBootSend` are gated on the calling agent holding
+    // `kici:capability:ssh-transport`, resolve the scoped SSH/secret, mint a
+    // single-use bootstrap token, audit, and return the SSH material to the
+    // agent (which performs the transport over the mesh). Only registered when
+    // the privileged deps (token store + secret resolver + access log) are
+    // present — independent mode without secrets simply won't expose it.
+    if (deps.tokenStore && deps.secretResolver && deps.accessLogWriter) {
+      const bringupDeps = {
+        registry: deps.registry,
+        rosterStore: hostRosterStore,
+        tokenStore: deps.tokenStore,
+        secretResolver: deps.secretResolver,
+        accessLog: deps.accessLogWriter,
+        graceMs: deps.config.rosterGraceMs,
+        // Single-tenant orchestrator: scoped-secret resolution uses the default
+        // org, matching the rest of app.ts's secret-context calls.
+        resolveOrgId: () => '__default__',
+        resolveOrchestratorUrl: () =>
+          resolveScalerOrchestratorUrl(
+            undefined,
+            process.env.KICI_ORCHESTRATOR_URL,
+            deps.config.port,
+          ),
+      };
+      agentApiRegistry.register(
+        'kici.ensureInitRunner',
+        'write',
+        createEnsureInitRunnerHandler(bringupDeps),
+      );
+      agentApiRegistry.register('kici.preBootSend', 'write', createPreBootSendHandler(bringupDeps));
+    }
   }
 
   // Register the provenance ID-token relay (read role). The relay drives the

@@ -1,6 +1,6 @@
 {
   "name": "kici-admin",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Administration CLI for a KiCI customer-deployable orchestrator. Manage runs, agents, peers, sources, secrets, event log, and database schema.",
   "keywords": [
     "ci",

@@ -650,11 +650,14 @@ export interface SeedEnvironmentBindingOpts {
   orgId: string;
   envName: string;
   scopePattern: string;
+  /** Host selector; defaults to `'**'` (all hosts). */
+  hostPattern?: string;
 }
 
 /**
- * Upsert an `environment_bindings` row connecting `envName` to `scopePattern`.
- * Throws if the environment does not exist.
+ * Upsert an `environment_bindings` row connecting `envName` to `scopePattern`
+ * (scoped to `hostPattern`, default `'**'`). Throws if the environment does
+ * not exist.
  */
 export async function seedEnvironmentBindingDirect(
   databaseUrl: string,
@@ -671,11 +674,11 @@ export async function seedEnvironmentBindingDirect(
     }
     const envId = envRow.rows[0].id;
     const result = await pool.query<{ inserted: boolean }>(
-      `INSERT INTO environment_bindings (org_id, environment_id, scope_pattern)
-         VALUES ($1, $2, $3)
+      `INSERT INTO environment_bindings (org_id, environment_id, scope_pattern, host_pattern)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT DO NOTHING
          RETURNING (xmax = 0) AS inserted`,
-      [opts.orgId, envId, opts.scopePattern],
+      [opts.orgId, envId, opts.scopePattern, opts.hostPattern ?? '**'],
     );
     return { created: result.rows[0]?.inserted ?? false };
   } finally {
@@ -809,6 +812,7 @@ export interface EnvironmentVariableRow {
 
 export interface EnvironmentBindingRow {
   scope_pattern: string;
+  host_pattern: string;
   created_at: string;
 }
 
@@ -848,10 +852,10 @@ export async function showEnvironmentDirect(
       [env.id],
     );
     const bindings = await pool.query<EnvironmentBindingRow>(
-      `SELECT scope_pattern, created_at
+      `SELECT scope_pattern, host_pattern, created_at
          FROM environment_bindings
         WHERE environment_id = $1
-        ORDER BY scope_pattern`,
+        ORDER BY scope_pattern, host_pattern`,
       [env.id],
     );
     return {

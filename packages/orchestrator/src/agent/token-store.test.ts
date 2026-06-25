@@ -185,6 +185,58 @@ describe('AgentTokenStore', () => {
     });
   });
 
+  describe('mintBootstrapToken', () => {
+    it('mints a single-use ephemeral token with init labels and a short TTL', async () => {
+      let capturedValues: any;
+      const { db } = createMockDb();
+      (db.insertInto as ReturnType<typeof vi.fn>).mockReturnValue({
+        values: vi.fn().mockImplementation((v: any) => {
+          capturedValues = v;
+          return {
+            returningAll: vi.fn().mockReturnValue({
+              executeTakeFirstOrThrow: vi.fn().mockResolvedValue({ id: 'boot-1' }),
+            }),
+          };
+        }),
+      });
+
+      const now = Date.now();
+      const ttlMs = 10 * 60 * 1000;
+      const store = new AgentTokenStore(db as any);
+      const { token, id } = await store.mintBootstrapToken({
+        targetAgentId: 'box-00007',
+        ttlMs,
+        labels: ['kici:init', 'kici:privileged:root', 'kici:host:box-00007'],
+      });
+
+      expect(token.startsWith('kat_')).toBe(true);
+      expect(id).toBe('boot-1');
+      expect(capturedValues.agent_type).toBe('ephemeral');
+      expect(capturedValues.created_by).toBe('bootstrap:box-00007');
+      expect(capturedValues.consumed_at).toBeNull();
+      expect(capturedValues.labels).toBe(
+        '["kici:init","kici:privileged:root","kici:host:box-00007"]',
+      );
+      const expiresAt = capturedValues.expires_at.getTime();
+      expect(expiresAt).toBeGreaterThanOrEqual(now + ttlMs - 1000);
+      expect(expiresAt).toBeLessThanOrEqual(now + ttlMs + 1000);
+    });
+  });
+
+  describe('consumeBootstrapToken', () => {
+    it('returns true when the token was newly consumed', async () => {
+      const { db } = createMockDb({ updateResult: { numUpdatedRows: 1n } });
+      const store = new AgentTokenStore(db as any);
+      expect(await store.consumeBootstrapToken('boot-1')).toBe(true);
+    });
+
+    it('returns false when the token was already consumed (consumed_at not null)', async () => {
+      const { db } = createMockDb({ updateResult: { numUpdatedRows: 0n } });
+      const store = new AgentTokenStore(db as any);
+      expect(await store.consumeBootstrapToken('boot-1')).toBe(false);
+    });
+  });
+
   describe('validate', () => {
     it('returns row (without hash) for valid token', async () => {
       const plaintext = 'kat_' + 'a'.repeat(64);

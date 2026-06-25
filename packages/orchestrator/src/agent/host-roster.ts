@@ -11,6 +11,20 @@ import type { Database, HostRosterRow } from '../db/types.js';
 export type HostProperties = Record<string, string | number | boolean>;
 
 /**
+ * Pre-agent reach metadata for a declared host — how to SSH to it for bootstrap
+ * bring-up before it has a KiCI agent. All fields nullable: a host with no reach
+ * metadata cannot be bootstrapped. `sshKeySecret` is a scoped-secret ref
+ * (`scope/key`) the orchestrator resolves server-side; the key never lives here.
+ */
+export interface HostReach {
+  agentId: string;
+  address: string | null;
+  sshUser: string | null;
+  sshPort: number | null;
+  sshKeySecret: string | null;
+}
+
+/**
  * Derived (read-time) status of a roster host. Never a stored mutable column:
  * status is computed from the shared `last_seen` + `connected_instance_id` so
  * every cluster instance agrees regardless of which one holds the live WS.
@@ -182,28 +196,90 @@ export class HostRosterStore {
       .execute();
   }
 
-  /** Operator pre-declare of a static host before its agent dials in. */
+  /**
+   * Operator pre-declare of a static host. A re-declare of an existing agent_id
+   * converges the operator-owned columns (labels, hostname, reach,
+   * host_properties) to the newly-declared values while preserving the
+   * agent-reported liveness/identity columns (connected_instance_id, last_seen,
+   * platform, arch, lifecycle_class, token_id, reboot_pending_until). The
+   * optional reach fields (`address`/`sshUser`/`sshPort`/`sshKeySecret`) carry
+   * how to SSH to the host for bootstrap bring-up. Each operator field is
+   * preserve-on-omit: an omitted field keeps the existing column value.
+   *
+   * Returns `{ created: true }` when the declare inserted a new row,
+   * `{ created: false }` when it converged an existing one.
+   */
   async declareStatic(input: {
     agentId: string;
-    labels: string[];
+    labels?: string[];
     hostname?: string;
     properties?: HostProperties;
-  }): Promise<void> {
-    await this.db
+    address?: string;
+    sshUser?: string;
+    sshPort?: number;
+    sshKeySecret?: string;
+  }): Promise<{ created: boolean }> {
+    // Operator-declared field binds: undefined ⇒ NULL ⇒ COALESCE preserves the
+    // existing column on update; on insert the .values() defaults apply.
+    const labelsBind = input.labels === undefined ? null : JSON.stringify(input.labels);
+    const propsBind = input.properties === undefined ? null : JSON.stringify(input.properties);
+    const row = await this.db
       .insertInto('host_roster')
       .values({
         agent_id: input.agentId,
         token_id: null,
         lifecycle_class: 'static',
-        labels: JSON.stringify(input.labels),
+        labels: JSON.stringify(input.labels ?? []),
         hostname: input.hostname ?? null,
         connected_instance_id: null,
         host_properties: JSON.stringify(input.properties ?? {}),
+        address: input.address ?? null,
+        ssh_user: input.sshUser ?? null,
+        ssh_port: input.sshPort ?? null,
+        ssh_key_secret: input.sshKeySecret ?? null,
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
-      .onConflict((oc) => oc.column('agent_id').doNothing())
-      .execute();
+      .onConflict((oc) =>
+        // Re-declare converges operator-owned columns only — never the
+        // agent-reported liveness/identity columns (connected_instance_id,
+        // last_seen, platform, arch, lifecycle_class, token_id,
+        // reboot_pending_until). Each field is preserve-on-omit via COALESCE;
+        // host_properties shallow-merges like the agent upsert.
+        oc.column('agent_id').doUpdateSet({
+          labels: sql`COALESCE(${labelsBind}, host_roster.labels)`,
+          hostname: sql`COALESCE(${input.hostname ?? null}, host_roster.hostname)`,
+          host_properties: sql`COALESCE(host_roster.host_properties, '{}'::jsonb) || COALESCE(${propsBind}::jsonb, '{}'::jsonb)`,
+          address: sql`COALESCE(${input.address ?? null}, host_roster.address)`,
+          ssh_user: sql`COALESCE(${input.sshUser ?? null}, host_roster.ssh_user)`,
+          ssh_port: sql`COALESCE(${input.sshPort ?? null}, host_roster.ssh_port)`,
+          ssh_key_secret: sql`COALESCE(${input.sshKeySecret ?? null}, host_roster.ssh_key_secret)`,
+          updated_at: sql`now()`,
+        }),
+      )
+      .returning(sql<boolean>`(xmax = 0)`.as('created'))
+      .executeTakeFirstOrThrow();
+    return { created: !!row.created };
+  }
+
+  /**
+   * Read a host's pre-agent reach metadata. Returns null when the host is not
+   * in the roster; a host declared without reach fields reads back with nulls.
+   */
+  async getReach(agentId: string): Promise<HostReach | null> {
+    const row = await this.db
+      .selectFrom('host_roster')
+      .select(['agent_id', 'address', 'ssh_user', 'ssh_port', 'ssh_key_secret'])
+      .where('agent_id', '=', agentId)
+      .executeTakeFirst();
+    if (!row) return null;
+    return {
+      agentId: row.agent_id,
+      address: row.address,
+      sshUser: row.ssh_user,
+      sshPort: row.ssh_port,
+      sshKeySecret: row.ssh_key_secret,
+    };
   }
 
   async get(agentId: string): Promise<HostRosterRow | null> {

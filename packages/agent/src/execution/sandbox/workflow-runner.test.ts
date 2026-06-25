@@ -17,6 +17,7 @@ import {
   rawPayloadFromEvent,
   createSandboxStepContext,
   buildStepNeedsContext,
+  deriveFanout,
 } from './workflow-runner.js';
 import type { JobExecutionRequest } from './ipc-protocol.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
@@ -1231,6 +1232,16 @@ describe('createSandboxStepContext - matrix threading', () => {
     expect(ctx.host).toBeUndefined();
     expect(ctx.agent).toBeUndefined();
   });
+
+  it('exposes request.dispatchInputs as ctx.dispatchInputs', () => {
+    const ctx = buildCtx(baseRequest({ dispatchInputs: { skipCveScan: true, mode: 'full' } }));
+    expect(ctx.dispatchInputs).toEqual({ skipCveScan: true, mode: 'full' });
+  });
+
+  it('defaults ctx.dispatchInputs to {} when none on the request', () => {
+    const ctx = buildCtx(baseRequest());
+    expect(ctx.dispatchInputs).toEqual({});
+  });
 });
 
 describe('buildStepNeedsContext', () => {
@@ -1265,5 +1276,38 @@ describe('buildStepNeedsContext', () => {
     expect(arr.map((e) => e.name)).toEqual(['test (a)', 'test (b)']);
     expect(arr.map((e) => e.status)).toEqual(['success', 'skipped']);
     expect(arr.map((e) => e.result.ok)).toEqual([1, 2]);
+  });
+});
+
+describe('deriveFanout', () => {
+  const req = (over: Partial<JobExecutionRequest>): JobExecutionRequest =>
+    ({ workflowName: 'w', jobName: 'j', runsOn: 'linux', ...over }) as JobExecutionRequest;
+
+  it('returns undefined on a non-fan-out request (no fanoutTotal)', () => {
+    expect(deriveFanout(req({}))).toBeUndefined();
+  });
+
+  it('derives first/last from index + total', () => {
+    expect(deriveFanout(req({ fanoutIndex: 0, fanoutTotal: 3 }))).toEqual({
+      index: 0,
+      total: 3,
+      first: true,
+      last: false,
+    });
+    expect(deriveFanout(req({ fanoutIndex: 2, fanoutTotal: 3 }))).toEqual({
+      index: 2,
+      total: 3,
+      first: false,
+      last: true,
+    });
+  });
+
+  it('defaults a missing index to 0 when total is present', () => {
+    expect(deriveFanout(req({ fanoutTotal: 1 }))).toEqual({
+      index: 0,
+      total: 1,
+      first: true,
+      last: true,
+    });
   });
 });

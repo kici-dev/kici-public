@@ -65,6 +65,7 @@ export function createStepContext(
   environment?: string,
   rawPayload?: Record<string, unknown>,
   provider?: string,
+  dispatchInputs: Readonly<Record<string, string | number | boolean | null>> = {},
 ): StepContext {
   const flat = testSecrets?.flat ?? {};
   const namespacedSecrets = testSecrets?.contexts ?? {};
@@ -162,6 +163,7 @@ export function createStepContext(
       process.env.PATH = updated;
     },
     inputs,
+    dispatchInputs,
     workflow: workflowInfo,
     job: jobInfo,
     matrix,
@@ -207,6 +209,20 @@ export function createStepContext(
         requestReboot: () =>
           Promise.reject(
             new Error('ctx.kici.host.requestReboot() is not available in the local test runner'),
+          ),
+      },
+      bootstrap: {
+        // Bring-up requires an ops agent + orchestrator; neither exists in the
+        // local test runner.
+        ensureInitRunner: () =>
+          Promise.reject(
+            new Error(
+              'ctx.kici.bootstrap.ensureInitRunner() is not available in the local test runner',
+            ),
+          ),
+        preBootSend: () =>
+          Promise.reject(
+            new Error('ctx.kici.bootstrap.preBootSend() is not available in the local test runner'),
           ),
       },
     },

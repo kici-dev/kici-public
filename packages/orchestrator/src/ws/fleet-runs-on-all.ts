@@ -13,6 +13,19 @@ import { isLockStaticJob, type LockWorkflow } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { ResolvedRunsOnAll } from './dashboard-fleet-handler.js';
 
+/** Pull the first static job's runsOnAll predicate from a parsed lock entry, or null. */
+export function extractRunsOnAll(workflow: LockWorkflow): ResolvedRunsOnAll | null {
+  for (const job of workflow.jobs) {
+    if (!isLockStaticJob(job) || !job.runsOnAll) continue;
+    return {
+      include: job.runsOnAll.include,
+      exclude: job.runsOnAll.exclude,
+      onUnreachable: job.onUnreachable ?? 'hold',
+    };
+  }
+  return null;
+}
+
 /** Find the resolved runsOnAll predicate for a workflow by name, or null. */
 export async function resolveWorkflowRunsOnAll(
   db: Kysely<Database>,
@@ -32,14 +45,8 @@ export async function resolveWorkflowRunsOnAll(
     } catch {
       continue;
     }
-    for (const job of workflow.jobs) {
-      if (!isLockStaticJob(job) || !job.runsOnAll) continue;
-      return {
-        include: job.runsOnAll.include,
-        exclude: job.runsOnAll.exclude,
-        onUnreachable: job.onUnreachable ?? 'hold',
-      };
-    }
+    const predicate = extractRunsOnAll(workflow);
+    if (predicate) return predicate;
   }
   return null;
 }

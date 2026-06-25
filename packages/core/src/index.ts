@@ -26,3 +26,4 @@ export {
   encryptJson,
   decryptJson,
 } from './crypto.js';
+export { computeBackoffDelay, type ResolvedRetry, type RetryBackoff } from './retry.js';

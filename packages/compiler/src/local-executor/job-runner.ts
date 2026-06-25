@@ -22,6 +22,7 @@ import {
 import { formatMatrixSuffix, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import type { SimulatedEvent, MatrixValues } from '@kici-dev/engine';
 import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
+import { computeBackoffDelay } from '@kici-dev/core';
 import type { EventPayload } from '@kici-dev/sdk';
 import { ensureTsLoaderHook } from '../execution/ts-loader.js';
 import { toEventPayload } from './to-event-payload.js';
@@ -49,6 +50,8 @@ export interface JobExecutionContext {
   signal: AbortSignal;
   /** Run mode for idempotent steps. Defaults to `apply` when unset. */
   checkMode?: CheckMode;
+  /** Resolved (coerced + defaulted) workflow-dispatch inputs for `ctx.dispatchInputs`. */
+  dispatchInputs?: Readonly<Record<string, string | number | boolean | null>>;
 }
 
 /**
@@ -155,6 +158,44 @@ async function runLocalStepWithCheckMode(
   };
 }
 
+/**
+ * Run a local step through its retry policy. An attempt is one full
+ * `runLocalStepWithCheckMode` call (which throws on failure). A thrown attempt
+ * is retried while attempts remain AND `retryIf(err)` is true; backoff sleeps
+ * between attempts. Mirrors the agent step loop so `kici run local` retries
+ * identically to a remote run.
+ */
+async function runLocalStepWithRetry(
+  step: Step,
+  ctx: StepContext,
+  checkMode: CheckMode,
+  log: (line: string) => void,
+): Promise<LocalCheckPhaseResult> {
+  const retry = step.retry;
+  const max = retry?.maxAttempts ?? 1;
+  let lastErr: unknown;
+  for (let n = 1; n <= max; n++) {
+    try {
+      return await runLocalStepWithCheckMode(step, ctx, checkMode);
+    } catch (err) {
+      lastErr = err;
+      const canRetry = n < max && (retry?.retryIf?.(err) ?? true);
+      if (!canRetry) break;
+      const delay = computeBackoffDelay(n, {
+        maxAttempts: max,
+        delayMs: retry!.delayMs,
+        backoff: retry!.backoff,
+        maxDelayMs: retry!.maxDelayMs,
+      });
+      log(
+        `Step '${step.name}' attempt ${n}/${max} failed: ${err instanceof Error ? err.message : String(err)}; retrying in ${delay}ms`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
 /** A matrix outputs envelope as exposed to a downstream `needs:` consumer. */
 interface MatrixOutputsEnvelope {
   byMatrix: Record<string, Record<string, unknown>>;
@@ -244,6 +285,20 @@ export async function resolveJobs(
             requestReboot: () =>
               Promise.reject(
                 new Error('ctx.kici.host.requestReboot() is not available during local execution'),
+              ),
+          },
+          bootstrap: {
+            ensureInitRunner: () =>
+              Promise.reject(
+                new Error(
+                  'ctx.kici.bootstrap.ensureInitRunner() is not available during local execution',
+                ),
+              ),
+            preBootSend: () =>
+              Promise.reject(
+                new Error(
+                  'ctx.kici.bootstrap.preBootSend() is not available during local execution',
+                ),
               ),
           },
         },
@@ -405,6 +460,7 @@ async function executeResolvedJobInner(
     const ruleContext = createRuleContext(
       context.event as EventPayload,
       context.event.changedFiles,
+      context.dispatchInputs ?? {},
     );
     const ruleEval = await evaluateRules(job.rules as Rule[], ruleContext, expandedName);
     ruleResults = ruleEval.results;
@@ -453,6 +509,7 @@ async function executeResolvedJobInner(
     undefined,
     context.event.payload,
     context.event.provider,
+    context.dispatchInputs ?? {},
   );
 
   // Execute steps sequentially
@@ -496,7 +553,9 @@ async function executeResolvedJobInner(
 
     try {
       const checkMode = context.checkMode ?? CheckMode.enum.apply;
-      const phase = await runLocalStepWithCheckMode(normalizedStep, stepCtx, checkMode);
+      const phase = await runLocalStepWithRetry(normalizedStep, stepCtx, checkMode, (line) =>
+        formatter.logJobLine(expandedName, line),
+      );
       const outputs = phase.outputs;
       const stepDuration = Date.now() - stepStart;
       formatter.logStepComplete(expandedName, normalizedStep.name, stepDuration);

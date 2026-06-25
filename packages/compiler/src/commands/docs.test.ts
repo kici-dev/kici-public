@@ -65,6 +65,16 @@ describe('docs llm command', () => {
       '# KiCI documentation bundle\n\n## Foo\n\nbody body body\n',
       'utf-8',
     );
+    await writeFile(
+      path.join(bundleDir, 'llms-sdk.txt'),
+      '# KiCI SDK reference\n\n## SDK core\n\nsdk body content\n',
+      'utf-8',
+    );
+    await writeFile(
+      path.join(bundleDir, 'llms-patterns.txt'),
+      '# KiCI Workflow patterns\n\npatterns body content\n',
+      'utf-8',
+    );
     stdoutChunks = [];
     stdoutWriteSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: unknown) => {
       stdoutChunks.push(typeof chunk === 'string' ? chunk : String(chunk));
@@ -77,16 +87,8 @@ describe('docs llm command', () => {
     await rm(bundleDir, { recursive: true, force: true });
   });
 
-  it('prints llms-full.txt to stdout by default', async () => {
+  it('prints the llms.txt index when no topic is given', async () => {
     const ok = await docsLlmCommand({ bundleDir });
-    expect(ok).toBe(true);
-    const joined = stdoutChunks.join('');
-    expect(joined).toContain('KiCI documentation bundle');
-    expect(joined).toContain('body body body');
-  });
-
-  it('prints llms.txt with --index', async () => {
-    const ok = await docsLlmCommand({ bundleDir, index: true });
     expect(ok).toBe(true);
     const joined = stdoutChunks.join('');
     expect(joined).toContain('# KiCI');
@@ -94,17 +96,41 @@ describe('docs llm command', () => {
     expect(joined).not.toContain('body body body');
   });
 
-  it('writes to --out file instead of stdout', async () => {
-    const outPath = path.join(bundleDir, 'captured.txt');
-    const ok = await docsLlmCommand({ bundleDir, out: outPath });
+  it('prints a task bundle by topic', async () => {
+    const ok = await docsLlmCommand({ bundleDir, topic: 'sdk' });
     expect(ok).toBe(true);
-    expect(stdoutChunks).toHaveLength(0);
-    const written = await readFile(outPath, 'utf-8');
-    expect(written).toContain('KiCI documentation bundle');
+    expect(stdoutChunks.join('')).toContain('sdk body content');
   });
 
-  it('returns false and logs an error when the bundle is missing', async () => {
-    const ok = await docsLlmCommand({ bundleDir: path.join(bundleDir, 'nope') });
+  it('prints the full bundle for the "full" topic', async () => {
+    const ok = await docsLlmCommand({ bundleDir, topic: 'full' });
+    expect(ok).toBe(true);
+    expect(stdoutChunks.join('')).toContain('body body body');
+  });
+
+  it('writes a topic bundle to --out instead of stdout', async () => {
+    const outPath = path.join(bundleDir, 'captured.txt');
+    const ok = await docsLlmCommand({ bundleDir, topic: 'patterns', out: outPath });
+    expect(ok).toBe(true);
+    expect(stdoutChunks).toHaveLength(0);
+    expect(await readFile(outPath, 'utf-8')).toContain('patterns body content');
+  });
+
+  it('returns false and lists available topics for an unknown topic', async () => {
+    const ok = await docsLlmCommand({ bundleDir, topic: 'nope' });
+    expect(ok).toBe(false);
+    expect(loggerMock.error).toHaveBeenCalled();
+    const logged = [
+      ...loggerMock.error.mock.calls.flat(),
+      ...loggerMock.info.mock.calls.flat(),
+    ].join(' ');
+    expect(logged).toContain('sdk');
+    expect(logged).toContain('patterns');
+    expect(logged).toContain('full');
+  });
+
+  it('returns false and logs an error when the bundle dir is missing', async () => {
+    const ok = await docsLlmCommand({ bundleDir: path.join(bundleDir, 'nope'), topic: 'sdk' });
     expect(ok).toBe(false);
     expect(loggerMock.error).toHaveBeenCalled();
   });

@@ -83,6 +83,9 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
   if (options.onUnreachable !== undefined && options.runsOnAll === undefined) {
     console.warn(`[kici] job('${name}'): onUnreachable is ignored without runsOnAll`);
   }
+  if (options.includeUninitialized !== undefined && options.runsOnAll === undefined) {
+    console.warn(`[kici] job('${name}'): includeUninitialized is ignored without runsOnAll`);
+  }
 
   return {
     _tag: 'Job' as const,
@@ -90,6 +93,9 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     ...(options.runsOn !== undefined && { runsOn: options.runsOn }),
     ...(options.runsOnAll !== undefined && { runsOnAll: options.runsOnAll }),
     ...(options.onUnreachable !== undefined && { onUnreachable: options.onUnreachable }),
+    ...(options.includeUninitialized !== undefined && {
+      includeUninitialized: options.includeUninitialized,
+    }),
     ...(options.maxParallel !== undefined && { maxParallel: options.maxParallel }),
     ...(options.failFast !== undefined && { failFast: options.failFast }),
     steps,

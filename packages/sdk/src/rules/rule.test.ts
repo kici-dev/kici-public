@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { rule, skip } from './rule.js';
+import { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from './rule.js';
 import type { RuleContext } from './types.js';
+import type { FanoutPosition } from '../fanout-context.js';
 
 describe('rule()', () => {
   it('creates a rule with _tag: Rule', () => {
@@ -138,5 +139,47 @@ describe('skip()', () => {
     expect(await s.check(emptyContext)).toBe(false);
     // Has files -> condition false -> run (true)
     expect(await s.check(nonEmptyContext)).toBe(true);
+  });
+});
+
+describe('fan-out position rule helpers', () => {
+  const ctx = (fanout?: FanoutPosition): RuleContext =>
+    ({ event: {}, changedFiles: [], env: {}, dispatchInputs: {}, $: {}, fanout }) as RuleContext;
+
+  it('onlyOnFirstHost runs on the first child, skips others', async () => {
+    expect(
+      await onlyOnFirstHost().check(ctx({ index: 0, total: 3, first: true, last: false })),
+    ).toBe(true);
+    expect(
+      await onlyOnFirstHost().check(ctx({ index: 1, total: 3, first: false, last: false })),
+    ).toBe(false);
+  });
+
+  it('onlyOnFirstHost runs normally on a non-fan-out job', async () => {
+    expect(await onlyOnFirstHost().check(ctx(undefined))).toBe(true);
+  });
+
+  it('onlyOnLastHost targets the last child, skips others', async () => {
+    expect(
+      await onlyOnLastHost().check(ctx({ index: 2, total: 3, first: false, last: true })),
+    ).toBe(true);
+    expect(
+      await onlyOnLastHost().check(ctx({ index: 0, total: 3, first: true, last: false })),
+    ).toBe(false);
+  });
+
+  it('onlyOnLastHost runs normally on a non-fan-out job', async () => {
+    expect(await onlyOnLastHost().check(ctx(undefined))).toBe(true);
+  });
+
+  it('onlyOnFanoutIndex targets index n (and index 0 when unfanned)', async () => {
+    expect(
+      await onlyOnFanoutIndex(1).check(ctx({ index: 1, total: 3, first: false, last: false })),
+    ).toBe(true);
+    expect(
+      await onlyOnFanoutIndex(1).check(ctx({ index: 2, total: 3, first: false, last: true })),
+    ).toBe(false);
+    expect(await onlyOnFanoutIndex(0).check(ctx(undefined))).toBe(true);
+    expect(await onlyOnFanoutIndex(1).check(ctx(undefined))).toBe(false);
   });
 });

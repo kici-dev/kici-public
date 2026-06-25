@@ -5,6 +5,7 @@ import {
   normalizeRunsOnToMatchers,
   normalizeRunsOnAllToMatchers,
   assertMatchersSafe,
+  runsOnPickFromInput,
 } from './compile.js';
 
 describe('toLabelMatcher', () => {
@@ -105,5 +106,23 @@ describe('assertMatchersSafe', () => {
     expect(() =>
       assertMatchersSafe([{ kind: 'regex', source: '(a+)+$', flags: '' }], 'lock job web runsOn'),
     ).toThrow(/ReDoS-prone/);
+  });
+});
+
+describe('runsOnPickFromInput', () => {
+  it('defaults string + array shorthand to deterministic', () => {
+    expect(runsOnPickFromInput('kici:group:ops')).toBe('deterministic');
+    expect(runsOnPickFromInput(['a', 'b'])).toBe('deterministic');
+  });
+
+  it('defaults a selector without pick to deterministic', () => {
+    expect(runsOnPickFromInput({ labels: ['role:db'] })).toBe('deterministic');
+  });
+
+  it('preserves an explicit pick on the selector', () => {
+    expect(runsOnPickFromInput({ labels: ['role:db'], pick: 'any' })).toBe('any');
+    expect(runsOnPickFromInput({ labels: ['role:db'], pick: 'deterministic' })).toBe(
+      'deterministic',
+    );
   });
 });

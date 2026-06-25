@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -52,6 +52,14 @@
     "./labels/compile": {
       "import": "./dist/labels/compile.js",
       "types": "./dist/labels/compile.d.ts"
+    },
+    "./environment/host-match": {
+      "import": "./dist/environment/host-match.js",
+      "types": "./dist/environment/host-match.d.ts"
+    },
+    "./environment/scope-template": {
+      "import": "./dist/environment/scope-template.js",
+      "types": "./dist/environment/scope-template.d.ts"
     },
     "./protocol/dashboard-global-workflows": {
       "import": "./dist/protocol/dashboard-global-workflows.js",

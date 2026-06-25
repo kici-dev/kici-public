@@ -1057,3 +1057,147 @@ describe('executeStepLoop check mode', () => {
     expect(result.stepResults[1].status).toBe('success');
   });
 });
+
+describe('step retry', () => {
+  function makeRetryStep(
+    name: string,
+    run: (ctx: StepContext) => Promise<void>,
+    retry: Step['retry'],
+    extra: Partial<Step> = {},
+  ): Step {
+    return { _tag: 'Step', name, run, retry, result: {} as any, ...extra };
+  }
+
+  it('retries a thrown step then succeeds', async () => {
+    let n = 0;
+    const step = makeRetryStep(
+      'flaky',
+      async () => {
+        if (++n < 3) throw new Error('boom');
+      },
+      { maxAttempts: 3, delayMs: 1, backoff: 'fixed', maxDelayMs: 1 },
+    );
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [step],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    expect(n).toBe(3);
+    expect(result.status).toBe('success');
+    expect(result.stepResults[0].status).toBe('success');
+  });
+
+  it('fails after exhausting attempts', async () => {
+    let n = 0;
+    const step = makeRetryStep(
+      'always',
+      async () => {
+        n++;
+        throw new Error('boom');
+      },
+      { maxAttempts: 2, delayMs: 1, backoff: 'fixed', maxDelayMs: 1 },
+    );
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [step],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    expect(n).toBe(2);
+    expect(result.stepResults[0].status).toBe('failed');
+  });
+
+  it('retryIf=false fails immediately (one attempt)', async () => {
+    let n = 0;
+    const step = makeRetryStep(
+      'nonretry',
+      async () => {
+        n++;
+        throw new Error('nope');
+      },
+      { maxAttempts: 3, delayMs: 1, backoff: 'fixed', maxDelayMs: 1, retryIf: () => false },
+    );
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [step],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    expect(n).toBe(1);
+    expect(result.stepResults[0].status).toBe('failed');
+  });
+
+  it('retries exhaust before continueOnError softens the failure', async () => {
+    let n = 0;
+    const secondRun = vi.fn(async () => {});
+    const flaky = makeRetryStep(
+      'soft',
+      async () => {
+        n++;
+        throw new Error('x');
+      },
+      { maxAttempts: 2, delayMs: 1, backoff: 'fixed', maxDelayMs: 1 },
+      { continueOnError: true },
+    );
+    const after: Step = { _tag: 'Step', name: 'after', run: secondRun as any, result: {} as any };
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [flaky, after],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    // Retries exhaust first (2 attempts), then continueOnError lets the loop reach
+    // the next step.
+    expect(n).toBe(2);
+    expect(secondRun).toHaveBeenCalledTimes(1);
+    expect(result.stepResults[0].status).toBe('failed');
+    expect(result.stepResults[1].status).toBe('success');
+  });
+
+  it('per-attempt timeout counts as one failed attempt and retries', async () => {
+    let n = 0;
+    const step = makeRetryStep(
+      'slow-then-fast',
+      async () => {
+        n++;
+        if (n === 1) await new Promise((r) => setTimeout(r, 200)); // exceeds the 50ms timeout
+      },
+      { maxAttempts: 2, delayMs: 1, backoff: 'fixed', maxDelayMs: 1 },
+      { timeout: 50 },
+    );
+    const { sendIpc } = collectMessages();
+    const result = await executeStepLoop({
+      steps: [step],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    expect(n).toBe(2);
+    expect(result.stepResults[0].status).toBe('success');
+  });
+});

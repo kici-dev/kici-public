@@ -51,6 +51,13 @@ export interface EnvironmentBinding {
   orgId: string;
   environmentId: string;
   scopePattern: string;
+  /**
+   * Host selector this binding applies to (exact / glob / regex, matched
+   * against a fan-out child's agentId / hostname / labels). `'**'` matches
+   * every host, preserving fleet-wide behaviour for bindings with no host
+   * scope.
+   */
+  hostPattern: string;
   createdAt: string;
 }
 

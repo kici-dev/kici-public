@@ -260,6 +260,7 @@ describe('kici-admin environment CLI', () => {
         orgId: 'o',
         envName: 'staging',
         scopePattern: 'staging',
+        hostPattern: '**',
       });
       expect(stdout).toContain('created=true');
       expect(stdout).toContain('(direct)');
@@ -276,8 +277,35 @@ describe('kici-admin environment CLI', () => {
       expect(client.post).toHaveBeenCalledWith('/api/v1/admin/environments/production/bind', {
         orgId: 'o',
         scopePattern: 'aws/prod/**',
+        hostPattern: '**',
       });
       expect(stdout).toContain('created=true');
+    });
+
+    it('passes --host through to the HTTP API', async () => {
+      const client = makeMockClient();
+      client.post.mockResolvedValue({ created: true });
+      const { exitCode } = await runCommand(
+        [
+          'environment',
+          'bind',
+          '--org',
+          'o',
+          '--env',
+          'production',
+          '--scope',
+          'prod/hosts/box-00002/**',
+          '--host',
+          'box-00002',
+        ],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.post).toHaveBeenCalledWith('/api/v1/admin/environments/production/bind', {
+        orgId: 'o',
+        scopePattern: 'prod/hosts/box-00002/**',
+        hostPattern: 'box-00002',
+      });
     });
 
     it('propagates direct-DB helper errors', async () => {

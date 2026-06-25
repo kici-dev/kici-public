@@ -7,7 +7,7 @@ KiCI uses an in-house RBAC system for all authorization decisions. The OIDC issu
 
 ## Overview
 
-Every organization in KiCI has a set of roles. Each role defines a permission matrix mapping 16 resources to 5 access levels. Users can have multiple roles assigned simultaneously -- their effective permissions are computed as the union (most permissive wins) across all assigned roles.
+Every organization in KiCI has a set of roles. Each role defines a permission matrix mapping 17 resources to 5 access levels. Users can have multiple roles assigned simultaneously -- their effective permissions are computed as the union (most permissive wins) across all assigned roles.
 
 ```
 User -> [Role A, Role B, Role C] -> merge(permsA, permsB, permsC) -> Effective Permissions
@@ -19,24 +19,25 @@ This additive model means roles only grant access -- there are no deny rules. Ad
 
 ### Resources
 
-| Resource            | Description                                             | Scope       |
-| ------------------- | ------------------------------------------------------- | ----------- |
-| `runs`              | Workflow runs, jobs, steps, logs                        | Repo-scoped |
-| `workflows`         | Workflow definitions and lock files                     | Repo-scoped |
-| `secrets`           | Encrypted secret values and contexts                    | Repo-scoped |
-| `api_keys`          | User API keys, orchestrator keys, and service accounts  | Global      |
-| `webhook_sources`   | Webhook source registration and secrets                 | Global      |
-| `org_settings`      | Organization display name, configuration                | Global      |
-| `members`           | Member management, roles, invitations                   | Global      |
-| `billing`           | Plan management, checkout, subscriptions                | Global      |
-| `audit`             | Audit log viewing (read-only resource)                  | Global      |
-| `environments`      | Environment definitions and approval policies           | Global      |
-| `ci_trust`          | CI trust level management and security approvals        | Global      |
-| `webhook_endpoints` | Webhook endpoint configuration and management           | Global      |
-| `event_log`         | Webhook event log metadata and payload viewing          | Global      |
-| `event_dlq`         | Webhook event dead-letter queue (requeue, discard)      | Global      |
-| `support`           | Enable/disable KiCI support sessions for the org        | Global      |
-| `teams`             | Operator-defined teams: membership and team-role grants | Global      |
+| Resource            | Description                                                       | Scope       |
+| ------------------- | ----------------------------------------------------------------- | ----------- |
+| `runs`              | Workflow runs, jobs, steps, logs                                  | Repo-scoped |
+| `workflows`         | Workflow definitions and lock files                               | Repo-scoped |
+| `secrets`           | Encrypted secret values and contexts                              | Repo-scoped |
+| `api_keys`          | User API keys, orchestrator keys, and service accounts            | Global      |
+| `webhook_sources`   | Webhook source registration and secrets                           | Global      |
+| `org_settings`      | Organization display name, configuration                          | Global      |
+| `members`           | Member management, roles, invitations                             | Global      |
+| `billing`           | Plan management, checkout, subscriptions                          | Global      |
+| `audit`             | Audit log viewing (read-only resource)                            | Global      |
+| `environments`      | Environment definitions and approval policies                     | Global      |
+| `ci_trust`          | CI trust level management and security approvals                  | Global      |
+| `webhook_endpoints` | Webhook endpoint configuration and management                     | Global      |
+| `event_log`         | Webhook event log metadata and payload viewing                    | Global      |
+| `event_dlq`         | Webhook event dead-letter queue (requeue, discard)                | Global      |
+| `support`           | Enable/disable KiCI support sessions for the org                  | Global      |
+| `teams`             | Operator-defined teams: membership and team-role grants           | Global      |
+| `fleet`             | Fleet management: host roster, host declare/remove, agent control | Global      |
 
 ### Access levels
 
@@ -63,7 +64,7 @@ Repo-scoped resources (`runs`, `workflows`, `secrets`) are filtered by **repo gl
 - **API keys and service accounts** always get `['*']` — repo scoping applies only to role-based human users.
 - Pattern matching uses [picomatch](https://github.com/micromatch/picomatch) (same library as orchestrator environments).
 
-Global resources (`api_keys`, `webhook_sources`, `org_settings`, `members`, `billing`, `audit`, `environments`, `ci_trust`, `webhook_endpoints`, `event_log`, `event_dlq`, `support`, `teams`) are governed by permission level alone -- repo patterns do not apply.
+Global resources (`api_keys`, `webhook_sources`, `org_settings`, `members`, `billing`, `audit`, `environments`, `ci_trust`, `webhook_endpoints`, `event_log`, `event_dlq`, `support`, `teams`, `fleet`) are governed by permission level alone -- repo patterns do not apply.
 
 Every role has at least one repo pattern. The default pattern `*` matches all repositories.
 
@@ -73,7 +74,7 @@ Organizations can create unlimited custom roles. Each role has:
 
 - **Name** -- unique within the organization (max 100 characters)
 - **Description** -- optional (max 500 characters)
-- **Permission matrix** -- 16 resources x 5 levels
+- **Permission matrix** -- 17 resources x 5 levels
 - **Repo patterns** -- array of glob patterns for scoping repo-bound resources
 
 ### Additive stacking
@@ -98,7 +99,7 @@ Users with no role assignments see the dashboard shell but cannot access any org
 ### Owner
 
 - **Immutable** -- cannot be edited, deleted, or renamed
-- All 16 resources set to `admin`
+- All 17 resources set to `admin`
 - Repo pattern: `*`
 - Marked with `is_owner = true` in the database
 - Visible in the roles tab with a "Built-in" badge
@@ -107,7 +108,7 @@ Users with no role assignments see the dashboard shell but cannot access any org
 ### Member
 
 - **Default custom role** -- editable and deletable by Owners
-- All resources set to `read` by default, except `ci_trust` and `support` which default to `none` (see `DEFAULT_MEMBER_PERMISSIONS` in `permissions.ts`)
+- All resources set to `read` by default, except `ci_trust`, `support`, and `fleet` which default to `none` (see `DEFAULT_MEMBER_PERMISSIONS` in `permissions.ts`)
 - Ships with every new organization
 - Assigned automatically to new members on invite acceptance
 

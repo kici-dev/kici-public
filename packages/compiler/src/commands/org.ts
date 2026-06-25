@@ -12,7 +12,7 @@ import { loadGlobalConfig, mergeGlobalConfig, type GlobalConfig } from '../remot
 interface UserOrg {
   id: string;
   displayName: string;
-  role: string;
+  isOwner: boolean;
 }
 
 /**
@@ -90,10 +90,10 @@ export async function orgListCommand(): Promise<boolean> {
     const isActive = org.id === config.activeOrgId;
     const marker = isActive ? pc.green('* ') : '  ';
     const name = isActive ? pc.bold(org.displayName) : org.displayName;
-    const role = pc.gray(`(${org.role})`);
+    const ownership = pc.gray(`(${org.isOwner ? 'owner' : 'member'})`);
     const id = pc.gray(org.id);
 
-    console.log(`  ${marker}${name.padEnd(nameWidth)} ${role}  ${id}`);
+    console.log(`  ${marker}${name.padEnd(nameWidth)} ${ownership}  ${id}`);
   }
 
   console.log('');

@@ -13,10 +13,13 @@ import type {
   OutputsMap,
   StepSecretMountRecord,
   CacheSpec,
+  FanoutPosition,
+  NormalizedRetry,
 } from '@kici-dev/sdk';
 import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk';
 import { ExecutionStepStatus, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
 import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
+import { computeBackoffDelay } from '@kici-dev/core';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
 import type { SandboxStepResult } from './types.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
@@ -50,6 +53,10 @@ export interface StepLoopOptions {
   event: Record<string, unknown>;
   /** Environment variables for rule context. */
   env: Record<string, string | undefined>;
+  /** Operator dispatch inputs for the rule context (`ctx.dispatchInputs`). */
+  dispatchInputs?: Readonly<Record<string, string | number | boolean | null>>;
+  /** Fan-out position for the rule context (`ctx.fanout`); undefined on a non-fan-out job. */
+  fanout?: FanoutPosition;
   /** Job-level hooks. */
   jobHooks?: JobHooks;
   /**
@@ -455,7 +462,13 @@ async function evaluateStepRulesAndMaybeSkip(
   opts: StepLoopOptions,
 ): Promise<SandboxStepResult | null> {
   if (!step.rules || step.rules.length === 0) return null;
-  const ruleCtx = createRuleContext(opts.event, [], opts.env);
+  const ruleCtx = createRuleContext(
+    opts.event,
+    [],
+    opts.env,
+    opts.dispatchInputs ?? {},
+    opts.fanout,
+  );
   const ruleResult = await evaluateRules(step.rules, ruleCtx, step.name);
   if (ruleResult.allPassed) return null;
 
@@ -598,6 +611,59 @@ async function runObserverHook(args: {
  * `ctx.secrets.mountFile` tmpdir, any env vars set via `exposeFile`) is
  * removed even when the step throws, times out, or rule-skips.
  */
+/**
+ * Run a step through its retry policy. Each call to `executeStepInLoop` is one
+ * attempt: it sets up its own per-attempt timeout from `step.timeout` and returns
+ * a `SandboxStepResult` (it never throws — a failed attempt is reported as a
+ * `failed` status with an `error`). A failed attempt is retried while attempts
+ * remain AND `retryIf(reconstructedError)` is true; backoff sleeps between
+ * attempts. The retry loop runs to completion BEFORE the caller applies
+ * `continueOnError` to the final outcome.
+ */
+async function runStepWithRetry(
+  step: Step,
+  stepIndex: number,
+  ctx: StepContext,
+  timeoutMs: number,
+  opts: StepLoopOptions,
+): Promise<SandboxStepResult> {
+  const retry: NormalizedRetry | undefined = step.retry;
+  const max = retry?.maxAttempts ?? 1;
+  let result!: SandboxStepResult;
+  for (let n = 1; n <= max; n++) {
+    result = await executeStepInLoop(
+      step,
+      stepIndex,
+      ctx,
+      timeoutMs,
+      opts.sendIpc,
+      opts.outputsMap,
+      opts.getSecretsAccessLog,
+      opts.getSecretMountRecords,
+      opts.jobDeadlineSignal,
+      opts.checkMode ?? CheckMode.enum.apply,
+      opts,
+    );
+    if (result.status !== ExecutionStepStatus.enum.failed) return result;
+    const err = new Error(result.error?.message ?? `Step '${step.name}' failed`);
+    const canRetry = n < max && (retry?.retryIf?.(err) ?? true);
+    if (!canRetry) break;
+    const delay = computeBackoffDelay(n, {
+      maxAttempts: max,
+      delayMs: retry!.delayMs,
+      backoff: retry!.backoff,
+      maxDelayMs: retry!.maxDelayMs,
+    });
+    opts.sendIpc({
+      type: 'log.line',
+      stepIndex,
+      line: `[kici] Step '${step.name}' attempt ${n}/${max} failed: ${err.message}; retrying in ${delay}ms`,
+    });
+    await new Promise((r) => setTimeout(r, delay));
+  }
+  return result;
+}
+
 async function runStepIteration(
   step: Step,
   stepIndex: number,
@@ -645,19 +711,7 @@ async function runStepIteration(
     const timeoutMs = step.timeout ?? opts.defaultTimeoutMs;
     let result: SandboxStepResult;
     try {
-      result = await executeStepInLoop(
-        step,
-        stepIndex,
-        ctx,
-        timeoutMs,
-        opts.sendIpc,
-        opts.outputsMap,
-        opts.getSecretsAccessLog,
-        opts.getSecretMountRecords,
-        opts.jobDeadlineSignal,
-        opts.checkMode ?? CheckMode.enum.apply,
-        opts,
-      );
+      result = await runStepWithRetry(step, stepIndex, ctx, timeoutMs, opts);
     } finally {
       await opts.afterStepApplyEnvFiles?.();
     }

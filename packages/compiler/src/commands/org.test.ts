@@ -51,8 +51,8 @@ describe('kici org', () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => [
-          { id: 'org-1', displayName: 'Personal', role: 'owner' },
-          { id: 'org-2', displayName: 'My team', role: 'admin' },
+          { id: 'org-1', displayName: 'Personal', isOwner: true },
+          { id: 'org-2', displayName: 'My team', isOwner: false },
         ],
       });
 
@@ -64,6 +64,9 @@ describe('kici org', () => {
       expect(output).toContain('My team');
       // Active org should have a marker
       expect(output).toMatch(/\*.*Personal/);
+      // Ownership column renders owner/member, not (undefined)
+      expect(output).toContain('(owner)');
+      expect(output).toContain('(member)');
     });
 
     it('sends PAT as bearer token', async () => {
@@ -147,8 +150,8 @@ describe('kici org', () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => [
-          { id: 'org-1', displayName: 'Personal', role: 'owner' },
-          { id: 'org-2', displayName: 'My team', role: 'admin' },
+          { id: 'org-1', displayName: 'Personal', isOwner: true },
+          { id: 'org-2', displayName: 'My team', isOwner: false },
         ],
       });
 
@@ -171,8 +174,8 @@ describe('kici org', () => {
       mockFetch.mockResolvedValue({
         ok: true,
         json: async () => [
-          { id: 'org-1', displayName: 'Personal', role: 'owner' },
-          { id: 'org-2', displayName: 'My team', role: 'admin' },
+          { id: 'org-1', displayName: 'Personal', isOwner: true },
+          { id: 'org-2', displayName: 'My team', isOwner: false },
         ],
       });
 
@@ -191,7 +194,7 @@ describe('kici org', () => {
 
       mockFetch.mockResolvedValue({
         ok: true,
-        json: async () => [{ id: 'org-1', displayName: 'Personal', role: 'owner' }],
+        json: async () => [{ id: 'org-1', displayName: 'Personal', isOwner: true }],
       });
 
       const result = await orgUseCommand('nonexistent');
@@ -240,7 +243,7 @@ describe('kici org', () => {
 
       mockFetch.mockResolvedValue({
         ok: true,
-        json: async () => [{ id: 'org-1', displayName: 'Personal', role: 'owner' }],
+        json: async () => [{ id: 'org-1', displayName: 'Personal', isOwner: true }],
       });
 
       const result = await orgCurrentCommand();

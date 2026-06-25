@@ -38,10 +38,16 @@ export function toLabelMatcher(el: string | RegExp, ctx: string): LabelMatcher {
 }
 
 export type SelectorEl = string | RegExp;
+/** Single-agent selection policy when multiple agents match a `runsOn` selector. */
+export type RunsOnPickInput = 'deterministic' | 'any';
 export type RunsOnAuthorInput =
   | SelectorEl
   | readonly SelectorEl[]
-  | { labels: SelectorEl | readonly SelectorEl[]; exclude?: SelectorEl | readonly SelectorEl[] };
+  | {
+      labels: SelectorEl | readonly SelectorEl[];
+      exclude?: SelectorEl | readonly SelectorEl[];
+      pick?: RunsOnPickInput;
+    };
 export type RunsOnAllAuthorInput =
   | string
   | RegExp
@@ -68,6 +74,18 @@ export function normalizeRunsOnToMatchers(
   const include = asArray(sel.labels).map((e) => toLabelMatcher(e, ctx));
   const exclude = sel.exclude ? asArray(sel.exclude).map((e) => toLabelMatcher(e, ctx)) : [];
   return { include, exclude };
+}
+
+/**
+ * Resolve a `runsOn` author value's single-agent selection policy, defaulting to
+ * `'deterministic'` for every form (string / array shorthand inherit the default
+ * after normalization; the selector object's explicit `pick` wins).
+ */
+export function runsOnPickFromInput(runsOn: RunsOnAuthorInput): RunsOnPickInput {
+  if (typeof runsOn === 'string' || runsOn instanceof RegExp || Array.isArray(runsOn)) {
+    return 'deterministic';
+  }
+  return (runsOn as { pick?: RunsOnPickInput }).pick ?? 'deterministic';
 }
 
 /** Normalize a `runsOnAll` author value into include groups + exclude matchers. */

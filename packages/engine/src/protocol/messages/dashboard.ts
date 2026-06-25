@@ -1031,6 +1031,17 @@ const envSourceOverrideDeleteResponseSchema = z.object({
 
 // -- Environment bindings --
 
+/**
+ * A scope→environment binding with its host selector. `hostPattern` is the host
+ * the binding applies to (`'**'` = all hosts); exact / glob / regex over a
+ * fan-out child's agentId / hostname / labels.
+ */
+export const envBindingEntrySchema = z.object({
+  scopePattern: z.string(),
+  hostPattern: z.string(),
+});
+export type EnvBindingEntry = z.infer<typeof envBindingEntrySchema>;
+
 /** List bindings for an environment. */
 export const envBindingsListRequestSchema = z.object({
   type: z.literal('dashboard.environments.bindings.list'),
@@ -1042,17 +1053,17 @@ export const envBindingsListRequestSchema = z.object({
 const envBindingsListResponseSchema = z.object({
   type: z.literal('dashboard.environments.bindings.list.response'),
   requestId: z.string(),
-  scopePatterns: z.array(z.string()).optional(),
+  bindings: z.array(envBindingEntrySchema).optional(),
   error: z.string().optional(),
 });
 
-/** Set bindings (scope patterns) for an environment. */
+/** Set bindings (scope + host patterns) for an environment. */
 export const envBindingsSetRequestSchema = z.object({
   type: z.literal('dashboard.environments.bindings.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   environmentId: z.string(),
-  scopePatterns: z.array(z.string()),
+  bindings: z.array(envBindingEntrySchema),
 });
 
 const envBindingsSetResponseSchema = z.object({
@@ -1330,10 +1341,14 @@ export const fleetPinnedRunSchema = z.object({
 });
 export type FleetPinnedRun = z.infer<typeof fleetPinnedRunSchema>;
 
+/** How a runsOnAll fan-out would treat one host, given its current reachability. */
+export const FleetHostDisposition = z.enum(['target', 'unreachable-durable', 'skipped-ephemeral']);
+export type FleetHostDisposition = z.infer<typeof FleetHostDisposition>;
+
 /** A host matched by a runsOnAll preview, plus how the fan-out would treat it. */
 export const fleetPreviewHostSchema = z.object({
   entry: HostInventoryEntry,
-  disposition: z.enum(['target', 'unreachable-durable', 'skipped-ephemeral']),
+  disposition: FleetHostDisposition,
 });
 export type FleetPreviewHost = z.infer<typeof fleetPreviewHostSchema>;
 
@@ -1383,6 +1398,39 @@ export type DashboardFleetHostsResponse = z.infer<typeof dashboardFleetHostsResp
 export type DashboardFleetHostResponse = z.infer<typeof dashboardFleetHostResponseSchema>;
 export type DashboardFleetPreviewResponse = z.infer<typeof dashboardFleetPreviewResponseSchema>;
 
+// --- Fleet "workflows for host" read (host-centric inverse of the preview) ---
+
+/** Request: which registered runsOnAll fan-outs target this host? */
+export const dashboardFleetWorkflowsForHostRequestSchema = z.object({
+  type: z.literal('dashboard.fleet.workflows-for-host'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  agentId: z.string(),
+});
+
+/** One registered runsOnAll workflow whose selector matches the host. */
+export const fleetHostWorkflowSchema = z.object({
+  workflowName: z.string(),
+  repoIdentifier: z.string(),
+  sourceFile: z.string().nullable(),
+  onUnreachable: OnUnreachableMode,
+  disposition: FleetHostDisposition,
+});
+export type FleetHostWorkflow = z.infer<typeof fleetHostWorkflowSchema>;
+
+export const dashboardFleetWorkflowsForHostResponseSchema = z.object({
+  type: z.literal('dashboard.fleet.workflows-for-host.response'),
+  requestId: z.string(),
+  workflows: z.array(fleetHostWorkflowSchema),
+});
+
+export type DashboardFleetWorkflowsForHostRequest = z.infer<
+  typeof dashboardFleetWorkflowsForHostRequestSchema
+>;
+export type DashboardFleetWorkflowsForHostResponse = z.infer<
+  typeof dashboardFleetWorkflowsForHostResponseSchema
+>;
+
 // --- Fleet host writes (Model C: declare / remove) ---
 
 /** Declare a static host into the roster (wraps HostRosterStore.declareStatic). */
@@ -1391,7 +1439,8 @@ export const fleetHostDeclareRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   agentId: z.string(),
-  labels: z.array(z.string()),
+  // Optional so a re-declare can omit labels (preserve-on-omit at the store).
+  labels: z.array(z.string()).optional(),
   hostname: z.string().optional(),
   properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
 });
@@ -1399,6 +1448,9 @@ export const fleetHostDeclareResponseSchema = z.object({
   type: z.literal('dashboard.fleet.host.declare.response'),
   requestId: z.string(),
   declared: z.boolean().optional(),
+  // true when the declare inserted a new roster row; false on a converging
+  // re-declare (existing row updated). Lets the dashboard report created vs updated.
+  created: z.boolean().optional(),
   error: z.string().optional(),
 });
 
@@ -1890,6 +1942,12 @@ export const testRelayTriggerRequestSchema = z.object({
    * job's matched roster with this selector. Omitted for webhook runs.
    */
   target: HostTargetSelector.optional(),
+  /**
+   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not coerced /
+   * defaulted), relayed verbatim. The orchestrator validates + coerces + applies
+   * defaults authoritatively against the matched workflow's lock descriptor.
+   */
+  dispatchInputs: z.record(z.string(), z.string()).optional(),
   secrets: z.record(z.string(), z.string()).optional(),
   encryptedSecrets: z.string().optional(),
   encryptedSecretsKey: z.string().optional(),
@@ -2044,6 +2102,7 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   dashboardFleetHostsRequestSchema,
   dashboardFleetHostRequestSchema,
   dashboardFleetPreviewRequestSchema,
+  dashboardFleetWorkflowsForHostRequestSchema,
   // Fleet host writes (Model C: declare / remove)
   fleetHostDeclareRequestSchema,
   fleetHostRemoveRequestSchema,
@@ -2134,6 +2193,7 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   dashboardFleetHostsResponseSchema,
   dashboardFleetHostResponseSchema,
   dashboardFleetPreviewResponseSchema,
+  dashboardFleetWorkflowsForHostResponseSchema,
   // Fleet host writes (Model C: declare / remove)
   fleetHostDeclareResponseSchema,
   fleetHostRemoveResponseSchema,

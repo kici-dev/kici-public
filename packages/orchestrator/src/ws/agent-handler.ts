@@ -961,6 +961,17 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
 
         logger.info('Agent registered', { agentId, labels });
 
+        // Single-use bootstrap (init-runner) tokens are consumed on their first
+        // successful register, so a leaked token is inert afterward. A bootstrap
+        // token is tagged `created_by: 'bootstrap:<targetAgentId>'` at mint time.
+        if (
+          tokenStore &&
+          regEntry.tokenId !== undefined &&
+          regEntry.tokenCreatedBy?.startsWith('bootstrap:')
+        ) {
+          await tokenStore.consumeBootstrapToken(regEntry.tokenId);
+        }
+
         // Reconcile in-flight jobs if agent reports them on reconnect
         if (parsed.data.inFlightJobs && parsed.data.inFlightJobs.length > 0) {
           await reconcileInFlightJobs(

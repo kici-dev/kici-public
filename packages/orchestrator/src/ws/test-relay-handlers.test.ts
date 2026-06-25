@@ -351,6 +351,55 @@ describe('handleTestRunLogs', () => {
     expect(drain.lines).toEqual([]);
     expect(drain.done).toBe(true);
   });
+
+  it('drains pending log appends for a terminal run before computing done', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'success', is_test_run: true },
+    });
+    // The final log file ("marker") is not yet visible to list/read until the
+    // pending append is drained — the race that drops the last user-visible
+    // line. The logWriter.drain mock both proves drain() is awaited AND, when
+    // it resolves, makes the marker file appear in the storage snapshot.
+    const visibleFiles: Record<string, string> = { ...FILES };
+    const logStorage = {
+      list: vi.fn(() => Promise.resolve(Object.keys(visibleFiles))),
+      read: vi.fn((p: string) =>
+        Promise.resolve({ data: visibleFiles[p], cursor: 0, complete: true }),
+      ),
+    };
+    const drain = vi.fn(async () => {
+      // Simulate the pending append landing as part of the drain.
+      visibleFiles['executions/run-1/job-test/step-1.log'] = 'marker:DYNENV_SECRET_OK';
+    });
+    const deps = { db, logStorage, logWriter: { drain } } as unknown as TestRelayHandlerDeps;
+
+    const result = (await handleTestRunLogs(
+      { type: 'test.relay.run.logs', requestId: 'r', actor: ACTOR, runId: 'run-1', cursor: 0 },
+      deps,
+    )) as { lines: string[]; nextCursor: number; done: boolean };
+
+    expect(drain).toHaveBeenCalledWith('run-1');
+    // The marker line — written during the drain — is present, AND the response
+    // is only done once it has been included (no done:true without the line).
+    expect(result.lines).toContain('marker:DYNENV_SECRET_OK');
+    expect(result.done).toBe(true);
+    expect(result.nextCursor).toBe(result.lines.length);
+  });
+
+  it('does not drain for a non-terminal run', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
+    });
+    const logStorage = logStorageStub(FILES);
+    const drain = vi.fn(async () => {});
+    const deps = { db, logStorage, logWriter: { drain } } as unknown as TestRelayHandlerDeps;
+
+    await handleTestRunLogs(
+      { type: 'test.relay.run.logs', requestId: 'r', actor: ACTOR, runId: 'run-1', cursor: 0 },
+      deps,
+    );
+    expect(drain).not.toHaveBeenCalled();
+  });
 });
 
 describe('handleTestCancel', () => {

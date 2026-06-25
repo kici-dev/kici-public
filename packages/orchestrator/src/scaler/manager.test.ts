@@ -7,7 +7,7 @@ import type {
   ScalerEvent,
 } from './types.js';
 import { ScalerEventType } from './types.js';
-import { ScalerManager, resolveScalerOrchestratorUrl } from './manager.js';
+import { ScalerManager, resolveScalerOrchestratorUrl, buildScalerUsageRows } from './manager.js';
 
 /**
  * Creates a mock ScalerBackend for testing.
@@ -1061,5 +1061,45 @@ describe('resolveScalerOrchestratorUrl', () => {
     expect(resolveScalerOrchestratorUrl(undefined, undefined, undefined)).toBe(
       'ws://127.0.0.1:4000/ws',
     );
+  });
+});
+
+describe('buildScalerUsageRows', () => {
+  it('stamps scalerType per scaler and __global__ on the rollup row', () => {
+    const perScaler = new Map([
+      ['ci-pool', { cpus: 2, memBytes: 100 }],
+      ['heavy', { cpus: 4, memBytes: 200 }],
+    ]);
+    const typeOf = (n: string) =>
+      ({ 'ci-pool': 'container', heavy: 'bare-metal' })[n] as string | undefined;
+    const rows = buildScalerUsageRows(perScaler, { cpus: 6, memBytes: 300 }, typeOf);
+
+    expect(rows).toContainEqual({
+      scaler: 'ci-pool',
+      scalerType: 'container',
+      cpus: 2,
+      memBytes: 100,
+    });
+    expect(rows).toContainEqual({
+      scaler: 'heavy',
+      scalerType: 'bare-metal',
+      cpus: 4,
+      memBytes: 200,
+    });
+    expect(rows).toContainEqual({
+      scaler: '__global__',
+      scalerType: '__global__',
+      cpus: 6,
+      memBytes: 300,
+    });
+  });
+
+  it('omits scalerType when the type is unknown (no bad enum value emitted)', () => {
+    const rows = buildScalerUsageRows(
+      new Map([['mystery', { cpus: 1, memBytes: 1 }]]),
+      { cpus: 1, memBytes: 1 },
+      () => undefined,
+    );
+    expect(rows.find((r) => r.scaler === 'mystery')?.scalerType).toBeUndefined();
   });
 });

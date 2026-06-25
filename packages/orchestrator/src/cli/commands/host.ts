@@ -104,8 +104,24 @@ export function registerHostCommands(program: Command): void {
       collectProp,
       [],
     )
+    .option('--address <host>', 'Pre-agent SSH reach address (IP / hostname) for bootstrap')
+    .option('--ssh-user <user>', 'SSH login user for bootstrap bring-up')
+    .option('--ssh-port <port>', 'SSH port for bootstrap bring-up')
+    .option(
+      '--ssh-key-secret <ref>',
+      'Scoped-secret ref (scope/key) holding the bring-up private key',
+    )
     .action(
-      async (opts: { agentId: string; labels: string; hostname?: string; prop: string[] }) => {
+      async (opts: {
+        agentId: string;
+        labels: string;
+        hostname?: string;
+        prop: string[];
+        address?: string;
+        sshUser?: string;
+        sshPort?: string;
+        sshKeySecret?: string;
+      }) => {
         try {
           const labels = opts.labels
             ? String(opts.labels)
@@ -114,12 +130,23 @@ export function registerHostCommands(program: Command): void {
                 .filter(Boolean)
             : [];
           const properties = parseHostPropertyAssignments(opts.prop);
+          let sshPort: number | undefined;
+          if (opts.sshPort !== undefined) {
+            sshPort = Number(opts.sshPort);
+            if (!Number.isInteger(sshPort) || sshPort <= 0) {
+              throw new Error(`--ssh-port must be a positive integer (got "${opts.sshPort}")`);
+            }
+          }
           await withDb((db) =>
             new HostRosterStore(db as unknown as Kysely<Database>).declareStatic({
               agentId: opts.agentId,
               labels,
               hostname: opts.hostname,
               properties,
+              address: opts.address,
+              sshUser: opts.sshUser,
+              sshPort,
+              sshKeySecret: opts.sshKeySecret,
             }),
           );
           console.log(`Declared static host: ${opts.agentId}`);

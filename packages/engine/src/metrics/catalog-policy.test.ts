@@ -8,8 +8,10 @@ import {
 import {
   METRIC_LABEL_POLICY,
   ORCH_PUSHED_METRIC_NAMES,
+  ORCH_SCALER_VALUES,
   OVERFLOW_LABEL_VALUE,
 } from './catalog-policy.js';
+import { ExecutionRunStatus } from '../protocol/messages/execution-status.js';
 
 describe('catalog-policy', () => {
   // Services whose metrics the orchestrator is allowed to push: its own,
@@ -86,6 +88,30 @@ describe('catalog-policy', () => {
 
   it('OVERFLOW_LABEL_VALUE is a stable sentinel', () => {
     expect(OVERFLOW_LABEL_VALUE).toBe('__overflow__');
+  });
+
+  it('executions_total status policy covers every ExecutionRunStatus value', () => {
+    const policy = METRIC_LABEL_POLICY.kici_orch_executions_total;
+    expect(policy?.status?.values).toEqual([...ExecutionRunStatus.options]);
+    // Regression guard for the original bug: pending/cancelling/held must be allowed.
+    for (const s of ['pending', 'cancelling', 'held']) {
+      expect(policy?.status?.values).toContain(s);
+    }
+  });
+
+  it('scaler resource gauges cap the free-form name and enum-constrain scalerType', () => {
+    for (const name of [
+      'kici_orch_scaler_cpus_used',
+      'kici_orch_scaler_memory_bytes_used',
+    ] as const) {
+      const policy = METRIC_LABEL_POLICY[name];
+      // scaler carries the operator-chosen name → capped, NOT a closed enum.
+      expect(policy?.scaler?.maxUniqueValues).toBe(50);
+      expect(policy?.scaler?.values).toBeUndefined();
+      // scalerType is the backend-type rollup dimension → closed enum.
+      expect(policy?.scalerType?.values).toEqual([...ORCH_SCALER_VALUES]);
+      expect(policy?.machinePool?.maxUniqueValues).toBe(50);
+    }
   });
 
   it('declares event_name as a capped label and result/reason as closed enums for the event family', () => {

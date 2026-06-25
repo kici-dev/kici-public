@@ -99,6 +99,12 @@ export function buildProgram(): Command {
       (val: string, prev: string[]) => [...prev, val],
       [] as string[],
     )
+    .option(
+      '--input <KEY=VALUE>',
+      'Typed workflow-dispatch input (repeatable)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
     .option('--quiet', 'Suppress streaming output', false)
     .option('--json', 'Output structured JSON result', false)
     .option('--junit <path>', 'Output JUnit XML result')
@@ -153,6 +159,7 @@ export function buildProgram(): Command {
         keepGoing: options.keepGoing,
         container: options.container,
         env: options.env,
+        inputs: options.input,
         quiet: options.quiet,
         json: options.json,
         junit: options.junit,
@@ -171,6 +178,7 @@ export function buildProgram(): Command {
     .description('Execute fixtures remotely via orchestrator')
     .option('--workflow <name>', 'Run a specific workflow directly (bypass triggers)')
     .option('--all', 'Run all available fixtures', false)
+    .option('-p, --pick', 'Interactively pick fixtures to run', false)
     .option('--parallel', 'Run matching fixtures concurrently', false)
     .option('--no-wait', "Fire and forget (print runIds, don't stream)")
     .option('--quiet', 'Suppress output except final result', false)
@@ -208,11 +216,31 @@ export function buildProgram(): Command {
       false,
     )
     .option(
+      '--input <KEY=VALUE>',
+      'Typed workflow-dispatch input (repeatable)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
+    .option(
       '--approve-all, --yes',
       'Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)',
       false,
     )
     .action(async (fixture, options) => {
+      if (options.pick && fixture) {
+        console.error(
+          'Error: --pick selects fixtures interactively; do not also pass a fixture name.',
+        );
+        process.exit(2);
+      }
+      if (options.pick && options.all) {
+        console.error('Error: --pick is mutually exclusive with --all.');
+        process.exit(2);
+      }
+      if (options.pick && options.workflow) {
+        console.error('Error: --pick is mutually exclusive with --workflow.');
+        process.exit(2);
+      }
       const { runRemoteCommand } = await import('./commands/index.js');
       const { resolveCheckMode } = await import('./commands/check-mode.js');
       let checkMode;
@@ -229,6 +257,7 @@ export function buildProgram(): Command {
         targets: options.target,
         targetAllowEmpty: options.targetAllowEmpty,
         approveAll: options.approveAll,
+        inputs: options.input,
       });
       process.exit(success ? 0 : 1);
     });
@@ -606,16 +635,14 @@ Environment variables:
     });
 
   docsCommandGroup
-    .command('llm')
-    .description('Print the bundled LLM context (llms-full.txt) to stdout')
-    .option('--index', 'Print the curated llms.txt index instead of the full bundle', false)
+    .command('llm [topic]')
+    .description(
+      'Print KiCI LLM docs bundles. No topic prints the llms.txt index; <topic> prints a task bundle (e.g. sdk, cli, patterns, features, providers, architecture, getting-started); "full" prints the complete bundle.',
+    )
     .option('--out <path>', 'Write the bundle to a file instead of stdout')
-    .action(async (options) => {
+    .action(async (topic, options) => {
       const { docsLlmCommand } = await import('./commands/index.js');
-      const success = await docsLlmCommand({
-        index: options.index,
-        out: options.out,
-      });
+      const success = await docsLlmCommand({ topic, out: options.out });
       process.exit(success ? 0 : 1);
     });
 

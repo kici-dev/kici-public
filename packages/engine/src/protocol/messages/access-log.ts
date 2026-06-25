@@ -15,7 +15,7 @@ import { ActorType, actorPrincipalSchema } from './actor.js';
  */
 
 /** Where the access-log entry was originated from. */
-export const AccessLogSource = z.enum(['platform_proxy', 'admin_http', 'admin_cli']);
+export const AccessLogSource = z.enum(['platform_proxy', 'admin_http', 'admin_cli', 'agent']);
 export type AccessLogSource = z.infer<typeof AccessLogSource>;
 
 /** Outcome of the attempted action. */
@@ -107,6 +107,19 @@ export const AccessLogAction = z.enum([
   'fleet.read',
   'fleet.host.declare',
   'fleet.host.remove',
+  /**
+   * Bootstrap init-runner bring-up over SSH (`ctx.kici.bootstrap.ensureInitRunner`).
+   * Emitted by the orchestrator's bring-up handler: the actor is the ops agent,
+   * the target is the fresh host. Recorded `denied` when the calling agent lacks
+   * the `kici:capability:ssh-transport` capability.
+   */
+  'fleet.init_runner.bringup',
+  /**
+   * Pre-boot input shipped to a host's dropbear/initramfs SSH channel
+   * (`ctx.kici.bootstrap.preBootSend`, e.g. a LUKS unlock passphrase). Same
+   * actor/target/gate shape as `fleet.init_runner.bringup`.
+   */
+  'fleet.pre_boot.send',
   'backend.list.read',
   'backend.get.read',
   'backend.sync',

@@ -360,6 +360,121 @@ describe('processTestTrigger', () => {
     expect(markTestRun).toHaveBeenCalledWith(result.runId);
   });
 
+  describe('dispatch inputs validation', () => {
+    function createDispatchWorkflow() {
+      return {
+        name: 'deploy-prod',
+        source: { file: '.kici/workflows/deploy.ts', export: '#default' },
+        contentHash: 'wf-hash-disp',
+        triggers: [
+          {
+            _type: 'dispatch' as const,
+            types: ['deploy-prod'],
+            inputs: {
+              skipCveScan: {
+                type: 'boolean' as const,
+                optional: false,
+                nullable: false,
+                default: false,
+              },
+              mode: {
+                type: 'enum' as const,
+                optional: false,
+                nullable: false,
+                values: ['full', 'edge-only'],
+                default: 'full',
+              },
+            },
+          },
+        ],
+        jobs: [
+          {
+            _type: 'static' as const,
+            name: 'gates',
+            runsOn: [{ kind: 'exact', value: 'default' }],
+            steps: [{ name: 'echo', run: 'echo hello' }],
+            needs: [],
+            rules: [],
+          },
+        ],
+      };
+    }
+
+    const dispatchEventInput = (overrides: Partial<TestTriggerInput> = {}) =>
+      createMockInput({
+        fixtureId: 'deploy-prod',
+        event: {
+          type: 'dispatch',
+          action: 'deploy-prod',
+          targetBranch: 'main',
+          payload: { action: 'deploy-prod' },
+        },
+        ...overrides,
+      });
+
+    it('validates + defaults operator dispatch inputs against the lock descriptor', async () => {
+      (deps.lockFileCache.get as any).mockResolvedValue(
+        createMockLockFile([createDispatchWorkflow()]),
+      );
+      const dispatchSpy = deps.dispatcher.dispatch as any;
+
+      const result = await processTestTrigger(
+        dispatchEventInput({ dispatchInputs: { skipCveScan: 'true' } }),
+        deps,
+      );
+
+      expect(result.status).toBe('accepted');
+      const jobConfig = dispatchSpy.mock.calls[0][0].jobConfig;
+      // skipCveScan coerced from 'true', mode defaulted to 'full'.
+      expect(jobConfig.dispatchInputs).toEqual({ skipCveScan: true, mode: 'full' });
+    });
+
+    it('applies defaults when no operator inputs are given', async () => {
+      (deps.lockFileCache.get as any).mockResolvedValue(
+        createMockLockFile([createDispatchWorkflow()]),
+      );
+      const dispatchSpy = deps.dispatcher.dispatch as any;
+
+      const result = await processTestTrigger(dispatchEventInput(), deps);
+
+      expect(result.status).toBe('accepted');
+      const jobConfig = dispatchSpy.mock.calls[0][0].jobConfig;
+      expect(jobConfig.dispatchInputs).toEqual({ skipCveScan: false, mode: 'full' });
+    });
+
+    it('rejects an invalid operator input before dispatch (no job dispatched)', async () => {
+      (deps.lockFileCache.get as any).mockResolvedValue(
+        createMockLockFile([createDispatchWorkflow()]),
+      );
+      const dispatchSpy = deps.dispatcher.dispatch as any;
+
+      const result = await processTestTrigger(
+        dispatchEventInput({ dispatchInputs: { mode: 'nope' } }),
+        deps,
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.reason).toMatch(/mode/);
+      expect(dispatchSpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unknown operator input key before dispatch', async () => {
+      (deps.lockFileCache.get as any).mockResolvedValue(
+        createMockLockFile([createDispatchWorkflow()]),
+      );
+      const dispatchSpy = deps.dispatcher.dispatch as any;
+
+      const result = await processTestTrigger(
+        dispatchEventInput({ dispatchInputs: { nope: 'x' } }),
+        deps,
+      );
+
+      expect(result.status).toBe('rejected');
+      expect(result.reason).toMatch(/nope/);
+      expect(dispatchSpy).not.toHaveBeenCalled();
+    });
+  });
+
   it('accepts the full ProcessingDeps bag (hostRosterStore + maxFanoutHosts) and dispatches', async () => {
     // The test path now receives the same ProcessingDeps the webhook entry
     // builds, so the host/init/dynamic deps are present (single-orch: no

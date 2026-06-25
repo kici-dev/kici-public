@@ -5,9 +5,28 @@ import type {
   StepOptionsWithCheck,
   StepRunFn,
   SourceLocation,
+  RetryConfig,
+  NormalizedRetry,
 } from './types.js';
 import { createStepOutputProxy } from './outputs.js';
 import { normalizeApproval } from './approval.js';
+
+/**
+ * Fill retry defaults and expand the `retry: N` shorthand into a
+ * {@link NormalizedRetry}. `retryIf` is carried through unchanged (it is
+ * execution-only and never serialized).
+ */
+function normalizeRetry(retry: number | RetryConfig | undefined): NormalizedRetry | undefined {
+  if (retry === undefined) return undefined;
+  const cfg = typeof retry === 'number' ? { maxAttempts: retry } : retry;
+  return {
+    maxAttempts: cfg.maxAttempts,
+    delayMs: cfg.delayMs ?? 1000,
+    backoff: cfg.backoff ?? 'exponential',
+    maxDelayMs: cfg.maxDelayMs ?? 30000,
+    ...(cfg.retryIf && { retryIf: cfg.retryIf }),
+  };
+}
 
 /**
  * Capture the call-site source location of step() using the V8 stack trace API.
@@ -192,6 +211,8 @@ export function step<TResult = void, TDrift = unknown>(
     throw new Error('approval.when "drift" requires a check facet');
   }
 
+  const retry = normalizeRetry(options.retry);
+
   return {
     _tag: 'Step' as const,
     name,
@@ -203,6 +224,7 @@ export function step<TResult = void, TDrift = unknown>(
     ...(options.whenInSync !== undefined && { whenInSync: options.whenInSync }),
     continueOnError: options.continueOnError,
     timeout: options.timeout,
+    ...(retry !== undefined && { retry }),
     ...(options.cache !== undefined && { cache: options.cache }),
     rules: options.rules,
     onCancel: options.onCancel,

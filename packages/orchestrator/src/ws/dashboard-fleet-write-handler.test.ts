@@ -16,7 +16,7 @@ function buildHandler(policy: Record<string, boolean> | undefined): {
   removeStatic: ReturnType<typeof vi.fn>;
 } {
   const sent: unknown[] = [];
-  const declareStatic = vi.fn().mockResolvedValue(undefined);
+  const declareStatic = vi.fn().mockResolvedValue({ created: true });
   const removeStatic = vi.fn().mockResolvedValue(1);
   const db = {
     selectFrom: vi.fn().mockReturnThis(),
@@ -61,8 +61,9 @@ describe('DashboardFleetWriteHandler', () => {
     expect(resp.requestId).toBe('req-1');
   });
 
-  it('declare with a permissive policy calls declareStatic and answers declared:true', async () => {
+  it('declare with a permissive policy calls declareStatic and answers declared+created', async () => {
     const { handler, sent, declareStatic } = buildHandler(undefined);
+    declareStatic.mockResolvedValueOnce({ created: false });
 
     await handler.handleMessage({
       type: 'dashboard.fleet.host.declare',
@@ -81,8 +82,36 @@ describe('DashboardFleetWriteHandler', () => {
       properties: undefined,
     });
     expect(sent).toEqual([
-      { type: 'dashboard.fleet.host.declare.response', requestId: 'req-2', declared: true },
+      {
+        type: 'dashboard.fleet.host.declare.response',
+        requestId: 'req-2',
+        declared: true,
+        created: false,
+      },
     ]);
+  });
+
+  it('declare threads an omitted labels field through to the store', async () => {
+    const { handler, sent, declareStatic } = buildHandler(undefined);
+
+    await handler.handleMessage({
+      type: 'dashboard.fleet.host.declare',
+      requestId: 'req-2b',
+      actor: ACTOR,
+      agentId: 'db-01',
+      hostname: 'db-01.internal',
+    } as never);
+
+    expect(declareStatic).toHaveBeenCalledWith({
+      agentId: 'db-01',
+      labels: undefined,
+      hostname: 'db-01.internal',
+      properties: undefined,
+    });
+    const resp = sent.find(
+      (m) => (m as Record<string, unknown>).type === 'dashboard.fleet.host.declare.response',
+    ) as Record<string, unknown>;
+    expect(resp).toMatchObject({ declared: true, created: true });
   });
 
   it('remove with a permissive policy calls removeStatic and reflects the count', async () => {

@@ -1,7 +1,14 @@
-import { describe, it, expect, vi } from 'vitest';
-import { resolveWorkflowRunsOnAll } from './fleet-runs-on-all.js';
+import { describe, it, expect } from 'vitest';
+import { extractRunsOnAll, resolveWorkflowRunsOnAll } from './fleet-runs-on-all.js';
 import type { Kysely } from 'kysely';
+import type { LockWorkflow } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
+
+const exact = (value: string) => ({ kind: 'exact' as const, value });
+
+function wf(jobs: unknown[]): LockWorkflow {
+  return { name: 'w', jobs } as unknown as LockWorkflow;
+}
 
 /** Build a Kysely stub whose workflow_registrations query returns `rows`. */
 function dbReturning(rows: Array<{ lock_entry: string }>): Kysely<Database> {
@@ -68,5 +75,49 @@ describe('resolveWorkflowRunsOnAll', () => {
       'fanout',
     );
     expect(res?.onUnreachable).toBe('skip');
+  });
+});
+
+describe('extractRunsOnAll', () => {
+  it('returns null when no job declares runsOnAll', () => {
+    expect(extractRunsOnAll(wf([{ _type: 'static', name: 'a' }]))).toBeNull();
+  });
+
+  it('returns the first static job runsOnAll with default onUnreachable=hold', () => {
+    const r = extractRunsOnAll(
+      wf([
+        { _type: 'static', name: 'a', runsOnAll: { include: [[exact('role:web')]], exclude: [] } },
+      ]),
+    );
+    expect(r).toEqual({ include: [[exact('role:web')]], exclude: [], onUnreachable: 'hold' });
+  });
+
+  it('honors an explicit onUnreachable=skip', () => {
+    const r = extractRunsOnAll(
+      wf([
+        {
+          _type: 'static',
+          name: 'a',
+          onUnreachable: 'skip',
+          runsOnAll: { include: [], exclude: [exact('x')] },
+        },
+      ]),
+    );
+    expect(r?.onUnreachable).toBe('skip');
+  });
+
+  it('returns the first runsOnAll job when several jobs exist', () => {
+    const r = extractRunsOnAll(
+      wf([
+        { _type: 'static', name: 'plain' },
+        {
+          _type: 'static',
+          name: 'web',
+          runsOnAll: { include: [[exact('role:web')]], exclude: [] },
+        },
+        { _type: 'static', name: 'db', runsOnAll: { include: [[exact('role:db')]], exclude: [] } },
+      ]),
+    );
+    expect(r?.include).toEqual([[exact('role:web')]]);
   });
 });

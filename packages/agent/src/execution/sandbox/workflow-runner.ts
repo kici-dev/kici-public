@@ -49,7 +49,7 @@ import {
   provenanceSubjectIsPath,
   buildNeedsContext,
 } from '@kici-dev/sdk';
-import type { UpstreamSnapshot, NeedsContext, DynamicJobNeed } from '@kici-dev/sdk';
+import type { UpstreamSnapshot, NeedsContext, DynamicJobNeed, FanoutPosition } from '@kici-dev/sdk';
 import type {
   OutputsMap,
   StepRefMap,
@@ -1322,6 +1322,17 @@ export function createSandboxStepContext(
     // dispatch time); absent for non-host jobs.
     ...(request.host && { host: request.host }),
     ...(request.agent && { agent: request.agent }),
+    // Fan-out position (runsOnAll host or matrix combination); absent otherwise.
+    ...(() => {
+      const fanout = deriveFanout(request);
+      return fanout ? { fanout } : {};
+    })(),
+    // Operator-supplied, validated + coerced + defaulted workflow-dispatch
+    // inputs (orchestrator-resolved from the lock descriptor). Always present —
+    // empty object when none declared — so `inputs.from(ctx)` never sees undefined.
+    dispatchInputs: (request.dispatchInputs ?? {}) as Readonly<
+      Record<string, string | number | boolean | null>
+    >,
     // Upstream needs (result + terminal status) for step-level branching.
     ...(() => {
       const needs = buildStepNeedsContext(
@@ -1335,6 +1346,22 @@ export function createSandboxStepContext(
 }
 
 // --- Helper ---
+
+/**
+ * Derive the fan-out position (`ctx.fanout`) from a dispatch request. Returns
+ * `undefined` for a non-fan-out job (no `fanoutTotal`), so `ctx.fanout` is only
+ * set for `runsOnAll` host children and matrix combinations.
+ */
+export function deriveFanout(request: JobExecutionRequest): FanoutPosition | undefined {
+  if (request.fanoutTotal === undefined) return undefined;
+  const index = request.fanoutIndex ?? 0;
+  return {
+    index,
+    total: request.fanoutTotal,
+    first: index === 0,
+    last: index === request.fanoutTotal - 1,
+  };
+}
 
 /** Raw provider webhook body for ctx.rawPayload — nested in the envelope. */
 export function rawPayloadFromEvent(
@@ -2150,6 +2177,8 @@ async function maybeSkipJobOnRules(
     request.event ?? {},
     [],
     process.env as Record<string, string | undefined>,
+    (request.dispatchInputs ?? {}) as Readonly<Record<string, string | number | boolean | null>>,
+    deriveFanout(request),
   );
   const ruleResult = await evaluateRules(job.rules, ruleCtx, request.jobName);
   if (ruleResult.allPassed) return false;
@@ -2528,6 +2557,10 @@ async function main(): Promise<void> {
     outputsMap,
     event: request.event ?? {},
     env: process.env as Record<string, string | undefined>,
+    dispatchInputs: (request.dispatchInputs ?? {}) as Readonly<
+      Record<string, string | number | boolean | null>
+    >,
+    fanout: deriveFanout(request),
     jobHooks,
     cachePhaseDeps,
     isAborted: () => aborted,

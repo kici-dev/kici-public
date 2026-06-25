@@ -3,6 +3,7 @@ import {
   materializeFanout,
   materializeResolvedHosts,
   hostEnvelopeFields,
+  matrixEnvelopeFields,
   FanoutError,
   FanoutCause,
   MAX_FANOUT_JOBS,
@@ -157,6 +158,68 @@ describe('materializeResolvedHosts', () => {
 
   it('throws FanoutError when matched hosts exceed maxHosts', () => {
     expect(() => materializeResolvedHosts(hostBase({}), agents, 1)).toThrow(/max 1/);
+  });
+
+  it('assigns fanoutIndex/Total over an agentId-sorted host fan-out', () => {
+    const unsorted: ResolvedHostAgent[] = [
+      { agentId: 'b', host: 'host-b', labels: [] },
+      { agentId: 'a', host: 'host-a', labels: [] },
+      { agentId: 'c', host: 'host-c', labels: [] },
+    ];
+    const { jobs } = materializeResolvedHosts(hostBase({}), unsorted, 1024);
+    const byAgent = Object.fromEntries(jobs.map((j) => [j.pinnedAgentId, j]));
+    expect(byAgent.a.fanoutIndex).toBe(0);
+    expect(byAgent.a.fanoutTotal).toBe(3);
+    expect(byAgent.b.fanoutIndex).toBe(1);
+    expect(byAgent.c.fanoutIndex).toBe(2);
+    expect(byAgent.c.fanoutTotal).toBe(3);
+    // Emission order is the input order; the index is the agentId-sorted rank,
+    // which the orchestrator wave dispatch keys on (dispatch order == index).
+    expect(jobs.map((j) => j.pinnedAgentId)).toEqual(['b', 'a', 'c']);
+  });
+});
+
+describe('fanout position assignment', () => {
+  const matrixBase = (over: Partial<LockJob>): LockJob =>
+    ({ _type: 'static', name: 'm', runsOn: 'ubuntu', needs: [], steps: [], ...over }) as LockJob;
+
+  it('assigns fanoutIndex/Total over matrix children by variant label', () => {
+    const { jobs } = materializeFanout([
+      matrixBase({ matrix: { _type: 'static', values: ['a', 'b', 'c'] } }),
+    ]);
+    expect(jobs).toHaveLength(3);
+    jobs.forEach((j, i) => {
+      expect(j.fanoutIndex).toBe(i);
+      expect(j.fanoutTotal).toBe(3);
+    });
+  });
+
+  it('omits fanout fields on a non-fan-out (single-child) job', () => {
+    const { jobs } = materializeFanout([matrixBase({})]);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].fanoutIndex).toBeUndefined();
+    expect(jobs[0].fanoutTotal).toBeUndefined();
+  });
+
+  it('carries fanout position through the envelope builders', () => {
+    const { jobs } = materializeFanout([
+      matrixBase({ matrix: { _type: 'static', values: ['a', 'b'] } }),
+    ]);
+    const env = matrixEnvelopeFields(jobs[0]);
+    expect(env.fanoutIndex).toBe(jobs[0].fanoutIndex);
+    expect(env.fanoutTotal).toBe(2);
+  });
+
+  it('host envelope carries fanout position; single-child envelope omits it', () => {
+    const agents: ResolvedHostAgent[] = [
+      { agentId: 'a', host: 'h-a', labels: [] },
+      { agentId: 'b', host: 'h-b', labels: [] },
+    ];
+    const fanned = materializeResolvedHosts(matrixBase({}), agents, 1024).jobs;
+    expect(hostEnvelopeFields(fanned[0]).fanoutTotal).toBe(2);
+    const single = materializeResolvedHosts(matrixBase({}), [agents[0]], 1024).jobs;
+    expect(hostEnvelopeFields(single[0]).fanoutIndex).toBeUndefined();
+    expect(hostEnvelopeFields(single[0]).fanoutTotal).toBeUndefined();
   });
 });
 

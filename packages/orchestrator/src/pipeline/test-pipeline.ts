@@ -39,7 +39,8 @@ import type {
   WorkflowDecision,
 } from '@kici-dev/engine';
 import { isLockStaticJob, matchAllWorkflows, createWorkflowDecision } from '@kici-dev/engine';
-import type { CheckMode, HostTargetSelector } from '@kici-dev/engine';
+import { coerceDispatchInputs } from '@kici-dev/engine';
+import type { CheckMode, HostTargetSelector, InputsDescriptorMap } from '@kici-dev/engine';
 import { evaluateInlineFields } from './inline-eval.js';
 
 const logger = createLogger({ prefix: 'test-pipeline' });
@@ -94,6 +95,12 @@ export interface TestTriggerInput {
    * context, where it post-filters each runsOnAll job's matched roster.
    */
   target?: HostTargetSelector;
+  /**
+   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not coerced /
+   * defaulted). Validated + coerced + defaulted here against the matched
+   * workflow's lock dispatch descriptor before dispatch.
+   */
+  dispatchInputs?: Record<string, string>;
 }
 
 /**
@@ -420,6 +427,61 @@ interface TestDispatchShared {
   extraJobConfig: Record<string, unknown>;
   /** CLI `--secret` / `--env` flat secrets, layered onto every dispatched job. */
   runWideFlatSecrets: Record<string, string>;
+  /** Resolved (coerced + defaulted) `kici run --input` dispatch inputs, or undefined. */
+  dispatchInputs?: Record<string, unknown>;
+}
+
+/**
+ * Merge the dispatch-trigger `inputs` descriptors declared by the matched
+ * workflows. Multiple workflows declaring the same key are last-write-wins
+ * (the operator's `--input` is validated against the union).
+ */
+function mergeMatchedDispatchDescriptors(
+  fullLockFile: FullLockFile,
+  matchedDecisions: WorkflowDecision[],
+): InputsDescriptorMap | undefined {
+  const merged: InputsDescriptorMap = {};
+  let found = false;
+  for (const decision of matchedDecisions) {
+    const workflow = fullLockFile.workflows.find((w) => w.name === decision.workflowName);
+    for (const trigger of workflow?.triggers ?? []) {
+      if (trigger._type === 'dispatch' && trigger.inputs) {
+        Object.assign(merged, trigger.inputs);
+        found = true;
+      }
+    }
+  }
+  return found ? merged : undefined;
+}
+
+/**
+ * Validate + coerce + default the operator's raw `--input` pairs against the
+ * matched workflows' dispatch descriptors. Returns the resolved values, or a
+ * `{ rejected }` reason on validation failure (no dispatch).
+ */
+function resolveDispatchInputs(
+  input: TestTriggerInput,
+  fullLockFile: FullLockFile,
+  matchedDecisions: WorkflowDecision[],
+): { values?: Record<string, unknown> } | { rejected: string } {
+  const descriptor = mergeMatchedDispatchDescriptors(fullLockFile, matchedDecisions);
+  // No declared inputs anywhere: only reject if the operator nonetheless passed
+  // some (a typo against a workflow that declares none).
+  if (!descriptor) {
+    if (input.dispatchInputs && Object.keys(input.dispatchInputs).length > 0) {
+      return {
+        rejected: `Workflow declares no dispatch inputs, but --input was given: ${Object.keys(
+          input.dispatchInputs,
+        ).join(', ')}`,
+      };
+    }
+    return {};
+  }
+  const r = coerceDispatchInputs(input.dispatchInputs ?? {}, descriptor);
+  if ('error' in r) {
+    return { rejected: r.error.message };
+  }
+  return { values: r.values };
 }
 
 /** Assemble a `WorkflowDispatchContext` for one matched workflow decision. */
@@ -450,6 +512,7 @@ function buildTestDispatchContext(
     extraJobConfig: shared.extraJobConfig,
     testRun: { fixtureId: shared.input.fixtureId },
     ...(shared.input.target && { target: shared.input.target }),
+    ...(shared.dispatchInputs && { dispatchInputs: shared.dispatchInputs }),
     ...(Object.keys(shared.runWideFlatSecrets).length > 0 && {
       runWideFlatSecrets: shared.runWideFlatSecrets,
     }),
@@ -511,6 +574,14 @@ export async function processTestTrigger(
     return { runId, status: 'rejected', reason: fieldsResult.rejected, jobIds: [] };
   }
 
+  // Authoritative dispatch-input validation: coerce + default + validate the
+  // operator's raw --input pairs against the matched workflows' lock descriptor.
+  // Rejected at the relay — no agent dispatched.
+  const dispatchInputsResult = resolveDispatchInputs(input, fullLockFile, matchedDecisions);
+  if ('rejected' in dispatchInputsResult) {
+    return { runId, status: 'rejected', reason: dispatchInputsResult.rejected, jobIds: [] };
+  }
+
   const protectionRejection = await enforceEnvironmentProtection(
     deps,
     fullLockFile,
@@ -565,6 +636,7 @@ export async function processTestTrigger(
     // CLI `--secret` / `--env` flat secrets reach EVERY job (env-declaring or
     // not), winning over a job's env-resolved secret on a key collision.
     runWideFlatSecrets: cliSecrets.flat,
+    ...(dispatchInputsResult.values && { dispatchInputs: dispatchInputsResult.values }),
   };
 
   const jobIds: string[] = [];

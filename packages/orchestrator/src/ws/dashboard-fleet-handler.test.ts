@@ -3,6 +3,7 @@ import {
   handleFleetHostsRequest,
   handleFleetHostRequest,
   handleFleetPreviewRequest,
+  handleFleetWorkflowsForHostRequest,
   type FleetHandlerDeps,
   type ResolvedRunsOnAll,
 } from './dashboard-fleet-handler.js';
@@ -44,11 +45,15 @@ function makeDeps(overrides: Partial<FleetHandlerDeps> = {}): FleetHandlerDeps {
       }),
     }),
   } as unknown as FleetHandlerDeps['db'];
+  const registrationStore = {
+    getAll: vi.fn().mockResolvedValue([]),
+  } as unknown as FleetHandlerDeps['registrationStore'];
   return {
     db,
     rosterStore,
     rosterGraceMs: 300_000,
     resolveRunsOnAll: vi.fn().mockResolvedValue(null),
+    registrationStore,
     ...overrides,
   };
 }
@@ -162,5 +167,91 @@ describe('handleFleetPreviewRequest', () => {
     const res = await handleFleetPreviewRequest(deps, 'req-7', 'fanout');
     expect(res.estimatedChildCount).toBe(1);
     expect(res.onUnreachable).toBe('skip');
+  });
+});
+
+describe('handleFleetWorkflowsForHostRequest', () => {
+  const exact = (value: string) => ({ kind: 'exact' as const, value });
+  const reg = (
+    name: string,
+    runsOnAll: unknown,
+    opts: { onUnreachable?: string; disabled?: boolean; sourceFile?: string | null } = {},
+  ) =>
+    ({
+      workflow_name: name,
+      repo_identifier: 'o/r',
+      sourceFile: opts.sourceFile ?? `f-${name}.ts`,
+      disabled: opts.disabled ?? false,
+      lock_entry: {
+        name,
+        jobs: [{ _type: 'static', name: 'j', runsOnAll, onUnreachable: opts.onUnreachable }],
+      },
+    }) as unknown;
+
+  function depsFor(host: HostInventoryEntry | null, regs: unknown[]): FleetHandlerDeps {
+    const deps = makeDeps();
+    (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockResolvedValue(host);
+    (deps.registrationStore.getAll as ReturnType<typeof vi.fn>).mockResolvedValue(regs);
+    return deps;
+  }
+
+  it('lists only workflows whose runsOnAll matches the host; disposition target when ready', async () => {
+    const host = { ...entry('h1', 'ready'), labels: ['role:web'] };
+    const regs = [
+      reg('deploy-web', { include: [[exact('role:web')]], exclude: [] }),
+      reg('deploy-db', { include: [[exact('role:db')]], exclude: [] }),
+    ];
+    const res = await handleFleetWorkflowsForHostRequest(depsFor(host, regs), 'r1', 'h1');
+    expect(res.type).toBe('dashboard.fleet.workflows-for-host.response');
+    expect(res.workflows.map((w) => w.workflowName)).toEqual(['deploy-web']);
+    expect(res.workflows[0].disposition).toBe('target');
+    expect(res.workflows[0].repoIdentifier).toBe('o/r');
+    expect(res.workflows[0].sourceFile).toBe('f-deploy-web.ts');
+  });
+
+  it('returns empty workflows when the host is absent from the roster', async () => {
+    const res = await handleFleetWorkflowsForHostRequest(depsFor(null, []), 'r2', 'gone');
+    expect(res.workflows).toEqual([]);
+  });
+
+  it('skips disabled workflows and workflows the host is excluded from', async () => {
+    const host = { ...entry('h1', 'ready'), labels: ['role:web', 'tier:canary'] };
+    const regs = [
+      reg('disabled-wf', { include: [[exact('role:web')]], exclude: [] }, { disabled: true }),
+      reg('excluded-wf', { include: [[exact('role:web')]], exclude: [exact('tier:canary')] }),
+      reg('match-wf', { include: [[exact('role:web')]], exclude: [] }),
+    ];
+    const res = await handleFleetWorkflowsForHostRequest(depsFor(host, regs), 'r3', 'h1');
+    expect(res.workflows.map((w) => w.workflowName)).toEqual(['match-wf']);
+  });
+
+  it('empty include groups match any host', async () => {
+    const host = { ...entry('h1', 'ready'), labels: ['anything'] };
+    const regs = [reg('all-hosts', { include: [], exclude: [] })];
+    const res = await handleFleetWorkflowsForHostRequest(depsFor(host, regs), 'r4', 'h1');
+    expect(res.workflows.map((w) => w.workflowName)).toEqual(['all-hosts']);
+  });
+
+  it('absent durable host: disposition follows onUnreachable (target on hold, unreachable-durable on skip)', async () => {
+    const host = { ...entry('h1', 'unreachable'), labels: ['role:web'], lifecycleClass: 'static' };
+    const hold = [
+      reg('hold-wf', { include: [[exact('role:web')]], exclude: [] }, { onUnreachable: 'hold' }),
+    ];
+    const skip = [
+      reg('skip-wf', { include: [[exact('role:web')]], exclude: [] }, { onUnreachable: 'skip' }),
+    ];
+    const holdRes = await handleFleetWorkflowsForHostRequest(depsFor(host, hold), 'r5', 'h1');
+    expect(holdRes.workflows[0].disposition).toBe('target');
+    expect(holdRes.workflows[0].onUnreachable).toBe('hold');
+    const skipRes = await handleFleetWorkflowsForHostRequest(depsFor(host, skip), 'r6', 'h1');
+    expect(skipRes.workflows[0].disposition).toBe('unreachable-durable');
+    expect(skipRes.workflows[0].onUnreachable).toBe('skip');
+  });
+
+  it('ephemeral non-ready host: disposition skipped-ephemeral', async () => {
+    const host = { ...entry('h1', 'stale'), labels: ['role:web'], lifecycleClass: 'ephemeral' };
+    const regs = [reg('eph-wf', { include: [[exact('role:web')]], exclude: [] })];
+    const res = await handleFleetWorkflowsForHostRequest(depsFor(host, regs), 'r7', 'h1');
+    expect(res.workflows[0].disposition).toBe('skipped-ephemeral');
   });
 });

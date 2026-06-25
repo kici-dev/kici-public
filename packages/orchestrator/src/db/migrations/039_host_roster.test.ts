@@ -64,23 +64,30 @@ describeDb('migration 039_host_roster', () => {
     }
   }, 60_000);
 
-  it('creates host_roster with expected columns', async () => {
+  it('creates host_roster with the base columns migration 039 establishes', async () => {
+    // The harness applies the full migration chain (migrateToLatest), so later
+    // migrations add further columns (host_properties, reach metadata,
+    // reboot_pending_until). Assert that migration 039's base columns are all
+    // present rather than freezing the exact set — that keeps this test stable
+    // as later migrations extend the table.
     expect(await tableExists('host_roster')).toBe(true);
     expect(await columns()).toEqual(
-      [
-        'agent_id',
-        'connected_instance_id',
-        'created_at',
-        'hostname',
-        'id',
-        'labels',
-        'last_seen',
-        'lifecycle_class',
-        'platform',
-        'arch',
-        'token_id',
-        'updated_at',
-      ].sort(),
+      expect.arrayContaining(
+        [
+          'agent_id',
+          'connected_instance_id',
+          'created_at',
+          'hostname',
+          'id',
+          'labels',
+          'last_seen',
+          'lifecycle_class',
+          'platform',
+          'arch',
+          'token_id',
+          'updated_at',
+        ].sort(),
+      ),
     );
   });
 

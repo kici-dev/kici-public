@@ -154,11 +154,10 @@ npm install -g kici
 kici login
 kici org use <your-org>
 
-kici compile
-
-# Run it — the run routes through the Platform to your orchestrator, the CLI
-# uploads your working tree directly to SeaweedFS, the scaler spawns a one-shot
-# agent container, and logs stream back to your terminal.
+# Run it — `kici run remote` recompiles your workflows first, then routes the run
+# through the Platform to your orchestrator, the CLI uploads your working tree
+# directly to SeaweedFS, the scaler spawns a one-shot agent container, and logs
+# stream back to your terminal.
 kici run remote push-main
 ```
 
@@ -278,6 +277,21 @@ docker compose up -d
 **First `docker compose pull` / `up` fails with `toomanyrequests` (Docker Hub rate limit).** The backing PostgreSQL and SeaweedFS images pull from Docker Hub, which rate-limits anonymous pulls by source IP. Authenticate with `docker login` (a free Docker Hub account raises the limit), wait a few minutes for the window to reset and retry, or point your runtime at a Docker Hub mirror / pull-through cache. The orchestrator and agent images come from `quay.io` and are unaffected.
 
 **Orchestrator logs show `auth.failed` immediately after start.** The `KICI_PLATFORM_TOKEN` in `.env` doesn't match what you minted at app.kici.dev. Mint a fresh one (the old one stays revokable from the dashboard) and update `.env`, then `docker compose restart orchestrator`.
+
+**SeaweedFS keeps restarting, or `kici run remote` can't upload the overlay.** `docker compose ps` shows the `seaweedfs` service unhealthy or restarting. Tail its logs with `docker compose logs seaweedfs` — if you see `fail to load config file /etc/seaweedfs/s3.json: … is a directory`, then `seaweedfs-s3.json` is a **directory**, not a file. The `curl -O …seaweedfs-s3.json` download in step 3 was skipped or failed, so `docker compose up` created an empty directory at the bind-mount path and SeaweedFS exits on startup. From your `my-kici` directory, remove the directory, re-download the file, confirm it's a file, and recreate the container:
+
+```bash
+rm -rf seaweedfs-s3.json
+curl -O https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/compose/seaweedfs-s3.json
+test -f seaweedfs-s3.json && echo "ok: it is a file"
+docker compose up -d --force-recreate seaweedfs
+```
+
+**`kici run remote` fails to upload with `Failed to parse URL from` or `no object storage configured`.** The orchestrator has no object storage wired. The bundled `docker-compose.yaml` ships the `KICI_STORAGE_*` settings on the `orchestrator` service's `environment:` block, so this only happens if that file was edited or replaced. Confirm the keys are still there with `grep KICI_STORAGE_ docker-compose.yaml` — you should see `KICI_STORAGE_TYPE`, `KICI_STORAGE_ENDPOINT`, `KICI_STORAGE_UPLOAD_ENDPOINT`, `KICI_STORAGE_EXTERNAL_ENDPOINT`, and `KICI_STORAGE_BUCKET` (plus `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`). If they're missing, re-download the file from the [kici-public repo](https://github.com/kici-dev/kici-public/blob/main/examples/quickstart/compose/docker-compose.yaml) and `docker compose up -d`.
+
+**`kici run remote` uploads, but the job fails with `Overlay download failed … ECONNREFUSED …:8333`.** The CLI upload succeeded (the host reaches `localhost:8333`), but the spawned agent container can't fetch the overlay back. The tell-tale: the failure is on the agent/job — not the CLI upload — and the URL host is `localhost` or `127.0.0.1`. A spawned agent container runs in its own network namespace, so a presigned URL pointing at `localhost:8333` resolves to the container's own empty loopback (`ECONNREFUSED`). The bundled `docker-compose.yaml` already avoids this: it sets `KICI_STORAGE_EXTERNAL_ENDPOINT=http://host.docker.internal:8333` (the address the scaler's `host.docker.internal:host-gateway` alias routes to the host) and publishes SeaweedFS on `8333:8333`. If you hit this, confirm both are intact with `grep -E 'KICI_STORAGE_EXTERNAL_ENDPOINT|8333:8333' docker-compose.yaml`; restore them from the [kici-public repo](https://github.com/kici-dev/kici-public/blob/main/examples/quickstart/compose/docker-compose.yaml) if either was removed, then `docker compose up -d`.
+
+**`kici run remote` runs but reports `No jobs dispatched`.** The job's `runsOn` label matches no agent your scaler can provide, so the orchestrator rejects the dispatch. A `runsOn` value must match either a **custom label your scaler declares** — the container scaler in `scalers.yaml` offers `linux` plus `container` — or an **auto-label every agent carries automatically**, such as `kici:os:linux` (the agent's operating system), which is what `kici init`'s starter workflows use. A value like `ubuntu-latest` matches neither and never dispatches. Set the job's `runsOn` to one of your scaler's labels (for example `'container'`) or an auto-label (for example `'kici:os:linux'`), then `kici compile` and re-run.
 
 **Push happens but no agent container spawns.** Tail `docker compose logs -f orchestrator` immediately after the push and look near the top for one of three failure modes:
 

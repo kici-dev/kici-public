@@ -129,7 +129,8 @@ function printShowEnvironment(res: ShowEnvironmentResult): void {
   if (res.bindings.length > 0) {
     console.log(`bindings (${res.bindings.length}):`);
     for (const b of res.bindings) {
-      console.log(`  ${b.scope_pattern}`);
+      const host = b.host_pattern && b.host_pattern !== '**' ? `  (host: ${b.host_pattern})` : '';
+      console.log(`  ${b.scope_pattern}${host}`);
     }
   } else {
     console.log('bindings: none');
@@ -213,17 +214,27 @@ export function registerEnvironmentCommands(
     .requiredOption('--org <id>', 'Org ID')
     .requiredOption('--env <name>', 'Environment name')
     .requiredOption('--scope <pattern>', 'Scope pattern (e.g. "staging" or "aws/prod/**")')
+    .option(
+      '--host <pattern>',
+      'Host selector (exact/glob/regex over agentId/host/labels); "**" = all hosts',
+      '**',
+    )
     .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .option('--json', 'Emit JSON output')
     .action(async (opts) => {
       try {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
-        const payload = { orgId: opts.org, envName: opts.env, scopePattern: opts.scope };
+        const payload = {
+          orgId: opts.org,
+          envName: opts.env,
+          scopePattern: opts.scope,
+          hostPattern: opts.host,
+        };
         const result = dbUrl
           ? await seedEnvironmentBindingDirect(dbUrl, payload)
           : await getClient().post<{ created: boolean }>(
               `/api/v1/admin/environments/${encodeURIComponent(opts.env)}/bind`,
-              { orgId: opts.org, scopePattern: opts.scope },
+              { orgId: opts.org, scopePattern: opts.scope, hostPattern: opts.host },
             );
         if (opts.json) {
           console.log(JSON.stringify(result));

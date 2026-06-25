@@ -89,6 +89,41 @@ export interface HostApi {
   requestReboot(opts?: { deadlineMs?: number }): Promise<void>;
 }
 
+// --- Bootstrap API ---
+
+export interface BootstrapApi {
+  /**
+   * Bring up a temporary privileged init-runner on a declared-but-un-agented
+   * host over SSH, so it auto-enrolls as a short-lived `kici:init` agent. The
+   * step calling this must run on an agent holding the
+   * `kici:capability:ssh-transport` capability (the orchestrator refuses
+   * otherwise). No-op (`broughtUp: false`) when the target already has a live
+   * agent. Each bring-up is access-logged.
+   *
+   * The target's reach metadata + the bring-up SSH key (a scoped secret) are
+   * resolved server-side from the host roster — the workflow author supplies
+   * only the target agent id.
+   */
+  ensureInitRunner(targetAgentId: string): Promise<{ broughtUp: boolean }>;
+
+  /**
+   * Ship an input to a host's pre-boot SSH channel (e.g. a LUKS passphrase to
+   * a dropbear/initramfs `cryptroot-unlock` prompt on port 2222). Generic
+   * "pipe stdin to a forced-command endpoint"; the unlock recipe is
+   * per-host-passphrase → `preBootSend` → `waitForHostAlive`. Same
+   * `kici:capability:ssh-transport` gate + access-log as `ensureInitRunner`.
+   *
+   * `inputSecret` is a scoped-secret ref (`scope/key`) the orchestrator
+   * resolves server-side; the plaintext never passes through the workflow.
+   * Success is the send completing (the session drops as the box boots) —
+   * compose `restartHost`/host-alive waits to confirm the boot.
+   */
+  preBootSend(
+    targetAgentId: string,
+    opts: { inputSecret: string; port?: number; command?: string },
+  ): Promise<void>;
+}
+
 // --- Top-level KiCI API ---
 
 export interface KiciApi {
@@ -100,6 +135,8 @@ export interface KiciApi {
   oidc: OidcApi;
   /** Host-lifecycle operations on the agent's own host (e.g. reboot). */
   host: HostApi;
+  /** Fresh-box bootstrap bring-up (init-runner over SSH, pre-boot unlock). */
+  bootstrap: BootstrapApi;
 }
 
 // --- Transport layer (internal) ---
@@ -157,6 +194,16 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
         transport('host.requestReboot', {
           ...(opts?.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
         }) as Promise<void>,
+    },
+    bootstrap: {
+      // The agent process intercepts these methods: it relays the privileged
+      // half to the orchestrator (which gates + mints + resolves + audits) and
+      // performs the SSH transport itself, returning only the safe result. The
+      // SSH key / bootstrap token never cross back into this sandbox.
+      ensureInitRunner: (targetAgentId) =>
+        transport('kici.ensureInitRunner', { targetAgentId }) as Promise<{ broughtUp: boolean }>,
+      preBootSend: (targetAgentId, opts) =>
+        transport('kici.preBootSend', { targetAgentId, ...opts }) as Promise<void>,
     },
   };
 }

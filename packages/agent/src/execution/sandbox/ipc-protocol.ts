@@ -457,6 +457,20 @@ export interface JobExecutionRequest {
     platform?: string;
     arch?: string;
   };
+  /**
+   * Operator-supplied, validated + coerced + defaulted workflow-dispatch inputs
+   * (from `kici run --input`), exposed to steps + rules as `ctx.dispatchInputs`.
+   * Absent for webhook runs.
+   */
+  dispatchInputs?: Record<string, unknown>;
+  /**
+   * For a fan-out child (`runsOnAll` host or matrix combination): the 0-based
+   * deterministic position in the fan-out, assembled into `ctx.fanout`. Absent
+   * for non-fan-out jobs.
+   */
+  fanoutIndex?: number;
+  /** For a fan-out child: the number of children in this fan-out. */
+  fanoutTotal?: number;
 
   /** Secrets to merge into step environment (highest precedence). */
   secrets?: Record<string, string>;

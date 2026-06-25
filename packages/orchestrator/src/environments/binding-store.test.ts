@@ -56,7 +56,10 @@ describe('BindingStore', () => {
       const { db, mocks } = createMockDb();
       const store = new BindingStore(db);
 
-      await store.set('org-abc', 'env-001', ['aws/prod/**', 'databases/*']);
+      await store.set('org-abc', 'env-001', [
+        { scopePattern: 'aws/prod/**' },
+        { scopePattern: 'databases/*' },
+      ]);
 
       // Transaction should have been used
       expect(mocks.transaction).toHaveBeenCalled();
@@ -66,18 +69,63 @@ describe('BindingStore', () => {
       expect(mocks.insertInto).toHaveBeenCalledWith('environment_bindings');
     });
 
-    it('should deduplicate scope patterns before inserting', async () => {
+    it('should default host_pattern to ** and round-trip an explicit host_pattern', async () => {
       const { db, mocks } = createMockDb();
       const store = new BindingStore(db);
 
-      await store.set('org-abc', 'env-001', ['aws/prod/**', 'databases/*', 'aws/prod/**']);
+      await store.set('org-abc', 'env-001', [
+        { scopePattern: 'prod/shared/**' },
+        { scopePattern: 'prod/hosts/box-00002/**', hostPattern: 'box-00002' },
+      ]);
 
-      // Transaction should have been used
-      expect(mocks.transaction).toHaveBeenCalled();
-      // Should insert with deduplicated values (2 unique patterns, not 3)
       expect(mocks.insertValues).toHaveBeenCalledWith([
-        { org_id: 'org-abc', environment_id: 'env-001', scope_pattern: 'aws/prod/**' },
-        { org_id: 'org-abc', environment_id: 'env-001', scope_pattern: 'databases/*' },
+        {
+          org_id: 'org-abc',
+          environment_id: 'env-001',
+          scope_pattern: 'prod/shared/**',
+          host_pattern: '**',
+        },
+        {
+          org_id: 'org-abc',
+          environment_id: 'env-001',
+          scope_pattern: 'prod/hosts/box-00002/**',
+          host_pattern: 'box-00002',
+        },
+      ]);
+    });
+
+    it('should deduplicate by (scope_pattern, host_pattern) before inserting', async () => {
+      const { db, mocks } = createMockDb();
+      const store = new BindingStore(db);
+
+      await store.set('org-abc', 'env-001', [
+        { scopePattern: 'aws/prod/**' },
+        { scopePattern: 'databases/*' },
+        { scopePattern: 'aws/prod/**' },
+        // Same scope, different host → NOT a duplicate.
+        { scopePattern: 'aws/prod/**', hostPattern: 'box-00002' },
+      ]);
+
+      expect(mocks.transaction).toHaveBeenCalled();
+      expect(mocks.insertValues).toHaveBeenCalledWith([
+        {
+          org_id: 'org-abc',
+          environment_id: 'env-001',
+          scope_pattern: 'aws/prod/**',
+          host_pattern: '**',
+        },
+        {
+          org_id: 'org-abc',
+          environment_id: 'env-001',
+          scope_pattern: 'databases/*',
+          host_pattern: '**',
+        },
+        {
+          org_id: 'org-abc',
+          environment_id: 'env-001',
+          scope_pattern: 'aws/prod/**',
+          host_pattern: 'box-00002',
+        },
       ]);
     });
 

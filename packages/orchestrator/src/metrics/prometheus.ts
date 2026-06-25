@@ -155,6 +155,8 @@ defineObservableGauge(
 
 interface ScalerUsageRow {
   scaler: string;
+  /** Backend type for this scaler (rollup dimension). `__global__` for the orchestrator-wide row. */
+  scalerType?: string;
   machinePool?: string;
   cpus: number;
   memBytes: number;
@@ -177,7 +179,8 @@ export function setScalerUsageBreakdown(rows: ScalerUsageRow[]): void {
 /**
  * Current CPU reservations per scaler / machine pool.
  * Labels:
- * - scaler: __global__ | container | firecracker | bare-metal | stateful
+ * - scaler: operator-chosen scaler name; "__global__" is the orchestrator-wide rollup.
+ * - scalerType: backend type (__global__ | stateful | container | firecracker | bare-metal).
  * - machinePool: optional pool name (operator-defined; capped at the Platform filter)
  */
 defineObservableGauge(
@@ -189,6 +192,7 @@ defineObservableGauge(
   (result) => {
     for (const row of _scalerUsageRows) {
       const attrs: Record<string, string> = { scaler: row.scaler };
+      if (row.scalerType) attrs.scalerType = row.scalerType;
       if (row.machinePool) attrs.machinePool = row.machinePool;
       result.observe(row.cpus, attrs);
     }
@@ -198,7 +202,8 @@ defineObservableGauge(
 /**
  * Current memory reservations per scaler / machine pool.
  * Labels:
- * - scaler: __global__ | container | firecracker | bare-metal | stateful
+ * - scaler: operator-chosen scaler name; "__global__" is the orchestrator-wide rollup.
+ * - scalerType: backend type (__global__ | stateful | container | firecracker | bare-metal).
  * - machinePool: optional pool name (operator-defined; capped at the Platform filter)
  */
 defineObservableGauge(
@@ -210,6 +215,7 @@ defineObservableGauge(
   (result) => {
     for (const row of _scalerUsageRows) {
       const attrs: Record<string, string> = { scaler: row.scaler };
+      if (row.scalerType) attrs.scalerType = row.scalerType;
       if (row.machinePool) attrs.machinePool = row.machinePool;
       result.observe(row.memBytes, attrs);
     }

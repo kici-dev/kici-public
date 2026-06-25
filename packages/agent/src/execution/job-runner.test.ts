@@ -893,6 +893,59 @@ describe('JobRunner', () => {
   // loadWorkflowSource, and a thrown drift error must surface as a failed
   // job status.
 
+  // --- E2. Bring-up job tests (init-runner SSH bring-up, no sandbox) ---
+
+  it('bring-up job: relays ensureInitRunner for the target and reports success', async () => {
+    // broughtUp:false (target already live) exercises the no-SSH path; the SSH
+    // transport itself is covered in ensure-init-runner.test.ts.
+    const sendApiRequest = vi.fn().mockResolvedValue({ broughtUp: false });
+    const deps = { ...makeDeps(), sendApiRequest };
+    const runner = new JobRunner(deps);
+
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: '__bringup__test-workflow__fresh-01',
+        workflowName: 'test-workflow',
+        runsOn: 'kici:capability:ssh-transport',
+        bringupOnly: true,
+        bringupTarget: 'fresh-01',
+      },
+    });
+
+    await runner.execute(dispatch);
+
+    expect(sendApiRequest).toHaveBeenCalledWith('kici.ensureInitRunner', {
+      targetAgentId: 'fresh-01',
+    });
+    const statuses = deps.directMessages
+      .filter((m) => m.type === 'job.status')
+      .map((m) => (m as { state: string }).state);
+    expect(statuses).toContain('success');
+  });
+
+  it('bring-up job: a failed bring-up reports a failed job status', async () => {
+    const sendApiRequest = vi.fn().mockRejectedValue(new Error('ssh refused'));
+    const deps = { ...makeDeps(), sendApiRequest };
+    const runner = new JobRunner(deps);
+
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: '__bringup__test-workflow__fresh-01',
+        workflowName: 'test-workflow',
+        runsOn: 'kici:capability:ssh-transport',
+        bringupOnly: true,
+        bringupTarget: 'fresh-01',
+      },
+    });
+
+    await runner.execute(dispatch);
+
+    const statuses = deps.directMessages
+      .filter((m) => m.type === 'job.status')
+      .map((m) => (m as { state: string }).state);
+    expect(statuses).toContain('failed');
+  });
+
   function makeInitDispatch(overrides: Record<string, unknown> = {}): JobDispatch {
     return makeDispatch({
       jobConfig: {

@@ -9,17 +9,17 @@ The asymmetry IS the industry-standard pattern for systems with a SaaS control p
 
 ## The two surfaces at a glance
 
-| Property                                    | Dashboard path (control plane)                                                                                                                                                  | CLI path (orchestrator)               |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| Audience                                    | Developers, release engineers                                                                                                                                                   | Ops / SRE / operators                 |
-| Authority                                   | Control-plane database (`roles`, `role_assignments`)                                                                                                                            | Orchestrator database (`api_keys`)    |
-| Granularity                                 | Per-user, per-resource, per-verb                                                                                                                                                | Three fixed roles                     |
-| Identity key                                | OIDC `sub` from the user's session                                                                                                                                              | Opaque bearer token                   |
-| Configured via                              | Dashboard → Settings → Roles + Members                                                                                                                                          | `kici-admin api-key create`           |
-| Resources                                   | 16 typed resources (`runs`, `secrets`, `environments`, `workflows`, `members`, `api_keys`, `webhooks`, `org-settings`, `audit`, `event_log`, `ci_trust`, `support`, `teams`, …) | Coarse — admin tokens get every write |
-| Verbs                                       | `none`, `read`, `read_payload`, `write`, `admin`                                                                                                                                | Fixed per role                        |
-| Per-resource scoping                        | Yes (give `environments:write` without `secrets:write`)                                                                                                                         | No (admin = every write)              |
-| Per-path scoping (e.g. "scope `prod` only") | Not today                                                                                                                                                                       | Not today                             |
+| Property                                    | Dashboard path (control plane)                                                                                                                                                           | CLI path (orchestrator)               |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Audience                                    | Developers, release engineers                                                                                                                                                            | Ops / SRE / operators                 |
+| Authority                                   | Control-plane database (`roles`, `role_assignments`)                                                                                                                                     | Orchestrator database (`api_keys`)    |
+| Granularity                                 | Per-user, per-resource, per-verb                                                                                                                                                         | Three fixed roles                     |
+| Identity key                                | OIDC `sub` from the user's session                                                                                                                                                       | Opaque bearer token                   |
+| Configured via                              | Dashboard → Settings → Roles + Members                                                                                                                                                   | `kici-admin api-key create`           |
+| Resources                                   | 17 typed resources (`runs`, `secrets`, `environments`, `workflows`, `members`, `api_keys`, `webhooks`, `org-settings`, `audit`, `event_log`, `ci_trust`, `support`, `teams`, `fleet`, …) | Coarse — admin tokens get every write |
+| Verbs                                       | `none`, `read`, `read_payload`, `write`, `admin`                                                                                                                                         | Fixed per role                        |
+| Per-resource scoping                        | Yes (give `environments:write` without `secrets:write`)                                                                                                                                  | No (admin = every write)              |
+| Per-path scoping (e.g. "scope `prod` only") | Not today                                                                                                                                                                                | Not today                             |
 
 ## Dashboard RBAC (control plane)
 
@@ -121,4 +121,4 @@ No. Orchestrator tokens are not path-scoped — a token's role (`admin`, `audito
 - [Dashboard-write policy](./dashboard-write-policy.md) — the per-operation policy that decides which surface a given mutation is reachable on.
 - [Secrets management](./secrets.md) — the secret store, master key rotation, multi-backend backends.
 - [Audit log](./audit-log.md) — querying `audit_log` and `access_log`.
-- [Role-based access control (architecture)](../../architecture/security/rbac.md) — the control-plane permission model: 16 resources, 5 access levels, custom roles, and enforcement.
+- [Role-based access control (architecture)](../../architecture/security/rbac.md) — the control-plane permission model: 17 resources, 5 access levels, custom roles, and enforcement.

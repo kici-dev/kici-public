@@ -122,6 +122,9 @@ export * from './trigger/trigger-event-type.js';
 export * from './trigger/decision-trace.js';
 export * from './trigger/matcher.js';
 
+// --- Dispatch inputs (descriptor + extract/build/coerce; browser-safe) ---
+export * from './inputs/index.js';
+
 // --- Execution state machine ---
 export * from './state-machine/index.js';
 
@@ -166,6 +169,11 @@ export {
   scalerAgentLabels,
   isSelfReportedLabel,
   SELF_REPORTED_LABEL_PREFIXES,
+  CAPABILITY_LABEL_PREFIX,
+  capabilityLabel,
+  SSH_TRANSPORT_CAPABILITY,
+  INIT_LABEL,
+  PRIVILEGED_ROOT_LABEL,
 } from './labels.js';
 export type { NormalizedRunsOn } from './labels.js';
 export type { AgentRole } from './labels.js';

@@ -303,10 +303,13 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   const deleteFrom = vi.fn().mockReturnValue({ where: deleteTerminal.where });
 
   // ── Transaction ──────────────────────────────────────────────
-  // Transaction re-uses the db object as the trx argument
+  // Transaction re-uses the db object as the trx argument. Kysely's
+  // `transaction().execute(cb)` resolves to the callback's return value, so the
+  // mock must forward it (consumers like HeldRunStore.recordAndRelease return
+  // the value produced inside the transaction).
   let dbRef: any;
   const transactionExecute = vi.fn().mockImplementation(async (cb: Function) => {
-    await cb(dbRef);
+    return cb(dbRef);
   });
   const transaction = vi.fn().mockReturnValue({ execute: transactionExecute });
 

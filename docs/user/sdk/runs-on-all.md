@@ -111,6 +111,66 @@ run: async (ctx) => {
 
 Both are `undefined` for jobs that do not use `runsOnAll`.
 
+### ctx.fanout — fan-out position
+
+Every fan-out child — a `runsOnAll` host **or** a matrix combination — also
+carries its **position** within the fan-out:
+
+```typescript
+ctx.fanout?: {
+  index: number;   // 0-based position in the deterministically-ordered fan-out
+  total: number;   // number of children in this fan-out
+  first: boolean;  // index === 0
+  last: boolean;   // index === total - 1
+};
+```
+
+The order is a **documented guarantee**: host fan-out is ordered by agent id,
+matrix fan-out by its combination label. So `ctx.fanout.first` is always the
+same (lowest-agent-id) host across re-runs, and `ctx.fanout.last` the same final
+one. `ctx.fanout` is `undefined` on a job that is not fanned out.
+
+### Run-once steps: onlyOnFirstHost / onlyOnLastHost / onlyOnFanoutIndex
+
+For ordered, stateful rollouts you often need a step that runs on exactly **one**
+host — enable a leader before the rest join, run a one-time migration, take a
+single dump. Three rule helpers express this by reading `ctx.fanout`:
+
+```typescript
+import { job, step, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from '@kici-dev/sdk';
+
+const rollout = job('rollout', {
+  runsOnAll: 'role:db',
+  maxParallel: 1, // serial, so "first" runs before the rest
+  steps: [
+    // Runs only on the first (lowest-agent-id) host — KiCI's run-once primitive.
+    step('enable-sync-mode', { rules: [onlyOnFirstHost()] }, async (ctx) => {
+      /* configure the leader before standbys join */
+    }),
+    // Runs on every host.
+    step('apply', async (ctx) => {
+      /* ... */
+    }),
+    // Runs only on the last host.
+    step('finalize', { rules: [onlyOnLastHost()] }, async (ctx) => {
+      /* ... */
+    }),
+  ],
+});
+```
+
+- A step gated this way is **skipped** (not failed) on non-matching hosts — its
+  outputs exist only on the host where it ran.
+- `onlyOnFanoutIndex(n)` targets the host at a specific position.
+- **Non-fan-out safety:** on a job that is not fanned out, `ctx.fanout` is
+  `undefined` and these helpers treat the job as a single implicit child at
+  index 0 — so `onlyOnFirstHost()` runs normally there (there is one host, which
+  is the first). This means you can author a step with `onlyOnFirstHost()` and it
+  behaves correctly whether or not the job ends up fanning out.
+- The helpers are host-flavored by name (the dominant use case) but read
+  `ctx.fanout`, so they work for matrix fan-out too — `onlyOnFirstHost()` runs on
+  the first combination.
+
 ### byHost outputs
 
 A downstream that `needs:` a `runsOnAll` job receives a **byHost** envelope instead
@@ -168,6 +228,37 @@ Ephemeral (scaled-down) hosts that are no longer connected are **always** skippe
 independent of `onUnreachable` — a scaled-down node may never return. A `runsOnAll`
 that matches zero usable hosts fails the run rather than reporting a silent zero-child
 success.
+
+### includeUninitialized: converge a fresh fleet
+
+`onUnreachable` governs declared hosts that _had_ an agent and are momentarily absent.
+A **never-initialized** host — a freshly-provisioned box reachable over SSH but with no
+agent yet — is a different case: there is nothing to run on. Set
+`includeUninitialized: true` to widen the fan-out to those hosts and bring them up:
+
+```typescript
+const converge = job('converge', {
+  runsOnAll: 'kici:group:prod',
+  includeUninitialized: true,
+  steps: [partitionDisk, formatLuks, debootstrap, installAgent],
+});
+```
+
+For each un-agented declared host (one carrying SSH reach metadata), KiCI brings up a
+temporary init-runner over SSH and runs the **same steps** on it; hosts that already
+have a live agent run the steps on their own agent. One workflow converges the whole
+fleet — fresh boxes get built, live boxes run the same phases.
+
+Because the steps run on already-initialized hosts too, the bootstrap phases **must be
+idempotent [check-steps](/user/sdk/core/)**: each step's `check()` reports in-sync on a
+live box so the partition / format / install steps **skip** there and run only on fresh
+boxes. This is the safety guard — an OS or disk-format step must never re-run on a host
+that is already built. Re-running the workflow is a no-op everywhere. See the operator
+[fresh-box bootstrap](/operator/orchestrator/host-roster/) doc for the bring-up,
+capability gating, and lifecycle details.
+
+`includeUninitialized` is only meaningful alongside `runsOnAll`; it is ignored on a
+single-agent `runsOn` job.
 
 ### Rolling rollout: maxParallel + failFast
 

@@ -973,7 +973,10 @@ export class DashboardEnvHandler {
       this.deps.send({
         type: 'dashboard.environments.bindings.list.response',
         requestId: msg.requestId,
-        scopePatterns: bindings.map((b) => b.scope_pattern),
+        bindings: bindings.map((b) => ({
+          scopePattern: b.scope_pattern,
+          hostPattern: b.host_pattern,
+        })),
       });
     } catch (err) {
       this.recordAccess(
@@ -1001,7 +1004,11 @@ export class DashboardEnvHandler {
       return;
     }
     try {
-      await this.deps.bindingStore.set(this.deps.orgId, msg.environmentId, msg.scopePatterns);
+      await this.deps.bindingStore.set(
+        this.deps.orgId,
+        msg.environmentId,
+        msg.bindings.map((b) => ({ scopePattern: b.scopePattern, hostPattern: b.hostPattern })),
+      );
       this.recordAccess(
         msg.actor,
         'env_binding.set',

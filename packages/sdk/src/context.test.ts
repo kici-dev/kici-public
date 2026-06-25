@@ -121,3 +121,21 @@ describe('context types', () => {
     });
   });
 });
+
+describe('dispatchInputs on contexts', () => {
+  it('StepContext + RuleContext expose dispatchInputs', () => {
+    expectTypeOf<StepContext>().toHaveProperty('dispatchInputs');
+    expectTypeOf<import('./rules/types.js').RuleContext>().toHaveProperty('dispatchInputs');
+  });
+});
+
+describe('ctx.fanout', () => {
+  it('is present on step + rule contexts as FanoutPosition | undefined', () => {
+    expectTypeOf<StepContext['fanout']>().toEqualTypeOf<
+      import('./fanout-context.js').FanoutPosition | undefined
+    >();
+    expectTypeOf<import('./rules/types.js').RuleContext['fanout']>().toEqualTypeOf<
+      import('./fanout-context.js').FanoutPosition | undefined
+    >();
+  });
+});

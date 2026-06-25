@@ -3,6 +3,16 @@
  * Supports both glob patterns and regex patterns for branch/path matching.
  */
 
+import type { z } from 'zod';
+
+/**
+ * A declared map of typed workflow-dispatch inputs: `{ name: ZodSchema }`.
+ * Each schema must fall within the closed dispatch-input subset (extracted by
+ * the compiler) — z.string/number/boolean/enum/literal plus
+ * .optional/.nullable/.default/.min/.max/.regex/.int.
+ */
+export type DispatchInputsMap = Record<string, z.ZodType>;
+
 /**
  * Branch pattern - discriminated union supporting both glob and regex patterns.
  * Glob patterns use micromatch syntax, regex patterns use standard JS regex.
@@ -226,6 +236,8 @@ export interface DispatchTriggerConfig {
   readonly repos: readonly BranchPattern[];
 
   readonly description?: string;
+  /** Declared, typed workflow-dispatch inputs (frozen `{ name: ZodSchema }`). */
+  readonly inputs?: DispatchInputsMap;
 }
 
 /**
@@ -236,6 +248,15 @@ export interface DispatchConfigInput {
   readonly repos?: string | RegExp | (string | RegExp)[];
 
   readonly description?: string;
+  /**
+   * Typed workflow-dispatch inputs. Accepts a bare `{ name: ZodSchema }` map or
+   * a `defineDispatchInputs(...)` branded handle (which also exposes a typed
+   * `.from(ctx)` accessor). The compiler validates each schema against the
+   * closed dispatch-input subset.
+   */
+  readonly inputs?:
+    | DispatchInputsMap
+    | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
 }
 
 // --- Create trigger ---

@@ -164,7 +164,7 @@ JWT and opaque OIDC tokens are validated against the configured OIDC issuer (JWK
 
 ### Permissions
 
-Tokens authenticate; RBAC authorizes. Every org-scoped route runs `orgContextMiddleware` (verifies you are a member of the target org) followed by `requirePermission(resource, level)`. The 15 resources and 5 levels are documented in [RBAC](../architecture/security/rbac.md#permission-model). User API keys carry their own permission matrix bounded above by the creator's effective permissions; PATs inherit the user's role permissions (or are capped further by their `scopes` field).
+Tokens authenticate; RBAC authorizes. Every org-scoped route runs `orgContextMiddleware` (verifies you are a member of the target org) followed by `requirePermission(resource, level)`. The 17 resources and 5 levels are documented in [RBAC](../architecture/security/rbac.md#permission-model). User API keys carry their own permission matrix bounded above by the creator's effective permissions; PATs inherit the user's role permissions (or are capped further by their `scopes` field).
 
 ### Configurable surfaces
 

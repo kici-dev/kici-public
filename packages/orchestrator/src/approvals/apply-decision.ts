@@ -100,11 +100,15 @@ export async function applyDecision(
   const requirement = normalizeRequirement(hold.approval_requirement);
 
   if (args.decision === ApprovalDecision.enum.reject) {
-    await store.recordDecision(args.heldRunId, {
-      approverSub: args.actorSub,
-      decision: ApprovalDecision.enum.reject,
-    });
-    await store.reject(orgId, args.heldRunId, args.reason);
+    // Atomic: record the reject decision AND flip the hold to rejected in one
+    // transaction, so a crash between the two writes cannot leave an orphaned
+    // reject decision that poisons evaluate() while the hold stays pending.
+    await store.recordAndReject(
+      orgId,
+      args.heldRunId,
+      { approverSub: args.actorSub, decision: ApprovalDecision.enum.reject },
+      args.reason,
+    );
     // Step-scoped rejects must notify the waiting agent so it fails the step
     // immediately rather than blocking until the hold expires.
     if (hold.hold_scope === HoldScope.enum.step) {
@@ -135,20 +139,34 @@ export async function applyDecision(
   const clausesSatisfied = requirement.clauses.filter((clause) =>
     isActorEligibleForClause(args.actorSub, clause, teamMembershipLookup),
   );
-  await store.recordDecision(args.heldRunId, {
-    approverSub: args.actorSub,
-    decision: ApprovalDecision.enum.approve,
-    clausesSatisfied,
-  });
 
-  const after = toRecorded(await store.listDecisions(args.heldRunId));
-  const result = evaluate(requirement, after, teamMembershipLookup);
+  // Evaluate the prospective decision set (existing + this approve) in memory.
+  // Only the *satisfying* approve needs the record + release to be atomic; a
+  // non-satisfying approve is a safe lone INSERT (a recorded approve with the
+  // hold still pending is a valid steady state — no orphan to poison anything).
+  const prospective: RecordedDecision[] = [
+    ...existing,
+    { approver_user_id: args.actorSub, decision: 'approve' },
+  ];
+  const result = evaluate(requirement, prospective, teamMembershipLookup);
   if (!result.satisfied) {
+    await store.recordDecision(args.heldRunId, {
+      approverSub: args.actorSub,
+      decision: ApprovalDecision.enum.approve,
+      clausesSatisfied,
+    });
     const remaining = result.perClause.filter((c) => !c.satisfied).length;
     return { accepted: true, status: 'pending', remainingClauses: remaining };
   }
 
-  const signal = await store.release(orgId, args.heldRunId);
+  // Atomic: record the satisfying approve AND release the hold in one
+  // transaction, so a crash between the two writes cannot leave the hold
+  // pending-but-satisfied (which makes canApprove() return false for everyone).
+  const signal = await store.recordAndRelease(orgId, args.heldRunId, {
+    approverSub: args.actorSub,
+    decision: ApprovalDecision.enum.approve,
+    clausesSatisfied,
+  });
   if (signal.scope === HoldScope.enum.step) {
     await deps.onStepRelease?.(signal);
   } else if (

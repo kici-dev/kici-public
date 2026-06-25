@@ -117,6 +117,29 @@ describe('kici types', () => {
       expect(content).toContain('interface EnvironmentSecrets');
       expect(content).not.toContain('KnownContexts');
     });
+
+    it('suppresses the success line on stdout when quiet', async () => {
+      await writeConfig(platformConfig);
+
+      mockFetch.mockResolvedValue(
+        jsonOk({
+          environments: [
+            { name: 'staging', secretKeys: ['KEY1'], allowLocalExecution: true, enabled: true },
+          ],
+        }),
+      );
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(kiciDir, { recursive: true });
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const result = await typesCommand({ kiciDir, quiet: true });
+      expect(result).toBe(true);
+      // The "Types generated" line is a direct stdout write — under quiet it
+      // must not fire so a machine-readable caller keeps stdout pure.
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
+    });
   });
 
   describe('handles auth errors', () => {

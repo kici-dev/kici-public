@@ -2,6 +2,34 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.23 — 2026-06-25
+
+### Features
+
+- Typed dispatch inputs: declare a workflow's manual-dispatch parameters with `defineDispatchInputs`, pass a typed `inputs` map on `dispatch()` triggers, and read coerced values via `ctx.dispatchInputs` in steps and rules. Inputs are validated and defaulted against their descriptors before dispatch, and a new repeatable `--input key=value` flag on `kici run local` / `kici run remote` supplies them from the CLI.
+- Ordered fan-out: fan-out children now carry a deterministic position exposed as `ctx.fanout` (index/total) to steps and rules, with `onlyOnFirstHost` / `onlyOnLastHost` / `onlyOnFanoutIndex` rule helpers for run-once-per-fan-out behavior. A new `runsOn.pick` selector deterministically pins a job to a single matching host by agentId.
+- Step retry policy: a step can declare `retry` with `retryIf` and a backoff so a thrown step is retried with computed delays before failing the job. Retries apply across dynamic jobs and `kici run local`.
+- Per-host secret scoping: environment bindings accept a `host_pattern` (exact, glob, or regex over agentId/host/labels), set via `kici-admin environment bind --host`, so a fan-out resolves a different secret value per host with host-specificity precedence. Scope patterns can template `agentId`/`host`/`label` with sanitization.
+- `kici docs llm` now takes a topic argument and emits per-task bundle files behind a router index (the bare command builds the index by default). Relative markdown links are rewritten to absolute docs URLs, and bundles are gated on link-cleanliness, dangling references, size, and coverage.
+- New `checkStep()` — a check-mode-aware sibling of `idempotentStep` for drift-detecting steps. Remote runs now persist the run's check mode on the dispatch path, so `kici run --check --fail-on-drift` correctly fails a remote run that finds configuration drift.
+- Fresh-box bring-up for `runsOnAll`: a new `includeUninitialized` job option fans a job out across declared hosts that have no agent yet. The orchestrator flags declared-but-offline hosts for bring-up and dispatches a synthetic bring-up job for un-agented children, using single-use short-TTL bootstrap tokens and an ephemeral-key SSH seam (`ensureInitRunner` / `preBootSend`) to stand the agent up before the real job runs.
+- Re-declaring a fleet host now converges it to the newly declared labels, hostname, and properties instead of silently no-opping; agent-reported liveness is preserved and the declare result reports whether the host was created or updated.
+- kici run remote --pick opens an interactive multi-select menu of the available fixtures, so you can choose which ones to run without typing their names. Selecting several runs them all through the normal remote pipeline (honoring --parallel).
+- kici run remote now recompiles workflows before dispatching (parity with kici run local)
+
+### Fixes
+
+- `kici run local` now exits with code 2 (not 1) when given an invalid `--input` value, distinguishing bad user input from a workflow failure.
+- Fix `kici run remote` failing with ECONNREFUSED on the bare-metal quickstart when using the container scaler: SeaweedFS is now published off-loopback and the storage config sets an agent-facing external endpoint.
+- `kici run remote` now reports a clear, actionable error when the target orchestrator has no object storage configured (overlay uploads require it), instead of failing with an opaque `Failed to parse URL from` after three retries. The orchestrator refuses to mint an empty upload URL, and the CLI fails fast if it ever receives one.
+- `kici run remote` no longer occasionally drops the last log line of a finished run. A blocking follow could exit the moment the run reached a terminal state while the agent's final log chunk was still being persisted, omitting it from the captured output. The orchestrator now drains a terminal run's in-flight log writes before reporting the log stream complete, so the final line is always included.
+- kici org list now shows org ownership (owner/member) instead of (undefined)
+
+### Documentation
+
+- New authoring docs for typed dispatch inputs (`kici run --input`), ordered fan-out (`ctx.fanout`, run-once helpers, `runsOn.pick`), the step retry policy, per-host secret scoping, `checkStep()`, and `kici docs llm` task bundles.
+- Quickstart troubleshooting: document the kici run remote container-scaler overlay-download failure (ECONNREFUSED on :8333) and the SeaweedFS empty-directory crash-loop, storage-not-configured, and No-jobs-dispatched failure modes in both the bare-metal and Docker/Podman quickstarts; the bare-metal quickstart now documents the three-endpoint storage block + all-interfaces SeaweedFS publish that make kici run remote work with the container scaler.
+
 ## v0.1.22 — 2026-06-24
 
 ### Features

@@ -145,6 +145,33 @@ const deploy = job('deploy', {
 });
 ```
 
+#### Single-host selection: `pick`
+
+When more than one agent matches a `runsOn` selector, the object form's `pick`
+field controls **which** one runs the job:
+
+```typescript
+// Always the same host across re-runs (default — can be omitted)
+runsOn: { labels: ['role:db'], pick: 'deterministic' }
+
+// Any available host (load spread)
+runsOn: { labels: ['role:db'], pick: 'any' }
+```
+
+- **`'deterministic'` (the default)** — the orchestrator sorts the matching
+  agents by their agent id and picks the lowest. A job that must run exactly
+  once on one stable host — a database migration, a backup dump — lands on the
+  **same** host every run. The string and array shorthand forms
+  (`runsOn: 'role:db'`, `runsOn: ['role:db', 'linux']`) inherit this default.
+- **`'any'`** — pick any available matching agent. Use this for jobs that don't
+  need a stable host and benefit from spreading load across an equivalent pool.
+
+**Trade-off:** `'deterministic'` can hot-spot — if many jobs target the same
+label set, they all pin to the same lowest-id agent. Use `'any'` to spread those
+across the pool; keep `'deterministic'` when reproducibility matters more than
+balance. (`pick` selects among **single-agent** candidates; to fan a job out to
+**every** matching host, use [`runsOnAll`](./runs-on-all.md) instead.)
+
 #### Targeting by pattern
 
 Every selector element — in `runsOn`, in `runsOnAll`, on both the include and the exclude side — can be a plain string, a glob pattern, or a regular expression. KiCI picks the matching mode from the value itself:
@@ -514,6 +541,43 @@ export default workflow('ci', {
 - A **workflow** `timeout` is a run-level deadline. The orchestrator records it when the run starts and cancels the run if its wall-clock exceeds the timeout, even when individual jobs and steps are still within their own caps.
 
 Workflow and job timeouts surface with a distinct "timed out" reason so the dashboard labels the run or job as timed out rather than a generic failure or cancel.
+
+### Retries
+
+A step can declare a `retry` policy so a thrown attempt is re-run automatically instead of failing the job on the first error. Use it for genuinely transient failures — a flaky network call, an occasional 503, a dependency that is briefly not ready.
+
+```typescript
+step('publish', {
+  retry: 3, // shorthand for { maxAttempts: 3 } with the defaults below
+  run: async (ctx) => {
+    await ctx.$`pnpm publish`;
+  },
+});
+
+step('fetch-token', {
+  retry: {
+    maxAttempts: 5, // total attempts including the first; must be >= 1
+    delayMs: 500, // base delay between attempts (default 1000)
+    backoff: 'exponential', // 'exponential' (default) or 'fixed'
+    maxDelayMs: 30_000, // cap for exponential growth (default 30000)
+    retryIf: (err) => err instanceof TransientError, // default: retry on any throw
+  },
+  run: async (ctx) => {
+    await fetchToken();
+  },
+});
+```
+
+- **`retry: N`** is shorthand for `{ maxAttempts: N }` with all defaults applied.
+- **Defaults:** `delayMs: 1000`, `backoff: 'exponential'`, `maxDelayMs: 30000`, and "retry on any throw" when no `retryIf` is given.
+- **Backoff.** With `'exponential'`, the wait after the `n`-th attempt (1-based) is `min(delayMs * 2 ** (n - 1), maxDelayMs)` — 1s, 2s, 4s, … capped at `maxDelayMs`. With `'fixed'`, the wait is always `delayMs`.
+- **`retryIf(err)`** runs against the thrown error before each retry; return `false` to stop retrying immediately and let the failure stand.
+- **Timeout is per-attempt.** Each attempt gets the step's full `timeout` budget — a timed-out attempt counts as one failed attempt and is retried while attempts remain. The total wall-clock can therefore approach `maxAttempts * (timeout + delay)`, so keep `maxAttempts` and `maxDelayMs` sane (the job-level `timeout` still bounds the whole job).
+- **Retries exhaust before `continueOnError`.** A step with both retries first; only the _final_ failure is then softened to a warning by `continueOnError`.
+
+`retry` works identically under `kici run local` and on a remote agent, and applies to dynamically-generated job steps too. The `retryIf` predicate is an in-memory function: it is honored at execution time but never serialized into the lock file.
+
+> **Retry vs. wait-until-condition.** `retry` re-runs a step that _throws_. To poll until a condition becomes true (a port listening, a `/health` endpoint returning 200, a unit becoming active), use [`waitForStep`](./wait-for.md) instead — it is purpose-built for declarative wait-for-condition with intervals, a timeout, and on-timeout handling.
 
 ### Output chaining
 

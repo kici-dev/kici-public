@@ -5,6 +5,7 @@
  * Uses the shared mock Kysely builder.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ApprovalDecision } from '@kici-dev/engine';
 
 import { HeldRunStore } from './held-runs.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
@@ -415,6 +416,80 @@ describe('HeldRunStore', () => {
 
       const result = await store.expireOverdue();
       expect(result).toBe(0);
+    });
+  });
+
+  describe('recordAndRelease (atomic record + approve)', () => {
+    it('runs the decision INSERT and the approve UPDATE in one transaction and returns a ReleaseSignal', async () => {
+      const approvedRow = makeHeldRunRow({
+        status: 'approved',
+        hold_scope: 'job',
+        step_index: null,
+        trigger_source: 'environment',
+        resolved_at: new Date('2026-03-08T12:05:00Z'),
+      });
+      // updatedRow drives the UPDATE...returningAll().executeTakeFirst() in flipToApproved.
+      const { db, mocks } = createMockDb({
+        insertedRow: { id: 'appr-1' },
+        updatedRow: approvedRow,
+      });
+      const store = new HeldRunStore(db);
+
+      const signal = await store.recordAndRelease('org-abc', 'hr-001', {
+        approverSub: 'u-alice',
+        decision: ApprovalDecision.enum.approve,
+        clausesSatisfied: [{ team: 'leads' }],
+      });
+
+      expect(mocks.transaction).toHaveBeenCalledTimes(1);
+      expect(mocks.insertInto).toHaveBeenCalledWith('held_run_approvals');
+      expect(mocks.updateTable).toHaveBeenCalledWith('held_runs');
+      expect(signal).toMatchObject({ holdId: 'hr-001', runId: 'run-001', scope: 'job' });
+    });
+
+    it('throws when the hold is not found / not pending (flip returns no row)', async () => {
+      const { db } = createMockDb({ insertedRow: { id: 'appr-1' }, updatedRow: undefined });
+      const store = new HeldRunStore(db);
+      await expect(
+        store.recordAndRelease('org-abc', 'hr-missing', {
+          approverSub: 'u-alice',
+          decision: ApprovalDecision.enum.approve,
+        }),
+      ).rejects.toThrow(/not found or not pending/);
+    });
+  });
+
+  describe('recordAndReject (atomic record + reject)', () => {
+    it('runs the decision INSERT and the reject UPDATE in one transaction and returns the rejected row', async () => {
+      const rejectedRow = makeHeldRunRow({ status: 'rejected', reason: 'no go' });
+      const { db, mocks } = createMockDb({
+        insertedRow: { id: 'appr-2' },
+        updatedRow: rejectedRow,
+      });
+      const store = new HeldRunStore(db);
+
+      const row = await store.recordAndReject(
+        'org-abc',
+        'hr-001',
+        { approverSub: 'u-bob', decision: ApprovalDecision.enum.reject },
+        'no go',
+      );
+
+      expect(mocks.transaction).toHaveBeenCalledTimes(1);
+      expect(mocks.insertInto).toHaveBeenCalledWith('held_run_approvals');
+      expect(mocks.updateTable).toHaveBeenCalledWith('held_runs');
+      expect(row).toMatchObject({ status: 'rejected', reason: 'no go' });
+    });
+
+    it('throws when the hold is not found / not pending (flip returns no row)', async () => {
+      const { db } = createMockDb({ insertedRow: { id: 'appr-2' }, updatedRow: undefined });
+      const store = new HeldRunStore(db);
+      await expect(
+        store.recordAndReject('org-abc', 'hr-missing', {
+          approverSub: 'u-bob',
+          decision: ApprovalDecision.enum.reject,
+        }),
+      ).rejects.toThrow(/not found or not pending/);
     });
   });
 });

@@ -30,11 +30,13 @@ import {
   materializeResolvedMatrix,
   materializeResolvedHosts,
   matrixEnvelopeFields,
+  fanoutEnvelopeFields,
   FanoutError,
   FanoutCause,
   VariantKind,
   partitionMatchers,
   hostSatisfiesTarget,
+  SSH_TRANSPORT_CAPABILITY,
 } from '@kici-dev/engine';
 import type {
   LabelMatcher,
@@ -53,6 +55,7 @@ import type {
   MaterializedJob,
   ResolvedHostAgent,
   UpstreamSnapshot,
+  HostFacts,
 } from '@kici-dev/engine';
 import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/host-roster.js';
 import type { Database } from '../db/types.js';
@@ -250,6 +253,12 @@ export interface WorkflowDispatchContext {
    * runsOnAll ∩ target. Narrow-only. Undefined for webhook runs (no narrowing).
    */
   target?: HostTargetSelector;
+  /**
+   * Resolved (coerced + defaulted + validated) workflow-dispatch inputs from
+   * `kici run --input`. Carried onto every dispatched job's request so the agent
+   * exposes them as `ctx.dispatchInputs`. Undefined for webhook runs.
+   */
+  dispatchInputs?: Record<string, unknown>;
 }
 
 export interface DispatchMatchedWorkflowResult {
@@ -292,6 +301,14 @@ interface DispatchSetup {
   effectiveDeliveryId: string;
   workflowConcurrency: { cancelInProgress?: boolean; max?: number } | undefined;
   workflowTimeoutMs: number | undefined;
+  /**
+   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`),
+   * carried on `ctx.extraJobConfig` by the test-trigger / `kici run --check`
+   * path. Persisted onto the `execution_runs` row so `computeRunStatus` can
+   * fail a `check-fail-on-drift` run that detected drift. Undefined for the
+   * default apply-mode webhook path.
+   */
+  checkMode: string | undefined;
 }
 
 interface BuildPrepResult {
@@ -478,6 +495,11 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
 
   const workflowTimeoutMs = workflow.timeout;
 
+  // The test-trigger / `kici run --check` path stamps the run mode onto
+  // ctx.extraJobConfig.checkMode; surface it so onExecutionStarted persists it.
+  const rawCheckMode = ctx.extraJobConfig?.checkMode;
+  const checkMode = typeof rawCheckMode === 'string' ? rawCheckMode : undefined;
+
   if (deps.onSourceLocationsExtracted) {
     for (const job of workflow.jobs.filter(isLockStaticJob)) {
       const locs = job.steps.map((s) => s.sourceLocation);
@@ -510,7 +532,14 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
     });
   }
 
-  return { dispatcher, info, effectiveDeliveryId, workflowConcurrency, workflowTimeoutMs };
+  return {
+    dispatcher,
+    info,
+    effectiveDeliveryId,
+    workflowConcurrency,
+    workflowTimeoutMs,
+    checkMode,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +672,75 @@ function buildBuildJobInput(args: {
 }
 
 /**
+ * Build the QueuedJobInput for a synthetic `__bringup__` job: the orchestrator
+ * dispatches one per declared-but-un-agented `includeUninitialized` child to an
+ * agent holding `kici:capability:ssh-transport`, which runs the agent-side
+ * `ensureInitRunner(targetAgentId)` over SSH. The init-runner then connects
+ * under `targetAgentId`, and the child's pinned-hold (already queued with that
+ * pin) drains its bootstrap steps onto it. The bring-up job clones nothing and
+ * runs no sandbox (`bringupOnly`).
+ */
+export function buildBringupJobInput(args: {
+  ctx: WorkflowDispatchContext;
+  setup: DispatchSetup;
+  targetAgentId: string;
+}): QueuedJobInput {
+  const { ctx, setup, targetAgentId } = args;
+  const { workflow } = ctx;
+  return {
+    runId: ctx.runId,
+    workflowName: workflow.name,
+    jobName: `__bringup__${workflow.name}__${targetAgentId}`,
+    runsOnLabels: [SSH_TRANSPORT_CAPABILITY],
+    jobConfig: {
+      bringupOnly: true,
+      bringupTarget: targetAgentId,
+      workflowName: workflow.name,
+    },
+    repoUrl: '',
+    ref: ctx.event.sourceBranch ?? ctx.event.targetBranch,
+    sha: ctx.ref,
+    deliveryId: setup.effectiveDeliveryId,
+    provider: setup.info.provider,
+    providerContext: ctx.credentials as Record<string, unknown>,
+    routingKey: setup.info.routingKey,
+    requestId: getRequestContext().requestId,
+  };
+}
+
+/**
+ * Dispatch the synthetic `__bringup__` job for one un-agented fan-out child. The
+ * bring-up runs on an ssh-transport ops agent; if none is connected, the
+ * bring-up job queues with its label pin and the held target child times out via
+ * the normal queue path. Best-effort: a bring-up dispatch failure is logged, not
+ * thrown — the held child surfaces the timeout if no init-runner ever connects.
+ */
+async function dispatchBringupForChild(args: {
+  ctx: WorkflowDispatchContext;
+  setup: DispatchSetup;
+  mat: MaterializedJob;
+}): Promise<void> {
+  const { ctx, setup, mat } = args;
+  const targetAgentId = mat.pinnedAgentId!;
+  const bringupInput = buildBringupJobInput({ ctx, setup, targetAgentId });
+  try {
+    const result = await setup.dispatcher.dispatch(bringupInput);
+    logger.info('Dispatched init-runner bring-up for un-agented fan-out child', {
+      runId: ctx.runId,
+      workflow: ctx.workflow.name,
+      targetAgentId,
+      bringupStatus: result.status,
+    });
+  } catch (err) {
+    logger.warn('Failed to dispatch init-runner bring-up', {
+      runId: ctx.runId,
+      targetAgentId,
+      error: toErrorMessage(err),
+    });
+  }
+}
+
+/**
  * Run the build job and track its result. Returns the build job metadata or
  * sentinel values when the build fails. Mutates execution-tracker rows so
  * downstream phases can attach execution_jobs to a real run.
@@ -732,6 +830,7 @@ async function runBuildJob(args: {
             undefined,
             setup.workflowConcurrency,
             setup.workflowTimeoutMs,
+            setup.checkMode,
           );
           await deps.executionTracker.failRun(runId, reason, {
             scope: 'run',
@@ -764,6 +863,7 @@ async function runBuildJob(args: {
           undefined,
           setup.workflowConcurrency,
           setup.workflowTimeoutMs,
+          setup.checkMode,
         );
         buildJobTrackedEarly = true;
       }
@@ -959,6 +1059,12 @@ export async function resolveHostFanoutTargets(
   }
   const predicate = lockJob.runsOnAll!;
   const onUnreachable = lockJob.onUnreachable ?? 'hold';
+  // `includeUninitialized` widens the fan-out to declared-but-un-agented hosts:
+  // each unreachable static host becomes a bring-up target (its child is held
+  // until a temporary init-runner connects under the same agentId) rather than
+  // being subject to the `onUnreachable` policy. A live host runs on its own
+  // agent. Default (absent) ⇒ today's `onUnreachable` semantics, no bring-up.
+  const includeUninitialized = lockJob.includeUninitialized === true;
   const matched = await deps.hostRosterStore.findMatching(
     predicate.include,
     predicate.exclude,
@@ -974,12 +1080,15 @@ export async function resolveHostFanoutTargets(
   const targetNarrowedToZero = !!target && matched.length > 0 && candidates.length === 0;
 
   const targets: MatchedHost[] = [];
+  const bringupTargets: MatchedHost[] = [];
   const unreachableDurable: MatchedHost[] = [];
   for (const h of candidates) {
     if (h.status === HostStatus.ready) {
       targets.push(h);
     } else if (h.lifecycleClass === 'ephemeral') {
       continue; // stale ephemeral (scaled down) → skip, never policy-controlled
+    } else if (includeUninitialized) {
+      bringupTargets.push(h); // static + not live + opted into bring-up
     } else {
       unreachableDurable.push(h); // static + not currently live
     }
@@ -1000,6 +1109,7 @@ export async function resolveHostFanoutTargets(
       skippedUnreachable = true; // 'skip' → omit them
     }
   }
+  targets.push(...bringupTargets); // bring-up targets always run (init-or-not)
 
   if (targets.length === 0) {
     if (targetNarrowedToZero) {
@@ -1023,6 +1133,7 @@ export async function resolveHostFanoutTargets(
     );
   }
 
+  const bringupIds = new Set(bringupTargets.map((h) => h.agentId));
   return targets.map((h) => ({
     agentId: h.agentId,
     host: h.host,
@@ -1030,6 +1141,7 @@ export async function resolveHostFanoutTargets(
     platform: h.platform ?? undefined,
     arch: h.arch ?? undefined,
     connectedInstanceId: h.connectedInstanceId,
+    needsBringup: bringupIds.has(h.agentId),
   }));
 }
 
@@ -1123,8 +1235,9 @@ export interface WavePlan {
  * Compute the rolling-wave plan for a materialized job set.
  *
  * For each base job declaring `maxParallel` whose fan-out produced more than one
- * child, children are ordered deterministically by `variant_label` (the matrix
- * suffix / hostname, via `expandedName`) and every child at index `>=
+ * child, children are ordered deterministically by `fanoutIndex` (the
+ * agentId / variant-label rank assigned at materialization; falling back to
+ * `expandedName` for children with no index) and every child at index `>=
  * maxParallel` is held (`wave_gated=true`). The first `maxParallel` dispatch
  * immediately; held children release one-per-terminal via the wave-scheduler.
  * Every child of a bounded-wave base — held or not — gets a `policy` entry so
@@ -1144,7 +1257,13 @@ export function computeWavePlan(materializedJobs: readonly MaterializedJob[]): W
     const maxParallel = children[0]?.lockJob.maxParallel;
     if (maxParallel === undefined || children.length <= 1) continue;
     const failFast = children[0]?.lockJob.failFast ?? false;
-    const ordered = [...children].sort((a, b) => a.expandedName.localeCompare(b.expandedName));
+    // Order by the deterministic fan-out index so wave-release order == child
+    // index; fall back to expandedName for children without an index.
+    const ordered = [...children].sort((a, b) =>
+      a.fanoutIndex !== undefined && b.fanoutIndex !== undefined
+        ? a.fanoutIndex - b.fanoutIndex
+        : a.expandedName.localeCompare(b.expandedName),
+    );
     ordered.forEach((mat, i) => {
       policy.set(mat.expandedName, { maxParallel, failFast });
       if (i >= maxParallel) held.add(mat.expandedName);
@@ -1747,6 +1866,23 @@ function buildExplicitWorkflowHold(
 }
 
 /**
+ * Build the per-host secret-resolution context for a materialized child. A
+ * `runsOnAll` host child carries its identity on `mat.agent` (preferred) or
+ * `mat.pinnedAgentId`/`mat.host`; a non-host child (matrix/static) has none, so
+ * resolution stays fleet-wide (`'**'`-only). Returns `undefined` when there are
+ * no host facts to scope by.
+ */
+export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
+  if (mat.agent) {
+    return { agentId: mat.agent.agentId, host: mat.agent.host, labels: mat.agent.labels };
+  }
+  if (mat.pinnedAgentId) {
+    return { agentId: mat.pinnedAgentId, host: mat.host ?? mat.pinnedAgentId, labels: [] };
+  }
+  return undefined;
+}
+
+/**
  * Apply per-job environment data: protection rules, hold creation, environment
  * variables, and per-job secret resolution. Mutates `jobEnvData` in place.
  */
@@ -1756,8 +1892,9 @@ async function applyEnvironmentRulesAndSecrets(args: {
   environmentName: string;
   concurrencyGroup: string | undefined;
   jobEnvData: JobEnvData;
+  hostCtx?: HostFacts;
 }): Promise<void> {
-  const { ctx, lockJob, environmentName, concurrencyGroup, jobEnvData } = args;
+  const { ctx, lockJob, environmentName, concurrencyGroup, jobEnvData, hostCtx } = args;
   const { deps, repoIdentifier, credentials, event, ref, runId, workflow, resolvedOrgId, bundle } =
     ctx;
   const { trustResolution } = ctx;
@@ -1886,7 +2023,11 @@ async function applyEnvironmentRulesAndSecrets(args: {
   }
   if (deps.secretResolver && !jobEnvData.rejected && !jobEnvData.held) {
     try {
-      const envSecrets = await deps.secretResolver.resolveForJob(resolvedOrgId, environmentName);
+      const envSecrets = await deps.secretResolver.resolveForJob(
+        resolvedOrgId,
+        environmentName,
+        hostCtx,
+      );
       if (Object.keys(envSecrets).length > 0) {
         jobEnvData.jobSecrets = envSecrets;
         jobEnvData.jobNamespacedSecrets = { [environmentName]: envSecrets };
@@ -1981,6 +2122,7 @@ async function evaluateJobEnvironments(args: {
         environmentName,
         concurrencyGroup,
         jobEnvData,
+        hostCtx: hostCtxFromMat(mat),
       });
     }
     // Explicit SDK requireApproval on a job with no environment-driven hold:
@@ -2048,6 +2190,12 @@ function makeBuildJobConfig(args: {
    * CLI `--secret` / `--env` flat secrets). Undefined for webhook runs.
    */
   runWideFlatSecrets: Record<string, string> | undefined;
+  /**
+   * Resolved (coerced + defaulted) workflow-dispatch inputs from `kici run
+   * --input`, stamped onto every job's config so the agent exposes them as
+   * `ctx.dispatchInputs`. Undefined for webhook runs.
+   */
+  dispatchInputs: Record<string, unknown> | undefined;
 }): BuildJobConfigFn {
   const {
     workflow,
@@ -2064,6 +2212,7 @@ function makeBuildJobConfig(args: {
     cacheRefScope,
     omitContentHash,
     runWideFlatSecrets,
+    dispatchInputs,
   } = args;
   return (mat: MaterializedJob): Record<string, unknown> => {
     const lockJob = mat.lockJob;
@@ -2090,6 +2239,8 @@ function makeBuildJobConfig(args: {
       name: mat.expandedName,
       baseJobName: mat.baseName,
       ...(mat.variantValues && { matrixValues: mat.variantValues }),
+      // Operator dispatch inputs (run-scoped, identical for every job).
+      ...(dispatchInputs && { dispatchInputs }),
       // Host fan-out: expose the per-host identity as ctx.host / ctx.agent.
       ...(mat.host && { host: mat.host }),
       ...(mat.agent && {
@@ -2100,6 +2251,11 @@ function makeBuildJobConfig(args: {
           ...(mat.agent.arch && { arch: mat.agent.arch }),
         },
       }),
+      // Fan-out position: expose the deterministic ordinal as ctx.fanout.
+      ...fanoutEnvelopeFields(mat),
+      // Single-agent selection policy (read by the dispatcher at selection time;
+      // the agent ignores it). Defaults to deterministic when the lock omits it.
+      ...(lockJob.runsOnPick && { runsOnPick: lockJob.runsOnPick }),
       steps: lockJob.steps,
       needs: lockJob.needs,
       rules: lockJob.rules,
@@ -2682,6 +2838,15 @@ async function dispatchSingleOrchPath(args: {
       continue;
     }
 
+    // Fresh-box convergence: an `includeUninitialized` child pinned to a
+    // declared-but-un-agented host gets a synthetic `__bringup__` job dispatched
+    // to an ssh-transport ops agent FIRST. That brings up a temporary init-runner
+    // (it enrolls under `mat.pinnedAgentId`), and the child below — queued with
+    // the same pin by `dispatchPinned` — drains onto it via `onAgentAvailable`.
+    if (mat.needsBringup && mat.pinnedAgentId) {
+      await dispatchBringupForChild({ ctx, setup, mat });
+    }
+
     const result = await setup.dispatcher.dispatch(jobInput);
     if (result.status === 'rejected') {
       const syntheticId = `rejected-${randomUUID()}`;
@@ -2851,6 +3016,7 @@ async function recordRunStart(args: {
       undefined,
       setup.workflowConcurrency,
       setup.workflowTimeoutMs,
+      setup.checkMode,
     );
   }
   if (runEnvironmentName && deps.db) {
@@ -2968,8 +3134,9 @@ async function applyInitResultEnvironment(args: {
   lockJob: LockJob;
   initResult: { environmentName?: string; env?: Record<string, string> } | undefined;
   jobEnvData: JobEnvData;
+  hostCtx?: HostFacts;
 }): Promise<void> {
-  const { ctx, lockJob, initResult, jobEnvData } = args;
+  const { ctx, lockJob, initResult, jobEnvData, hostCtx } = args;
   const { deps, runId, resolvedOrgId } = ctx;
   if (lockJob.dynamicEnvironment && initResult?.environmentName !== undefined) {
     jobEnvData.environmentName = initResult.environmentName;
@@ -2995,6 +3162,7 @@ async function applyInitResultEnvironment(args: {
             const envSecrets = await deps.secretResolver.resolveForJob(
               resolvedOrgId,
               initResult.environmentName,
+              hostCtx,
             );
             if (Object.keys(envSecrets).length > 0) {
               jobEnvData.jobSecrets = envSecrets;
@@ -3254,7 +3422,13 @@ function startDeferredInitDispatch(args: {
         const initResult = await pendingInits.track(dispatchResult.jobId);
         const jobEnvData = jobEnvironmentData.get(mat.expandedName) ?? {};
         jobEnvData.pendingInit = false;
-        await applyInitResultEnvironment({ ctx, lockJob, initResult, jobEnvData });
+        await applyInitResultEnvironment({
+          ctx,
+          lockJob,
+          initResult,
+          jobEnvData,
+          hostCtx: hostCtxFromMat(mat),
+        });
         jobEnvironmentData.set(mat.expandedName, jobEnvData);
         if (mat.pendingDynamicMatrix && initResult.matrixValues) {
           // The agent resolved the dynamic matrix to N combinations — materialize
@@ -3588,6 +3762,7 @@ async function resolveGeneratedJobConfigs(args: {
               const envSecrets = await deps.secretResolver.resolveForJob(
                 resolvedOrgId,
                 genJob.environment,
+                hostCtxFromMat(mat),
               );
               if (Object.keys(envSecrets).length > 0) {
                 genSecrets = { ...genSecrets, ...envSecrets };
@@ -4564,6 +4739,7 @@ async function ensureExecutionRunForDeferred(args: {
     undefined,
     setup.workflowConcurrency,
     setup.workflowTimeoutMs,
+    setup.checkMode,
   );
 }
 
@@ -4740,6 +4916,7 @@ export async function dispatchMatchedWorkflow(
     cacheRefScope: deriveCacheRefScope(ctx.trustResolution),
     omitContentHash: !!ctx.testRun,
     runWideFlatSecrets: ctx.runWideFlatSecrets,
+    dispatchInputs: ctx.dispatchInputs,
   });
 
   const dispatchedJobs: DispatchedJob[] = [];

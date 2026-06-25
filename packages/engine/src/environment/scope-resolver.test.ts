@@ -33,11 +33,17 @@ describe('matchScopePattern', () => {
 });
 
 describe('resolveSecretsForEnvironment', () => {
-  const makeBinding = (id: string, envId: string, scopePattern: string): EnvironmentBinding => ({
+  const makeBinding = (
+    id: string,
+    envId: string,
+    scopePattern: string,
+    hostPattern = '**',
+  ): EnvironmentBinding => ({
     id,
     orgId: 'org1',
     environmentId: envId,
     scopePattern,
+    hostPattern,
     createdAt: '2026-01-01',
   });
 
@@ -149,11 +155,17 @@ describe('matchScopePattern with prefixed scopes', () => {
 });
 
 describe('resolveSecretsForEnvironment with prefixed scopes', () => {
-  const makeBinding = (id: string, envId: string, scopePattern: string): EnvironmentBinding => ({
+  const makeBinding = (
+    id: string,
+    envId: string,
+    scopePattern: string,
+    hostPattern = '**',
+  ): EnvironmentBinding => ({
     id,
     orgId: 'org1',
     environmentId: envId,
     scopePattern,
+    hostPattern,
     createdAt: '2026-01-01',
   });
 
@@ -218,5 +230,97 @@ describe('resolveSecretsForEnvironment with prefixed scopes', () => {
     const result = resolveSecretsForEnvironment(bindings, secrets, decryptFn);
     // Same depth (2 segments after prefix strip), first encountered wins (stable)
     expect(result).toEqual({ DB_PASSWORD: 'decrypted:pg-value' });
+  });
+});
+
+describe('resolveSecretsForEnvironment — per-host scoping', () => {
+  const makeBinding = (
+    id: string,
+    scopePattern: string,
+    hostPattern = '**',
+  ): EnvironmentBinding => ({
+    id,
+    orgId: 'org1',
+    environmentId: 'env1',
+    scopePattern,
+    hostPattern,
+    createdAt: '2026-01-01',
+  });
+
+  const makeSecret = (id: string, scope: string, key: string, value: string): ScopedSecret => ({
+    id,
+    orgId: 'org1',
+    scope,
+    key,
+    encryptedValue: value,
+    backendType: 'pg',
+    keyVersion: 1,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+  });
+
+  const id = (s: ScopedSecret): string => s.encryptedValue;
+  const f2 = { agentId: 'box-00002', host: 'box-00002', labels: ['role:db'] };
+  const f3 = { agentId: 'box-00003', host: 'box-00003', labels: ['role:db'] };
+
+  it('templated scope resolves each host its own subtree (one binding, N hosts)', () => {
+    const bindings = [
+      makeBinding('1', 'prod/shared/**'),
+      makeBinding('2', 'prod/hosts/${agentId}/**'),
+    ];
+    const secrets = [
+      makeSecret('s0', 'pg:prod/shared', 'REPL', 'shared'),
+      makeSecret('s2', 'pg:prod/hosts/box-00002', 'WG', 'wg-for-2'),
+      makeSecret('s3', 'pg:prod/hosts/box-00003', 'WG', 'wg-for-3'),
+    ];
+    const r2 = resolveSecretsForEnvironment(bindings, secrets, id, f2);
+    const r3 = resolveSecretsForEnvironment(bindings, secrets, id, f3);
+    expect(r2).toEqual({ REPL: 'shared', WG: 'wg-for-2' });
+    expect(r3).toEqual({ REPL: 'shared', WG: 'wg-for-3' });
+  });
+
+  it('host_pattern gates which hosts a binding applies to', () => {
+    const bindings = [makeBinding('1', 'prod/db/**', 'role:db')];
+    const secrets = [makeSecret('s1', 'pg:prod/db', 'PG', 'pg-secret')];
+    expect(resolveSecretsForEnvironment(bindings, secrets, id, f2).PG).toBe('pg-secret');
+    const web = { agentId: 'web-1', host: 'web-1', labels: ['role:web'] };
+    expect(resolveSecretsForEnvironment(bindings, secrets, id, web).PG).toBeUndefined();
+  });
+
+  it('a per-host binding overrides a fleet-wide one for a colliding key', () => {
+    const bindings = [
+      makeBinding('1', 'prod/shared/**', '**'),
+      makeBinding('2', 'prod/hosts/box-00002/**', 'box-00002'),
+    ];
+    const secrets = [
+      makeSecret('s1', 'pg:prod/shared', 'WG', 'shared'),
+      makeSecret('s2', 'pg:prod/hosts/box-00002', 'WG', 'host2'),
+    ];
+    expect(resolveSecretsForEnvironment(bindings, secrets, id, f2).WG).toBe('host2');
+  });
+
+  it('without hostFacts, only ** bindings resolve and templated scopes are skipped', () => {
+    const bindings = [
+      makeBinding('1', 'prod/shared/**', '**'),
+      makeBinding('2', 'prod/hosts/box-00002/**', 'box-00002'),
+      makeBinding('3', 'prod/hosts/${agentId}/**', '**'),
+    ];
+    const secrets = [
+      makeSecret('s1', 'pg:prod/shared', 'REPL', 'shared'),
+      makeSecret('s2', 'pg:prod/hosts/box-00002', 'WG', 'host2'),
+    ];
+    const out = resolveSecretsForEnvironment(bindings, secrets, id);
+    // The ** + non-templated binding contributes REPL; the host-gated and the
+    // templated binding both resolve to nothing without host facts.
+    expect(out).toEqual({ REPL: 'shared' });
+  });
+
+  it('skips a templated binding for a host whose label is missing', () => {
+    const bindings = [makeBinding('1', 'prod/racks/${label:rack}/**')];
+    const secrets = [makeSecret('s1', 'pg:prod/racks/r12', 'K', 'v')];
+    // f2 has no rack label → binding contributes nothing.
+    expect(resolveSecretsForEnvironment(bindings, secrets, id, f2)).toEqual({});
+    const withRack = { ...f2, labels: ['rack:r12'] };
+    expect(resolveSecretsForEnvironment(bindings, secrets, id, withRack).K).toBe('v');
   });
 });

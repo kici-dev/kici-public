@@ -55,6 +55,9 @@ import * as m047 from './migrations/047_needs_run_on.js';
 import * as m048 from './migrations/048_host_reboot_pending.js';
 import * as m049 from './migrations/049_held_runs_payload.js';
 import * as m050 from './migrations/050_sources_slug.js';
+import * as m051 from './migrations/051_binding_host_pattern.js';
+import * as m052 from './migrations/052_host_reach_metadata.js';
+import * as m053 from './migrations/053_agent_token_single_use.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -110,6 +113,9 @@ export function createMigrationProvider(): MigrationProvider {
         '048_host_reboot_pending': m048,
         '049_held_runs_payload': m049,
         '050_sources_slug': m050,
+        '051_binding_host_pattern': m051,
+        '052_host_reach_metadata': m052,
+        '053_agent_token_single_use': m053,
       };
     },
   };

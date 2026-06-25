@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { job } from './job.js';
 import { step } from './step.js';
 import { rule } from './rules/index.js';
@@ -130,6 +130,30 @@ describe('job()', () => {
       });
       expect(patch.runsOnAll).toEqual(['role:web', '!kici:host:web-01']);
       expect(patch.onUnreachable).toBe('fail');
+    });
+
+    it('threads includeUninitialized alongside runsOnAll', () => {
+      const converge = job('converge', {
+        runsOnAll: 'kici:role:test',
+        includeUninitialized: true,
+        steps: [checkoutStep],
+      });
+      expect(converge.runsOnAll).toBe('kici:role:test');
+      expect(converge.includeUninitialized).toBe(true);
+    });
+
+    it('leaves includeUninitialized undefined when omitted', () => {
+      const patch = job('patch', { runsOnAll: 'role:web', steps: [checkoutStep] });
+      expect(patch.includeUninitialized).toBeUndefined();
+    });
+
+    it('warns when includeUninitialized is set without runsOnAll', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      job('bad', { runsOn: 'linux', includeUninitialized: true, steps: [checkoutStep] });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('includeUninitialized is ignored without runsOnAll'),
+      );
+      warn.mockRestore();
     });
 
     it('throws when both runsOn and runsOnAll are set', () => {

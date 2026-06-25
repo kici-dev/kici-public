@@ -23,12 +23,14 @@ import {
   jobComplete,
   genericWebhook,
   rule,
+  z,
 } from '@kici-dev/sdk';
 import * as sdk from '@kici-dev/sdk';
 
 // delete is a reserved word -- access via namespace
 const del = sdk['delete'];
 import { generateLockFile, transformTriggers } from './generator.js';
+import type { LockDispatchTrigger } from '@kici-dev/engine';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { SCHEMA_VERSION, type WorkflowWithSource } from '../types.js';
 
@@ -196,6 +198,27 @@ describe('generator - agent execution fields', () => {
       if (lockJob._type === 'static') {
         expect(lockJob.steps[0].continueOnError).toBe(true);
         expect(lockJob.steps[0].timeout).toBe(120000);
+      }
+    });
+
+    it('serializes the retry data subset to LockStep without retryIf', () => {
+      const s = step('flaky', {
+        run: async () => {},
+        retry: { maxAttempts: 4, retryIf: () => true },
+      });
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.steps[0].retry).toEqual({
+          maxAttempts: 4,
+          delayMs: 1000,
+          backoff: 'exponential',
+          maxDelayMs: 30000,
+        });
+        expect(lockJob.steps[0].retry).not.toHaveProperty('retryIf');
       }
     });
 
@@ -460,14 +483,53 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 22', () => {
+  it('schemaVersion is 26', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(22);
-    expect(SCHEMA_VERSION).toBe(22);
+    expect(lockFile.schemaVersion).toBe(26);
+    expect(SCHEMA_VERSION).toBe(26);
+  });
+
+  it('serializes runsOnPick: deterministic by default and any when set', () => {
+    const def = job('a', { runsOn: 'linux', steps: [step('s', async () => {})] });
+    const opt = job('b', {
+      runsOn: { labels: ['role:db'], pick: 'any' },
+      steps: [step('s', async () => {})],
+    });
+    const w = workflow('ci', { jobs: [def, opt] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const byName = Object.fromEntries(
+      lockFile.workflows[0].jobs
+        .filter((jj): jj is Extract<typeof jj, { _type: 'static' }> => jj._type === 'static')
+        .map((jj) => [jj.name, jj]),
+    );
+    expect(byName.a.runsOnPick).toBe('deterministic');
+    expect(byName.b.runsOnPick).toBe('any');
+  });
+});
+
+describe('generator - dispatch inputs descriptors', () => {
+  it('serializes dispatch inputs to descriptors', () => {
+    const [t] = transformTriggers([
+      dispatch({ types: ['deploy'], inputs: { skipCveScan: z.boolean().default(false) } }),
+    ]);
+    expect((t as LockDispatchTrigger).inputs).toEqual({
+      skipCveScan: { type: 'boolean', optional: false, nullable: false, default: false },
+    });
+  });
+
+  it('omits inputs when none declared', () => {
+    const [t] = transformTriggers([dispatch({ types: ['deploy'] })]);
+    expect((t as LockDispatchTrigger).inputs).toBeUndefined();
+  });
+
+  it('rejects a non-subset input schema at compile', () => {
+    expect(() =>
+      transformTriggers([dispatch({ types: ['x'], inputs: { bad: z.object({ a: z.string() }) } })]),
+    ).toThrow(/bad/);
   });
 });
 
@@ -2035,6 +2097,30 @@ describe('generator - runsOn normalization and validation', () => {
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
         expect(lockJob.onUnreachable).toBe('fail');
+      }
+    });
+
+    it('lowers includeUninitialized alongside runsOnAll', () => {
+      const j = job('converge', {
+        runsOnAll: 'kici:role:test',
+        includeUninitialized: true,
+        steps: [step('s', async () => {})],
+      });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.includeUninitialized).toBe(true);
+      }
+    });
+
+    it('omits includeUninitialized when not set', () => {
+      const j = job('patch', { runsOnAll: 'role:web', steps: [step('s', async () => {})] });
+      const w = workflow('ci', { jobs: [j] });
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.includeUninitialized).toBeUndefined();
       }
     });
 

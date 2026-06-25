@@ -350,4 +350,33 @@ describe('step()', () => {
       expect(s.name).toBe('');
     });
   });
+
+  describe('retry', () => {
+    it('expands retry: 3 to a normalized config with defaults', () => {
+      const s = step('flaky', { run: async () => {}, retry: 3 });
+      expect(s.retry).toMatchObject({
+        maxAttempts: 3,
+        delayMs: 1000,
+        backoff: 'exponential',
+        maxDelayMs: 30000,
+      });
+    });
+    it('preserves a full retry config incl. retryIf', () => {
+      const pred = (e: unknown) => e instanceof Error;
+      const s = step('flaky', {
+        run: async () => {},
+        retry: { maxAttempts: 5, delayMs: 200, backoff: 'fixed', retryIf: pred },
+      });
+      expect(s.retry).toMatchObject({
+        maxAttempts: 5,
+        delayMs: 200,
+        backoff: 'fixed',
+        maxDelayMs: 30000,
+      });
+      expect(s.retry?.retryIf).toBe(pred);
+    });
+    it('omits retry when not set', () => {
+      expect(step('x', { run: async () => {} }).retry).toBeUndefined();
+    });
+  });
 });

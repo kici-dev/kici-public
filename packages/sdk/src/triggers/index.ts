@@ -25,9 +25,12 @@ export { jobComplete } from './job-complete.js';
 export { genericWebhook } from './generic-webhook.js';
 export { schedule } from './schedule.js';
 export { lifecycle } from './lifecycle.js';
+export { defineDispatchInputs } from './dispatch-inputs.js';
+export type { DefinedDispatchInputs, InferDispatchInputs } from './dispatch-inputs.js';
 
 // Types
 export type {
+  DispatchInputsMap,
   BranchPattern,
   BodyMatchPattern,
   PrEvent,

@@ -41,6 +41,7 @@ function makeBinding(overrides: Partial<EnvironmentBinding> = {}): EnvironmentBi
     orgId: 'org-1',
     environmentId: 'env-1',
     scopePattern: 'pg:aws/prod/**',
+    hostPattern: '**',
     createdAt: '2026-01-01T00:00:00Z',
     ...overrides,
   };
@@ -507,6 +508,74 @@ describe('SecretResolver', () => {
       expect(logCall.secretKeys).toEqual(['forgejo-pat']);
       expect(logCall.outcome).toBe('allowed');
       expect(logCall.metadata.backend).toBe('pg');
+    });
+  });
+
+  describe('per-host resolution (hostCtx)', () => {
+    function seedHostScopedEnv() {
+      envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
+      bindingStore.getByEnvironmentId.mockResolvedValue([
+        makeBinding({ scopePattern: 'pg:prod/shared/**', hostPattern: '**' }),
+        makeBinding({
+          id: 'bind-2',
+          scopePattern: 'pg:prod/hosts/${agentId}/**',
+          hostPattern: '**',
+        }),
+      ]);
+      secretStore.getAllSecrets.mockResolvedValue([
+        makeScopedSecret({ scope: 'prod/shared', key: 'REPL', encryptedValue: 'enc:shared' }),
+        makeScopedSecret({
+          id: 'sec-2',
+          scope: 'prod/hosts/box-00002',
+          key: 'WG',
+          encryptedValue: 'enc:wg-2',
+        }),
+        makeScopedSecret({
+          id: 'sec-3',
+          scope: 'prod/hosts/box-00003',
+          key: 'WG',
+          encryptedValue: 'enc:wg-3',
+        }),
+      ]);
+      secretStore.decrypt.mockImplementation((s: ScopedSecret) =>
+        s.encryptedValue.replace('enc:', ''),
+      );
+    }
+
+    it('resolves a different per-host value for the same key via one templated binding', async () => {
+      seedHostScopedEnv();
+      const resolver = createResolver();
+      const r2 = await resolver.resolveForJob('org-1', 'production', {
+        agentId: 'box-00002',
+        host: 'box-00002',
+        labels: [],
+      });
+      const r3 = await resolver.resolveForJob('org-1', 'production', {
+        agentId: 'box-00003',
+        host: 'box-00003',
+        labels: [],
+      });
+      expect(r2).toEqual({ REPL: 'shared', WG: 'wg-2' });
+      expect(r3).toEqual({ REPL: 'shared', WG: 'wg-3' });
+    });
+
+    it('without hostCtx, the templated binding is skipped (only ** non-templated resolves)', async () => {
+      seedHostScopedEnv();
+      const resolver = createResolver();
+      const result = await resolver.resolveForJob('org-1', 'production');
+      expect(result).toEqual({ REPL: 'shared' });
+    });
+
+    it('resolveForJobWithMeta threads hostCtx and reports the host-scoped backend/scope', async () => {
+      seedHostScopedEnv();
+      const resolver = createResolver();
+      const meta = await resolver.resolveForJobWithMeta('org-1', 'production', {
+        agentId: 'box-00002',
+        host: 'box-00002',
+        labels: [],
+      });
+      expect(meta.WG?.value).toBe('wg-2');
+      expect(meta.WG?.scope).toBe('pg:prod/hosts/box-00002');
     });
   });
 });

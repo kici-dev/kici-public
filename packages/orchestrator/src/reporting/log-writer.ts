@@ -27,11 +27,35 @@ export class LogWriter {
   private readonly logStorage: LogStorage;
   private readonly observerRegistry?: ObserverRegistry;
   private readonly isTestRun?: (runId: string) => boolean;
+  /**
+   * In-flight `logStorage.append` promises, keyed by runId. `appendChunk` is
+   * called fire-and-forget from the agent WS handler (it does not await the
+   * storage write), so a run can flip to a terminal status while the final
+   * log chunk's append is still pending. `drain(runId)` lets a reader (the
+   * test-run logs cursor endpoint) wait for those pending writes before it
+   * reports the stream as fully drained — without this, the `done` flag can
+   * be returned `true` while the last user-visible log line is not yet on
+   * disk, dropping it from a blocking `kici run remote` follow.
+   */
+  private readonly pendingAppends = new Map<string, Set<Promise<void>>>();
 
   constructor(deps: LogWriterDeps) {
     this.logStorage = deps.logStorage;
     this.observerRegistry = deps.observerRegistry;
     this.isTestRun = deps.isTestRun;
+  }
+
+  /**
+   * Await every in-flight log append for `runId` that was registered before
+   * this call. Settles even if an append rejected (errors are already logged
+   * by `appendChunk`); the point is ordering, not error propagation. New
+   * appends started after this call are not waited on — a terminal run emits
+   * no further chunks, so the snapshot taken at call time is complete.
+   */
+  async drain(runId: string): Promise<void> {
+    const pending = this.pendingAppends.get(runId);
+    if (!pending || pending.size === 0) return;
+    await Promise.allSettled([...pending]);
   }
 
   /**
@@ -93,14 +117,34 @@ export class LogWriter {
       );
     }
 
-    try {
-      await this.logStorage.append(path, data);
-    } catch (err) {
-      logger.error('Failed to append log chunk', {
-        path,
-        lineCount: lines.length,
-        error: toErrorMessage(err),
-      });
+    // Track this append so a terminal-run reader can drain it before claiming
+    // the log stream is complete. The handler that calls us does not await this
+    // method, so the write would otherwise race the run-status transition.
+    const appendPromise = (async () => {
+      try {
+        await this.logStorage.append(path, data);
+      } catch (err) {
+        logger.error('Failed to append log chunk', {
+          path,
+          lineCount: lines.length,
+          error: toErrorMessage(err),
+        });
+      }
+    })();
+
+    let runPending = this.pendingAppends.get(runId);
+    if (!runPending) {
+      runPending = new Set();
+      this.pendingAppends.set(runId, runPending);
     }
+    runPending.add(appendPromise);
+    appendPromise.finally(() => {
+      const set = this.pendingAppends.get(runId);
+      if (!set) return;
+      set.delete(appendPromise);
+      if (set.size === 0) this.pendingAppends.delete(runId);
+    });
+
+    await appendPromise;
   }
 }

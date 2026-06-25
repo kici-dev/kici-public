@@ -107,6 +107,62 @@ export class AgentTokenStore {
   }
 
   /**
+   * Mint a single-use, short-TTL bootstrap token for an init-runner bring-up.
+   *
+   * The token is stored as `agent_type: 'ephemeral'` (so the existing expiry
+   * cleanup reaps it) and is bound to exactly the init-runner label set. It is
+   * single-use: `consumeBootstrapToken` sets `consumed_at` on first
+   * `agent.register`, and a second register is rejected. A leaked token is
+   * therefore inert after enrollment AND after its short TTL elapses.
+   *
+   * @param targetAgentId - The agent id the init-runner will register as.
+   * @param ttlMs - Time-to-live in milliseconds (short, ~10 min).
+   * @param labels - The init-runner labels the token authorizes.
+   * @returns The plaintext token (shown once) and the DB row ID.
+   */
+  async mintBootstrapToken(opts: {
+    targetAgentId: string;
+    ttlMs: number;
+    labels: string[];
+  }): Promise<{ token: string; id: string }> {
+    const token = generateToken();
+    const tokenHash = hashToken(token);
+    const tokenPrefix = token.slice(0, 12);
+
+    const row = await this.db
+      .insertInto('agent_tokens')
+      .values({
+        token_hash: tokenHash,
+        token_prefix: tokenPrefix,
+        labels: JSON.stringify(opts.labels),
+        agent_type: 'ephemeral',
+        created_by: `bootstrap:${opts.targetAgentId}`,
+        expires_at: new Date(Date.now() + opts.ttlMs),
+        consumed_at: null,
+      })
+      .returningAll()
+      .executeTakeFirstOrThrow();
+
+    return { token, id: row.id };
+  }
+
+  /**
+   * Consume a single-use bootstrap token by id. Sets `consumed_at` only when it
+   * is currently null, so the first register wins and any subsequent attempt
+   * with the same token returns false (already consumed). Returns true when
+   * this call performed the consumption.
+   */
+  async consumeBootstrapToken(id: string): Promise<boolean> {
+    const result = await this.db
+      .updateTable('agent_tokens')
+      .set({ consumed_at: sql`now()` })
+      .where('id', '=', id)
+      .where('consumed_at', 'is', null)
+      .executeTakeFirst();
+    return BigInt(result.numUpdatedRows) > 0n;
+  }
+
+  /**
    * Validate a plaintext token against stored hashes.
    *
    * Checks that the token exists, is not revoked, and has not expired.
@@ -123,6 +179,10 @@ export class AgentTokenStore {
       .selectAll()
       .where('token_hash', '=', tokenHash)
       .where('revoked_at', 'is', null)
+      // Single-use bootstrap tokens are consumed at first register; a consumed
+      // token never re-validates. Non-single-use tokens keep `consumed_at` null
+      // forever, so this clause is a no-op for them.
+      .where('consumed_at', 'is', null)
       .where((eb) => eb.or([eb('expires_at', 'is', null), eb('expires_at', '>', sql<Date>`now()`)]))
       .executeTakeFirst();
 
@@ -182,6 +242,7 @@ export class AgentTokenStore {
         'created_by',
         'revoked_at',
         'expires_at',
+        'consumed_at',
       ])
       .where('revoked_at', 'is', null);
 

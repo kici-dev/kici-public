@@ -1,40 +1,18 @@
 ---
 title: Fleet management
-description: The three-tier per-org gate that controls who can use fleet management
+description: View and manage your organization's declared host fleet from the dashboard
 ---
 
-Fleet management lets an organization view and manage its declared host fleet from the dashboard. Access is controlled by a **three-tier gate** so the feature can be rolled out deliberately: an organization must be marked eligible, then turn the feature on for itself, before it appears.
-
-## The three tiers
-
-The feature is effectively on for an organization when:
-
-```
-effectiveEnabled = globalDefault || (eligible && enabled)
-```
-
-| Tier               | Controlled by                           | Default | Answers                                     |
-| ------------------ | --------------------------------------- | ------- | ------------------------------------------- |
-| **1. Eligibility** | KiCI operator                           | off     | "May this org use fleet management at all?" |
-| **2. Activation**  | Org owner                               | off     | "Has the org turned it on?"                 |
-| **3. GA**          | `KICI_FLEET_MANAGEMENT_DEFAULT_ENABLED` | off     | "Is it on for everyone?"                    |
-
-- **Eligibility** allows but does not activate — once an org is eligible, it still self-enables (tier 2). An org that is not eligible never sees the activation toggle and cannot turn the feature on.
-- **Activation** is the org owner's self-service switch, gated by the `fleet:admin` permission (owners hold it by default).
-- **GA** is the global override: when `KICI_FLEET_MANAGEMENT_DEFAULT_ENABLED` is `true`, fleet management is effectively on for every org regardless of tiers 1 and 2.
+Fleet management lets an organization view and manage its declared host fleet from the dashboard: a roster of every declared host, per-host detail, and controls to declare or remove hosts. It is turned on per organization from organization settings.
 
 ## The activation toggle
 
 
-The activation toggle lives in the organization's settings under **Fleet management**. It is shown only when the organization is eligible — until then, the feature is invisible to the organization.
-
-## The global GA flag
-
-`KICI_FLEET_MANAGEMENT_DEFAULT_ENABLED` (Platform env, default `false`) is the cluster-wide override. Setting it to `true` makes fleet management effectively enabled for every organization, bypassing the per-org eligibility and activation flags. Leave it unset until the feature is ready for general availability.
+The activation toggle lives in the organization's settings under **Fleet management**. Turning it on makes the **Fleet** section available; turning it off hides it again.
 
 ## The fleet view
 
-Once fleet management is effectively enabled for an organization, a **Fleet** section appears in the dashboard for members who hold the `fleet:read` permission (Owners by default). It surfaces the declared host fleet read-only — viewing the fleet never changes it.
+Once fleet management is enabled for an organization, a **Fleet** section appears in the dashboard for members who hold the `fleet:read` permission (Owners by default). It surfaces the declared host fleet read-only — viewing the fleet never changes it.
 
 ### Roster
 
@@ -44,7 +22,7 @@ The roster reads through the orchestrator that owns the organization's host flee
 ### Host detail
 
 
-A host's recent runs link back to the run detail page so you can trace what each host has executed. The `runsOnAll` preview is a read-only what-if — it never starts a run.
+A host's recent runs link back to the run detail page so you can trace what each host has executed. The fan-outs list is a read-only, derived view — it never starts a run.
 
 ## Managing hosts
 
@@ -54,6 +32,8 @@ Members who hold the `fleet:write` permission can change the host inventory from
 
 
 Declaring a host names an expected member of the fleet ahead of time, so a `runsOnAll` fan-out can target it (and report it as unreachable) instead of silently skipping a host that has not connected yet. The command-line equivalent is `kici-admin host declare --agent-id <id> --labels <a,b>`.
+
+Re-declaring an existing host converges it to the fields you submit: the labels, hostname, and properties you provide overwrite the stored values, while fields you leave blank keep their current values and the host's agent-reported liveness (connection state, platform, architecture) is left untouched. The result tells you whether the host was newly created or an existing one was updated.
 
 ### Remove a host
 

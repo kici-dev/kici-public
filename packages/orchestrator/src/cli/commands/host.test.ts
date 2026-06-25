@@ -171,6 +171,60 @@ describe('kici-admin host', () => {
     );
   });
 
+  it('host declare passes reach flags through to declareStatic', async () => {
+    mockDeclareStatic.mockResolvedValue(undefined);
+    await runCommand([
+      'host',
+      'declare',
+      '--agent-id',
+      'box-00007',
+      '--address',
+      '10.0.0.7',
+      '--ssh-user',
+      'root',
+      '--ssh-port',
+      '2222',
+      '--ssh-key-secret',
+      'prod/bootstrap/ssh',
+    ]);
+    expect(mockDeclareStatic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'box-00007',
+        address: '10.0.0.7',
+        sshUser: 'root',
+        sshPort: 2222,
+        sshKeySecret: 'prod/bootstrap/ssh',
+      }),
+    );
+  });
+
+  it('host declare leaves reach fields undefined when flags omitted', async () => {
+    mockDeclareStatic.mockResolvedValue(undefined);
+    await runCommand(['host', 'declare', '--agent-id', 'plain']);
+    expect(mockDeclareStatic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'plain',
+        address: undefined,
+        sshUser: undefined,
+        sshPort: undefined,
+        sshKeySecret: undefined,
+      }),
+    );
+  });
+
+  it('host declare rejects a non-numeric --ssh-port', async () => {
+    const { exitCode, stderr } = await runCommand([
+      'host',
+      'declare',
+      '--agent-id',
+      'bad-port',
+      '--ssh-port',
+      'abc',
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--ssh-port must be a positive integer');
+  });
+
   it('host declare rejects a malformed --prop value', async () => {
     const { exitCode, stderr } = await runCommand([
       'host',

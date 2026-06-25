@@ -1,5 +1,9 @@
 import picomatch from 'picomatch';
 import type { EnvironmentBinding, ScopedSecret } from './types.js';
+import { hostSpecificity, matchHostPattern, type HostFacts } from './host-match.js';
+import { substituteScopePattern } from './scope-template.js';
+
+export type { HostFacts } from './host-match.js';
 
 /**
  * Check whether a scope string matches a pattern.
@@ -57,50 +61,88 @@ export function stripScopePrefix(scope: string): string {
 }
 
 /**
+ * Resolve the effective scope pattern a binding contributes for a given host,
+ * applying the host gate and per-child scope-pattern templating.
+ *
+ * Returns the (possibly substituted) scope pattern to glob-match secrets
+ * against, or `null` when the binding contributes nothing for this host:
+ * - With `hostFacts`: skipped when `host_pattern` doesn't match, or when a
+ *   templated `scope_pattern` can't be substituted (missing label / unsafe
+ *   value).
+ * - Without `hostFacts` (workflow-level, no-host caller): only `'**'`/NULL
+ *   host bindings contribute, and a templated `scope_pattern` is skipped (it
+ *   cannot be substituted without facts).
+ */
+function bindingScopeForHost(
+  binding: EnvironmentBinding,
+  hostFacts: HostFacts | undefined,
+): string | null {
+  if (hostFacts) {
+    if (!matchHostPattern(hostFacts, binding.hostPattern)) return null;
+    return substituteScopePattern(binding.scopePattern, hostFacts);
+  }
+  // No host facts: fleet-wide bindings only, and templated scopes are skipped.
+  if (binding.hostPattern !== '**' && binding.hostPattern !== '') return null;
+  return binding.scopePattern.includes('${') ? null : binding.scopePattern;
+}
+
+interface ScopeCandidate {
+  secret: ScopedSecret;
+  scopeDepth: number;
+  hostSpec: number;
+}
+
+/** Higher `(hostSpec, scopeDepth)` wins; ties keep the first-encountered. */
+function candidateWins(c: ScopeCandidate, existing: ScopeCandidate | undefined): boolean {
+  if (!existing) return true;
+  if (c.hostSpec !== existing.hostSpec) return c.hostSpec > existing.hostSpec;
+  return c.scopeDepth > existing.scopeDepth;
+}
+
+/**
  * Resolve secrets for an environment by matching bindings against scoped secrets.
  *
  * Takes already-filtered bindings (for the target environment). For each binding,
- * finds secrets whose scope matches the binding's scopePattern via picomatch.
- * When multiple scopes provide the same key, longest scope path wins (higher specificity).
- * Scope depth is computed AFTER stripping the backend prefix.
+ * finds secrets whose (substituted) scope matches the binding's scopePattern via
+ * picomatch. When multiple scopes provide the same key, precedence is the tuple
+ * `(host specificity, scope depth)` — a per-host binding (exact host) overrides a
+ * fleet-wide one, then longest scope path wins. Scope depth is computed AFTER
+ * stripping the backend prefix.
+ *
+ * When `hostFacts` is supplied (a fan-out child's identity), each binding is
+ * gated by its `host_pattern` and its `scope_pattern` is templated per-child
+ * (`${agentId}`/`${host}`/`${label:NAME}`). When omitted, only fleet-wide
+ * (`'**'`/NULL) non-templated bindings contribute — preserving the workflow-level
+ * (no-host) behaviour.
  *
  * @param bindings - Bindings already filtered for the target environment
  * @param allSecrets - All scoped secrets in the org
  * @param decryptFn - Pure decryption function (keeps this module crypto-free)
+ * @param hostFacts - Optional fan-out child identity for per-host resolution
  * @returns Flat record of decrypted secret key-value pairs
  */
 export function resolveSecretsForEnvironment(
   bindings: EnvironmentBinding[],
   allSecrets: ScopedSecret[],
   decryptFn: (s: ScopedSecret) => string,
+  hostFacts?: HostFacts,
 ): Record<string, string> {
-  // Collect all matching secrets with their scope depth for precedence
-  const candidates: Array<{ secret: ScopedSecret; scopeDepth: number }> = [];
+  const resolved = new Map<string, ScopeCandidate>();
 
   for (const binding of bindings) {
+    const scopePattern = bindingScopeForHost(binding, hostFacts);
+    if (scopePattern === null) continue;
+    const hostSpec = hostSpecificity(binding.hostPattern);
     for (const secret of allSecrets) {
-      if (matchScopePattern(secret.scope, binding.scopePattern)) {
-        // Scope depth uses path AFTER stripping backend prefix
-        const scopePath = stripScopePrefix(secret.scope);
-        candidates.push({
-          secret,
-          scopeDepth: scopePath.split('/').length,
-        });
+      if (!matchScopePattern(secret.scope, scopePattern)) continue;
+      const scopeDepth = stripScopePrefix(secret.scope).split('/').length;
+      const candidate: ScopeCandidate = { secret, scopeDepth, hostSpec };
+      if (candidateWins(candidate, resolved.get(secret.key))) {
+        resolved.set(secret.key, candidate);
       }
     }
   }
 
-  // Deduplicate by key — longest scope path wins (after prefix strip)
-  const resolved = new Map<string, { secret: ScopedSecret; scopeDepth: number }>();
-
-  for (const candidate of candidates) {
-    const existing = resolved.get(candidate.secret.key);
-    if (!existing || candidate.scopeDepth > existing.scopeDepth) {
-      resolved.set(candidate.secret.key, candidate);
-    }
-  }
-
-  // Decrypt and return flat record
   const result: Record<string, string> = {};
   for (const [key, { secret }] of resolved) {
     result[key] = decryptFn(secret);

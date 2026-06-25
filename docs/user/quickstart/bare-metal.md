@@ -50,7 +50,9 @@ Even on a bare-metal orchestrator host, the least-fiddly way to run the database
 mkdir -p ~/.config/kici
 
 # Download the backing-services compose (PostgreSQL + SeaweedFS) and the
-# static S3 identity SeaweedFS mounts. Both publish on loopback only.
+# static S3 identity SeaweedFS mounts. PostgreSQL publishes on loopback only;
+# SeaweedFS publishes on all interfaces so a spawned container-scaler agent
+# can fetch the `kici run remote` overlay (see the seaweedfs note after step 3).
 curl -o ~/.config/kici/docker-compose.postgres.yaml \
   https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/bare-metal/docker-compose.postgres.yaml
 curl -o ~/.config/kici/seaweedfs-s3.json \
@@ -67,10 +69,10 @@ docker compose -f ~/.config/kici/docker-compose.postgres.yaml exec postgres \
   psql -U kici -d kici -c 'SELECT 1;'
 ```
 
-The compose publishes PostgreSQL on `127.0.0.1:5432` and a SeaweedFS object store on `127.0.0.1:8333`, so the orchestrator (a native process on the same host) connects to both exactly as it would native installs. SeaweedFS is what makes `kici run remote` work in step 8. To stop or remove these later: `docker compose -f ~/.config/kici/docker-compose.postgres.yaml down` (add `-v` to also wipe the data volumes).
+The compose publishes PostgreSQL on `127.0.0.1:5432` (loopback only, not reachable off-box) and a SeaweedFS object store on `:8333` (all interfaces), so the orchestrator (a native process on the same host) connects to both exactly as it would native installs. SeaweedFS is published beyond loopback on purpose: a `container`-scaler agent runs in its own network namespace and reaches the host via `host.docker.internal` (the bridge gateway), so it can only fetch the `kici run remote` overlay if the store is reachable on that interface — a loopback-only publish would refuse the agent's download. The trade-off: the object store carries a static public identity (`seaweedfs-s3.json`), so publishing it on all interfaces makes it reachable from your LAN. If you don't run a container scaler (only the bare-metal scaler in step 7), you can keep it loopback-only by changing the ports line in `docker-compose.postgres.yaml` to `127.0.0.1:8333:8333`. SeaweedFS is what makes `kici run remote` work in step 8. To stop or remove these later: `docker compose -f ~/.config/kici/docker-compose.postgres.yaml down` (add `-v` to also wipe the data volumes).
 
 :::note[macOS]
-On **Docker Desktop** these containers and their loopback ports work out of the box. On **podman machine**, the runtime runs in a VM — `podman machine init && podman machine start` first, then `docker compose`/`podman compose` against it as shown. The `127.0.0.1:5432` and `127.0.0.1:8333` published ports are forwarded to the macOS host, so the native orchestrator and `kici` CLI reach them at `localhost` exactly as on Linux.
+On **Docker Desktop** these containers and their loopback ports work out of the box. On **podman machine**, the runtime runs in a VM — `podman machine init && podman machine start` first, then `docker compose`/`podman compose` against it as shown. The `127.0.0.1:5432` (Postgres, loopback) and `:8333` (SeaweedFS, all interfaces) published ports are forwarded to the macOS host, so the native orchestrator and `kici` CLI reach them at `localhost` exactly as on Linux.
 :::
 
 #### Option B — Native PostgreSQL install
@@ -111,7 +113,7 @@ curl -o ~/.config/kici/seaweedfs-s3.json \
 docker compose -f ~/.config/kici/docker-compose.postgres.yaml up -d --wait seaweedfs
 ```
 
-SeaweedFS is now published on `127.0.0.1:8333` — the same endpoint the env file in step 5 already points at.
+SeaweedFS is now published on `:8333` (all interfaces, so a container-scaler agent can reach it via `host.docker.internal`) — the same store the env file in step 5 already points at. To keep it loopback-only when you run no container scaler, change the ports line in `docker-compose.postgres.yaml` to `127.0.0.1:8333:8333`.
 
 ### 4. Install the `kici-admin` CLI
 
@@ -140,7 +142,7 @@ curl -o ~/.config/kici/kici-orchestrator.env \
 ${EDITOR:-vi} ~/.config/kici/kici-orchestrator.env
 ```
 
-The template already carries the `KICI_STORAGE_*` block wired to the SeaweedFS container from step 3 (`http://localhost:8333`, bucket `kici-cache`) — nothing to fill in there. That's what lets `kici run remote` work in step 8.
+The template already carries the `KICI_STORAGE_*` block wired to the SeaweedFS container from step 3 (bucket `kici-cache`) — nothing to fill in there for the container scaler. It sets three endpoints for three vantage points: `KICI_STORAGE_ENDPOINT=http://localhost:8333` (the native orchestrator → loopback), `KICI_STORAGE_UPLOAD_ENDPOINT=http://localhost:8333` (your local `kici` CLI uploading the overlay → loopback), and `KICI_STORAGE_EXTERNAL_ENDPOINT=http://host.docker.internal:8333` (the address baked into the presigned URL handed to a spawned **container** agent, which reaches the host through the bridge gateway). That's what lets `kici run remote` work in step 8. One caveat for the **bare-metal** scaler: a host-process agent reaches the host loopback directly, but `host.docker.internal` does **not** resolve for it — if you run the bare-metal scaler, set `KICI_STORAGE_EXTERNAL_ENDPOINT` to the host's LAN address (e.g. `http://<host-ip>:8333`) instead.
 
 ### 6. Install the orchestrator as a managed service
 
@@ -297,13 +299,13 @@ npm install -g kici
 kici login
 kici org use <your-org>
 
-kici compile
+# `kici run remote` recompiles your workflows first, then dispatches the run.
 kici run remote push-main
 ```
 
 You should see a green `push-main … success` run in your terminal — the bare-metal scaler spawned a one-shot agent process on this host, which fetched your working tree from SeaweedFS and ran the step. **That's Part 1 done — a workflow run end-to-end on your own box, with no GitHub App in sight.** Keep this `hello-kici/.kici/` folder around: Part 2 reuses it.
 
-`kici run remote` uses two planes. The **control plane** (run initiation, status, logs, cancellation) flows from your machine through the Platform, which relays it over a WebSocket connection to your orchestrator. The **data plane** — your working-tree overlay — uploads **directly** from your machine to SeaweedFS via a presigned URL and never passes through the Platform. That direct upload is what the `KICI_STORAGE_*` block from step 5 (`http://localhost:8333`) enables.
+`kici run remote` uses two planes. The **control plane** (run initiation, status, logs, cancellation) flows from your machine through the Platform, which relays it over a WebSocket connection to your orchestrator. The **data plane** — your working-tree overlay — uploads **directly** from your machine to SeaweedFS via a presigned URL and never passes through the Platform. That direct upload is what the `KICI_STORAGE_*` block from step 5 enables: the host CLI uploads to `localhost:8333` (the upload endpoint), and the orchestrator hands the spawned agent a routable fetch URL — `host.docker.internal:8333` (the external endpoint) for a container agent, or the host loopback for a bare-metal-scaler host process.
 
 With a single connected orchestrator the Platform selects it automatically. If your org later connects more than one, list them with `kici orchestrators list` and pin a default with `kici orchestrators use <name>` (or pass `--orchestrator <name>` per run).
 
@@ -412,6 +414,28 @@ The service unit already points at the global `kici-admin` package, so the `npm 
 **Orchestrator logs show `auth.failed` against api.kici.dev.** The `KICI_PLATFORM_TOKEN` in the env file doesn't match what you minted in step 2. Mint a fresh one and update the env file; then `kici-admin orchestrator restart`.
 
 **`kici-admin source add` returns 401 / 403.** The `--token` you passed doesn't match `KICI_BOOTSTRAP_ADMIN_TOKEN` in the orchestrator's env file. Re-extract it with `grep '^KICI_BOOTSTRAP_ADMIN_TOKEN=' ~/.config/kici/kici-orchestrator.env`.
+
+**SeaweedFS never becomes healthy, or `kici run remote` can't upload the overlay.** In step 3, `docker compose … up -d --wait` hangs and then fails on the seaweedfs healthcheck. Tail the container's logs with `docker compose -f ~/.config/kici/docker-compose.postgres.yaml logs seaweedfs` — if you see `fail to load config file /etc/seaweedfs/s3.json: … is a directory`, then `~/.config/kici/seaweedfs-s3.json` is a **directory**, not a file. The `curl -o …seaweedfs-s3.json` download in step 3 was skipped or failed, so `docker compose up` created an empty directory at the bind-mount path and SeaweedFS exits on startup. Remove the directory, re-download the file, confirm it's a file, and recreate the container:
+
+```bash
+rm -rf ~/.config/kici/seaweedfs-s3.json
+curl -o ~/.config/kici/seaweedfs-s3.json \
+  https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/bare-metal/seaweedfs-s3.json
+test -f ~/.config/kici/seaweedfs-s3.json && echo "ok: it is a file"
+docker compose -f ~/.config/kici/docker-compose.postgres.yaml up -d --force-recreate seaweedfs
+```
+
+**`kici run remote` fails to upload with `Failed to parse URL from` or `no object storage configured`.** The orchestrator has no object storage wired, so it can't hand the CLI an upload URL. Confirm the `KICI_STORAGE_*` block from the step 5 template is present:
+
+```bash
+grep -E '^KICI_STORAGE_|^AWS_ACCESS_KEY_ID' ~/.config/kici/kici-orchestrator.env
+```
+
+You should see `KICI_STORAGE_TYPE=s3`, `KICI_STORAGE_ENDPOINT=http://localhost:8333`, `KICI_STORAGE_UPLOAD_ENDPOINT=http://localhost:8333`, `KICI_STORAGE_EXTERNAL_ENDPOINT=http://host.docker.internal:8333`, `KICI_STORAGE_BUCKET=kici-cache`, and the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` pair. If they're missing, restore them from the [bare-metal env template](https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/bare-metal/.env.example) and run `kici-admin orchestrator restart`. Newer orchestrators report this as a clear "no object storage configured" message; older builds surfaced the opaque `Failed to parse URL from` — both mean the same thing.
+
+**`kici run remote` uploads, but the job fails with `Overlay download failed … ECONNREFUSED …:8333`.** The CLI upload succeeded (it runs on the host, which reaches `localhost:8333`), but the spawned **agent** can't fetch the overlay back. The tell-tale: the failure is on the agent/job — not the CLI upload — and the URL host is `localhost` or `127.0.0.1`. A `container`-scaler agent runs in its own network namespace, so a presigned URL pointing at `localhost:8333` resolves to the container's own empty loopback (`ECONNREFUSED`). Fix: set `KICI_STORAGE_EXTERNAL_ENDPOINT` to an address reachable from inside the agent container — the container scaler injects `host.docker.internal:host-gateway`, so `http://host.docker.internal:8333` works — **and** confirm SeaweedFS is published beyond loopback (`docker-compose.postgres.yaml` publishes `8333:8333`, not `127.0.0.1:8333`). The bare-metal env template already sets `KICI_STORAGE_EXTERNAL_ENDPOINT=http://host.docker.internal:8333`; if you cleared it, restore it and run `kici-admin orchestrator restart`. The **bare-metal scaler** path is unaffected — a host-process agent reaches the host loopback directly; this only bites the **container** scaler.
+
+**`kici run remote` runs but reports `No jobs dispatched`.** The job's `runsOn` label matches no agent your scaler can provide, so the orchestrator rejects the dispatch. A `runsOn` value must match either a **custom label your scaler declares** — the scalers in step 7 offer `linux` plus `container` / `bare-metal` — or an **auto-label every agent carries automatically**, such as `kici:os:linux` (the agent's operating system), which is what `kici init`'s starter workflows use. A value like `ubuntu-latest` matches neither and never dispatches. Set the job's `runsOn` to one of your scaler's labels (for example `'bare-metal'`) or an auto-label (for example `'kici:os:linux'`), then `kici compile` and re-run.
 
 **Push happens but no agent spawns.** Tail `kici-admin orchestrator logs --follow` immediately after the push and look near the top for one of three failure modes:
 

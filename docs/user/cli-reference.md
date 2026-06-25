@@ -93,26 +93,27 @@ kici run local [event] [options]
 
 **Options:**
 
-| Option              | Default   | Description                                                                                                                                                                                                       |
-| ------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-p, --pick`        | `false`   | Interactively pick a workflow + trigger (see below)                                                                                                                                                               |
-| `--workflow <name>` | none      | Run only the specified workflow (mutex with `--pick`)                                                                                                                                                             |
-| `--job <name>`      | none      | Run only the specified job (and its dependencies)                                                                                                                                                                 |
-| `--branch <name>`   | detected  | Override detected git branch                                                                                                                                                                                      |
-| `--sha <hash>`      | detected  | Override detected git SHA                                                                                                                                                                                         |
-| `--payload <path>`  | none      | Path to explicit event payload JSON file                                                                                                                                                                          |
-| `--concurrency <n>` | CPU cores | Max parallel jobs **within one run** (job-level only). Cross-run [concurrency groups](concurrency.md) declared in `workflow({ concurrency: ... })` are enforced separately — see "Concurrency enforcement" below. |
-| `--keep-going`      | `false`   | Continue after job failure                                                                                                                                                                                        |
-| `--container`       | `false`   | Use Podman container isolation                                                                                                                                                                                    |
-| `--env <KEY=VALUE>` | none      | Environment variable override (repeatable)                                                                                                                                                                        |
-| `--files <path>`    | git diff  | Override changed file paths (repeatable, default: git diff)                                                                                                                                                       |
-| `--quiet`           | `false`   | Suppress streaming output (summary only)                                                                                                                                                                          |
-| `--json`            | `false`   | Output structured JSON result                                                                                                                                                                                     |
-| `--junit <path>`    | none      | Output JUnit XML result to file                                                                                                                                                                                   |
-| `--debug`           | `false`   | Verbose internals                                                                                                                                                                                                 |
-| `--kici-dir <path>` | `.kici`   | Path to .kici directory                                                                                                                                                                                           |
-| `--in-place`        | `false`   | Run against the real working directory instead of an isolated tmp checkout (see "Execution isolation" below)                                                                                                      |
-| `--keep`            | `false`   | Always retain the isolated tmp checkout (default: keep only on failure)                                                                                                                                           |
+| Option                | Default   | Description                                                                                                                                                                                                                            |
+| --------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-p, --pick`          | `false`   | Interactively pick a workflow + trigger (see below)                                                                                                                                                                                    |
+| `--workflow <name>`   | none      | Run only the specified workflow (mutex with `--pick`)                                                                                                                                                                                  |
+| `--job <name>`        | none      | Run only the specified job (and its dependencies)                                                                                                                                                                                      |
+| `--branch <name>`     | detected  | Override detected git branch                                                                                                                                                                                                           |
+| `--sha <hash>`        | detected  | Override detected git SHA                                                                                                                                                                                                              |
+| `--payload <path>`    | none      | Path to explicit event payload JSON file                                                                                                                                                                                               |
+| `--concurrency <n>`   | CPU cores | Max parallel jobs **within one run** (job-level only). Cross-run [concurrency groups](concurrency.md) declared in `workflow({ concurrency: ... })` are enforced separately — see "Concurrency enforcement" below.                      |
+| `--keep-going`        | `false`   | Continue after job failure                                                                                                                                                                                                             |
+| `--container`         | `false`   | Use Podman container isolation                                                                                                                                                                                                         |
+| `--env <KEY=VALUE>`   | none      | Environment variable override (repeatable)                                                                                                                                                                                             |
+| `--input <KEY=VALUE>` | none      | Typed workflow-dispatch input (repeatable) — coerced + validated against the workflow's `dispatch({ inputs })` schema, exposed as `ctx.dispatchInputs` (see [triggers → typed dispatch inputs](sdk/triggers.md#typed-dispatch-inputs)) |
+| `--files <path>`      | git diff  | Override changed file paths (repeatable, default: git diff)                                                                                                                                                                            |
+| `--quiet`             | `false`   | Suppress streaming output (summary only)                                                                                                                                                                                               |
+| `--json`              | `false`   | Output structured JSON result                                                                                                                                                                                                          |
+| `--junit <path>`      | none      | Output JUnit XML result to file                                                                                                                                                                                                        |
+| `--debug`             | `false`   | Verbose internals                                                                                                                                                                                                                      |
+| `--kici-dir <path>`   | `.kici`   | Path to .kici directory                                                                                                                                                                                                                |
+| `--in-place`          | `false`   | Run against the real working directory instead of an isolated tmp checkout (see "Execution isolation" below)                                                                                                                           |
+| `--keep`              | `false`   | Always retain the isolated tmp checkout (default: keep only on failure)                                                                                                                                                                |
 
 **Interactive workflow selection (`--pick` / `-p`):**
 
@@ -218,6 +219,8 @@ Execute fixtures remotely through the full CI pipeline. Fixtures are defined in 
 
 Remote runs route through the Platform. Authenticate with a personal access token (`kici login`), then target an organization with `kici org use <org>` or the `--org` flag. The Platform relays the run to the org's orchestrator, while your working-tree overlay uploads directly to object storage — see [How the run is routed](#how-the-run-is-routed) and [The two planes](#the-two-planes) below.
 
+Like `kici run local`, `kici run remote` recompiles your workflows (`.kici/workflows` → `kici.lock.json`) before dispatching, so the orchestrator matches and dispatches against your current workflow definitions — a brand-new or edited workflow takes effect without a separate `kici compile`. A compile or validation error aborts the run before anything is uploaded.
+
 The orchestrator must have **cache storage configured** (`KICI_STORAGE_TYPE` = `s3` or `filesystem`) with a dev-reachable upload endpoint so the CLI's direct upload succeeds; see the [testing guide](testing-guide.md) and [Storage layout](../operator/orchestrator/storage-layout.md) for setup.
 
 ```bash
@@ -232,24 +235,26 @@ kici run remote [fixture] [options]
 
 **Options:**
 
-| Option                      | Default | Description                                                                                       |
-| --------------------------- | ------- | ------------------------------------------------------------------------------------------------- |
-| `--org <id>`                | active  | Target organization for this run (overrides `kici org use`)                                       |
-| `--orchestrator <name>`     | default | Target orchestrator cluster within the org (overrides the per-org default)                        |
-| `--all`                     | `false` | Run all fixtures                                                                                  |
-| `--workflow <name>`         | none    | Run a specific workflow directly (bypass triggers)                                                |
-| `--parallel`                | `false` | Run multiple fixtures concurrently                                                                |
-| `--no-wait`                 | -       | Fire and forget (print runIds, don't stream)                                                      |
-| `--quiet`                   | `false` | Minimal output (only final result)                                                                |
-| `--json`                    | `false` | Machine-readable JSON output                                                                      |
-| `--junit <path>`            | none    | JUnit XML output to file for CI integration                                                       |
-| `--history`                 | `false` | Show table of recent test runs                                                                    |
-| `--context <ctx.key=value>` | none    | Inject a namespaced context secret, uploaded encrypted (repeatable)                               |
-| `--env <KEY=VALUE>`         | none    | Provide a per-run secret, uploaded encrypted (repeatable) — see [testing guide](testing-guide.md) |
-| `--target <selector>`       | none    | Narrow `runsOnAll` jobs to hosts matching this label selector (repeatable, AND-combined)          |
-| `--target-allow-empty`      | `false` | A `--target` that narrows a `runsOnAll` job to zero hosts skips it instead of failing             |
-| `--debug`                   | `false` | Verbose internals                                                                                 |
-| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                           |
+| Option                      | Default | Description                                                                                                                                                                                                                                |
+| --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--org <id>`                | active  | Target organization for this run (overrides `kici org use`)                                                                                                                                                                                |
+| `--orchestrator <name>`     | default | Target orchestrator cluster within the org (overrides the per-org default)                                                                                                                                                                 |
+| `--all`                     | `false` | Run all fixtures                                                                                                                                                                                                                           |
+| `-p, --pick`                | `false` | Interactively pick fixtures to run (multi-select; mutex with a fixture arg, `--all`, and `--workflow`)                                                                                                                                     |
+| `--workflow <name>`         | none    | Run a specific workflow directly (bypass triggers)                                                                                                                                                                                         |
+| `--parallel`                | `false` | Run multiple fixtures concurrently                                                                                                                                                                                                         |
+| `--no-wait`                 | -       | Fire and forget (print runIds, don't stream)                                                                                                                                                                                               |
+| `--quiet`                   | `false` | Minimal output (only final result)                                                                                                                                                                                                         |
+| `--json`                    | `false` | Machine-readable JSON output                                                                                                                                                                                                               |
+| `--junit <path>`            | none    | JUnit XML output to file for CI integration                                                                                                                                                                                                |
+| `--history`                 | `false` | Show table of recent test runs                                                                                                                                                                                                             |
+| `--context <ctx.key=value>` | none    | Inject a namespaced context secret, uploaded encrypted (repeatable)                                                                                                                                                                        |
+| `--env <KEY=VALUE>`         | none    | Provide a per-run secret, uploaded encrypted (repeatable) — see [testing guide](testing-guide.md)                                                                                                                                          |
+| `--input <KEY=VALUE>`       | none    | Typed workflow-dispatch input (repeatable) — validated + coerced + defaulted on the orchestrator from the lock descriptor, exposed as `ctx.dispatchInputs` (see [triggers → typed dispatch inputs](sdk/triggers.md#typed-dispatch-inputs)) |
+| `--target <selector>`       | none    | Narrow `runsOnAll` jobs to hosts matching this label selector (repeatable, AND-combined)                                                                                                                                                   |
+| `--target-allow-empty`      | `false` | A `--target` that narrows a `runsOnAll` job to zero hosts skips it instead of failing                                                                                                                                                      |
+| `--debug`                   | `false` | Verbose internals                                                                                                                                                                                                                          |
+| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                                                                                                                                                                    |
 
 **Examples:**
 
@@ -287,6 +292,9 @@ kici run remote push-main --no-wait
 # View recent test run history
 kici run remote --history
 
+# Interactively pick which fixtures to run (multi-select)
+kici run remote --pick
+
 # Narrow runsOnAll jobs to a subset of the host roster
 kici run remote deploy --target role:web
 
@@ -296,6 +304,18 @@ kici run remote deploy --target role:web --target dc:eu
 # Skip a runsOnAll job instead of failing it when the target matches no host
 kici run remote deploy --target role:gpu --target-allow-empty
 ```
+
+**Interactive fixture selection (`--pick` / `-p`):**
+
+Pass `--pick` (or `-p`) to open an interactive checkbox menu of the available
+fixtures. Toggle one or more with space, confirm with enter, and the selected
+fixtures run through the normal remote pipeline (honoring `--parallel`,
+`--no-wait`, and the other run flags). Notes:
+
+- `--pick` is mutually exclusive with a fixture argument, `--all`, and
+  `--workflow`. Passing any together exits with code 2.
+- When `stdin` is not a TTY, `--pick` prints the available fixtures and exits
+  without running anything — pass a fixture name (or `--all`) in scripts.
 
 #### Host narrowing with `--target`
 
@@ -1088,9 +1108,10 @@ Open the KiCI documentation site in the default browser. With the `llm` subcomma
 ```bash
 kici docs               # open https://kici.dev/docs/
 kici docs --no-open     # print the URL instead of opening a browser
-kici docs llm           # print llms-full.txt (the full bundle) to stdout
-kici docs llm --index   # print llms.txt (the curated link index) to stdout
-kici docs llm --out path/to/file.md   # write the bundle to a file
+kici docs llm           # print the llms.txt index (a router over the task bundles)
+kici docs llm sdk       # print the SDK task bundle
+kici docs llm full      # print llms-full.txt (every page in one file)
+kici docs llm sdk --out sdk-context.md   # write a bundle to a file
 ```
 
 **Examples:**
@@ -1099,14 +1120,14 @@ kici docs llm --out path/to/file.md   # write the bundle to a file
 # Open the docs site in your browser
 kici docs
 
-# Pipe the full LLM bundle into a coding agent
-kici docs llm | claude -- "Read this and help me author a deploy workflow"
+# Pipe just the SDK bundle into a coding agent (small, task-scoped context)
+kici docs llm sdk | claude -- "Read this and help me author a deploy workflow"
 
-# Save the curated index for offline reference
-kici docs llm --index --out kici-llms.txt
+# Save the router index for offline reference
+kici docs llm --out kici-llms-index.txt
 ```
 
-The bundle is regenerated from `docs/` every time `@kici-dev/compiler` is built, so it always matches your installed CLI version. The same content is available online at <https://kici.dev/llms.txt> and <https://kici.dev/llms-full.txt> following the [llms.txt convention](https://llmstxt.org/).
+Bundles are regenerated from `docs/` every time `@kici-dev/compiler` is built, so they always match your installed CLI version. The index lists each task bundle — `getting-started`, `sdk`, `cli`, `patterns`, `features`, `providers`, `architecture` — with its size and a one-line purpose; pass the bundle id as the topic. Every cross-reference link inside a bundle is an absolute `docs.kici.dev` URL. The same files are published online following the [llms.txt convention](https://llmstxt.org/).
 
 ### kici admin
 

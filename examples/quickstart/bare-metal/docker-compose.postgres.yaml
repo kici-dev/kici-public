@@ -3,8 +3,9 @@
 # The bare-metal orchestrator runs as a native systemd service (see
 # docs/user/quickstart/bare-metal.md); this compose runs only the two backing
 # services it can't easily run natively: PostgreSQL 18 and a SeaweedFS object
-# store. Both are published on loopback so they aren't exposed off-box. Bring
-# them up with:
+# store. Postgres is published on loopback (not reachable off-box); SeaweedFS is
+# published on all interfaces so spawned agent containers can fetch overlays for
+# `kici run remote` (see the seaweedfs ports note below). Bring them up with:
 #
 #   docker compose -f docker-compose.postgres.yaml up -d --wait
 #
@@ -45,10 +46,15 @@ services:
     volumes:
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
       - seaweedfs-data:/data
-    # Publish only on loopback — host CLI, orchestrator, and agents all run on
-    # this host and reach it here.
+    # Published on all interfaces (not loopback-only) so that container-scaler
+    # AGENTS — which run in their own network namespace and reach the host via
+    # `host.docker.internal` / the bridge gateway — can fetch the overlay for
+    # `kici run remote`. A loopback-only publish is reachable by the host CLI
+    # and the native orchestrator but NOT by a spawned agent container, which
+    # fails the overlay download with ECONNREFUSED. See the KICI_STORAGE_*
+    # endpoint notes in .env.example.
     ports:
-      - '127.0.0.1:8333:8333'
+      - '8333:8333'
     healthcheck:
       # /status is the unauthenticated liveness endpoint (the S3 root needs
       # auth → 403). 127.0.0.1 (not localhost): SeaweedFS binds IPv4 only.

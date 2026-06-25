@@ -396,6 +396,19 @@ export function getSizeWarning(compressedSize: number): string | null {
 export async function uploadTarball(opts: UploadOptions): Promise<UploadResult> {
   const { tarballPath, signedUrl, orchestratorPublicKey, onProgress } = opts;
 
+  // The orchestrator mints the presigned PUT URL; an empty value means it has no
+  // object storage configured (or upload init otherwise failed). Fail fast with
+  // an actionable message instead of letting fetch('') throw an opaque
+  // "Failed to parse URL from " after three pointless retries.
+  if (!signedUrl) {
+    throw new Error(
+      'The orchestrator did not return an upload URL, so the overlay cannot be ' +
+        'uploaded. This usually means the orchestrator has no object storage ' +
+        'configured for remote runs. Ask your orchestrator operator to enable ' +
+        'cache storage (KICI_STORAGE_TYPE=s3 or filesystem).',
+    );
+  }
+
   // Encrypt tarball
   const { encryptedPath, cliPublicKey } = await encryptTarball(tarballPath, orchestratorPublicKey);
 

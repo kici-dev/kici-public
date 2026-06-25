@@ -33,6 +33,8 @@ export interface TestOptions extends PayloadOptions {
 export interface RemoteRunOptions extends TestOptions {
   /** Run all available fixtures */
   all?: boolean;
+  /** Interactively pick fixtures to run (multi-select checkbox). */
+  pick?: boolean;
   /** Run matching fixtures concurrently */
   parallel?: boolean;
   /** Fire and forget (print runIds, don't stream) */
@@ -69,6 +71,8 @@ export interface RemoteRunOptions extends TestOptions {
    * operator must still be clause-eligible per hold; an ineligible hold blocks.
    */
   approveAll?: boolean;
+  /** `--input KEY=VALUE` values (repeatable): typed workflow-dispatch inputs. */
+  inputs?: string[];
 }
 
 /** Result of a single remote fixture run */

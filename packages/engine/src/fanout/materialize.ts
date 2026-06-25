@@ -70,6 +70,13 @@ export interface ResolvedHostAgent {
   arch?: string;
   /** Which orchestrator owns the live WS (null = not currently connected). */
   connectedInstanceId?: string | null;
+  /**
+   * True when this host is a declared-but-un-agented `includeUninitialized`
+   * target: it has no live agent, so the dispatcher first brings up a temporary
+   * init-runner over SSH before the child's pinned steps can land. False / absent
+   * for a live host (runs on its own agent directly).
+   */
+  needsBringup?: boolean;
 }
 
 /**
@@ -102,6 +109,52 @@ export interface MaterializedJob {
   agent?: ResolvedHostAgent;
   /** Which orchestrator owns the pinned agent's live WS (null = not connected). */
   connectedInstanceId?: string | null;
+  /**
+   * True for a declared-but-un-agented `includeUninitialized` host child: the
+   * dispatcher brings up a temporary init-runner over SSH before its pinned
+   * steps land. Mirrors `agent.needsBringup`.
+   */
+  needsBringup?: boolean;
+  // --- fan-out position (set only for multi-child fan-outs) ---
+  /**
+   * 0-based position of this child in the deterministically-ordered fan-out
+   * (host: by `agentId`; matrix: by variant label). Exposed to the agent as
+   * `ctx.fanout.index`. Absent on a non-fan-out (single-child) job.
+   */
+  fanoutIndex?: number;
+  /** Number of children in this fan-out. Exposed as `ctx.fanout.total`. */
+  fanoutTotal?: number;
+}
+
+/**
+ * Stamp a deterministic `fanoutIndex`/`fanoutTotal` onto each child of a
+ * multi-child fan-out. `fanoutIndex` is the child's rank in the order defined by
+ * `keyOf` (host: `agentId`; matrix: variant label), independent of emission
+ * order — the orchestrator's wave dispatch keys on `fanoutIndex`, so emission
+ * order need not be touched (this preserves the local-executor matrix naming
+ * order). A single child gets no position (non-fan-out job; `ctx.fanout` stays
+ * undefined). Mutates and returns the same array.
+ */
+function assignFanoutPositions(
+  children: MaterializedJob[],
+  keyOf: (child: MaterializedJob) => string,
+): MaterializedJob[] {
+  if (children.length <= 1) return children;
+  const total = children.length;
+  const rank = new Map<MaterializedJob, number>();
+  [...children]
+    .sort((a, b) => keyOf(a).localeCompare(keyOf(b)))
+    .forEach((child, index) => rank.set(child, index));
+  for (const child of children) {
+    child.fanoutIndex = rank.get(child)!;
+    child.fanoutTotal = total;
+  }
+  return children;
+}
+
+/** Variant label of a child = the text inside the trailing `(...)` of its expanded name. */
+function variantLabelOf(child: MaterializedJob): string {
+  return child.expandedName.slice(child.baseName.length + 2, -1);
 }
 
 export interface FanoutResult {
@@ -122,12 +175,29 @@ export function matrixEnvelopeFields(mat: MaterializedJob): {
   name: string;
   baseJobName: string;
   matrixValues?: MatrixValues;
+  fanoutIndex?: number;
+  fanoutTotal?: number;
 } {
   return {
     name: mat.expandedName,
     baseJobName: mat.baseName,
     ...(mat.variantValues && { matrixValues: mat.variantValues }),
+    ...fanoutEnvelopeFields(mat),
   };
+}
+
+/**
+ * The fan-out position envelope fields (`fanoutIndex`/`fanoutTotal`) of a
+ * materialized child, shared by the matrix + host envelope builders. Both are
+ * present together or absent together (a non-fan-out child has neither).
+ */
+export function fanoutEnvelopeFields(mat: MaterializedJob): {
+  fanoutIndex?: number;
+  fanoutTotal?: number;
+} {
+  return mat.fanoutTotal !== undefined
+    ? { fanoutIndex: mat.fanoutIndex, fanoutTotal: mat.fanoutTotal }
+    : {};
 }
 
 /**
@@ -153,19 +223,17 @@ export function materializeResolvedMatrix(
     );
   }
   const jobs: MaterializedJob[] = [];
-  const names: string[] = [];
   for (const variantValues of combos) {
-    const expandedName = formatExpandedJobName(lockJob.name, variantValues);
-    names.push(expandedName);
     jobs.push({
       lockJob,
       baseName: lockJob.name,
-      expandedName,
+      expandedName: formatExpandedJobName(lockJob.name, variantValues),
       variantKind: VariantKind.matrix,
       variantValues,
     });
   }
-  return { jobs, expansionMap: new Map([[lockJob.name, names]]) };
+  assignFanoutPositions(jobs, variantLabelOf);
+  return { jobs, expansionMap: new Map([[lockJob.name, jobs.map((j) => j.expandedName)]]) };
 }
 
 /**
@@ -181,6 +249,8 @@ export function hostEnvelopeFields(mat: MaterializedJob): {
   host?: string;
   agent?: ResolvedHostAgent;
   connectedInstanceId?: string | null;
+  fanoutIndex?: number;
+  fanoutTotal?: number;
 } {
   return {
     name: mat.expandedName,
@@ -189,6 +259,7 @@ export function hostEnvelopeFields(mat: MaterializedJob): {
     ...(mat.host && { host: mat.host }),
     ...(mat.agent && { agent: mat.agent }),
     ...(mat.connectedInstanceId !== undefined && { connectedInstanceId: mat.connectedInstanceId }),
+    ...fanoutEnvelopeFields(mat),
   };
 }
 
@@ -217,22 +288,21 @@ export function materializeResolvedHosts(
     );
   }
   const jobs: MaterializedJob[] = [];
-  const names: string[] = [];
   for (const agent of agents) {
-    const expandedName = `${lockJob.name} (${agent.host})`;
-    names.push(expandedName);
     jobs.push({
       lockJob,
       baseName: lockJob.name,
-      expandedName,
+      expandedName: `${lockJob.name} (${agent.host})`,
       variantKind: VariantKind.host,
       pinnedAgentId: agent.agentId,
       host: agent.host,
       agent,
       connectedInstanceId: agent.connectedInstanceId ?? null,
+      ...(agent.needsBringup && { needsBringup: true }),
     });
   }
-  return { jobs, expansionMap: new Map([[lockJob.name, names]]) };
+  assignFanoutPositions(jobs, (child) => child.pinnedAgentId ?? '');
+  return { jobs, expansionMap: new Map([[lockJob.name, jobs.map((j) => j.expandedName)]]) };
 }
 
 /**
@@ -290,19 +360,19 @@ export function materializeFanout(staticJobs: readonly LockJob[]): FanoutResult 
       );
     }
 
-    const names: string[] = [];
-    for (const variantValues of combos) {
-      const expandedName = formatExpandedJobName(lockJob.name, variantValues);
-      names.push(expandedName);
-      jobs.push({
-        lockJob,
-        baseName: lockJob.name,
-        expandedName,
-        variantKind: VariantKind.matrix,
-        variantValues,
-      });
-    }
-    expansionMap.set(lockJob.name, names);
+    const children: MaterializedJob[] = combos.map((variantValues) => ({
+      lockJob,
+      baseName: lockJob.name,
+      expandedName: formatExpandedJobName(lockJob.name, variantValues),
+      variantKind: VariantKind.matrix,
+      variantValues,
+    }));
+    assignFanoutPositions(children, variantLabelOf);
+    jobs.push(...children);
+    expansionMap.set(
+      lockJob.name,
+      children.map((j) => j.expandedName),
+    );
   }
 
   return { jobs, expansionMap };

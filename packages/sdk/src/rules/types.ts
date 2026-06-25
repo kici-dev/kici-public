@@ -1,5 +1,6 @@
 import type { $ as Shell } from 'zx';
 import type { EventPayload } from '../events/event-payloads.js';
+import type { FanoutPosition } from '../fanout-context.js';
 
 // Re-export the typed discriminated union (replaces the old placeholder interface).
 export type { EventPayload } from '../events/event-payloads.js';
@@ -15,6 +16,14 @@ export interface RuleContext {
   changedFiles: string[];
   /** Environment variables */
   env: Record<string, string | undefined>;
+  /** Operator-supplied, validated + coerced workflow-dispatch inputs. Empty when none declared. */
+  dispatchInputs: Readonly<Record<string, string | number | boolean | null>>;
+  /**
+   * Position of this child within its fan-out (a `runsOnAll` host or a matrix
+   * combination); undefined on a non-fan-out job. Read by the run-once rule
+   * helpers (`onlyOnFirstHost` / `onlyOnLastHost` / `onlyOnFanoutIndex`).
+   */
+  fanout?: FanoutPosition;
   /** zx shell executor for running commands */
   $: typeof Shell;
 }

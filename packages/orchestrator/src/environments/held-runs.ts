@@ -3,7 +3,7 @@
  *
  * Manages the lifecycle: pending -> approved/rejected/expired.
  */
-import { sql, type Kysely } from 'kysely';
+import { sql, type Kysely, type Transaction } from 'kysely';
 import {
   type ApprovalRequirement,
   type ApproverClause,
@@ -13,6 +13,9 @@ import {
   TriggerSource,
 } from '@kici-dev/engine';
 import type { Database, HeldRun, HeldRunApproval } from '../db/types.js';
+
+/** A Kysely root handle or an in-flight transaction — query builders accept either. */
+type Executor = Kysely<Database> | Transaction<Database>;
 
 /** Status values for held runs (held_runs table). */
 export enum HeldRunStatus {
@@ -157,8 +160,12 @@ export class HeldRunStore {
       .executeTakeFirstOrThrow();
   }
 
-  /** Record one approve/reject decision against a hold. */
-  async recordDecision(heldRunId: string, data: RecordDecisionData): Promise<HeldRunApproval> {
+  /** INSERT one decision row using the given executor (root or transaction). */
+  private insertDecisionRow(
+    exec: Executor,
+    heldRunId: string,
+    data: RecordDecisionData,
+  ): Promise<HeldRunApproval> {
     // The driver renders a JS array as a Postgres array literal ('{...}'),
     // which a jsonb column rejects ('invalid input syntax for type json').
     // Serialize to a JSON string so the value lands as jsonb. Objects are
@@ -166,7 +173,7 @@ export class HeldRunStore {
     // JSON.stringify here, matching the jsonb-insert pattern in job-queue.ts.
     const clausesSatisfied =
       data.clausesSatisfied != null ? JSON.stringify(data.clausesSatisfied) : null;
-    return this.db
+    return exec
       .insertInto('held_run_approvals')
       .values({
         held_run_id: heldRunId,
@@ -176,6 +183,108 @@ export class HeldRunStore {
       })
       .returningAll()
       .executeTakeFirstOrThrow();
+  }
+
+  /** Flip a pending hold to 'approved' using the given executor. Undefined if not pending. */
+  private flipToApproved(
+    exec: Executor,
+    orgId: string,
+    heldRunId: string,
+  ): Promise<HeldRun | undefined> {
+    return exec
+      .updateTable('held_runs')
+      .set({ status: HeldRunStatus.Approved, resolved_at: sql`now()` })
+      .where('id', '=', heldRunId)
+      .where('org_id', '=', orgId)
+      .where('status', '=', HeldRunStatus.Pending)
+      .returningAll()
+      .executeTakeFirst();
+  }
+
+  /** Flip a pending hold to 'rejected' using the given executor. Undefined if not pending. */
+  private flipToRejected(
+    exec: Executor,
+    orgId: string,
+    heldRunId: string,
+    reason?: string,
+  ): Promise<HeldRun | undefined> {
+    const set: Record<string, unknown> = {
+      status: HeldRunStatus.Rejected,
+      resolved_at: sql`now()`,
+    };
+    if (reason !== undefined) {
+      set.reason = reason;
+    }
+    return exec
+      .updateTable('held_runs')
+      .set(set)
+      .where('id', '=', heldRunId)
+      .where('org_id', '=', orgId)
+      .where('status', '=', HeldRunStatus.Pending)
+      .returningAll()
+      .executeTakeFirst();
+  }
+
+  /** Map a released held_runs row to the resume ReleaseSignal. */
+  private toReleaseSignal(row: HeldRun): ReleaseSignal {
+    return {
+      holdId: row.id,
+      runId: row.run_id,
+      jobId: row.job_id,
+      scope: (row.hold_scope as HoldScope) ?? HoldScope.enum.job,
+      stepIndex: row.step_index,
+      triggerSource: (row.trigger_source as TriggerSource) ?? TriggerSource.enum.environment,
+    };
+  }
+
+  /** Record one approve/reject decision against a hold. */
+  async recordDecision(heldRunId: string, data: RecordDecisionData): Promise<HeldRunApproval> {
+    return this.insertDecisionRow(this.db, heldRunId, data);
+  }
+
+  /**
+   * Atomically record an approve decision and release the (now-satisfied) hold.
+   * The INSERT into `held_run_approvals` and the `held_runs` → approved UPDATE
+   * run in a single transaction, so a crash between them cannot strand the hold
+   * `pending` with a recorded approve. Throws if the hold is not found or no
+   * longer pending (the whole transaction rolls back).
+   */
+  async recordAndRelease(
+    orgId: string,
+    heldRunId: string,
+    data: RecordDecisionData,
+  ): Promise<ReleaseSignal> {
+    return this.db.transaction().execute(async (tx) => {
+      await this.insertDecisionRow(tx, heldRunId, data);
+      const row = await this.flipToApproved(tx, orgId, heldRunId);
+      if (!row) {
+        throw new Error(`Held run '${heldRunId}' not found or not pending`);
+      }
+      return this.toReleaseSignal(row);
+    });
+  }
+
+  /**
+   * Atomically record a reject decision and reject the hold. The INSERT and the
+   * `held_runs` → rejected UPDATE run in a single transaction, so a crash
+   * between them cannot strand the hold `pending` with a recorded reject (which
+   * would poison `evaluate()` forever). Throws if the hold is not found or no
+   * longer pending (the whole transaction rolls back).
+   */
+  async recordAndReject(
+    orgId: string,
+    heldRunId: string,
+    data: RecordDecisionData,
+    reason?: string,
+  ): Promise<HeldRun> {
+    return this.db.transaction().execute(async (tx) => {
+      await this.insertDecisionRow(tx, heldRunId, data);
+      const row = await this.flipToRejected(tx, orgId, heldRunId, reason);
+      if (!row) {
+        throw new Error(`Held run '${heldRunId}' not found or not pending`);
+      }
+      return row;
+    });
   }
 
   /** List the recorded decisions for a hold, oldest first. */
@@ -207,29 +316,11 @@ export class HeldRunStore {
    * lives in `held_run_approvals`, not on the row.
    */
   async release(orgId: string, heldRunId: string): Promise<ReleaseSignal> {
-    const row = await this.db
-      .updateTable('held_runs')
-      .set({
-        status: HeldRunStatus.Approved,
-        resolved_at: sql`now()`,
-      })
-      .where('id', '=', heldRunId)
-      .where('org_id', '=', orgId)
-      .where('status', '=', HeldRunStatus.Pending)
-      .returningAll()
-      .executeTakeFirst();
-
+    const row = await this.flipToApproved(this.db, orgId, heldRunId);
     if (!row) {
       throw new Error(`Held run '${heldRunId}' not found or not pending`);
     }
-    return {
-      holdId: row.id,
-      runId: row.run_id,
-      jobId: row.job_id,
-      scope: (row.hold_scope as HoldScope) ?? HoldScope.enum.job,
-      stepIndex: row.step_index,
-      triggerSource: (row.trigger_source as TriggerSource) ?? TriggerSource.enum.environment,
-    };
+    return this.toReleaseSignal(row);
   }
 
   /** Approve a pending held run. Throws if not found or not pending. */
@@ -255,23 +346,7 @@ export class HeldRunStore {
 
   /** Reject a pending held run. Throws if not found or not pending. */
   async reject(orgId: string, heldRunId: string, reason?: string): Promise<HeldRun> {
-    const set: Record<string, unknown> = {
-      status: HeldRunStatus.Rejected,
-      resolved_at: sql`now()`,
-    };
-    if (reason !== undefined) {
-      set.reason = reason;
-    }
-
-    const row = await this.db
-      .updateTable('held_runs')
-      .set(set)
-      .where('id', '=', heldRunId)
-      .where('org_id', '=', orgId)
-      .where('status', '=', HeldRunStatus.Pending)
-      .returningAll()
-      .executeTakeFirst();
-
+    const row = await this.flipToRejected(this.db, orgId, heldRunId, reason);
     if (!row) {
       throw new Error(`Held run '${heldRunId}' not found or not pending`);
     }

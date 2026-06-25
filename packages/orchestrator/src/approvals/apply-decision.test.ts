@@ -18,6 +18,8 @@ function makeStore(overrides: Record<string, unknown> = {}) {
     recordDecision: vi.fn().mockResolvedValue({}),
     reject: vi.fn().mockResolvedValue({}),
     release: vi.fn(),
+    recordAndRelease: vi.fn(),
+    recordAndReject: vi.fn().mockResolvedValue({}),
     ...overrides,
   } as any;
 }
@@ -71,12 +73,10 @@ describe('applyDecision', () => {
   it('releases and resumes a job hold once all clauses are satisfied', async () => {
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(pendingHold),
-      // After recording, the decision list includes the approve.
-      listDecisions: vi
-        .fn()
-        .mockResolvedValueOnce([]) // pre-record (eligibility check)
-        .mockResolvedValueOnce([{ approver_user_id: 'u-alice', decision: 'approve' }]),
-      release: vi.fn().mockResolvedValue({
+      // Eligibility read returns no prior decisions; the prospective approve is
+      // evaluated in memory, so the satisfying path takes the atomic method.
+      listDecisions: vi.fn().mockResolvedValue([]),
+      recordAndRelease: vi.fn().mockResolvedValue({
         holdId: 'hr-1',
         runId: 'run-1',
         jobId: 'deploy',
@@ -93,8 +93,9 @@ describe('applyDecision', () => {
     });
 
     expect(result.status).toBe('released');
-    expect(store.recordDecision).toHaveBeenCalledTimes(1);
-    expect(store.release).toHaveBeenCalledWith('org-1', 'hr-1');
+    expect(store.recordAndRelease).toHaveBeenCalledTimes(1);
+    expect(store.recordDecision).not.toHaveBeenCalled();
+    expect(store.release).not.toHaveBeenCalled();
     expect(deps.onJobRelease).toHaveBeenCalledTimes(1);
     expect(deps.onStepRelease).not.toHaveBeenCalled();
   });
@@ -110,10 +111,7 @@ describe('applyDecision', () => {
     };
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(twoClauseHold),
-      listDecisions: vi
-        .fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ approver_user_id: 'u-alice', decision: 'approve' }]),
+      listDecisions: vi.fn().mockResolvedValue([]),
     });
     const result = await applyDecision(makeDeps(store), {
       heldRunId: 'hr-1',
@@ -122,6 +120,9 @@ describe('applyDecision', () => {
     });
     expect(result.status).toBe('pending');
     expect(result.remainingClauses).toBe(1);
+    // A non-satisfying approve is a safe lone INSERT — no atomic release.
+    expect(store.recordDecision).toHaveBeenCalledTimes(1);
+    expect(store.recordAndRelease).not.toHaveBeenCalled();
     expect(store.release).not.toHaveBeenCalled();
   });
 
@@ -129,11 +130,8 @@ describe('applyDecision', () => {
     const stepHold = { ...pendingHold, hold_scope: 'step', step_index: 2 };
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(stepHold),
-      listDecisions: vi
-        .fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ approver_user_id: 'u-alice', decision: 'approve' }]),
-      release: vi.fn().mockResolvedValue({
+      listDecisions: vi.fn().mockResolvedValue([]),
+      recordAndRelease: vi.fn().mockResolvedValue({
         holdId: 'hr-1',
         runId: 'run-1',
         jobId: 'deploy',
@@ -157,11 +155,8 @@ describe('applyDecision', () => {
     const workflowHold = { ...pendingHold, hold_scope: 'workflow', job_id: '__install__CI' };
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(workflowHold),
-      listDecisions: vi
-        .fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ approver_user_id: 'u-alice', decision: 'approve' }]),
-      release: vi.fn().mockResolvedValue({
+      listDecisions: vi.fn().mockResolvedValue([]),
+      recordAndRelease: vi.fn().mockResolvedValue({
         holdId: 'hr-1',
         runId: 'run-1',
         jobId: '__install__CI',
@@ -193,11 +188,8 @@ describe('applyDecision', () => {
     const workflowHold = { ...pendingHold, hold_scope: 'workflow', job_id: 'release' };
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(workflowHold),
-      listDecisions: vi
-        .fn()
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([{ approver_user_id: 'u-alice', decision: 'approve' }]),
-      release: vi.fn().mockResolvedValue({
+      listDecisions: vi.fn().mockResolvedValue([]),
+      recordAndRelease: vi.fn().mockResolvedValue({
         holdId: 'hr-1',
         runId: 'run-1',
         jobId: 'release',
@@ -231,7 +223,12 @@ describe('applyDecision', () => {
       reason: 'no',
     });
     expect(result.status).toBe('rejected');
-    expect(store.reject).toHaveBeenCalledWith('org-1', 'hr-1', 'no');
+    expect(store.recordAndReject).toHaveBeenCalledWith(
+      'org-1',
+      'hr-1',
+      expect.objectContaining({ approverSub: 'u-alice', decision: 'reject' }),
+      'no',
+    );
     expect(onWorkflowReject).toHaveBeenCalledWith('run-1');
   });
 
@@ -249,7 +246,7 @@ describe('applyDecision', () => {
     expect(result.status).toBe('ineligible');
   });
 
-  it('records and rejects on a reject decision', async () => {
+  it('records and rejects atomically on a reject decision (recordAndReject, not recordDecision + reject)', async () => {
     const store = makeStore({ getById: vi.fn().mockResolvedValue(pendingHold) });
     const result = await applyDecision(makeDeps(store), {
       heldRunId: 'hr-1',
@@ -258,11 +255,14 @@ describe('applyDecision', () => {
       reason: 'not ready',
     });
     expect(result.status).toBe('rejected');
-    expect(store.recordDecision).toHaveBeenCalledWith('hr-1', {
-      approverSub: 'u-alice',
-      decision: 'reject',
-    });
-    expect(store.reject).toHaveBeenCalledWith('org-1', 'hr-1', 'not ready');
+    expect(store.recordAndReject).toHaveBeenCalledWith(
+      'org-1',
+      'hr-1',
+      expect.objectContaining({ approverSub: 'u-alice', decision: 'reject' }),
+      'not ready',
+    );
+    expect(store.recordDecision).not.toHaveBeenCalled();
+    expect(store.reject).not.toHaveBeenCalled();
   });
 
   it('notifies onStepReject when a step-scoped hold is rejected', async () => {

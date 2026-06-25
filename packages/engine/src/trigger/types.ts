@@ -15,16 +15,21 @@
  * Schema version 18: adds LockJob.runsOnAll host fan-out predicate + onUnreachable policy.
  * Schema version 19: adds LockJob.maxParallel/failFast fan-out concurrency (rolling waves).
  * Schema version 20: runsOn/runsOnAll/excludeLabels carry LabelMatcher (exact|regex) for glob+regex selectors.
+ * Schema version 23: adds LockDispatchTrigger.inputs (typed dispatch inputs descriptors).
+ * Schema version 24: adds LockJob.runsOnPick (deterministic single-host selection).
+ * Schema version 25: adds LockStep.retry (step retry policy data subset; retryIf is execution-only).
+ * Schema version 26: adds LockJob.includeUninitialized (runsOnAll fans out to declared-but-un-agented hosts, bringing up a temporary init-runner per fresh box).
  */
 
 import { z } from 'zod';
 import type { ProviderType } from '../provider/types.js';
 import type { ApproverClause } from '../approval/types.js';
+import type { InputsDescriptorMap } from '../inputs/descriptor.js';
 import { LabelMatcher } from '../labels-match.js';
 import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
 
 /** Schema version - increment on breaking changes */
-export const SCHEMA_VERSION = 22 as const;
+export const SCHEMA_VERSION = 26 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
@@ -152,6 +157,8 @@ export interface LockDispatchTrigger {
   readonly _type: 'dispatch';
   readonly types: readonly string[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Typed dispatch-input descriptors (from `dispatch({ inputs })`). */
+  readonly inputs?: InputsDescriptorMap;
 }
 
 /**
@@ -389,6 +396,13 @@ export interface LockStep {
   readonly continueOnError?: boolean;
   /** Step-level timeout in milliseconds. */
   readonly timeout?: number;
+  /** Retry policy data (retryIf is execution-only and never serialized). */
+  readonly retry?: {
+    readonly maxAttempts: number;
+    readonly delayMs: number;
+    readonly backoff: 'fixed' | 'exponential';
+    readonly maxDelayMs: number;
+  };
   /** Source location of the step() call in the original TypeScript file (for annotations). */
   readonly sourceLocation?: {
     readonly file: string;
@@ -513,6 +527,16 @@ export type RunsOnAllInput =
 export const OnUnreachableMode = z.enum(['skip', 'fail', 'hold']);
 export type OnUnreachableMode = z.infer<typeof OnUnreachableMode>;
 
+/**
+ * Single-agent selection policy when multiple agents match a `runsOn` selector.
+ *
+ * - `deterministic` (default): sort matching candidates by `agentId` and pick the
+ *   lowest, so a run-once-on-one-host job is reproducible across re-runs.
+ * - `any`: pick any available agent (load spread).
+ */
+export const RunsOnPick = z.enum(['deterministic', 'any']);
+export type RunsOnPick = z.infer<typeof RunsOnPick>;
+
 export interface LockJob {
   readonly _type: 'static';
   readonly name: string;
@@ -520,12 +544,26 @@ export interface LockJob {
   readonly runsOn?: readonly LabelMatcher[];
   readonly excludeLabels?: readonly LabelMatcher[];
   /**
+   * Single-agent selection policy when more than one agent matches `runsOn`.
+   * `deterministic` (default) sorts candidates by `agentId` and picks the lowest;
+   * `any` picks any available agent. Absent on a `runsOnAll` fan-out job.
+   */
+  readonly runsOnPick?: RunsOnPick;
+  /**
    * Host fan-out predicate (mutually exclusive with `runsOn`). When set, the job
    * fans out to every roster host matching the predicate, one pinned child per host.
    */
   readonly runsOnAll?: RunsOnAllPredicate;
   /** Failure policy for unreachable durable hosts in a `runsOnAll` fan-out. */
   readonly onUnreachable?: OnUnreachableMode;
+  /**
+   * Widen a `runsOnAll` fan-out to declared-but-un-agented hosts. When true,
+   * every roster host matching the predicate is a fan-out target even with no
+   * live agent: a fresh host gets a temporary init-runner brought up over SSH
+   * and its pinned steps run there; a live host runs on its own agent. Default
+   * absent ⇒ only live hosts (today's behavior governed by `onUnreachable`).
+   */
+  readonly includeUninitialized?: boolean;
   /**
    * Fan-out concurrency width (sliding window; `1` = serial). When set on a
    * fan-out job (matrix or `runsOnAll`), only the first `maxParallel` children

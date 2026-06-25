@@ -3,7 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import { Migrator } from 'kysely/migration';
 import pg from 'pg';
 import { createMigrationProvider } from '../db/migration-provider.js';
-import { deriveHostStatus, HostRosterStore, HostStatus } from './host-roster.js';
+import {
+  deriveHostStatus,
+  HostRosterStore,
+  HostStatus,
+  parseHostProperties,
+} from './host-roster.js';
 import type { LabelMatcher } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 
@@ -160,10 +165,65 @@ describeDb('HostRosterStore', () => {
     expect(JSON.parse(row!.labels)).toEqual(['role:web']);
   });
 
-  it('declareStatic is idempotent on agent_id (does not clobber a live row)', async () => {
+  it('declareStatic persists reach metadata and getReach reads it back', async () => {
+    await store.declareStatic({
+      agentId: 'box-00007',
+      labels: ['role:fresh'],
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 2222,
+      sshKeySecret: 'prod/bootstrap/ssh',
+    });
+    expect(await store.getReach('box-00007')).toEqual({
+      agentId: 'box-00007',
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 2222,
+      sshKeySecret: 'prod/bootstrap/ssh',
+    });
+  });
+
+  it('getReach returns nulls for a host declared without reach metadata', async () => {
+    await store.declareStatic({ agentId: 'no-reach', labels: [] });
+    expect(await store.getReach('no-reach')).toEqual({
+      agentId: 'no-reach',
+      address: null,
+      sshUser: null,
+      sshPort: null,
+      sshKeySecret: null,
+    });
+  });
+
+  it('getReach returns null for an unknown host', async () => {
+    expect(await store.getReach('does-not-exist')).toBeNull();
+  });
+
+  it('declareStatic returns created:true on insert, created:false on update', async () => {
+    expect((await store.declareStatic({ agentId: 'web-09', labels: ['role:web'] })).created).toBe(
+      true,
+    );
+    expect(
+      (await store.declareStatic({ agentId: 'web-09', labels: ['role:web', 'region:eu'] })).created,
+    ).toBe(false);
+  });
+
+  it('declareStatic re-declare updates operator fields', async () => {
+    await store.declareStatic({ agentId: 'web-09', labels: ['role:web'], hostname: 'old' });
+    await store.declareStatic({
+      agentId: 'web-09',
+      labels: ['role:web', 'region:eu'],
+      hostname: 'new',
+    });
+    const row = await store.get('web-09');
+    expect(JSON.parse(row!.labels)).toEqual(['role:web', 'region:eu']);
+    expect(row!.hostname).toBe('new');
+  });
+
+  it('declareStatic re-declare preserves a live row liveness and agent identity', async () => {
+    const tokenId = '11111111-1111-1111-1111-111111111111';
     await store.upsert({
       agentId: 'web-09',
-      tokenId: null,
+      tokenId,
       lifecycleClass: 'static',
       labels: ['role:web'],
       hostname: 'web-09',
@@ -171,9 +231,53 @@ describeDb('HostRosterStore', () => {
       arch: 'x64',
       instanceId: 'orch-A',
     });
-    await store.declareStatic({ agentId: 'web-09', labels: [] });
-    // The pre-declare must not overwrite the connected row.
-    expect((await store.get('web-09'))?.connected_instance_id).toBe('orch-A');
+    await store.declareStatic({ agentId: 'web-09', labels: ['role:db'] });
+    const row = await store.get('web-09');
+    // Operator labels DID update...
+    expect(JSON.parse(row!.labels)).toEqual(['role:db']);
+    // ...but agent-reported liveness/identity survived.
+    expect(row!.connected_instance_id).toBe('orch-A');
+    expect(row!.platform).toBe('linux');
+    expect(row!.arch).toBe('x64');
+    expect(row!.token_id).toBe(tokenId);
+  });
+
+  it('declareStatic re-declare with omitted labels preserves existing labels', async () => {
+    await store.declareStatic({ agentId: 'web-09', labels: ['role:web'] });
+    await store.declareStatic({ agentId: 'web-09', hostname: 'h' });
+    expect(JSON.parse((await store.get('web-09'))!.labels)).toEqual(['role:web']);
+  });
+
+  it('declareStatic re-declare with omitted reach preserves CLI-set reach', async () => {
+    await store.declareStatic({
+      agentId: 'box-7',
+      labels: [],
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 2222,
+      sshKeySecret: 'prod/bootstrap/ssh',
+    });
+    await store.declareStatic({ agentId: 'box-7', labels: ['role:fresh'] });
+    expect(await store.getReach('box-7')).toEqual({
+      agentId: 'box-7',
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 2222,
+      sshKeySecret: 'prod/bootstrap/ssh',
+    });
+  });
+
+  it('declareStatic re-declare shallow-merges host_properties', async () => {
+    await store.declareStatic({
+      agentId: 'web-09',
+      labels: [],
+      properties: { region: 'eu', tier: 'gold' },
+    });
+    await store.declareStatic({ agentId: 'web-09', labels: [], properties: { tier: 'silver' } });
+    expect(parseHostProperties((await store.get('web-09'))!.host_properties)).toEqual({
+      region: 'eu',
+      tier: 'silver',
+    });
   });
 
   it('removeStatic deletes the row and returns the count', async () => {

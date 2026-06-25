@@ -1,5 +1,5 @@
 // Factory functions
-export { rule, skip } from './rule.js';
+export { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from './rule.js';
 
 // Rule evaluator
 export { evaluateRules, type RuleEvaluationResult } from './evaluator.js';

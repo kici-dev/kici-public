@@ -142,6 +142,42 @@ export type AgentRole = (typeof KNOWN_ROLES)[number];
 /** Reserved label prefix — labels starting with this are system-managed. */
 export const RESERVED_LABEL_PREFIX = 'kici:';
 
+/**
+ * Capability label prefix — `kici:capability:<name>` grants an agent a
+ * privileged capability beyond plain execution. Distinct from `kici:role:`
+ * (which gates which internal job kinds an agent runs).
+ */
+export const CAPABILITY_LABEL_PREFIX = 'kici:capability:';
+
+/** Build a `kici:capability:<name>` label. */
+export function capabilityLabel(name: string): string {
+  return `${CAPABILITY_LABEL_PREFIX}${name}`;
+}
+
+/**
+ * The `ssh-transport` capability: an agent holding this may run the bootstrap
+ * bring-up (`ctx.kici.bootstrap.ensureInitRunner` / `preBootSend`) — i.e. SSH
+ * to a declared-but-un-agented host. The orchestrator refuses to run a
+ * bring-up on an agent that lacks it. Prod-critical: such an agent custodies
+ * the bootstrap SSH key.
+ */
+export const SSH_TRANSPORT_CAPABILITY = 'kici:capability:ssh-transport';
+
+/**
+ * The `kici:init` lifecycle label carried by a temporary init-runner agent
+ * brought up on a fresh box for bootstrap. Marks it as ephemeral + privileged;
+ * it dies on reboot and is reaped. Distinct from `kici:role:init-runner`
+ * (which is the per-job `__init__` workspace-init capability — a different
+ * concept entirely).
+ */
+export const INIT_LABEL = 'kici:init';
+
+/**
+ * The `kici:privileged:root` label a bootstrap init-runner carries — it runs
+ * as root in the target's rescue env to partition / format / install.
+ */
+export const PRIVILEGED_ROOT_LABEL = 'kici:privileged:root';
+
 /** Role label prefix — used to generate role-specific labels. */
 export const ROLE_LABEL_PREFIX = 'kici:role:';
 

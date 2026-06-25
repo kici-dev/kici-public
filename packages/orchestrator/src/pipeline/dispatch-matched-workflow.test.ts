@@ -5,9 +5,13 @@ import {
   materializeStaticJobsSafe,
   resolveHostFanoutTargets,
   dispatchMatchedWorkflow,
+  buildBringupJobInput,
+  hostCtxFromMat,
   type GeneratedJobConfig,
   type WorkflowDispatchContext,
 } from './dispatch-matched-workflow.js';
+import { SSH_TRANSPORT_CAPABILITY } from '@kici-dev/engine';
+import type { MaterializedJob } from '@kici-dev/engine';
 import { ExecutionJobStatus, FanoutError, FanoutCause, HostTargetSelector } from '@kici-dev/engine';
 import { HostStatus, type MatchedHost } from '../agent/host-roster.js';
 import type { ProcessingDeps } from './processor.js';
@@ -143,6 +147,84 @@ describe('resolveHostFanoutTargets — --target post-filter', () => {
   });
 });
 
+describe('resolveHostFanoutTargets — includeUninitialized', () => {
+  const convergeJob = {
+    ...runsOnAllJob,
+    includeUninitialized: true,
+  };
+
+  it('flags an unreachable static host for bring-up and a ready host as live', async () => {
+    const deps = rosterDeps([
+      host({ agentId: 'live-01', host: 'live-01', status: HostStatus.ready }),
+      host({
+        agentId: 'fresh-01',
+        host: 'fresh-01',
+        status: HostStatus.unreachable,
+        connectedInstanceId: null,
+      }),
+    ]);
+    const resolved = await resolveHostFanoutTargets(convergeJob as never, deps);
+    const byId = new Map(resolved.map((h) => [h.agentId, h]));
+    expect(byId.get('live-01')?.needsBringup).toBe(false);
+    expect(byId.get('fresh-01')?.needsBringup).toBe(true);
+    expect(resolved.map((h) => h.agentId).sort()).toEqual(['fresh-01', 'live-01']);
+  });
+
+  it('without the flag, an unreachable static host is governed by onUnreachable (no bring-up)', async () => {
+    // Default onUnreachable is 'hold' → the unreachable host is still a target,
+    // but it carries no needsBringup (today's behavior, no init-runner attempt).
+    const deps = rosterDeps([
+      host({ agentId: 'live-01', host: 'live-01', status: HostStatus.ready }),
+      host({
+        agentId: 'fresh-01',
+        host: 'fresh-01',
+        status: HostStatus.unreachable,
+        connectedInstanceId: null,
+      }),
+    ]);
+    const resolved = await resolveHostFanoutTargets(runsOnAllJob as never, deps);
+    for (const h of resolved) expect(h.needsBringup).toBeFalsy();
+  });
+
+  it('skips a stale ephemeral host even under includeUninitialized', async () => {
+    const deps = rosterDeps([
+      host({ agentId: 'live-01', host: 'live-01', status: HostStatus.ready }),
+      host({
+        agentId: 'eph-01',
+        host: 'eph-01',
+        lifecycleClass: 'ephemeral',
+        status: HostStatus.stale,
+        connectedInstanceId: null,
+      }),
+    ]);
+    const resolved = await resolveHostFanoutTargets(convergeJob as never, deps);
+    expect(resolved.map((h) => h.agentId)).toEqual(['live-01']);
+  });
+});
+
+describe('buildBringupJobInput', () => {
+  it('builds a bringupOnly job pinned to the ssh-transport capability for the target', () => {
+    const ctx = {
+      runId: 'run-1',
+      ref: 'abc',
+      workflow: { name: 'converge-fleet' },
+      event: { sourceBranch: 'main' },
+      credentials: { token: 't' },
+    } as unknown as WorkflowDispatchContext;
+    const setup = {
+      effectiveDeliveryId: 'd1',
+      info: { provider: 'local', routingKey: 'rk' },
+    } as never;
+    const input = buildBringupJobInput({ ctx, setup, targetAgentId: 'fresh-01' });
+    expect(input.jobName).toBe('__bringup__converge-fleet__fresh-01');
+    expect(input.runsOnLabels).toEqual([SSH_TRANSPORT_CAPABILITY]);
+    expect((input.jobConfig as { bringupOnly?: boolean }).bringupOnly).toBe(true);
+    expect((input.jobConfig as { bringupTarget?: string }).bringupTarget).toBe('fresh-01');
+    // A bring-up clones nothing.
+    expect(input.repoUrl).toBe('');
+  });
+});
+
 describe('runsOnSelectorsForLockJob', () => {
   it('splits lock runsOn matchers into exact labels + regex patterns', () => {
     const lockJob = {
@@ -221,6 +303,7 @@ function makeSingleJobContext(over: {
   runWideFlatSecrets?: Record<string, string>;
   jobEnvironment?: string;
   secretResolver?: unknown;
+  checkMode?: string;
 }): { ctx: WorkflowDispatchContext; dispatched: QueuedJobInput[] } {
   const dispatched: QueuedJobInput[] = [];
   const workflow = {
@@ -339,7 +422,11 @@ function makeSingleJobContext(over: {
     trustResolution: undefined,
     lockFileSource: undefined,
     crossSource: false,
-    extraJobConfig: { isTestRun: true, fixtureId: 'fx-1' },
+    extraJobConfig: {
+      isTestRun: true,
+      fixtureId: 'fx-1',
+      ...(over.checkMode ? { checkMode: over.checkMode } : {}),
+    },
     ...(over.runWideFlatSecrets ? { runWideFlatSecrets: over.runWideFlatSecrets } : {}),
     ...(over.fullRepo ? {} : {}),
     ...(over.testRun ? { testRun: over.testRun } : {}),
@@ -605,6 +692,44 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
   });
 });
 
+describe('dispatchMatchedWorkflow — checkMode threading', () => {
+  // The run-level check mode (`--check` / `--check --fail-on-drift`) rides on
+  // ctx.extraJobConfig.checkMode. It MUST reach onExecutionStarted's trailing
+  // checkMode argument so the execution_runs.check_mode column is persisted —
+  // otherwise computeRunStatus can never fail a drifted check-fail-on-drift run.
+  // onExecutionStarted's signature ends with (..., workflowConcurrency,
+  // workflowTimeoutMs, checkMode); checkMode is the final positional arg.
+  function lastCallCheckMode(mock: ReturnType<typeof vi.fn>): unknown {
+    const call = mock.mock.calls.at(-1);
+    return call?.[call.length - 1];
+  }
+
+  it('threads ctx.extraJobConfig.checkMode into onExecutionStarted', async () => {
+    const onExecutionStarted = vi.fn().mockResolvedValue(undefined);
+    const { ctx } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      executionTracker: { onExecutionStarted },
+      checkMode: 'check-fail-on-drift',
+    });
+    await dispatchMatchedWorkflow(ctx);
+    expect(onExecutionStarted).toHaveBeenCalled();
+    expect(lastCallCheckMode(onExecutionStarted)).toBe('check-fail-on-drift');
+  });
+
+  it('passes checkMode undefined for the default apply-mode path', async () => {
+    const onExecutionStarted = vi.fn().mockResolvedValue(undefined);
+    const { ctx } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      executionTracker: { onExecutionStarted },
+    });
+    await dispatchMatchedWorkflow(ctx);
+    expect(onExecutionStarted).toHaveBeenCalled();
+    expect(lastCallCheckMode(onExecutionStarted)).toBeUndefined();
+  });
+});
+
 describe('partitionGeneratedConfigsByPin', () => {
   function cfg(name: string, pinnedAgentId?: string): GeneratedJobConfig {
     return {
@@ -635,5 +760,39 @@ describe('partitionGeneratedConfigsByPin', () => {
       pinnedConfigs: [],
       unpinnedConfigs: [cfg('a'), cfg('b')],
     });
+  });
+});
+
+describe('hostCtxFromMat — per-host secret-resolution context', () => {
+  const baseMat = { lockJob: {} } as unknown as MaterializedJob;
+
+  it('prefers mat.agent facts (agentId/host/labels) for a runsOnAll host child', () => {
+    const mat = {
+      ...baseMat,
+      agent: { agentId: 'box-00002', host: 'box-00002.prod', labels: ['role:db'] },
+    } as unknown as MaterializedJob;
+    expect(hostCtxFromMat(mat)).toEqual({
+      agentId: 'box-00002',
+      host: 'box-00002.prod',
+      labels: ['role:db'],
+    });
+  });
+
+  it('falls back to pinnedAgentId/host with no labels when agent facts are absent', () => {
+    const mat = {
+      ...baseMat,
+      pinnedAgentId: 'box-00003',
+      host: 'box-00003',
+    } as unknown as MaterializedJob;
+    expect(hostCtxFromMat(mat)).toEqual({ agentId: 'box-00003', host: 'box-00003', labels: [] });
+  });
+
+  it('uses the agentId as host when pinnedAgentId is set but host is absent', () => {
+    const mat = { ...baseMat, pinnedAgentId: 'box-00004' } as unknown as MaterializedJob;
+    expect(hostCtxFromMat(mat)).toEqual({ agentId: 'box-00004', host: 'box-00004', labels: [] });
+  });
+
+  it('returns undefined for a non-host child (no fan-out facts → fleet-wide resolution)', () => {
+    expect(hostCtxFromMat(baseMat)).toBeUndefined();
   });
 });

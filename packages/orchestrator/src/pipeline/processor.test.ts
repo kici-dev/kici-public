@@ -1262,6 +1262,7 @@ describe('processWebhook', () => {
       undefined, // originalRunId
       undefined, // concurrency (no concurrency config in test workflow)
       undefined, // workflowTimeoutMs (no timeout config in test workflow)
+      undefined, // checkMode (apply mode — no check-mode override in test fixture)
     );
   });
 
@@ -1291,8 +1292,10 @@ describe('processWebhook', () => {
     // The concurrency config (without hasGroup) is the second-to-last argument;
     // the trailing argument is the workflow timeout (undefined here).
     const call = mockTracker.onExecutionStarted.mock.calls[0];
-    expect(call[call.length - 2]).toEqual({ cancelInProgress: false, max: 3 });
-    expect(call[call.length - 1]).toBeUndefined();
+    // Trailing args: …, concurrency, workflowTimeoutMs, checkMode.
+    expect(call[call.length - 3]).toEqual({ cancelInProgress: false, max: 3 });
+    expect(call[call.length - 2]).toBeUndefined(); // workflowTimeoutMs
+    expect(call[call.length - 1]).toBeUndefined(); // checkMode
   });
 
   it('does not call executionTracker when not provided', async () => {

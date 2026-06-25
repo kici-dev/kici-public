@@ -1,5 +1,6 @@
 import type { z } from 'zod';
 import type { $ as Shell } from 'zx';
+import type { RetryBackoff } from '@kici-dev/core';
 import type {
   ResourceRequest,
   RunsOnAllInput,
@@ -83,6 +84,8 @@ export interface Step<TResult = void> {
   readonly continueOnError?: boolean;
   /** Step-level timeout in milliseconds. Overrides the agent's default (30 minutes). */
   readonly timeout?: number;
+  /** Normalized retry policy (defaults filled, shorthand expanded). `retryIf` is execution-only. */
+  readonly retry?: NormalizedRetry;
   /** Declarative cache: restored before this step, saved after on key miss. */
   readonly cache?: import('./cache-types.js').CacheInput;
   /** Step-level conditional rules (evaluated agent-side). */
@@ -119,6 +122,35 @@ export type StepInput = Step<any> | BareStepFn<any>;
 export type StepRunFn = (ctx: StepContext) => Promise<void>;
 
 /**
+ * Author-supplied retry policy for a step. A thrown attempt is re-run while
+ * attempts remain and `retryIf(err)` is true.
+ */
+export interface RetryConfig {
+  /** Total attempts incl. the first; `maxAttempts: 3` ⇒ up to 3 runs. Must be >= 1. */
+  maxAttempts: number;
+  /** Base delay between attempts, ms. Default 1000. */
+  delayMs?: number;
+  /** Delay growth. Default 'exponential'. */
+  backoff?: RetryBackoff;
+  /** Cap for exponential backoff, ms. Default 30000. */
+  maxDelayMs?: number;
+  /** Retry only when this returns true for the thrown error. Default: retry on any throw. */
+  retryIf?: (err: unknown) => boolean;
+}
+
+/**
+ * Retry policy with defaults filled in, carried on the built {@link Step}.
+ * `retryIf` rides along on the in-memory step (it is never serialized).
+ */
+export interface NormalizedRetry {
+  maxAttempts: number;
+  delayMs: number;
+  backoff: RetryBackoff;
+  maxDelayMs: number;
+  retryIf?: (err: unknown) => boolean;
+}
+
+/**
  * Facets shared by both the plain and the check variant of {@link StepOptions}.
  * These compose unchanged whether or not a step declares a `check` facet.
  */
@@ -129,6 +161,8 @@ export interface StepOptionsBase {
   continueOnError?: boolean;
   /** Step-level timeout in milliseconds. Overrides the agent's default (30 minutes). */
   timeout?: number;
+  /** Retry policy: re-run a thrown step with backoff. `retry: N` ⇒ `{ maxAttempts: N }`. */
+  retry?: number | RetryConfig;
   /** Declarative cache: restored before this step, saved after on key miss. */
   cache?: import('./cache-types.js').CacheInput;
   /** Step-level conditional rules (evaluated agent-side). */
@@ -438,7 +472,22 @@ export type InitConfig = InitItem | InitItem[] | 'auto' | false;
 export interface RunsOnSelector {
   labels: string | RegExp | (string | RegExp)[];
   exclude?: string | RegExp | (string | RegExp)[];
+  /**
+   * How to pick the single agent when more than one matches.
+   *
+   * - `'deterministic'` (default) — sort matching candidates by `agentId` and
+   *   pick the lowest, so a run-once-on-one-host job (a migration, a dump) lands
+   *   on the same host across re-runs. Can hot-spot equivalent agents.
+   * - `'any'` — pick any available agent (load spread). Opt out of determinism
+   *   for jobs that don't need a stable host.
+   *
+   * The string / array shorthand `runsOn` forms imply `'deterministic'` too.
+   */
+  pick?: RunsOnPick;
 }
+
+/** Single-agent selection policy when multiple agents match a `runsOn` selector. */
+export type RunsOnPick = 'deterministic' | 'any';
 
 /**
  * Polymorphic runsOn type: string shorthand, array shorthand, or full selector object.
@@ -470,6 +519,14 @@ export interface Job {
   readonly runsOnAll?: RunsOnAllInput;
   /** Failure policy for unreachable durable hosts when using `runsOnAll`. */
   readonly onUnreachable?: OnUnreachableMode;
+  /**
+   * Widen a `runsOnAll` fan-out to declared-but-un-agented hosts: each matching
+   * host that has no live agent gets a temporary init-runner brought up over SSH
+   * and its steps run on it (fresh-box bootstrap convergence). Already-live hosts
+   * run on their own agent. Default `false` (only live hosts run). Only
+   * meaningful alongside `runsOnAll`.
+   */
+  readonly includeUninitialized?: boolean;
   /** Fan-out concurrency width (sliding window; `1` = serial). Applies to matrix and `runsOnAll`. */
   readonly maxParallel?: number;
   /** Halt the fan-out on first child failure, skipping the remainder. Default `false`. */
@@ -573,6 +630,13 @@ export interface JobOptions {
    * pinned child and waits. Only meaningful alongside `runsOnAll`.
    */
   onUnreachable?: OnUnreachableMode;
+  /**
+   * Widen a `runsOnAll` fan-out to declared-but-un-agented hosts: a matching host
+   * with no live agent gets a temporary init-runner brought up over SSH and its
+   * steps run on it (fresh-box bootstrap convergence); already-live hosts run on
+   * their own agent. Default `false`. Only meaningful alongside `runsOnAll`.
+   */
+  includeUninitialized?: boolean;
   /**
    * Fan-out concurrency width: the maximum number of fan-out children (matrix
    * combinations or `runsOnAll` hosts) that run at once. A sliding window —

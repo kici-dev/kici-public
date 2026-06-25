@@ -18,8 +18,14 @@ import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import { logger } from '@kici-dev/core';
 import pc from 'picocolors';
-import { matchAllWorkflows, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
-import type { SimulatedEvent } from '@kici-dev/engine';
+import {
+  matchAllWorkflows,
+  CheckMode,
+  CheckStepOutcome,
+  parseInputPairs,
+  coerceDispatchInputs,
+} from '@kici-dev/engine';
+import type { SimulatedEvent, InputsDescriptorMap } from '@kici-dev/engine';
 import type { Workflow } from '@kici-dev/sdk';
 import { compileCommand } from '../commands/compile.js';
 import { discoverWorkflows, resolveKiciDir } from '../execution/index.js';
@@ -158,6 +164,41 @@ async function runOneMatchedWorkflow(
  * The actual DAG-execution body for one workflow. Split out so
  * {@link runOneMatchedWorkflow} can wrap it in a lock acquire/release.
  */
+/**
+ * Resolve the dispatch-input descriptor declared on a workflow's `dispatch()`
+ * trigger(s) from the in-memory trigger objects, merged across triggers.
+ * Returns undefined when none declared.
+ */
+function dispatchInputsDescriptorForWorkflow(workflow: Workflow): InputsDescriptorMap | undefined {
+  const merged: InputsDescriptorMap = {};
+  let found = false;
+  for (const trigger of transformTriggers(workflow.on)) {
+    if (trigger._type === 'dispatch' && trigger.inputs) {
+      Object.assign(merged, trigger.inputs);
+      found = true;
+    }
+  }
+  return found ? merged : undefined;
+}
+
+/**
+ * Coerce + default the operator's `--input` pairs against the workflow's
+ * dispatch descriptor for a local run. The local executor is authoritative for
+ * `run local` (no orchestrator), so defaults are applied here exactly once.
+ * Returns the resolved values, or throws when input is invalid.
+ */
+function resolveLocalDispatchInputs(
+  workflow: Workflow,
+  options: RunLocalOptions,
+): Readonly<Record<string, string | number | boolean | null>> {
+  const descriptor = dispatchInputsDescriptorForWorkflow(workflow);
+  const raw = parseInputPairs(options.inputs ?? []);
+  if (!descriptor) return raw;
+  const r = coerceDispatchInputs(raw, descriptor);
+  if ('error' in r) throw r.error;
+  return r.values as Readonly<Record<string, string | number | boolean | null>>;
+}
+
 async function runWorkflowBody(
   workflow: Workflow,
   ctx: RunOneMatchedWorkflowContext,
@@ -168,6 +209,9 @@ async function runWorkflowBody(
   failFast: boolean,
 ): Promise<{ result: WorkflowExecutionResult; succeeded: boolean } | null> {
   const { event } = ctx;
+
+  // Resolve operator-supplied dispatch inputs (coerced + defaulted) for ctx.
+  const dispatchInputs = resolveLocalDispatchInputs(workflow, options);
 
   // Resolve jobs (matrix expansion, dynamic evaluation)
   const resolvedJobs = await resolveJobs(workflow, event);
@@ -224,6 +268,7 @@ async function runWorkflowBody(
           jobOutputsMap,
           signal,
           checkMode: options.checkMode,
+          dispatchInputs,
         });
       },
       isSuccess: (result) => result.status === 'success' || result.status === 'skipped',
@@ -289,6 +334,9 @@ export async function executeLocal(options: RunLocalOptions): Promise<boolean> {
     kiciDir,
     check: false,
     verbose: options.debug ?? false,
+    // Keep stdout pure under --json (and --quiet): the compile / auto-types
+    // success lines must not precede the JSON result on stdout.
+    quiet: Boolean(options.json || options.quiet),
   });
 
   if (!compileSuccess) {
@@ -351,6 +399,20 @@ export async function executeLocal(options: RunLocalOptions): Promise<boolean> {
     if (matchedWorkflows.length === 0) {
       logger.info(pc.yellow(`No workflow named "${options.workflow}" matched the event`));
       return true;
+    }
+  }
+
+  // Fail fast on invalid --input before any execution (the local executor is
+  // authoritative for run local, so this is the only validation pass). Exit 2
+  // directly (matching the --fail-on-drift convention below) — a `return false`
+  // would be mapped to exit 1 by the CLI wrapper, masking the malformed-input
+  // signal that other --input paths surface as exit 2.
+  for (const workflow of matchedWorkflows) {
+    try {
+      resolveLocalDispatchInputs(workflow, options);
+    } catch (err) {
+      logger.error(pc.red(`Error: ${err instanceof Error ? err.message : String(err)}`));
+      process.exit(2);
     }
   }
 

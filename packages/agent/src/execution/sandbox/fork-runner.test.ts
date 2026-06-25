@@ -475,6 +475,26 @@ describe('buildRequest - global workflow fields', () => {
     expect(request.matrixValues).toBeUndefined();
   });
 
+  it('maps dispatchInputs from jobConfig onto the request', async () => {
+    const { buildRequest } = await import('./fork-runner.js');
+    const dispatch = makeDispatch({
+      jobConfig: {
+        workflowName: 'deploy',
+        name: 'gates',
+        runsOn: 'kici:os:linux',
+        dispatchInputs: { skipCveScan: true, mode: 'full' },
+      },
+    });
+    const request = buildRequest(dispatch, '/workspace');
+    expect(request.dispatchInputs).toEqual({ skipCveScan: true, mode: 'full' });
+  });
+
+  it('leaves dispatchInputs undefined when absent (webhook parity)', async () => {
+    const { buildRequest } = await import('./fork-runner.js');
+    const request = buildRequest(makeDispatch(), '/workspace');
+    expect(request.dispatchInputs).toBeUndefined();
+  });
+
   it('non-global workflow (isGlobalWorkflow=false) maps the flag', async () => {
     const { buildRequest } = await import('./fork-runner.js');
     const dispatch = makeDispatch({

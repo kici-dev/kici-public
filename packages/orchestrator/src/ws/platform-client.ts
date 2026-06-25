@@ -30,6 +30,7 @@ import {
   type DashboardFleetHostsRequest,
   type DashboardFleetHostRequest,
   type DashboardFleetPreviewRequest,
+  type DashboardFleetWorkflowsForHostRequest,
   type JoinRequest,
   type JoinResponse,
   type SourceRegistration,
@@ -210,6 +211,8 @@ export interface PlatformClientOptions {
   onFleetHost?: (msg: DashboardFleetHostRequest) => void;
   /** Optional callback for fleet runsOnAll-preview requests from Platform. */
   onFleetPreview?: (msg: DashboardFleetPreviewRequest) => void;
+  /** Optional callback for fleet workflows-for-host requests from Platform. */
+  onFleetWorkflowsForHost?: (msg: DashboardFleetWorkflowsForHostRequest) => void;
   /** Optional callback for trust policy updates pushed from Platform. */
   onTrustPolicyUpdate?: (msg: TrustPolicyUpdate) => void;
   /** Optional callback for stale check run cleanup requests from Platform. */
@@ -308,6 +311,7 @@ export class PlatformClient {
   private readonly onFleetHosts?: PlatformClientOptions['onFleetHosts'];
   private readonly onFleetHost?: PlatformClientOptions['onFleetHost'];
   private readonly onFleetPreview?: PlatformClientOptions['onFleetPreview'];
+  private readonly onFleetWorkflowsForHost?: PlatformClientOptions['onFleetWorkflowsForHost'];
   private readonly onTrustPolicyUpdate?: PlatformClientOptions['onTrustPolicyUpdate'];
   private readonly onStaleCheckrunCleanup?: PlatformClientOptions['onStaleCheckrunCleanup'];
   private readonly onJoinRequest?: PlatformClientOptions['onJoinRequest'];
@@ -374,6 +378,7 @@ export class PlatformClient {
     this.onFleetHosts = options.onFleetHosts;
     this.onFleetHost = options.onFleetHost;
     this.onFleetPreview = options.onFleetPreview;
+    this.onFleetWorkflowsForHost = options.onFleetWorkflowsForHost;
     this.onTrustPolicyUpdate = options.onTrustPolicyUpdate;
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
@@ -1074,6 +1079,13 @@ export class PlatformClient {
           workflowName: msg.workflowName,
         });
         this.onFleetPreview?.(msg);
+        break;
+      case 'dashboard.fleet.workflows-for-host':
+        logger.debug('Dashboard fleet workflows-for-host request received', {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+        });
+        this.onFleetWorkflowsForHost?.(msg);
         break;
 
       // Scaler capacity

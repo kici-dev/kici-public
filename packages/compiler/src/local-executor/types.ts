@@ -28,6 +28,8 @@ export interface RunLocalOptions {
   container?: boolean;
   /** --env KEY=VALUE overrides (repeatable) */
   env?: string[];
+  /** --input KEY=VALUE typed workflow-dispatch inputs (repeatable) */
+  inputs?: string[];
   /** --quiet: minimal output */
   quiet?: boolean;
   /** --json: JSON output format */

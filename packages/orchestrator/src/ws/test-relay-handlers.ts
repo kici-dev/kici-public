@@ -40,6 +40,13 @@ export interface TestRelayHandlerDeps extends ProcessingDeps {
   agentRegistry: NonNullable<ProcessingDeps['agentRegistry']>;
   cacheStorage?: CacheStorage;
   logStorage?: LogStorage;
+  /**
+   * Log writer that owns the in-flight append tracking. The logs cursor
+   * handler drains its pending appends for a terminal run before computing the
+   * `done` flag, so the final (fire-and-forget) log chunk can't be lost to a
+   * race with the run-status transition.
+   */
+  logWriter?: { drain(runId: string): Promise<void> };
   accessLog?: AccessLogWriter;
   /** Canonical org id this orchestrator is bound to (for access_log attribution). */
   orgId?: string | null;
@@ -141,6 +148,7 @@ export async function handleTestTrigger(
       fullRepo: msg.fullRepo,
       checkMode: msg.checkMode,
       target: msg.target,
+      dispatchInputs: msg.dispatchInputs,
       requestId: msg.requestId,
     },
     deps,
@@ -247,6 +255,12 @@ export async function handleTestRunLogs(
   }
 
   const terminal = TERMINAL_RUN_STATES.has(run.status);
+  // For a terminal run, drain any in-flight log appends before reading lines.
+  // Log chunks are persisted fire-and-forget from the agent WS handler, so the
+  // run status can flip terminal while the final chunk's write is still
+  // pending. Draining here guarantees the snapshot below contains every line
+  // the agent sent, so a `done: true` response never omits the last line.
+  if (terminal) await deps.logWriter?.drain(msg.runId);
   const allLines = await collectRunLogLines(msg.runId, deps.logStorage);
 
   const cursor = Math.max(0, msg.cursor);

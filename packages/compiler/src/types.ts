@@ -21,6 +21,7 @@ import type {
   OnUnreachableMode,
   LabelMatcher,
   ExecutionJobStatus,
+  InputsDescriptorMap,
 } from '@kici-dev/engine';
 
 /**
@@ -150,6 +151,8 @@ export interface LockDispatchTrigger {
   readonly _type: 'dispatch';
   readonly types: readonly string[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Typed dispatch-input descriptors (from `dispatch({ inputs })`). */
+  readonly inputs?: InputsDescriptorMap;
 }
 
 /**
@@ -465,6 +468,8 @@ export interface LockJob {
   readonly runsOnAll?: RunsOnAllPredicate;
   /** Failure policy for unreachable durable hosts in a runsOnAll fan-out. */
   readonly onUnreachable?: OnUnreachableMode;
+  /** Widen runsOnAll to declared-but-un-agented hosts (init-runner bring-up per fresh box). */
+  readonly includeUninitialized?: boolean;
   /** Fan-out concurrency width (sliding window; 1 = serial). Applies to matrix and runsOnAll. */
   readonly maxParallel?: number;
   /** Halt the fan-out on first child failure, skipping the held remainder. Default false. */

@@ -646,6 +646,12 @@ export interface EnvironmentBindingsTable {
   environment_id: string;
   /** Scope pattern for matching (e.g. workflow name glob, repo pattern) */
   scope_pattern: string;
+  /**
+   * Host selector this binding applies to (exact / glob / regex over a fan-out
+   * child's agentId / hostname / labels). `'**'` (the default) matches every
+   * host.
+   */
+  host_pattern: Generated<string>;
   /** When this binding was created */
   created_at: Generated<Date>;
 }
@@ -938,6 +944,13 @@ export interface AgentTokenTable {
   revoked_at: Date | null;
   /** When this token expires (null = never, static tokens) */
   expires_at: Date | null;
+  /**
+   * Single-use marker for bootstrap (init-runner) tokens. Set the first time
+   * the token is consumed at `agent.register`; a second register is rejected.
+   * NULL = never consumed (every static / ephemeral token stays reusable until
+   * expiry).
+   */
+  consumed_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 }
 
 // Convenience types for agent_tokens
@@ -1798,6 +1811,16 @@ export interface HostRosterTable {
    * reconnects (down-then-up). NULL = no reboot pending.
    */
   reboot_pending_until: ColumnType<Date | null, Date | string | null, Date | string | null>;
+  /**
+   * Pre-agent reach metadata: how to SSH to a declared host before it has a
+   * KiCI agent, for bootstrap bring-up. All nullable — a host with no reach
+   * metadata cannot be bootstrapped and behaves exactly as before.
+   */
+  address: ColumnType<string | null, string | null | undefined, string | null>;
+  ssh_user: ColumnType<string | null, string | null | undefined, string | null>;
+  ssh_port: ColumnType<number | null, number | null | undefined, number | null>;
+  /** Scoped-secret ref (`scope/key`) holding the bring-up private key. */
+  ssh_key_secret: ColumnType<string | null, string | null | undefined, string | null>;
   created_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
 }

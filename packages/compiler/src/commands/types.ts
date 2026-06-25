@@ -10,6 +10,8 @@ import { toErrorMessage } from '@kici-dev/core';
 export interface TypesOptions {
   /** Path to .kici directory (defaults to .kici) */
   kiciDir?: string;
+  /** Suppress the success line on stdout (so machine-readable output stays pure). */
+  quiet?: boolean;
 }
 
 /**
@@ -47,7 +49,9 @@ export async function typesCommand(options: TypesOptions = {}): Promise<boolean>
     const outputPath = path.join(typesDir, 'secrets.d.ts');
     await fs.writeFile(outputPath, dtsContent, 'utf-8');
 
-    console.log(pc.green('Types generated') + pc.dim(` ${outputPath}`));
+    if (!options.quiet) {
+      console.log(pc.green('Types generated') + pc.dim(` ${outputPath}`));
+    }
     return true;
   } catch (err: unknown) {
     if (err instanceof DashboardClientError) {

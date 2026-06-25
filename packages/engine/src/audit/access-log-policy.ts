@@ -109,6 +109,8 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'backend.test': { kind: 'always' },
   'fleet.host.declare': { kind: 'always' },
   'fleet.host.remove': { kind: 'always' },
+  'fleet.init_runner.bringup': { kind: 'always' },
+  'fleet.pre_boot.send': { kind: 'always' },
   'global_workflows.update': { kind: 'always' },
   'org_settings.dashboard_write_policy.update': { kind: 'always' },
   'cluster_name.update': { kind: 'always' },

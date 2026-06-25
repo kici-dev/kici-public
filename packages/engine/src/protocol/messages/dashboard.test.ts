@@ -16,10 +16,66 @@ import {
   runListResponseSchema,
   diagnosticsInfrastructureResponseSchema,
   testRelayTriggerRequestSchema,
+  dashboardFleetWorkflowsForHostRequestSchema,
+  dashboardFleetWorkflowsForHostResponseSchema,
+  fleetHostDeclareRequestSchema,
+  fleetHostDeclareResponseSchema,
 } from './dashboard.js';
 import { InitFailureCategory } from './execution-status.js';
 
 const testActor = { type: 'user' as const, sub: 'zsub-test' };
+
+describe('dashboard.fleet.workflows-for-host messages', () => {
+  it('parses a workflows-for-host request and is in the platform→orch union', () => {
+    const msg = {
+      type: 'dashboard.fleet.workflows-for-host' as const,
+      requestId: 'r1',
+      actor: testActor,
+      agentId: 'host-1',
+    };
+    expect(dashboardFleetWorkflowsForHostRequestSchema.parse(msg)).toMatchObject({
+      agentId: 'host-1',
+    });
+    expect(dashboardPlatformToOrchSchema.parse(msg)).toMatchObject({ agentId: 'host-1' });
+  });
+
+  it('parses a workflows-for-host response and is in the orch→platform union', () => {
+    const msg = {
+      type: 'dashboard.fleet.workflows-for-host.response' as const,
+      requestId: 'r1',
+      workflows: [
+        {
+          workflowName: 'deploy-all',
+          repoIdentifier: 'org/repo',
+          sourceFile: '.kici/workflows/deploy.ts',
+          onUnreachable: 'hold' as const,
+          disposition: 'target' as const,
+        },
+      ],
+    };
+    expect(dashboardFleetWorkflowsForHostResponseSchema.parse(msg).workflows).toHaveLength(1);
+    expect(dashboardOrchToPlatformSchema.parse(msg)).toMatchObject({
+      type: 'dashboard.fleet.workflows-for-host.response',
+    });
+  });
+
+  it('accepts a null sourceFile', () => {
+    const parsed = dashboardFleetWorkflowsForHostResponseSchema.parse({
+      type: 'dashboard.fleet.workflows-for-host.response',
+      requestId: 'r1',
+      workflows: [
+        {
+          workflowName: 'w',
+          repoIdentifier: 'o/r',
+          sourceFile: null,
+          onUnreachable: 'skip',
+          disposition: 'unreachable-durable',
+        },
+      ],
+    });
+    expect(parsed.workflows[0].sourceFile).toBeNull();
+  });
+});
 
 describe('testRelayTriggerRequestSchema — target host narrowing', () => {
   const base = {
@@ -51,6 +107,37 @@ describe('testRelayTriggerRequestSchema — target host narrowing', () => {
     const r = testRelayTriggerRequestSchema.safeParse({
       ...base,
       target: { values: [], allowEmpty: false },
+    });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe('testRelayTriggerRequestSchema — dispatch inputs', () => {
+  const base = {
+    type: 'test.relay.trigger' as const,
+    requestId: 'req-d',
+    actor: testActor,
+    routingKey: 'github:1',
+    fixtureId: 'fx',
+    event: { type: 'dispatch', targetBranch: 'main', payload: {} },
+  };
+
+  it('round-trips raw operator dispatchInputs', () => {
+    const parsed = testRelayTriggerRequestSchema.parse({
+      ...base,
+      dispatchInputs: { skipCveScan: 'true', mode: 'full' },
+    });
+    expect(parsed.dispatchInputs).toEqual({ skipCveScan: 'true', mode: 'full' });
+  });
+
+  it('accepts a request with no dispatchInputs', () => {
+    expect(testRelayTriggerRequestSchema.parse(base).dispatchInputs).toBeUndefined();
+  });
+
+  it('rejects non-string dispatchInput values (raw pairs are strings)', () => {
+    const r = testRelayTriggerRequestSchema.safeParse({
+      ...base,
+      dispatchInputs: { n: 3 },
     });
     expect(r.success).toBe(false);
   });
@@ -946,5 +1033,40 @@ describe('REST response schemas (CLI reuse)', () => {
       alerts: [],
     });
     expect(ok.orchestrators[0].deployment.mode).toBe('unknown');
+  });
+});
+
+describe('fleetHostDeclareRequestSchema labels optionality', () => {
+  it('accepts a declare request with labels omitted', () => {
+    const parsed = fleetHostDeclareRequestSchema.parse({
+      type: 'dashboard.fleet.host.declare',
+      requestId: 'r1',
+      actor: testActor,
+      agentId: 'db-01',
+    });
+    expect(parsed.labels).toBeUndefined();
+  });
+
+  it('accepts a declare request with labels provided', () => {
+    const parsed = fleetHostDeclareRequestSchema.parse({
+      type: 'dashboard.fleet.host.declare',
+      requestId: 'r1',
+      actor: testActor,
+      agentId: 'db-01',
+      labels: ['role:db'],
+    });
+    expect(parsed.labels).toEqual(['role:db']);
+  });
+});
+
+describe('fleetHostDeclareResponseSchema created flag', () => {
+  it('accepts a response carrying created', () => {
+    const parsed = fleetHostDeclareResponseSchema.parse({
+      type: 'dashboard.fleet.host.declare.response',
+      requestId: 'r1',
+      declared: true,
+      created: false,
+    });
+    expect(parsed.created).toBe(false);
   });
 });

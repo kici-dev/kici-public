@@ -119,6 +119,12 @@ export interface PlatformTriggerInput {
    * the orchestrator, which intersects each runsOnAll roster with it.
    */
   target?: HostTargetSelector;
+  /**
+   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not defaulted /
+   * coerced). The Platform relays them verbatim; the orchestrator validates,
+   * coerces, and applies defaults authoritatively against the lock descriptor.
+   */
+  dispatchInputs?: Record<string, string>;
 }
 
 export interface PlatformTriggerResponse {

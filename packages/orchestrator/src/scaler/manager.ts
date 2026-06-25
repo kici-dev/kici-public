@@ -111,6 +111,34 @@ function mirrorRequestsLimits(resources: ResourceRequest | undefined): ResourceR
 }
 
 /**
+ * Build the scaler-usage metric rows: one per active scaler (stamped with its
+ * backend type) plus a `__global__` rollup row. Pure so it is unit-testable
+ * without constructing a full ScalerManager.
+ */
+export function buildScalerUsageRows(
+  perScalerUsage: ReadonlyMap<string, { cpus: number; memBytes: number }>,
+  globalUsage: { cpus: number; memBytes: number },
+  scalerTypeOf: (name: string) => string | undefined,
+): Array<{ scaler: string; scalerType?: string; cpus: number; memBytes: number }> {
+  const rows: Array<{ scaler: string; scalerType?: string; cpus: number; memBytes: number }> = [];
+  for (const [scaler, usage] of perScalerUsage.entries()) {
+    rows.push({
+      scaler,
+      scalerType: scalerTypeOf(scaler),
+      cpus: usage.cpus,
+      memBytes: usage.memBytes,
+    });
+  }
+  rows.push({
+    scaler: '__global__',
+    scalerType: '__global__',
+    cpus: globalUsage.cpus,
+    memBytes: globalUsage.memBytes,
+  });
+  return rows;
+}
+
+/**
  * Status summary for metrics and health endpoints.
  */
 export interface ScalerStatus {
@@ -673,21 +701,13 @@ export class ScalerManager {
    * `kici_orch_scaler_cpus_used` rows whose scaler belongs to the pool.
    */
   private publishUsageMetrics(): void {
-    const rows: Array<{
-      scaler: string;
-      machinePool?: string;
-      cpus: number;
-      memBytes: number;
-    }> = [];
-    for (const [scaler, usage] of this.perScalerUsage.entries()) {
-      rows.push({ scaler, cpus: usage.cpus, memBytes: usage.memBytes });
-    }
-    rows.push({
-      scaler: '__global__',
-      cpus: this.globalUsage.cpus,
-      memBytes: this.globalUsage.memBytes,
-    });
-    setScalerUsageBreakdown(rows);
+    setScalerUsageBreakdown(
+      buildScalerUsageRows(
+        this.perScalerUsage,
+        this.globalUsage,
+        (name) => this.backends.get(name)?.type,
+      ),
+    );
   }
 
   /**
