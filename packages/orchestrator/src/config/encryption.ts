@@ -8,7 +8,7 @@
  * Supports glob patterns (e.g., 'providers.github.*.privateKey') for
  * array and object traversal.
  */
-import { encrypt, decrypt, type EncryptedValue } from '../secrets/crypto.js';
+import { encrypt, decrypt, type EncryptedValue } from '@kici-dev/shared';
 
 /** Sentinel value used for redacted fields in display/export. */
 export const REDACTED_VALUE = '***REDACTED***';

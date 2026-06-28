@@ -16,6 +16,8 @@ export {
 export {
   restoreCacheSpecs,
   saveCacheSpecs,
+  createCacheStepIndexAllocator,
+  JOB_CACHE_OWNER,
   type CachePhaseDeps,
   type CacheRestoreOutcome,
 } from './cache-phase.js';

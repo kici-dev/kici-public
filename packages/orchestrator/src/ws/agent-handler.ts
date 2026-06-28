@@ -30,9 +30,12 @@ import {
   WsRateLimiter,
   ExecutionJobStatus,
   isSelfReportedLabel,
+  PRIVILEGED_ROOT_LABEL,
 } from '@kici-dev/engine';
-import type { RateLimiterConfig } from '@kici-dev/engine';
+import type { RateLimiterConfig, AttestationVerifyStatus } from '@kici-dev/engine';
 import { provenanceStorageKey } from '@kici-dev/engine/provenance/bundle';
+import type { ProvenanceTrustRoot } from '../provenance/trust-root.js';
+import { computeAttestationVerdict } from '../provenance/verify-at-ingest.js';
 import type { AgentRegistry, WsLike } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
@@ -73,6 +76,14 @@ const REGISTER_TIMEOUT_MS = 10_000;
 type AuthState = {
   tokenId?: string;
   tokenLabels?: string[] | null;
+  /**
+   * Token-authorized taint set (`agent_tokens.mandatory_labels`). Becomes the
+   * static agent's registry-entry `mandatoryLabels` at register time, confining
+   * it to jobs whose `runsOn` demands every label here. `null`/`undefined` = no
+   * taint. When it (or the advertised labels) includes `PRIVILEGED_ROOT_LABEL`,
+   * the uid-0 honesty gate verifies the agent is actually running as root.
+   */
+  tokenMandatoryLabels?: string[] | null;
   tokenAgentType?: string;
   tokenCreatedBy?: string | null;
 };
@@ -127,13 +138,40 @@ export function truncateCloseReason(reason: string): string {
 
 function enforceRegisterAuthGates(
   authState: AuthState | undefined,
-  payload: { agentId: string; labels: string[] },
+  payload: { agentId: string; labels: string[]; runningAsUid?: number },
   ws: { close(code: number, reason: string): void },
   agentIdToTokenId: Map<unknown, string>,
 ): boolean {
+  const { agentId, labels, runningAsUid } = payload;
+
+  // Gate 0 — privileged-root honesty (independent of auth mode). The
+  // kici:privileged:root SELECTOR must be true: a root-demanding job must never
+  // land on a non-root agent. Fail closed when the agent claims the label
+  // (advertised on the wire, or authorized by its token as a label or a taint)
+  // but is not verifiably uid 0 (including absent uid — we cannot verify, so we
+  // refuse). uid is self-reported, so this catches honest misconfig, not a
+  // malicious agent: such an agent already holds an operator-minted privileged
+  // token and is inside the trust boundary by construction.
+  const claimsPrivilegedRoot =
+    labels.includes(PRIVILEGED_ROOT_LABEL) ||
+    (authState?.tokenLabels?.includes(PRIVILEGED_ROOT_LABEL) ?? false) ||
+    (authState?.tokenMandatoryLabels?.includes(PRIVILEGED_ROOT_LABEL) ?? false);
+  if (claimsPrivilegedRoot && runningAsUid !== 0) {
+    logger.warn('Agent register rejected: privileged-root claim by non-root agent', {
+      agentId,
+      runningAsUid: runningAsUid ?? null,
+    });
+    ws.close(
+      WS_CLOSE_AGENT_AUTH_FAILED,
+      truncateCloseReason(
+        `privileged-root token presented by non-root agent (uid=${runningAsUid ?? 'absent'})`,
+      ),
+    );
+    return false;
+  }
+
   if (authState === undefined) return true;
   const { tokenId, tokenLabels, tokenAgentType, tokenCreatedBy } = authState;
-  const { agentId, labels } = payload;
 
   // Gate 1 — token-scope subset. Self-reported platform facts (kici:os:,
   // kici:arch:, kici:host:) are exempt: the agent derives them from its own
@@ -233,6 +271,10 @@ export interface AgentWsHandlerDeps {
       timestamp: number;
       data?: Record<string, unknown>;
       secretsAccessed?: string[];
+      /** Parallel step-group concurrency role (`sequential` | `parallel-child` | `parallel-group`). */
+      concurrencyKind?: string;
+      /** Parallel-group correlation id shared by a group's children. */
+      groupId?: string;
       /** Raw log bytes accumulated by this step's LogStreamer at terminal time. */
       logBytesStreamed?: number;
     },
@@ -324,8 +366,14 @@ export interface AgentWsHandlerDeps {
    */
   provenanceStorage?: CacheStorage;
   /**
+   * Provenance trust root used to verify each bundle at ingest. When absent (or
+   * its issuer is null) the verdict is recorded as `unverifiable`.
+   */
+  provenanceTrustRoot?: ProvenanceTrustRoot;
+  /**
    * Record a completed provenance-bundle upload (writes an attestations row).
    * `runId` is resolved server-side from the job's dispatch ref, never the wire.
+   * The verdict fields are computed at ingest (verify-at-ingest).
    */
   onProvenanceUpload?: (record: {
     runId: string;
@@ -334,6 +382,9 @@ export interface AgentWsHandlerDeps {
     subjectDigest: string;
     storageKey: string;
     mediaType: string;
+    verifyStatus: AttestationVerifyStatus;
+    verifyReason: string | null;
+    verifiedAt: Date | null;
   }) => Promise<void>;
   /** Optional rate limiter configuration. */
   rateLimiterConfig?: RateLimiterConfig;
@@ -541,6 +592,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     userCache,
     dispatchCacheRefs,
     cacheStorage,
+    provenanceTrustRoot,
     provenanceStorage,
     onProvenanceUpload,
     rateLimiterConfig,
@@ -581,6 +633,13 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
        * and the regression test at `agent-handler.label-elevation.test.ts`.
        */
       tokenLabels?: string[] | null;
+      /**
+       * Token's `mandatory_labels` column, captured at auth time. Becomes the
+       * static agent's registry-entry `mandatoryLabels` taint at register time
+       * (so the dispatch gate confines it to jobs demanding every label here).
+       * `null` = no taint; `undefined` only when auth mode is `none`.
+       */
+      tokenMandatoryLabels?: string[] | null;
       /**
        * Token's `agent_type` column (`'static'` | `'ephemeral'`). Captured at
        * auth time; consumed at register time to enforce the
@@ -809,6 +868,24 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           }
         }
 
+        // Parse the token's authorized taint set (`agent_tokens.mandatory_labels`),
+        // symmetric with `labels` above. Malformed JSON is treated as "no taint"
+        // (null) rather than a hard auth failure: an absent taint is the safe
+        // default — it never grants privilege, it only widens which jobs the
+        // agent will accept, and the privileged-root selector is still gated by
+        // the uid-0 honesty check and the dispatch authorization chain.
+        let tokenMandatoryLabels: string[] | null = null;
+        if (tokenRow.mandatory_labels !== null) {
+          try {
+            const parsed: unknown = JSON.parse(tokenRow.mandatory_labels);
+            if (Array.isArray(parsed) && parsed.every((l) => typeof l === 'string')) {
+              tokenMandatoryLabels = parsed as string[];
+            }
+          } catch {
+            tokenMandatoryLabels = null;
+          }
+        }
+
         // Auth successful -- send auth.success and move to pendingRegistration
         const connectionId = randomUUID();
         sendJson(ws, { type: 'auth.success', connectionId });
@@ -823,6 +900,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           timer: regTimer,
           tokenId: tokenRow.id,
           tokenLabels,
+          tokenMandatoryLabels,
           tokenAgentType: tokenRow.agent_type,
           tokenCreatedBy: tokenRow.created_by,
           tokenExpiresAt: tokenRow.expires_at,
@@ -860,11 +938,17 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         const authStateForRegister: AuthState = {
           tokenId: regEntry.tokenId,
           tokenLabels: regEntry.tokenLabels,
+          tokenMandatoryLabels: regEntry.tokenMandatoryLabels,
           tokenAgentType: regEntry.tokenAgentType,
           tokenCreatedBy: regEntry.tokenCreatedBy,
         };
         if (
-          !enforceRegisterAuthGates(authStateForRegister, { agentId, labels }, ws, agentIdToTokenId)
+          !enforceRegisterAuthGates(
+            authStateForRegister,
+            { agentId, labels, runningAsUid: parsed.data.runningAsUid },
+            ws,
+            agentIdToTokenId,
+          )
         ) {
           return;
         }
@@ -911,10 +995,13 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             // when auth mode is `none` (no token-bound authority).
             tokenId: regEntry.tokenId ?? null,
             // Scaler-spawned agents inherit the spawning scaler's
-            // Kubernetes-taint-style gate. Empty for static agents
-            // (scalerInfo === null) — `findAvailable` and the queue-drain
-            // path then behave exactly as before.
-            mandatoryLabels: scalerInfo?.mandatoryLabels,
+            // Kubernetes-taint-style gate; static agents inherit the
+            // token-authorized taint (`agent_tokens.mandatory_labels`). The two
+            // are mutually exclusive in practice (scaler-spawned vs static-token),
+            // and an un-tainted static token leaves this undefined — so
+            // `findAvailable` and the queue-drain path behave exactly as before.
+            mandatoryLabels:
+              scalerInfo?.mandatoryLabels ?? authStateForRegister.tokenMandatoryLabels ?? undefined,
             // Scaler-spawned agents are single-use (destroyed on disconnect).
             // The dispatcher's disconnect triage keys off this flag.
             scalerManaged: scalerInfo !== null,
@@ -1124,7 +1211,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           if (
             !enforceRegisterAuthGates(
               reregisterAuthState,
-              { agentId: msg.agentId, labels: msg.labels },
+              { agentId: msg.agentId, labels: msg.labels, runningAsUid: msg.runningAsUid },
               ws,
               agentIdToTokenId,
             )
@@ -1408,6 +1495,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             timestamp,
             data,
             secretsAccessed,
+            concurrencyKind,
+            groupId,
             logBytesStreamed,
           } = msg;
           logger.info('Step status update', {
@@ -1427,6 +1516,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             timestamp,
             data,
             secretsAccessed,
+            concurrencyKind,
+            groupId,
             logBytesStreamed,
           });
           break;
@@ -1877,6 +1968,15 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             if (provenanceStorage) {
               await provenanceStorage.initMeta(storageKey);
             }
+            // Verify-at-ingest: compute and store the verdict over the just-
+            // uploaded bundle (fail-closed to `unverifiable`, never blocks).
+            const verdict = await computeAttestationVerdict({
+              trustRoot: provenanceTrustRoot,
+              storage: provenanceStorage,
+              storageKey,
+              logWarn: (reason) =>
+                logger.warn('Attestation verify-at-ingest failed', { jobId: msg.jobId, reason }),
+            });
             await onProvenanceUpload({
               runId: ref.runId,
               jobId: msg.jobId,
@@ -1884,6 +1984,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               subjectDigest: msg.subjectDigest,
               storageKey,
               mediaType: msg.mediaType,
+              verifyStatus: verdict.verifyStatus,
+              verifyReason: verdict.verifyReason,
+              verifiedAt: verdict.verifiedAt,
             });
             logger.info('Provenance attestation recorded', {
               agentId,

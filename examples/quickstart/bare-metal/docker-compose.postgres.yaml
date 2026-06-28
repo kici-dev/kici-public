@@ -16,7 +16,7 @@
 # directory) — it carries the static S3 identity for the kici-cache bucket.
 services:
   postgres:
-    image: postgres:18.4-trixie
+    image: postgres:18.4-alpine
     environment:
       POSTGRES_DB: kici
       POSTGRES_USER: kici

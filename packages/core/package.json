@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/core",
-  "version": "0.1.23",
+  "version": "0.1.24",
   "description": "Light shared utilities for the KiCI stack (logging, errors, formatting, crypto, zx init, the TypeScript ESM loader hook). No server-side dependencies.",
   "keywords": [
     "ci",

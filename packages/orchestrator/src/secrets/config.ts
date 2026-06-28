@@ -6,7 +6,7 @@
  * to normalize the key material to a 32-byte Buffer.
  */
 import { readFileSync } from 'node:fs';
-import { deriveKey } from './crypto.js';
+import { deriveKey } from '@kici-dev/shared';
 
 /** Default environment variable name for the master key. */
 const DEFAULT_ENV_KEY = 'KICI_SECRET_KEY';

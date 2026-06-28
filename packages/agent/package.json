@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/agent",
-  "version": "0.1.23",
+  "version": "0.1.24",
   "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
   "keywords": [
     "ci",
@@ -59,7 +59,7 @@
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/agent --name @kici-dev/agent"
   },
   "dependencies": {
-    "@hono/node-server": "^2.0.4",
+    "@hono/node-server": "^1.19.14",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
     "@kici-dev/sdk": "workspace:*",

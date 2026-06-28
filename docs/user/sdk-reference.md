@@ -3,7 +3,7 @@ title: SDK reference
 description: Complete API reference for @kici-dev/sdk -- workflows, jobs, steps, triggers, rules, matrix, validation, runtime
 ---
 
-Reference documentation for `@kici-dev/sdk`. The reference is split across five pages by topic.
+Reference documentation for `@kici-dev/sdk`. The reference is split across the per-topic pages below.
 
 | Page                                                         | Covers                                                                                                                                                                                                                      |
 | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -15,6 +15,7 @@ Reference documentation for `@kici-dev/sdk`. The reference is split across five 
 | [Runtime](./sdk/runtime.md)                                  | Types index, `StepContext`, secrets, and fixtures.                                                                                                                                                                          |
 | [Idempotent helpers](./sdk/idempotent.md)                    | `idempotent()`, `idempotentStep()`, and the check-mode-aware `checkStep()` — check / apply pattern with typed results on both the skipped and applied branches.                                                             |
 | [Wait-for helpers](./sdk/wait-for.md)                        | `waitFor()` and `waitForStep()` — poll a condition on an interval, run an optional success action, recover gracefully on timeout.                                                                                           |
+| [Parallel steps](./sdk/parallel.md)                          | `parallel()` — run independent steps concurrently within one job behind a join barrier, each as its own observable step, with `failFast` and `maxParallel` controls.                                                        |
 
 The `@kici-dev/sdk` package re-exports the entire surface from a single entry point. Pick what you need:
 

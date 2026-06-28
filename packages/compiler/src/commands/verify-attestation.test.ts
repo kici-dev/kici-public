@@ -121,10 +121,28 @@ describe('kici verify-attestation', () => {
     expect(mockVerify).not.toHaveBeenCalled();
   });
 
-  it('errors (returns false) when --trust-root is missing', async () => {
+  it('defaults --trust-root to the hosted prod issuer when omitted', async () => {
+    mockVerify.mockResolvedValue({
+      verified: true,
+      mode: 'kici',
+      checks: {},
+      claims: {},
+      failures: [],
+    });
+    const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
+    expect(ok).toBe(true);
+    expect(mockResolve).toHaveBeenCalledWith('https://api.kici.dev');
+    expect(logOutput.join('\n')).toContain('Using default trust root https://api.kici.dev');
+  });
+
+  it('gives a provenance-not-enabled message when the default issuer returns 503', async () => {
+    mockResolve.mockRejectedValue(
+      new Error('failed to fetch https://api.kici.dev/.well-known/openid-configuration: 503'),
+    );
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
     expect(ok).toBe(false);
     expect(mockVerify).not.toHaveBeenCalled();
+    expect(logOutput.join('\n')).toContain('not enabled on the hosted KiCI platform yet');
   });
 
   it('uses the provided --audience over the default', async () => {

@@ -35,7 +35,7 @@ describe('evaluateDynamicFields', () => {
       { dynamicEnvironment: true, dynamicEnv: true, dynamicConcurrencyGroup: true },
     );
 
-    expect(result.environmentName).toBe('staging');
+    expect(result.environmentNames).toEqual(['staging']);
     expect(result.env).toEqual({ NODE_ENV: 'staging', DEBUG: '1' });
     expect(result.concurrencyGroup).toBe('deploy-staging');
   });
@@ -106,7 +106,7 @@ describe('evaluateDynamicFields', () => {
       { dynamicEnvironment: true, dynamicEnv: false, dynamicConcurrencyGroup: false },
     );
 
-    expect(result.environmentName).toBe('production');
+    expect(result.environmentNames).toEqual(['production']);
     expect(result.env).toBeUndefined();
     expect(result.concurrencyGroup).toBeUndefined();
   });
@@ -124,7 +124,7 @@ describe('evaluateDynamicFields', () => {
     );
 
     expect(result.env).toEqual({ NODE_ENV: 'staging' });
-    expect(result.environmentName).toBeUndefined();
+    expect(result.environmentNames).toBeUndefined();
     expect(result.concurrencyGroup).toBeUndefined();
   });
 
@@ -157,7 +157,7 @@ describe('evaluateDynamicFields', () => {
       { dynamicEnvironment: true, dynamicEnv: false, dynamicConcurrencyGroup: false },
     );
 
-    expect(result.environmentName).toBeUndefined();
+    expect(result.environmentNames).toBeUndefined();
   });
 
   it('throws timeout error when dynamic function exceeds timeout', async () => {
@@ -195,7 +195,7 @@ describe('evaluateDynamicFields', () => {
       { dynamicEnvironment: true, dynamicEnv: true, dynamicConcurrencyGroup: false },
     );
 
-    expect(result.environmentName).toBe('async-env');
+    expect(result.environmentNames).toEqual(['async-env']);
     expect(result.env).toEqual({ ASYNC: 'true' });
   });
 
@@ -216,7 +216,7 @@ describe('evaluateDynamicFields', () => {
       dynamicConcurrencyGroup: true,
     });
 
-    expect(result.environmentName).toBe('production');
+    expect(result.environmentNames).toEqual(['production']);
     expect(result.env).toEqual({ DEPLOY_TARGET: 'main' });
     expect(result.concurrencyGroup).toBe('deploy-main');
   });
@@ -234,9 +234,9 @@ describe('evaluateDynamicFields', () => {
     ).rejects.toThrow("Job 'nonexistent' not found in workflow 'ci'");
   });
 
-  it('leaves field undefined when flag is true but property is not a function', async () => {
+  it('resolves the full ordered env list including static elements when the list is dynamic', async () => {
     const workflow = makeWorkflow({
-      environment: 'static-env', // string, not function
+      environment: 'static-env', // single static name, normalized to a one-element list
     });
 
     const result = await evaluateDynamicFields(
@@ -246,7 +246,25 @@ describe('evaluateDynamicFields', () => {
       { dynamicEnvironment: true, dynamicEnv: false, dynamicConcurrencyGroup: false },
     );
 
-    // Static value is not evaluated -- the flag says dynamic but property is static
-    expect(result.environmentName).toBeUndefined();
+    // The agent returns the complete ordered name list (static names verbatim).
+    expect(result.environmentNames).toEqual(['static-env']);
+  });
+
+  it('resolves each element of a multi-environment list in order', async () => {
+    const workflow = makeWorkflow({
+      environments: [
+        'staging',
+        (event: Record<string, unknown>) => `env-${event.branch as string}`,
+      ],
+    });
+
+    const result = await evaluateDynamicFields(
+      workflow,
+      'deploy',
+      { branch: 'main' },
+      { dynamicEnvironment: true, dynamicEnv: false, dynamicConcurrencyGroup: false },
+    );
+
+    expect(result.environmentNames).toEqual(['staging', 'env-main']);
   });
 });

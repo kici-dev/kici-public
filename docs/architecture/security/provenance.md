@@ -99,12 +99,47 @@ only build-supplied input.
   attestation it ever signed — there is no per-attestation trusted timestamp to
   scope revocation to "before time T". Time-scoped revocation requires a
   transparency log and is a future capability.
-- **Trust roots are pinned over HTTPS.** Verifiers fetch the published key set
-  from the configured issuer and pin the token's issuer to it, rather than
-  following the issuer named in the token.
-- **Self-hosted platforms are their own trust root.** A self-hosted platform
-  publishes its own JWKS and is its own issuer; verifiers point `--trust-root` at
-  it.
+- **The trust root is pinned over HTTPS.** Verifiers fetch the published key set
+  from the platform's provenance issuer and pin the token's issuer to it, rather
+  than following the issuer named in the token. There is a single KiCI platform,
+  so there is a single provenance issuer; `--trust-root` always names it.
 - **The bundle format is forward-compatible.** Verification dispatches on the
   bundle's media type, so additional bundle formats can be added without
   changing the verifier's existing path.
+
+## Verify-at-ingest and stored verdicts
+
+Beyond on-demand verification (CLI or in-browser), the orchestrator verifies
+each provenance bundle **at ingest** — when it records the attestation — and
+stores the verdict alongside the row. This is what makes the org-wide
+attestations browser trustworthy at any scale: the list shows a real badge per
+row with no per-row bundle fetch or re-verification.
+
+The stored verdict is one of:
+
+- **verified** — the bundle's signature, build identity, and build context all
+  checked out against the provenance trust root.
+- **failed** — verification ran and the bundle did not pass (bad signature,
+  mismatched identity, or unsupported bundle mode). A provenance-integrity
+  signal; the first failure code is stored.
+- **unverifiable** — no verdict could be computed: the trust root is not
+  configured, or its key set / the bundle could not be read. This is **not** a
+  forgery signal — it means "we could not check", distinct from "we checked and
+  it failed".
+- **pending** — the verdict has not been computed yet (a row recorded before
+  verification, awaiting backfill).
+
+The verdict is a point-in-time record over an immutable bundle. The
+attestation-detail page offers a live re-verification against the current
+signing keys, and operators backfill or refresh stored verdicts with
+`kici-admin attestations reverify`.
+
+**Trust-root propagation.** To verify at ingest, the orchestrator needs the
+provenance trust root — the OIDC issuer the platform mints provenance tokens
+under. The platform pushes the issuer to the orchestrator on the
+connection-accepted handshake; the orchestrator derives the key-set discovery
+URL from it (`<issuer>/.well-known/jwks.json`), fetches the keys, and caches
+them. When the issuer is absent (provenance not configured), every verdict is
+recorded as `unverifiable` rather than silently `verified`. The orchestrator
+never mints tokens or holds signing material — it only consumes the public
+issuer + key set to check bundles.

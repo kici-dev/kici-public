@@ -2,7 +2,7 @@
  * Local run history manager.
  *
  * Persists test run history in ~/.kici/history/runs.json so developers
- * can review past runs (kici test --history) and inspect specific runs
+ * can review past runs (kici run remote --history) and inspect specific runs
  * (kici status <run-id>).
  */
 

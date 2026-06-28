@@ -116,6 +116,14 @@ Webhook arrives
 9. Dispatch to agent (or queue)
 ```
 
+### Registration-time satisfiability
+
+Before the dispatch flow ever runs, a manual workflow registration is checked for provably-unsatisfiable multi-environment bindings. For each job that binds two or more static environment names, the orchestrator resolves each name and intersects the statically-decidable gates — environment existence, the enabled flag, and the fixed (non-glob) branch / trigger-type / repository restriction sets. When an intersection is provably empty (a missing or disabled environment, or two environments restricted to disjoint fixed branch sets), the registration is rejected with a precise message naming the job, the environments, and the rule. Bindings whose restrictions use globs are undecidable here and are left to the dispatch-time all-must-pass gate. This is a proactive check layered on top of the dispatch-time catch-all, not a replacement for it.
+
+### Per-job bound-environment persistence
+
+Each job's ordered bound-environment name list is persisted on its `execution_jobs.environments` column (a JSON-encoded `string[]`). It is written at dispatch with the statically-resolved names — an impure dynamic element it cannot resolve yet is stored as a `(dynamic)` placeholder — and overwritten with the agent-resolved names when a deferred-init evaluation resolves dynamic elements. The dashboard reads this column to render the bound-environment chips on the run detail and run list views.
+
 ### Dynamic field resolution
 
 When a lock file job has dynamic fields (`dynamicEnvironment`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. There are two resolution paths:
@@ -194,6 +202,15 @@ evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
 | `hold`   | Awaiting human action   | held_run created, job pending          |
 | `wait`   | Time-based delay        | held_run created with expiry           |
 | `queue`  | Concurrency full        | Job queued, dispatched when slot opens |
+
+### Multiple bound environments
+
+A job can bind an ordered list of environments (`environments: [...]` in the lock as `environments: [{ value, dynamic }]`). On every dispatch:
+
+- **Resolution + merge.** Each environment is resolved independently with the per-environment logic above, then the per-environment secret and variable maps are folded in array order — a later environment's key overrides an earlier one (last-wins). The folded set flows into the single `secrets` / `environmentVars` dispatch fields, so the agent-side injection is unchanged.
+- **All-must-pass gate aggregation.** Bound names with no configured environment are skipped first (they contribute nothing — the established lenient behavior). The hard reject gates (enabled, branch, trigger-type, repo) must then pass for **every** configured bound environment; the first failing one produces a rejection naming the offending environment and rule. The hold/wait/queue parameters aggregate most-restrictively: minimum trust = max tier, required reviewers = union, wait timer = max, hold expiry = min, concurrency limit = min. The aggregated parameters are evaluated through the same gate pipeline on a synthetic effective environment, so adding an environment can never loosen access.
+- **Skip-on-test.** For a test/local run, bound environments whose `allow_local_execution` is false are dropped before gate evaluation and merge; if all are dropped the job runs with no environment-scoped variables and a warning.
+- **Concurrency grouping.** The default concurrency group is the first bound environment's name; the run's `environment` column records that group.
 
 ## Scope resolution algorithm
 

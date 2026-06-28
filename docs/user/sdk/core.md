@@ -661,7 +661,7 @@ const deploy = job('deploy', {
 
 **Important:** `needs` must be declared explicitly. Output chaining does not auto-infer dependencies -- you must list job dependencies in `needs` even if you access their outputs via `.result`.
 
-Cross-job output chaining works in both local test mode (`kici test`) and remote pipeline execution. The orchestrator's needs-aware dispatch scheduler guarantees upstream jobs reach a terminal state before downstream jobs dispatch, and upstream outputs are transported to the downstream agent sandbox via the `upstreamJobOutputs` field on `job.dispatch`. See [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the full dispatch semantics.
+Cross-job output chaining works in both local execution (`kici run local`) and remote pipeline execution. The orchestrator's needs-aware dispatch scheduler guarantees upstream jobs reach a terminal state before downstream jobs dispatch, and upstream outputs are transported to the downstream agent sandbox via the `upstreamJobOutputs` field on `job.dispatch`. See [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the full dispatch semantics.
 
 ### Job dependencies (`needs`)
 

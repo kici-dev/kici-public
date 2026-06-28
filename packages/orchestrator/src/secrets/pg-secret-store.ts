@@ -9,7 +9,7 @@
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { SecretStore } from '@kici-dev/engine';
-import { encrypt, decrypt, type EncryptedValue } from './crypto.js';
+import { encrypt, decrypt, type EncryptedValue } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 /**

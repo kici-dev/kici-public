@@ -162,10 +162,10 @@ The lock file (`kici.lock.json`) is a JSON representation of your workflow that 
 
 ## Preview trigger matching
 
-Use `kici test` to preview which workflows match a trigger event (dry-run, no execution):
+Use `kici preview` to preview which workflows match a trigger event (dry-run, no execution):
 
 ```bash
-npx kici test pr:open
+npx kici preview pr:open
 ```
 
 Expected output (simplified):
@@ -331,14 +331,14 @@ Or add the flag to your root `package.json`:
 
 ## Authoring KiCI workflows with LLM coding agents
 
-KiCI is LLM-ready by design. Because workflows are real, typed TypeScript, coding agents reason over the SDK's `.d.ts` signatures instead of guessing a bespoke YAML DSL — and they verify their own pipelines with the same `kici test` and `kici run local` loop you use, so there's no push-to-find-out round-trip. First-class agent context ships in the box, so an agent is briefed the moment it opens the project.
+KiCI is LLM-ready by design. Because workflows are real, typed TypeScript, coding agents reason over the SDK's `.d.ts` signatures instead of guessing a bespoke YAML DSL — and they verify their own pipelines with the same `kici preview` and `kici run local` loop you use, so there's no push-to-find-out round-trip. First-class agent context ships in the box, so an agent is briefed the moment it opens the project.
 
 KiCI ships first-class context for LLM coding agents (Claude Code, Cursor, Aider, etc.). When you scaffold a project with `kici init`, the CLI writes `.kici/AGENTS.md`, a one-page briefing that tells the agent:
 
 - where the SDK type declarations live (`node_modules/@kici-dev/sdk/dist/index.d.ts`)
 - the five canonical authoring patterns with runnable examples
 - the anti-patterns that catch agents off-guard (no YAML, no `/dist/...` imports, no top-level `await`)
-- the local commands the agent should drive (`kici compile --check`, `kici test`, `kici run local`, `kici docs llm`)
+- the local commands the agent should drive (`kici compile --check`, `kici preview`, `kici run local`, `kici docs llm`)
 
 If you don't want the file, pass `--no-agents-md` to `kici init`, or delete the file afterwards — KiCI never reads it at runtime.
 

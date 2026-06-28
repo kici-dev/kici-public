@@ -117,19 +117,37 @@ RUN cd packages/shared && node --input-type=module -e "import('oxc-transform').t
 FROM dhi.io/node:24.16.0-0-debian13-dev
 WORKDIR /app
 
-# Install the CI userland, then strip the full perl package set. The vulnerable
-# IO::Compress / File::GlobMapper / zipdetails code lives in
-# perl-modules-5.40 / libperl5.40; only the Essential perl-base is kept (it
-# does NOT carry those modules). Debian's git declares a hard `Depends: perl,
-# liberror-perl`, so an `apt-get purge perl` would cascade-remove git too. The
-# git binary does not link libperl — only perl-subcommands (git svn /
+# Install the CI userland, then strip perl ENTIRELY — including the Essential
+# perl-base. The agent never invokes perl, so removing it eliminates the whole
+# perl-source CVE surface (e.g. DEBIAN-CVE-2026-8376/12087/42496, which OSV
+# maps to the perl SOURCE package and would otherwise surface via the retained
+# perl-base on the node base image). Customer CI steps that shell out to perl
+# are unsupported by design — this is a deliberate operator decision to keep the
+# image perl-free rather than carry the perl CVEs.
+#
+# Order matters: first force-remove the non-Essential perl set
+# (perl-modules-5.40 / libperl5.40 / liberror-perl and the perl metapackage),
+# then purge the Essential perl-base with --force-remove-essential. Debian's
+# git declares a hard `Depends: perl, liberror-perl` and debconf depends on
+# perl-base, so --force-depends is required to drop them without cascade-
+# removing git; --force-remove-essential is additionally required for perl-base.
+# The git binary does not link libperl — only perl-subcommands (git svn /
 # send-email / add -i) need it, and those are out of scope for the agent — so
-# we force-remove the perl packages with dpkg while leaving git's own files in
-# place. Core git clone / checkout / fetch keep working; the agent ships no
-# perl package OSV can flag.
+# core git clone / checkout / fetch keep working after the purge.
+#
+# The DHI node base ships its SBOM as one stub file per package under
+# /var/lib/dpkg/status.d/ (the distroless SBOM convention), which dpkg does NOT
+# manage — so a dpkg purge leaves the perl SBOM stubs behind and OSV-Scanner
+# still attributes the perl-source CVEs to the image. Now that the perl files
+# are genuinely gone, delete the matching SBOM stubs so the image's SBOM
+# reflects reality and the CVE gate sees no perl.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends git bash curl gzip xz-utils iptables \
   && dpkg --remove --force-depends perl perl-modules-5.40 libperl5.40 liberror-perl \
+  && dpkg --purge --force-depends --force-remove-essential perl-base \
+  && rm -f /var/lib/dpkg/status.d/perl /var/lib/dpkg/status.d/perl-base \
+       /var/lib/dpkg/status.d/perl-modules-5.40 /var/lib/dpkg/status.d/libperl5.40 \
+       /var/lib/dpkg/status.d/liberror-perl \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system --add safe.directory '*'
 

@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { SharedConfigStore } from './shared-store.js';
-import { encrypt } from '../secrets/crypto.js';
+import { encrypt } from '@kici-dev/shared';
 import { encryptConfigFields } from './encryption.js';
 import { SENSITIVE_FIELD_PATHS } from './loader.js';
 

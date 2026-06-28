@@ -83,6 +83,31 @@ describe('ActorPrincipal schema', () => {
     const r = actorPrincipalSchema.safeParse({ type: 'other', sub: 'x' });
     expect(r.success).toBe(false);
   });
+
+  it('accepts a user actor annotated with an agent', () => {
+    const r = actorPrincipalSchema.safeParse({
+      type: 'user',
+      sub: 'u1',
+      agent: { patId: 'p1', label: 'claude-code' },
+    });
+    expect(r.success).toBe(true);
+    if (r.success && r.data.type === 'user') {
+      expect(r.data.agent?.label).toBe('claude-code');
+    }
+  });
+
+  it('still accepts a plain user actor (agent optional)', () => {
+    expect(actorPrincipalSchema.safeParse({ type: 'user', sub: 'u1' }).success).toBe(true);
+  });
+
+  it('rejects an agent annotation with an empty label', () => {
+    const r = actorPrincipalSchema.safeParse({
+      type: 'user',
+      sub: 'u1',
+      agent: { patId: 'p1', label: '' },
+    });
+    expect(r.success).toBe(false);
+  });
 });
 
 describe('stringifyActor / parseActor', () => {
@@ -135,6 +160,22 @@ describe('flattenActor', () => {
       actorId: 'z1',
       actorMeta: null,
     });
+  });
+
+  it('flattens an agent-annotated user → agent label + patId in meta', () => {
+    expect(
+      flattenActor({ type: 'user', sub: 'z1', agent: { patId: 'p1', label: 'claude-code' } }),
+    ).toEqual({
+      actorType: 'user',
+      actorId: 'z1',
+      actorMeta: { agentPatId: 'p1', agentLabel: 'claude-code' },
+    });
+  });
+
+  it('stringifies an agent-annotated user with the agent label', () => {
+    expect(
+      stringifyActor({ type: 'user', sub: 'z1', agent: { patId: 'p1', label: 'claude-code' } }),
+    ).toBe('user:z1 via agent:claude-code');
   });
 
   it('flattens api_key → ownerSub in meta', () => {

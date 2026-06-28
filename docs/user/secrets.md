@@ -11,6 +11,8 @@ Secrets are managed per-environment in the orchestrator (see [operator docs](/op
 
 This design prevents accidental secret leakage through child processes, log output, or error messages. Only secrets you explicitly request are loaded into memory.
 
+A job can bind several environments with `environments: ['staging', 'my-testing']`; the secret keys from all bound environments are merged in array order, with a later environment's value winning on a key collision. See [Multiple environments per job](environments.md#multiple-environments-per-job).
+
 ## Where secret values come from
 
 Secret values are written either through the dashboard or through `kici-admin` running against the orchestrator. The orchestrator operator decides — per organization — which surface accepts secret writes. From the workflow author's perspective, the resolution path at run time is identical either way; the difference is where you (or your ops team) **enter** the value.

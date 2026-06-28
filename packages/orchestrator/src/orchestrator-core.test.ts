@@ -5,6 +5,7 @@ import {
   buildHostOutputsEnvelope,
   buildUpstreamOutputsByBase,
   buildUpstreamStatusesByBase,
+  buildInternalJobConfigForWorkflow,
   internalJobRunsOnSelectors,
 } from './orchestrator-core.js';
 
@@ -194,5 +195,36 @@ describe('buildUpstreamStatusesByBase', () => {
 
   it('skips rows with no status and returns undefined when none have one', () => {
     expect(buildUpstreamStatusesByBase([{ job_name: 'x', status: null }])).toBeUndefined();
+  });
+});
+
+describe('buildInternalJobConfigForWorkflow dispatchInputs', () => {
+  const job = { id: 'j', name: 'j', steps: [], needs: [] };
+
+  it('stamps defaults-only schedule inputs for a cron fire', () => {
+    const wf = {
+      name: 'sched-wf',
+      source: 'test/repo',
+      triggers: [
+        {
+          _type: 'schedule',
+          cronExpression: '0 0 * * *',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+        },
+      ],
+    };
+    const cfg = buildInternalJobConfigForWorkflow(wf, job);
+    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
+  });
+
+  it('omits dispatchInputs for a non-schedule internal event workflow', () => {
+    const wf = {
+      name: 'wc-wf',
+      source: 'test/repo',
+      triggers: [{ _type: 'workflow_complete', status: ['success'] }],
+    };
+    const cfg = buildInternalJobConfigForWorkflow(wf, job);
+    expect('dispatchInputs' in cfg).toBe(false);
   });
 });

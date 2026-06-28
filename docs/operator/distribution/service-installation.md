@@ -399,12 +399,14 @@ Previous versions of the resolved instance are preserved on disk for rollback. O
 For deployments installed from npm, you can upgrade without supplying an archive. First update the global package, then run `upgrade` with no `--from`/`--url`:
 
 ```bash
-# Upgrade an npm-installed orchestrator to a published version
-npm install -g @kici-dev/orchestrator@<version>
+# Upgrade an npm-installed orchestrator to a published version.
+# The install unit is the `kici-admin` wrapper — it carries both the
+# orchestrator and the agent, and updating it refreshes the copies the
+# service unit's ExecStart points at.
+npm install -g kici-admin@<version>
 kici-admin orchestrator upgrade --version <version> --yes
 
-# The agent flavor is symmetric
-npm install -g @kici-dev/agent@<version>
+# The agent flavor uses the same wrapper install
 kici-admin agent upgrade --version <version> --yes
 ```
 
@@ -444,6 +446,24 @@ kici-admin orchestrator upgrade --rollback
 
 This stops the service, switches the per-instance symlink to the previous version, and restarts.
 
+### Pick an installed version
+
+To switch to a specific already-installed version (not just the immediately
+previous one), use `--pick`:
+
+```bash
+cd ~/kici-deploy
+kici-admin orchestrator upgrade --pick
+```
+
+It lists every installed version, lets you choose one interactively (the active
+version is shown but not selectable), prints the change summary, and asks for
+confirmation before flipping the symlink / re-registering the service. Like
+`--rollback`, `--pick` only switches between versions already extracted under
+the instance's install base — it never downloads. It requires an interactive
+terminal (for non-interactive switching, use `--rollback` or an explicit
+`--from`/`--url` archive).
+
 ### Cleanup old versions
 
 To remove old versions (keeps current and previous) of the resolved instance:
@@ -460,6 +480,7 @@ kici-admin orchestrator upgrade --instance-dir ~/kici-deploy --cleanup
 | `--url <url>`           | URL to download package archive from                                                                                                                                                               |
 | `--version <ver>`       | Target version string (e.g., `0.3.0`). Required for archive upgrades; for npm-source upgrades it is validated against the installed package and defaults to it when omitted                        |
 | `--rollback`            | Roll back the resolved instance to its previous version                                                                                                                                            |
+| `--pick`                | Interactively pick an already-installed version to activate (switch, no download). Requires an interactive terminal                                                                                |
 | `--cleanup`             | Remove old versions of the resolved instance (keeps current and previous)                                                                                                                          |
 | `--force`               | Archive upgrades: overwrite an existing versioned directory. npm-source upgrades: bypass launch-target version verification (for opaque `--binary` installs); restarts without recording a version |
 | `--yes`                 | Skip confirmation prompt                                                                                                                                                                           |

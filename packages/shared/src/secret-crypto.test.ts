@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { encrypt, decrypt, deriveKey, generateMasterKey, type EncryptedValue } from './crypto.js';
+import {
+  encrypt,
+  decrypt,
+  deriveKey,
+  generateMasterKey,
+  type EncryptedValue,
+} from './secret-crypto.js';
 
 describe('AES-256-GCM crypto module', () => {
   const testKey = deriveKey('a'.repeat(64)); // 64 hex chars = 32 bytes

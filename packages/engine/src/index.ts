@@ -13,6 +13,8 @@
 export * from './protocol/version.js';
 export * from './protocol/messages/common.js';
 export * from './protocol/messages/actor.js';
+export * from './protocol/messages/pat-kind.js';
+export * from './mcp/tool-schemas.js';
 export * from './protocol/messages/auth.js';
 export * from './protocol/messages/capabilities.js';
 
@@ -53,6 +55,9 @@ export {
 
 // --- Protocol: Execution status (orchestrator -> Platform, in main union) ---
 export * from './protocol/messages/execution-status.js';
+
+// --- Protocol: Agent-facing provenance-tagged run-result (read path) ---
+export * from './protocol/messages/agent-run-result.js';
 
 // --- Protocol: Orchestrator deployment identity (browser-safe, pure Zod) ---
 export * from './protocol/messages/deployment-identity.js';

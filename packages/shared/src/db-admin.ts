@@ -1145,6 +1145,8 @@ export interface ExecutionJobRow {
   duration_ms: number | null;
   created_at: string;
   error_message: string | null;
+  /** Ordered bound deployment-environment names (JSON-encoded `string[]`), or null. */
+  environments: string | null;
 }
 
 export interface ListExecutionRunsOpts {
@@ -1224,7 +1226,7 @@ export async function showExecutionRunDirect(
     const run = runResult.rows[0];
     const jobsResult = await pool.query<ExecutionJobRow>(
       `SELECT id, run_id, job_id, job_name, status, agent_id,
-              started_at, completed_at, duration_ms, created_at, error_message
+              started_at, completed_at, duration_ms, created_at, error_message, environments
          FROM execution_jobs
         WHERE run_id = $1
         ORDER BY created_at ASC`,
@@ -1251,7 +1253,8 @@ export async function listExecutionJobsDirect(
     // must be r.run_id = j.run_id (not r.id = j.run_id).
     const result = await pool.query<ExecutionJobRow>(
       `SELECT j.id, j.run_id, j.job_id, j.job_name, j.status, j.agent_id,
-              j.started_at, j.completed_at, j.duration_ms, j.created_at, j.error_message
+              j.started_at, j.completed_at, j.duration_ms, j.created_at, j.error_message,
+              j.environments
          FROM execution_jobs j
          INNER JOIN execution_runs r ON r.run_id = j.run_id
         WHERE r.run_id::text = $1 OR r.id::text = $1

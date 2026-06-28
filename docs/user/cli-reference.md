@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: 'All CLI commands: compile, run (local/remote), orchestrators, test, login, logout, org, diagnostics, runs (list/show/logs/rerun/cancel), secrets, types, fixture, init, hook, endpoints, workflows, docs, admin'
+description: 'All CLI commands: compile, run (local/remote), orchestrators, preview, login, logout, org, diagnostics, runs (list/show/logs/rerun/cancel), secrets, types, fixture, init, hook, endpoints, workflows, docs, admin'
 ---
 
 The `@kici-dev/compiler` package provides the `kici` CLI for compiling, testing, and managing workflows.
@@ -19,7 +19,7 @@ Run commands with `npx kici` or add scripts to your `package.json`:
 {
   "scripts": {
     "kici:compile": "kici compile",
-    "kici:test": "kici test"
+    "kici:preview": "kici preview"
   }
 }
 ```
@@ -114,6 +114,8 @@ kici run local [event] [options]
 | `--kici-dir <path>`   | `.kici`   | Path to .kici directory                                                                                                                                                                                                                |
 | `--in-place`          | `false`   | Run against the real working directory instead of an isolated tmp checkout (see "Execution isolation" below)                                                                                                                           |
 | `--keep`              | `false`   | Always retain the isolated tmp checkout (default: keep only on failure)                                                                                                                                                                |
+| `--check`             | `false`   | Run in [check mode](idempotent-steps.md): each step reports drift instead of applying; the run still exits 0                                                                                                                           |
+| `--fail-on-drift`     | `false`   | In check mode, exit non-zero if any step reports drift (no effect without `--check`)                                                                                                                                                   |
 
 **Interactive workflow selection (`--pick` / `-p`):**
 
@@ -255,6 +257,10 @@ kici run remote [fixture] [options]
 | `--target-allow-empty`      | `false` | A `--target` that narrows a `runsOnAll` job to zero hosts skips it instead of failing                                                                                                                                                      |
 | `--debug`                   | `false` | Verbose internals                                                                                                                                                                                                                          |
 | `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                                                                                                                                                                    |
+| `--routing-key <key>`       | none    | Override the routing key for this run (advanced; selecting the org normally suffices — see [How the run is routed](#how-the-run-is-routed))                                                                                                |
+| `--check`                   | `false` | Run in [check mode](idempotent-steps.md): each step reports drift instead of applying                                                                                                                                                      |
+| `--fail-on-drift`           | `false` | In check mode, fail the run if any step reports drift (no effect without `--check`)                                                                                                                                                        |
+| `--approve-all, --yes`      | `false` | Auto-approve every [approval gate](approvals.md) this run holds on (run-scoped; eligibility still enforced)                                                                                                                                |
 
 **Examples:**
 
@@ -420,12 +426,12 @@ kici orchestrators use us-east
 kici orchestrators use us-east --org xyz789ghi012
 ```
 
-### kici test
+### kici preview
 
 Preview which workflows match a trigger event (dry-run, no execution). Useful for verifying trigger configurations during development.
 
 ```bash
-kici test [event] [options]
+kici preview [event] [options]
 ```
 
 **Arguments:**
@@ -452,19 +458,19 @@ kici test [event] [options]
 
 ```bash
 # Preview which workflows match a push event
-kici test push
+kici preview push
 
 # Preview PR trigger matching
-kici test pr:open
+kici preview pr:open
 
 # Preview with branch override
-kici test push --branch develop
+kici preview push --branch develop
 
 # Filter to specific workflow
-kici test push --workflow ci
+kici preview push --workflow ci
 
 # Simulate changed files for path-filtered triggers
-kici test push --files src/index.ts --files README.md
+kici preview push --files src/index.ts --files README.md
 ```
 
 **Exit codes:**
@@ -474,7 +480,7 @@ kici test push --files src/index.ts --files README.md
 | 0    | Preview completed (including zero matches) |
 | 1    | Error                                      |
 
-**Migration from old `kici test <fixture>`:** If you were using `kici test <fixture-name>` for remote fixture execution, use `kici run remote <fixture-name>` instead. For local workflow execution, use `kici run local <event>`.
+**Migration from the old `test` command:** The dry-run preview command was renamed from `test` to `preview`. If you were using the old `test` command with a fixture name for remote fixture execution, use `kici run remote <fixture-name>` instead. For local workflow execution, use `kici run local <event>`.
 
 ### kici login
 
@@ -851,6 +857,27 @@ Only key names are shown — secret values are never returned over this endpoint
 
 **Prerequisites:** authenticate via `kici login` and select an active organization with `kici org use <name>`.
 
+### kici pat create
+
+Mint a personal access token under your own identity. Pass `--agent` to mint an
+**agent-kind** PAT — the credential a coding agent points the KiCI MCP server at.
+
+```bash
+kici pat create --agent --name "claude-code"
+```
+
+- `--agent` marks the token as agent-kind. An agent PAT inherits your
+  permissions unchanged (it carries provenance, not extra authority) and is the
+  **only** credential the MCP server accepts.
+- `--name <label>` sets the token name. For an agent PAT this is the **agent
+  label** recorded on every action the agent takes — required with `--agent`.
+- `--expires-in-days <n>` overrides the default expiry.
+
+The token is printed once — save it immediately; it cannot be retrieved later.
+See [Drive KiCI from your coding agent](./ai-agents.md) for the full setup.
+
+**Prerequisites:** authenticate via `kici login` first.
+
 ### kici types
 
 Generate TypeScript declaration files from orchestrator environment metadata. The generated `.d.ts` file augments the SDK's `KnownSecretKeys` and `EnvironmentSecrets` interfaces, providing compile-time autocomplete and type checking for secret key names.
@@ -1169,7 +1196,7 @@ kici admin drain-worker --url http://worker-2.internal:10143
 Verify a KiCI build-provenance attestation bundle offline. A bundle is the signed package a workflow step produces via `ctx.attestProvenance(...)`: a DSSE-wrapped SLSA in-toto statement, the ephemeral public key that signed it, and the KiCI identity token that anchors the build context. For the end-to-end attest → verify → view journey, see the [build provenance guide](./provenance.md). Verification establishes the full chain — the identity token verifies against the trusted issuer's JWKS, the DSSE signature verifies against the bundled key, and the statement's build context must match the token's claims (a mismatch is a hard failure). When an `[artifact]` is given, its SHA-256 digest is also matched against the attestation subject.
 
 ```bash
-kici verify-attestation [artifact] --bundle <path-or-url> --trust-root <url-or-file> [options]
+kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-file>] [options]
 ```
 
 **Arguments:**
@@ -1180,14 +1207,14 @@ kici verify-attestation [artifact] --bundle <path-or-url> --trust-root <url-or-f
 
 **Options:**
 
-| Option                       | Required | Description                                                                               |
-| ---------------------------- | -------- | ----------------------------------------------------------------------------------------- |
-| `--bundle <path-or-url>`     | yes      | Path or `http(s)` URL to the attestation bundle JSON.                                     |
-| `--trust-root <url-or-file>` | yes      | Trusted issuer (see below). The token issuer is pinned to it, never taken from the token. |
-| `--audience <aud>`           | no       | Expected token audience (defaults to the KiCI provenance audience).                       |
-| `--json`                     | no       | Print the structured verification result as JSON instead of human-readable output.        |
+| Option                       | Required | Description                                                                                                                     |
+| ---------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `--bundle <path-or-url>`     | yes      | Path or `http(s)` URL to the attestation bundle JSON.                                                                           |
+| `--trust-root <url-or-file>` | no       | Trusted issuer (see below). Defaults to the hosted KiCI platform. The token issuer is pinned to it, never taken from the token. |
+| `--audience <aud>`           | no       | Expected token audience (defaults to the KiCI provenance audience).                                                             |
+| `--json`                     | no       | Print the structured verification result as JSON instead of human-readable output.                                              |
 
-**Trust root:** the verifier never trusts the issuer named inside the token — you supply the trusted issuer out-of-band via `--trust-root`, in one of two forms:
+**Trust root:** `--trust-root` defaults to the hosted KiCI platform's provenance issuer — the same platform you `kici login` against (see [Which trust root do I use?](./provenance.md#which-trust-root-do-i-use)), so the common case needs no flag. The verifier never trusts the issuer named inside the token; supplying it out-of-band is what prevents a forged bundle from self-attesting. To override the default, pass `--trust-root` in one of two forms:
 
 - **Online — an HTTPS issuer URL.** The verifier fetches `<url>/.well-known/openid-configuration`, reads its `issuer` and `jwks_uri`, and fetches the JWKS. The token's `iss` is pinned to the discovery document's `issuer`.
 - **Offline — a self-contained trust-root file.** A local JSON file with the issuer and JWKS inlined, so no network access is needed (air-gapped verification):
@@ -1206,7 +1233,10 @@ kici verify-attestation [artifact] --bundle <path-or-url> --trust-root <url-or-f
 **Examples:**
 
 ```bash
-# Online: verify a bundle against a deployed issuer, digest-checking the artifact
+# Default: verify against the hosted KiCI platform (no --trust-root needed)
+kici verify-attestation ./dist/app.tgz --bundle ./app.tgz.kici.json
+
+# Override: verify a bundle against a specific issuer, digest-checking the artifact
 kici verify-attestation ./dist/app.tgz \
   --bundle ./app.tgz.kici.json \
   --trust-root https://platform.example/issuer
@@ -1223,10 +1253,10 @@ kici verify-attestation --bundle ./app.tgz.kici.json \
 
 **Exit codes:**
 
-| Code | Meaning                                                                             |
-| ---- | ----------------------------------------------------------------------------------- |
-| 0    | Verified — signature, identity, build context (and digest, if checked) all pass     |
-| 1    | Not verified, or an error (missing flag, unreadable bundle, unreachable trust root) |
+| Code | Meaning                                                                                   |
+| ---- | ----------------------------------------------------------------------------------------- |
+| 0    | Verified — signature, identity, build context (and digest, if checked) all pass           |
+| 1    | Not verified, or an error (missing `--bundle`, unreadable bundle, unreachable trust root) |
 
 ## Workflow discovery
 
@@ -1268,7 +1298,7 @@ All commands follow a consistent exit code convention:
 
 ## Debug output
 
-Use `--debug` (on `kici run local`, `kici run remote`, `kici test`) or `--verbose` (on `kici compile`) for detailed output:
+Use `--debug` (on `kici run local`, `kici run remote`, `kici preview`) or `--verbose` (on `kici compile`) for detailed output:
 
 ```bash
 # Shows trigger matching, rule evaluation, decision traces
@@ -1278,7 +1308,7 @@ kici run local push --debug
 kici compile --verbose
 
 # Shows trigger matching preview
-kici test pr:open --debug
+kici preview pr:open --debug
 ```
 
 Set `KICI_DEBUG=true` for additional internal debug output across all commands.

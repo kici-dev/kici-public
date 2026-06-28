@@ -152,7 +152,7 @@ interface StepContext<TInputs = Record<string, unknown>> {
   rawPayload?: Record<string, unknown>;
   /** Which git provider triggered this workflow (e.g. 'github', 'gitlab') */
   provider?: string;
-  /** Whether this execution was triggered by `kici test` (remote test run) */
+  /** Whether this execution was triggered by `kici run remote` (developer-initiated remote run) */
   isTestRun: boolean;
   /** The resolved deployment environment name for this job (undefined without environment) */
   environment?: string;
@@ -549,7 +549,7 @@ Tools that require a file path on disk (sops `SOPS_AGE_KEY_FILE`, kubectl `KUBEC
 
 ### Local test mode secrets
 
-When running `kici test`, you can provide secrets locally without an orchestrator.
+When running `kici preview`, you can provide secrets locally without an orchestrator.
 
 #### .kici/.secrets file
 
@@ -577,10 +577,10 @@ Override or supplement file-based secrets with CLI flags:
 
 ```bash
 # Inject flat secrets (repeatable)
-kici test push --secret DEPLOY_TOKEN=my-token --secret API_KEY=my-key
+kici preview push --secret DEPLOY_TOKEN=my-token --secret API_KEY=my-key
 
 # Inject context-scoped secrets (repeatable)
-kici test push --context production.DB_PASSWORD=prod-secret --context npm-publish.NPM_TOKEN=abc123
+kici preview push --context production.DB_PASSWORD=prod-secret --context npm-publish.NPM_TOKEN=abc123
 ```
 
 **Precedence:** CLI flags override `.kici/.secrets` file values. Context secrets are auto-flattened into `ctx.secrets` using the same merge logic as production (last context wins).

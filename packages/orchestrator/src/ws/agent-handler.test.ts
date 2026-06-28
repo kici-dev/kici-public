@@ -12,6 +12,7 @@ import {
   WS_CLOSE_AUTH_TIMEOUT,
   WS_CLOSE_INVALID_MESSAGE,
   WS_CLOSE_AGENT_AUTH_FAILED,
+  PRIVILEGED_ROOT_LABEL,
 } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
@@ -46,6 +47,7 @@ function mockTokenStore(
         id: 'tok-1',
         token_prefix: 'kat_abcd1234',
         labels: null,
+        mandatory_labels: null,
         agent_type: 'static',
         created_at: new Date(),
         last_seen_at: null,
@@ -267,6 +269,113 @@ describe('createAgentWsHandler', () => {
         .find((m: Record<string, unknown>) => m.type === 'register.ack');
       expect(registerAck).toBeDefined();
       expect(registerAck!.agentId).toBe('agent-1');
+    });
+
+    // ── Privileged-root taint (token mandatory_labels) ──────────
+
+    /** A validated token row carrying authorized labels + a taint set. */
+    function privilegedRootTokenRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: 'tok-root',
+        token_prefix: 'kat_root0000',
+        labels: JSON.stringify(['linux', PRIVILEGED_ROOT_LABEL]),
+        mandatory_labels: JSON.stringify([PRIVILEGED_ROOT_LABEL]),
+        agent_type: 'static',
+        created_at: new Date(),
+        last_seen_at: null,
+        created_by: 'cli:admin',
+        revoked_at: null,
+        expires_at: null,
+        ...overrides,
+      };
+    }
+
+    /** Drive auth.request -> agent.register with a custom register payload. */
+    async function authAndRegister(
+      tokenRow: Record<string, unknown>,
+      register: { agentId: string; labels: string[]; runningAsUid?: number },
+    ) {
+      const ts = mockTokenStore({ validate: vi.fn().mockResolvedValue(tokenRow) });
+      const handler = createHandler({ tokenStore: ts });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'agent.register',
+          messageId: 'reg-1',
+          agentId: register.agentId,
+          labels: register.labels,
+          ...(register.runningAsUid !== undefined ? { runningAsUid: register.runningAsUid } : {}),
+        }),
+        ws as any,
+      );
+      return ws;
+    }
+
+    it('static agent inherits token mandatory_labels and is confined by the taint', async () => {
+      await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 0,
+      });
+
+      const entry = registry.get('agent-root');
+      expect(entry).toBeDefined();
+      expect([...entry!.mandatoryLabels]).toEqual([PRIVILEGED_ROOT_LABEL]);
+
+      // A plain job (no privileged:root) must NOT match the tainted agent.
+      expect(registry.findAvailable(['linux']).map((e) => e.agentId)).not.toContain('agent-root');
+      // A root-demanding job MUST match it.
+      expect(
+        registry.findAvailable(['linux', PRIVILEGED_ROOT_LABEL]).map((e) => e.agentId),
+      ).toContain('agent-root');
+    });
+
+    it('accepts a privileged-root agent running as root (uid 0)', async () => {
+      await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 0,
+      });
+      expect(registry.get('agent-root')).toBeDefined();
+    });
+
+    it('rejects a privileged-root token presented by a non-root agent (uid != 0)', async () => {
+      const ws = await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 1000,
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
+      expect(String(close?.[1])).toMatch(/privileged-root.*non-root|uid/i);
+    });
+
+    it('rejects a privileged-root claim when uid is absent (cannot verify)', async () => {
+      const ws = await authAndRegister(privilegedRootTokenRow(), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        // no runningAsUid
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
+    });
+
+    it('rejects a privileged-root advertised label by a non-root agent even without a taint', async () => {
+      // The honesty gate keys off the advertised label too: an agent that
+      // advertises kici:privileged:root (authorized by a token that lists it as
+      // a label but mints no taint) must still be uid 0.
+      const ws = await authAndRegister(privilegedRootTokenRow({ mandatory_labels: null }), {
+        agentId: 'agent-root',
+        labels: ['linux', PRIVILEGED_ROOT_LABEL],
+        runningAsUid: 1000,
+      });
+      expect(registry.get('agent-root')).toBeUndefined();
+      const close = (ws.close as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      expect(close?.[0]).toBe(WS_CLOSE_AGENT_AUTH_FAILED);
     });
 
     it('rejects invalid token -> auth.failure + WS close 4010', async () => {

@@ -2,6 +2,8 @@
 export { step } from './step.js';
 export { job } from './job.js';
 export { workflow } from './workflow.js';
+export { parallel, isParallelGroup, flattenStepInputs } from './parallel.js';
+export type { ParallelGroup, ParallelOptions } from './parallel.js';
 
 // Approval gate API
 export { normalizeApproval } from './approval.js';

@@ -398,6 +398,98 @@ describe('DashboardHandler', () => {
       );
       expect(response.error).toBeUndefined();
     });
+
+    it('returns the bound environment list (parsed from jsonb text) on the run-detail job', async () => {
+      const {
+        db,
+        mocks: { selectExecute: execute },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+
+      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+
+      execute.mockResolvedValueOnce([
+        {
+          job_id: 'job-deploy',
+          job_name: 'deploy',
+          status: 'success',
+          matrix_values: null,
+          agent_id: 'agent-1',
+          started_at: null,
+          completed_at: null,
+          duration_ms: null,
+          error_message: null,
+          runs_on_labels: null,
+          environments: JSON.stringify(['staging', 'my-testing']),
+          outputs: null,
+          init_failure: null,
+        },
+      ]);
+      execute.mockResolvedValueOnce([]); // steps
+      execute.mockResolvedValueOnce([]); // run_secret_outputs
+
+      const msg: DashboardRunDetailRequest = {
+        type: 'dashboard.run.detail',
+        requestId: 'req-env',
+        runId: 'run-with-multi-env-job',
+      };
+
+      await handler.handleRunDetail(msg);
+
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.run.detail.response');
+      expect(response.jobs).toHaveLength(1);
+      expect(response.jobs[0].environments).toEqual(['staging', 'my-testing']);
+      expect(response.error).toBeUndefined();
+    });
+  });
+
+  describe('handleRunStructured', () => {
+    it('sends a null result when the run is not found and records the read', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const record = vi.fn();
+
+      // resolveOrgForRun: routing_key null short-circuits; aggregateRunDetail's
+      // run-row query then returns undefined (default) → result is null.
+      mockNoopResolveOrgForRun(selectExecuteTakeFirst);
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        send,
+        accessLog: { record } as never,
+        ...noopCallbacks,
+      });
+
+      await handler.handleRunStructured({
+        type: 'dashboard.run.structured',
+        requestId: 'req-s1',
+        runId: 'run-missing',
+        actor: { type: 'user', sub: 'u1', agent: { patId: 'p1', label: 'e2e-agent' } },
+      });
+
+      expect(send).toHaveBeenCalledOnce();
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.run.structured.response');
+      expect(response.requestId).toBe('req-s1');
+      expect(response.result).toBeNull();
+
+      // The read is recorded under the agent-attributed actor.
+      expect(record).toHaveBeenCalledOnce();
+      const entry = record.mock.calls[0][0];
+      expect(entry.action).toBe('run.structured.read');
+      expect(entry.actor).toEqual({
+        type: 'user',
+        sub: 'u1',
+        agent: { patId: 'p1', label: 'e2e-agent' },
+      });
+    });
   });
 
   describe('handleStepLogs', () => {
@@ -746,6 +838,179 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.attestations).toEqual([]);
       expect(response.error).toBe('Provenance storage not configured');
+    });
+  });
+
+  describe('handleAttestationsListAll', () => {
+    const summaryRowA = {
+      id: 'att-1',
+      runId: 'run-1',
+      jobId: 'job-1',
+      jobName: 'publish',
+      subjectName: 'pkg-a',
+      subjectDigest: 'sha256:' + 'a'.repeat(64),
+      mode: 'kici',
+      mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+      createdAt: new Date('2026-06-11T00:00:00.000Z'),
+      verifyStatus: 'verified',
+      verifyReason: null,
+      repository: 'owner/repo',
+      workflow: '.kici/workflows/release.ts',
+    };
+    const summaryRowB = {
+      ...summaryRowA,
+      id: 'att-2',
+      runId: 'run-2',
+      subjectName: 'pkg-b',
+      verifyStatus: 'failed',
+      verifyReason: 'dsse_signature_invalid',
+    };
+
+    it('returns metadata-only summaries, paginated, and access-logged', async () => {
+      const {
+        db,
+        mocks: { selectExecute, selectExecuteTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const accessLog = { record: vi.fn() };
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        send,
+        accessLog: accessLog as never,
+        ...noopCallbacks,
+      });
+
+      selectExecute.mockResolvedValueOnce([summaryRowA, summaryRowB]);
+      selectExecuteTakeFirst.mockResolvedValueOnce({ count: 2 });
+
+      await handler.handleAttestationsListAll({
+        type: 'dashboard.attestations.list.all',
+        requestId: 'req-all-1',
+        actor: { type: 'user', sub: 'u1' },
+        page: 1,
+        filters: { status: 'verified' },
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.attestations.list.all.response');
+      expect(response.total).toBe(2);
+      expect(response.pageSize).toBe(25);
+      expect(response.attestations).toHaveLength(2);
+      // Metadata only — never an inlined bundle on the list.
+      expect(response.attestations[0]).not.toHaveProperty('bundle');
+      expect(response.attestations[0].verifyStatus).toBe('verified');
+      expect(response.attestations[1].verifyStatus).toBe('failed');
+      expect(accessLog.record).toHaveBeenCalled();
+      const logged = accessLog.record.mock.calls[0][0];
+      expect(logged.target.type).toBe('attestation');
+      expect(logged.action).toBe('attestations.read');
+    });
+  });
+
+  describe('handleAttestationGet', () => {
+    const validBundle = {
+      mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+      dsseEnvelope: {
+        payloadType: 'application/vnd.in-toto+json',
+        payload: 'eA==',
+        signatures: [{ keyid: 'k', sig: 'eA==' }],
+      },
+      verificationMaterial: {
+        publicKey: { kty: 'EC', crv: 'P-256', x: 'a', y: 'b' },
+        identityToken: 'eyJ.a.b',
+      },
+    };
+    function mockProvenanceStorage(getImpl?: (key: string) => Promise<Buffer | null>) {
+      return {
+        get: vi.fn(getImpl ?? (async () => Buffer.from(JSON.stringify(validBundle)))),
+        put: vi.fn(),
+        getUploadUrl: vi.fn(),
+        getInternalUploadUrl: vi.fn(),
+        commit: vi.fn(),
+        delete: vi.fn(),
+        list: vi.fn(),
+      } as never;
+    }
+    const getRow = {
+      id: 'att-1',
+      runId: 'run-42',
+      jobId: 'job-1',
+      jobName: 'publish',
+      subjectName: 'pkg',
+      subjectDigest: 'a'.repeat(64),
+      mode: 'kici',
+      mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+      storageKey: 'provenance/run-42/job-1/x.kici.json',
+      createdAt: new Date('2026-06-11T00:00:00.000Z'),
+    };
+
+    it('inlines exactly one bundle and logs against the attestation target', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const provenanceStorage = mockProvenanceStorage();
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        provenanceStorage,
+        send,
+        ...noopCallbacks,
+      });
+
+      // 1) the get row, then 2) resolveOrgForRun short-circuit.
+      selectExecuteTakeFirst.mockResolvedValueOnce(getRow);
+      mockNoopResolveOrgForRun(selectExecuteTakeFirst);
+
+      await handler.handleAttestationGet({
+        type: 'dashboard.attestation.get',
+        requestId: 'req-get-1',
+        actor: { type: 'user', sub: 'u1' },
+        attestationId: 'att-1',
+      });
+
+      expect(provenanceStorage.get).toHaveBeenCalledTimes(1);
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.attestation.get.response');
+      expect(response.attestation.id).toBe('att-1');
+      expect(response.attestation.bundle.mediaType).toContain('kici.provenance.bundle');
+    });
+
+    it('returns null attestation when the id is not found', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const provenanceStorage = mockProvenanceStorage();
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        provenanceStorage,
+        send,
+        ...noopCallbacks,
+      });
+
+      selectExecuteTakeFirst.mockResolvedValueOnce(undefined);
+
+      await handler.handleAttestationGet({
+        type: 'dashboard.attestation.get',
+        requestId: 'req-get-2',
+        actor: { type: 'user', sub: 'u1' },
+        attestationId: 'missing',
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response.attestation).toBeNull();
+      expect(provenanceStorage.get).not.toHaveBeenCalled();
     });
   });
 

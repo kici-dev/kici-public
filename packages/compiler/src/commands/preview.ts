@@ -11,10 +11,11 @@ import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import { displayDryRun } from '../test-runner/dry-run.js';
 import { loadSecretsFile, type ParsedSecrets } from '../test-runner/secrets-file.js';
 import type { Workflow } from '@kici-dev/sdk';
+import { flattenStepInputs } from '@kici-dev/sdk';
 import { parseEventArg } from '../test-runner/event-types.js';
 
-/** Options for the kici test command (dry-run trigger preview) */
-export interface TestOptions extends PayloadOptions {
+/** Options for the kici preview command (dry-run trigger preview) */
+export interface PreviewOptions extends PayloadOptions {
   /** Filter to specific workflow */
   workflow?: string;
   /** Filter to specific job */
@@ -30,7 +31,7 @@ export interface TestOptions extends PayloadOptions {
 }
 
 /** Options for the kici run remote command */
-export interface RemoteRunOptions extends TestOptions {
+export interface RemoteRunOptions extends PreviewOptions {
   /** Run all available fixtures */
   all?: boolean;
   /** Interactively pick fixtures to run (multi-select checkbox). */
@@ -87,14 +88,14 @@ export interface RemoteRunResult {
 }
 
 /**
- * Main test command entry point.
+ * Main preview command entry point.
  *
- * `kici test <event>` is now dry-run trigger preview only.
+ * `kici preview <event>` is a dry-run trigger preview only — it executes nothing.
  * If the argument looks like a fixture name (not a known event type), prints a migration message.
  */
-export async function testCommand(
+export async function previewCommand(
   event: string | undefined,
-  options: TestOptions,
+  options: PreviewOptions,
 ): Promise<boolean> {
   if (options.debug) {
     process.env.KICI_DEBUG = 'true';
@@ -104,13 +105,13 @@ export async function testCommand(
   try {
     // No event provided
     if (!event) {
-      logger.info(pc.bold('\nUsage: kici test <event>\n'));
+      logger.info(pc.bold('\nUsage: kici preview <event>\n'));
       logger.info(pc.gray('Preview which workflows and jobs would run for a given event.\n'));
       logger.info(pc.gray('Examples:'));
-      logger.info(pc.gray('  kici test push'));
-      logger.info(pc.gray('  kici test pr:open'));
-      logger.info(pc.gray('  kici test schedule'));
-      logger.info(pc.gray('  kici test lifecycle:workflow_complete\n'));
+      logger.info(pc.gray('  kici preview push'));
+      logger.info(pc.gray('  kici preview pr:open'));
+      logger.info(pc.gray('  kici preview schedule'));
+      logger.info(pc.gray('  kici preview lifecycle:workflow_complete\n'));
       logger.info(
         pc.gray('For remote fixture execution, use: kici run remote [fixture] [options]'),
       );
@@ -131,7 +132,7 @@ export async function testCommand(
     }
 
     // Run dry-run trigger preview
-    return await testDryRun(event, options);
+    return await previewEvent(event, options);
   } catch (error) {
     const message = toErrorMessage(error);
     logger.error(pc.red(`\nError: ${message}\n`));
@@ -163,7 +164,7 @@ function isKnownEventArg(arg: string): boolean {
 /**
  * Local-only dry-run mode: compile workflows, match triggers, display what would execute.
  */
-export async function testDryRun(event: string, options: TestOptions): Promise<boolean> {
+export async function previewEvent(event: string, options: PreviewOptions): Promise<boolean> {
   try {
     // Resolve .kici directory
     const kiciDir = resolveKiciDir(options.kiciDir);
@@ -275,7 +276,7 @@ function workflowsToLockFormat(workflows: Workflow[]): LockWorkflow[] {
             if ('group' in n) return `__group:${(n as { group: string }).group}`;
             return (n as { name: string }).name;
           }) ?? [],
-        steps: j.steps.map((s) => {
+        steps: flattenStepInputs(j.steps).map((s) => {
           if (typeof s === 'function') {
             return { name: '', hasOutputs: false };
           }

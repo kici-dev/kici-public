@@ -45,6 +45,7 @@ import type { PendingBuildTracker } from './cache/index.js';
 import type { PendingInitTracker, InitResult } from './cache/index.js';
 import type { PendingDynamicTracker } from './cache/index.js';
 import type { CacheStorage } from './storage/types.js';
+import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
 import { registerBlobRoutes } from './storage/blob-routes.js';
 import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
@@ -161,6 +162,8 @@ export interface AppDependencies {
   dispatchCacheRefs?: DispatchCacheRefTracker;
   /** Cache storage backend (S3) for metadata operations on upload completion. */
   cacheStorage?: CacheStorage;
+  /** Provenance trust root used to verify build-provenance bundles at ingest. */
+  provenanceTrustRoot?: ProvenanceTrustRoot;
   /**
    * Filesystem cache backend handle. Only set when KICI_STORAGE_TYPE is
    * `filesystem`. Drives the /api/v1/cache/blob/* HTTP route that serves and
@@ -798,11 +801,13 @@ export function createApp(deps: AppDependencies) {
           stepsTotal.add(1, { status: msg.state });
 
           if (deps.executionTracker) {
-            // Merge secretsAccessed into data for forwarding through the pipeline
-            const data =
-              msg.secretsAccessed !== undefined
-                ? { ...msg.data, secretsAccessed: msg.secretsAccessed }
-                : msg.data;
+            // Merge top-level fields back into data for the persistence/forward pipeline.
+            const data = {
+              ...msg.data,
+              ...(msg.secretsAccessed !== undefined && { secretsAccessed: msg.secretsAccessed }),
+              ...(msg.concurrencyKind !== undefined && { concurrencyKind: msg.concurrencyKind }),
+              ...(msg.groupId !== undefined && { groupId: msg.groupId }),
+            };
             deps.executionTracker.onStepStatus(
               msg.runId,
               msg.jobId,
@@ -902,6 +907,7 @@ export function createApp(deps: AppDependencies) {
         // Provenance bundles reuse the cache storage backend for presigned PUTs;
         // each completed upload records one attestations row.
         provenanceStorage: deps.cacheStorage,
+        provenanceTrustRoot: deps.provenanceTrustRoot,
         onProvenanceUpload: async (record) => {
           await deps.db
             .insertInto('attestations')
@@ -914,6 +920,9 @@ export function createApp(deps: AppDependencies) {
               storage_key: record.storageKey,
               mode: 'kici',
               media_type: record.mediaType,
+              verify_status: record.verifyStatus,
+              verify_reason: record.verifyReason,
+              verified_at: record.verifiedAt,
             })
             .execute();
         },
@@ -1356,6 +1365,7 @@ export function createApp(deps: AppDependencies) {
         registrationIndex: deps.registrationIndex,
         tokenManager: deps.adminDeps.tokenManager,
         rbac: deps.adminDeps.rbac,
+        ...(deps.environmentStore && { environmentStore: deps.environmentStore }),
       }),
     );
   }
@@ -1372,6 +1382,7 @@ export function createApp(deps: AppDependencies) {
         rbac: deps.adminDeps.rbac,
         auditLogger: deps.adminDeps.auditLogger,
         masterSecretKey: deps.config.secretKey,
+        logStorage: deps.logStorage,
       }),
     );
   }

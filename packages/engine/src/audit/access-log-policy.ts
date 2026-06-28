@@ -11,7 +11,10 @@
  * 1. `outcome !== 'allowed'` → always record (denied/error are full-fidelity).
  * 2. `actor.type === 'platform_operator'` → always record (compliance: any
  *    activity by a non-org member must be auditable in full).
- * 3. The per-action `POLICY_BY_ACTION` decision (`always` / `sample` /
+ * 3. agent-attributed actor (`actor.agent` present) → always record. The
+ *    agent-provenance guarantee is that every action an agent takes is fully
+ *    auditable; a sampled subset would break it.
+ * 4. The per-action `POLICY_BY_ACTION` decision (`always` / `sample` /
  *    `rate_limit`).
  *
  * Browser-safe: this module MUST NOT import any Node built-ins (`node:crypto`
@@ -48,6 +51,7 @@ export interface AccessLogRateLimiter {
 export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   // High-volume tenant reads (sampled).
   'run.detail.read': { kind: 'sample', allowedRate: 0.05 },
+  'run.structured.read': { kind: 'sample', allowedRate: 0.05 },
   'runs.list.read': { kind: 'sample', allowedRate: 0.05 },
   'runs.filters.read': { kind: 'sample', allowedRate: 0.05 },
   'sources.list.read': { kind: 'sample', allowedRate: 0.1 },
@@ -179,6 +183,11 @@ export function shouldRecordAccess(
   // Override 2: platform_operator activity always recorded
   // (research §7 — operator break-glass is non-tenant-attributable).
   if (actor.type === 'platform_operator') return true;
+
+  // Override 3: agent-attributed actions always recorded — the agent-provenance
+  // guarantee (every action an agent takes is fully auditable) requires the
+  // complete trail, never a sampled subset.
+  if (actor.type === 'user' && actor.agent) return true;
 
   const policy = POLICY_BY_ACTION[action];
   switch (policy.kind) {

@@ -1263,6 +1263,9 @@ describe('processWebhook', () => {
       undefined, // concurrency (no concurrency config in test workflow)
       undefined, // workflowTimeoutMs (no timeout config in test workflow)
       undefined, // checkMode (apply mode — no check-mode override in test fixture)
+      false, // localWorkingTree (github webhook, not a `kici run remote` upload)
+      undefined, // triggerActorUsername (no sender in the test PR fixture)
+      undefined, // triggerActorUserId (no sender in the test PR fixture)
     );
   });
 
@@ -1289,13 +1292,15 @@ describe('processWebhook', () => {
     await processWebhook(basePrInfo(), deps);
 
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
-    // The concurrency config (without hasGroup) is the second-to-last argument;
-    // the trailing argument is the workflow timeout (undefined here).
     const call = mockTracker.onExecutionStarted.mock.calls[0];
-    // Trailing args: …, concurrency, workflowTimeoutMs, checkMode.
-    expect(call[call.length - 3]).toEqual({ cancelInProgress: false, max: 3 });
-    expect(call[call.length - 2]).toBeUndefined(); // workflowTimeoutMs
-    expect(call[call.length - 1]).toBeUndefined(); // checkMode
+    // Index from the FRONT of the (long) onExecutionStarted signature so this
+    // assertion survives new trailing optional args (e.g. localWorkingTree).
+    // See execution-tracker.ts onExecutionStarted(): concurrency is arg 17,
+    // workflowTimeoutMs 18, checkMode 19.
+    const CONCURRENCY_ARG = 17;
+    expect(call[CONCURRENCY_ARG]).toEqual({ cancelInProgress: false, max: 3 });
+    expect(call[CONCURRENCY_ARG + 1]).toBeUndefined(); // workflowTimeoutMs
+    expect(call[CONCURRENCY_ARG + 2]).toBeUndefined(); // checkMode
   });
 
   it('does not call executionTracker when not provided', async () => {
@@ -3344,13 +3349,9 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
           runsOn: [{ kind: 'exact', value: 'linux' }],
           needs: [],
           steps: [{ name: 'Run', hasOutputs: false }],
-          dynamicEnvironment: true,
-          // Non-inline environment triggers needsInit (see processor.ts
-          // `needsInit` predicate: `dynamicEnvironment && !isLockInlineValue(environment)`).
-          environment: {
-            _type: 'dynamicFunction',
-            source: { file: '.kici/workflows/foo.ts', index: 0 },
-          },
+          // An impure (non-inline) dynamic environment element triggers needsInit
+          // (the agent resolves it via an init job).
+          environments: [{ value: '', dynamic: true }],
         },
       ],
     });
@@ -3699,8 +3700,8 @@ describe('processWebhook — environment integration', () => {
     expect(mockEnvStore.matchEnvironment).not.toHaveBeenCalled();
   });
 
-  it('dispatches job with static environment name and includes it in job config', async () => {
-    const lockFile = envLockFile({ environment: 'production' });
+  it('dispatches a job whose referenced environment is not configured (lenient skip)', async () => {
+    const lockFile = envLockFile({ environments: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const mockEnvStore = createMockEnvironmentStore(null); // No env config in DB
 
@@ -3713,14 +3714,16 @@ describe('processWebhook — environment integration', () => {
     await processWebhook(basePrInfo(), deps);
 
     expect(mockEnvStore.matchEnvironment).toHaveBeenCalledWith('__default__', 'production');
-    // Job dispatched (no env config in DB means no protection rules)
+    // A bound environment with no configured record contributes no protection
+    // rules / vars but does not block dispatch — the job still runs, with the
+    // declared name recorded as the run environment.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
     const jobConfig = mockDispatcher.dispatch.mock.calls[0][0].jobConfig;
     expect(jobConfig.environment).toBe('production');
   });
 
   it('evaluates protection rules and rejects job when environment rejects', async () => {
-    const lockFile = envLockFile({ environment: 'production' });
+    const lockFile = envLockFile({ environments: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     // Return a disabled environment -> always rejected
     const mockEnvStore = createMockEnvironmentStore({
@@ -3758,7 +3761,7 @@ describe('processWebhook — environment integration', () => {
   });
 
   it('creates held run when protection rules return hold action', async () => {
-    const lockFile = envLockFile({ environment: 'staging' });
+    const lockFile = envLockFile({ environments: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const mockHeldRunStore = createMockHeldRunStore();
     // Environment with required reviewers -> hold action
@@ -3934,7 +3937,7 @@ describe('processWebhook — environment integration', () => {
   });
 
   it('includes environment vars from variable store in dispatched job config', async () => {
-    const lockFile = envLockFile({ environment: 'dev' });
+    const lockFile = envLockFile({ environments: [{ value: 'dev', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const envVars = { DB_HOST: 'localhost', API_KEY: 'test-key' };
     const mockVariableStore = createMockVariableStore(envVars);
@@ -3999,7 +4002,7 @@ describe('processWebhook — environment integration', () => {
   });
 
   it('skips environment evaluation for dynamic environment (flag-only)', async () => {
-    const lockFile = envLockFile({ dynamicEnvironment: true });
+    const lockFile = envLockFile({ environments: [{ value: '', dynamic: true }] });
     const mockDispatcher = createMockDispatcher();
     const mockEnvStore = createMockEnvironmentStore();
 
@@ -4018,7 +4021,7 @@ describe('processWebhook — environment integration', () => {
   });
 
   it('dispatches job with pass result from protection rules', async () => {
-    const lockFile = envLockFile({ environment: 'staging' });
+    const lockFile = envLockFile({ environments: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     // Enabled environment with no restrictive rules -> pass
     const mockEnvStore = createMockEnvironmentStore({
@@ -4357,7 +4360,7 @@ function dynamicEnvironmentLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            dynamicEnvironment: true,
+            environments: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4388,7 +4391,7 @@ function dynamicEnvOnlyLockFile() {
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
             dynamicEnv: true,
-            environment: 'production',
+            environments: [{ value: 'production', dynamic: false }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4418,7 +4421,7 @@ function multipleDynamicJobsLockFile() {
             name: 'deploy-staging',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            dynamicEnvironment: true,
+            environments: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy staging', hasOutputs: false }],
           },
           {
@@ -4437,7 +4440,9 @@ function multipleDynamicJobsLockFile() {
 
 function createMockPendingInits() {
   return {
-    track: vi.fn().mockResolvedValue({ environmentName: 'staging', env: { NODE_ENV: 'staging' } }),
+    track: vi
+      .fn()
+      .mockResolvedValue({ environmentNames: ['staging'], env: { NODE_ENV: 'staging' } }),
     resolve: vi.fn(),
     reject: vi.fn(),
     has: vi.fn().mockReturnValue(false),
@@ -4493,7 +4498,7 @@ describe('init job dispatch (dynamic fields)', () => {
   it('applies init result environmentName to static resolution pipeline', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
-    mockPendingInits.track.mockResolvedValue({ environmentName: 'production' });
+    mockPendingInits.track.mockResolvedValue({ environmentNames: ['production'] });
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
@@ -4723,11 +4728,15 @@ function inlineEnvironmentLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            dynamicEnvironment: true,
-            environment: {
-              _type: 'inline' as const,
-              expression: "(event) => event.payload.ref.split('/').pop()",
-            },
+            environments: [
+              {
+                value: {
+                  _type: 'inline' as const,
+                  expression: "(event) => event.payload.ref.split('/').pop()",
+                },
+                dynamic: true,
+              },
+            ],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4757,11 +4766,15 @@ function inlineEnvironmentErrorLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            dynamicEnvironment: true,
-            environment: {
-              _type: 'inline' as const,
-              expression: '(event) => event.nonExistent.boom',
-            },
+            environments: [
+              {
+                value: {
+                  _type: 'inline' as const,
+                  expression: '(event) => event.nonExistent.boom',
+                },
+                dynamic: true,
+              },
+            ],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4791,11 +4804,15 @@ function mixedInlineAndDynamicLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            dynamicEnvironment: true,
-            environment: {
-              _type: 'inline' as const,
-              expression: "(event) => event.payload.ref.split('/').pop()",
-            },
+            environments: [
+              {
+                value: {
+                  _type: 'inline' as const,
+                  expression: "(event) => event.payload.ref.split('/').pop()",
+                },
+                dynamic: true,
+              },
+            ],
             dynamicEnv: true,
             // env is NOT inline -- needs init job
             steps: [{ name: 'Deploy', hasOutputs: false }],

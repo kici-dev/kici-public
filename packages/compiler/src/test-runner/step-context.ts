@@ -66,6 +66,7 @@ export function createStepContext(
   rawPayload?: Record<string, unknown>,
   provider?: string,
   dispatchInputs: Readonly<Record<string, string | number | boolean | null>> = {},
+  signal: AbortSignal = new AbortController().signal,
 ): StepContext {
   const flat = testSecrets?.flat ?? {};
   const namespacedSecrets = testSecrets?.contexts ?? {};
@@ -151,6 +152,7 @@ export function createStepContext(
   return {
     $: scoped$,
     log: createTestLogger(jobInfo.name),
+    signal,
     env,
     setEnv: (key: string, value: string) => {
       env[key] = value;

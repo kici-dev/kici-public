@@ -42,6 +42,36 @@ The user identity that spawned processes run as depends on the scaler backend. T
 - **Firecracker requires root** — this is by design and safe due to jailer privilege dropping.
 - **Container backend** is safe regardless of orchestrator user, since containers provide their own isolation boundary.
 
+## Confined root agents
+
+Some workloads need a **persistent agent that runs as root** — for example a deploy agent that installs packages, writes system service units, and restarts services on the host. An agent that can run arbitrary workflow steps as root is root by construction, so the right place to confine it is **which jobs may reach it**, not what it may do once it accepts a job.
+
+KiCI confines a root agent with a **mandatory-label taint** (a Kubernetes-taint-style gate). A tainted agent only accepts a job when the job's `runsOn` explicitly demands every label in the taint. So an ordinary CI workflow can never accidentally land on a root host — only a job that deliberately asks for `kici:privileged:root` (and clears the environment-protection and approval gates in front of it) is dispatched there.
+
+### Minting a confined root token
+
+The taint is **token-bound**: it is the operator's grant, anchored to the token they mint, not something the agent self-declares. Create the token with `--privileged-root`:
+
+```bash
+kici-admin agent register --privileged-root
+```
+
+This authorizes the agent to advertise `kici:privileged:root` (so root-demanding jobs route to it) **and** taints it with the same label (so it refuses every job that does not demand root). Set the resulting token as `KICI_AGENT_TOKEN` on the root agent (installed with `kici-admin agent install --system`).
+
+For arbitrary taints (GPU pools, tenant-pinned agents), use the general, repeatable form — each label is unioned into both the authorized labels and the taint:
+
+```bash
+kici-admin agent register --mandatory-label kici:pool:gpu --mandatory-label kici:tenant:acme
+```
+
+A bare `kici-admin agent install --system` root agent stays **un-tainted** and accepts every job its labels match — the taint is strictly opt-in, so the trusted single-tenant "one root agent runs everything" case is unchanged.
+
+### Fail-closed uid verification
+
+The `kici:privileged:root` selector must be honest: a root-demanding job must never land on a non-root agent. At registration the orchestrator verifies that an agent presenting `kici:privileged:root` is actually running as uid 0. If it is not — or if it does not report its uid at all — the registration is **refused** (the connection is closed and the rejection is logged), rather than silently demoting the agent.
+
+This catches honest misconfiguration. It is **not** a defense against an agent that lies about its uid: such an agent already holds an operator-minted privileged token and is inside the trust boundary by construction. The real confinement of _which_ jobs may demand root lives one level up, at dispatch authorization — environment protection plus the approval chain gate every job that would run as root.
+
 ## Isolation model per backend
 
 ### Container backend (strongest for standard workloads)

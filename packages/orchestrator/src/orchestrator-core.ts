@@ -65,6 +65,7 @@ import {
   WS_CLOSE_DISPATCH_ACK_TIMEOUT,
   isLockStaticJob,
   partitionMatchers,
+  resolveScheduleInputs,
   VariantKind,
   ExecutionJobStatus,
   type LabelMatcher,
@@ -85,6 +86,8 @@ import {
 import type { ScalerBackend, ScalerConfig, ScalerEvent } from './scaler/index.js';
 import { createCacheStorage, generateSigningSecret } from './storage/index.js';
 import type { CacheStorage } from './storage/index.js';
+import { assertAgentReachableStorage } from './storage/loopback-guard.js';
+import { createProvenanceTrustRoot, type ProvenanceTrustRoot } from './provenance/trust-root.js';
 import {
   SourceCache,
   BuildCoordinator,
@@ -174,7 +177,7 @@ import { CronStore } from './cron/cron-store.js';
 import { CronScheduler } from './cron/cron-scheduler.js';
 import { SecretOutputStore } from './secrets/secret-output-store.js';
 import { decryptPrivateKey, decryptSecretOutput } from './secrets/ephemeral-keys.js';
-import { encrypt, decrypt as pskDecrypt, deriveKey } from './secrets/crypto.js';
+import { encrypt, decrypt as pskDecrypt, deriveKey } from '@kici-dev/shared';
 import { ProviderRegistry } from './provider-registry.js';
 import { ClusterIdentity } from './cluster/cluster-identity.js';
 import { resolveAndPersistClusterName } from './config/cluster-name.js';
@@ -211,6 +214,12 @@ export interface OrchestratorSubsystems {
   scalerManager: ScalerManager | null;
   scalerConfig: ScalerConfig | null;
   cacheStorage: CacheStorage | undefined;
+  /**
+   * Provenance trust root used to verify build-provenance bundles at ingest.
+   * The mode-specific hook (server.ts) wires the live issuer onto it from the
+   * Platform `auth.success` message via `onProvenanceIssuer`.
+   */
+  provenanceTrustRoot: ProvenanceTrustRoot;
   sourceCache: SourceCache | undefined;
   depCache: DepCache | undefined;
   userCache: UserCache | undefined;
@@ -672,7 +681,7 @@ function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefine
     const cacheStorage = createCacheStorage({
       type: 's3',
       bucket: config.storage.bucket!,
-      prefix: config.storage.prefix ?? 'kici-cache/',
+      prefix: config.storage.prefix ?? '',
       ttlMs: config.cacheTtlDays * 86_400_000,
       region: config.storage.region,
       endpoint: config.storage.endpoint,
@@ -1583,7 +1592,17 @@ async function dispatchInternalJobsDirect(
   return dispatchedJobs;
 }
 
-function buildInternalJobConfigForWorkflow(workflow: any, job: any): Record<string, unknown> {
+export function buildInternalJobConfigForWorkflow(
+  workflow: any,
+  job: any,
+): Record<string, unknown> {
+  // Schedule fires carry no operator input — resolve the trigger's declared
+  // defaults. Non-schedule internal events (workflow_complete, job_complete)
+  // have no schedule trigger, so this is undefined and the field is omitted.
+  const scheduleTrigger = (workflow.triggers ?? []).find(
+    (t: { _type?: string }) => t._type === 'schedule',
+  ) as { inputs?: Parameters<typeof resolveScheduleInputs>[0] } | undefined;
+  const dispatchInputs = resolveScheduleInputs(scheduleTrigger?.inputs);
   return {
     source: workflow.source ?? undefined,
     workflowName: workflow.name,
@@ -1594,6 +1613,7 @@ function buildInternalJobConfigForWorkflow(workflow: any, job: any): Record<stri
     ...(job.include && { include: job.include }),
     ...(job.exclude && { exclude: job.exclude }),
     ...(job.rules && { rules: job.rules }),
+    ...(dispatchInputs && { dispatchInputs }),
     ...(workflow.contentHash && { contentHash: workflow.contentHash }),
     ...(job.resources && { resources: job.resources }),
   };
@@ -2268,6 +2288,13 @@ export async function bootstrapOrchestrator(
   );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
+
+  // Fail fast if a non-co-located scaler would receive a loopback storage URL.
+  // A loopback agent-facing endpoint is only reachable by a co-located process;
+  // serving it to a scaled agent produces an opaque ECONNREFUSED. Throwing here
+  // — before any cache client is built — surfaces the fix in the orchestrator
+  // logs instead.
+  assertAgentReachableStorage(config, scalerConfig);
 
   // 10. Initialize cache infrastructure
   const {
@@ -3019,6 +3046,12 @@ export async function bootstrapOrchestrator(
   }
 
   // Build subsystems object for hooks
+  // Provenance trust root: the live issuer is wired by the mode-specific hook
+  // from the Platform `auth.success`; the config/env value seeds the CLI path.
+  const provenanceTrustRoot = createProvenanceTrustRoot({
+    issuer: config.provenanceIssuer ?? null,
+  });
+
   const subsystems: OrchestratorSubsystems = {
     config,
     db,
@@ -3031,6 +3064,7 @@ export async function bootstrapOrchestrator(
     scalerManager,
     scalerConfig,
     cacheStorage,
+    provenanceTrustRoot,
     sourceCache,
     depCache,
     userCache,
@@ -3353,6 +3387,7 @@ export async function bootstrapOrchestrator(
     userCache,
     dispatchCacheRefs,
     cacheStorage,
+    provenanceTrustRoot,
     fsCache,
     pendingBuilds,
     pendingInits,

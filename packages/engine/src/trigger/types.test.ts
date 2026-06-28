@@ -9,8 +9,8 @@ import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/ex
 import type { LockDynamicJobFn, LockStep, LockJob, LockWorkflow } from './types.js';
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 26 (LockJob.includeUninitialized)', () => {
-    expect(SCHEMA_VERSION).toBe(26);
+  it('SCHEMA_VERSION is 29 (parallel step groups)', () => {
+    expect(SCHEMA_VERSION).toBe(29);
   });
 
   it('LockJob accepts includeUninitialized alongside runsOnAll', () => {

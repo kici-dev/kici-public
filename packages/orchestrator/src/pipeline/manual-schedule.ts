@@ -17,8 +17,9 @@ import {
   materializeFanout,
   matrixEnvelopeFields,
   partitionMatchers,
+  resolveScheduleInputs,
 } from '@kici-dev/engine';
-import type { LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 import type { RerunDeps } from './rerun.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
@@ -133,8 +134,14 @@ function resolveRepoUrl(registration: RegisteredWorkflow, deps: ManualScheduleDe
   return providerBundle?.repoUrlBuilder?.buildCloneUrl(registration.repoIdentifier) ?? '';
 }
 
-function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
+export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
   const job = mat.lockJob;
+  // A schedule fire carries no operator input — resolve the trigger's declared
+  // defaults so steps and rules see them as ctx.dispatchInputs.
+  const scheduleTrigger = workflow.triggers.find(
+    (t): t is LockScheduleTrigger => t._type === 'schedule',
+  );
+  const dispatchInputs = resolveScheduleInputs(scheduleTrigger?.inputs);
   return {
     source: workflow.source,
     workflowName: workflow.name,
@@ -142,6 +149,7 @@ function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
     steps: job.steps,
     needs: job.needs,
     rules: job.rules,
+    ...(dispatchInputs && { dispatchInputs }),
     ...(workflow.contentHash && { contentHash: workflow.contentHash }),
     ...(workflow.resolvedHashFiles?.length && {
       resolvedHashFiles: workflow.resolvedHashFiles,

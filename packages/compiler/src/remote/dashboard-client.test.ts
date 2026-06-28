@@ -117,6 +117,8 @@ describe('DashboardClient typed methods', () => {
             workflowName: 'ci',
             status: 'success',
             repoIdentifier: 'o/r',
+            repoProvider: 'github',
+            localWorkingTree: false,
             sha: 'abc',
             ref: 'main',
             triggerEvent: 'push',
@@ -164,18 +166,16 @@ describe('DashboardClient typed methods', () => {
   });
 
   it('listRegistrations hits /registrations and passes filters', async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            registrations: [],
-            registryVersion: 3,
-            registryUpdatedAt: '2026-01-01',
-          }),
-          { status: 200 },
-        ),
-      );
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          registrations: [],
+          registryVersion: 3,
+          registryUpdatedAt: '2026-01-01',
+        }),
+        { status: 200 },
+      ),
+    );
     const client = DashboardClient.fromConfig(baseConfig);
     const out = await client.listRegistrations({ triggerType: 'schedule', repoIdentifier: 'o/r' });
     expect(out.registryVersion).toBe(3);

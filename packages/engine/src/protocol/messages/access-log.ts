@@ -42,6 +42,7 @@ export const AccessLogTargetType = z.enum([
   'event_dlq',
   'org_settings',
   'cluster_meta',
+  'attestation',
 ]);
 export type AccessLogTargetType = z.infer<typeof AccessLogTargetType>;
 
@@ -51,6 +52,7 @@ export type AccessLogTargetType = z.infer<typeof AccessLogTargetType>;
  */
 export const AccessLogAction = z.enum([
   'run.detail.read',
+  'run.structured.read',
   'runs.list.read',
   'runs.filters.read',
   'sources.list.read',

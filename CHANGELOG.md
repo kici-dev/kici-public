@@ -2,6 +2,48 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.24 — 2026-06-28
+
+### Features
+
+- schedule() triggers can declare defaults-only typed inputs exposed as ctx.dispatchInputs
+- kici-admin orchestrator/agent upgrade --pick to interactively switch to an installed version
+- kici-admin agent register --privileged-root mints a confined root agent token
+- Jobs can bind multiple environments via environments: [...]
+- Add ctx.signal (AbortSignal) to step context for cooperative cancellation
+- Registering a workflow rejects mutually-exclusive multi-environment job bindings with a precise message
+- Add parallel() to run independent steps concurrently within a job
+- Rename kici test to kici preview
+- Add provenance-tagged agent run-result schema
+- Add agent-annotated actor + PatKind to the protocol
+- Mint agent PATs with kici pat create --agent for the MCP server
+- Add a Platform-hosted MCP server so a coding agent can drive KiCI under your identity
+- Verify build-provenance attestations at ingest and store the verdict for browsing
+- kici-admin attestations reverify: backfill stored provenance verdicts
+- Execution notifications engine: run-terminal evaluation, coalescing, Slack delivery worker
+- Email notification channel with per-recipient delivery and bounce/complaint suppression
+- Self-service notification subscriptions: manage your own email notifications without admin
+- Capture and notify the person who triggered a run (actor-scope notifications)
+- `kici verify-attestation` now defaults `--trust-root` to the hosted KiCI platform, so verifying a bundle attested on the hosted platform needs no flag
+
+### Fixes
+
+- kici run remote --json now emits clean JSON even when a workflow logs at module top level (workflow output goes to stderr)
+- Orchestrator fails fast when a scaler would receive a loopback storage URL, naming the endpoint env var to set
+- kici types: generated secrets.d.ts augments the SDK module instead of shadowing it
+- kici run remote labels runs with the local working tree's git origin instead of an internal routing key
+- Stop npm install -g of @kici-dev/orchestrator and @kici-dev/compiler from colliding (EEXIST) with the kici-admin and kici wrapper CLIs
+- Environment Secrets tab now resolves scope bindings against the selected orchestrator (per-orchestrator environment pages no longer preview against the wrong cluster's scopes)
+- Dashboard now reports 'orchestrator too old' instead of a misleading invalid-payload error when a feature needs a newer orchestrator
+- Platform now falls back to X-Real-IP (and then null) when the first X-Forwarded-For hop is empty or whitespace, so a malformed forwarding header no longer records an empty-string client IP in legal consent records and webhook audit logs
+- Agent image no longer ships perl (removed to eliminate the perl CVEs); workflow steps that invoke perl are no longer supported
+- Quickstart compose templates now use the postgres alpine image (perl-free, smaller attack surface)
+
+### Documentation
+
+- Document the structured agent run-result API
+- Document driving KiCI from a coding agent via the MCP server
+
 ## v0.1.23 — 2026-06-25
 
 ### Features

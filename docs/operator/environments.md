@@ -183,6 +183,8 @@ SELECT name, branch_restrictions FROM environments WHERE org_id = 'your-org';
 
 **Fix:** Update branch restrictions to include the required branch pattern, or remove restrictions entirely by setting `branch_restrictions = '[]'`.
 
+For a job bound to multiple environments (`environments: ['staging', 'my-testing']`), protection rules combine all-must-pass: the run is rejected if **any** configured bound environment rejects it, and the rejection reason names the offending environment and rule (e.g. `multi-environment gate: 'my-testing' rejected (branch_restricted: branch 'main' not allowed)`). A bound name with no configured environment contributes no rules (it is skipped, not rejected). Check the branch restrictions of every configured environment in the array, not just the first.
+
 ### Job held indefinitely
 
 **Symptom:** Job stays in `pending` held state beyond the expected hold expiry.

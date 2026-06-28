@@ -26,6 +26,37 @@ describe('createStepContext', () => {
     }
   });
 
+  it('exposes an unaborted AbortSignal by default', () => {
+    const ctx = createStepContext(
+      { name: 'test-wf' },
+      { name: 'test-job', runsOn: 'local' },
+      process.cwd(),
+    );
+    expect(ctx.signal).toBeInstanceOf(AbortSignal);
+    expect(ctx.signal.aborted).toBe(false);
+  });
+
+  it('exposes the provided AbortSignal and reflects its aborted state', () => {
+    const controller = new AbortController();
+    const ctx = createStepContext(
+      { name: 'test-wf' },
+      { name: 'test-job', runsOn: 'local' },
+      process.cwd(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      controller.signal,
+    );
+    expect(ctx.signal).toBe(controller.signal);
+    expect(ctx.signal.aborted).toBe(false);
+    controller.abort();
+    expect(ctx.signal.aborted).toBe(true);
+  });
+
   it('propagates rawPayload + provider when supplied', () => {
     const rawPayload = { client_payload: { foo: 'bar' }, action: 'cdn-bundle' };
     const ctx = createStepContext(

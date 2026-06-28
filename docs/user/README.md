@@ -21,7 +21,7 @@ Why the lock file must stay in sync with workflow source, how to commit both tog
 
 ### [CLI reference](cli-reference.md)
 
-All CLI commands provided by `@kici-dev/compiler`: `kici compile` (with watch mode and check mode), `kici run` (local and remote execution), `kici test` (event simulation with dry-run, filtering, debug output, and custom payloads), `kici login`/`logout`/`org` (authentication and org management), `kici diagnostics` (infrastructure tree) and `kici runs` (`list`/`show`/`logs`/`rerun`/`cancel` — run management), `kici secrets` (secret listing), `kici types` (type generation), `kici fixture` (generate test payloads), `kici init` (interactive project scaffolding), `kici hook` (pre-commit hook installation), `kici endpoints` (webhook entrypoints), and `kici workflows` (workflow listing). Includes environment variables and exit codes.
+All CLI commands provided by `@kici-dev/compiler`: `kici compile` (with watch mode and check mode), `kici run` (local and remote execution), `kici preview` (event simulation with dry-run, filtering, debug output, and custom payloads), `kici login`/`logout`/`org` (authentication and org management), `kici diagnostics` (infrastructure tree) and `kici runs` (`list`/`show`/`logs`/`rerun`/`cancel` — run management), `kici secrets` (secret listing), `kici types` (type generation), `kici fixture` (generate test payloads), `kici init` (interactive project scaffolding), `kici hook` (pre-commit hook installation), `kici endpoints` (webhook entrypoints), and `kici workflows` (workflow listing). Includes environment variables and exit codes.
 
 ### [Workflow patterns](workflow-patterns.md)
 

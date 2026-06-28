@@ -33,4 +33,4 @@ If you're not sure, pick Docker / Podman.
 
 ## Looking for the laptop-only path?
 
-Both quickstarts deploy a real orchestrator + agent. If you only want to write a workflow and dry-run it on your laptop with no infrastructure, [Getting started](./getting-started.md) covers `kici test` and `kici run local` instead.
+Both quickstarts deploy a real orchestrator + agent. If you only want to write a workflow and dry-run it on your laptop with no infrastructure, [Getting started](./getting-started.md) covers `kici preview` and `kici run local` instead.

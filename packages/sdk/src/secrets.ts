@@ -53,7 +53,7 @@ export interface MountedFile {
  *
  * The SDK owns the public surface (`mountFile` / `exposeFile`) but defers
  * disk and `process.env` operations to the agent so the SDK stays free of
- * any `node:fs` / `node:os` imports. Local-test mode (`kici test`) plugs
+ * any `node:fs` / `node:os` imports. Local preview/run mode (`kici preview` / `kici run local`) plugs
  * in the same adapter shape against `os.tmpdir()`.
  */
 export interface StepSecretsFileHost {

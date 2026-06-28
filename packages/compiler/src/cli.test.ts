@@ -40,11 +40,10 @@ const SPAWN_TIMEOUT_MS = 30_000;
 
 describe('CLI argument errors', () => {
   it(
-    'kici test without fixture lists fixtures or shows empty message',
+    'kici preview without event shows usage help',
     () => {
-      const result = runCli('test');
-      // In the fixture-based interface, kici test (no args) lists available fixtures.
-      // It exits 0 even when no fixtures are found (informational output).
+      const result = runCli('preview');
+      // kici preview (no event) prints usage help and exits 0.
       // It should NOT show argument errors about events.
       expect(result.stderr).not.toContain('missing required argument');
       expect(result.stderr).not.toContain('Allowed choices');
@@ -65,11 +64,11 @@ describe('CLI argument errors', () => {
   );
 
   it(
-    'kici test with fixture name does not show argument error',
+    'kici preview with fixture-like name shows migration message, not an argument error',
     () => {
-      const result = runCli('test some-fixture');
-      // In the fixture-based interface, any string is a valid fixture name.
-      // It may fail (no matching fixture) but should NOT show argument errors.
+      const result = runCli('preview some-fixture');
+      // A non-event arg prints the "moved to kici run remote" migration message.
+      // It exits non-zero but must NOT show Commander argument errors.
       expect(result.stderr).not.toContain('Allowed choices');
       expect(result.stderr).not.toContain('missing required argument');
     },
@@ -89,10 +88,10 @@ describe('CLI argument errors', () => {
   );
 
   it(
-    'kici test with --dry-run and valid event does not show argument error',
+    'kici preview with a valid event does not show an argument error',
     () => {
-      const result = runCli('test --dry-run pr:open');
-      // Events are now only used with --dry-run. Should not show argument errors.
+      const result = runCli('preview pr:open');
+      // A known event type runs the dry-run preview path. No argument errors.
       expect(result.stderr).not.toContain('missing required argument');
       expect(result.stderr).not.toContain('Allowed choices');
     },

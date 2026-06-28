@@ -111,11 +111,34 @@ statement's build context must match the token's identity claims (a mismatch is
 a hard failure).
 
 ```bash
-kici verify-attestation [artifact] --bundle <path-or-url> --trust-root <url-or-file>
+kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-file>]
 ```
 
-You supply the trusted issuer out-of-band via `--trust-root` — the verifier
-never trusts the issuer named inside the token. There are two forms:
+### Which trust root do I use?
+
+The trust root is the **KiCI platform's provenance issuer** — the same hosted
+KiCI platform you `kici login` against. KiCI attestations are issued by, and
+verified against, that one issuer; there are no competing "roots" to choose
+between. So the answer to "shouldn't I just use KiCI as the trust root?" is yes
+— and that's the **default**: omit `--trust-root` and the verifier checks the
+bundle against the hosted KiCI platform automatically. You only pass
+`--trust-root` to verify against a different environment or, more commonly, an
+offline `{ issuer, jwks }` file for air-gapped checks.
+
+### Why you supply it out-of-band
+
+Given there's a single issuer, why pass it at all instead of letting the
+verifier read it from the token? Because the issuer named **inside** a token
+cannot be trusted: a forged bundle could carry a token that names
+`iss: https://attacker.example` _and_ bundle a key set that "verifies" it,
+making the whole signature chain circular and self-attesting. The verifier
+therefore pins to an issuer you supply out-of-band and checks the token against
+_that_ — the bundle is verified against a key set you trust, not one it shipped
+with. Naming the trust root is a security requirement, not a multiple-choice
+question.
+
+To override the default, supply the trusted issuer via `--trust-root`, in one of
+two forms:
 
 - **Online — an HTTPS issuer URL.** The verifier fetches
   `<url>/.well-known/openid-configuration`, reads its `issuer` and `jwks_uri`,
@@ -143,7 +166,10 @@ when it does not (or on an error such as a missing flag or unreachable trust
 root).
 
 ```bash
-# Verify a bundle against a deployed issuer, digest-checking the artifact:
+# Default: verify against the hosted KiCI platform (no --trust-root needed):
+kici verify-attestation ./dist/app.tgz --bundle ./app.tgz.kici.json
+
+# Override the trust root to verify against a specific issuer:
 kici verify-attestation ./dist/app.tgz \
   --bundle ./app.tgz.kici.json \
   --trust-root https://platform.example/issuer
@@ -157,6 +183,25 @@ kici verify-attestation ./dist/app.tgz \
 The full flag reference is in the [CLI reference](./cli-reference.md#kici-verify-attestation).
 
 ## Viewing attestations in the dashboard
+
+
+## Browsing attestations across runs
+
+The **Attestations** page (in the org sidebar) lists every build-provenance
+attestation your organization has produced — not just one run's. It is the
+supply-chain audit surface: look up "who built `sha256:…`?" by digest, or browse
+and filter every attestation across all runs.
+
+
+The status badge here is the **server-side verdict**, computed once when the
+attestation was recorded (verify-at-ingest) — so the list stays fast at any
+size. `verified` means the signature, build identity, and build context all
+checked out against the provenance issuer; `failed` means verification ran and
+the bundle did not pass; `unverifiable` means no verdict could be computed (no
+provenance issuer configured, or its keys could not be read — not a forgery
+signal); `pending` means the verdict has not been computed yet.
+
+Opening a row leads to the **attestation detail page**:
 
 
 ## See also

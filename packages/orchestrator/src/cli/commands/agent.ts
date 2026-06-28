@@ -8,6 +8,7 @@
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import { PRIVILEGED_ROOT_LABEL } from '@kici-dev/engine';
 
 /**
  * Format agent tokens as a table.
@@ -37,21 +38,48 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
     .command('register')
     .description('Create a static agent token')
     .option('--labels <labels>', 'Comma-separated agent labels (e.g. linux,x64)')
-    .action(async (opts: { labels?: string }) => {
-      try {
-        const labels = opts.labels ? opts.labels.split(',').map((l) => l.trim()) : undefined;
-        const result = await getClient().createAgentToken({ labels });
-        console.log(`Agent token created successfully.`);
-        console.log(`Token ID: ${result.id}`);
-        console.log(`Token:    ${result.token}`);
-        console.log('');
-        console.log('WARNING: Save this token now -- it cannot be recovered after this point.');
-        console.log('Set KICI_AGENT_TOKEN on the agent to use this token.');
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
+    .option(
+      '--mandatory-label <label>',
+      'Taint label the agent only accepts jobs demanding (repeatable). Also authorized as an advertised label.',
+      (val: string, acc: string[]) => [...acc, val.trim()],
+      [] as string[],
+    )
+    .option(
+      '--privileged-root',
+      `Shorthand for --mandatory-label ${PRIVILEGED_ROOT_LABEL}: mint a confined root agent token (the agent must run as uid 0).`,
+    )
+    .action(
+      async (opts: { labels?: string; mandatoryLabel: string[]; privilegedRoot?: boolean }) => {
+        try {
+          const mandatorySet = new Set<string>(opts.mandatoryLabel);
+          if (opts.privilegedRoot) mandatorySet.add(PRIVILEGED_ROOT_LABEL);
+          const mandatoryLabels = mandatorySet.size > 0 ? [...mandatorySet] : undefined;
+
+          const baseLabels = opts.labels ? opts.labels.split(',').map((l) => l.trim()) : [];
+          // A mandatory (taint) label must also be advertisable (the selector side),
+          // so union it into the authorized labels — a taint the agent can't even
+          // advertise would be incoherent.
+          const labelSet = new Set<string>([...baseLabels, ...(mandatoryLabels ?? [])]);
+          const labels = labelSet.size > 0 ? [...labelSet] : undefined;
+
+          const result = await getClient().createAgentToken({ labels, mandatoryLabels });
+          console.log(`Agent token created successfully.`);
+          console.log(`Token ID: ${result.id}`);
+          console.log(`Token:    ${result.token}`);
+          if (mandatoryLabels) {
+            console.log(
+              `Taint:    ${mandatoryLabels.join(', ')} (agent only accepts jobs demanding these)`,
+            );
+          }
+          console.log('');
+          console.log('WARNING: Save this token now -- it cannot be recovered after this point.');
+          console.log('Set KICI_AGENT_TOKEN on the agent to use this token.');
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      },
+    );
 
   agent
     .command('list')

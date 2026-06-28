@@ -430,7 +430,10 @@ export class AdminApiClient {
 
   // --- Agent token management ---
 
-  async createAgentToken(opts: { labels?: string[] }): Promise<{ id: string; token: string }> {
+  async createAgentToken(opts: {
+    labels?: string[];
+    mandatoryLabels?: string[];
+  }): Promise<{ id: string; token: string }> {
     return this.request<{ id: string; token: string }>('POST', '/api/v1/agent-tokens', opts);
   }
 
@@ -696,6 +699,16 @@ export class AdminApiClient {
   ): Promise<{ jobs: Array<Record<string, unknown>> }> {
     const qs = opts?.includeSteps ? '?includeSteps=true' : '';
     return this.request('GET', `/api/v1/admin/runs/${encodeURIComponent(runId)}/jobs${qs}`);
+  }
+
+  /**
+   * Fetch the machine-first, provenance-tagged structured run result: typed
+   * job DAG, per-step exit codes / durations / statuses, derived failure
+   * category. Untrusted fields are envelope-tagged; secret values are never
+   * returned (only secret-output key names).
+   */
+  async getRunStructured(runId: string): Promise<Record<string, unknown>> {
+    return this.request('GET', `/api/v1/admin/runs/${encodeURIComponent(runId)}/structured`);
   }
 
   /**

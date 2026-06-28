@@ -149,6 +149,13 @@ export interface StepContext<TInputs = Record<string, unknown>> {
   setEnv(key: string, value: string): void;
   /** Prepend a directory to PATH, visible to this step and all subsequent steps. */
   addPath(dir: string): void;
+  /**
+   * Aborted when this step should stop early — the job is being cancelled, the
+   * job-level timeout fired, or (in a `parallel()` group) a sibling failed under
+   * fail-fast. Pass it to `fetch`, `ctx.$`, timers, or any cancellable async work
+   * to cooperatively unwind. Unaborted for a normally-running step.
+   */
+  signal: AbortSignal;
   /** Typed inputs from dependencies */
   inputs: TInputs;
   /**
@@ -188,7 +195,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
   /**
    * Raw webhook payload from the git provider.
    * Contains the full, unmodified payload as received from the webhook.
-   * In local test mode (kici test), contains the simulated payload.
+   * In local preview/run mode (`kici preview` / `kici run local`), contains the simulated payload.
    * Use this for provider-specific data not covered by normalized fields.
    */
   rawPayload?: Record<string, unknown>;
@@ -199,7 +206,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   provider?: string;
   /**
-   * Whether this execution was triggered by `kici test` (remote test run).
+   * Whether this execution was triggered by `kici run remote` (developer-initiated remote run).
    * Use to conditionally skip destructive operations in test mode.
    * Defaults to false for backward compatibility.
    */

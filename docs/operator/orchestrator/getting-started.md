@@ -377,6 +377,15 @@ your-domain.example {
 
 The orchestrator binds a single HTTP listener at `KICI_PORT`. Every registered webhook source (GitHub Apps and generic) is served from that one listener, distinguished by URL path (`/webhook/<orgId>/github`, `/webhook/<orgId>/generic/<sourceId>`) rather than by port number. There is no per-source port option in `kici-admin source add` and no `port` column on the source row — if you need different public URLs / hostnames / TLS certs per source, terminate that mapping at your reverse proxy and have it forward to the orchestrator's single port. See [Multi-Provider Setup](configuration.md#multi-provider-setup) for the full discussion.
 
+## Feature availability and keeping the orchestrator current
+
+Newer dashboard features depend on request types only newer orchestrator builds understand. The orchestrator advertises the set of dashboard request types it supports in its connection handshake, and that manifest drives the dashboard and the hosted relay:
+
+- The dashboard greys out an orchestrator-backed action — with an "orchestrator upgrade required" banner naming the connected version — when the connected orchestrator does not advertise the request types that action needs.
+- If such an action is attempted anyway, the response is a clear "this feature requires a newer orchestrator (connected vX)" error, not a misleading "invalid payload".
+
+The fix in both cases is to **upgrade the orchestrator** to a build that supports the feature. Read-only views are never gated, and tenant-plane actions handled entirely by the hosted relay are unaffected by the orchestrator version. After an upgrade, the greyed actions re-enable automatically on the next connection.
+
 ## See also
 
 - [Configuration reference](configuration.md) -- full list of environment variables

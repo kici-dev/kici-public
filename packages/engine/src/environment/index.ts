@@ -9,6 +9,8 @@ export type {
   TrustTier,
 } from './types.js';
 
+export { TrustTierSchema } from './types.js';
+
 export {
   resolveSecretsForEnvironment,
   matchScopePattern,
@@ -16,3 +18,5 @@ export {
 } from './scope-resolver.js';
 
 export type { HostFacts } from './host-match.js';
+
+export { mergeOrderedMaps, EnvGateRejectReason } from './multi-env.js';

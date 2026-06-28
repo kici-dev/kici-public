@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DASHBOARD_REQUEST_TYPES,
+  DASHBOARD_REQUEST_TYPE_SET,
+  DashboardResponseErrorCode,
   dashboardRunDetailRequestSchema,
   dashboardRunDetailResponseSchema,
   dashboardRunDetailApiResponseSchema,
@@ -20,10 +23,85 @@ import {
   dashboardFleetWorkflowsForHostResponseSchema,
   fleetHostDeclareRequestSchema,
   fleetHostDeclareResponseSchema,
+  dashboardRunStructuredRequestSchema,
+  dashboardRunStructuredResponseSchema,
 } from './dashboard.js';
 import { InitFailureCategory } from './execution-status.js';
 
 const testActor = { type: 'user' as const, sub: 'zsub-test' };
+
+const minimalAgentRunResult = {
+  runId: 'run-1',
+  workflowName: { untrusted: true, value: 'ci' },
+  status: 'success',
+  provider: 'github',
+  repoIdentifier: { untrusted: true, value: 'octo/repo' },
+  ref: { untrusted: true, value: 'refs/heads/main' },
+  sha: 'abc123',
+  baseSha: null,
+  startedAt: null,
+  completedAt: null,
+  durationMs: null,
+  trustTier: null,
+  contributorUsername: null,
+  failureCategory: null,
+  failureReason: null,
+  triggeredBy: null,
+  jobs: [],
+};
+
+describe('dashboard.run.structured messages', () => {
+  it('is registered in the platform→orch request union', () => {
+    expect(DASHBOARD_REQUEST_TYPES).toContain('dashboard.run.structured');
+    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.run.structured')).toBe(true);
+  });
+
+  it('parses a structured request', () => {
+    const ok = dashboardRunStructuredRequestSchema.safeParse({
+      type: 'dashboard.run.structured',
+      requestId: 'r1',
+      actor: testActor,
+      runId: 'run-1',
+    });
+    expect(ok.success).toBe(true);
+  });
+
+  it('parses a structured response carrying an AgentRunResult', () => {
+    const ok = dashboardRunStructuredResponseSchema.safeParse({
+      type: 'dashboard.run.structured.response',
+      requestId: 'r1',
+      result: minimalAgentRunResult,
+    });
+    expect(ok.success).toBe(true);
+  });
+
+  it('accepts a null result (run not found)', () => {
+    const ok = dashboardRunStructuredResponseSchema.safeParse({
+      type: 'dashboard.run.structured.response',
+      requestId: 'r1',
+      result: null,
+    });
+    expect(ok.success).toBe(true);
+  });
+
+  it('is routable through both wire unions', () => {
+    expect(
+      dashboardPlatformToOrchSchema.safeParse({
+        type: 'dashboard.run.structured',
+        requestId: 'r1',
+        actor: testActor,
+        runId: 'run-1',
+      }).success,
+    ).toBe(true);
+    expect(
+      dashboardOrchToPlatformSchema.safeParse({
+        type: 'dashboard.run.structured.response',
+        requestId: 'r1',
+        result: null,
+      }).success,
+    ).toBe(true);
+  });
+});
 
 describe('dashboard.fleet.workflows-for-host messages', () => {
   it('parses a workflows-for-host request and is in the platform→orch union', () => {
@@ -938,6 +1016,8 @@ describe('REST response schemas (CLI reuse)', () => {
           cancelledByUser: null,
           hadCompileJob: false,
           compileJobId: null,
+          repoProvider: 'github',
+          localWorkingTree: false,
           source: null,
         },
       ],
@@ -1068,5 +1148,20 @@ describe('fleetHostDeclareResponseSchema created flag', () => {
       created: false,
     });
     expect(parsed.created).toBe(false);
+  });
+});
+
+describe('dashboard request-type registry', () => {
+  it('derives every request type from the union and includes a known type', () => {
+    expect(DASHBOARD_REQUEST_TYPES.length).toBeGreaterThan(20);
+    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.environments.bindings.set')).toBe(true);
+    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.totally.made.up')).toBe(false);
+  });
+
+  it('exposes the response error-code enum', () => {
+    expect(DashboardResponseErrorCode.enum.unsupported_request_type).toBe(
+      'unsupported_request_type',
+    );
+    expect(DashboardResponseErrorCode.options).toContain('invalid_payload');
   });
 });

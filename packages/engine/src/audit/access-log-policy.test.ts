@@ -101,6 +101,33 @@ describe('shouldRecordAccess — overrides', () => {
       shouldRecordAccess('diagnostics.read', 'allowed', operatorActor, 'req-1', blocking),
     ).toBe(true);
   });
+
+  it('records agent-attributed activity in full for sampled actions', () => {
+    // run.structured.read is sampled at 5% — the agent override forces full
+    // fidelity so the agent-provenance trail is complete.
+    const agentActor = {
+      type: 'user' as const,
+      sub: 'u1',
+      agent: { patId: 'p1', label: 'claude-code' },
+    };
+    for (let i = 0; i < 100; i++) {
+      expect(
+        shouldRecordAccess('run.structured.read', 'allowed', agentActor, `req-${i}`, limiter),
+      ).toBe(true);
+    }
+  });
+
+  it('records agent-attributed activity even for rate-limited actions', () => {
+    const blocking = new NeverAllowLimiter();
+    const agentActor = {
+      type: 'user' as const,
+      sub: 'u1',
+      agent: { patId: 'p1', label: 'claude-code' },
+    };
+    expect(shouldRecordAccess('diagnostics.read', 'allowed', agentActor, 'req-1', blocking)).toBe(
+      true,
+    );
+  });
 });
 
 describe('shouldRecordAccess — always actions', () => {

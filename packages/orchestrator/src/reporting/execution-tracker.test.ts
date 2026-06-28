@@ -401,6 +401,47 @@ describe('ExecutionTracker', () => {
       expect(runInsert!.values).not.toHaveProperty('check_mode');
     });
 
+    it('onExecutionStarted persists the trigger actor into the run insert + context', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db as any, onExecutionStatusChange });
+      await t.onExecutionStarted(
+        'run-actor',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+        undefined, // routingKey
+        undefined, // dispatchedContexts
+        undefined, // triggerEvent
+        undefined, // commitMessage
+        undefined, // parentRunId
+        undefined, // triggeredBy
+        undefined, // originalRunId
+        undefined, // concurrency
+        undefined, // workflowTimeoutMs
+        undefined, // checkMode
+        undefined, // localWorkingTree
+        'octocat', // triggerActorUsername
+        '583231', // triggerActorUserId
+      );
+
+      const runInsert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-actor',
+      );
+      expect(runInsert!.values.trigger_actor_provider).toBe('github');
+      expect(runInsert!.values.trigger_actor_username).toBe('octocat');
+      expect(runInsert!.values.trigger_actor_user_id).toBe('583231');
+
+      const ctx = t.getExecutionContext('run-actor');
+      expect(ctx?.triggerActorUsername).toBe('octocat');
+      expect(ctx?.triggerActorUserId).toBe('583231');
+    });
+
     it('inserts execution_jobs rows in DB', async () => {
       await tracker.onExecutionStarted(
         'run-1',
@@ -649,6 +690,7 @@ describe('ExecutionTracker', () => {
         undefined, // runsOnLabels
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
+        undefined, // environments (only set for multi-env jobs)
       );
 
       const secondRunning = firstRunning + 4000;
@@ -673,6 +715,7 @@ describe('ExecutionTracker', () => {
         undefined, // runsOnLabels
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
+        undefined, // environments (only set for multi-env jobs)
       );
     });
 
@@ -2895,10 +2938,11 @@ describe('ExecutionTracker', () => {
         }),
       );
 
-      // The onJobStatusChange callback receives initFailure as the final positional arg.
+      // The onJobStatusChange callback receives initFailure as the second-to-last
+      // positional arg (environments is the final one).
       const lastCall = onJobStatusChange.mock.calls.at(-1)!;
       expect(lastCall[3]).toBe(ExecutionJobStatus.enum.failed);
-      expect(lastCall.at(-1)).toMatchObject({
+      expect(lastCall.at(-2)).toMatchObject({
         category: 'environment_rules',
         scope: 'job',
         jobName: 'deploy',

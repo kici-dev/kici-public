@@ -124,6 +124,10 @@ export class AccessLogWriter {
       }
       const { actorType, actorId, actorMeta } = flattenActor(entry.actor);
       const mergedMeta = entry.meta ? { ...(actorMeta ?? {}), ...entry.meta } : actorMeta;
+      // An agent-kind PAT carries its label on the user actor; promote it to a
+      // queryable column so the access log can be filtered by agent.
+      const agentLabel =
+        entry.actor.type === 'user' ? (entry.actor.agent?.label ?? null) : null;
       await this.db
         .insertInto('access_log')
         .values({
@@ -139,6 +143,7 @@ export class AccessLogWriter {
           source: entry.source,
           outcome: entry.outcome,
           error_message: entry.errorMessage ?? null,
+          agent_label: agentLabel,
         })
         .execute();
     } catch (err) {

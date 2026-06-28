@@ -146,6 +146,7 @@ describe('kici-admin runs CLI commands', () => {
   let mockGetRunJobs: ReturnType<typeof vi.fn>;
   let mockGetRunEphemeralKey: ReturnType<typeof vi.fn>;
   let mockGetRunSecretOutputs: ReturnType<typeof vi.fn>;
+  let mockGetRunStructured: ReturnType<typeof vi.fn>;
   let client: Partial<AdminApiClient>;
 
   beforeEach(() => {
@@ -181,6 +182,55 @@ describe('kici-admin runs CLI commands', () => {
         },
       ],
     });
+    mockGetRunStructured = vi.fn().mockResolvedValue({
+      runId: 'run-abc-123',
+      workflowName: { untrusted: true, value: 'ci' },
+      status: 'failed',
+      provider: 'github',
+      repoIdentifier: { untrusted: true, value: 'owner/repo' },
+      ref: { untrusted: true, value: 'refs/heads/main' },
+      sha: 'abcdef1234',
+      baseSha: null,
+      startedAt: null,
+      completedAt: null,
+      durationMs: 1000,
+      trustTier: 'trusted',
+      contributorUsername: null,
+      failureCategory: 'step_failed',
+      failureReason: { untrusted: true, value: 'boom' },
+      triggeredBy: null,
+      jobs: [
+        {
+          jobId: 'j1',
+          jobName: { untrusted: true, value: 'build' },
+          status: 'failed',
+          startedAt: null,
+          completedAt: null,
+          durationMs: null,
+          agentId: null,
+          errorMessage: null,
+          initFailure: null,
+          needs: [],
+          outputs: null,
+          secretOutputKeys: [],
+          steps: [
+            {
+              stepIndex: 0,
+              stepName: { untrusted: true, value: 'compile' },
+              status: 'failed',
+              exitCode: 1,
+              durationMs: null,
+              startedAt: null,
+              completedAt: null,
+              errorMessage: null,
+              stepType: 'step',
+              checkOutcome: null,
+              secretsAccessed: [],
+            },
+          ],
+        },
+      ],
+    });
     client = {
       listRuns: mockListRuns as any,
       countRuns: mockCountRuns as any,
@@ -188,6 +238,7 @@ describe('kici-admin runs CLI commands', () => {
       getRunJobs: mockGetRunJobs as any,
       getRunEphemeralKey: mockGetRunEphemeralKey as any,
       getRunSecretOutputs: mockGetRunSecretOutputs as any,
+      getRunStructured: mockGetRunStructured as any,
     };
   });
 
@@ -479,6 +530,27 @@ describe('kici-admin runs CLI commands', () => {
       );
       expect(stdout).toContain('"outputs"');
       expect(stdout).toContain('"API_KEY"');
+    });
+  });
+
+  describe('runs structured', () => {
+    it('R-45: --json prints the raw AgentRunResult (untrusted envelopes preserved)', async () => {
+      const { stdout } = await runCommand(['runs', 'structured', 'run-abc-123', '--json'], client);
+      expect(mockGetRunStructured).toHaveBeenCalledWith('run-abc-123');
+      const parsed = JSON.parse(stdout);
+      expect(parsed.runId).toBe('run-abc-123');
+      expect(parsed.workflowName).toEqual({ untrusted: true, value: 'ci' });
+      expect(parsed.failureCategory).toBe('step_failed');
+    });
+
+    it('R-46: human view unwraps untrusted values and shows failure category', async () => {
+      const { stdout } = await runCommand(['runs', 'structured', 'run-abc-123'], client);
+      expect(stdout).toContain('Workflow:');
+      expect(stdout).toContain('ci');
+      expect(stdout).toContain('step_failed');
+      expect(stdout).toContain('compile');
+      // The unwrapped human view must not leak the envelope wrapper.
+      expect(stdout).not.toContain('untrusted');
     });
   });
 });

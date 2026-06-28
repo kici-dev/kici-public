@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import { PgSecretStore, SecretScopeNotFoundError } from './pg-secret-store.js';
-import { encrypt, decrypt, deriveKey, type EncryptedValue } from './crypto.js';
+import { encrypt, decrypt, deriveKey, type EncryptedValue } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 // ── Test fixtures ──────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { testCommand, testDryRun } from './test.js';
+import { previewCommand, previewEvent } from './preview.js';
 
 // Mock dependencies
 vi.mock('../remote/config.js', () => ({
@@ -56,7 +56,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
-describe('kici test command (dry-run only)', () => {
+describe('kici preview command (dry-run only)', () => {
   let loggerInfo: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
@@ -67,7 +67,7 @@ describe('kici test command (dry-run only)', () => {
 
   describe('no args (usage help)', () => {
     it('shows usage instructions when no event provided', async () => {
-      const result = await testCommand(undefined, { kiciDir: '.kici' });
+      const result = await previewCommand(undefined, { kiciDir: '.kici' });
 
       expect(result).toBe(true);
       // Should show usage text
@@ -77,34 +77,34 @@ describe('kici test command (dry-run only)', () => {
 
   describe('event arg (dry-run)', () => {
     it('runs dry-run for push event', async () => {
-      const result = await testCommand('push', { kiciDir: '.kici' });
+      const result = await previewCommand('push', { kiciDir: '.kici' });
 
       // Dry-run path should not throw
-      // The underlying testDryRun uses displayDryRun (mocked)
+      // The underlying previewEvent uses displayDryRun (mocked)
       expect(typeof result).toBe('boolean');
     });
 
     it('runs dry-run for pr:open event', async () => {
-      await testCommand('pr:open', { kiciDir: '.kici' });
+      await previewCommand('pr:open', { kiciDir: '.kici' });
       // Should not throw
     });
 
     it('runs dry-run for schedule event', async () => {
-      await testCommand('schedule', { kiciDir: '.kici' });
+      await previewCommand('schedule', { kiciDir: '.kici' });
     });
 
     it('runs dry-run for lifecycle:workflow_complete event', async () => {
-      await testCommand('lifecycle:workflow_complete', { kiciDir: '.kici' });
+      await previewCommand('lifecycle:workflow_complete', { kiciDir: '.kici' });
     });
 
     it('runs dry-run for webhook:stripe event', async () => {
-      await testCommand('webhook:stripe', { kiciDir: '.kici' });
+      await previewCommand('webhook:stripe', { kiciDir: '.kici' });
     });
   });
 
   describe('fixture-like arg (migration message)', () => {
     it('prints migration message when fixture name is given', async () => {
-      const result = await testCommand('push-main', { kiciDir: '.kici' });
+      const result = await previewCommand('push-main', { kiciDir: '.kici' });
 
       expect(result).toBe(false);
       // Should print migration message mentioning kici run remote
@@ -112,7 +112,7 @@ describe('kici test command (dry-run only)', () => {
     });
 
     it('prints migration message for multi-word fixture names', async () => {
-      const result = await testCommand('my-custom-fixture', { kiciDir: '.kici' });
+      const result = await previewCommand('my-custom-fixture', { kiciDir: '.kici' });
 
       expect(result).toBe(false);
       expect(loggerInfo).toHaveBeenCalledWith(
@@ -123,7 +123,7 @@ describe('kici test command (dry-run only)', () => {
     it('does not trigger migration for colon-separated patterns', async () => {
       // Colon patterns are treated as potential event types, not fixture names
       // Even unknown ones should try the dry-run path (will error naturally)
-      const result = await testCommand('unknown:event', { kiciDir: '.kici' });
+      const result = await previewCommand('unknown:event', { kiciDir: '.kici' });
       // This should try to parse as an event -- whether it succeeds depends on parseEventArg
       expect(typeof result).toBe('boolean');
     });
@@ -131,31 +131,31 @@ describe('kici test command (dry-run only)', () => {
 
   describe('--dry-run backward compatibility', () => {
     it('still accepts --dry-run flag', async () => {
-      const result = await testCommand(undefined, { dryRun: 'push', kiciDir: '.kici' });
+      const result = await previewCommand(undefined, { dryRun: 'push', kiciDir: '.kici' });
 
-      // Should delegate to testDryRun
+      // Should delegate to previewEvent
       expect(typeof result).toBe('boolean');
     });
   });
 
-  describe('testDryRun', () => {
+  describe('previewEvent', () => {
     it('accepts push event type', async () => {
-      const result = await testDryRun('push', { kiciDir: '.kici' });
+      const result = await previewEvent('push', { kiciDir: '.kici' });
       expect(typeof result).toBe('boolean');
     });
 
     it('accepts lifecycle:workflow_complete event type', async () => {
-      const result = await testDryRun('lifecycle:workflow_complete', { kiciDir: '.kici' });
+      const result = await previewEvent('lifecycle:workflow_complete', { kiciDir: '.kici' });
       expect(typeof result).toBe('boolean');
     });
 
     it('accepts schedule event type', async () => {
-      const result = await testDryRun('schedule', { kiciDir: '.kici' });
+      const result = await previewEvent('schedule', { kiciDir: '.kici' });
       expect(typeof result).toBe('boolean');
     });
 
     it('accepts webhook:stripe event type', async () => {
-      const result = await testDryRun('webhook:stripe', { kiciDir: '.kici' });
+      const result = await previewEvent('webhook:stripe', { kiciDir: '.kici' });
       expect(typeof result).toBe('boolean');
     });
   });

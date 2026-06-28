@@ -14,7 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminRunRoutes, type AdminRunRoutesDeps } from './admin-runs.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 import type { Role } from '../secrets/rbac.js';
-import { encrypt, deriveKey } from '../secrets/crypto.js';
+import { encrypt, deriveKey } from '@kici-dev/shared';
 
 /**
  * Minimal mock for a Kysely query chain. Each call in the builder chain
@@ -56,12 +56,19 @@ interface Deps extends AdminRunRoutesDeps {
 function createMockDeps(overrides: Partial<AdminRunRoutesDeps> = {}): Deps {
   const mockDb = createMockDb();
   const auditLoggerLog = vi.fn().mockResolvedValue(undefined);
+  const logStorage = {
+    append: vi.fn(),
+    read: vi.fn().mockResolvedValue({ data: 'log-a\nlog-b\n', cursor: 0, complete: true }),
+    exists: vi.fn(),
+    list: vi.fn(),
+  } as any;
   return {
     db: mockDb as any,
     tokenManager: { validate: vi.fn() } as any,
     rbac: new RbacEnforcer(),
     auditLogger: { log: auditLoggerLog } as any,
     masterSecretKey: TEST_SECRET_KEY,
+    logStorage,
     ...overrides,
     mockDb,
     auditLoggerLog,
@@ -552,6 +559,105 @@ describe('admin run routes', () => {
       const entry = deps.auditLoggerLog.mock.calls[0][0];
       expect(entry.metadata.failedCount).toBe(1);
       expect(entry.metadata.revealedCount).toBe(0);
+    });
+  });
+
+  // ── GET /runs/:runId/structured (agent run result) ──────────────
+
+  describe('GET /api/v1/admin/runs/:runId/structured', () => {
+    const headerRow = {
+      run_id: 'run-1',
+      workflow_name: 'ci',
+      status: 'failed',
+      provider: 'github',
+      repo_identifier: 'owner/repo',
+      ref: 'refs/heads/main',
+      sha: 'abc123',
+      started_at: new Date(),
+      completed_at: null,
+      duration_ms: null,
+      trust_tier: 'trusted',
+      contributor_username: 'alice',
+      triggered_by: null,
+      failure_reason: 'boom',
+      init_failure: null,
+      provider_context: '{}',
+      routing_key: null,
+    };
+
+    it('returns a provenance-tagged result with untrusted-wrapped names', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(headerRow);
+      const res = await request(app, '/run-1/structured', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.runId).toBe('run-1');
+      expect(body.workflowName).toEqual({ untrusted: true, value: 'ci' });
+      expect(body.sha).toBe('abc123');
+      expect(body.jobs).toEqual([]);
+    });
+
+    it('404s for an unknown run', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/nope/structured', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('403s for a routing-key-scoped token reading a foreign run', async () => {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: 'scope-a',
+        label: 'test',
+      });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        ...headerRow,
+        routing_key: 'scope-b',
+      });
+      const res = await request(app, '/run-1/structured', { token: validToken });
+      expect(res.status).toBe(403);
+    });
+  });
+
+  // ── GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs ──────────
+
+  describe('GET /api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs', () => {
+    it('returns untrusted-wrapped log lines', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' }); // step lookup
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.lines.every((l: any) => l.untrusted === true)).toBe(true);
+      expect(body.lines).toEqual([
+        { untrusted: true, value: 'log-a' },
+        { untrusted: true, value: 'log-b' },
+      ]);
+      expect(body.totalLines).toBe(2);
+    });
+
+    it('400s on a non-numeric stepIndex', async () => {
+      const res = await request(app, '/run-1/jobs/job-a/steps/abc/logs', { token: validToken });
+      expect(res.status).toBe(400);
+    });
+
+    it('404s for an unknown run', async () => {
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
+      const res = await request(app, '/nope/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(404);
+    });
+
+    it('503s when log storage is not configured', async () => {
+      const depsNoLog = createMockDeps({ logStorage: undefined });
+      (depsNoLog.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const appNoLog = createAdminRunRoutes(depsNoLog);
+      const res = await request(appNoLog, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      expect(res.status).toBe(503);
     });
   });
 });

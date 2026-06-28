@@ -8,6 +8,7 @@ import {
   validateResourceRequest,
   resolveWhenToRunOn,
   extractInputsDescriptorMap,
+  assertScheduleInputsSatisfiable,
 } from '@kici-dev/engine';
 import type { LabelMatcher, RunsOnPick } from '@kici-dev/engine';
 import type { NeedsWhenInput } from '@kici-dev/sdk';
@@ -22,7 +23,9 @@ import path from 'node:path';
 import type {
   Workflow,
   Job,
+  Step,
   StepInput,
+  ParallelGroup,
   TriggerConfig,
   Rule,
   JobOrFactory,
@@ -39,6 +42,7 @@ import {
   getDynamicJobNeeds,
   normalizeCacheSpecs,
   normalizeApproval,
+  isParallelGroup,
 } from '@kici-dev/sdk';
 import type { ApprovalConfig } from '@kici-dev/sdk';
 import {
@@ -76,6 +80,8 @@ import {
   type LockMatrix,
   type LockRule,
   type LockStep,
+  type LockParallelStep,
+  type LockStepEntry,
   type LockApproval,
   type LockBranchPattern,
   type WorkflowWithSource,
@@ -537,11 +543,16 @@ function toLockGenericWebhook(
 }
 
 function toLockSchedule(t: ExtractTrigger<'ScheduleTrigger'>): LockScheduleTrigger {
+  const inputs = t.inputs
+    ? extractInputsDescriptorMap(t.inputs as Record<string, unknown>)
+    : undefined;
+  if (inputs) assertScheduleInputsSatisfiable(inputs);
   return {
     _type: 'schedule',
     cronExpression: t.cron,
     timezone: t.timezone,
     ...(t.description && { description: t.description }),
+    ...(inputs && { inputs }),
   };
 }
 
@@ -739,6 +750,31 @@ function validateRunsOn(runsOn: RunsOn, jobName: string): void {
 }
 
 /**
+ * Transform one environment reference (static name or function) into a lock
+ * `{ value, dynamic }` entry. A function element is analyzed for purity: a pure
+ * function becomes an inline expression resolvable at two-phase eval; an impure
+ * one carries only the `dynamic` flag (the agent runs an init job to resolve it).
+ */
+function transformEnvironmentRef(
+  ref: NonNullable<Job['environments']>[number],
+  jobName: string,
+): { value: string | LockInlineValue; dynamic: boolean } {
+  if (typeof ref === 'function') {
+    const fnSource = ref.toString();
+    const purity = analyzePurity(fnSource);
+    if (purity.pure) {
+      return { value: { _type: 'inline', expression: fnSource }, dynamic: true };
+    }
+    console.warn(
+      `[kici] Job "${jobName}": environment function is not pure (${purity.reason}). ` +
+        'An init job will be required, adding ~5-10s delay.',
+    );
+    return { value: '', dynamic: true };
+  }
+  return { value: ref, dynamic: false };
+}
+
+/**
  * Transform a static job to lock file format.
  */
 function transformJob(
@@ -772,27 +808,17 @@ function transformJob(
   // Validate runsOn for overlap between required and excluded labels
   if (job.runsOn !== undefined) validateRunsOn(job.runsOn, job.name);
 
-  // Resolve environment: static string, inline expression (pure function), or dynamic function marker
+  // Resolve environments into an ordered array of { value, dynamic } entries.
+  // Either spelling normalizes here: `environment: 'x'` becomes a one-element
+  // array; `environments: [...]` is emitted in order. Each function element is
+  // analyzed for purity exactly like a dynamic singular environment was.
   const environmentFields: {
-    environment?: string | LockInlineValue;
-    dynamicEnvironment?: boolean;
+    environments?: Array<{ value: string | LockInlineValue; dynamic: boolean }>;
   } = {};
-  if (job.environment !== undefined) {
-    if (typeof job.environment === 'function') {
-      const fnSource = job.environment.toString();
-      const purity = analyzePurity(fnSource);
-      environmentFields.dynamicEnvironment = true;
-      if (purity.pure) {
-        environmentFields.environment = { _type: 'inline', expression: fnSource };
-      } else {
-        console.warn(
-          `[kici] Job "${job.name}": environment function is not pure (${purity.reason}). ` +
-            'An init job will be required, adding ~5-10s delay.',
-        );
-      }
-    } else if (typeof job.environment === 'string') {
-      environmentFields.environment = job.environment;
-    }
+  const envRefs =
+    job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
+  if (envRefs !== undefined && envRefs.length > 0) {
+    environmentFields.environments = envRefs.map((ref) => transformEnvironmentRef(ref, job.name));
   }
 
   // Resolve env: static object, inline expression (pure function), or dynamic function marker
@@ -1007,55 +1033,119 @@ function assertStepApprovalCheckFacet(step: {
   }
 }
 
-function transformSteps(steps: readonly StepInput[], gitRoot: string): readonly LockStep[] {
-  let stepCounter = 0;
-  return steps.map((stepOrFn) => {
-    if (typeof stepOrFn === 'function') {
-      // Bare function step -- auto-named with counter
-      stepCounter++;
-      return { name: `step-${stepCounter}`, hasOutputs: false };
+/** Mutable flat-step counter shared across an entire job's step sequence. */
+interface StepCounter {
+  n: number;
+}
+
+/**
+ * Transform a job's `steps` array into lock-file entries. Sequential steps and
+ * parallel-group children share one flat `step-N` counter (anonymous steps are
+ * numbered across the whole flattened sequence, parallel children inline) so the
+ * compiler's naming matches the agent's `extractAndNormalizeSteps` enumeration —
+ * the flat-stepIndex invariant.
+ */
+export function transformSteps(
+  steps: readonly StepInput[],
+  gitRoot: string,
+): readonly LockStepEntry[] {
+  const counter: StepCounter = { n: 0 };
+  let groupOrdinal = 0;
+  return steps.map((entry) => {
+    if (isParallelGroup(entry)) {
+      return transformParallelGroup(entry, gitRoot, counter, groupOrdinal++);
     }
-    const step = stepOrFn;
-    // Empty name = id-less step -> assign counter
-    const name = step.name || `step-${++stepCounter}`;
-    return {
-      name,
-      hasOutputs: !!step.outputs && Object.keys(step.outputs).length > 0,
-      ...(step.continueOnError !== undefined && { continueOnError: step.continueOnError }),
-      ...(step.timeout !== undefined && { timeout: step.timeout }),
-      ...(step.retry !== undefined && {
-        retry: {
-          maxAttempts: step.retry.maxAttempts,
-          delayMs: step.retry.delayMs,
-          backoff: step.retry.backoff,
-          maxDelayMs: step.retry.maxDelayMs,
-        },
-      }),
-      ...(step.cache !== undefined && { cache: normalizeCacheSpecs(step.cache) }),
-      ...(step._sourceLocation && {
-        sourceLocation: {
-          file: makeRelativePath(step._sourceLocation.file, gitRoot),
-          line: step._sourceLocation.line,
-          column: step._sourceLocation.column,
-        },
-      }),
-      ...(step.rules &&
-        step.rules.length > 0 && {
-          hasRules: true,
-          rules: transformRules(
-            step.rules,
-            makeRelativePath(step._sourceLocation?.file ?? '', gitRoot),
-          ),
-        }),
-      ...(step.onCancel !== undefined && { hasOnCancel: true }),
-      ...(step.cleanup !== undefined && { hasCleanup: true }),
-      ...(step.check !== undefined && { hasCheck: true }),
-      ...(step.whenInSync !== undefined && { hasWhenInSync: true }),
-      ...(step.approval !== undefined && {
-        approval: (assertStepApprovalCheckFacet(step), toLockApproval(step.approval)),
-      }),
-    };
+    return transformSequentialStep(entry, gitRoot, counter);
   });
+}
+
+/** Validate and transform a `ParallelGroup` into a `LockParallelStep`. */
+function transformParallelGroup(
+  group: ParallelGroup,
+  gitRoot: string,
+  counter: StepCounter,
+  groupOrdinal: number,
+): LockParallelStep {
+  if (group.steps.length === 0) {
+    throw new Error('job step: empty parallel group not allowed');
+  }
+  const seen = new Set<string>();
+  const children = group.steps.map((child) => {
+    if (isParallelGroup(child)) {
+      throw new Error('job step: nested parallel groups are not supported');
+    }
+    const lockChild = transformSequentialStep(child, gitRoot, counter);
+    if (seen.has(lockChild.name)) {
+      throw new Error(`job step: duplicate step name '${lockChild.name}' in parallel group`);
+    }
+    seen.add(lockChild.name);
+    return lockChild;
+  });
+  if (children.length === 1) {
+    console.warn(
+      `[kici] parallel group with a single step ('${children[0].name}') runs identically to a sequential step`,
+    );
+  }
+  return {
+    kind: 'parallel',
+    name: group.name ?? `parallel-${groupOrdinal}`,
+    failFast: group.failFast,
+    ...(group.maxParallel !== undefined && { maxParallel: group.maxParallel }),
+    children,
+  };
+}
+
+/** Transform a single sequential step (or bare function) into a `LockStep`. */
+function transformSequentialStep(
+  stepOrFn: StepInput,
+  gitRoot: string,
+  counter: StepCounter,
+): LockStep {
+  if (typeof stepOrFn === 'function') {
+    // Bare function step -- auto-named with counter
+    counter.n++;
+    return { name: `step-${counter.n}`, hasOutputs: false };
+  }
+  const step = stepOrFn as Step<any>;
+  // Empty name = id-less step -> assign counter
+  const name = step.name || `step-${++counter.n}`;
+  return {
+    name,
+    hasOutputs: !!step.outputs && Object.keys(step.outputs).length > 0,
+    ...(step.continueOnError !== undefined && { continueOnError: step.continueOnError }),
+    ...(step.timeout !== undefined && { timeout: step.timeout }),
+    ...(step.retry !== undefined && {
+      retry: {
+        maxAttempts: step.retry.maxAttempts,
+        delayMs: step.retry.delayMs,
+        backoff: step.retry.backoff,
+        maxDelayMs: step.retry.maxDelayMs,
+      },
+    }),
+    ...(step.cache !== undefined && { cache: normalizeCacheSpecs(step.cache) }),
+    ...(step._sourceLocation && {
+      sourceLocation: {
+        file: makeRelativePath(step._sourceLocation.file, gitRoot),
+        line: step._sourceLocation.line,
+        column: step._sourceLocation.column,
+      },
+    }),
+    ...(step.rules &&
+      step.rules.length > 0 && {
+        hasRules: true,
+        rules: transformRules(
+          step.rules,
+          makeRelativePath(step._sourceLocation?.file ?? '', gitRoot),
+        ),
+      }),
+    ...(step.onCancel !== undefined && { hasOnCancel: true }),
+    ...(step.cleanup !== undefined && { hasCleanup: true }),
+    ...(step.check !== undefined && { hasCheck: true }),
+    ...(step.whenInSync !== undefined && { hasWhenInSync: true }),
+    ...(step.approval !== undefined && {
+      approval: (assertStepApprovalCheckFacet(step), toLockApproval(step.approval)),
+    }),
+  };
 }
 
 /**

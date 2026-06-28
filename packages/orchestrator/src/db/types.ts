@@ -291,6 +291,8 @@ export interface ExecutionRunTable {
   provider_context: Generated<string>;
   /** Whether this is a CLI-initiated test run */
   is_test_run: Generated<boolean>;
+  /** True when the run executed an uploaded local working tree (`kici run remote`). */
+  local_working_tree: Generated<boolean>;
   /** Fixture ID for test runs (null for real webhook runs) */
   fixture_id: string | null;
   /** Parent run ID for re-run lineage (null for original runs). */
@@ -309,6 +311,22 @@ export interface ExecutionRunTable {
   lock_file_source: string | null;
   /** Username of the contributor (null for non-PR events) */
   contributor_username: string | null;
+  /**
+   * Origin provider of the triggering actor (`github` today). Provider-generic
+   * so GitLab/Bitbucket extend later. Null when no actor was captured.
+   */
+  trigger_actor_provider: string | null;
+  /**
+   * Provider login of the person who triggered the run (pusher / PR author).
+   * Captured for ALL event types, unlike the PR-only `contributor_username`.
+   */
+  trigger_actor_username: string | null;
+  /**
+   * Immutable provider user id of the triggering actor (mirrors
+   * `identity_links.provider_user_id`). Preferred over the mutable username
+   * when resolving the actor to a KiCI user.
+   */
+  trigger_actor_user_id: string | null;
   /** Human-readable reason why the run failed (null for non-failed runs). */
   failure_reason: string | null;
   /**
@@ -392,6 +410,12 @@ export interface ExecutionJobTable {
   dispatched_contexts: Generated<string>;
   /** Aggregated step outputs JSONB (step-keyed map of outputs). Populated on job success. */
   outputs: string | null;
+  /**
+   * Ordered bound deployment-environment names for this job, JSON-encoded
+   * `string[]` (null when the job binds none). Written at dispatch and
+   * overwritten with the agent-resolved list for dynamic environments.
+   */
+  environments: string | null;
   /** Whether all upstream needs edges are satisfied (dispatch gate). */
   needs_satisfied: Generated<boolean>;
   /** Timestamp when needs_satisfied first flipped to true. */
@@ -475,6 +499,13 @@ export interface ExecutionStepTable {
   drift_summary: string | null;
   /** Structured drift value returned by `check()` (JSONB). NULL when no drift. */
   drift: ColumnType<unknown | null, unknown, unknown>;
+  /**
+   * Parallel step-group concurrency role (`sequential` | `parallel-child` |
+   * `parallel-group`). NULL for an ordinary sequential step.
+   */
+  concurrency_kind: string | null;
+  /** Parallel-group correlation id shared by a group's children. NULL for sequential steps. */
+  group_id: string | null;
   /** When this record was created */
   created_at: Generated<Date>;
   /**
@@ -874,6 +905,12 @@ export interface AccessLogTable {
   source: string;
   outcome: string;
   error_message: string | null;
+  /**
+   * Human-set agent name, when the actor authenticated with an agent-kind PAT.
+   * NULL for ordinary human / API-key / system actors. Queryable so the access
+   * log can be filtered by agent.
+   */
+  agent_label: string | null;
   created_at: Generated<Date>;
   /**
    * Set inside the archive transaction before the row is DELETEd.
@@ -932,6 +969,14 @@ export interface AgentTokenTable {
   token_prefix: string;
   /** JSON-encoded string[] of agent labels (null = any) */
   labels: string | null;
+  /**
+   * JSON-encoded string[] of mandatory labels (a Kubernetes-taint-style gate):
+   * a static agent registering with this token only accepts a job when every
+   * label here appears in the job's required labels. null = no taint (the
+   * default; the agent accepts any job its advertised labels match).
+   * Authorized at mint time alongside `labels`.
+   */
+  mandatory_labels: string | null;
   /** Token type: 'ephemeral' (scaler-issued) or 'static' (CLI-created) */
   agent_type: string;
   /** When this token was created */
@@ -1735,6 +1780,16 @@ export interface AttestationsTable {
   media_type: string;
   /** When this row was inserted. */
   created_at: Generated<Date>;
+  /**
+   * Server-side verification verdict computed at ingest. One of
+   * `verified` / `failed` / `unverifiable` / `pending`
+   * (`attestationVerifyStatusSchema.enum.*`). DB default is `pending`.
+   */
+  verify_status: Generated<string>;
+  /** First failure code from `verifyKiciBundle`, or NULL when verified/pending. */
+  verify_reason: string | null;
+  /** When the verdict was recorded (explicitly set, not DB-generated). */
+  verified_at: Date | null;
 }
 
 // Convenience types for attestations

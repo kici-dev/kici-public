@@ -200,6 +200,8 @@ await guardStartup(logger, async () => {
             workflowName: context.workflowName,
             status,
             repoIdentifier: context.repoIdentifier,
+            ...(context.provider && { repoProvider: context.provider }),
+            ...(context.localWorkingTree && { localWorkingTree: true }),
             sha: context.sha,
             ...(context.ref && { ref: context.ref }),
             ...(context.triggerEvent && { triggerEvent: context.triggerEvent }),
@@ -207,6 +209,14 @@ await guardStartup(logger, async () => {
             ...(context.parentRunId != null && { parentRunId: context.parentRunId }),
             ...(context.originalRunId != null && { originalRunId: context.originalRunId }),
             ...(context.triggeredBy != null && { triggeredBy: context.triggeredBy }),
+            ...((context.triggerActorUsername != null || context.triggerActorUserId != null) &&
+              context.provider && { triggerActorProvider: context.provider }),
+            ...(context.triggerActorUsername != null && {
+              triggerActorUsername: context.triggerActorUsername,
+            }),
+            ...(context.triggerActorUserId != null && {
+              triggerActorUserId: context.triggerActorUserId,
+            }),
             jobCount,
             startedAt,
             timestamp: Date.now(),
@@ -238,6 +248,7 @@ await guardStartup(logger, async () => {
         runsOnLabels,
         logBytes,
         initFailure,
+        environments,
       ) => {
         try {
           platformClient.send({
@@ -262,6 +273,7 @@ await guardStartup(logger, async () => {
             ...(logBytes !== undefined && { logBytes }),
             ...(agentId && { agentId }),
             ...(runsOnLabels?.length && { runsOnLabels }),
+            ...(environments?.length && { environments }),
             ...(initFailure && { initFailure }),
             orchestratorId: config.instanceId,
           });
@@ -286,9 +298,15 @@ await guardStartup(logger, async () => {
         reqId,
       ) => {
         const doWork = () => {
-          // Extract secretsAccessed from data (merged there by app.ts) for top-level forwarding
+          // Extract top-level forward fields from data (merged there by app.ts).
           const secretsAccessed = data?.secretsAccessed as string[] | undefined;
-          const { secretsAccessed: _, ...restData } = data ?? {};
+          const concurrencyKind = data?.concurrencyKind as
+            | 'sequential'
+            | 'parallel-child'
+            | 'parallel-group'
+            | undefined;
+          const groupId = data?.groupId as string | undefined;
+          const { secretsAccessed: _s, concurrencyKind: _c, groupId: _g, ...restData } = data ?? {};
           const hasRestData = Object.keys(restData).length > 0;
 
           platformClient.send({
@@ -299,10 +317,12 @@ await guardStartup(logger, async () => {
             jobName,
             stepIndex,
             stepName,
-            state: state as 'running' | 'success' | 'failed' | 'skipped',
+            state: state as 'running' | 'success' | 'failed' | 'skipped' | 'pending' | 'cancelled',
             timestamp,
             ...(hasRestData && { data: restData }),
             ...(secretsAccessed !== undefined && { secretsAccessed }),
+            ...(concurrencyKind !== undefined && { concurrencyKind }),
+            ...(groupId !== undefined && { groupId }),
           });
         };
         if (reqId) {
@@ -955,6 +975,11 @@ await guardStartup(logger, async () => {
             }),
           );
         },
+        onProvenanceIssuer: (issuer) => {
+          // Learn the provenance trust root from the Platform so the
+          // agent-handler can verify provenance bundles at ingest.
+          sub.provenanceTrustRoot.setIssuer(issuer);
+        },
         onTestRelay: async (msg) => {
           // Platform-relayed `kici run remote` control plane: route the parsed
           // `test.relay.*` request to its handler (reusing the test pipeline /
@@ -991,6 +1016,7 @@ await guardStartup(logger, async () => {
         onJoinRequest: (msg) => sub.joinHandler.handleJoinRequest(msg),
         onLogPullRequest: (msg) => logPullHandler.handleRequest(msg),
         onDashboardRunDetail: (msg) => dashboardHandler.handleRunDetail(msg),
+        onDashboardRunStructured: (msg) => dashboardHandler.handleRunStructured(msg),
         onDashboardRunsList: async (msg) => {
           // The handler records its own access_log row internally and
           // returns the response envelope; relay it over the WS connection.
@@ -1009,6 +1035,8 @@ await guardStartup(logger, async () => {
         },
         onDashboardStepLogs: (msg) => dashboardHandler.handleStepLogs(msg),
         onDashboardAttestationsList: (msg) => dashboardHandler.handleAttestationsList(msg),
+        onDashboardAttestationsListAll: (msg) => dashboardHandler.handleAttestationsListAll(msg),
+        onDashboardAttestationGet: (msg) => dashboardHandler.handleAttestationGet(msg),
         onRunRerun: (msg) => dashboardHandler.handleRerunRequest(msg),
         onManualSchedule: (msg) => dashboardHandler.handleManualScheduleRequest(msg),
         onRunCancel: (msg) => dashboardHandler.handleCancelRequest(msg),

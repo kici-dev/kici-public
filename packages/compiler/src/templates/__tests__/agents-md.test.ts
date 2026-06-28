@@ -25,7 +25,7 @@ describe('agents-md template', () => {
   it('documents the local command loop', () => {
     expect(agentsMdTemplate).toContain('kici compile --check');
     expect(agentsMdTemplate).toContain('kici run local');
-    expect(agentsMdTemplate).toContain('kici test');
+    expect(agentsMdTemplate).toContain('kici preview');
   });
 
   it('includes runnable examples for push and PR matrix triggers', () => {

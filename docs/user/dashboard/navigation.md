@@ -13,8 +13,10 @@ The left sidebar provides persistent navigation across all org-scoped pages:
 - **Getting started** -- onboarding checklist (shows a `done/total` badge until complete or dismissed)
 - **Runs** -- the default landing page, showing your workflow run history
 - **Workflows** -- permanently registered workflows listening for events
+- **Fleet** -- read-only view of the organization's declared host fleet, listing each host's status, labels, and a per-host detail page (shown directly below Workflows, only when fleet management is enabled for the org and you hold `fleet:read`)
 - **Diagnostics** -- infrastructure health, execution metrics, and recent errors
 - **Metrics** -- time-series charts of orchestrator health (dispatch & agents, execution, webhooks, caching, logs, errors), scoped to this org
+- **Orchestrators** -- the orchestrator clusters connected to this org, keyed by cluster name; selecting one opens its per-cluster scoped views (overview, environments, secrets, DLQ, workflows)
 - **Environments** -- deployment environments with protection rules
 - **Secrets** -- secret scope management with environment bindings
 - **Approval queue** -- held runs pending approval (shows a badge with pending count)

@@ -19,7 +19,7 @@ import {
   decryptPrivateKey,
   decryptSecretOutput,
 } from './ephemeral-keys.js';
-import { encrypt, decrypt, deriveKey } from './crypto.js';
+import { encrypt, decrypt, deriveKey } from '@kici-dev/shared';
 import {
   generateKeyPairSync,
   createPrivateKey,

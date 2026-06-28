@@ -1,7 +1,11 @@
 import { z } from 'zod';
 
 import { approverClauseSchema } from '../../approval/types.js';
-import { ExecutionJobStatus, ExecutionStepStatus } from './execution-status.js';
+import {
+  ExecutionJobStatus,
+  ExecutionStepStatus,
+  StepConcurrencyKind,
+} from './execution-status.js';
 
 /**
  * Cache write scope for a job's user-facing cache.
@@ -400,6 +404,10 @@ export const agentStepStatusSchema = z.object({
     .optional(),
   /** Secret key names accessed by this step via ctx.secrets.get()/expose(). Never contains values. */
   secretsAccessed: z.array(z.string()).optional(),
+  /** Step concurrency role; absent means an ordinary sequential step. */
+  concurrencyKind: StepConcurrencyKind.optional(),
+  /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
+  groupId: z.string().optional(),
   /**
    * Total raw bytes streamed by this step's LogStreamer at terminal time.
    * Counts agent-side raw bytes (the same count fed to the transient

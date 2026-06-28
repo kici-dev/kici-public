@@ -58,6 +58,13 @@ import * as m050 from './migrations/050_sources_slug.js';
 import * as m051 from './migrations/051_binding_host_pattern.js';
 import * as m052 from './migrations/052_host_reach_metadata.js';
 import * as m053 from './migrations/053_agent_token_single_use.js';
+import * as m054 from './migrations/054_local_working_tree.js';
+import * as m055 from './migrations/055_agent_token_mandatory_labels.js';
+import * as m056 from './migrations/056_execution_jobs_environments.js';
+import * as m057 from './migrations/057_step_concurrency.js';
+import * as m058 from './migrations/058_access_log_agent_label.js';
+import * as m059 from './migrations/059_attestation_verdict.js';
+import * as m060 from './migrations/060_run_trigger_actor.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -116,6 +123,13 @@ export function createMigrationProvider(): MigrationProvider {
         '051_binding_host_pattern': m051,
         '052_host_reach_metadata': m052,
         '053_agent_token_single_use': m053,
+        '054_local_working_tree': m054,
+        '055_agent_token_mandatory_labels': m055,
+        '056_execution_jobs_environments': m056,
+        '057_step_concurrency': m057,
+        '058_access_log_agent_label': m058,
+        '059_attestation_verdict': m059,
+        '060_run_trigger_actor': m060,
       };
     },
   };

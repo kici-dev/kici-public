@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { z } from 'zod';
 import { schedule } from './index.js';
+import { defineDispatchInputs } from './dispatch-inputs.js';
 
 describe('schedule()', () => {
   it('creates frozen config with correct _tag', () => {
@@ -49,5 +51,26 @@ describe('schedule()', () => {
       timezone: 'Europe/Berlin',
       description: 'Hourly check',
     });
+  });
+});
+
+describe('schedule({ inputs })', () => {
+  it('carries an inputs map on the frozen config', () => {
+    const t = schedule({
+      cron: '0 0 * * *',
+      inputs: { mode: z.enum(['full', 'quick']).default('full') },
+    });
+    expect(t.inputs?.mode).toBeDefined();
+    expect(Object.isFrozen(t)).toBe(true);
+  });
+
+  it('omits inputs when not declared', () => {
+    expect(schedule({ cron: '0 0 * * *' }).inputs).toBeUndefined();
+  });
+
+  it('unwraps a defineDispatchInputs handle to its map', () => {
+    const handle = defineDispatchInputs({ mode: z.enum(['full', 'quick']).default('full') });
+    const t = schedule({ cron: '0 0 * * *', inputs: handle });
+    expect(t.inputs?.mode).toBeDefined();
   });
 });

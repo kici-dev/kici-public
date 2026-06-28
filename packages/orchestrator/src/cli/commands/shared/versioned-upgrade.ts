@@ -15,6 +15,7 @@ import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { execSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { select } from '@inquirer/prompts';
 import {
   createServiceManager,
   detectPlatform,
@@ -50,6 +51,7 @@ interface VersionedUpgradeOptions {
   yes?: boolean;
   cleanup?: boolean;
   rollback?: boolean;
+  pick?: boolean;
   force?: boolean;
 }
 
@@ -160,6 +162,68 @@ export function getInstallBase(platform: ServicePlatform, name: string): string 
     case 'windows':
       return `C:\\Program Files\\KiCI\\${name}${sep}`;
   }
+}
+
+/** A choice row for the `--pick` interactive select. */
+export interface PickChoice {
+  value: string;
+  name: string;
+  /** `false` when selectable; a reason string when disabled (inquirer renders it). */
+  disabled: boolean | string;
+}
+
+/**
+ * Build the interactive `--pick` choices, newest-first (lexicographic, matching
+ * the rest of the versioned-directory handling). The currently-active version is
+ * labeled `(current)` and disabled so it cannot be selected — picking it would be
+ * a no-op restart.
+ */
+export function buildPickChoices(versions: string[], current: string | null): PickChoice[] {
+  return [...versions]
+    .sort()
+    .reverse()
+    .map((v) => ({
+      value: v,
+      name: v === current ? `${v} (current)` : v,
+      disabled: v === current ? 'current version' : false,
+    }));
+}
+
+/**
+ * The versions a `--pick` switch may target: every installed version except the
+ * currently-active one. Empty when only the current version (or nothing) is
+ * installed — the caller turns that into a "nothing to pick" error.
+ */
+export function selectablePickTargets(versions: string[], current: string | null): string[] {
+  return versions.filter((v) => v !== current);
+}
+
+/**
+ * Validate that `--pick` is not combined with a source/mode flag it conflicts
+ * with. `--pick` activates an already-installed version, so it never downloads
+ * (`--from`/`--url`), never takes an explicit `--version`, and is its own mode
+ * (not `--rollback`/`--cleanup`). Returns an error message, or null when OK.
+ */
+export function checkPickFlagConflicts(opts: {
+  pick?: boolean;
+  from?: string;
+  url?: string;
+  version?: string;
+  rollback?: boolean;
+  cleanup?: boolean;
+}): string | null {
+  if (!opts.pick) return null;
+  const conflicts: string[] = [];
+  if (opts.from) conflicts.push('--from');
+  if (opts.url) conflicts.push('--url');
+  if (opts.version) conflicts.push('--version');
+  if (opts.rollback) conflicts.push('--rollback');
+  if (opts.cleanup) conflicts.push('--cleanup');
+  if (conflicts.length === 0) return null;
+  return (
+    `--pick cannot be combined with ${conflicts.join(', ')}. ` +
+    `--pick activates an already-installed version; it never downloads or takes an explicit version.`
+  );
 }
 
 /** Check if the platform is Windows. */
@@ -408,9 +472,30 @@ export async function performVersionedUpgrade(
       process.exit(1);
     }
 
+    // Validate --pick flag combination up front.
+    const pickConflict = checkPickFlagConflicts(opts);
+    if (pickConflict) {
+      console.error(`Error: ${pickConflict}`);
+      process.exit(1);
+    }
+
+    // Handle --pick (interactive switch to an installed version)
+    if (opts.pick) {
+      await handlePick(component, platform, installBase, config, manager, resolvedInstance, opts);
+      return;
+    }
+
     // Handle --rollback
     if (opts.rollback) {
-      await handleRollback(component, platform, installBase, config, manager, opts);
+      await handleRollback(
+        component,
+        platform,
+        installBase,
+        config,
+        manager,
+        resolvedInstance,
+        opts,
+      );
       return;
     }
 
@@ -658,6 +743,132 @@ async function performNpmSourceUpgrade(
 }
 
 /**
+ * Handle `--pick`: interactively choose an already-installed version and switch
+ * the active version pointer to it. Lists every installed version (the active
+ * one shown disabled), confirms the change, then delegates to
+ * {@link switchToInstalledVersion}.
+ */
+async function handlePick(
+  component: UpgradeComponent,
+  platform: ServicePlatform,
+  installBase: string,
+  config: ServiceConfig,
+  manager: ServiceManager,
+  resolvedInstance: ResolvedInstance,
+  opts: VersionedUpgradeOptions,
+): Promise<void> {
+  if (!process.stdin.isTTY) {
+    console.error(
+      'Error: --pick requires an interactive terminal; pass an explicit archive ' +
+        '(--from/--url) or use --rollback for non-interactive switching.',
+    );
+    process.exit(1);
+  }
+
+  const versions = listInstalledVersions(installBase, component);
+  const current = getCurrentVersion(installBase, component, platform);
+  const targets = selectablePickTargets(versions, current);
+  if (targets.length === 0) {
+    const only = current ?? versions[0];
+    console.error(
+      only
+        ? `Error: only one version installed (${only}), nothing to pick.`
+        : `Error: no installed versions found for ${component}.`,
+    );
+    process.exit(1);
+  }
+
+  const target = await select({
+    message: `Select a ${component} version to activate:`,
+    choices: buildPickChoices(versions, current),
+  });
+
+  if (!opts.yes) {
+    console.log(`This will switch "${config.name}":`);
+    if (current) console.log(`  Current version: ${current}`);
+    console.log(`  Pick target: ${target}`);
+    console.log(`  Install path: ${path.join(installBase, `${component}-${target}`)}`);
+    console.log('  The service will be stopped during the switch.');
+    console.log('');
+    const ok = await confirm('Proceed with switch?');
+    if (!ok) {
+      console.log('Pick cancelled.');
+      return;
+    }
+  }
+
+  await switchToInstalledVersion({
+    component,
+    platform,
+    installBase,
+    config,
+    manager,
+    resolvedInstance,
+    targetVersion: target,
+  });
+
+  console.log('');
+  console.log(`Switched: ${current ?? '(unknown)'} -> ${target}`);
+}
+
+/**
+ * Stop the service, switch the active version pointer to an already-installed
+ * versioned directory (atomic symlink on Unix; uninstall→install + version file
+ * on Windows), restart, and persist the new `kiciVersion` into the manifest.
+ *
+ * Shared by `--rollback` (switch to the previous version) and `--pick` (switch
+ * to any chosen installed version).
+ */
+export async function switchToInstalledVersion(args: {
+  component: UpgradeComponent;
+  platform: ServicePlatform;
+  installBase: string;
+  config: ServiceConfig;
+  manager: ServiceManager;
+  resolvedInstance: ResolvedInstance;
+  targetVersion: string;
+}): Promise<void> {
+  const { component, platform, installBase, config, manager, resolvedInstance, targetVersion } =
+    args;
+
+  console.log('Stopping service...');
+  const status = await manager.status(config);
+  if (status.state === 'running') {
+    await manager.stop(config);
+    console.log('Service stopped.');
+  }
+
+  if (isWindows(platform)) {
+    const launcherPath = path.join(
+      installBase,
+      `${component}-${targetVersion}`,
+      getLauncherName(component, platform),
+    );
+    config.executablePath = launcherPath;
+    await manager.uninstall(config);
+    await manager.install(config);
+    writeCurrentVersion(installBase, component, targetVersion);
+    console.log(`Service registration updated to ${launcherPath}`);
+  } else {
+    updateSymlinkAtomic(installBase, component, targetVersion);
+    console.log(
+      `Symlink updated: ${path.join(installBase, component)} -> ${component}-${targetVersion}`,
+    );
+  }
+
+  console.log('Starting service...');
+  await manager.start(config);
+  console.log('Service started.');
+
+  // Persist the new version into the manifest so subsequent lifecycle commands
+  // and the next upgrade see the current kiciVersion.
+  writeManifest(resolvedInstance.instanceDir, {
+    ...resolvedInstance.manifest,
+    kiciVersion: targetVersion,
+  });
+}
+
+/**
  * Handle --rollback: switch symlink to the previous version and restart.
  */
 async function handleRollback(
@@ -665,7 +876,8 @@ async function handleRollback(
   platform: ServicePlatform,
   installBase: string,
   config: ServiceConfig,
-  manager: Awaited<ReturnType<typeof createServiceManager>>,
+  manager: ServiceManager,
+  resolvedInstance: ResolvedInstance,
   opts: VersionedUpgradeOptions,
 ): Promise<void> {
   const versions = listInstalledVersions(installBase, component);
@@ -714,36 +926,15 @@ async function handleRollback(
     }
   }
 
-  // Stop service
-  console.log('Stopping service...');
-  const status = await manager.status(config);
-  if (status.state === 'running') {
-    await manager.stop(config);
-    console.log('Service stopped.');
-  }
-
-  if (isWindows(platform)) {
-    const launcherPath = path.join(
-      installBase,
-      `${component}-${previousVersion}`,
-      getLauncherName(component, platform),
-    );
-    config.executablePath = launcherPath;
-    await manager.uninstall(config);
-    await manager.install(config);
-    writeCurrentVersion(installBase, component, previousVersion);
-    console.log(`Service registration updated to ${launcherPath}`);
-  } else {
-    updateSymlinkAtomic(installBase, component, previousVersion);
-    console.log(
-      `Symlink updated: ${path.join(installBase, component)} -> ${component}-${previousVersion}`,
-    );
-  }
-
-  // Start service
-  console.log('Starting service...');
-  await manager.start(config);
-  console.log('Service started.');
+  await switchToInstalledVersion({
+    component,
+    platform,
+    installBase,
+    config,
+    manager,
+    resolvedInstance,
+    targetVersion: previousVersion,
+  });
 
   console.log('');
   console.log(`Rollback complete: ${currentVersion} -> ${previousVersion}`);

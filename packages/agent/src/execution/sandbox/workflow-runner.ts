@@ -38,6 +38,7 @@ import type {
 } from '@kici-dev/sdk';
 import {
   isDynamicJobFn,
+  isParallelGroup,
   buildKiciApi,
   createStepSecrets,
   setStepOutputsMap,
@@ -78,6 +79,8 @@ import {
   createCacheApi,
   restoreCacheSpecs,
   saveCacheSpecs,
+  createCacheStepIndexAllocator,
+  JOB_CACHE_OWNER,
   type CacheTransport,
   type CachePhaseDeps,
 } from '../cache/index.js';
@@ -85,7 +88,9 @@ import { LogMasker } from './log-masker.js';
 import { applyEnvDelta } from './env-delta.js';
 import { createEnvFiles, readEnvDelta, truncateEnvFiles, type EnvFiles } from './env-file.js';
 import { buildMergedFlatSecrets } from './secret-merge.js';
-import { executeStepLoop } from './step-loop.js';
+import { executeStepLoop, type StepNode } from './step-loop.js';
+import { runInStepCapture, currentCaptureStepIndex } from './capture-context.js';
+import { StepTaskRegistry } from './step-task-registry.js';
 import type { JobHooks, StepLoopOptions } from './step-loop.js';
 import { runInitPhase } from '../env-init/init-phase.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
@@ -141,13 +146,6 @@ const origStderrWrite = process.stderr.write.bind(process.stderr);
 // --- Console Output Capture ---
 
 /**
- * Current step index for console.log/console.error capture.
- * When >= 0, process.stdout/stderr writes are intercepted and sent as
- * log.line IPC messages for the given step. Set to -1 outside step execution.
- */
-let captureStepIndex = -1;
-
-/**
  * Workflow-level capture flag for the pre-step `prepare` phase
  * (module load, concurrency-group evaluation, rule evaluation).
  *
@@ -158,8 +156,9 @@ let captureStepIndex = -1;
  * rule check functions lands in the job's workflow-level log file
  * (`executions/{runId}/job-{name}/step--1.log`) alongside runner narration.
  *
- * Mutually exclusive with `captureStepIndex >= 0` — the step loop resets
- * this flag to false before setting `captureStepIndex` to a real step index.
+ * Mutually exclusive with a step capture scope: the step loop resets this flag
+ * to false before any step runs inside its {@link runInStepCapture} scope (the
+ * async-context source of {@link currentCaptureStepIndex}).
  */
 let capturePrepareActive = false;
 
@@ -167,13 +166,13 @@ let capturePrepareActive = false;
 let captureSendFn: ((msg: RunnerToAgentMessage) => void) | null = null;
 
 function captureIsActive(): boolean {
-  return (captureStepIndex >= 0 || capturePrepareActive) && captureSendFn !== null;
+  return (currentCaptureStepIndex() >= 0 || capturePrepareActive) && captureSendFn !== null;
 }
 
 function captureTargetIndex(): number {
-  // `capturePrepareActive` emits as workflow-level log (stepIndex: -1);
-  // step capture takes precedence when both are set.
-  return captureStepIndex >= 0 ? captureStepIndex : -1;
+  // A step capture scope (async context) attributes to its own step index;
+  // `capturePrepareActive` emits as workflow-level log (stepIndex: -1).
+  return currentCaptureStepIndex();
 }
 
 /**
@@ -363,6 +362,15 @@ let jobTimedOutMs: number | undefined;
  * long step that has no per-step `timeout`.
  */
 const jobDeadlineAbort = new AbortController();
+
+/**
+ * Aborted when the job is being torn down by cancellation (abort IPC / SIGTERM),
+ * as distinct from the wall-clock deadline (`jobDeadlineAbort`). Each step's
+ * `ctx.signal` composes this with the deadline signal and its own per-step
+ * controller, so a cancelled job cooperatively unwinds in-flight step bodies
+ * that opted into `ctx.signal`. Inert for the rest of the runner today.
+ */
+const jobCancelAbort = new AbortController();
 
 // --- Event Emit Response Tracking ---
 
@@ -819,16 +827,15 @@ async function setupJobCache(
   jobCacheSpecs: CacheSpec[];
   jobCacheRestore: Map<string, { hit: boolean; matchedKey?: string }>;
 }> {
-  let cacheStepCursor = stepCount * 3 + 100;
   const cachePhaseDeps: CachePhaseDeps = {
     cache: createCacheApi(stepCwd, buildCacheTransport()),
     sendIpc,
-    nextStepIndex: () => cacheStepCursor++,
+    nextStepIndex: createCacheStepIndexAllocator(stepCount),
   };
   const jobCacheSpecs: CacheSpec[] = normalizeCacheSpecs(jobCache);
   const jobCacheRestore =
     jobCacheSpecs.length > 0
-      ? await restoreCacheSpecs(jobCacheSpecs, cachePhaseDeps)
+      ? await restoreCacheSpecs(jobCacheSpecs, cachePhaseDeps, JOB_CACHE_OWNER)
       : new Map<string, { hit: boolean; matchedKey?: string }>();
   return { cachePhaseDeps, jobCacheSpecs, jobCacheRestore };
 }
@@ -848,7 +855,7 @@ async function maybeSaveJobCache(
   succeeded: boolean,
 ): Promise<void> {
   if (specs.length === 0 || !succeeded) return;
-  await saveCacheSpecs(specs, restoreResults, deps);
+  await saveCacheSpecs(specs, restoreResults, deps, JOB_CACHE_OWNER);
 }
 
 /**
@@ -858,6 +865,7 @@ async function maybeSaveJobCache(
 function dispatchAgentMessage(msg: AgentToRunnerMessage): void {
   if (msg.type === 'abort') {
     aborted = true;
+    jobCancelAbort.abort();
     if (msg.force) {
       forceAborted = true;
     }
@@ -924,6 +932,7 @@ if (isForkMode) {
 // SIGTERM handling (used by container backend to stop execution).
 process.on('SIGTERM', () => {
   aborted = true;
+  jobCancelAbort.abort();
 });
 
 // --- IPC Logger ---
@@ -1216,6 +1225,7 @@ export function createSandboxStepContext(
   jobOutputsMap: OutputsMap,
   secrets: TrackedStepSecrets,
   masker: LogMasker,
+  signal: AbortSignal,
 ): StepContext {
   const step$ = buildSandboxShell(workDir, stepIndex, maskedSendFn);
 
@@ -1250,6 +1260,7 @@ export function createSandboxStepContext(
   return {
     $: step$,
     log,
+    signal,
     env: process.env as Record<string, string | undefined>,
     setEnv: (key: string, value: string) => {
       applyEnvDelta(
@@ -1934,13 +1945,13 @@ async function runCancelPathHooks(args: {
   outputsMap: OutputsMap;
   createStepCtxWithCapture: (stepIndex: number, stepName: string) => StepContext;
   /**
-   * Tear down per-step state created by the most recent
-   * `createStepCtxWithCapture` invocation. Each cancel-path hook allocates a
-   * fresh secrets handle via the factory; calling dispose() after the hook
-   * returns ensures the tmpdir is removed and any env vars set via
+   * Tear down per-step state created by a `createStepCtxWithCapture`
+   * invocation, keyed by the hook's pseudo-step index. Each cancel-path hook
+   * allocates a fresh secrets handle via the factory; calling dispose() after
+   * the hook returns ensures the tmpdir is removed and any env vars set via
    * `exposeFile` are unset before the next hook (or the process exit).
    */
-  disposeStepResources: () => Promise<void>;
+  disposeStepResources: (stepIndex: number) => Promise<void>;
   maskedSend: (msg: RunnerToAgentMessage) => void;
 }): Promise<{ finalStatus: 'success' | 'failed'; cancelFailureReason?: string }> {
   const {
@@ -1998,16 +2009,20 @@ async function runCancelPathHooks(args: {
     const ctx = createStepCtxWithCapture(hookStepIndex, label);
     let hookResult;
     try {
-      hookResult = await executeHook({
-        hook,
-        stepContext: ctx,
-        outcome: failedStep ? { ...cancelOutcome, failedStep } : cancelOutcome,
-        hookType,
-        stepIndex: hookStepIndex,
-        sendIpc: maskedSend,
-      });
+      // Wrap the hook body in the capture scope so its console output attributes
+      // to the hook's pseudo-step index rather than the workflow-level bucket.
+      hookResult = await runInStepCapture(hookStepIndex, () =>
+        executeHook({
+          hook,
+          stepContext: ctx,
+          outcome: failedStep ? { ...cancelOutcome, failedStep } : cancelOutcome,
+          hookType,
+          stepIndex: hookStepIndex,
+          sendIpc: maskedSend,
+        }),
+      );
     } finally {
-      await disposeStepResources();
+      await disposeStepResources(hookStepIndex);
     }
     hookStepIndex++;
     if (!hookResult.success) {
@@ -2071,7 +2086,12 @@ async function extractAndNormalizeSteps(
   workflow: Workflow,
   request: JobExecutionRequest,
   apiTransport: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
-): Promise<{ normalizedSteps: Step[]; refMap: StepRefMap; driftDroppedJobs: string[] }> {
+): Promise<{
+  normalizedSteps: Step[];
+  nodes: StepNode[];
+  refMap: StepRefMap;
+  driftDroppedJobs: string[];
+}> {
   let rawSteps: readonly StepInput[];
   let driftDroppedJobs: string[] = [];
   if (request.dynamicSource) {
@@ -2099,17 +2119,16 @@ async function extractAndNormalizeSteps(
 
   const refMap: StepRefMap = new WeakMap();
   let stepCounter = 0;
-  const normalizedSteps: Step[] = rawSteps.map((stepOrFn) => {
+  // Coerce one raw entry (bare function or Step) into a normalized Step, naming
+  // anonymous steps `step-N` with a counter shared across the whole flattened
+  // sequence (parallel children inline) — matching the compiler's transformSteps
+  // enumeration so the flat-stepIndex invariant holds agent ↔ orchestrator.
+  const coerce = (stepOrFn: StepInput): Step<any> => {
     if (typeof stepOrFn === 'function') {
       stepCounter++;
       const name = `step-${stepCounter}`;
       refMap.set(stepOrFn, name);
-      return {
-        _tag: 'Step' as const,
-        name,
-        run: stepOrFn,
-        outputs: undefined,
-      } as Step<any>;
+      return { _tag: 'Step' as const, name, run: stepOrFn, outputs: undefined } as Step<any>;
     }
     const s = stepOrFn as Step<any>;
     if (!s.name) {
@@ -2117,9 +2136,38 @@ async function extractAndNormalizeSteps(
       return { ...s, name: `step-${stepCounter}` } as Step<any>;
     }
     return s;
-  });
+  };
 
-  return { normalizedSteps, refMap, driftDroppedJobs };
+  const normalizedSteps: Step[] = [];
+  const nodes: StepNode[] = [];
+  let flatIndex = 0;
+  let groupOrdinal = 0;
+  for (const entry of rawSteps) {
+    if (isParallelGroup(entry)) {
+      const groupId = `g${groupOrdinal++}`;
+      const children = entry.steps.map((child) => {
+        const step = coerce(child);
+        const stepIndex = flatIndex++;
+        normalizedSteps.push(step);
+        return { step, stepIndex };
+      });
+      nodes.push({
+        kind: 'parallel',
+        groupId,
+        name: entry.name ?? groupId,
+        failFast: entry.failFast,
+        ...(entry.maxParallel !== undefined && { maxParallel: entry.maxParallel }),
+        children,
+      });
+      continue;
+    }
+    const step = coerce(entry);
+    const stepIndex = flatIndex++;
+    normalizedSteps.push(step);
+    nodes.push({ kind: 'sequential', step, stepIndex });
+  }
+
+  return { normalizedSteps, nodes, refMap, driftDroppedJobs };
 }
 
 /**
@@ -2252,26 +2300,46 @@ async function applyEnvFilesDelta(
 }
 
 /**
- * Build the step loop's KICI_ENV/KICI_PATH callbacks over the shared `envFiles`.
- * `beforeStepEnvFiles` points the runner's process.env at the files (each step's
- * zx $ snapshots process.env at context creation, which happens AFTER this
+ * Build the step loop's KICI_ENV/KICI_PATH callbacks with a per-step delta-file
+ * pair (keyed by step index). `beforeStepEnvFiles(stepIndex)` lazily creates the
+ * step's pair and points the runner's process.env at it (each step's zx $
+ * snapshots process.env at context creation, which happens AFTER this
  * before-hook, so the shell sees them; the pre-fork env allowlist does not
- * re-filter runtime-set vars). `afterStepApplyEnvFiles` applies + truncates the
- * delta, mirroring the init phase's env port.
+ * re-filter runtime-set vars). `afterStepApplyEnvFiles(stepIndex)` applies that
+ * step's delta and releases the pair.
+ *
+ * Env-isolation contract: under sequential execution this is identical to a
+ * single shared pair truncated between steps — each step still sees only its own
+ * delta. The pair is now per-step so two concurrently-running steps cannot
+ * corrupt each other's delta file. `process.env.KICI_ENV` / `process.env.KICI_PATH`
+ * remain process-global, so Phase 1 forbids `setEnv` / `addPath` / `$KICI_ENV`
+ * writes inside `parallel()` children (compile-time validation); Phase 0 only
+ * makes the file pair per-task.
  */
-function buildStepEnvFileHooks(
-  envFiles: EnvFiles,
+export function buildStepEnvFileHooks(
   operatorSecretKeys: Set<string>,
   maskedSend: (msg: RunnerToAgentMessage) => void,
-): { beforeStepEnvFiles: () => Promise<void>; afterStepApplyEnvFiles: () => Promise<void> } {
+): {
+  beforeStepEnvFiles: (stepIndex: number) => Promise<void>;
+  afterStepApplyEnvFiles: (stepIndex: number) => Promise<void>;
+} {
+  const perStep = new Map<number, EnvFiles>();
   return {
-    beforeStepEnvFiles: async () => {
-      process.env.KICI_ENV = envFiles.envFile;
-      process.env.KICI_PATH = envFiles.pathFile;
+    beforeStepEnvFiles: async (stepIndex: number) => {
+      let files = perStep.get(stepIndex);
+      if (!files) {
+        files = await createEnvFiles(tmpdir());
+        perStep.set(stepIndex, files);
+      }
+      process.env.KICI_ENV = files.envFile;
+      process.env.KICI_PATH = files.pathFile;
     },
-    afterStepApplyEnvFiles: async () => {
+    afterStepApplyEnvFiles: async (stepIndex: number) => {
+      const files = perStep.get(stepIndex);
+      if (!files) return;
+      perStep.delete(stepIndex);
       try {
-        await applyEnvFilesDelta(envFiles, operatorSecretKeys, maskedSend);
+        await applyEnvFilesDelta(files, operatorSecretKeys, maskedSend);
       } catch (err) {
         maskedSend({
           type: 'log.line',
@@ -2454,7 +2522,7 @@ async function main(): Promise<void> {
     });
     return waitForApiResponse(reqId);
   };
-  const { normalizedSteps, refMap, driftDroppedJobs } = await extractAndNormalizeSteps(
+  const { normalizedSteps, nodes, refMap, driftDroppedJobs } = await extractAndNormalizeSteps(
     workflow,
     request,
     apiTransport,
@@ -2507,14 +2575,26 @@ async function main(): Promise<void> {
     maskedSend,
   );
 
-  // Track the most recently created step's secrets handle (for access-log
-  // + mount-record reporting) and the matching dispose closure (called from
-  // the step-loop's `finally` to remove the per-step mount tmpdir + clear
-  // any env vars set via `ctx.secrets.exposeFile`).
-  let currentStepSecrets: TrackedStepSecrets | null = null;
-  let currentStepDispose: (() => Promise<void>) | null = null;
+  // Per-step secrets handle (for access-log + mount-record reporting) and the
+  // matching dispose closure (called from the step-loop's `finally` to remove
+  // the per-step mount tmpdir + clear any env vars set via
+  // `ctx.secrets.exposeFile`), keyed by step index so concurrent steps keep
+  // independent secrets-audit trails.
+  const stepTasks = new StepTaskRegistry();
+  // Per-step abort controllers. Today they are only aborted via the composed
+  // `ctx.signal` when the job is cancelled / times out; Phase 1 fail-fast aborts
+  // an individual step's controller to cancel one in-flight sibling.
+  const stepAbortControllers = new Map<number, AbortController>();
   const createStepCtxWithCapture = (stepIndex: number, stepName: string): StepContext => {
-    captureStepIndex = stepIndex;
+    const stepAbort = new AbortController();
+    stepAbortControllers.set(stepIndex, stepAbort);
+    // ctx.signal aborts when this step's own controller, the job-cancel signal,
+    // or the job-deadline signal fires.
+    const signal = AbortSignal.any([
+      stepAbort.signal,
+      jobCancelAbort.signal,
+      jobDeadlineAbort.signal,
+    ]);
     // Build the secrets handle FIRST so the file-mount host is bound for
     // this step's invocation. The masker is global to the job; mount calls
     // register their (potentially-concatenated) content into it before the
@@ -2523,8 +2603,7 @@ async function main(): Promise<void> {
     const handle = buildStepSecrets(request, masker, () => {
       // No-op: registerSecrets() already rebuilds the masker pattern.
     });
-    currentStepSecrets = handle.secrets;
-    currentStepDispose = handle.dispose;
+    stepTasks.set(stepIndex, { secrets: handle.secrets, dispose: handle.dispose });
     const ctx = createSandboxStepContext(
       stepCwd,
       stepIndex,
@@ -2538,6 +2617,7 @@ async function main(): Promise<void> {
       jobOutputsMap,
       handle.secrets,
       masker,
+      signal,
     );
     if (globalRepoInfo) {
       ctx.workflowRepo = globalRepoInfo.workflowRepo;
@@ -2546,10 +2626,13 @@ async function main(): Promise<void> {
     return ctx;
   };
 
-  const stepEnvHooks = buildStepEnvFileHooks(envFiles, operatorSecretKeys, maskedSend);
+  const stepEnvHooks = buildStepEnvFileHooks(operatorSecretKeys, maskedSend);
   const jobStartTime = Date.now();
   const loopResult = await executeStepLoop({
     steps: normalizedSteps,
+    stepNodes: nodes,
+    abortStep: (stepIndex) => stepAbortControllers.get(stepIndex)?.abort(),
+    getStepAbortSignal: (stepIndex) => stepAbortControllers.get(stepIndex)?.signal,
     checkMode: request.checkMode,
     createStepContext: createStepCtxWithCapture,
     sendIpc: maskedSend,
@@ -2566,21 +2649,22 @@ async function main(): Promise<void> {
     isAborted: () => aborted,
     jobDeadlineSignal: jobDeadlineAbort.signal,
     startTime: jobStartTime,
-    getSecretsAccessLog: () => {
-      // Flush any remaining console output buffered for this step, then
-      // disable capture until the next step's createStepContext sets it again.
+    // Run each step body (and its hooks) inside an async-context capture scope so
+    // console output attributes to that step's index even under Phase 1
+    // concurrency. The flush below runs inside this scope, so a step's trailing
+    // partial line is still attributed to it.
+    runWithStepCapture: runInStepCapture,
+    getSecretsAccessLog: (stepIndex) => {
+      // Flush any remaining console output buffered for this step. Called inside
+      // the step's `runWithStepCapture` scope, so the flush attributes to this
+      // step; the scope unwinds on its own once the step run completes.
       flushOutputCapture();
-      captureStepIndex = -1;
-      return currentStepSecrets?.getAccessLog() ?? [];
+      return stepTasks.getAccessLog(stepIndex);
     },
-    getSecretMountRecords: () => {
-      return currentStepSecrets ? [...currentStepSecrets.getMountRecords()] : [];
-    },
-    disposeStepResources: async () => {
-      const disposeFn = currentStepDispose;
-      currentStepDispose = null;
-      currentStepSecrets = null;
-      if (disposeFn) await disposeFn();
+    getSecretMountRecords: (stepIndex) => stepTasks.getMountRecords(stepIndex),
+    disposeStepResources: (stepIndex) => {
+      stepAbortControllers.delete(stepIndex);
+      return stepTasks.dispose(stepIndex);
     },
     // KICI_ENV / KICI_PATH file callbacks (shared with the init phase via
     // buildStepEnvFileHooks): point process.env at the files before each step,
@@ -2614,11 +2698,9 @@ async function main(): Promise<void> {
       jobStartTime,
       outputsMap,
       createStepCtxWithCapture,
-      disposeStepResources: async () => {
-        const disposeFn = currentStepDispose;
-        currentStepDispose = null;
-        currentStepSecrets = null;
-        if (disposeFn) await disposeFn();
+      disposeStepResources: (stepIndex) => {
+        stepAbortControllers.delete(stepIndex);
+        return stepTasks.dispose(stepIndex);
       },
       maskedSend,
     });

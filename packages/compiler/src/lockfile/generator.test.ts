@@ -22,6 +22,7 @@ import {
   workflowComplete,
   jobComplete,
   genericWebhook,
+  schedule,
   rule,
   z,
 } from '@kici-dev/sdk';
@@ -483,14 +484,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 26', () => {
+  it('schemaVersion is 29', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(26);
-    expect(SCHEMA_VERSION).toBe(26);
+    expect(lockFile.schemaVersion).toBe(29);
+    expect(SCHEMA_VERSION).toBe(29);
   });
 
   it('serializes runsOnPick: deterministic by default and any when set', () => {
@@ -1358,7 +1359,7 @@ describe('generator - auto-IDs and bare function normalization', () => {
 
 describe('generator - environment/env/concurrencyGroup', () => {
   describe('environment extraction', () => {
-    it('extracts static environment string', () => {
+    it('normalizes a static singular environment to environments[]', () => {
       const s = step('deploy', async () => {});
       const j = job('deploy', {
         runsOn: 'linux',
@@ -1370,46 +1371,46 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environment).toBe('production');
+        expect(lockJob.environments).toEqual([{ value: 'production', dynamic: false }]);
+        expect(lockJob).not.toHaveProperty('environment');
         expect(lockJob).not.toHaveProperty('dynamicEnvironment');
       }
     });
 
-    it('sets dynamicEnvironment flag for impure (async) function environment', () => {
-      const s = step('deploy', async () => {});
-      const j = job('deploy', {
-        runsOn: 'linux',
-        steps: [s],
-        environment: async () => 'staging',
-      });
-      const w = workflow('ci', { jobs: [j] });
-
-      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.dynamicEnvironment).toBe(true);
-        expect(lockJob).not.toHaveProperty('environment');
-      }
-    });
-
-    it('inlines pure environment function as LockInlineValue', () => {
+    it('emits environments[] in order, marking dynamic elements', () => {
       const s = step('deploy', async () => {});
       const envFn = (event: { ref: string }) => event.ref.split('/').pop();
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environment: envFn as unknown as () => Promise<string>,
+        environments: ['staging', envFn as unknown as () => Promise<string>],
       });
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.dynamicEnvironment).toBe(true);
-        expect(lockJob.environment).toEqual({
-          _type: 'inline',
-          expression: envFn.toString(),
+        expect(lockJob.environments?.[0]).toEqual({ value: 'staging', dynamic: false });
+        expect(lockJob.environments?.[1]).toEqual({
+          value: { _type: 'inline', expression: envFn.toString() },
+          dynamic: true,
         });
+      }
+    });
+
+    it('marks an impure (async) function element dynamic with no inline value', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        environments: [async () => 'staging'],
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.environments).toEqual([{ value: '', dynamic: true }]);
       }
     });
 
@@ -1436,8 +1437,8 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('environments');
         expect(lockJob).not.toHaveProperty('environment');
-        expect(lockJob).not.toHaveProperty('dynamicEnvironment');
       }
     });
   });
@@ -1591,7 +1592,7 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environment).toBe('production');
+        expect(lockJob.environments).toEqual([{ value: 'production', dynamic: false }]);
         expect(lockJob.env).toEqual({ DEPLOY_TARGET: 'aws' });
         expect(lockJob.concurrencyGroup).toBe('deploy-prod');
       }
@@ -2446,5 +2447,47 @@ describe('runsOn glob/regex compilation', () => {
     } else {
       throw new Error('expected static job');
     }
+  });
+});
+
+describe('schedule inputs in lock file', () => {
+  function findScheduleTrigger(w: ReturnType<typeof workflow>) {
+    const lock = generateLockFile([makeWorkflowWithSource(w)]);
+    return lock.workflows[0].triggers.find((t) => t._type === 'schedule');
+  }
+
+  it('extracts a defaulted schedule input descriptor into the lock', () => {
+    const w = workflow('sched-inputs', {
+      on: [
+        schedule({
+          cron: '0 0 * * *',
+          inputs: { mode: z.enum(['full', 'quick']).default('full') },
+        }),
+      ],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    const trig = findScheduleTrigger(w);
+    expect(trig?._type).toBe('schedule');
+    if (trig?._type === 'schedule') {
+      expect(trig.inputs?.mode).toMatchObject({ type: 'enum', default: 'full' });
+    }
+  });
+
+  it('compiles an optional-no-default schedule input', () => {
+    const w = workflow('sched-opt', {
+      on: [schedule({ cron: '0 0 * * *', inputs: { note: z.string().optional() } })],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).not.toThrow();
+  });
+
+  it('rejects a required-no-default schedule input at compile time', () => {
+    const w = workflow('sched-bad', {
+      on: [schedule({ cron: '0 0 * * *', inputs: { name: z.string() } })],
+      jobs: [job('j', { runsOn: ['default'], run: async () => {} })],
+    });
+    expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
+      /schedule input "name" must declare a \.default\(\) or be \.optional\(\)/,
+    );
   });
 });

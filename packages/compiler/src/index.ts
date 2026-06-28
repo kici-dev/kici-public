@@ -8,7 +8,7 @@ export type { ValidationResult } from './validation/index.js';
 export { generateLockFile, serializeLockFile } from './lockfile/index.js';
 
 // Lock file types
-export { SCHEMA_VERSION, isLockStaticJob } from './types.js';
+export { SCHEMA_VERSION, isLockStaticJob, isLockParallelStep } from './types.js';
 export type {
   LockFile,
   LockWorkflow,
@@ -21,6 +21,8 @@ export type {
   LockMatrix,
   LockRule,
   LockStep,
+  LockParallelStep,
+  LockStepEntry,
   LockApproval,
   LockSource,
   LockBranchPattern,

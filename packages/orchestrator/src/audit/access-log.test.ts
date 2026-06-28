@@ -144,6 +144,44 @@ describe('AccessLogWriter (mocked — failure swallow)', () => {
   });
 });
 
+describe('AccessLogWriter (mocked — agent label column)', () => {
+  function captureWriter() {
+    const valuesFn = vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) }));
+    const db = { insertInto: vi.fn(() => ({ values: valuesFn })) } as unknown as Kysely<Database>;
+    return { writer: new AccessLogWriter(db), valuesFn };
+  }
+
+  it('writes agent_label when the actor is an agent-annotated user', async () => {
+    const { writer, valuesFn } = captureWriter();
+    await writer.record({
+      orgId: 'org-1',
+      routingKey: 'rk',
+      actor: { type: 'user', sub: 'u1', agent: { patId: 'p1', label: 'e2e-agent' } },
+      action: 'run.structured.read',
+      target: { type: 'run', id: 'run-1' },
+      requestId: 'req-1',
+      source: 'platform_proxy',
+      outcome: 'denied',
+    });
+    expect(valuesFn.mock.calls[0][0]).toMatchObject({ agent_label: 'e2e-agent' });
+  });
+
+  it('writes null agent_label for a plain user actor', async () => {
+    const { writer, valuesFn } = captureWriter();
+    await writer.record({
+      orgId: 'org-1',
+      routingKey: 'rk',
+      actor: { type: 'user', sub: 'u1' },
+      action: 'run.structured.read',
+      target: { type: 'run', id: 'run-1' },
+      requestId: 'req-1',
+      source: 'platform_proxy',
+      outcome: 'denied',
+    });
+    expect(valuesFn.mock.calls[0][0]).toMatchObject({ agent_label: null });
+  });
+});
+
 describe('AccessLogWriter (mocked — best-effort contract)', () => {
   // Every caller uses `void this.accessLog.record(...)` (fire-and-forget),
   // so an unhandled rejection from any code path inside record() would

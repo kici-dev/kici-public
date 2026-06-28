@@ -5,7 +5,7 @@ description: End-to-end data flows through the KiCI three-tier architecture
 
 This document describes the key data flows through the KiCI architecture: webhook delivery, job execution, developer-initiated remote runs, dependency caching, re-run and cancel, trace ID propagation, internal event routing, and generic webhook ingestion.
 
-> **Lock file schema version:** The lock file uses schema version 21, which adds the `CheckMode` / `CheckStepOutcome` enums for check-mode step execution on top of v20's `LabelMatcher` (exact/regex) selectors for `runsOn`/`runsOnAll`/`excludeLabels`, v19's `maxParallel`/`failFast` fan-out concurrency, v18's `runsOnAll` host fan-out predicate and `onUnreachable` policy, v17's typed init presets (`mise` / `{ mise }`) and `auto` detection, v16's normalized approval config, v15's per-job init config, v14's declarative cache specs, v11's `LockInlineValue` for pure function inline evaluation, v10's simplified negative patterns (! prefix in repos/paths arrays), v9's global workflow repos matching, and v8's runsOn polymorphic type support.
+> **Lock file schema version:** The lock file uses schema version 29. The orchestrator rejects any fetched lock whose `schemaVersion` does not exactly match the engine version it was built against, so a stale lock must be recompiled with `kici compile` and pushed again after any SDK upgrade that bumps the schema.
 
 ## Webhook delivery flow
 
@@ -211,7 +211,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 21.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 29.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -779,7 +779,7 @@ The compiler processes the workflow definition:
 
 ### Execution time (local test runner)
 
-When `kici test` runs a workflow:
+When `kici run local` runs a workflow:
 
 1. **SDK module resolution:** The runner resolves `setStepOutputsMap` / `setJobOutputsMap` from the same `@kici-dev/sdk` module instance that the workflow uses (ensures the proxy reads from the same map)
 2. **Map injection:** Fresh `OutputsMap` and `StepRefMap` are created and injected via `setStepOutputsMap()` / `setStepRefMap()` before each job

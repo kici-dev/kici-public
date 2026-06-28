@@ -40,6 +40,14 @@ const baseSchema = z.object({
    */
   dashboardUrl: z.string().optional(),
   /**
+   * Provenance trust root (the OIDC issuer) used to verify build-provenance
+   * bundles. The live process learns this over the Platform `auth.success`
+   * connect message; this config/env value is the source for the CLI backfill
+   * (`kici-admin attestations reverify`), which has no live handshake. When
+   * unset, the orchestrator records attestation verdicts as `unverifiable`.
+   */
+  provenanceIssuer: z.string().optional(),
+  /**
    * Public base URL at which this orchestrator's own webhook ingress is
    * reachable (independent/hybrid self-serve generic webhooks:
    * `<base>/webhook/<customerId>/generic/<sourceId>`). Used by
@@ -86,7 +94,7 @@ const baseSchema = z.object({
   cacheStorageType: z.enum(['s3', 'filesystem']).optional(),
   cacheStoragePath: z.string().optional(), // legacy, used for log storage filesystem fallback
   cacheStorageS3Bucket: z.string().optional(), // S3 only
-  cacheStorageS3Prefix: z.string().default('kici-cache/'), // S3 only
+  cacheStorageS3Prefix: z.string().default(''), // S3 only — empty; the bucket already scopes the cache
   cacheStorageS3Region: z.string().optional(), // S3 only
   cacheStorageS3Endpoint: z.string().optional(), // S3-compatible endpoint (SeaweedFS, LocalStack)
   cacheStorageS3ExternalEndpoint: z.string().optional(), // Separate endpoint for pre-signed URLs (agents)
@@ -442,6 +450,7 @@ export const envDef = defineEnv({
     platformUrl: 'KICI_PLATFORM_URL',
     platformToken: 'KICI_PLATFORM_TOKEN',
     dashboardUrl: 'KICI_DASHBOARD_URL',
+    provenanceIssuer: 'KICI_PROVENANCE_ISSUER',
     webhookPublicUrl: 'KICI_WEBHOOK_PUBLIC_URL',
     databaseUrl: 'KICI_DATABASE_URL',
     cacheStorageType: 'KICI_STORAGE_TYPE',

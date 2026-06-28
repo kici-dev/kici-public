@@ -148,6 +148,33 @@ interface SecretOutputsResponse {
   outputs: SecretOutputDTO[];
 }
 
+/** An untrusted-envelope value (or null) as returned by /structured. */
+type UntrustedOrNull = { untrusted: true; value: string } | null;
+
+/** Minimal AgentRunResult shape for human rendering (full type lives in engine). */
+interface AgentRunResultDTO {
+  runId: string;
+  workflowName: UntrustedOrNull;
+  status: string;
+  failureCategory: string | null;
+  failureReason: UntrustedOrNull;
+  repoIdentifier: UntrustedOrNull;
+  ref: UntrustedOrNull;
+  sha: string;
+  durationMs: number | null;
+  jobs: Array<{
+    jobName: UntrustedOrNull;
+    status: string;
+    steps: Array<{
+      stepIndex: number;
+      stepName: UntrustedOrNull;
+      status: string;
+      exitCode: number | null;
+      durationMs: number | null;
+    }>;
+  }>;
+}
+
 /**
  * Render an aligned ASCII table.
  * Same pattern as workflow.ts — deliberately no cli-table dependency.
@@ -357,6 +384,68 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             ]);
             console.log(renderTable(stepHeaders, stepRows));
           }
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  // ── runs structured <runId> ────────────────────────────────────
+  // Machine-first provenance-tagged run result. --json is lossless (untrusted
+  // envelopes preserved); the human view unwraps for display only.
+  runs
+    .command('structured <runId>')
+    .description(
+      'Show the provenance-tagged structured run result (agent read path; /structured)',
+    )
+    .option('--json', 'Emit the raw AgentRunResult (untrusted envelopes preserved)')
+    .action(async (runId: string, opts) => {
+      try {
+        const result = (await getClient().getRunStructured(runId)) as unknown as AgentRunResultDTO;
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+        const uv = (v: UntrustedOrNull): string =>
+          v == null ? '-' : typeof v === 'object' ? v.value : String(v);
+
+        console.log(`Run: ${result.runId}`);
+        console.log(`  Workflow:    ${uv(result.workflowName)}`);
+        console.log(`  Status:      ${result.status}`);
+        console.log(`  Failure:     ${result.failureCategory ?? '-'}`);
+        if (result.failureReason) console.log(`  Reason:      ${uv(result.failureReason)}`);
+        console.log(`  Repo:        ${uv(result.repoIdentifier)}`);
+        console.log(`  Ref:         ${uv(result.ref)}`);
+        console.log(`  SHA:         ${result.sha}`);
+        console.log(`  Duration:    ${formatDuration(result.durationMs)}`);
+
+        if (result.jobs.length === 0) {
+          console.log('\nNo jobs.');
+          return;
+        }
+        console.log('');
+        const jobHeaders = ['job', 'status', 'failed_steps'];
+        const jobRows = result.jobs.map((j) => [
+          uv(j.jobName),
+          j.status,
+          String(j.steps.filter((s) => s.exitCode != null && s.exitCode !== 0).length),
+        ]);
+        console.log(renderTable(jobHeaders, jobRows));
+
+        for (const job of result.jobs) {
+          if (job.steps.length === 0) continue;
+          console.log('');
+          console.log(`Steps for ${uv(job.jobName)}:`);
+          const stepHeaders = ['#', 'name', 'status', 'exit', 'duration'];
+          const stepRows = job.steps.map((s) => [
+            String(s.stepIndex),
+            uv(s.stepName),
+            s.status,
+            s.exitCode != null ? String(s.exitCode) : '-',
+            formatDuration(s.durationMs),
+          ]);
+          console.log(renderTable(stepHeaders, stepRows));
         }
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

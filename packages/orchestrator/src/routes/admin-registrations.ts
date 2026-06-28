@@ -13,6 +13,9 @@ import type { RegistrationStore } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
+import type { EnvironmentStore } from '../environments/environment-store.js';
+import { toEnvironment } from '../environments/environment-store.js';
+import { assertWorkflowsSatisfiable } from '../environments/protection/satisfiability.js';
 import { handleAdminError } from './admin-errors.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 
@@ -26,6 +29,13 @@ export interface AdminRegistrationRoutesDeps {
   registrationIndex: RegistrationIndex;
   tokenManager: TokenManager;
   rbac: RbacEnforcer;
+  /**
+   * Resolves a bound environment by name for registration-time satisfiability.
+   * When present, a manual registration is rejected up front if a job binds a
+   * provably-unsatisfiable environment list (missing/disabled env, or
+   * mutually-exclusive fixed branch/trigger/repo restrictions).
+   */
+  environmentStore?: Pick<EnvironmentStore, 'matchEnvironment'>;
 }
 
 /** Hono env type for admin registration routes with context variables. */
@@ -205,6 +215,23 @@ export function createAdminRegistrationRoutes(
       }
       if (!Array.isArray((lockFile as { workflows?: unknown }).workflows)) {
         return c.json({ error: 'lock file missing workflows[] array' }, 400);
+      }
+
+      // Proactive satisfiability: reject a manual registration whose job binds a
+      // provably-unsatisfiable environment list before it ever dispatches.
+      if (deps.environmentStore) {
+        const envStore = deps.environmentStore;
+        try {
+          await assertWorkflowsSatisfiable(
+            lockFile.workflows as Parameters<typeof assertWorkflowsSatisfiable>[0],
+            async (name) => {
+              const row = await envStore.matchEnvironment(parsed.customerId, name);
+              return row ? toEnvironment(row) : null;
+            },
+          );
+        } catch (err) {
+          return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+        }
       }
 
       await deps.registrationStore.replaceAll(

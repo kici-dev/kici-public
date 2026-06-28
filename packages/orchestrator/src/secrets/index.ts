@@ -12,7 +12,13 @@ export {
   loadSecretStoreConfig,
   type SecretStoreConfig,
 } from './config.js';
-export { encrypt, decrypt, deriveKey, generateMasterKey, type EncryptedValue } from './crypto.js';
+export {
+  encrypt,
+  decrypt,
+  deriveKey,
+  generateMasterKey,
+  type EncryptedValue,
+} from '@kici-dev/shared';
 export { VaultSecretStore, type VaultConfig } from './vault-secret-store.js';
 export {
   SecretResolver,

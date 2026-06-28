@@ -36,6 +36,15 @@ export const authSuccessSchema = z.object({
    * remote-source provisioning.
    */
   orgId: z.string().optional(),
+  /**
+   * Provenance trust root (the OIDC issuer) the Platform mints build-provenance
+   * tokens under. The orchestrator uses it to verify provenance bundles at
+   * ingest: it derives the JWKS URI (`<issuer>/.well-known/jwks.json`) and
+   * caches the key set. `null` (or absent) means provenance is not configured —
+   * the orchestrator records each attestation's verdict as `unverifiable`
+   * rather than silently `verified`.
+   */
+  provenanceIssuer: z.string().nullable().optional(),
 });
 
 /** Auth failure response sent by Platform to orchestrator when authentication fails. */

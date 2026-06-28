@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleManualSchedule } from './manual-schedule.js';
+import { buildManualJobConfig, handleManualSchedule } from './manual-schedule.js';
+import type { LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 
 function makeRegistration(overrides: Record<string, unknown> = {}) {
   return {
@@ -268,5 +269,44 @@ describe('handleManualSchedule', () => {
         (h.deps as { eventRouter: { emit: ReturnType<typeof vi.fn> } }).eventRouter.emit,
       ).not.toHaveBeenCalled();
     });
+  });
+});
+
+function fakeScheduleWorkflow(inputs?: Record<string, unknown>): LockWorkflow {
+  return {
+    name: 'sched-wf',
+    source: 'test/repo',
+    triggers: [
+      {
+        _type: 'schedule',
+        cronExpression: '0 0 * * *',
+        timezone: 'UTC',
+        ...(inputs && { inputs }),
+      },
+    ],
+    jobs: [],
+  } as unknown as LockWorkflow;
+}
+
+function fakeMat(): MaterializedJob {
+  return {
+    expandedName: 'j',
+    baseName: 'j',
+    lockJob: { _type: 'static', name: 'j', steps: [], needs: [], rules: [] },
+  } as unknown as MaterializedJob;
+}
+
+describe('buildManualJobConfig dispatchInputs', () => {
+  it('stamps defaults-only schedule inputs onto the job config', () => {
+    const wf = fakeScheduleWorkflow({
+      mode: { type: 'enum', values: ['full', 'quick'], default: 'full' },
+    });
+    const cfg = buildManualJobConfig(wf, fakeMat());
+    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
+  });
+
+  it('omits dispatchInputs when the schedule declares no inputs', () => {
+    const cfg = buildManualJobConfig(fakeScheduleWorkflow(), fakeMat());
+    expect('dispatchInputs' in cfg).toBe(false);
   });
 });

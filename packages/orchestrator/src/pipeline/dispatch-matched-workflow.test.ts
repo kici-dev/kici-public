@@ -319,7 +319,9 @@ function makeSingleJobContext(over: {
         steps: [{ name: 'echo', run: 'echo hi' }],
         needs: [],
         rules: [],
-        ...(over.jobEnvironment ? { environment: over.jobEnvironment } : {}),
+        ...(over.jobEnvironment
+          ? { environments: [{ value: over.jobEnvironment, dynamic: false }] }
+          : {}),
       },
     ],
   } as unknown as LockWorkflow;
@@ -698,10 +700,13 @@ describe('dispatchMatchedWorkflow — checkMode threading', () => {
   // checkMode argument so the execution_runs.check_mode column is persisted —
   // otherwise computeRunStatus can never fail a drifted check-fail-on-drift run.
   // onExecutionStarted's signature ends with (..., workflowConcurrency,
-  // workflowTimeoutMs, checkMode); checkMode is the final positional arg.
+  // workflowTimeoutMs, checkMode, localWorkingTree); checkMode is the
+  // second-to-last positional arg.
   function lastCallCheckMode(mock: ReturnType<typeof vi.fn>): unknown {
     const call = mock.mock.calls.at(-1);
-    return call?.[call.length - 1];
+    // Trailing args: …, checkMode, localWorkingTree, triggerActorUsername,
+    // triggerActorUserId → checkMode is the 4th from the end.
+    return call?.[call.length - 4];
   }
 
   it('threads ctx.extraJobConfig.checkMode into onExecutionStarted', async () => {

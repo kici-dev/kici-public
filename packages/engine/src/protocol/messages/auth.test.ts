@@ -72,6 +72,26 @@ describe('authSuccessSchema', () => {
     expect(msg.orgId).toBe('org_abc123def456');
     expect(msg.orgPublicAlias).toBe('oal_x');
   });
+
+  it('accepts an optional provenanceIssuer on auth.success', () => {
+    expect(
+      authSuccessSchema.safeParse({
+        type: 'auth.success',
+        connectionId: 'c1',
+        provenanceIssuer: 'https://issuer.example',
+      }).success,
+    ).toBe(true);
+    expect(
+      authSuccessSchema.safeParse({
+        type: 'auth.success',
+        connectionId: 'c1',
+        provenanceIssuer: null,
+      }).success,
+    ).toBe(true);
+    expect(authSuccessSchema.safeParse({ type: 'auth.success', connectionId: 'c1' }).success).toBe(
+      true,
+    );
+  });
 });
 
 describe('authFailureSchema', () => {

@@ -29,14 +29,28 @@ interface StepStartMessage {
   stepName: string;
   /** Distinguishes regular steps from hook executions (e.g., 'hook:onCancel', 'hook:cleanup'). Defaults to 'step'. */
   step_type?: string;
+  /**
+   * Initial state for the step. Defaults to `running`. A parallel-group child
+   * queued behind `maxParallel` is announced as `pending` before it acquires a
+   * slot; it later emits a second `step.start` with `running` when it launches.
+   */
+  state?: 'running' | 'pending';
+  /** Step concurrency role; absent means an ordinary sequential step. */
+  concurrencyKind?: string;
+  /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
+  groupId?: string;
 }
 
-/** A step has completed (success, failure, or a check-mode skip). */
+/** A step has completed (success, failure, check-mode skip, or fail-fast cancel). */
 interface StepCompleteMessage {
   type: 'step.complete';
   stepIndex: number;
-  status: 'success' | 'failed' | 'skipped';
+  status: 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs: number;
+  /** Step concurrency role; absent means an ordinary sequential step. */
+  concurrencyKind?: string;
+  /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
+  groupId?: string;
   error?: {
     message: string;
     exitCode?: number;
@@ -501,7 +515,7 @@ export interface JobExecutionRequest {
   provider?: string;
   /** Whether to checkout the repo (default: true). */
   checkout?: boolean;
-  /** Whether this job is part of a test run triggered by `kici test`. */
+  /** Whether this job is part of a developer-initiated run triggered by `kici run`. */
   isTestRun?: boolean;
   /**
    * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`).

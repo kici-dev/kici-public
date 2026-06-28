@@ -163,6 +163,7 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   selectTerminal.where = vi.fn().mockReturnValue(selectTerminal);
   selectTerminal.orderBy = vi.fn().mockReturnValue(selectTerminal);
   selectTerminal.limit = vi.fn().mockReturnValue(selectTerminal);
+  selectTerminal.offset = vi.fn().mockReturnValue(selectTerminal);
   selectTerminal.or = vi.fn().mockReturnValue(selectTerminal);
   selectTerminal.returningAll = vi.fn().mockReturnValue(selectTerminal);
   selectTerminal.forUpdate = vi.fn().mockReturnValue(selectTerminal);
@@ -197,6 +198,10 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
     // terminal. Mirrors selectTerminal's own join methods.
     innerJoin: vi.fn().mockImplementation(() => selectFromReturn),
     leftJoin: vi.fn().mockImplementation(() => selectFromReturn),
+    // `.where()` applied before `.select()` (filter builders that narrow the
+    // base query) chains back to the same object so a following `.select()`
+    // still reaches the terminal.
+    where: vi.fn().mockImplementation(() => selectFromReturn),
   };
   const selectFrom = vi.fn().mockReturnValue(selectFromReturn);
 

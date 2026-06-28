@@ -28,6 +28,7 @@ import { registerSourceCommands } from './commands/source.js';
 import { registerRemoteSourceCommands } from './commands/remote-source.js';
 import { registerWorkflowCommands } from './commands/workflow.js';
 import { registerRunsCommands } from './commands/runs.js';
+import { registerAttestationsCommands } from './commands/attestations.js';
 import { registerEventLogCommands } from './commands/event-log.js';
 import { registerAccessLogCommands } from './commands/access-log.js';
 import { registerBackendCommands } from './commands/backend.js';
@@ -100,6 +101,7 @@ export function buildProgram(): Command {
   registerRemoteSourceCommands(program);
   registerWorkflowCommands(program, getClient);
   registerRunsCommands(program, getClient);
+  registerAttestationsCommands(program);
   registerEventLogCommands(program, getClient);
   registerAccessLogCommands(program, getClient);
   registerBackendCommands(program, getClient);

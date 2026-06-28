@@ -182,7 +182,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 21, which adds the `CheckMode` / `CheckStepOutcome` enums for check-mode step execution on top of v20's `LabelMatcher` (exact/regex) selectors for `runsOn`/`runsOnAll`/`excludeLabels`, v19's `maxParallel`/`failFast` fan-out concurrency, v18's `runsOnAll` host fan-out predicate and `onUnreachable` policy, v17's typed init presets (`mise` / `{ mise }`) and `auto` detection, v16's normalized approval config, v15's per-job init config, v14's declarative cache specs, v11's inline value evaluation, v10's simplified negative patterns, v9's global workflow matching, and v8's runsOn polymorphic type support.
+Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 29; the orchestrator rejects any fetched lock whose `schemaVersion` does not exactly match the version it was compiled against, so a stale lock must be recompiled with `pnpm kici compile` and pushed again.
 
 ### Prometheus metrics
 

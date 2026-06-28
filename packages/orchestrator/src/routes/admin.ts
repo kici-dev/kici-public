@@ -147,6 +147,7 @@ const createTokenSchema = z.object({
 
 const createAgentTokenSchema = z.object({
   labels: z.array(z.string()).optional(),
+  mandatoryLabels: z.array(z.string()).optional(),
   createdBy: z.string().optional(),
 });
 
@@ -474,6 +475,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       const parsed = createAgentTokenSchema.parse(body);
       const result = await deps.tokenStore.createStatic({
         labels: parsed.labels,
+        mandatoryLabels: parsed.mandatoryLabels,
         createdBy: parsed.createdBy ?? c.get('userId'),
       });
       // Fetch the created row for full response (without hash)

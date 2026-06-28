@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Command } from 'commander';
+import { PRIVILEGED_ROOT_LABEL } from '@kici-dev/engine';
 
 // Mock pg pool — agent direct-DB list uses createPool from @kici-dev/shared
 const mockPoolQuery = vi.fn();
@@ -81,6 +82,47 @@ describe('kici-admin agent CLI', () => {
     delete process.env.KICI_DATABASE_URL;
     mockPoolQuery.mockReset();
     mockPoolEnd.mockReset();
+  });
+
+  it('register --privileged-root adds the root label to both labels and mandatoryLabels', async () => {
+    const client = makeMockClient();
+    client.createAgentToken.mockResolvedValue({ id: 'tok-x', token: 'kat_secret' });
+    const { stdout, exitCode } = await runCommand(
+      ['agent', 'register', '--labels', 'linux', '--privileged-root'],
+      client,
+    );
+    expect(exitCode).toBeNull();
+    expect(client.createAgentToken).toHaveBeenCalledWith({
+      labels: ['linux', PRIVILEGED_ROOT_LABEL],
+      mandatoryLabels: [PRIVILEGED_ROOT_LABEL],
+    });
+    expect(stdout).toContain('Taint:');
+    expect(stdout).toContain(PRIVILEGED_ROOT_LABEL);
+  });
+
+  it('register --mandatory-label is repeatable and unions into the authorized labels', async () => {
+    const client = makeMockClient();
+    client.createAgentToken.mockResolvedValue({ id: 'tok-y', token: 'kat_secret' });
+    const { exitCode } = await runCommand(
+      ['agent', 'register', '--mandatory-label', 'a', '--mandatory-label', 'b'],
+      client,
+    );
+    expect(exitCode).toBeNull();
+    expect(client.createAgentToken).toHaveBeenCalledWith({
+      labels: ['a', 'b'],
+      mandatoryLabels: ['a', 'b'],
+    });
+  });
+
+  it('register with no taint flags omits mandatoryLabels', async () => {
+    const client = makeMockClient();
+    client.createAgentToken.mockResolvedValue({ id: 'tok-z', token: 'kat_secret' });
+    const { exitCode } = await runCommand(['agent', 'register', '--labels', 'linux'], client);
+    expect(exitCode).toBeNull();
+    expect(client.createAgentToken).toHaveBeenCalledWith({
+      labels: ['linux'],
+      mandatoryLabels: undefined,
+    });
   });
 
   it('list (no flag) uses HTTP listAgentTokens', async () => {

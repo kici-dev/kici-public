@@ -374,4 +374,100 @@ describe('admin registration routes', () => {
       expect(res.status).toBe(404);
     });
   });
+
+  // ---- POST /registrations/register-manual (satisfiability) ----
+
+  describe('POST /registrations/register-manual', () => {
+    // Returns the DB-row shape `matchEnvironment` resolves; the route converts it
+    // via `toEnvironment` before the satisfiability check.
+    function envRecord(name: string, branchRestrictions: string[]) {
+      return {
+        id: `id-${name}`,
+        org_id: 'cust-1',
+        name,
+        type: 'fixed',
+        glob_pattern: null,
+        branch_restrictions: JSON.stringify(branchRestrictions),
+        trigger_type_filters: '[]',
+        repo_patterns: '[]',
+        concurrency_limit: null,
+        concurrency_strategy: 'queue',
+        concurrency_timeout_ms: 0,
+        required_reviewers: null,
+        wait_timer_seconds: null,
+        hold_expiry_seconds: 3600,
+        minimum_trust: null,
+        allow_local_execution: false,
+        enabled: true,
+        created_at: new Date('2026-01-01'),
+        updated_at: new Date('2026-01-01'),
+        created_by: 'tester',
+      };
+    }
+
+    function lockBody(envValues: string[]) {
+      return {
+        repoIdentifier: 'owner/repo',
+        routingKey: 'github:42',
+        customerId: 'cust-1',
+        lockFileContents: JSON.stringify({
+          workflows: [
+            {
+              name: 'ci',
+              jobs: [
+                {
+                  name: 'deploy',
+                  environments: envValues.map((v) => ({ value: v, dynamic: false })),
+                },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+
+    it('rejects a mutually-exclusive multi-env binding with a precise message', async () => {
+      const matchEnvironment = vi.fn(async (_org: string, name: string) =>
+        name === 'staging' ? envRecord('staging', ['main']) : envRecord('testing', ['develop']),
+      );
+      deps = createMockDeps({
+        registrationStore: { ...(createMockDeps().registrationStore as any), replaceAll: vi.fn() },
+        environmentStore: { matchEnvironment } as any,
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+
+      const res = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: lockBody(['staging', 'testing']),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('mutually exclusive');
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+    });
+
+    it('accepts a satisfiable multi-env binding', async () => {
+      const matchEnvironment = vi.fn(async (_org: string, name: string) =>
+        envRecord(name, ['main']),
+      );
+      deps = createMockDeps({
+        registrationStore: {
+          ...(createMockDeps().registrationStore as any),
+          replaceAll: vi.fn(),
+          bumpVersion: vi.fn().mockResolvedValue(7),
+        },
+        environmentStore: { matchEnvironment } as any,
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+
+      const res = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: lockBody(['staging', 'testing']),
+      });
+      expect(res.status).toBe(200);
+      expect(deps.registrationStore.replaceAll).toHaveBeenCalled();
+    });
+  });
 });

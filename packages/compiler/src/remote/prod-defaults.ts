@@ -18,3 +18,12 @@ export const PROD_OIDC_ISSUER = 'https://auth.kici.dev/realms/kici-internal';
 
 /** Public OIDC client id registered for the `kici` CLI. */
 export const PROD_OIDC_CLIENT_ID = 'kici-cli';
+
+/**
+ * Provenance trust root for `kici verify-attestation` when `--trust-root` is
+ * omitted: the hosted KiCI Platform's provenance issuer. The verifier appends
+ * `/.well-known/openid-configuration` and pins the token issuer to it. Pass
+ * `--trust-root` to verify against a different environment (e.g. staging) or an
+ * offline `{ issuer, jwks }` file.
+ */
+export const PROD_PROVENANCE_ISSUER = 'https://api.kici.dev';

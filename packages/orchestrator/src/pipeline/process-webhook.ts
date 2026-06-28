@@ -434,6 +434,7 @@ async function dispatchOneCrossSourceCandidate(args: {
       runId: crossRunId,
       trustResolution: undefined,
       lockFileSource: undefined,
+      localWorkingTree: false,
       crossSource: true,
       crossSourceDeliveryId: crossDedupKey,
       effectiveRoutingKey: reg.routingKey,
@@ -1533,6 +1534,7 @@ async function dispatchMatchedSameSourceWorkflows(args: {
       runId,
       trustResolution,
       lockFileSource,
+      localWorkingTree: false,
       crossSource: false,
       effectiveRoutingKey: resolvedFallbackRoutingKey ?? undefined,
       effectiveProvider: resolvedFallbackBundle

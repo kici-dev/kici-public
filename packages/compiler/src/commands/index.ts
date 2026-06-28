@@ -6,8 +6,8 @@ export { watchCommand } from './watch.js';
 export { fixtureCommand } from './fixture.js';
 export type { FixtureOptions } from './fixture.js';
 
-export { testCommand, testDryRun } from './test.js';
-export type { TestOptions, RemoteRunOptions, RemoteRunResult } from './test.js';
+export { previewCommand, previewEvent } from './preview.js';
+export type { PreviewOptions, RemoteRunOptions, RemoteRunResult } from './preview.js';
 
 export { runLocalCommand, runRemoteCommand } from './run.js';
 
@@ -22,6 +22,9 @@ export type { LoginOptions } from './login.js';
 
 export { secretsListCommand } from './secrets-list.js';
 export type { SecretsListOptions } from './secrets-list.js';
+
+export { patCreateCommand } from './pat.js';
+export type { PatCreateOptions } from './pat.js';
 
 export { runsListCommand } from './runs/list.js';
 export type { RunsListOptions } from './runs/list.js';

@@ -48,11 +48,15 @@ export class AgentTokenStore {
    * Static tokens have no expiry and are intended for manually-registered agents.
    *
    * @param opts.labels - Optional agent labels this token is authorized for.
+   * @param opts.mandatoryLabels - Optional taint labels (a Kubernetes-taint-style
+   *   gate): a static agent registering with this token only accepts a job when
+   *   every label here appears in the job's required labels. Undefined = no taint.
    * @param opts.createdBy - Optional creator identifier (e.g. "cli:admin").
    * @returns The plaintext token (shown once) and the DB row ID.
    */
   async createStatic(opts: {
     labels?: string[];
+    mandatoryLabels?: string[];
     createdBy?: string;
   }): Promise<{ token: string; id: string }> {
     const token = generateToken();
@@ -65,6 +69,7 @@ export class AgentTokenStore {
         token_hash: tokenHash,
         token_prefix: tokenPrefix,
         labels: opts.labels ? JSON.stringify(opts.labels) : null,
+        mandatory_labels: opts.mandatoryLabels ? JSON.stringify(opts.mandatoryLabels) : null,
         agent_type: 'static',
         created_by: opts.createdBy ?? null,
         expires_at: null,
@@ -236,6 +241,7 @@ export class AgentTokenStore {
         'id',
         'token_prefix',
         'labels',
+        'mandatory_labels',
         'agent_type',
         'created_at',
         'last_seen_at',

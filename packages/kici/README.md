@@ -1,6 +1,6 @@
 # KiCI
 
-> TypeScript-native CI/CD that runs on your infrastructure — define your CI in TypeScript, test it locally, and we never see your source or secrets.
+> TypeScript-native CI/CD that runs on your infrastructure — define your CI in typed TypeScript an AI agent can author and type-check, run every job confined on your own machines, and we never see your source or secrets.
 
 `kici` is the developer CLI for [KiCI](https://kici.dev): scaffold a `.kici/` workflow directory, compile workflows, dry-run them against synthetic or real events, and execute them locally or against a remote orchestrator.
 
@@ -9,7 +9,7 @@
 ```bash
 npm install -g kici
 kici init
-kici test pr:open
+kici preview pr:open
 kici run local push
 ```
 
@@ -21,7 +21,7 @@ Full quickstart with the hosted dashboard and a customer-deployed orchestrator: 
 | --------------------------------------------------------------------------------------------------- | ------------- | -------------------------------------------------------------------- |
 | [`kici`](https://github.com/kici-dev/kici-public/tree/main/packages/kici)                           | Apache-2.0    | Developer CLI wrapper — author + drive workflows                     |
 | [`@kici-dev/sdk`](https://github.com/kici-dev/kici-public/tree/main/packages/sdk)                   | Apache-2.0    | Workflow definition SDK (`workflow`, `job`, `step`, triggers)        |
-| [`@kici-dev/compiler`](https://github.com/kici-dev/kici-public/tree/main/packages/compiler)         | Apache-2.0    | CLI tooling: `kici init`, `kici compile`, `kici test`, `kici run`    |
+| [`@kici-dev/compiler`](https://github.com/kici-dev/kici-public/tree/main/packages/compiler)         | Apache-2.0    | CLI tooling: `kici init`, `kici compile`, `kici preview`, `kici run` |
 | [`@kici-dev/core`](https://github.com/kici-dev/kici-public/tree/main/packages/core)                 | Apache-2.0    | Light shared utilities (no server-side dependencies)                 |
 | [`@kici-dev/shared`](https://github.com/kici-dev/kici-public/tree/main/packages/shared)             | Apache-2.0    | Shared utilities (logging, crypto, telemetry, health routes)         |
 | [`@kici-dev/engine`](https://github.com/kici-dev/kici-public/tree/main/packages/engine)             | AGPL-3.0-only | Core business logic (protocol, triggers, state machine)              |

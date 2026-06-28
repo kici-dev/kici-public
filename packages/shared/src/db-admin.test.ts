@@ -428,7 +428,8 @@ describe('seedEnvironmentBindingDirect', () => {
     expect(result).toEqual({ created: true });
     expect(pool.calls[0].sql).toMatch(/SELECT id FROM environments/);
     expect(pool.calls[1].sql).toMatch(/INSERT INTO environment_bindings/);
-    expect(pool.calls[1].params).toEqual(['org1', 'env-abc', 'staging']);
+    // host_pattern defaults to '**' (all hosts) when no --host selector is given.
+    expect(pool.calls[1].params).toEqual(['org1', 'env-abc', 'staging', '**']);
   });
 
   it('throws when the environment is missing', async () => {

@@ -1024,6 +1024,13 @@ export async function bootstrapWorker(
       });
     },
     onStepStatus: (_agentId, msg) => {
+      // Merge top-level wire fields back into data for the persistence/forward pipeline.
+      const data = {
+        ...msg.data,
+        ...(msg.secretsAccessed !== undefined && { secretsAccessed: msg.secretsAccessed }),
+        ...(msg.concurrencyKind !== undefined && { concurrencyKind: msg.concurrencyKind }),
+        ...(msg.groupId !== undefined && { groupId: msg.groupId }),
+      };
       executionTracker.onStepStatus(
         msg.runId,
         msg.jobId,
@@ -1031,7 +1038,7 @@ export async function bootstrapWorker(
         msg.stepName,
         msg.state,
         msg.timestamp,
-        msg.data,
+        data,
       );
     },
     onScalerAgentRegistered: scalerManager

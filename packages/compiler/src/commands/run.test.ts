@@ -6,6 +6,7 @@ import {
   buildTargetSelector,
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
+  withStdoutOnStderr,
 } from './run.js';
 
 // Shared mock PlatformRunClient instance -- all tests configure this
@@ -719,5 +720,62 @@ describe('lookupDispatchInputsDescriptor', () => {
     expect(lookupDispatchInputsDescriptor(lock, undefined)).toEqual({
       skipCveScan: { type: 'boolean', optional: false, nullable: false },
     });
+  });
+});
+
+describe('withStdoutOnStderr', () => {
+  function captureStreams() {
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const origStdout = process.stdout.write;
+    const origStderr = process.stderr.write;
+    process.stdout.write = ((c: unknown) => {
+      stdoutChunks.push(String(c));
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((c: unknown) => {
+      stderrChunks.push(String(c));
+      return true;
+    }) as typeof process.stderr.write;
+    const restore = () => {
+      process.stdout.write = origStdout;
+      process.stderr.write = origStderr;
+    };
+    return { stdoutChunks, stderrChunks, restore };
+  }
+
+  it('redirects stdout writes to stderr inside the callback, then restores stdout', async () => {
+    const { stdoutChunks, stderrChunks, restore } = captureStreams();
+    try {
+      const result = await withStdoutOnStderr(async () => {
+        // Simulates a user workflow's module-top-level console.log during compile.
+        process.stdout.write('CAPTURE_MARKER_MODULE_TOPLEVEL\n');
+        return 'ok';
+      });
+      // After the guard returns, stdout is live again.
+      process.stdout.write('AFTER\n');
+
+      expect(result).toBe('ok');
+      expect(stderrChunks).toContain('CAPTURE_MARKER_MODULE_TOPLEVEL\n');
+      expect(stdoutChunks).not.toContain('CAPTURE_MARKER_MODULE_TOPLEVEL\n');
+      expect(stdoutChunks).toContain('AFTER\n');
+    } finally {
+      restore();
+    }
+  });
+
+  it('restores stdout even when the callback throws', async () => {
+    const { stdoutChunks, restore } = captureStreams();
+    try {
+      await expect(
+        withStdoutOnStderr(async () => {
+          throw new Error('boom');
+        }),
+      ).rejects.toThrow('boom');
+      process.stdout.write('AFTER_THROW\n');
+      expect(stdoutChunks).toContain('AFTER_THROW\n');
+    } finally {
+      restore();
+    }
   });
 });

@@ -777,4 +777,18 @@ KiCI propagates a `requestId` (UUIDv4) through the entire webhook processing pip
 
 The `app.service` field identifies which KiCI tier produced a log line (values: `platform`, `orchestrator`, `agent`). Set process-wide at startup via `setServiceName()` from `@kici-dev/shared`. This field is independent of container naming and works in all deployment models (containerized, bare-metal, Firecracker). For forwarded agent logs flowing through orchestrator stdout, the `service` field is preserved from the agent's original JSON output.
 
+## Capability negotiation
+
+The set of `dashboard.*` request types is the de-facto feature contract between the dashboard, the relay, and the orchestrator. Because each tier can be on a different version (the dashboard and relay are centrally deployed and always current; a customer's orchestrator upgrades on the customer's own schedule), a dashboard request for a feature a particular orchestrator predates would otherwise come back as a confusing "invalid payload" — indistinguishable from a genuinely malformed body.
+
+To make version mismatches explicit, the orchestrator advertises a **capability manifest** in its connection handshake: `supportedDashboardRequests`, the list of every `dashboard.*` request type that build understands. The list is derived directly from the orchestrator's own protocol schema, so it can never drift from what the build actually handles.
+
+The manifest drives three behaviors:
+
+- **Pre-flight gating (relay).** Before forwarding a `dashboard.*` request to an orchestrator, the relay checks the request type against that connection's advertised manifest. If the type is absent, the relay short-circuits with a structured `501` carrying the connected orchestrator version and the unsupported request type — the request never reaches the orchestrator. A connection that advertises **no** manifest (an orchestrator predating this mechanism) is treated as "unknown": the request is forwarded and the reactive path below applies.
+- **Reactive classification (orchestrator).** When a request does reach the orchestrator and fails schema validation, the orchestrator distinguishes a request type it has never heard of (version mismatch → `unsupported_request_type`, "upgrade the orchestrator") from a known type with a malformed body (`invalid_payload`, a genuine client error). The error response frame carries the structured `code` and the orchestrator version.
+- **Proactive UI signalling (dashboard).** The dashboard reads each orchestrator's manifest from the org-scoped orchestrators listing and greys out — with an "upgrade required" banner naming the connected version — any orchestrator-backed write action whose request types the connected orchestrator does not advertise. When the manifest is unknown, the action stays enabled and the reactive `501` handles a real mismatch. Only orchestrator-backed surfaces are gated; tenant-plane actions handled entirely by the relay are never gated on orchestrator capability.
+
+The net effect: a feature the connected orchestrator is too old to handle produces a clear "upgrade your orchestrator (connected vX)" signal instead of a misleading malformed-payload error, and the system self-heals after the orchestrator is upgraded.
+
 ## See also

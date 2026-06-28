@@ -114,9 +114,9 @@ export type BareStepFn<TResult = void> = (ctx: StepContext) => Promise<TResult>;
 
 /**
  * Union type for items accepted in a job's steps array.
- * Accepts both Step objects and bare async functions.
+ * Accepts Step objects, bare async functions, and concurrent parallel groups.
  */
-export type StepInput = Step<any> | BareStepFn<any>;
+export type StepInput = Step<any> | BareStepFn<any> | import('./parallel.js').ParallelGroup;
 
 /** Options for step() factory - simple form (just async function) */
 export type StepRunFn = (ctx: StepContext) => Promise<void>;
@@ -555,11 +555,18 @@ export interface Job {
   readonly container?: string | ContainerConfig;
   /** Deployment environment for this job. String for static, or a function of the normalized event envelope for dynamic (resolved at orchestrator two-phase eval). */
   readonly environment?: string | ((event: EventPayload) => string | Promise<string>);
+  /**
+   * Deployment environments for this job, in merge order (later entries override
+   * earlier on name collisions). Mutually exclusive with `environment`. Each entry
+   * is a static name or a function of the event (dynamic, resolved per element at
+   * two-phase eval).
+   */
+  readonly environments?: readonly (string | ((event: EventPayload) => string | Promise<string>))[];
   /** Environment variables. Static object or a function of the normalized event envelope (resolved at orchestrator two-phase eval). */
   readonly env?:
     | Record<string, string>
     | ((event: EventPayload) => Record<string, string> | Promise<Record<string, string>>);
-  /** Concurrency group name. Defaults to environment name if not set. String or a function of the normalized event envelope. */
+  /** Concurrency group name. Defaults to the first bound environment's name if not set. String or a function of the normalized event envelope. */
   readonly concurrencyGroup?: string | ((event: EventPayload) => string | Promise<string>);
   /** Runs on cancellation. */
   readonly onCancel?: HookInput;
@@ -699,11 +706,18 @@ export interface JobOptions {
   container?: string | ContainerConfig;
   /** Deployment environment for this job. String for static, or a function of the normalized event envelope for dynamic (resolved at orchestrator two-phase eval). */
   environment?: string | ((event: EventPayload) => string | Promise<string>);
+  /**
+   * Deployment environments for this job, in merge order (later entries override
+   * earlier on name collisions). Mutually exclusive with `environment`. Each entry
+   * is a static name or a function of the event (dynamic, resolved per element at
+   * two-phase eval).
+   */
+  environments?: (string | ((event: EventPayload) => string | Promise<string>))[];
   /** Environment variables. Static object or a function of the normalized event envelope (resolved at orchestrator two-phase eval). */
   env?:
     | Record<string, string>
     | ((event: EventPayload) => Record<string, string> | Promise<Record<string, string>>);
-  /** Concurrency group name. Defaults to environment name if not set. String or a function of the normalized event envelope. */
+  /** Concurrency group name. Defaults to the first bound environment's name if not set. String or a function of the normalized event envelope. */
   concurrencyGroup?: string | ((event: EventPayload) => string | Promise<string>);
   /** Runs on cancellation. */
   onCancel?: HookInput;

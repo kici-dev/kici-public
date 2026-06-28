@@ -47,6 +47,7 @@ import { type ActorType } from '../protocol/messages/actor.js';
 export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   // 30 days — high-volume tenant reads (sampled)
   'run.detail.read': 30,
+  'run.structured.read': 30,
   'runs.list.read': 30,
   'runs.filters.read': 30,
   'sources.list.read': 30,
@@ -379,6 +380,7 @@ export type ColdRetention = number | 'forever';
 export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   // 180 days — high-volume tenant reads (sampled at write-time)
   'run.detail.read': 180,
+  'run.structured.read': 180,
   'runs.list.read': 180,
   'runs.filters.read': 180,
   'sources.list.read': 180,

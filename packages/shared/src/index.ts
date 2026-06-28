@@ -1,4 +1,11 @@
 export * from '@kici-dev/core';
+export {
+  encrypt,
+  decrypt,
+  deriveKey,
+  generateMasterKey,
+  type EncryptedValue,
+} from './secret-crypto.js';
 export { RingBuffer } from './ring-buffer.js';
 export { redactConfig, addLogsToArchive, MAX_LOG_BYTES } from './diagnostics/bundle-archive.js';
 export {
@@ -9,6 +16,7 @@ export {
   type BundleChunkFrame,
 } from './diagnostics/bundle-chunks.js';
 export { createPool, createDb, type CreatePoolOptions, type PgPoolErrorSource } from './db.js';
+export { isPgUniqueViolation } from './pg-errors.js';
 export {
   parseDatabaseUrl,
   maskDatabaseUrl,

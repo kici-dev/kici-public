@@ -595,6 +595,15 @@ export interface ScheduleConfigInput {
   readonly cron: string;
   readonly timezone?: string;
   readonly description?: string;
+  /**
+   * Typed schedule inputs (defaults-only — no operator overrides on a fire).
+   * Accepts a bare `{ name: ZodSchema }` map or a `defineDispatchInputs(...)`
+   * branded handle. Each input must declare a `.default()` or be `.optional()`
+   * (enforced at compile time).
+   */
+  readonly inputs?:
+    | DispatchInputsMap
+    | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
 }
 
 /**
@@ -605,6 +614,8 @@ export interface ScheduleTriggerConfig {
   readonly cron: string;
   readonly timezone: string;
   readonly description?: string;
+  /** Declared, typed schedule inputs (frozen `{ name: ZodSchema }`). */
+  readonly inputs?: DispatchInputsMap;
 }
 
 // --- Lifecycle trigger ---

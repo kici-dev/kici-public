@@ -262,12 +262,12 @@ export function buildProgram(): Command {
       process.exit(success ? 0 : 1);
     });
 
-  // --- kici test (dry-run trigger preview only) ---
+  // --- kici preview (dry-run trigger preview only) ---
 
   program
-    .command('test')
+    .command('preview')
     .argument('[event]', 'Event type to preview (e.g., push, pr:open, schedule)')
-    .description('Preview which workflows match a trigger event (dry-run)')
+    .description('Preview which workflows match a trigger event (no execution)')
     .option('--branch <name>', 'Override target branch for trigger matching (default: main)')
     .option('--sha <hash>', 'Override commit SHA')
     .option('--workflow <name>', 'Filter to specific workflow in display')
@@ -293,8 +293,8 @@ export function buildProgram(): Command {
       [] as string[],
     )
     .action(async (event, options) => {
-      const { testCommand } = await import('./commands/index.js');
-      const success = await testCommand(event, options);
+      const { previewCommand } = await import('./commands/index.js');
+      const success = await previewCommand(event, options);
       process.exit(success ? 0 : 1);
     });
 
@@ -451,6 +451,25 @@ Environment variables:
     .action(async () => {
       const { secretsListCommand } = await import('./commands/index.js');
       const success = await secretsListCommand();
+      process.exit(success ? 0 : 1);
+    });
+
+  const patCommand = program.command('pat').description('Manage personal access tokens');
+
+  patCommand
+    .command('create')
+    .description('Mint a personal access token (use --agent for a coding-agent token)')
+    .option('--name <name>', 'Token name (defaults to the agent label)')
+    .option('--agent', 'Mint an agent-kind PAT for the KiCI MCP server', false)
+    .option('--expires-in-days <n>', 'Custom expiry in days', (v) => parseInt(v, 10))
+    .action(async (options) => {
+      const { patCreateCommand } = await import('./commands/index.js');
+      const success = await patCreateCommand({
+        name: options.name,
+        agent: options.agent,
+        label: options.name,
+        expiresInDays: options.expiresInDays,
+      });
       process.exit(success ? 0 : 1);
     });
 
@@ -672,7 +691,7 @@ Environment variables:
     .option('--bundle <path>', 'Path or URL to the attestation bundle JSON')
     .option(
       '--trust-root <url-or-file>',
-      'Trusted issuer URL, or a self-contained { issuer, jwks } file',
+      'Trusted issuer URL, or a self-contained { issuer, jwks } file (default: hosted KiCI platform)',
     )
     .option('--audience <aud>', 'Expected token audience')
     .option('--json', 'Output structured JSON result', false)

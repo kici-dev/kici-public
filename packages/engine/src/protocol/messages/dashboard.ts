@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { CheckMode, CheckStepOutcome } from '../../check-mode.js';
 import { actorPrincipalSchema } from './actor.js';
+import { agentRunResultSchema } from './agent-run-result.js';
 import { kiciBundleSchema } from '../../provenance/bundle.js';
 import {
   dashboardAccessLogListRequestSchema,
@@ -8,7 +9,7 @@ import {
 } from './access-log.js';
 import { dashboardOrchLogsRequestSchema, dashboardOrchLogsResponseSchema } from './run-events.js';
 import { EventLogStatus, PayloadOmittedReason, EventLogSource } from './event-log.js';
-import { initFailureSchema } from './execution-status.js';
+import { initFailureSchema, StepConcurrencyKind } from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
 import { DeploymentModeSchema, DeploymentContainerRuntimeSchema } from './deployment-identity.js';
 import { ScalerBackendType } from '../../scaler/scaler-backend-type.js';
@@ -40,6 +41,28 @@ export const dashboardRunDetailRequestSchema = z.object({
   runId: z.string(),
 });
 
+/**
+ * Request the machine-first, provenance-tagged structured run result from the
+ * orchestrator (user-plane equivalent of the orchestrator-admin
+ * `/runs/:id/structured` endpoint). Reuses the Phase-1 `AgentRunResult` shape.
+ */
+export const dashboardRunStructuredRequestSchema = z.object({
+  type: z.literal('dashboard.run.structured'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  runId: z.string(),
+});
+export type DashboardRunStructuredRequest = z.infer<typeof dashboardRunStructuredRequestSchema>;
+
+/** Response carrying the provenance-tagged AgentRunResult (null when not found). */
+export const dashboardRunStructuredResponseSchema = z.object({
+  type: z.literal('dashboard.run.structured.response'),
+  requestId: z.string(),
+  result: agentRunResultSchema.nullable(),
+  error: z.string().optional(),
+});
+export type DashboardRunStructuredResponse = z.infer<typeof dashboardRunStructuredResponseSchema>;
+
 /** Request step logs from orchestrator. */
 export const dashboardStepLogsRequestSchema = z.object({
   type: z.literal('dashboard.step.logs'),
@@ -70,6 +93,10 @@ const dashboardStepDetailSchema = z.object({
   checkOutcome: CheckStepOutcome.nullable().optional(),
   /** Human-readable drift summary, present when the step reported drift. */
   driftSummary: z.string().nullable().optional(),
+  /** Step concurrency role; absent/`sequential` for ordinary steps. */
+  concurrencyKind: StepConcurrencyKind.nullable().optional(),
+  /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
+  groupId: z.string().nullable().optional(),
 });
 
 /** Job detail within a run detail response. */
@@ -92,6 +119,12 @@ export const dashboardJobDetailSchema = z.object({
   errorMessage: z.string().nullable(),
   /** Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). */
   runsOnLabels: z.array(z.string()).nullable().optional(),
+  /**
+   * Ordered bound deployment-environment names for this job, in merge order
+   * (later environments override earlier on key collisions). A `(dynamic)`
+   * entry marks an element resolved at runtime. null/absent = no binding.
+   */
+  environments: z.array(z.string()).nullable().optional(),
   /** Aggregated step outputs (step-keyed map). Present when job completed successfully with outputs. */
   outputs: z.record(z.string(), z.record(z.string(), z.unknown())).nullable().optional(),
   /** Secret output key names produced by this job (values are NOT included -- display masked). */
@@ -171,6 +204,24 @@ export type DashboardAttestationsListRequest = z.infer<
 >;
 
 /**
+ * Server-side verification verdict for an attestation, computed at ingest.
+ * - `verified` — `verifyKiciBundle` succeeded.
+ * - `failed` — verification ran and the bundle failed (signature / identity /
+ *   build-context / unsupported mode). A provenance-integrity signal.
+ * - `unverifiable` — no verdict could be computed (no trust root configured, or
+ *   the JWKS / bundle could not be read). NOT a forgery signal.
+ * - `pending` — verdict not yet computed (pre-backfill row, or ingest raced the
+ *   trust root).
+ */
+export const attestationVerifyStatusSchema = z.enum([
+  'verified',
+  'failed',
+  'unverifiable',
+  'pending',
+]);
+export type AttestationVerifyStatus = z.infer<typeof attestationVerifyStatusSchema>;
+
+/**
  * Single attestation in the list response, with its bundle inlined from object
  * storage so the dashboard verifies it without a second fetch. The bundle is a
  * KiCI Mode-A bundle (`@kici-dev/engine/provenance/bundle`).
@@ -185,6 +236,15 @@ export const attestationListItemSchema = z.object({
   mediaType: z.string(),
   createdAt: z.string(),
   bundle: kiciBundleSchema,
+  /**
+   * Owning run id — populated by the single-attestation detail get (for the
+   * "view run" link); omitted by the per-run list (the run is already known).
+   */
+  runId: z.string().optional(),
+  /** Stored server-side verdict — populated by the detail get (omitted per-run). */
+  verifyStatus: attestationVerifyStatusSchema.optional(),
+  /** First failure reason for the stored verdict, when failed (detail get only). */
+  verifyReason: z.string().nullable().optional(),
 });
 export type AttestationListItem = z.infer<typeof attestationListItemSchema>;
 
@@ -198,6 +258,94 @@ export const dashboardAttestationsListResponseSchema = z.object({
 export type DashboardAttestationsListResponse = z.infer<
   typeof dashboardAttestationsListResponseSchema
 >;
+
+// --- Org-wide attestations browser (search + browse) ---
+//
+// A second, org-scoped read surface alongside the per-run list above. The list
+// is metadata-only (no inlined bundle) so it stays cheap at any scale; the
+// verdict badge comes from the server-side `verifyStatus` recorded at ingest.
+// The detail get inlines exactly one bundle for the attestation-detail page.
+// (`attestationVerifyStatusSchema` is defined above, next to the list item.)
+
+/**
+ * Metadata-only summary row for the org-wide list. No inlined bundle (keeps the
+ * list cheap). `repository` / `workflow` are joined from `execution_runs` when
+ * available.
+ */
+export const attestationListSummarySchema = z.object({
+  id: z.string(),
+  runId: z.string(),
+  jobId: z.string(),
+  jobName: z.string().nullable(),
+  subjectName: z.string(),
+  subjectDigest: z.string(),
+  mode: z.string(),
+  mediaType: z.string(),
+  createdAt: z.string(),
+  verifyStatus: attestationVerifyStatusSchema,
+  verifyReason: z.string().nullable(),
+  repository: z.string().nullable(),
+  workflow: z.string().nullable(),
+});
+export type AttestationListSummary = z.infer<typeof attestationListSummarySchema>;
+
+/** Filters for the org-wide attestations list. */
+export const attestationListFiltersSchema = z.object({
+  digest: z.string().optional(),
+  name: z.string().optional(),
+  status: attestationVerifyStatusSchema.optional(),
+  repository: z.string().optional(),
+  workflow: z.string().optional(),
+  job: z.string().optional(),
+  createdAfter: z.string().optional(),
+  createdBefore: z.string().optional(),
+});
+export type AttestationListFilters = z.infer<typeof attestationListFiltersSchema>;
+
+/** Request the org-wide, paginated, filtered list of attestations. */
+export const dashboardAttestationsListAllRequestSchema = z.object({
+  type: z.literal('dashboard.attestations.list.all'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  page: z.number().int().positive(),
+  sort: z.string().optional(),
+  filters: attestationListFiltersSchema.default({}),
+});
+export type DashboardAttestationsListAllRequest = z.infer<
+  typeof dashboardAttestationsListAllRequestSchema
+>;
+
+/** Response with one page of org-wide attestation summaries. */
+export const dashboardAttestationsListAllResponseSchema = z.object({
+  type: z.literal('dashboard.attestations.list.all.response'),
+  requestId: z.string(),
+  attestations: z.array(attestationListSummarySchema),
+  page: z.number().int(),
+  pageSize: z.number().int(),
+  total: z.number().int(),
+  error: z.string().optional(),
+});
+export type DashboardAttestationsListAllResponse = z.infer<
+  typeof dashboardAttestationsListAllResponseSchema
+>;
+
+/** Request a single attestation by id (detail page; inlines the one bundle). */
+export const dashboardAttestationGetRequestSchema = z.object({
+  type: z.literal('dashboard.attestation.get'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  attestationId: z.string(),
+});
+export type DashboardAttestationGetRequest = z.infer<typeof dashboardAttestationGetRequestSchema>;
+
+/** Response with one attestation (the existing item shape with bundle), or null. */
+export const dashboardAttestationGetResponseSchema = z.object({
+  type: z.literal('dashboard.attestation.get.response'),
+  requestId: z.string(),
+  attestation: attestationListItemSchema.nullable(),
+  error: z.string().optional(),
+});
+export type DashboardAttestationGetResponse = z.infer<typeof dashboardAttestationGetResponseSchema>;
 
 // --- Run list request/response (REST-over-WS proxy) ---
 //
@@ -227,6 +375,8 @@ export const dashboardRunSummarySchema = z.object({
   triggerEvent: z.string().optional(),
   commitMessage: z.string().optional(),
   jobCount: z.number().optional(),
+  /** Distinct bound deployment-environment names across the run's jobs (first-seen order). */
+  environments: z.array(z.string()).optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   durationMs: z.number().optional(),
@@ -2050,8 +2200,11 @@ export type TestRelayRequest =
 /** Dashboard messages flowing from Platform to Orchestrator. */
 export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   dashboardRunDetailRequestSchema,
+  dashboardRunStructuredRequestSchema,
   dashboardStepLogsRequestSchema,
   dashboardAttestationsListRequestSchema,
+  dashboardAttestationsListAllRequestSchema,
+  dashboardAttestationGetRequestSchema,
   dashboardRunsListRequestSchema,
   dashboardRunsFiltersRequestSchema,
   dashboardSourcesListRequestSchema,
@@ -2141,8 +2294,11 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
 /** Dashboard messages flowing from Orchestrator to Platform. */
 export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   dashboardRunDetailResponseSchema,
+  dashboardRunStructuredResponseSchema,
   dashboardStepLogsResponseSchema,
   dashboardAttestationsListResponseSchema,
+  dashboardAttestationsListAllResponseSchema,
+  dashboardAttestationGetResponseSchema,
   dashboardRunsListResponseSchema,
   dashboardRunsFiltersResponseSchema,
   dashboardSourcesListResponseSchema,
@@ -2402,6 +2558,19 @@ export const runListItemSchema = z.object({
   failureReason: z.string().optional(),
   hadCompileJob: z.boolean(),
   compileJobId: z.string().nullable(),
+  /**
+   * Distinct bound deployment-environment names across the run's jobs
+   * (first-seen order). Drives the run-list environment chips; empty/absent
+   * when no job binds an environment.
+   */
+  environments: z.array(z.string()).optional(),
+  /**
+   * Run-level repo provider (origin host) — distinct from `source.provider`
+   * which is derived from the routing key. Drives provider-aware repo links.
+   */
+  repoProvider: z.string().nullable(),
+  /** True when the run executed a developer's local working tree (`kici run remote`). */
+  localWorkingTree: z.boolean(),
   source: runListSourceSchema.nullable(),
 });
 export type RunListItem = z.infer<typeof runListItemSchema>;
@@ -2649,3 +2818,25 @@ export const memberListResponseSchema = z.object({
 
 export type OrgMember = z.infer<typeof orgMemberSchema>;
 export type MemberListResponse = z.infer<typeof memberListResponseSchema>;
+
+/**
+ * Every dashboard request type the local build understands, derived from the
+ * discriminated union so it can never drift. A component advertises this set to
+ * describe ITSELF; gating decisions always compare against the REMOTE's
+ * advertised set, never this local one.
+ */
+export const DASHBOARD_REQUEST_TYPES: readonly string[] = dashboardPlatformToOrchSchema.options.map(
+  (o) => o.shape.type.value,
+);
+
+/** Membership-test form of {@link DASHBOARD_REQUEST_TYPES}. */
+export const DASHBOARD_REQUEST_TYPE_SET: ReadonlySet<string> = new Set(DASHBOARD_REQUEST_TYPES);
+
+/** Structured error code on a dashboard `*.response` frame's `code` field. */
+export const DashboardResponseErrorCode = z.enum([
+  'unsupported_request_type',
+  'invalid_payload',
+  'unsupported_message_type',
+  'internal_error',
+]);
+export type DashboardResponseErrorCode = z.infer<typeof DashboardResponseErrorCode>;

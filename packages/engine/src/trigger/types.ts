@@ -19,6 +19,7 @@
  * Schema version 24: adds LockJob.runsOnPick (deterministic single-host selection).
  * Schema version 25: adds LockStep.retry (step retry policy data subset; retryIf is execution-only).
  * Schema version 26: adds LockJob.includeUninitialized (runsOnAll fans out to declared-but-un-agented hosts, bringing up a temporary init-runner per fresh box).
+ * Schema version 27: adds LockScheduleTrigger.inputs (defaults-only schedule dispatch inputs).
  */
 
 import { z } from 'zod';
@@ -29,7 +30,7 @@ import { LabelMatcher } from '../labels-match.js';
 import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
 
 /** Schema version - increment on breaking changes */
-export const SCHEMA_VERSION = 26 as const;
+export const SCHEMA_VERSION = 29 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
@@ -319,6 +320,8 @@ export interface LockScheduleTrigger {
   readonly cronExpression: string;
   readonly timezone: string;
   readonly description?: string;
+  /** Typed schedule-input descriptors (from `schedule({ inputs })`); defaults-only. */
+  readonly inputs?: InputsDescriptorMap;
 }
 
 /**
@@ -390,6 +393,8 @@ export interface LockRule {
  * Minimal representation - agents load full step functions from source.
  */
 export interface LockStep {
+  /** Discriminator for the step union; absent/`'sequential'` is an ordinary step. */
+  readonly kind?: 'sequential';
   readonly name: string;
   readonly hasOutputs: boolean;
   /** When true, job proceeds even if this step fails. */
@@ -411,6 +416,29 @@ export interface LockStep {
   };
   /** Normalized approval gate; when set the step pauses for a human approval. */
   readonly approval?: LockApproval;
+}
+
+/**
+ * A concurrent group of sequential steps in the lock file. Children run
+ * concurrently behind a join barrier; the group wrapper itself consumes no
+ * flat step index (its children carry the indices). No nesting is allowed.
+ */
+export interface LockParallelStep {
+  readonly kind: 'parallel';
+  readonly name: string;
+  /** Cancel in-flight siblings when the first child fails (default true). */
+  readonly failFast: boolean;
+  /** Maximum children running at once; queued children report `pending`. */
+  readonly maxParallel?: number;
+  readonly children: readonly LockStep[];
+}
+
+/** A lock-file entry in a job's `steps` array: an ordinary step or a parallel group. */
+export type LockStepEntry = LockStep | LockParallelStep;
+
+/** Type guard distinguishing a parallel group from an ordinary lock step. */
+export function isLockParallelStep(entry: LockStepEntry): entry is LockParallelStep {
+  return (entry as LockParallelStep).kind === 'parallel';
 }
 
 /**
@@ -575,16 +603,18 @@ export interface LockJob {
   readonly needs: readonly (string | NeedsEntry | NeedsGroupEntry)[];
   /** Group names this job depends on (populated by compiler from dynamicGroup refs). */
   readonly dependsOnGroups?: readonly string[];
-  readonly steps: readonly LockStep[];
+  readonly steps: readonly LockStepEntry[];
   readonly matrix?: LockMatrix;
   readonly include?: readonly Record<string, string>[];
   readonly exclude?: readonly Record<string, string>[];
   readonly rules?: readonly LockRule[];
   readonly description?: string;
-  /** Deployment environment name (static string) or inline expression (pure function). */
-  readonly environment?: string | LockInlineValue;
-  /** When true, environment is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
-  readonly dynamicEnvironment?: boolean;
+  /**
+   * Deployment environments in merge order. Each entry is a static name or inline
+   * expression (pure function); `dynamic` is set when it is a function resolved at
+   * two-phase eval. Later entries override earlier ones on name collisions.
+   */
+  readonly environments?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
   /** Static environment variables or inline expression (pure function). */
   readonly env?: Record<string, string> | LockInlineValue;
   /** When true, env is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */

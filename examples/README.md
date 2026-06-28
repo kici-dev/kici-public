@@ -4,7 +4,7 @@ Runnable templates and example workflows. Two subdirectories today:
 
 | Subdirectory                   | Purpose                                                                                                             |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| [`workflows/`](./workflows/)   | Standalone `.ts` workflow definitions you can run via `pnpm kici test`.                                             |
+| [`workflows/`](./workflows/)   | Standalone `.ts` workflow definitions you can run via `pnpm kici preview`.                                          |
 | [`quickstart/`](./quickstart/) | Deployment templates for the 5-minute quickstart — `compose/` (Docker / Podman) and `bare-metal/` (native systemd). |
 
 ## Workflows
@@ -19,26 +19,27 @@ Test any example locally:
 
 ```bash
 # From repo root
-pnpm kici test push --config examples/workflows/hello-world.ts
+pnpm kici preview push --config examples/workflows/hello-world.ts
 
 # Or from examples directory
 cd examples
-pnpm kici test push --config workflows/hello-world.ts
+pnpm kici preview push --config workflows/hello-world.ts
 ```
 
 ## Available Examples
 
 ### Workflows (`workflows/`)
 
-Single-file workflows, runnable with `pnpm kici test <event> --config <path>`:
+Single-file workflows, runnable with `pnpm kici preview <event> --config <path>`:
 
-| Example                                              | Description                                                             | Triggers     |
-| ---------------------------------------------------- | ----------------------------------------------------------------------- | ------------ |
-| [hello-world.ts](./workflows/hello-world.ts)         | Minimal workflow that echoes "Hello, World!"                            | `push`       |
-| [ci-monorepo.ts](./workflows/ci-monorepo.ts)         | Dynamic matrix discovered at runtime, a shared step, conditional deploy | `pr`, `push` |
-| [mise-init.ts](./workflows/mise-init.ts)             | Generic init phase provisions jq via mise (`mise.toml`)                 | `push`       |
-| [mise-preset.ts](./workflows/mise-preset.ts)         | Zero-config `init: 'mise'` preset (sugar over the generic mise init)    | `push`       |
-| [wait-for-marker.ts](./workflows/wait-for-marker.ts) | `waitForStep` polls until a producer job writes a marker file           | `push`       |
+| Example                                                              | Description                                                             | Triggers     |
+| -------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------ |
+| [hello-world.ts](./workflows/hello-world.ts)                         | Minimal workflow that echoes "Hello, World!"                            | `push`       |
+| [ci-monorepo.ts](./workflows/ci-monorepo.ts)                         | Dynamic matrix discovered at runtime, a shared step, conditional deploy | `pr`, `push` |
+| [mise-init.ts](./workflows/mise-init.ts)                             | Generic init phase provisions jq via mise (`mise.toml`)                 | `push`       |
+| [mise-preset.ts](./workflows/mise-preset.ts)                         | Zero-config `init: 'mise'` preset (sugar over the generic mise init)    | `push`       |
+| [wait-for-marker.ts](./workflows/wait-for-marker.ts)                 | `waitForStep` polls until a producer job writes a marker file           | `push`       |
+| [parallel-lint-typecheck.ts](./workflows/parallel-lint-typecheck.ts) | `parallel([...])` runs independent checks concurrently within a job     | `push`       |
 
 ### Project layout (`dynamic-environment/`)
 
@@ -55,7 +56,7 @@ When adding new examples:
 1. Create file in appropriate subfolder (`workflows/`, etc.)
 2. Include JSDoc comment explaining what it demonstrates
 3. Update this README with entry in the table
-4. Test with `pnpm kici test <event> --config <path>`
+4. Test with `pnpm kici preview <event> --config <path>`
 
 ## Maintenance
 

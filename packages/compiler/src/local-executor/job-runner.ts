@@ -15,6 +15,7 @@ import {
   expandMatrix,
   applyIncludeExclude,
   isDynamicJobFn,
+  flattenStepInputs,
   setStepOutputsMap as setStepOutputsMapLocal,
   setStepRefMap as setStepRefMapLocal,
   setJobOutputsMap as setJobOutputsMapLocal,
@@ -510,13 +511,16 @@ async function executeResolvedJobInner(
     context.event.payload,
     context.event.provider,
     context.dispatchInputs ?? {},
+    context.signal,
   );
 
-  // Execute steps sequentially
+  // Execute steps sequentially. Parallel groups are expanded inline: the local
+  // single-process executor surfaces each child as its own step and runs them in
+  // array order (the concurrent scheduler is the remote agent path).
   const stepResults: StepResult[] = [];
   let stepCounter = 0;
 
-  for (const stepOrFn of job.steps) {
+  for (const stepOrFn of flattenStepInputs(job.steps)) {
     // Check abort signal between steps
     if (context.signal.aborted) {
       const durationMs = Date.now() - startTime;

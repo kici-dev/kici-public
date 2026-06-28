@@ -1,11 +1,16 @@
 /**
- * `kici verify-attestation [artifact] --bundle <path|url> --trust-root <url|file>`
+ * `kici verify-attestation [artifact] --bundle <path|url> [--trust-root <url|file>]`
  *
  * Offline verification of a KiCI-signed provenance bundle: read the bundle,
- * resolve the trusted issuer + JWKS out-of-band (`--trust-root`), optionally
- * digest the artifact, and hand everything to the shared browser-safe
- * `verifyKiciBundle` core in `@kici-dev/engine`. The engine owns all crypto;
- * this command is the thin Node wrapper (fs / fetch / artifact digest / output).
+ * resolve the trusted issuer + JWKS out-of-band, optionally digest the artifact,
+ * and hand everything to the shared browser-safe `verifyKiciBundle` core in
+ * `@kici-dev/engine`. The engine owns all crypto; this command is the thin Node
+ * wrapper (fs / fetch / artifact digest / output).
+ *
+ * `--trust-root` is optional: when omitted it defaults to the hosted KiCI
+ * Platform's provenance issuer, so the common case (verifying a bundle attested
+ * on the hosted platform) needs no flag. Pass `--trust-root` to verify against a
+ * different environment (e.g. staging) or an offline `{ issuer, jwks }` file.
  *
  * Returns a boolean (verified) so `cli.ts` can map it to an exit code (0/1).
  */
@@ -14,12 +19,16 @@ import { logger, sha256File, toErrorMessage } from '@kici-dev/core';
 import pc from 'picocolors';
 import { KICI_PROVENANCE_AUDIENCE } from '@kici-dev/engine/provenance/bundle';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
-import { resolveTrustRoot } from '../provenance-trust-root.js';
+import { resolveTrustRoot, type TrustRoot } from '../provenance-trust-root.js';
+import { PROD_PROVENANCE_ISSUER } from '../remote/prod-defaults.js';
 
 export interface VerifyAttestationOptions {
   /** Path or `http(s)` URL to the attestation bundle JSON. Required. */
   bundle?: string;
-  /** Trusted issuer URL (online discovery) or a self-contained `{ issuer, jwks }` file. Required. */
+  /**
+   * Trusted issuer URL (online discovery) or a self-contained `{ issuer, jwks }`
+   * file. Optional — defaults to the hosted KiCI Platform's provenance issuer.
+   */
   trustRoot?: string;
   /** Expected token audience (defaults to the KiCI provenance audience). */
   audience?: string;
@@ -36,13 +45,33 @@ export async function verifyAttestationCommand(
       logger.error(pc.red('Error: --bundle <path|url> is required'));
       return false;
     }
-    if (!options.trustRoot) {
-      logger.error(pc.red('Error: --trust-root <url|file> is required'));
-      return false;
+
+    const trustRoot = options.trustRoot ?? PROD_PROVENANCE_ISSUER;
+    const usingDefault = !options.trustRoot;
+    if (usingDefault) {
+      logger.info(pc.gray(`Using default trust root ${trustRoot} (pass --trust-root to override)`));
     }
 
     const bundle = JSON.parse(await readBundle(options.bundle)) as unknown;
-    const { issuer, jwks } = await resolveTrustRoot(options.trustRoot);
+
+    let resolved: TrustRoot;
+    try {
+      resolved = await resolveTrustRoot(trustRoot);
+    } catch (error) {
+      const msg = toErrorMessage(error);
+      if (usingDefault && /\b503\b/.test(msg)) {
+        logger.error(
+          pc.red(
+            `Error: build provenance is not enabled on the hosted KiCI platform yet ` +
+              `(${trustRoot} returned 503). Pass --trust-root to verify against another ` +
+              `environment (e.g. staging) or an offline { issuer, jwks } file.`,
+          ),
+        );
+        return false;
+      }
+      throw error;
+    }
+    const { issuer, jwks } = resolved;
     const expectedDigest = artifact
       ? { alg: 'sha256', hex: await sha256File(artifact) }
       : undefined;

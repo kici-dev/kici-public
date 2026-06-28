@@ -699,10 +699,23 @@ function relayChildIpcMessage(
     case 'log.line':
       ctx.execOptions.onLogLine(msg.stepIndex, msg.line);
       return;
-    case 'step.start':
+    case 'step.start': {
       ctx.stepNames.set(msg.stepIndex, msg.stepName);
-      ctx.execOptions.onStepStatus(msg.stepIndex, msg.stepName, ExecutionStepStatus.enum.running);
+      const startState =
+        msg.state === 'pending'
+          ? ExecutionStepStatus.enum.pending
+          : ExecutionStepStatus.enum.running;
+      const startData = {
+        ...(msg.concurrencyKind && { concurrencyKind: msg.concurrencyKind }),
+        ...(msg.groupId && { groupId: msg.groupId }),
+      };
+      if (Object.keys(startData).length > 0) {
+        ctx.execOptions.onStepStatus(msg.stepIndex, msg.stepName, startState, startData);
+      } else {
+        ctx.execOptions.onStepStatus(msg.stepIndex, msg.stepName, startState);
+      }
       return;
+    }
     case 'step.complete':
       ctx.execOptions.onStepStatus(
         msg.stepIndex,
@@ -716,6 +729,8 @@ function relayChildIpcMessage(
           ...(msg.checkOutcome !== undefined && { checkOutcome: msg.checkOutcome }),
           ...(msg.driftSummary !== undefined && { driftSummary: msg.driftSummary }),
           ...(msg.drift !== undefined && { drift: msg.drift }),
+          ...(msg.concurrencyKind && { concurrencyKind: msg.concurrencyKind }),
+          ...(msg.groupId && { groupId: msg.groupId }),
           ...(msg.data && msg.data),
         },
       );

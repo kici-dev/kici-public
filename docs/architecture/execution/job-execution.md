@@ -96,7 +96,7 @@ Inside the sandbox child process (workflow runner), the following steps execute 
 
 The sandbox performs a shallow `git clone` at the dispatch ref. For private repositories, a GitHub App installation token from `job.dispatch.token` is injected via `http.extraHeader` git config (keeps it out of the clone URL). After clone, `HEAD` is verified against the expected SHA.
 
-**Overlay (test runs only).** For `kici test` runs, the sandbox downloads, decrypts, and applies the developer's uncommitted changes on top of the clone. See [Test run architecture](test-runs.md).
+**Overlay (test runs only).** For `kici run remote` runs, the sandbox downloads, decrypts, and applies the developer's uncommitted changes on top of the clone. See [Test run architecture](test-runs.md).
 
 > See `packages/agent/src/checkout/git-clone.ts` for the implementation.
 

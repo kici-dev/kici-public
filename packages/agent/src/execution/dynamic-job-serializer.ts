@@ -25,11 +25,19 @@ import type {
   DynamicMatrixContext,
   NeedsWhenInput,
 } from '@kici-dev/sdk';
-import { isDynamicJobFn, isDynamicGroupRef, isStaticArray, isStaticObject } from '@kici-dev/sdk';
-import type { DynamicGroupRef } from '@kici-dev/sdk';
+import {
+  isDynamicJobFn,
+  isDynamicGroupRef,
+  isStaticArray,
+  isStaticObject,
+  isParallelGroup,
+} from '@kici-dev/sdk';
+import type { DynamicGroupRef, StepInput } from '@kici-dev/sdk';
 import type {
   LockJob,
   LockStep,
+  LockParallelStep,
+  LockStepEntry,
   LockMatrix,
   NeedsEntry,
   NeedsGroupEntry,
@@ -141,21 +149,26 @@ async function serializeJob(
   );
 
   // Resolve dynamic environment/env/concurrencyGroup against the eval context.
-  let resolvedEnvironment: string | undefined;
-  if (typeof job.environment === 'function') {
-    const value = await withTimeout(
-      () =>
-        (job.environment as (event: Record<string, unknown>) => string | Promise<string>)(
-          ctx.event,
-        ),
-      DYNAMIC_FIELD_TIMEOUT_MS,
-      `dynamic environment for generated job '${job.name}'`,
-    );
-    if (value !== undefined && value !== null) {
-      resolvedEnvironment = value;
+  // Either spelling (`environment` or `environments`) normalizes to an ordered
+  // list of resolved names emitted as static lock environments entries.
+  const envRefs =
+    job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
+  let resolvedEnvironments: Array<{ value: string; dynamic: boolean }> | undefined;
+  if (envRefs !== undefined && envRefs.length > 0) {
+    const resolved: Array<{ value: string; dynamic: boolean }> = [];
+    for (const ref of envRefs) {
+      if (typeof ref === 'function') {
+        const value = await withTimeout(
+          () => (ref as (event: Record<string, unknown>) => string | Promise<string>)(ctx.event),
+          DYNAMIC_FIELD_TIMEOUT_MS,
+          `dynamic environment for generated job '${job.name}'`,
+        );
+        if (value !== undefined && value !== null) resolved.push({ value, dynamic: false });
+      } else if (typeof ref === 'string') {
+        resolved.push({ value: ref, dynamic: false });
+      }
     }
-  } else if (typeof job.environment === 'string') {
-    resolvedEnvironment = job.environment;
+    if (resolved.length > 0) resolvedEnvironments = resolved;
   }
 
   let resolvedEnv: Record<string, string> | undefined;
@@ -217,7 +230,7 @@ async function serializeJob(
     ...(job.include ? { include: job.include } : {}),
     ...(job.exclude ? { exclude: job.exclude } : {}),
     ...(job.description ? { description: job.description } : {}),
-    ...(resolvedEnvironment !== undefined ? { environment: resolvedEnvironment } : {}),
+    ...(resolvedEnvironments !== undefined ? { environments: resolvedEnvironments } : {}),
     ...(resolvedEnv !== undefined ? { env: resolvedEnv } : {}),
     ...(resolvedConcurrencyGroup !== undefined
       ? { concurrencyGroup: resolvedConcurrencyGroup }
@@ -324,34 +337,50 @@ function resolveNeeds(
  * Steps are minimal in the lock file — just metadata. The actual run functions
  * are loaded from the workflow bundle at execution time.
  */
-function serializeSteps(steps: readonly (Step<any> | ((...args: any[]) => any))[]): LockStep[] {
-  return steps.map((stepOrFn, index) => {
-    // Bare function steps (anonymous)
-    if (typeof stepOrFn === 'function') {
+function serializeSteps(steps: readonly StepInput[]): LockStepEntry[] {
+  let flatIndex = 0;
+  return steps.map((entry): LockStepEntry => {
+    if (isParallelGroup(entry)) {
+      const children = entry.steps.map((child) => serializeSequentialStep(child, flatIndex++));
       return {
-        name: `step-${index}`,
-        hasOutputs: false,
-      };
+        kind: 'parallel',
+        name: entry.name ?? `parallel-${children[0]?.name ?? 'group'}`,
+        failFast: entry.failFast,
+        ...(entry.maxParallel !== undefined ? { maxParallel: entry.maxParallel } : {}),
+        children,
+      } satisfies LockParallelStep;
     }
-
-    const step = stepOrFn as Step<any>;
-    return {
-      name: step.name || `step-${index}`,
-      hasOutputs: !!step.outputs,
-      ...(step.continueOnError ? { continueOnError: true } : {}),
-      ...(step.timeout ? { timeout: step.timeout } : {}),
-      ...(step.retry
-        ? {
-            retry: {
-              maxAttempts: step.retry.maxAttempts,
-              delayMs: step.retry.delayMs,
-              backoff: step.retry.backoff,
-              maxDelayMs: step.retry.maxDelayMs,
-            },
-          }
-        : {}),
-    };
+    return serializeSequentialStep(entry, flatIndex++);
   });
+}
+
+/** Serialize one sequential step (or bare function) to a flat `LockStep`. */
+function serializeSequentialStep(stepOrFn: StepInput, index: number): LockStep {
+  // Bare function steps (anonymous)
+  if (typeof stepOrFn === 'function') {
+    return {
+      name: `step-${index}`,
+      hasOutputs: false,
+    };
+  }
+
+  const step = stepOrFn as Step<any>;
+  return {
+    name: step.name || `step-${index}`,
+    hasOutputs: !!step.outputs,
+    ...(step.continueOnError ? { continueOnError: true } : {}),
+    ...(step.timeout ? { timeout: step.timeout } : {}),
+    ...(step.retry
+      ? {
+          retry: {
+            maxAttempts: step.retry.maxAttempts,
+            delayMs: step.retry.delayMs,
+            backoff: step.retry.backoff,
+            maxDelayMs: step.retry.maxDelayMs,
+          },
+        }
+      : {}),
+  };
 }
 
 /**

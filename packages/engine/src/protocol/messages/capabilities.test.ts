@@ -88,3 +88,18 @@ describe('hasOrchCapability', () => {
     expect(hasOrchCapability(caps, 'futureFlag')).toBe(false);
   });
 });
+
+describe('orch capabilities dashboard-request manifest', () => {
+  it('advertises the supported dashboard request set', () => {
+    expect(ORCH_CAPABILITIES.supportedDashboardRequests).toContain(
+      'dashboard.environments.bindings.set',
+    );
+  });
+  it('parses a capabilities object carrying the manifest', () => {
+    const parsed = orchCapabilitiesSchema.parse({
+      orchRole: 'coordinator',
+      supportedDashboardRequests: ['dashboard.environments.bindings.set'],
+    });
+    expect(parsed.supportedDashboardRequests).toHaveLength(1);
+  });
+});

@@ -14,6 +14,7 @@
  */
 import { z } from 'zod';
 import { dashboardWritePolicyMap } from '../dashboard-write-operations.js';
+import { DASHBOARD_REQUEST_TYPES } from './dashboard.js';
 
 /** Orchestrator role in a cluster topology. */
 export const OrchRole = z.enum(['coordinator', 'worker']);
@@ -36,6 +37,15 @@ export const orchCapabilitiesSchema = z
      * change (see platform-orchestrator.ts).
      */
     dashboardWrites: dashboardWritePolicyMap.optional(),
+    /**
+     * Every `dashboard.*` request type this orchestrator build understands.
+     * The Platform pre-flight-checks an incoming dashboard request against this
+     * set and refuses (with a precise "upgrade orchestrator" error) when the
+     * type is absent. Derived from the orchestrator's own protocol schema, so it
+     * cannot drift. Absent on pre-capability builds → treated as "unknown",
+     * never as "supports nothing".
+     */
+    supportedDashboardRequests: z.array(z.string()).optional(),
   })
   .passthrough();
 
@@ -45,6 +55,7 @@ export type OrchCapabilities = z.infer<typeof orchCapabilitiesSchema>;
 /** Default orchestrator capabilities sent in auth.request. */
 export const ORCH_CAPABILITIES = Object.freeze({
   orchRole: OrchRole.enum.coordinator,
+  supportedDashboardRequests: [...DASHBOARD_REQUEST_TYPES],
 } satisfies OrchCapabilities);
 
 /**

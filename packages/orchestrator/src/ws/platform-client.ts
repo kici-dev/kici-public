@@ -12,11 +12,14 @@ import {
   type TrustPolicyUpdate,
   type StaleCheckrunCleanup,
   type DashboardRunDetailRequest,
+  type DashboardRunStructuredRequest,
   type DashboardRunsListRequest,
   type DashboardRunsFiltersRequest,
   type DashboardSourcesListRequest,
   type DashboardStepLogsRequest,
   type DashboardAttestationsListRequest,
+  type DashboardAttestationsListAllRequest,
+  type DashboardAttestationGetRequest,
   type DashboardOrchLogsRequest,
   type RunRerunRequest,
   type ManualScheduleRequest,
@@ -38,6 +41,8 @@ import {
   ORCH_CAPABILITIES,
   PROTOCOL_VERSION,
   WS_MAX_PAYLOAD_BYTES,
+  DASHBOARD_REQUEST_TYPE_SET,
+  DashboardResponseErrorCode,
   type OrchCapabilities,
   type OrchRole,
 } from '@kici-dev/engine';
@@ -169,8 +174,16 @@ export interface PlatformClientOptions {
    * provisioning is idempotent.
    */
   onOrgIdentified?: (info: { orgId: string; clusterId: string | null }) => void;
+  /**
+   * Optional callback fired with the provenance trust root (OIDC issuer) the
+   * Platform supplies on `auth.success`. The orchestrator uses it to verify
+   * provenance bundles at ingest. `null` means provenance is not configured.
+   */
+  onProvenanceIssuer?: (issuer: string | null) => void;
   /** Optional callback for dashboard run detail requests from Platform. */
   onDashboardRunDetail?: (msg: DashboardRunDetailRequest) => void;
+  /** Optional callback for dashboard structured run-result requests from Platform. */
+  onDashboardRunStructured?: (msg: DashboardRunStructuredRequest) => void;
   /** Optional callback for dashboard runs.list (operator console) requests from Platform. */
   onDashboardRunsList?: (msg: DashboardRunsListRequest) => void;
   /** Optional callback for dashboard runs.filters (operator console) requests from Platform. */
@@ -181,6 +194,10 @@ export interface PlatformClientOptions {
   onDashboardStepLogs?: (msg: DashboardStepLogsRequest) => void;
   /** Optional callback for dashboard attestations-list requests from Platform. */
   onDashboardAttestationsList?: (msg: DashboardAttestationsListRequest) => void;
+  /** Optional callback for org-wide attestations list (browser) requests from Platform. */
+  onDashboardAttestationsListAll?: (msg: DashboardAttestationsListAllRequest) => void;
+  /** Optional callback for single-attestation detail requests from Platform. */
+  onDashboardAttestationGet?: (msg: DashboardAttestationGetRequest) => void;
   /** Optional callback for run re-run requests from Platform (dashboard action). */
   onRunRerun?: (msg: RunRerunRequest) => void;
   /** Optional callback for manual schedule trigger requests from Platform (dashboard action). */
@@ -240,6 +257,44 @@ export interface PlatformClientOptions {
   relayBuffer?: RelayBufferRegistry;
 }
 
+/** Error `*.response` frame shape for a dashboard request that failed validation. */
+export interface DashboardRequestErrorFrame {
+  type: string;
+  requestId: string;
+  error: string;
+  code: string;
+  orchVersion?: string;
+  requestType: string;
+}
+
+/**
+ * Build the error `*.response` frame for a dashboard request that failed schema
+ * validation, distinguishing a request type this build has never heard of
+ * (version mismatch → upgrade the orchestrator) from a known type with a
+ * malformed body (genuine client error).
+ */
+export function classifyDashboardRequestError(
+  raw: { type: string; requestId: string },
+  knownTypes: ReadonlySet<string>,
+  orchVersion: string | undefined,
+): DashboardRequestErrorFrame {
+  const known = knownTypes.has(raw.type);
+  const code = known
+    ? DashboardResponseErrorCode.enum.invalid_payload
+    : DashboardResponseErrorCode.enum.unsupported_request_type;
+  const error = known
+    ? `invalid dashboard request payload for ${raw.type}`
+    : `This orchestrator (v${orchVersion ?? 'unknown'}) does not support '${raw.type}'. Upgrade the orchestrator to use this feature.`;
+  return {
+    type: `${raw.type}.response`,
+    requestId: raw.requestId,
+    error,
+    code,
+    ...(orchVersion ? { orchVersion } : {}),
+    requestType: raw.type,
+  };
+}
+
 /**
  * WebSocket client that connects the orchestrator to the Platform relay.
  *
@@ -292,12 +347,16 @@ export class PlatformClient {
   private readonly onPeerDiscover?: PlatformClientOptions['onPeerDiscover'];
   private readonly onAuthenticated?: PlatformClientOptions['onAuthenticated'];
   private readonly onOrgIdentified?: PlatformClientOptions['onOrgIdentified'];
+  private readonly onProvenanceIssuer?: PlatformClientOptions['onProvenanceIssuer'];
   private readonly onDashboardRunDetail?: PlatformClientOptions['onDashboardRunDetail'];
+  private readonly onDashboardRunStructured?: PlatformClientOptions['onDashboardRunStructured'];
   private readonly onDashboardRunsList?: PlatformClientOptions['onDashboardRunsList'];
   private readonly onDashboardRunsFilters?: PlatformClientOptions['onDashboardRunsFilters'];
   private readonly onDashboardSourcesList?: PlatformClientOptions['onDashboardSourcesList'];
   private readonly onDashboardStepLogs?: PlatformClientOptions['onDashboardStepLogs'];
   private readonly onDashboardAttestationsList?: PlatformClientOptions['onDashboardAttestationsList'];
+  private readonly onDashboardAttestationsListAll?: PlatformClientOptions['onDashboardAttestationsListAll'];
+  private readonly onDashboardAttestationGet?: PlatformClientOptions['onDashboardAttestationGet'];
   private readonly onRunRerun?: PlatformClientOptions['onRunRerun'];
   private readonly onManualSchedule?: PlatformClientOptions['onManualSchedule'];
   private readonly onRunCancel?: PlatformClientOptions['onRunCancel'];
@@ -359,12 +418,16 @@ export class PlatformClient {
     this.onPeerDiscover = options.onPeerDiscover;
     this.onAuthenticated = options.onAuthenticated;
     this.onOrgIdentified = options.onOrgIdentified;
+    this.onProvenanceIssuer = options.onProvenanceIssuer;
     this.onDashboardRunDetail = options.onDashboardRunDetail;
+    this.onDashboardRunStructured = options.onDashboardRunStructured;
     this.onDashboardRunsList = options.onDashboardRunsList;
     this.onDashboardRunsFilters = options.onDashboardRunsFilters;
     this.onDashboardSourcesList = options.onDashboardSourcesList;
     this.onDashboardStepLogs = options.onDashboardStepLogs;
     this.onDashboardAttestationsList = options.onDashboardAttestationsList;
+    this.onDashboardAttestationsListAll = options.onDashboardAttestationsListAll;
+    this.onDashboardAttestationGet = options.onDashboardAttestationGet;
     this.onRunRerun = options.onRunRerun;
     this.onManualSchedule = options.onManualSchedule;
     this.onRunCancel = options.onRunCancel;
@@ -892,16 +955,18 @@ export class PlatformClient {
     const { type, requestId } = raw as { type?: unknown; requestId?: unknown };
     if (typeof type !== 'string' || !type.startsWith('dashboard.')) return false;
     if (typeof requestId !== 'string' || requestId.length === 0) return false;
+    const frame = classifyDashboardRequestError(
+      { type, requestId },
+      DASHBOARD_REQUEST_TYPE_SET,
+      this.version,
+    );
     logger.warn('Invalid dashboard request from Platform; answering structured error', {
       type,
       requestId,
+      code: frame.code,
       errors: issues,
     });
-    this.sendRaw({
-      type: `${type}.response`,
-      requestId,
-      error: `invalid dashboard request payload for ${type}`,
-    });
+    this.sendRaw(frame);
     return true;
   }
 
@@ -955,6 +1020,14 @@ export class PlatformClient {
         this.onDashboardRunDetail?.(msg);
         break;
 
+      case 'dashboard.run.structured':
+        logger.debug('Dashboard structured run-result request received', {
+          requestId: msg.requestId,
+          runId: msg.runId,
+        });
+        this.onDashboardRunStructured?.(msg);
+        break;
+
       case 'dashboard.runs.list':
         logger.debug('Dashboard runs list request received', {
           requestId: msg.requestId,
@@ -995,6 +1068,21 @@ export class PlatformClient {
           runId: msg.runId,
         });
         this.onDashboardAttestationsList?.(msg);
+        break;
+
+      case 'dashboard.attestations.list.all':
+        logger.debug('Dashboard org-wide attestations list request received', {
+          requestId: msg.requestId,
+        });
+        this.onDashboardAttestationsListAll?.(msg);
+        break;
+
+      case 'dashboard.attestation.get':
+        logger.debug('Dashboard attestation get request received', {
+          requestId: msg.requestId,
+          attestationId: msg.attestationId,
+        });
+        this.onDashboardAttestationGet?.(msg);
         break;
 
       case 'run.rerun.request':
@@ -1216,6 +1304,10 @@ export class PlatformClient {
     if (msg.orgId) {
       this.onOrgIdentified?.({ orgId: msg.orgId, clusterId: this.clusterId ?? null });
     }
+    // Surface the provenance trust root so the agent-handler can verify
+    // provenance bundles at ingest. Fires on every (re)connect; `null` when
+    // the Platform has no provenance issuer configured.
+    this.onProvenanceIssuer?.(msg.provenanceIssuer ?? null);
     this.startHeartbeat();
 
     // Announce presence to the Platform. Always send source.register —

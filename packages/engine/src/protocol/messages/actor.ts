@@ -24,6 +24,19 @@ export const userActorSchema = z.object({
   type: z.literal(ActorType.enum.user),
   /** Keycloak subject (idp_sub). */
   sub: z.string().min(1),
+  /**
+   * Present when the user is acting through an agent-kind PAT (e.g. a coding
+   * agent driving KiCI via the developer MCP server). The PAT still inherits
+   * the user's permissions — this is provenance only, not an authority change.
+   * `patId` is the opaque PAT identifier; `label` is the human-set agent name
+   * recorded on every audit / access-log row.
+   */
+  agent: z
+    .object({
+      patId: z.string().min(1),
+      label: z.string().min(1),
+    })
+    .optional(),
 });
 export type UserActor = z.infer<typeof userActorSchema>;
 
@@ -92,7 +105,7 @@ export type ActorPrincipal = z.infer<typeof actorPrincipalSchema>;
 export function stringifyActor(actor: ActorPrincipal): string {
   switch (actor.type) {
     case 'user':
-      return `user:${actor.sub}`;
+      return actor.agent ? `user:${actor.sub} via agent:${actor.agent.label}` : `user:${actor.sub}`;
     case 'api_key':
       return `api_key:${actor.keyId}`;
     case 'service_account':
@@ -138,7 +151,13 @@ export function flattenActor(actor: ActorPrincipal): {
 } {
   switch (actor.type) {
     case 'user':
-      return { actorType: 'user', actorId: actor.sub, actorMeta: null };
+      return {
+        actorType: 'user',
+        actorId: actor.sub,
+        actorMeta: actor.agent
+          ? { agentPatId: actor.agent.patId, agentLabel: actor.agent.label }
+          : null,
+      };
     case 'api_key':
       return {
         actorType: 'api_key',

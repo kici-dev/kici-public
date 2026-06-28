@@ -99,5 +99,12 @@ export function generateSecretsDts(options: GenerateSecretsDtsOptions): string {
   lines.push('}');
   lines.push('');
 
+  // A top-level export makes the generated .d.ts a TypeScript module, so the
+  // `declare module '@kici-dev/sdk'` block above augments the SDK's interfaces
+  // instead of being parsed as an ambient declaration that replaces (shadows)
+  // the whole module.
+  lines.push('export {};');
+  lines.push('');
+
   return lines.join('\n');
 }

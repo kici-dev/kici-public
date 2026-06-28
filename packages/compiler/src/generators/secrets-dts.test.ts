@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import ts from 'typescript';
 import { generateSecretsDts } from './secrets-dts.js';
 import type { EnvironmentMetadata, GenerateSecretsDtsOptions } from './secrets-dts.js';
 
@@ -154,5 +155,29 @@ describe('generateSecretsDts', () => {
     const output = generateSecretsDts(makeOptions([{ name: 'production', keys: ['KEY'] }]));
 
     expect(output).not.toContain('KnownContexts');
+  });
+
+  it('emits a top-level export so the file is a module (augments, not shadows)', () => {
+    const output = generateSecretsDts(makeOptions([{ name: 'production', keys: ['KEY'] }]));
+
+    // A bare `export {};` on its own line makes the .d.ts a module, which turns
+    // the `declare module '@kici-dev/sdk'` block into an augmentation instead of
+    // an ambient declaration that would replace (shadow) the whole SDK.
+    expect(output).toMatch(/^export \{\};$/m);
+  });
+
+  it('produces a source file TypeScript treats as a module', () => {
+    const output = generateSecretsDts(makeOptions([{ name: 'production', keys: ['KEY'] }]));
+
+    const sourceFile = ts.createSourceFile(
+      'secrets.d.ts',
+      output,
+      ts.ScriptTarget.Latest,
+      /* setParentNodes */ false,
+    );
+
+    // externalModuleIndicator is set iff TS parses the file as a module. If it
+    // were undefined, the `declare module` block would shadow @kici-dev/sdk.
+    expect(sourceFile.externalModuleIndicator).toBeTruthy();
   });
 });

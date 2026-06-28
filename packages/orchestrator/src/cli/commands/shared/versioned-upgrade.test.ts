@@ -27,6 +27,10 @@ import {
   resolveUpgradeTarget,
   resolveNpmSourceVersion,
   verifyNpmSourceLaunch,
+  buildPickChoices,
+  selectablePickTargets,
+  switchToInstalledVersion,
+  checkPickFlagConflicts,
 } from './versioned-upgrade.js';
 import { writeManifest, writeIndex } from '../../service/index.js';
 import type { DiscoveredInstance, InstanceManifest, ServiceManager } from '../../service/index.js';
@@ -309,5 +313,127 @@ describe('verifyNpmSourceLaunch', () => {
       force: true,
     });
     expect(v).toEqual({ ok: true, version: '0.1.17', manifestVersion: null });
+  });
+});
+
+describe('buildPickChoices — interactive --pick list', () => {
+  it('returns one choice per version, newest-first (lexicographic desc)', () => {
+    const choices = buildPickChoices(['0.1.1', '0.1.2', '0.1.3'], '0.1.2');
+    expect(choices.map((c) => c.value)).toEqual(['0.1.3', '0.1.2', '0.1.1']);
+  });
+
+  it('marks the current version disabled with a "(current)" label', () => {
+    const choices = buildPickChoices(['0.1.1', '0.1.2'], '0.1.2');
+    const cur = choices.find((c) => c.value === '0.1.2')!;
+    expect(cur.disabled).toBe('current version');
+    expect(cur.name).toContain('(current)');
+  });
+
+  it('leaves non-current versions enabled with name === value', () => {
+    const choices = buildPickChoices(['0.1.1', '0.1.2'], '0.1.2');
+    const other = choices.find((c) => c.value === '0.1.1')!;
+    expect(other.disabled).toBe(false);
+    expect(other.name).toBe('0.1.1');
+  });
+
+  it('disables nothing when there is no current version', () => {
+    const choices = buildPickChoices(['0.1.1', '0.1.2'], null);
+    expect(choices.every((c) => c.disabled === false)).toBe(true);
+  });
+});
+
+describe('selectablePickTargets — what --pick can switch to', () => {
+  it('excludes the current version', () => {
+    expect(selectablePickTargets(['0.1.1', '0.1.2', '0.1.3'], '0.1.2')).toEqual(['0.1.1', '0.1.3']);
+  });
+
+  it('is empty when only the current version is installed', () => {
+    expect(selectablePickTargets(['0.1.2'], '0.1.2')).toEqual([]);
+  });
+
+  it('is empty when nothing is installed', () => {
+    expect(selectablePickTargets([], null)).toEqual([]);
+  });
+});
+
+describe('switchToInstalledVersion — shared switch sequence', () => {
+  let installBase: string;
+  let instanceDir: string;
+
+  beforeEach(() => {
+    installBase = mkTmp('kici-switch-base-');
+    instanceDir = mkTmp('kici-switch-inst-');
+    // Two installed versioned dirs + an active symlink pointing at the older one.
+    fs.mkdirSync(path.join(installBase, 'orchestrator-0.1.1'), { recursive: true });
+    fs.mkdirSync(path.join(installBase, 'orchestrator-0.1.2'), { recursive: true });
+    fs.symlinkSync('orchestrator-0.1.1', path.join(installBase, 'orchestrator'));
+  });
+
+  afterEach(() => {
+    for (const d of [installBase, instanceDir]) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  it('flips the symlink to the target and persists kiciVersion to the manifest', async () => {
+    const manager = makeManager(); // status → stopped, start/stop are vi.fns
+    const manifest = makeManifest({ name: 'kici-test', installBase, kiciVersion: '0.1.1' });
+    const resolvedInstance = {
+      manifest,
+      manifestPath: path.join(instanceDir, '.kici-orchestrator.json'),
+      instanceDir,
+    };
+    writeManifest(instanceDir, manifest);
+    const config = {
+      name: 'kici-test',
+      displayName: 'KiCI orchestrator',
+      description: 'x',
+      executablePath: '',
+      envFilePath: manifest.envFilePath,
+      workingDirectory: manifest.configDir,
+      isUserLevel: true,
+      restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+      component: 'orchestrator' as const,
+      instanceDir,
+    };
+
+    await switchToInstalledVersion({
+      component: 'orchestrator',
+      platform: 'systemd',
+      installBase,
+      config,
+      manager,
+      resolvedInstance,
+      targetVersion: '0.1.2',
+    });
+
+    expect(fs.readlinkSync(path.join(installBase, 'orchestrator'))).toBe('orchestrator-0.1.2');
+    const written = JSON.parse(
+      fs.readFileSync(path.join(instanceDir, '.kici-orchestrator.json'), 'utf-8'),
+    );
+    expect(written.kiciVersion).toBe('0.1.2');
+    expect(manager.start).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('checkPickFlagConflicts — --pick mutual exclusivity', () => {
+  it('returns null when --pick is absent', () => {
+    expect(checkPickFlagConflicts({ from: 'x.tar.gz' })).toBeNull();
+  });
+
+  it('returns null when --pick is used alone', () => {
+    expect(checkPickFlagConflicts({ pick: true })).toBeNull();
+  });
+
+  it('reports conflict with --from / --url / --version / --rollback / --cleanup', () => {
+    expect(checkPickFlagConflicts({ pick: true, from: 'x' })).toContain('--from');
+    expect(checkPickFlagConflicts({ pick: true, url: 'x' })).toContain('--url');
+    expect(checkPickFlagConflicts({ pick: true, version: '0.1.0' })).toContain('--version');
+    expect(checkPickFlagConflicts({ pick: true, rollback: true })).toContain('--rollback');
+    expect(checkPickFlagConflicts({ pick: true, cleanup: true })).toContain('--cleanup');
+  });
+
+  it('lists every conflicting flag at once', () => {
+    const msg = checkPickFlagConflicts({ pick: true, from: 'x', rollback: true })!;
+    expect(msg).toContain('--from');
+    expect(msg).toContain('--rollback');
   });
 });

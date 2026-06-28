@@ -56,8 +56,10 @@ import type {
   ResolvedHostAgent,
   UpstreamSnapshot,
   HostFacts,
+  Environment as EngineEnvironment,
 } from '@kici-dev/engine';
 import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/host-roster.js';
+import { flattenLockSteps } from './flatten-lock-steps.js';
 import type { Database } from '../db/types.js';
 import { parseOutputsCell } from '../orchestrator-core.js';
 import { AgentJobFailedError } from '../cache/agent-job-failed-error.js';
@@ -72,6 +74,17 @@ import {
   evaluateProtectionRules,
   type JobDispatchContext,
 } from '../environments/protection/pipeline.js';
+import {
+  evaluateMultiEnvGates,
+  aggregateProtectionParams,
+  buildEffectiveEnvironment,
+  formatMultiEnvRejection,
+} from '../environments/protection/aggregate.js';
+import {
+  buildJobEnvironmentDisplayNames,
+  resolveJobEnvironmentNames,
+  resolveMultiEnvMergedData,
+} from './job-environments.js';
 import { toEnvironment } from '../environments/environment-store.js';
 import { resolveInstallSecrets, type NpmRegistrySpec } from './install-secrets-resolver.js';
 import { storePendingWorkflowContext, toSerializableInputs } from './pending-workflow-context.js';
@@ -204,6 +217,8 @@ export interface WorkflowDispatchContext {
   runId: string;
   trustResolution: TrustResolution | undefined;
   lockFileSource: string | undefined;
+  /** True when this run executes an uploaded local working tree (CLI remote run). */
+  localWorkingTree: boolean;
   /** True only when invoked from the cross-source dispatch shell. */
   crossSource: boolean;
   /** Composite dedup key `${info.deliveryId}:${reg.id}` (cross-source only). */
@@ -360,6 +375,12 @@ interface SecretBundle {
 
 interface JobEnvData {
   environmentName?: string;
+  /**
+   * Ordered bound-environment names persisted on the job row (`(dynamic)`
+   * placeholder for elements unresolved at dispatch; overwritten with the
+   * agent-resolved list for dynamic environments). Empty/undefined = no binding.
+   */
+  environmentNames?: string[];
   environmentVars?: Record<string, string>;
   jobEnv?: Record<string, string>;
   jobSecrets?: Record<string, string>;
@@ -375,6 +396,10 @@ interface JobEnvData {
   rejected?: boolean;
   rejectReason?: string;
   pendingInit?: boolean;
+  /** Bound environments skipped on a test/local run because they disallow local execution. */
+  skippedEnvs?: string[];
+  /** Warning surfaced when every bound environment was skipped on a test run. */
+  envWarning?: string;
 }
 
 /** A resolved approval requirement awaiting hold creation in the dispatch loop. */
@@ -411,6 +436,8 @@ interface DispatchedJob {
   waveMaxParallel?: number;
   /** The base's failFast policy, stamped on every child of a bounded wave. */
   waveFailFast?: boolean;
+  /** Ordered bound-environment names persisted on the job row (multi-env jobs). */
+  environments?: string[];
 }
 
 interface RejectedJob {
@@ -502,7 +529,7 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
 
   if (deps.onSourceLocationsExtracted) {
     for (const job of workflow.jobs.filter(isLockStaticJob)) {
-      const locs = job.steps.map((s) => s.sourceLocation);
+      const locs = flattenLockSteps(job.steps).map((s) => s.sourceLocation);
       if (locs.some((l) => l !== undefined)) {
         deps.onSourceLocationsExtracted(
           workflow.name,
@@ -770,7 +797,17 @@ async function runBuildJob(args: {
   error: unknown;
 }> {
   const { ctx, setup, contentHash, lockfileHash } = args;
-  const { deps, workflow, repoIdentifier, credentials, event, ref, runId, decision } = ctx;
+  const {
+    deps,
+    workflow,
+    repoIdentifier,
+    credentials,
+    event,
+    ref,
+    runId,
+    decision,
+    localWorkingTree,
+  } = ctx;
   const buildJobName = `__build__${workflow.name}`;
   let buildJobId: string | undefined;
   let buildJobLabels: string[] | undefined;
@@ -831,6 +868,9 @@ async function runBuildJob(args: {
             setup.workflowConcurrency,
             setup.workflowTimeoutMs,
             setup.checkMode,
+            localWorkingTree,
+            event.senderUsername ?? undefined,
+            event.senderUserId ?? undefined,
           );
           await deps.executionTracker.failRun(runId, reason, {
             scope: 'run',
@@ -864,6 +904,9 @@ async function runBuildJob(args: {
           setup.workflowConcurrency,
           setup.workflowTimeoutMs,
           setup.checkMode,
+          localWorkingTree,
+          event.senderUsername ?? undefined,
+          event.senderUserId ?? undefined,
         );
         buildJobTrackedEarly = true;
       }
@@ -1755,7 +1798,7 @@ function buildDeferredInitJob(args: {
       targetJobName: mat.baseName,
       workflowName: workflow.name,
       source: workflow.source?.file ?? fullLockFile.source.file,
-      dynamicEnvironment: lockJob.dynamicEnvironment ?? false,
+      dynamicEnvironment: (lockJob.environments ?? []).some((e) => e.dynamic),
       dynamicEnv: lockJob.dynamicEnv ?? false,
       dynamicConcurrencyGroup: lockJob.dynamicConcurrencyGroup ?? false,
       dynamicMatrix: mat.pendingDynamicMatrix === true,
@@ -1889,19 +1932,69 @@ export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
 async function applyEnvironmentRulesAndSecrets(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
-  environmentName: string;
+  environmentNames: readonly string[];
   concurrencyGroup: string | undefined;
   jobEnvData: JobEnvData;
   hostCtx?: HostFacts;
 }): Promise<void> {
-  const { ctx, lockJob, environmentName, concurrencyGroup, jobEnvData, hostCtx } = args;
+  const { ctx, lockJob, environmentNames, concurrencyGroup, jobEnvData, hostCtx } = args;
   const { deps, repoIdentifier, credentials, event, ref, runId, workflow, resolvedOrgId, bundle } =
     ctx;
   const { trustResolution } = ctx;
   if (!deps.environmentStore) return;
-  const envConfig = await deps.environmentStore.matchEnvironment(resolvedOrgId, environmentName);
-  if (!envConfig) return;
-  const env = toEnvironment(envConfig);
+
+  // Match each bound environment by name (in order).
+  let matched: Array<{ name: string; env: EngineEnvironment | undefined }> = [];
+  for (const name of environmentNames) {
+    const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
+    matched.push({ name, env: cfg ? toEnvironment(cfg) : undefined });
+  }
+
+  // The run's environment column / concurrency grouping uses the first declared
+  // bound name, even if some bound environments have no configured record.
+  jobEnvData.environmentName = environmentNames[0];
+
+  // Lenient missing-environment handling: a bound name with no configured record
+  // simply does not contribute protection rules / vars (the established
+  // single-environment behavior). Proactive rejection of a provably-missing
+  // environment is the deferred registration-time satisfiability check.
+  const missing = matched.filter((m) => !m.env).map((m) => m.name);
+  if (missing.length > 0) {
+    logger.warn('bound environment(s) not configured; skipping', {
+      runId,
+      workflow: workflow.name,
+      job: lockJob.name,
+      missing,
+    });
+    matched = matched.filter((m) => m.env);
+  }
+
+  // Skip-on-test: a test/local run drops bound environments that disallow local
+  // execution (their vars/secrets and gates do not participate). If every bound
+  // env is skipped, the job runs with no environment vars and a clear warning.
+  if (ctx.testRun) {
+    const skipped = matched.filter((m) => m.env && m.env.allowLocalExecution === false);
+    if (skipped.length > 0) {
+      jobEnvData.skippedEnvs = skipped.map((m) => m.name);
+      matched = matched.filter((m) => !(m.env && m.env.allowLocalExecution === false));
+      if (matched.length === 0) {
+        jobEnvData.envWarning =
+          'all bound environments disallow test runs; running with no environment variables';
+        logger.warn('multi-env skip-on-test: all bound environments skipped', {
+          runId,
+          workflow: workflow.name,
+          job: lockJob.name,
+          skippedEnvs: jobEnvData.skippedEnvs,
+        });
+        return;
+      }
+    }
+  }
+
+  // No configured environment participates (all missing and/or test-skipped):
+  // dispatch with the job's own env only, no environment-scoped vars/secrets.
+  if (matched.length === 0) return;
+
   const jobId = randomUUID();
   const dispatchCtx: JobDispatchContext = {
     branch: event.targetBranch,
@@ -1910,7 +2003,31 @@ async function applyEnvironmentRulesAndSecrets(args: {
     runId,
     jobId,
   };
-  const effectiveConcurrencyGroup = concurrencyGroup ?? environmentName;
+
+  // All-must-pass hard reject gates (enabled/branch/trigger/repo) across every
+  // configured bound environment. When any rejects, the run is rejected with a
+  // reason naming the offending environment and rule.
+  const rejections = evaluateMultiEnvGates(matched, dispatchCtx);
+  if (rejections.length > 0) {
+    jobEnvData.rejected = true;
+    jobEnvData.rejectReason = formatMultiEnvRejection(rejections);
+    logger.warn('multi-env gate rejection', {
+      runId,
+      workflow: workflow.name,
+      job: lockJob.name,
+      rejections,
+    });
+    return;
+  }
+
+  // Every remaining bound environment is configured and passed the reject gates.
+  const present = matched.map((m) => ({ name: m.name, env: m.env as EngineEnvironment }));
+  // The configured primary environment drives the merged-data resolution below.
+  jobEnvData.environmentName = present[0].name;
+  const eff = aggregateProtectionParams(present.map((p) => p.env));
+  const env = buildEffectiveEnvironment(present[0].env, eff);
+
+  const effectiveConcurrencyGroup = concurrencyGroup ?? present[0].name;
   let runningCount = 0;
   if (deps.db) {
     const result = await deps.db
@@ -2011,33 +2128,25 @@ async function applyEnvironmentRulesAndSecrets(args: {
     }
   }
 
-  if (deps.variableStore && !jobEnvData.rejected && !jobEnvData.held) {
-    const envVars = await deps.variableStore.getResolvedVars(
-      resolvedOrgId,
-      env.id,
-      ctx.info.routingKey,
-    );
-    if (Object.keys(envVars).length > 0) {
-      jobEnvData.environmentVars = envVars;
-    }
-  }
-  if (deps.secretResolver && !jobEnvData.rejected && !jobEnvData.held) {
+  if (!jobEnvData.rejected && !jobEnvData.held) {
     try {
-      const envSecrets = await deps.secretResolver.resolveForJob(
-        resolvedOrgId,
-        environmentName,
+      const merged = await resolveMultiEnvMergedData({
+        deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
+        orgId: resolvedOrgId,
+        entries: present,
         hostCtx,
-      );
-      if (Object.keys(envSecrets).length > 0) {
-        jobEnvData.jobSecrets = envSecrets;
-        jobEnvData.jobNamespacedSecrets = { [environmentName]: envSecrets };
-      }
+        routingKey: ctx.info.routingKey,
+      });
+      if (merged.environmentVars) jobEnvData.environmentVars = merged.environmentVars;
+      if (merged.jobSecrets) jobEnvData.jobSecrets = merged.jobSecrets;
+      if (merged.jobNamespacedSecrets)
+        jobEnvData.jobNamespacedSecrets = merged.jobNamespacedSecrets;
     } catch (err) {
       logger.error('Per-job secret resolution failed', {
         runId,
         workflow: workflow.name,
         job: lockJob.name,
-        environment: environmentName,
+        environment: present.map((p) => p.name).join(','),
         error: toErrorMessage(err),
       });
     }
@@ -2066,20 +2175,28 @@ async function evaluateJobEnvironments(args: {
   for (const mat of buildPrep.materializedJobs) {
     const lockJob = mat.lockJob;
     const jobEnvData: JobEnvData = {};
-    const { inlineEnvironmentName, inlineEnv, inlineConcurrencyGroup } = evaluateInlineFields(
+    const { inlineEnvironmentNames, inlineEnv, inlineConcurrencyGroup } = evaluateInlineFields(
       lockJob,
       inlineEvent,
     );
-    if (inlineEnvironmentName || inlineEnv || inlineConcurrencyGroup) {
+    const { names: environmentNames, needsInit: envNeedsInit } = resolveJobEnvironmentNames(
+      lockJob,
+      inlineEnvironmentNames,
+    );
+    // Ordered display list persisted on the job row (placeholder for unresolved
+    // dynamic elements; the deferred-init flow-back overwrites it once resolved).
+    const displayEnvNames = buildJobEnvironmentDisplayNames(lockJob, inlineEnvironmentNames);
+    if (displayEnvNames.length > 0) jobEnvData.environmentNames = displayEnvNames;
+    if (inlineEnvironmentNames.some(Boolean) || inlineEnv || inlineConcurrencyGroup) {
       logger.debug('Inline evaluation resolved dynamic fields', {
         job: mat.expandedName,
-        environment: !!inlineEnvironmentName,
+        environment: inlineEnvironmentNames.some(Boolean),
         env: !!inlineEnv,
         concurrencyGroup: !!inlineConcurrencyGroup,
       });
     }
     const needsInit =
-      (lockJob.dynamicEnvironment && !isLockInlineValue(lockJob.environment)) ||
+      envNeedsInit ||
       (lockJob.dynamicEnv && !isLockInlineValue(lockJob.env)) ||
       (lockJob.dynamicConcurrencyGroup && !isLockInlineValue(lockJob.concurrencyGroup)) ||
       // A dynamic matrix is resolved by the same agent-eval init flow: the agent
@@ -2094,13 +2211,6 @@ async function evaluateJobEnvironments(args: {
       continue;
     }
 
-    const environmentName: string | undefined =
-      inlineEnvironmentName ??
-      (lockJob.dynamicEnvironment
-        ? undefined
-        : typeof lockJob.environment === 'string'
-          ? lockJob.environment
-          : undefined);
     const jobEnv: Record<string, string> | undefined =
       inlineEnv ??
       (lockJob.dynamicEnv ? undefined : !isLockInlineValue(lockJob.env) ? lockJob.env : undefined);
@@ -2113,13 +2223,12 @@ async function evaluateJobEnvironments(args: {
           : undefined);
 
     if (jobEnv) jobEnvData.jobEnv = jobEnv;
-    if (environmentName) {
-      jobEnvData.environmentName = environmentName;
-      if (!runEnvironmentName) runEnvironmentName = environmentName;
+    if (environmentNames.length > 0) {
+      if (!runEnvironmentName) runEnvironmentName = environmentNames[0];
       await applyEnvironmentRulesAndSecrets({
         ctx,
         lockJob,
-        environmentName,
+        environmentNames,
         concurrencyGroup,
         jobEnvData,
         hostCtx: hostCtxFromMat(mat),
@@ -2983,6 +3092,7 @@ async function recordRunStart(args: {
     decision,
     trustResolution,
     lockFileSource,
+    localWorkingTree,
     testRun,
   } = ctx;
   if (!deps.executionTracker || dispatchedJobs.length === 0) return;
@@ -3017,6 +3127,9 @@ async function recordRunStart(args: {
       setup.workflowConcurrency,
       setup.workflowTimeoutMs,
       setup.checkMode,
+      localWorkingTree,
+      event.senderUsername ?? undefined,
+      event.senderUserId ?? undefined,
     );
   }
   if (runEnvironmentName && deps.db) {
@@ -3058,6 +3171,19 @@ async function recordRunStart(args: {
       .execute()
       .catch((err) => {
         logger.error('Failed to set test-run context on execution run', {
+          runId,
+          error: toErrorMessage(err),
+        });
+      });
+  }
+  if (localWorkingTree && deps.db) {
+    deps.db
+      .updateTable('execution_runs')
+      .set({ local_working_tree: true })
+      .where('run_id', '=', runId)
+      .execute()
+      .catch((err) => {
+        logger.error('Failed to mark execution run as local working tree', {
           runId,
           error: toErrorMessage(err),
         });
@@ -3132,52 +3258,47 @@ async function insertEdgesAndMarkRejected(args: {
 async function applyInitResultEnvironment(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
-  initResult: { environmentName?: string; env?: Record<string, string> } | undefined;
+  initResult: { environmentNames?: string[]; env?: Record<string, string> } | undefined;
   jobEnvData: JobEnvData;
   hostCtx?: HostFacts;
 }): Promise<void> {
   const { ctx, lockJob, initResult, jobEnvData, hostCtx } = args;
   const { deps, runId, resolvedOrgId } = ctx;
-  if (lockJob.dynamicEnvironment && initResult?.environmentName !== undefined) {
-    jobEnvData.environmentName = initResult.environmentName;
-    if (deps.environmentStore) {
-      const env = await deps.environmentStore.matchEnvironment(
-        resolvedOrgId,
-        initResult.environmentName,
-      );
-      if (env) {
-        jobEnvData.environmentName = env.name;
-        if (deps.variableStore) {
-          const envVars = await deps.variableStore.getResolvedVars(
-            resolvedOrgId,
-            env.id,
-            ctx.info.routingKey,
-          );
-          if (Object.keys(envVars).length > 0) {
-            jobEnvData.environmentVars = envVars;
-          }
+  const anyDynamic = (lockJob.environments ?? []).some((e) => e.dynamic);
+  const resolvedNames = initResult?.environmentNames ?? [];
+  if (anyDynamic && resolvedNames.length > 0 && deps.environmentStore) {
+    jobEnvData.environmentName = resolvedNames[0];
+    // Overwrite the dispatch-time placeholder list with the agent-resolved one.
+    jobEnvData.environmentNames = [...resolvedNames];
+    const present: Array<{ name: string; env: EngineEnvironment }> = [];
+    for (const name of resolvedNames) {
+      const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
+      if (cfg) {
+        const env = toEnvironment(cfg);
+        present.push({ name: env.name, env });
+      }
+    }
+    if (present.length > 0) {
+      jobEnvData.environmentName = present[0].name;
+      try {
+        const merged = await resolveMultiEnvMergedData({
+          deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
+          orgId: resolvedOrgId,
+          entries: present,
+          hostCtx,
+          routingKey: ctx.info.routingKey,
+        });
+        if (merged.environmentVars) jobEnvData.environmentVars = merged.environmentVars;
+        if (merged.jobSecrets) jobEnvData.jobSecrets = merged.jobSecrets;
+        if (merged.jobNamespacedSecrets) {
+          jobEnvData.jobNamespacedSecrets = merged.jobNamespacedSecrets;
         }
-        if (deps.secretResolver) {
-          try {
-            const envSecrets = await deps.secretResolver.resolveForJob(
-              resolvedOrgId,
-              initResult.environmentName,
-              hostCtx,
-            );
-            if (Object.keys(envSecrets).length > 0) {
-              jobEnvData.jobSecrets = envSecrets;
-              jobEnvData.jobNamespacedSecrets = {
-                [initResult.environmentName]: envSecrets,
-              };
-            }
-          } catch (err) {
-            logger.error('Deferred init: secret resolution failed', {
-              runId,
-              job: lockJob.name,
-              error: toErrorMessage(err),
-            });
-          }
-        }
+      } catch (err) {
+        logger.error('Deferred init: secret resolution failed', {
+          runId,
+          job: lockJob.name,
+          error: toErrorMessage(err),
+        });
       }
     }
   }
@@ -3196,8 +3317,11 @@ async function dispatchExecutionAfterInit(args: {
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
   mat: MaterializedJob;
+  /** Agent-resolved ordered bound-environment names, persisted on the real job row. */
+  environments?: string[];
 }): Promise<void> {
-  const { ctx, setup, buildPrep, buildJobConfig, mat } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, mat, environments } = args;
+  const envFields = environments?.length ? { environments } : {};
   const lockJob = mat.lockJob;
   const matrixValues = mat.variantValues;
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
@@ -3268,7 +3392,12 @@ async function dispatchExecutionAfterInit(args: {
       for (const local of routeResult.localJobs) {
         deps.executionTracker
           .addJobsToRun(runId, [
-            { jobId: local.jobId, jobName: local.jobName, runsOnLabels: jobInput.runsOnLabels },
+            {
+              jobId: local.jobId,
+              jobName: local.jobName,
+              runsOnLabels: jobInput.runsOnLabels,
+              ...envFields,
+            },
           ])
           .catch((err) => {
             logger.error('Failed to add deferred init job to execution tracker', {
@@ -3289,6 +3418,7 @@ async function dispatchExecutionAfterInit(args: {
           jobName: mat.expandedName,
           ...(matrixValues && { matrixValues }),
           runsOnLabels: jobInput.runsOnLabels,
+          ...envFields,
         },
       ]);
       await deps.executionTracker.onJobStatus(
@@ -3307,6 +3437,7 @@ async function dispatchExecutionAfterInit(args: {
             jobName: mat.expandedName,
             ...(matrixValues && { matrixValues }),
             runsOnLabels: jobInput.runsOnLabels,
+            ...envFields,
           },
         ])
         .catch((err) => {
@@ -3373,7 +3504,14 @@ async function dispatchResolvedDynamicMatrix(args: {
   const baseEnvData = jobEnvironmentData.get(mat.expandedName) ?? {};
   for (const child of result.jobs) {
     jobEnvironmentData.set(child.expandedName, { ...baseEnvData });
-    await dispatchExecutionAfterInit({ ctx, setup, buildPrep, buildJobConfig, mat: child });
+    await dispatchExecutionAfterInit({
+      ctx,
+      setup,
+      buildPrep,
+      buildJobConfig,
+      mat: child,
+      environments: baseEnvData.environmentNames,
+    });
   }
 
   // Insert needs edges for the resolved children so downstream jobs that need
@@ -3443,7 +3581,14 @@ function startDeferredInitDispatch(args: {
             jobEnvironmentData,
           });
         } else {
-          await dispatchExecutionAfterInit({ ctx, setup, buildPrep, buildJobConfig, mat });
+          await dispatchExecutionAfterInit({
+            ctx,
+            setup,
+            buildPrep,
+            buildJobConfig,
+            mat,
+            environments: jobEnvData.environmentNames,
+          });
         }
       } catch (err) {
         const errMsg = toErrorMessage(err);
@@ -3742,42 +3887,39 @@ async function resolveGeneratedJobConfigs(args: {
       let genNamespacedSecrets: Record<string, Record<string, string>> = {
         ...resolvedNamespacedSecrets,
       };
-      if (typeof genJob.environment === 'string' && deps.environmentStore) {
-        genEnvironmentName = genJob.environment;
-        const env = await deps.environmentStore.matchEnvironment(resolvedOrgId, genJob.environment);
-        if (env) {
-          genEnvironmentName = env.name;
-          if (deps.variableStore) {
-            const envVars = await deps.variableStore.getResolvedVars(
-              resolvedOrgId,
-              env.id,
-              ctx.info.routingKey,
-            );
-            if (Object.keys(envVars).length > 0) {
-              genEnvironmentVars = envVars;
-            }
+      const genEnvNames = (genJob.environments ?? [])
+        .filter((e) => !e.dynamic && typeof e.value === 'string')
+        .map((e) => e.value as string);
+      if (genEnvNames.length > 0 && deps.environmentStore) {
+        const present: Array<{ name: string; env: EngineEnvironment }> = [];
+        for (const name of genEnvNames) {
+          const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
+          if (cfg) {
+            const env = toEnvironment(cfg);
+            present.push({ name: env.name, env });
           }
-          if (deps.secretResolver) {
-            try {
-              const envSecrets = await deps.secretResolver.resolveForJob(
-                resolvedOrgId,
-                genJob.environment,
-                hostCtxFromMat(mat),
-              );
-              if (Object.keys(envSecrets).length > 0) {
-                genSecrets = { ...genSecrets, ...envSecrets };
-                genNamespacedSecrets = {
-                  ...genNamespacedSecrets,
-                  [genJob.environment]: envSecrets,
-                };
-              }
-            } catch (err) {
-              logger.error('Dynamic job: secret resolution failed', {
-                runId,
-                job: mat.expandedName,
-                error: toErrorMessage(err),
-              });
+        }
+        if (present.length > 0) {
+          genEnvironmentName = present[0].name;
+          try {
+            const merged = await resolveMultiEnvMergedData({
+              deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
+              orgId: resolvedOrgId,
+              entries: present,
+              hostCtx: hostCtxFromMat(mat),
+              routingKey: ctx.info.routingKey,
+            });
+            if (merged.environmentVars) genEnvironmentVars = merged.environmentVars;
+            if (merged.jobSecrets) genSecrets = { ...genSecrets, ...merged.jobSecrets };
+            if (merged.jobNamespacedSecrets) {
+              genNamespacedSecrets = { ...genNamespacedSecrets, ...merged.jobNamespacedSecrets };
             }
+          } catch (err) {
+            logger.error('Dynamic job: secret resolution failed', {
+              runId,
+              job: mat.expandedName,
+              error: toErrorMessage(err),
+            });
           }
         }
       }
@@ -4740,6 +4882,9 @@ async function ensureExecutionRunForDeferred(args: {
     setup.workflowConcurrency,
     setup.workflowTimeoutMs,
     setup.checkMode,
+    undefined, // localWorkingTree
+    event.senderUsername ?? undefined,
+    event.senderUserId ?? undefined,
   );
 }
 
@@ -4950,6 +5095,12 @@ export async function dispatchMatchedWorkflow(
         ? failure
         : { ...failure, category: InitFailureCategory.enum.matrix_expansion },
     );
+  }
+  // Stamp each dispatched job with its ordered bound-environment list so the
+  // job row persists it for the dashboard (keyed by expanded job name).
+  for (const dj of dispatchedJobs) {
+    const ed = evalResult.jobEnvironmentData.get(dj.jobName);
+    if (ed?.environmentNames?.length) dj.environments = ed.environmentNames;
   }
   await recordRunStart({
     ctx,

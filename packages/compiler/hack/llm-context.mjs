@@ -69,6 +69,7 @@ export const SCOPE_GROUPS = [
     only: [
       'cli-reference.md',
       'cli-auth.md',
+      'ai-agents.md',
       'testing-guide.md',
       'hooks.md',
       'lock-file-and-drift.md',

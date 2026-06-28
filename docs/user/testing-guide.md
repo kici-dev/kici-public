@@ -14,7 +14,7 @@ Test your workflows remotely against the full CI pipeline from your local machin
 - Give test runs test-scoped secrets — your local secret files and `--env` values (uploaded encrypted) plus any environment flagged `allowLocalExecution: true` — while production environments stay unreachable
 - Detect test mode in workflow code via `ctx.isTestRun`
 
-The command is remote-only -- all execution happens on the orchestrator and agent. For local-only trigger matching previews, use `kici test <event>`.
+The command is remote-only -- all execution happens on the orchestrator and agent. For local-only trigger matching previews, use `kici preview <event>`.
 
 :::note[Orchestrator prerequisite: cache storage]
 `kici run remote` uploads your working-tree overlay to the orchestrator's **cache storage** via a pre-signed URL, and the agent fetches it from there (see [Repo state transfer](#repo-state-transfer)). The target orchestrator must therefore have cache storage enabled (`KICI_STORAGE_TYPE` = `s3` or `filesystem`).

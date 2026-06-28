@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BackendRegistry } from './backend-registry.js';
-import { encrypt, decrypt, deriveKey } from './crypto.js';
+import { encrypt, decrypt, deriveKey } from '@kici-dev/shared';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 // ── Test fixtures ──────────────────────────────────────────────

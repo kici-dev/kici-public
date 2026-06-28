@@ -137,13 +137,15 @@ Output includes actor (type + id + optional metadata), action, source, outcome, 
 **Token management:**
 
 ```bash
-kici-admin agent register [--labels <labels>]
+kici-admin agent register [--labels <labels>] [--mandatory-label <label>...] [--privileged-root]
 kici-admin agent list [--type static|ephemeral] [--include-pending] [--database-url <url>] [--json]
 kici-admin agent revoke <id>
 ```
 
 - `register` creates a static agent token. The token is shown once -- save it and set `KICI_AGENT_TOKEN` on the agent.
 - `--labels` accepts comma-separated labels (e.g., `linux,x64,gpu`) for label-based routing.
+- `--mandatory-label` (repeatable) taints the token with a label the agent only accepts jobs demanding (a Kubernetes-taint-style gate). Each mandatory label is also authorized as an advertised label, so the agent can both advertise it (selector) and be confined by it (taint).
+- `--privileged-root` is shorthand for `--mandatory-label kici:privileged:root`: it mints a **confined root agent** token. The agent must run as uid 0 — the orchestrator refuses the registration otherwise. See [Confined root agents](../security/agent-security.md#confined-root-agents) for the full security model.
 - `list --include-pending` (HTTP mode only) additionally shows agents that have connected via WS but have not yet completed registration. Pending state is in-memory on the orchestrator, so direct-DB mode cannot surface it.
 - `list --database-url` switches to offline direct-DB mode, reading `agent_tokens` directly (pending agents are not visible).
 
@@ -157,7 +159,7 @@ kici-admin agent stop [--platform <type>] [--instance-dir <path>] [--name <name>
 kici-admin agent restart [--platform <type>] [--instance-dir <path>] [--name <name>]
 kici-admin agent status [--platform <type>] [--instance-dir <path>] [--name <name>] [--json]
 kici-admin agent logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--since <duration>] [--level <level>] [--json] [--no-follow]
-kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
 ```
 
 These commands manage the agent as a native system service. The `install --wizard` flow walks through orchestrator URL, agent token, and labels configuration. Lifecycle targeting is folder-anchored — see [Service installation guide](../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
@@ -179,18 +181,19 @@ These commands manage the agent as a native system service. The `install --wizar
 
 **Upgrade options (agent):**
 
-| Option                  | Default       | Description                                                       |
-| ----------------------- | ------------- | ----------------------------------------------------------------- |
-| `--from <path>`         |               | Path to package archive (`.tar.gz` or `.zip`)                     |
-| `--url <url>`           |               | URL to download package archive from                              |
-| `--version <version>`   |               | Target version string (e.g., `0.3.0`)                             |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`      |
-| `--instance-dir <path>` |               | Deploy folder of the instance to upgrade                          |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest) |
-| `--yes`                 |               | Skip confirmation prompt                                          |
-| `--force`               |               | Overwrite existing versioned directory                            |
-| `--cleanup`             |               | Remove old versions (keeps current and previous)                  |
-| `--rollback`            |               | Roll back to the previous version                                 |
+| Option                  | Default       | Description                                                               |
+| ----------------------- | ------------- | ------------------------------------------------------------------------- |
+| `--from <path>`         |               | Path to package archive (`.tar.gz` or `.zip`)                             |
+| `--url <url>`           |               | URL to download package archive from                                      |
+| `--version <version>`   |               | Target version string (e.g., `0.3.0`)                                     |
+| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`              |
+| `--instance-dir <path>` |               | Deploy folder of the instance to upgrade                                  |
+| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest)         |
+| `--yes`                 |               | Skip confirmation prompt                                                  |
+| `--force`               |               | Overwrite existing versioned directory                                    |
+| `--cleanup`             |               | Remove old versions (keeps current and previous)                          |
+| `--rollback`            |               | Roll back to the previous version                                         |
+| `--pick`                |               | Interactively pick an installed version to activate (switch, no download) |
 
 **Status options (agent):**
 
@@ -225,6 +228,26 @@ kici-admin api-key add-routing-key <id> <pattern>
 - Creates API keys for orchestrator-to-Platform authentication.
 - `--routing-keys` accepts comma-separated routing key patterns (e.g., `github:42,github:99`).
 - The key is shown once on creation -- save it immediately.
+
+### attestations -- provenance verdict backfill
+
+```bash
+kici-admin attestations reverify [--all] [--database-url <url>]
+```
+
+- `reverify` recomputes the stored verification verdict for build-provenance
+  attestations. The orchestrator verifies each provenance bundle when it records
+  the attestation (verify-at-ingest), so the org-wide **Attestations** page shows
+  a trustworthy badge with no per-row work. This command refreshes that stored
+  verdict for rows that predate verification, or for an org that configured
+  provenance **after** some builds already ran.
+- Default scope is rows with no usable verdict yet (`pending` / `unverifiable`).
+  `--all` re-evaluates every attestation (gated by a confirmation prompt; pass
+  `--yes` to skip it in scripts). Idempotent — re-running recomputes the same
+  verdict over the immutable bundles.
+- Direct orchestrator DB + object storage. The provenance trust root comes from
+  the orchestrator's `KICI_PROVENANCE_ISSUER` config; when it is unset every
+  verdict is `unverifiable`.
 
 ### audit -- secrets audit log
 
@@ -608,7 +631,7 @@ kici-admin orchestrator stop [--platform <type>] [--instance-dir <path>] [--name
 kici-admin orchestrator restart [--platform <type>] [--instance-dir <path>] [--name <name>]
 kici-admin orchestrator status [--platform <type>] [--instance-dir <path>] [--name <name>] [--json]
 kici-admin orchestrator logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--since <duration>] [--level <level>] [--json] [--no-follow]
-kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
 ```
 
 Manages the orchestrator as a native system service. The `install --wizard` flow handles database setup, encryption key generation, Platform credentials, and optionally adding your first source. Lifecycle targeting is folder-anchored — see [Service installation guide](../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
@@ -640,8 +663,9 @@ Manages the orchestrator as a native system service. The `install --wizard` flow
 | `--force`               |               | Overwrite existing versioned directory                                    |
 | `--cleanup`             |               | Remove old versions of the resolved instance (keeps current and previous) |
 | `--rollback`            |               | Roll back the resolved instance to its previous version                   |
+| `--pick`                |               | Interactively pick an installed version to activate (switch, no download) |
 
-The `upgrade` command uses a name-scoped versioned directory layout: new versions are extracted under the resolved instance's own `<installBase>/<name>/` tree alongside old ones, and a per-instance symlink is atomically switched. Other installed instances on the host are not touched. Use `--rollback` to revert to the previous version and `--cleanup` to remove old versions (keeping current and previous).
+The `upgrade` command uses a name-scoped versioned directory layout: new versions are extracted under the resolved instance's own `<installBase>/<name>/` tree alongside old ones, and a per-instance symlink is atomically switched. Other installed instances on the host are not touched. Use `--rollback` to revert to the previous version and `--cleanup` to remove old versions (keeping current and previous). Use `--pick` to switch to any already-installed version: it lists every installed version, lets you choose one interactively (the active version is shown but not selectable), prints the change summary, and confirms before switching. Like `--rollback`, `--pick` only switches between versions already extracted under the instance's install base — it never downloads.
 
 **Status options:**
 
@@ -842,6 +866,7 @@ See [Secrets management > Key rotation](../security/secrets.md#key-rotation) for
 ```bash
 kici-admin runs list [--status <csv>] [--workflow-name <name>] [--repo <ownerRepo>] [--since <iso>] [--count] [--limit <n>] [--offset <n>] [--json]
 kici-admin runs show <runId> [--json]
+kici-admin runs structured <runId> [--json]
 kici-admin runs jobs <runId> [--include-steps] [--json]
 kici-admin runs ephemeral-key <runId> [--json]
 kici-admin runs secret-outputs <runId> [--output-key <k>] [--reveal] [--json]
@@ -870,6 +895,15 @@ Inspects execution runs, jobs, ephemeral keys, and secret outputs. Useful for in
 | `--json`  | Output raw JSON instead of formatted text   |
 
 Shows run header (status, repo, ref, SHA, provider, timing, environment, trust tier), jobs table, and steps per job. Internally composes two admin API calls: `GET /admin/runs/:runId` (run header) + `GET /admin/runs/:runId/jobs?includeSteps=true`.
+
+**runs structured:**
+
+| Option    | Description                                                   |
+| --------- | ------------------------------------------------------------- |
+| `<runId>` | Run ID to inspect (required positional arg)                   |
+| `--json`  | Output the raw provenance-tagged result (envelopes preserved) |
+
+Shows the machine-first, provenance-tagged structured run result — the same shape an automation agent reads over the admin API (`GET /admin/runs/:runId/structured`). Trusted fields (run/job/step ids, enum statuses, exit codes, durations, hashes, the derived failure category) are plain; untrusted fields (workflow / repo / job / step names, refs, error text, job output values) are wrapped in an `{ untrusted: true, value }` envelope so a consumer can keep user-controlled content out of an instruction channel. Secret output **values** are never returned — only their key names. The human view unwraps envelopes for display; `--json` is lossless. See [Agent run-result API](./agent-run-result-api.md) for the full contract.
 
 **runs jobs:**
 

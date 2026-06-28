@@ -750,19 +750,21 @@ describe('agentStepStatusSchema', () => {
   });
 
   it('validates all valid state values', () => {
-    const states = ['running', 'success', 'failed', 'skipped'];
+    const states = ['running', 'success', 'failed', 'skipped', 'pending', 'cancelled'];
     for (const state of states) {
       expect(agentStepStatusSchema.parse({ ...validStepStatus, state })).toBeDefined();
     }
   });
 
   it('rejects invalid state value', () => {
-    expect(() => agentStepStatusSchema.parse({ ...validStepStatus, state: 'pending' })).toThrow();
+    expect(() => agentStepStatusSchema.parse({ ...validStepStatus, state: 'bogus' })).toThrow();
   });
 
   it('rejects job-level states not applicable to steps', () => {
     expect(() => agentStepStatusSchema.parse({ ...validStepStatus, state: 'queued' })).toThrow();
-    expect(() => agentStepStatusSchema.parse({ ...validStepStatus, state: 'cancelled' })).toThrow();
+    expect(() =>
+      agentStepStatusSchema.parse({ ...validStepStatus, state: 'timed_out_stale' }),
+    ).toThrow();
   });
 
   it('accepts optional data field', () => {

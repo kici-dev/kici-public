@@ -3,14 +3,14 @@ title: Test run architecture
 description: Architecture deep-dive on the test run pipeline
 ---
 
-This document describes the end-to-end data flow for remote test runs triggered by `kici test`, including the upload encryption scheme, overlay application, observer streaming, and how test runs integrate with the existing production pipeline.
+This document describes the end-to-end data flow for remote test runs triggered by `kici run remote`, including the upload encryption scheme, overlay application, observer streaming, and how test runs integrate with the existing production pipeline.
 
 ## High-level data flow
 
 ```
 Developer workstation            Orchestrator              Agent
        |                              |                      |
-  1. kici test push-main              |                      |
+  1. kici run remote push-main        |                      |
        |                              |                      |
   2. Compile fixture                  |                      |
        |                              |                      |
@@ -221,7 +221,7 @@ Test runs share most of the production pipeline but differ in key ways:
 
 ### One dispatch core, two adapters
 
-There is a single dispatch core (`dispatchMatchedWorkflow`) and two thin adapters that feed it: the webhook adapter (real provider event) and the test adapter (`processTestTrigger`, for `kici run` / `kici test`). The webhook-only preamble — delivery dedup, Platform relay, provider normalization, source registration — runs in the caller, not inside the core, so the test adapter reaches the same core without it.
+There is a single dispatch core (`dispatchMatchedWorkflow`) and two thin adapters that feed it: the webhook adapter (real provider event) and the test adapter (`processTestTrigger`, for `kici run`). The webhook-only preamble — delivery dedup, Platform relay, provider normalization, source registration — runs in the caller, not inside the core, so the test adapter reaches the same core without it.
 
 The test adapter:
 

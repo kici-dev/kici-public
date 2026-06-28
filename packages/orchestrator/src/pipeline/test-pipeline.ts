@@ -123,6 +123,25 @@ interface ResolvedLockFile {
   fullLockFile: FullLockFile;
   bundle: ProviderBundle | undefined;
   repoIdentifier: string;
+  provider?: string;
+}
+
+/**
+ * Repo identity for an inline-lock (local working tree) run. Derived from the
+ * event payload the CLI stamps -- NOT the relay routing key, which is the
+ * Platform-internal `remote:<orgId>` anchor and is meaningless as a repo.
+ */
+export function repoIdentityFromInlineInput(input: TestTriggerInput): {
+  repoIdentifier: string;
+  provider: string;
+} {
+  const repository = input.event.payload?.repository as
+    | { full_name?: string; provider?: string }
+    | undefined;
+  return {
+    repoIdentifier: repository?.full_name ?? 'local/unknown',
+    provider: repository?.provider ?? 'local',
+  };
 }
 
 /**
@@ -143,12 +162,13 @@ async function resolveLockFileForTest(
     } catch {
       return { rejected: 'Invalid inline lock file JSON' };
     }
-    const repoIdentifier = input.routingKey.replace('local:', '');
-    logger.info('Using inline lock file for local repo', {
+    const { repoIdentifier, provider } = repoIdentityFromInlineInput(input);
+    logger.info('Using inline lock file for local working tree', {
       routingKey: input.routingKey,
+      repoIdentifier,
       runId,
     });
-    return { fullLockFile, bundle: undefined, repoIdentifier };
+    return { fullLockFile, bundle: undefined, repoIdentifier, provider };
   }
 
   // Remote repo -- existing provider-based lock file fetch
@@ -212,102 +232,33 @@ function selectMatchedDecisions(
   return matched;
 }
 
-/** Per-job dynamic fields resolved once per test run; consumed by the env gate. */
-interface ResolvedJobFields {
-  environmentName?: string;
-}
-
-/** Key: `${workflowName}:${jobName}` composite (see resolvedFieldsKey). */
-type ResolvedFieldsMap = Map<string, ResolvedJobFields>;
-
-function resolvedFieldsKey(workflowName: string, jobName: string): string {
-  return `${workflowName}:${jobName}`;
-}
-
 /**
- * Resolve each matched static job's environment once, evaluating pure inline
- * expressions against the fixture's simulated event (the normalized envelope —
- * the same argument production dispatch passes). Impure dynamic fields (marker
- * set, no inline value) stay unresolved: the environment gate only covers what
- * can be statically known. Inline evaluation failures reject the run (no
- * fallback), matching production's immediate-failure semantics.
+ * Validate each matched static job's pure inline dynamic fields once per test
+ * run by evaluating them against the fixture's simulated event (the normalized
+ * envelope — the same argument production dispatch passes). Inline evaluation
+ * failures reject the run (no fallback), matching production's immediate-failure
+ * semantics. Non-test-allowed bound environments are NOT rejected here: the
+ * shared dispatch core skips them for test runs (skip-on-test).
  */
-function resolveJobFieldsForRun(
+function validateInlineFieldsForRun(
   fullLockFile: FullLockFile,
   matchedDecisions: WorkflowDecision[],
   simulatedEvent: SimulatedEvent,
-): { resolved: ResolvedFieldsMap } | { rejected: string } {
-  const map: ResolvedFieldsMap = new Map();
+): { ok: true } | { rejected: string } {
   for (const decision of matchedDecisions) {
     const workflow = fullLockFile.workflows.find(
       (w: LockWorkflow) => w.name === decision.workflowName,
     );
     if (!workflow) continue;
     for (const job of workflow.jobs.filter(isLockStaticJob)) {
-      const lockJob = job as LockJob;
-      let inline;
       try {
-        inline = evaluateInlineFields(lockJob, simulatedEvent);
+        evaluateInlineFields(job as LockJob, simulatedEvent);
       } catch (err) {
         return { rejected: toErrorMessage(err) };
       }
-      const fields: ResolvedJobFields = {};
-      const environmentName =
-        inline.inlineEnvironmentName ??
-        (typeof lockJob.environment === 'string' ? lockJob.environment : undefined);
-      if (environmentName) fields.environmentName = environmentName;
-      map.set(resolvedFieldsKey(workflow.name, lockJob.name), fields);
     }
   }
-  return { resolved: map };
-}
-
-/**
- * Environment protection gate for all remote test runs.
- * Returns a rejection reason if any matched workflow targets an environment
- * that disallows test runs; null otherwise.
- *
- * The gate covers static string environments AND pure inline environments
- * resolved against the fixture's simulated event (via `resolvedFields`).
- * Impure dynamic environments (marker set, no inline value) are skipped
- * because the gate only enforces what can be statically known.
- *
- * The environments lookup is scoped by `org_id` + `name` so a tenant's
- * environment can only match its own org's row (a name-only filter would let
- * org A match org B's same-named environment).
- */
-async function enforceEnvironmentProtection(
-  deps: ProcessingDeps,
-  fullLockFile: FullLockFile,
-  matchedDecisions: WorkflowDecision[],
-  orgId: string,
-  resolvedFields: ResolvedFieldsMap,
-): Promise<string | null> {
-  if (!deps.db) return null;
-
-  for (const decision of matchedDecisions) {
-    const workflow = fullLockFile.workflows.find(
-      (w: LockWorkflow) => w.name === decision.workflowName,
-    );
-    if (!workflow) continue;
-    const staticJobs = workflow.jobs.filter(isLockStaticJob);
-    for (const job of staticJobs) {
-      const envName = resolvedFields.get(
-        resolvedFieldsKey(workflow.name, job.name),
-      )?.environmentName;
-      if (!envName) continue;
-      const env = await deps.db
-        .selectFrom('environments')
-        .select(['allow_local_execution'])
-        .where('org_id', '=', orgId)
-        .where('name', '=', envName)
-        .executeTakeFirst();
-      if (env && !env.allow_local_execution) {
-        return `Environment '${envName}' does not allow test runs. Enable test access for this environment (allowLocalExecution) to allow them.`;
-      }
-    }
-  }
-  return null;
+  return { ok: true };
 }
 
 /**
@@ -508,6 +459,7 @@ function buildTestDispatchContext(
     runId,
     trustResolution: undefined,
     lockFileSource: undefined,
+    localWorkingTree: shared.input.inlineLockFile != null,
     crossSource: false,
     extraJobConfig: shared.extraJobConfig,
     testRun: { fixtureId: shared.input.fixtureId },
@@ -545,7 +497,7 @@ export async function processTestTrigger(
   if ('rejected' in lockResult) {
     return { runId, status: 'rejected', reason: lockResult.rejected, jobIds: [] };
   }
-  const { fullLockFile, bundle, repoIdentifier } = lockResult;
+  const { fullLockFile, bundle, repoIdentifier, provider: inlineProvider } = lockResult;
 
   const simulatedEvent: SimulatedEvent = {
     type: input.event.type,
@@ -569,7 +521,7 @@ export async function processTestTrigger(
   // namespaced-secret resolution, and the dispatch core.
   const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
 
-  const fieldsResult = resolveJobFieldsForRun(fullLockFile, matchedDecisions, simulatedEvent);
+  const fieldsResult = validateInlineFieldsForRun(fullLockFile, matchedDecisions, simulatedEvent);
   if ('rejected' in fieldsResult) {
     return { runId, status: 'rejected', reason: fieldsResult.rejected, jobIds: [] };
   }
@@ -580,17 +532,6 @@ export async function processTestTrigger(
   const dispatchInputsResult = resolveDispatchInputs(input, fullLockFile, matchedDecisions);
   if ('rejected' in dispatchInputsResult) {
     return { runId, status: 'rejected', reason: dispatchInputsResult.rejected, jobIds: [] };
-  }
-
-  const protectionRejection = await enforceEnvironmentProtection(
-    deps,
-    fullLockFile,
-    matchedDecisions,
-    resolvedOrgId,
-    fieldsResult.resolved,
-  );
-  if (protectionRejection) {
-    return { runId, status: 'rejected', reason: protectionRejection, jobIds: [] };
   }
 
   const namespacedResult = await resolveFixtureNamespacedSecrets(input, deps, resolvedOrgId);
@@ -612,7 +553,9 @@ export async function processTestTrigger(
   // core performs from the testRun meta).
   deps.executionTracker?.markTestRun(runId);
 
-  const provider = (input.routingKey.split(':')[0] ?? 'local') as ProviderType;
+  // Inline (local working tree) runs carry the real origin provider on the
+  // payload; provider-fetch runs derive it from the routing-key prefix.
+  const provider = (inlineProvider ?? input.routingKey.split(':')[0] ?? 'local') as ProviderType;
   const info: WebhookInfo = {
     routingKey: input.routingKey,
     deliveryId,

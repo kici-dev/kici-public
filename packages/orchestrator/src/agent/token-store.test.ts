@@ -147,6 +147,50 @@ describe('AgentTokenStore', () => {
       expect(capturedValues.created_by).toBe('cli:admin');
       expect(capturedValues.expires_at).toBeNull();
     });
+
+    it('stores mandatory_labels as JSON when provided', async () => {
+      const { db } = createMockDb();
+      let capturedValues: any;
+      (db.insertInto as ReturnType<typeof vi.fn>).mockReturnValue({
+        values: vi.fn().mockImplementation((v: any) => {
+          capturedValues = v;
+          return {
+            returningAll: vi.fn().mockReturnValue({
+              executeTakeFirstOrThrow: vi.fn().mockResolvedValue({ id: 'tok-taint' }),
+            }),
+          };
+        }),
+      });
+
+      const store = new AgentTokenStore(db as any);
+      await store.createStatic({
+        labels: ['linux', 'kici:privileged:root'],
+        mandatoryLabels: ['kici:privileged:root'],
+      });
+
+      expect(capturedValues.labels).toBe('["linux","kici:privileged:root"]');
+      expect(capturedValues.mandatory_labels).toBe('["kici:privileged:root"]');
+    });
+
+    it('defaults mandatory_labels to null when not given', async () => {
+      const { db } = createMockDb();
+      let capturedValues: any;
+      (db.insertInto as ReturnType<typeof vi.fn>).mockReturnValue({
+        values: vi.fn().mockImplementation((v: any) => {
+          capturedValues = v;
+          return {
+            returningAll: vi.fn().mockReturnValue({
+              executeTakeFirstOrThrow: vi.fn().mockResolvedValue({ id: 'tok-no-taint' }),
+            }),
+          };
+        }),
+      });
+
+      const store = new AgentTokenStore(db as any);
+      await store.createStatic({ labels: ['linux'] });
+
+      expect(capturedValues.mandatory_labels).toBeNull();
+    });
   });
 
   describe('createEphemeral', () => {

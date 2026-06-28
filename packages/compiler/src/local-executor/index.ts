@@ -27,6 +27,7 @@ import {
 } from '@kici-dev/engine';
 import type { SimulatedEvent, InputsDescriptorMap } from '@kici-dev/engine';
 import type { Workflow } from '@kici-dev/sdk';
+import { flattenStepInputs } from '@kici-dev/sdk';
 import { compileCommand } from '../commands/compile.js';
 import { discoverWorkflows, resolveKiciDir } from '../execution/index.js';
 import { transformTriggers } from '../lockfile/generator.js';
@@ -67,7 +68,7 @@ function workflowsToLockFormat(workflows: Workflow[]) {
         name: j.name,
         runsOn: j.runsOn,
         needs: j.needs?.map((n: any) => (typeof n === 'string' ? n : n.name)) ?? [],
-        steps: j.steps.map((s: any) => {
+        steps: flattenStepInputs(j.steps).map((s: any) => {
           if (typeof s === 'function') return { name: '', hasOutputs: false };
           return { name: s.name, hasOutputs: !!s.outputs };
         }),

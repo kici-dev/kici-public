@@ -218,7 +218,11 @@ describe('admin routes', () => {
       });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ renamed: true });
-      expect(deps.secretStore.renameScope).toHaveBeenCalledWith('org-1', 'aws/prod', 'aws/production');
+      expect(deps.secretStore.renameScope).toHaveBeenCalledWith(
+        'org-1',
+        'aws/prod',
+        'aws/production',
+      );
     });
 
     it('returns 404 (not 500) when renaming a non-existent scope', async () => {
@@ -378,6 +382,34 @@ describe('admin routes', () => {
       expect(body.token).toMatch(/^kat_/);
       expect(body.id).toBe('at-1');
       expect(body.agentType).toBe('static');
+    });
+
+    it('forwards mandatoryLabels from the request body to createStatic', async () => {
+      const mockTokenStore = {
+        createStatic: vi.fn().mockResolvedValue({ token: 'kat_x', id: 'at-2' }),
+        list: vi.fn().mockResolvedValue([]),
+        revoke: vi.fn(),
+      };
+      const depsWithTokens = createMockDeps({ tokenStore: mockTokenStore as any });
+      (depsWithTokens.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      const appWithTokens = createAdminRoutes(depsWithTokens);
+
+      const res = await request(appWithTokens, 'POST', '/../api/v1/agent-tokens', {
+        token: validToken,
+        body: {
+          labels: ['linux', 'kici:privileged:root'],
+          mandatoryLabels: ['kici:privileged:root'],
+        },
+      });
+      expect(res.status).toBe(201);
+      expect(mockTokenStore.createStatic).toHaveBeenCalledWith(
+        expect.objectContaining({ mandatoryLabels: ['kici:privileged:root'] }),
+      );
     });
 
     it('lists agent tokens without hash', async () => {

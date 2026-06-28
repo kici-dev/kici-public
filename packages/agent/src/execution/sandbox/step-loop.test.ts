@@ -577,6 +577,105 @@ describe('executeStepLoop', () => {
   });
 });
 
+describe('executeStepLoop parallel groups', () => {
+  /** Wire per-step abort controllers so fail-fast can cancel a sibling. */
+  function parallelOpts(extra: Partial<Parameters<typeof executeStepLoop>[0]> = {}) {
+    const controllers = new Map<number, AbortController>();
+    const { messages, sendIpc } = collectMessages();
+    return {
+      messages,
+      opts: {
+        steps: [] as Step[],
+        sendIpc,
+        defaultTimeoutMs: 30_000,
+        outputsMap: new Map(),
+        event: {},
+        env: {},
+        startTime: Date.now(),
+        createStepContext: (stepIndex: number) => {
+          const c = new AbortController();
+          controllers.set(stepIndex, c);
+          return stubStepContext({ signal: c.signal } as Partial<StepContext>);
+        },
+        abortStep: (stepIndex: number) => controllers.get(stepIndex)?.abort(),
+        getStepAbortSignal: (stepIndex: number) => controllers.get(stepIndex)?.signal,
+        ...extra,
+      } as Parameters<typeof executeStepLoop>[0],
+    };
+  }
+
+  it('runs a parallel group concurrently and stamps concurrencyKind/groupId', async () => {
+    const order: string[] = [];
+    const a = makeStep('a', async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      order.push('a');
+    });
+    const b = makeStep('b', async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      order.push('b');
+    });
+    const { messages, opts } = parallelOpts({
+      steps: [a, b],
+      stepNodes: [
+        {
+          kind: 'parallel',
+          groupId: 'g0',
+          name: 'g0',
+          failFast: true,
+          children: [
+            { step: a, stepIndex: 0 },
+            { step: b, stepIndex: 1 },
+          ],
+        },
+      ],
+    });
+    const result = await executeStepLoop(opts);
+    expect(result.status).toBe('success');
+    expect(order).toEqual(['b', 'a']);
+    const completes = messages.filter((m) => m.type === 'step.complete');
+    expect(completes.every((m) => (m as { groupId?: string }).groupId === 'g0')).toBe(true);
+    expect(
+      completes.every(
+        (m) => (m as { concurrencyKind?: string }).concurrencyKind === 'parallel-child',
+      ),
+    ).toBe(true);
+  });
+
+  it('fail-fast cancels the in-flight sibling and fails the job', async () => {
+    const boom = makeStep('boom', async () => {
+      await new Promise((r) => setTimeout(r, 2));
+      throw new Error('boom failed');
+    });
+    const slow = makeStep('slow', async (ctx) => {
+      await new Promise<void>((resolve) => {
+        ctx.signal.addEventListener('abort', () => resolve());
+        setTimeout(resolve, 1000);
+      });
+    });
+    const { messages, opts } = parallelOpts({
+      steps: [boom, slow],
+      stepNodes: [
+        {
+          kind: 'parallel',
+          groupId: 'g0',
+          name: 'g0',
+          failFast: true,
+          children: [
+            { step: boom, stepIndex: 0 },
+            { step: slow, stepIndex: 1 },
+          ],
+        },
+      ],
+    });
+    const result = await executeStepLoop(opts);
+    expect(result.status).toBe('failed');
+    const slowComplete = messages.find((m) => m.type === 'step.complete' && m.stepIndex === 1) as
+      | { status?: string }
+      | undefined;
+    expect(slowComplete?.status).toBe('cancelled');
+  });
+});
+
 describe('executeStepLoop step-approval gate', () => {
   function makeApprovalStep(name: string, ran: { value: boolean }): Step {
     return {

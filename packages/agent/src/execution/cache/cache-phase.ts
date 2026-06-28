@@ -26,8 +26,40 @@ export interface CachePhaseDeps {
   cache: CacheApi;
   /** Emit a runner→agent IPC message (the masked send). */
   sendIpc: (msg: RunnerToAgentMessage) => void;
-  /** Monotonic pseudo-step index allocator (continues after real steps + hooks). */
-  nextStepIndex: () => number;
+  /**
+   * Allocate the next cache pseudo-step index for `ownerStepIndex` (the real
+   * step the cache op belongs to, or {@link JOB_CACHE_OWNER} for job-level
+   * cache). Each owner draws from a disjoint block above every real-step and
+   * hook index, so two concurrently-running steps' cache pseudo-steps never
+   * collide.
+   */
+  nextStepIndex: (ownerStepIndex: number) => number;
+}
+
+/** Owner sentinel for job-level (not step-scoped) cache restore/save. */
+export const JOB_CACHE_OWNER = -1;
+
+/** Block size reserved per owner for cache pseudo-step indices. */
+const CACHE_INDEX_BLOCK = 1000;
+
+/**
+ * Build the cache pseudo-step index allocator. Each owner (a real step index, or
+ * {@link JOB_CACHE_OWNER}) gets its own disjoint block of {@link CACHE_INDEX_BLOCK}
+ * indices, all above every real-step and hook index (`stepCount * 3 + 100`). A
+ * step's two-or-more cache pseudo-steps are a pure function of its own owner
+ * index, so concurrent children never collide. Under sequential execution the
+ * emitted indices stay above all real/hook indices exactly as before.
+ */
+export function createCacheStepIndexAllocator(
+  stepCount: number,
+): (ownerStepIndex: number) => number {
+  const cacheBase = stepCount * 3 + 100;
+  const counters = new Map<number, number>();
+  return (ownerStepIndex: number): number => {
+    const n = counters.get(ownerStepIndex) ?? 0;
+    counters.set(ownerStepIndex, n + 1);
+    return cacheBase + (ownerStepIndex + 1) * CACHE_INDEX_BLOCK + n;
+  };
 }
 
 /**
@@ -38,10 +70,11 @@ export interface CachePhaseDeps {
 export async function restoreCacheSpecs(
   specs: CacheSpec[],
   deps: CachePhaseDeps,
+  ownerStepIndex: number,
 ): Promise<Map<string, CacheRestoreOutcome>> {
   const results = new Map<string, CacheRestoreOutcome>();
   for (const spec of specs) {
-    const stepIndex = deps.nextStepIndex();
+    const stepIndex = deps.nextStepIndex(ownerStepIndex);
     deps.sendIpc({
       type: 'step.start',
       stepIndex,
@@ -90,11 +123,12 @@ export async function saveCacheSpecs(
   specs: CacheSpec[],
   restoreResults: Map<string, CacheRestoreOutcome>,
   deps: CachePhaseDeps,
+  ownerStepIndex: number,
 ): Promise<void> {
   for (const spec of specs) {
     // Exact key already present (restore matched it verbatim) — nothing to do.
     if (restoreResults.get(spec.key)?.matchedKey === spec.key) continue;
-    const stepIndex = deps.nextStepIndex();
+    const stepIndex = deps.nextStepIndex(ownerStepIndex);
     deps.sendIpc({
       type: 'step.start',
       stepIndex,

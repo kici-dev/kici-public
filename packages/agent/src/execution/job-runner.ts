@@ -1322,7 +1322,7 @@ export class JobRunner {
 
       logger.info('Init job completed successfully', {
         jobId,
-        hasEnvironment: initResult.environmentName !== undefined,
+        hasEnvironment: initResult.environmentNames !== undefined,
         hasEnv: initResult.env !== undefined,
         hasConcurrencyGroup: initResult.concurrencyGroup !== undefined,
       });
@@ -1821,9 +1821,12 @@ export class JobRunner {
     data?: Record<string, unknown>,
     logBytesStreamed?: number,
   ): void {
-    // Extract secretsAccessed from data to send as top-level field (per protocol schema)
+    // Extract top-level fields from data (per protocol schema): secretsAccessed
+    // plus the parallel concurrency role + group id.
     const secretsAccessed = data?.secretsAccessed as string[] | undefined;
-    const { secretsAccessed: _, ...restData } = data ?? {};
+    const concurrencyKind = data?.concurrencyKind as AgentStepStatus['concurrencyKind'] | undefined;
+    const groupId = data?.groupId as string | undefined;
+    const { secretsAccessed: _s, concurrencyKind: _c, groupId: _g, ...restData } = data ?? {};
     const hasRestData = Object.keys(restData).length > 0;
 
     this.sendDirect({
@@ -1837,6 +1840,8 @@ export class JobRunner {
       timestamp: Date.now(),
       ...(hasRestData && { data: restData }),
       ...(secretsAccessed !== undefined && { secretsAccessed }),
+      ...(concurrencyKind !== undefined && { concurrencyKind }),
+      ...(groupId !== undefined && { groupId }),
       ...(logBytesStreamed !== undefined && { logBytesStreamed }),
     });
   }

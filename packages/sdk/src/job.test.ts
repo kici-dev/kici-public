@@ -638,6 +638,68 @@ describe('job()', () => {
       expect(() => job('build', { runsOn: 'linux', steps: [], init: false })).not.toThrow();
     });
   });
+
+  describe('multiple environments', () => {
+    it('accepts an environments array', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        environments: ['staging', 'my-testing'],
+      });
+      expect(j.environments).toEqual(['staging', 'my-testing']);
+      expect(j.environment).toBeUndefined();
+    });
+
+    it('throws when both environment and environments are set', () => {
+      expect(() =>
+        job('deploy', {
+          runsOn: 'role:web',
+          run: async () => {},
+          environment: 'staging',
+          environments: ['my-testing'],
+        }),
+      ).toThrow(/mutually exclusive/);
+    });
+
+    it('accepts dynamic function elements in environments', () => {
+      const fn = (event: EventPayload) => event.targetBranch ?? 'fallback';
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        environments: ['staging', fn],
+      });
+      expect(j.environments?.[0]).toBe('staging');
+      expect(typeof j.environments?.[1]).toBe('function');
+    });
+
+    it('defaults concurrencyGroup to the first bound environment', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        environments: ['staging', 'my-testing'],
+      });
+      expect(j.concurrencyGroup).toBe('staging');
+    });
+
+    it('keeps an explicit concurrencyGroup over the env default', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        environments: ['staging'],
+        concurrencyGroup: 'custom',
+      });
+      expect(j.concurrencyGroup).toBe('custom');
+    });
+
+    it('leaves concurrencyGroup undefined when the first environment is dynamic', () => {
+      const j = job('deploy', {
+        runsOn: 'role:web',
+        run: async () => {},
+        environments: [(event: EventPayload) => event.targetBranch ?? 'x'],
+      });
+      expect(j.concurrencyGroup).toBeUndefined();
+    });
+  });
 });
 
 describe('runsOn accepts RegExp and glob strings', () => {

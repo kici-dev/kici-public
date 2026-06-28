@@ -198,7 +198,7 @@ describe('serializeJobsToLock', () => {
     ];
 
     const result = await serializeJobsToLock(jobs, mockCtx());
-    expect(result[0].environment).toBe('production');
+    expect(result[0].environments).toEqual([{ value: 'production', dynamic: false }]);
     expect(result[0].env).toEqual({ NODE_ENV: 'production' });
   });
 
@@ -229,7 +229,7 @@ describe('serializeJobsToLock', () => {
     ];
 
     const result = await serializeJobsToLock(jobs, mockCtx({ branch: 'staging' }));
-    expect(result[0].environment).toBe('env-staging');
+    expect(result[0].environments).toEqual([{ value: 'env-staging', dynamic: false }]);
   });
 
   it('resolves dynamic env function against the eval event', async () => {

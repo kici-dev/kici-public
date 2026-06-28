@@ -11,7 +11,7 @@ The orchestrator writes to **three independent object-storage subsystems**: cach
 
 | Subsystem  | Bucket env var            | Default prefix | Retention                                                      | What lives there                                                                              |
 | ---------- | ------------------------- | -------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| Cache      | `KICI_STORAGE_BUCKET`     | `kici-cache/`  | TTL via `KICI_CACHE_TTL_DAYS` (default 30 days)                | Compiled source tarballs, dependency tarballs, dep-tarball integrity-hash companions          |
+| Cache      | `KICI_STORAGE_BUCKET`     | _(none)_       | TTL via `KICI_CACHE_TTL_DAYS` (default 30 days)                | Compiled source tarballs, dependency tarballs, dep-tarball integrity-hash companions          |
 | Logs       | `KICI_STORAGE_LOG_BUCKET` | `kici-logs/`   | None on step logs; webhook payloads → cold-store after 30 days | NDJSON step logs, gzipped webhook delivery payloads                                           |
 | Cold-store | `KICI_COLD_STORE_BUCKET`  | `cold-store/`  | Per-table tier (`30d` / `180d` / `1y` / `2y` / `forever`)      | Append-only archive of execution rows, secret-audit-log rows, access-log rows, event-log rows |
 
@@ -34,7 +34,7 @@ Compiled source bundles and dependency tarballs the orchestrator hands to execut
 | `provenance/{runId}/{jobId}/{subjectDigest}.kici.json` | Signed build-provenance bundle produced by `ctx.attestProvenance` (DSSE envelope + ephemeral public key + identity token). One entry per attested artifact; the `attestations` DB row points at this key.                                                     | `packages/engine/src/provenance/bundle.ts` (`provenanceStorageKey`) |
 | `.kici-cluster-id`                                     | Cluster identity sentinel (UUID). Written once on first orch boot, validated on every subsequent boot. Mismatch with `cluster_meta.cluster_id` blocks startup — see [cluster identity](../../architecture/clustering/multi-orchestrator.md#cluster-identity). | `packages/orchestrator/src/cluster/cluster-identity.ts`             |
 
-The source / deps keys are namespaced under the configured prefix (default `kici-cache/`). The `.kici-cluster-id` sentinel sits at `<KICI_STORAGE_PREFIX>/.kici-cluster-id` (or at the bucket root when no prefix is set), so two clusters can safely share a physical bucket as long as they use distinct prefixes.
+The source / deps keys are namespaced under the configured prefix, which defaults to **empty** — the bucket already scopes the cache, so the default keys land at `<bucket>/source/...` and `<bucket>/deps/...` with no extra path segment. Set `KICI_STORAGE_PREFIX` to add an explicit prefix when two clusters share a physical bucket. The `.kici-cluster-id` sentinel sits at `<KICI_STORAGE_PREFIX>/.kici-cluster-id` (or at the bucket root when no prefix is set), so two clusters can safely share a physical bucket as long as they use distinct prefixes.
 
 ### Env vars
 
@@ -42,7 +42,7 @@ The source / deps keys are namespaced under the configured prefix (default `kici
 | -------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `KICI_STORAGE_TYPE`              | yes (when caching)      | `s3` or `filesystem`                                                                                                                                                                                                                                                     |
 | `KICI_STORAGE_BUCKET`            | yes (when `s3`)         | Bucket name                                                                                                                                                                                                                                                              |
-| `KICI_STORAGE_PREFIX`            | no (`kici-cache/`)      | Object-key prefix                                                                                                                                                                                                                                                        |
+| `KICI_STORAGE_PREFIX`            | no (empty)              | Object-key prefix. Defaults to empty (the bucket already scopes the cache); set it to share one physical bucket across clusters via distinct per-cluster prefixes                                                                                                        |
 | `KICI_STORAGE_REGION`            | no                      | AWS region                                                                                                                                                                                                                                                               |
 | `KICI_STORAGE_ENDPOINT`          | no                      | Custom S3 endpoint the orchestrator uses for its own object operations                                                                                                                                                                                                   |
 | `KICI_STORAGE_EXTERNAL_ENDPOINT` | no                      | Endpoint baked into pre-signed URLs handed to **agents** (container-routable). Falls back to `KICI_STORAGE_ENDPOINT` when unset                                                                                                                                          |
@@ -70,6 +70,15 @@ The source / deps keys are namespaced under the configured prefix (default `kici
 When the orchestrator, the developer machine, and the agents all reach the bucket at the same address (e.g. a public AWS S3 endpoint), only `KICI_STORAGE_ENDPOINT` is needed — the other two fall back to it. They matter when the addresses diverge: the Docker quickstart, for example, runs the orchestrator in a container (so its endpoint is the compose DNS name `seaweedfs:8333`), the host CLI uses `localhost:8333`, and spawned agent containers use `host.docker.internal:8333`.
 
 These three endpoints are **static connection / topology configuration**, set once per deployment based on the network layout. They are **not** per-tenant `org_settings` tunables — they describe where each party reaches the bucket, which is a property of the deployment's network, not of any one organization.
+
+#### Startup validation: loopback agent-facing endpoint
+
+When at least one scaler is configured (`container`, `firecracker`, or `bare-metal`), the orchestrator **refuses to start** if the agent-facing storage URL resolves to a loopback address (`localhost`, `127.x`, `::1`, `0.0.0.0`). A loopback URL is only reachable by a co-located process, so a scaled agent — which runs in a separate network namespace, microVM, or host — would fail its overlay/cache download with `ECONNREFUSED`. Failing fast at startup surfaces the misconfiguration as a clear orchestrator-side error instead of an opaque agent-side connection refusal.
+
+- **S3 storage:** set `KICI_STORAGE_EXTERNAL_ENDPOINT` to an address the agents can reach (the agent-facing pre-signed URLs are signed against it). A loopback `KICI_STORAGE_ENDPOINT` paired with a routable `KICI_STORAGE_EXTERNAL_ENDPOINT` passes — the orchestrator validates the **agent-facing** URL, not its own.
+- **Filesystem storage:** set `KICI_STORAGE_FS_BASE_URL` to the orchestrator's agent-reachable base URL. The loopback default (`http://127.0.0.1:<KICI_PORT>`) only works for co-located agents — i.e. a no-scaler orchestrator.
+
+A no-scaler orchestrator (agents managed externally and assumed co-located, or none at all) skips this check entirely. The error names the exact env var to set and is written to the orchestrator logs (`kici-admin orchestrator logs`), where an operator looks.
 
 #### `kici run remote` against a hidden orchestrator
 

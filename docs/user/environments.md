@@ -66,6 +66,36 @@ job('deploy-review', {
 
 A pure function like the one above (see [Dynamic values](dynamic-values.md)) is evaluated inline at dispatch with no init-job overhead. Dynamic environments that match a glob pattern (e.g., `review/*`) inherit the pattern's configuration, variables, and protection rules.
 
+### Multiple environments per job
+
+A job can bind more than one environment with `environments`, an ordered array. This lets a single job draw secrets and variables from several environments at once — for example a shared `staging` environment plus a `my-testing` environment that carries test-only variables:
+
+```typescript
+job('deploy', {
+  runsOn: 'default',
+  environments: ['staging', 'my-testing'],
+  steps: [
+    step('deploy', async (ctx) => {
+      // ctx.secrets and ctx.env carry the merged set from both environments
+      const dbUrl = await ctx.secrets.get('DB_URL');
+    }),
+  ],
+});
+```
+
+- `environment` (singular) and `environments` (array) are mutually exclusive — setting both is a compile error. `environment: 'staging'` is exactly equivalent to `environments: ['staging']`.
+- Each array entry is a static name or a function of the event, resolved per element exactly like a single dynamic environment.
+
+**Merge order — last wins.** All bound environments are resolved on every dispatch (webhook, scheduled, and test runs alike) and merged in array order. When the same secret or variable key is defined in more than one environment, the later entry in the array wins. With `environments: ['staging', 'my-testing']`, a key defined in both resolves to `my-testing`'s value; keys defined in only one are preserved. The longest-scope-path-wins rule still applies _within_ each environment.
+
+**Protection rules combine all-must-pass.** A job must satisfy **every** bound environment's gates — adding an environment can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all environments; the minimum trust tier is the most restrictive across them; required reviewers are the union of all environments' reviewers; the wait timer is the longest; and the hold expiry is the shortest. If a run is gated out, the rejection names which environment and which rule rejected it (visible via `kici status` and the run's rejection reason), so a mutually-exclusive set of rules surfaces as a clear failure rather than a silent perpetual rejection.
+
+**Skip-on-test.** On a test or local run (`kici run remote`, `kici run local`), any bound environment that disallows local execution is skipped — its variables and secrets are omitted from the merge and its gates are not evaluated. This makes the test-only-variables pattern work: with `environments: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves just `my-testing`'s variables. If every bound environment disallows test runs, the job runs with no environment variables and a clear warning.
+
+**Unconfigured environments contribute nothing at dispatch.** At dispatch time a bound environment name with no matching configured environment (and no matching glob environment) simply adds no variables, secrets, or protection rules — the job still runs, exactly as a single dynamic environment resolving to an as-yet-unconfigured name does today.
+
+**Registration rejects a provably-unsatisfiable binding.** When a workflow is registered, KiCI statically checks every multi-environment binding: a bound environment that does not exist, a disabled one, or two environments with mutually-exclusive fixed branch / trigger-type / repository restrictions (no value can satisfy both) makes the binding provably unsatisfiable, and the registration is rejected with a precise message naming the job, the environments, and the rule — for example `unsatisfiable environment binding: job 'deploy' binds environments [staging, my-testing] with mutually exclusive branch restrictions (no value satisfies all bound environments)`. Bindings whose restrictions use globs are undecidable at registration and fall through to the dispatch-time gate check instead.
+
 ### Job-level environment variables
 
 The `env` property on a job provides static or dynamic environment variables:
@@ -105,7 +135,7 @@ job('deploy', {
 });
 ```
 
-If no `concurrencyGroup` is specified, the environment name is used as the default concurrency group.
+If no `concurrencyGroup` is specified, the environment name is used as the default concurrency group. For a job bound to multiple environments, the default is the **first** bound environment's name.
 
 ### Step context
 
@@ -245,6 +275,12 @@ Each environment has four tabs:
 3. **Protection** -- configure branch restrictions, required reviewers, wait timers, and concurrency limits with enable toggles for each section.
 
 4. **History** -- view filtered runs targeting this environment.
+
+### Bound environments on runs
+
+A job's bound deployment environments are shown as chips on the run detail page (in the job metadata panel) in the order the job declared them, and the distinct set across a run's jobs appears as compact chips on the run list. For a multi-environment job the chips read left-to-right in merge order — later environments override earlier ones on key collisions. A `(dynamic)` chip marks an environment whose name is computed at runtime; it resolves to the real name once the run starts. A job that binds a single environment shows one chip; a job that binds none shows no chip.
+
+If a multi-environment binding is gated out, the run's failure banner names which environment and which rule rejected it (the same all-must-pass detail surfaced by `kici status`).
 
 ### Secrets management
 

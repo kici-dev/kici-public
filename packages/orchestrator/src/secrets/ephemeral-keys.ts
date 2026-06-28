@@ -15,7 +15,7 @@ import {
   hkdfSync,
   createDecipheriv,
 } from 'node:crypto';
-import { encrypt, decrypt, deriveKey, type EncryptedValue } from './crypto.js';
+import { encrypt, decrypt, deriveKey, type EncryptedValue } from '@kici-dev/shared';
 
 /** AAD string used when encrypting/decrypting private keys with secret key. */
 const PRIVATE_KEY_AAD = 'ephemeral-private-key';

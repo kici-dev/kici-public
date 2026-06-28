@@ -49,7 +49,7 @@ Data model, protection rule pipeline, scope resolution algorithm, and state mach
 
 ### [Test run architecture](./execution/test-runs.md)
 
-End-to-end data flow for remote test runs triggered by `kici test`. Covers the upload encryption scheme (X25519 ECDH + AES-256-GCM), overlay application on the agent, observer WebSocket streaming, and how test runs integrate with the existing production pipeline. Includes comparison table of test vs production runs.
+End-to-end data flow for remote test runs triggered by `kici run remote`. Covers the upload encryption scheme (X25519 ECDH + AES-256-GCM), overlay application on the agent, observer WebSocket streaming, and how test runs integrate with the existing production pipeline. Includes comparison table of test vs production runs.
 
 ### [Data flows](data-flows.md)
 

@@ -98,10 +98,15 @@ describe('evaluateInlineFields', () => {
       runsOn: 'default',
       needs: [],
       steps: [],
-      environment: {
-        _type: 'inline',
-        expression: "(event) => event.type === 'pull_request' ? 'preview' : 'production'",
-      },
+      environments: [
+        {
+          value: {
+            _type: 'inline',
+            expression: "(event) => event.type === 'pull_request' ? 'preview' : 'production'",
+          },
+          dynamic: true,
+        },
+      ],
       env: {
         _type: 'inline',
         expression: '(event) => ({ PR: String(event.payload.pull_request.number) })',
@@ -113,7 +118,7 @@ describe('evaluateInlineFields', () => {
     } as unknown as LockJob;
 
     const result = evaluateInlineFields(lockJob, envelope);
-    expect(result.inlineEnvironmentName).toBe('preview');
+    expect(result.inlineEnvironmentNames).toEqual(['preview']);
     expect(result.inlineEnv).toEqual({ PR: '7' });
     expect(result.inlineConcurrencyGroup).toBe('cg-main');
   });
@@ -125,7 +130,9 @@ describe('evaluateInlineFields', () => {
       runsOn: 'default',
       needs: [],
       steps: [],
-      environment: { _type: 'inline', expression: '(event) => event.nope.deref' },
+      environments: [
+        { value: { _type: 'inline', expression: '(event) => event.nope.deref' }, dynamic: true },
+      ],
     } as unknown as LockJob;
     expect(() => evaluateInlineFields(lockJob, envelope)).toThrow(/job 'bad'/);
   });

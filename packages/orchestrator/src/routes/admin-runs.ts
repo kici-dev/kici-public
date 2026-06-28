@@ -26,10 +26,14 @@ import type { Database } from '../db/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import type { AuditLogger } from '../secrets/audit-logger.js';
-import { decrypt, deriveKey } from '../secrets/crypto.js';
+import { decrypt, deriveKey } from '@kici-dev/shared';
 import { handleAdminError } from './admin-errors.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import { groupNeedsByJobName } from '../dashboard/needs-edges.js';
+import { aggregateRunDetail } from '../reporting/run-aggregator.js';
+import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
+import { readStepLogLines, toAgentStepLogs } from '../reporting/step-log-reader.js';
+import type { LogStorage } from '../reporting/log-storage.js';
 
 const logger = createLogger({ prefix: 'admin-runs' });
 
@@ -101,6 +105,12 @@ export interface AdminRunRoutesDeps {
    * secret-output plaintext. Derived once per request via deriveKey().
    */
   masterSecretKey?: string;
+  /**
+   * Log storage backend. Required only by the agent step-logs endpoint
+   * (`/runs/:runId/jobs/:jobId/steps/:stepIndex/logs`); when absent, that
+   * path 503s cleanly.
+   */
+  logStorage?: LogStorage;
 }
 
 /** Hono env type for admin run routes with context variables. */
@@ -459,6 +469,65 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
         },
         200,
       );
+    } catch (err) {
+      return handleAdminError(c, err, logger);
+    }
+  });
+
+  // ── GET /api/v1/admin/runs/:runId/structured — agent run result ──
+  // Machine-first, provenance-tagged run result: typed job DAG, per-step exit
+  // codes / durations / statuses, derived failure category. Untrusted fields
+  // (names, refs, error text, job outputs) are envelope-tagged; secret values
+  // are never returned (only secret-output key names).
+  app.get('/api/v1/admin/runs/:runId/structured', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'run.read');
+      const runId = c.req.param('runId');
+      const detail = await aggregateRunDetail(deps.db, runId);
+      if (!detail) {
+        return c.json({ error: `Run ${runId} not found` }, 404);
+      }
+      const denied = enforceRoutingKeyScope(c, detail.routingKey);
+      if (denied) return denied;
+      return c.json(mapToAgentRunResult(detail), 200);
+    } catch (err) {
+      return handleAdminError(c, err, logger);
+    }
+  });
+
+  // ── GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs — step logs ──
+  // Paginated step log lines, every line tagged untrusted. cursor = line
+  // offset; limit capped at 2000.
+  app.get('/api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs', async (c) => {
+    try {
+      deps.rbac.requirePermission(c.get('role'), 'run.read');
+      const runId = c.req.param('runId');
+      const jobId = c.req.param('jobId');
+      const stepIndex = parseInt(c.req.param('stepIndex'), 10);
+      if (Number.isNaN(stepIndex)) {
+        return c.json({ error: 'Invalid stepIndex' }, 400);
+      }
+      if (!deps.logStorage) {
+        return c.json({ error: 'Log storage not configured on this orchestrator' }, 503);
+      }
+
+      const run = await deps.db
+        .selectFrom('execution_runs')
+        .select(['run_id', 'routing_key'])
+        .where('run_id', '=', runId)
+        .executeTakeFirst();
+      if (!run) {
+        return c.json({ error: `Run ${runId} not found` }, 404);
+      }
+      const denied = enforceRoutingKeyScope(c, run.routing_key);
+      if (denied) return denied;
+
+      const limit = Math.min(parseInt(c.req.query('limit') ?? '500', 10) || 500, 2000);
+      const raw = await readStepLogLines(
+        { db: deps.db, logStorage: deps.logStorage },
+        { runId, jobId, stepIndex, cursor: c.req.query('cursor'), limit },
+      );
+      return c.json(toAgentStepLogs(runId, jobId, stepIndex, raw), 200);
     } catch (err) {
       return handleAdminError(c, err, logger);
     }

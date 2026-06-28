@@ -36,6 +36,7 @@ import { formatJsonResult } from '../remote/output/json.js';
 import { formatJunitResult } from '../remote/output/junit.js';
 import { RunHistory } from '../remote/history.js';
 import { buildEncryptedSecrets } from '../remote/secret-upload.js';
+import { buildLocalRepoIdentity } from '../remote/local-repo-identity.js';
 import {
   resolveHeldRunContext,
   listHeldRunsForRun,
@@ -44,7 +45,7 @@ import {
 import { handleNewHolds } from './run-hold-watch.js';
 import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
-import type { RemoteRunOptions, RemoteRunResult } from './test.js';
+import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
 
 /** Terminal run statuses returned by the Platform run-status snapshot. */
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled', 'error']);
@@ -126,6 +127,25 @@ export function buildDispatchInputs(
 const POLL_INTERVAL_MS = 750;
 
 /**
+ * Run `fn` with everything written to `process.stdout` redirected to
+ * `process.stderr`, then restore the original writer. Compiling a repo
+ * evaluates every user workflow / fixture module, and a `console.log` at a
+ * module's top level writes straight to stdout. On a machine-readable
+ * (`--json`) run that stdout MUST carry only the final JSON result, so the
+ * compile phases run inside this guard — workflow log output belongs on
+ * stderr regardless.
+ */
+export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
+  const realWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = process.stderr.write.bind(process.stderr) as typeof process.stdout.write;
+  try {
+    return await fn();
+  } finally {
+    process.stdout.write = realWrite;
+  }
+}
+
+/**
  * Recompile `.kici/workflows` → `kici.lock.json` before a remote run, mirroring
  * `kici run local`. The orchestrator matches triggers and dispatches against the
  * inline lock, so a stale lock would route an edited or newly-added workflow
@@ -133,14 +153,18 @@ const POLL_INTERVAL_MS = 750;
  * abort before any upload or dispatch.
  */
 async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolean> {
-  return compileCommand({
-    kiciDir: options.kiciDir ?? '.kici',
-    check: false,
-    verbose: options.debug ?? false,
-    // Keep stdout pure for machine-readable runs: --json (and --quiet) must not
-    // carry the compile / auto-types success lines before the JSON result.
-    quiet: Boolean(options.json || options.quiet),
-  });
+  // Keep stdout pure for machine-readable runs: --json (and --quiet) must not
+  // carry the compile / auto-types success lines — nor any user workflow's
+  // module-top-level console.log — before the JSON result.
+  const pureStdout = Boolean(options.json || options.quiet);
+  const compile = () =>
+    compileCommand({
+      kiciDir: options.kiciDir ?? '.kici',
+      check: false,
+      verbose: options.debug ?? false,
+      quiet: pureStdout,
+    });
+  return pureStdout ? withStdoutOnStderr(compile) : compile();
 }
 
 /**
@@ -218,9 +242,13 @@ export async function runRemoteCommand(
       return true;
     }
 
-    // Compile fixtures
+    // Compile fixtures. In machine-readable mode, isolate any module-top-level
+    // console.log a fixture emits when evaluated so it cannot corrupt the JSON
+    // result that stdout must carry alone.
     const testsDir = path.join(kiciDir, 'tests');
-    const fixtures = await compileFixtures(testsDir);
+    const fixtures = options.json
+      ? await withStdoutOnStderr(() => compileFixtures(testsDir))
+      : await compileFixtures(testsDir);
 
     // Determine which fixtures to run
     let selected: CompiledFixture[];
@@ -573,14 +601,19 @@ async function runSingleFixture(
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
 
-    // Build the simulated event from fixture. The run always executes the
-    // local working tree (fullRepo), so stamp a synthetic `local/<repo>`
-    // repository identifier regardless of whether a git remote exists.
+    // Build the simulated event from fixture. The run executes the local
+    // working tree. Stamp the real origin `owner/repo` + provider when the tree
+    // has a recognized git remote, else a synthetic `local/<repo>` identity so
+    // the dashboard never builds a broken external link.
     const event = buildEventFromFixture(opts);
     {
-      const repoName = path.basename(overlay.repoRoot);
+      const identity = buildLocalRepoIdentity(overlay.repoRoot);
       const repo = event.payload.repository as Record<string, unknown> | undefined;
-      event.payload.repository = { ...(repo ?? {}), full_name: `local/${repoName}` };
+      event.payload.repository = {
+        ...(repo ?? {}),
+        full_name: identity.repoIdentifier,
+        provider: identity.provider,
+      };
     }
 
     if (!options.quiet) {
@@ -925,10 +958,13 @@ async function runDirectWorkflow(
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
 
-    // The run always executes the local working tree (fullRepo), so stamp the
-    // synthetic `local/<repo>` identifier regardless of a git remote.
+    // The run executes the local working tree. Stamp the real origin
+    // `owner/repo` + provider when the tree has a recognized git remote, else a
+    // synthetic `local/<repo>` identity so the dashboard never builds a broken
+    // external link.
+    const identity = buildLocalRepoIdentity(overlay.repoRoot);
     const payload: Record<string, unknown> = {
-      repository: { full_name: `local/${path.basename(overlay.repoRoot)}` },
+      repository: { full_name: identity.repoIdentifier, provider: identity.provider },
     };
 
     const encrypted = await buildEncryptedSecrets(

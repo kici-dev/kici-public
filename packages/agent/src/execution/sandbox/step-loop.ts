@@ -25,6 +25,37 @@ import type { SandboxStepResult } from './types.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
 import { evaluateRules, createRuleContext } from '../rule-evaluator.js';
 import { restoreCacheSpecs, saveCacheSpecs, type CachePhaseDeps } from '../cache/index.js';
+import { runParallelGroup } from './parallel-scheduler.js';
+
+/**
+ * Thrown inside the step race when a step's own per-task abort controller fires
+ * (parallel fail-fast cancels an in-flight sibling). Distinguished from a
+ * timeout/job-deadline reject so the loop reports the step as `cancelled`
+ * (which is NOT a failure) rather than `failed`.
+ */
+export class StepCancelledError extends Error {
+  readonly name = 'StepCancelledError';
+  constructor(stepName: string) {
+    super(`Step '${stepName}' was cancelled by parallel fail-fast`);
+    Object.setPrototypeOf(this, StepCancelledError.prototype);
+  }
+}
+
+/**
+ * A node in the concurrency-aware step walk. A `sequential` node is one ordinary
+ * step; a `parallel` node is a `parallel()` group whose children each carry their
+ * own flat `stepIndex` (the group wrapper consumes no index).
+ */
+export type StepNode =
+  | { kind: 'sequential'; step: Step; stepIndex: number }
+  | {
+      kind: 'parallel';
+      groupId: string;
+      name: string;
+      failFast: boolean;
+      maxParallel?: number;
+      children: { step: Step; stepIndex: number }[];
+    };
 
 /** Job-level hooks passed to the step loop. */
 export interface JobHooks {
@@ -38,7 +69,32 @@ export interface JobHooks {
 
 /** Options for the step execution loop. */
 export interface StepLoopOptions {
+  /**
+   * Flat list of every executable step (sequential steps + parallel-group
+   * children inlined in flat-stepIndex order). `steps.length` is the flat step
+   * count used to derive hook pseudo-indices. The structural walk order (which
+   * entries are grouped) is carried separately by `stepNodes`.
+   */
   steps: Step[];
+  /**
+   * Structural walk order: sequential steps and parallel groups in array order.
+   * When present, the loop walks these nodes (dispatching parallel groups to the
+   * concurrency-aware scheduler); when absent, it walks `steps` sequentially with
+   * the array index as the stepIndex (unit-harness back-compat).
+   */
+  stepNodes?: StepNode[];
+  /**
+   * Abort the per-task controller for `stepIndex` (parallel fail-fast). Wired to
+   * the workflow-runner's `stepAbortControllers` map so an aborted sibling's
+   * `ctx.signal` fires and its step race rejects with {@link StepCancelledError}.
+   */
+  abortStep?: (stepIndex: number) => void;
+  /**
+   * Returns the per-task abort signal for `stepIndex` (the same controller
+   * `abortStep` triggers). The step race watches it so a fail-fast abort
+   * interrupts an in-flight step even if its body ignores `ctx.signal`.
+   */
+  getStepAbortSignal?: (stepIndex: number) => AbortSignal | undefined;
   /**
    * Run mode for idempotent steps. `apply` (default) converges; `check` /
    * `check-fail-on-drift` preview drift and never invoke a checked step's apply.
@@ -46,6 +102,12 @@ export interface StepLoopOptions {
   checkMode?: CheckMode;
   /** Factory that creates a StepContext for a given step index and name. */
   createStepContext: (stepIndex: number, stepName: string) => StepContext;
+  /**
+   * Run `fn` inside the step's console-capture scope so any console output it
+   * (or its hooks) produces attributes to `stepIndex`. Defaults to calling `fn`
+   * directly when absent (unit harnesses without capture wiring).
+   */
+  runWithStepCapture?: <T>(stepIndex: number, fn: () => Promise<T>) => Promise<T>;
   sendIpc: (msg: RunnerToAgentMessage) => void;
   defaultTimeoutMs: number;
   outputsMap: OutputsMap;
@@ -80,36 +142,38 @@ export interface StepLoopOptions {
   /** Job start time (epoch ms) for outcome metadata duration. */
   startTime?: number;
   /**
-   * Returns the secret key names accessed by the most recently created step context.
-   * Called after each step completes to include in step.complete IPC messages.
+   * Returns the secret key names accessed by the step context created for
+   * `stepIndex`. Called after each step completes to include in step.complete
+   * IPC messages.
    */
-  getSecretsAccessLog?: () => string[];
+  getSecretsAccessLog?: (stepIndex: number) => string[];
   /**
-   * Tear down per-step state created by the most recent `createStepContext`
-   * call. Invoked from the step-loop's `finally` after the step completes
+   * Tear down per-step state created by the `createStepContext` call for
+   * `stepIndex`. Invoked from the step-loop's `finally` after the step completes
    * (success, failure, rule-skip, or timeout) so resources like the
    * `ctx.secrets.mountFile` tmpdir get removed even on the failure paths.
    * Never throws -- errors are logged by the wired implementation.
    */
-  disposeStepResources?: () => Promise<void>;
+  disposeStepResources?: (stepIndex: number) => Promise<void>;
   /**
-   * Returns the IPC `step.secret_mount` records collected by the most
-   * recently created step context. Emitted on step completion so the
-   * orchestrator can persist the audit trail alongside `secretsAccessed`.
+   * Returns the IPC `step.secret_mount` records collected by the step context
+   * created for `stepIndex`. Emitted on step completion so the orchestrator can
+   * persist the audit trail alongside `secretsAccessed`.
    */
-  getSecretMountRecords?: () => StepSecretMountRecord[];
+  getSecretMountRecords?: (stepIndex: number) => StepSecretMountRecord[];
   /**
    * Before a step's run function executes, point KICI_ENV / KICI_PATH at fresh
-   * temp files for this step. Invoked once per executed step (NOT for rule-skipped
+   * temp files for this step (keyed by `stepIndex` so concurrent steps never
+   * share a delta file). Invoked once per executed step (NOT for rule-skipped
    * steps). The workflow-runner owns the file lifecycle.
    */
-  beforeStepEnvFiles?: () => Promise<void>;
+  beforeStepEnvFiles?: (stepIndex: number) => Promise<void>;
   /**
-   * After a step's run function completes (success OR failure), read the
-   * KICI_ENV / KICI_PATH files, apply the delta via applyEnvDelta, and truncate
-   * them for the next step. Never throws -- errors are logged by the wired impl.
+   * After a step's run function completes (success OR failure), read this
+   * step's KICI_ENV / KICI_PATH files, apply the delta via applyEnvDelta, and
+   * release them. Never throws -- errors are logged by the wired impl.
    */
-  afterStepApplyEnvFiles?: () => Promise<void>;
+  afterStepApplyEnvFiles?: (stepIndex: number) => Promise<void>;
   /**
    * Block an `approval` step (`when: 'always'`) pending an orchestrator-side
    * approval hold. The runner sends the normalized requirement and awaits the
@@ -145,6 +209,16 @@ export interface StepLoopOptions {
 export interface StepApprovalResolution {
   outcome: 'approved' | 'rejected' | 'expired';
   reason?: string;
+}
+
+/**
+ * Resolve the capture-scope wrapper from options, falling back to a direct call
+ * when no capture wiring is present (unit harnesses).
+ */
+function captureWrap(
+  opts: StepLoopOptions,
+): <T>(stepIndex: number, fn: () => Promise<T>) => Promise<T> {
+  return opts.runWithStepCapture ?? ((_stepIndex, fn) => fn());
 }
 
 /** Result of the step execution loop. */
@@ -284,8 +358,8 @@ async function executeStepInLoop(
   timeoutMs: number,
   sendFn: (msg: RunnerToAgentMessage) => void,
   outputsMap: OutputsMap,
-  getSecretsAccessLog: (() => string[]) | undefined,
-  getSecretMountRecords: (() => StepSecretMountRecord[]) | undefined,
+  getSecretsAccessLog: ((stepIndex: number) => string[]) | undefined,
+  getSecretMountRecords: ((stepIndex: number) => StepSecretMountRecord[]) | undefined,
   jobDeadlineSignal: AbortSignal | undefined,
   checkMode: CheckMode,
   opts: StepLoopOptions,
@@ -295,6 +369,7 @@ async function executeStepInLoop(
   const startTime = Date.now();
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), timeoutMs);
+  const stepAbortSignal = opts.getStepAbortSignal?.(stepIndex);
 
   try {
     const phase = await Promise.race([
@@ -317,6 +392,17 @@ async function executeStepInLoop(
           reject(new Error(`Step '${step.name}' aborted: job timeout exceeded`));
         });
       }),
+      // Per-task fail-fast: a parallel sibling failed and aborted this step's
+      // own controller. Reject with StepCancelledError so the catch reports
+      // `cancelled` (not `failed`) — a cancelled sibling is not a failure.
+      new Promise<never>((_, reject) => {
+        if (!stepAbortSignal) return;
+        if (stepAbortSignal.aborted) {
+          reject(new StepCancelledError(step.name));
+          return;
+        }
+        stepAbortSignal.addEventListener('abort', () => reject(new StepCancelledError(step.name)));
+      }),
     ]);
 
     clearTimeout(timeoutId);
@@ -328,8 +414,8 @@ async function executeStepInLoop(
       outputsMap.set(step.name, outputsPayload);
     }
 
-    const secretsAccessed = getSecretsAccessLog?.();
-    emitSecretMountEvents(getSecretMountRecords?.(), stepIndex, sendFn);
+    const secretsAccessed = getSecretsAccessLog?.(stepIndex);
+    emitSecretMountEvents(getSecretMountRecords?.(stepIndex), stepIndex, sendFn);
 
     const stepStatus =
       phase.status === 'skipped'
@@ -360,11 +446,30 @@ async function executeStepInLoop(
     const durationMs = Date.now() - startTime;
     const error = e instanceof Error ? e : new Error(String(e));
 
+    // A fail-fast cancellation is a terminal `cancelled` step, not a failure.
+    if (e instanceof StepCancelledError) {
+      const secretsAccessed = getSecretsAccessLog?.(stepIndex);
+      emitSecretMountEvents(getSecretMountRecords?.(stepIndex), stepIndex, sendFn);
+      sendFn({
+        type: 'step.complete',
+        stepIndex,
+        status: ExecutionStepStatus.enum.cancelled,
+        durationMs,
+        ...(secretsAccessed !== undefined && { secretsAccessed }),
+      });
+      return {
+        name: step.name,
+        stepIndex,
+        status: ExecutionStepStatus.enum.cancelled,
+        durationMs,
+      };
+    }
+
     const exitCode = extractExitCode(e);
     const signal = extractSignal(e);
 
-    const secretsAccessed = getSecretsAccessLog?.();
-    emitSecretMountEvents(getSecretMountRecords?.(), stepIndex, sendFn);
+    const secretsAccessed = getSecretsAccessLog?.(stepIndex);
+    emitSecretMountEvents(getSecretMountRecords?.(stepIndex), stepIndex, sendFn);
 
     sendFn({
       type: 'step.complete',
@@ -443,7 +548,7 @@ function extractSignal(error: unknown): string | undefined {
 /**
  * Per-step iteration outcome returned by `runStepIteration`.
  */
-interface StepIterationOutcome {
+export interface StepIterationOutcome {
   /** The result to append to the running stepResults list. */
   result: SandboxStepResult;
   /** When true, the loop must break (failed step without continueOnError). */
@@ -545,7 +650,7 @@ async function maybeGateStepApproval(
     stepIndex,
     line: `[kici] Step '${step.name}' ${why}.`,
   });
-  await opts.disposeStepResources?.();
+  await opts.disposeStepResources?.(stepIndex);
   return {
     result: {
       name: step.name,
@@ -583,15 +688,17 @@ async function runObserverHook(args: {
     ...(failedStep !== undefined && { failedStep }),
   });
   const ctx = opts.createStepContext(stepIndex, step.name);
-  const hookResult = await executeHook({
-    hook,
-    stepContext: ctx,
-    outcome,
-    hookType,
-    stepIndex: hookStepIndex,
-    sendIpc: opts.sendIpc,
-    timeout: 300_000,
-  });
+  const hookResult = await captureWrap(opts)(hookStepIndex, () =>
+    executeHook({
+      hook,
+      stepContext: ctx,
+      outcome,
+      hookType,
+      stepIndex: hookStepIndex,
+      sendIpc: opts.sendIpc,
+      timeout: 300_000,
+    }),
+  );
   if (!hookResult.success) {
     opts.sendIpc({
       type: 'log.line',
@@ -664,7 +771,7 @@ async function runStepWithRetry(
   return result;
 }
 
-async function runStepIteration(
+export async function runStepIteration(
   step: Step,
   stepIndex: number,
   opts: StepLoopOptions,
@@ -675,7 +782,7 @@ async function runStepIteration(
     // `createStepContext` call (when `getSecretMountRecords` is wired the
     // outer caller may have pre-allocated the secrets handle). Dispose to be
     // safe.
-    await opts.disposeStepResources?.();
+    await opts.disposeStepResources?.(stepIndex);
     return { result: skippedResult, shouldBreak: false };
   }
 
@@ -702,18 +809,20 @@ async function runStepIteration(
   const stepCacheSpecs: CacheSpec[] = opts.cachePhaseDeps ? normalizeCacheSpecs(step.cache) : [];
   const stepCacheRestore =
     stepCacheSpecs.length > 0 && opts.cachePhaseDeps
-      ? await restoreCacheSpecs(stepCacheSpecs, opts.cachePhaseDeps)
+      ? await restoreCacheSpecs(stepCacheSpecs, opts.cachePhaseDeps, stepIndex)
       : new Map<string, { hit: boolean; matchedKey?: string }>();
 
   try {
-    await opts.beforeStepEnvFiles?.();
+    await opts.beforeStepEnvFiles?.(stepIndex);
     const ctx = opts.createStepContext(stepIndex, step.name);
     const timeoutMs = step.timeout ?? opts.defaultTimeoutMs;
     let result: SandboxStepResult;
     try {
-      result = await runStepWithRetry(step, stepIndex, ctx, timeoutMs, opts);
+      result = await captureWrap(opts)(stepIndex, () =>
+        runStepWithRetry(step, stepIndex, ctx, timeoutMs, opts),
+      );
     } finally {
-      await opts.afterStepApplyEnvFiles?.();
+      await opts.afterStepApplyEnvFiles?.(stepIndex);
     }
 
     // Step-level declarative cache: save AFTER the step succeeds (on exact-key
@@ -723,7 +832,7 @@ async function runStepIteration(
       opts.cachePhaseDeps &&
       result.status === ExecutionStepStatus.enum.success
     ) {
-      await saveCacheSpecs(stepCacheSpecs, stepCacheRestore, opts.cachePhaseDeps);
+      await saveCacheSpecs(stepCacheSpecs, stepCacheRestore, opts.cachePhaseDeps, stepIndex);
     }
 
     if (opts.jobHooks?.afterStep) {
@@ -747,7 +856,7 @@ async function runStepIteration(
     }
     return { result, shouldBreak: false };
   } finally {
-    await opts.disposeStepResources?.();
+    await opts.disposeStepResources?.(stepIndex);
   }
 }
 
@@ -779,14 +888,16 @@ async function runCompletionHook(args: {
   const { hook, hookType, hookStepIndex, outcome, state, promoteToFailed, opts } = args;
   opts.sendIpc({ type: 'log.line', stepIndex: -1, line: `[kici] Running ${hookType} hook...` });
   const ctx = opts.createStepContext(hookStepIndex, hookType);
-  const hookResult = await executeHook({
-    hook,
-    stepContext: ctx,
-    outcome,
-    hookType,
-    stepIndex: hookStepIndex,
-    sendIpc: opts.sendIpc,
-  });
+  const hookResult = await captureWrap(opts)(hookStepIndex, () =>
+    executeHook({
+      hook,
+      stepContext: ctx,
+      outcome,
+      hookType,
+      stepIndex: hookStepIndex,
+      sendIpc: opts.sendIpc,
+    }),
+  );
   if (hookResult.success) {
     opts.sendIpc({
       type: 'log.line',
@@ -900,9 +1011,25 @@ export async function executeStepLoop(opts: StepLoopOptions): Promise<StepLoopRe
   const stepResults: SandboxStepResult[] = [];
   const state: CompletionState = { failed: false };
 
-  for (const [i, step] of opts.steps.entries()) {
+  // Walk the structural node list when present (sequential steps + parallel
+  // groups); otherwise fall back to the flat `steps` list (unit-harness path)
+  // with the array index as the stepIndex.
+  const nodes: StepNode[] =
+    opts.stepNodes ?? opts.steps.map((step, i) => ({ kind: 'sequential', step, stepIndex: i }));
+
+  for (const node of nodes) {
     if (opts.isAborted?.()) break;
-    const outcome = await runStepIteration(step, i, opts);
+    if (node.kind === 'parallel') {
+      const groupOutcome = await runParallelGroup(node, opts);
+      stepResults.push(...groupOutcome.results);
+      if (groupOutcome.failed) {
+        state.failed = true;
+        state.failedStepName = groupOutcome.failedStepName;
+        break;
+      }
+      continue;
+    }
+    const outcome = await runStepIteration(node.step, node.stepIndex, opts);
     stepResults.push(outcome.result);
     if (outcome.failedStepName) {
       state.failed = true;

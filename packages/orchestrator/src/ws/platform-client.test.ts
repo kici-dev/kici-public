@@ -1,6 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { WS_MAX_PAYLOAD_BYTES, type OrchestratorToPlatformMessage } from '@kici-dev/engine';
-import { PlatformClient, type PlatformClientOptions } from './platform-client.js';
+import {
+  WS_MAX_PAYLOAD_BYTES,
+  DASHBOARD_REQUEST_TYPE_SET,
+  ORCH_CAPABILITIES,
+  type OrchestratorToPlatformMessage,
+} from '@kici-dev/engine';
+import {
+  PlatformClient,
+  classifyDashboardRequestError,
+  type PlatformClientOptions,
+} from './platform-client.js';
 
 // ── Hoisted mock state ──────────────────────────────────────────────
 
@@ -159,7 +168,10 @@ describe('PlatformClient', () => {
         type: 'auth.request',
         token: 'test-api-key',
         protocolVersion: 1,
-        capabilities: { orchRole: 'coordinator' },
+        capabilities: {
+          orchRole: 'coordinator',
+          supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
+        },
       });
     });
 
@@ -249,6 +261,7 @@ describe('PlatformClient', () => {
         type: 'orch.capabilities.update',
         capabilities: {
           orchRole: 'coordinator',
+          supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
           dashboardWrites: { 'secrets.set': false },
         },
       });
@@ -292,12 +305,14 @@ describe('PlatformClient', () => {
       });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
+        supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
         dashboardWrites: { 'secrets.set': false },
       });
 
       client.broadcastCapabilities({ dashboardWrites: { 'secrets.delete': false } });
       expect(client.getCapabilities()).toEqual({
         orchRole: 'coordinator',
+        supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
         dashboardWrites: { 'secrets.delete': false },
       });
     });
@@ -1748,5 +1763,45 @@ describe('PlatformClient', () => {
       expect(arg.identityLinks[0].userId).toBe('forged-user');
       expect(arg.memberCiTrustLevels['forged-user']).toBe('admin');
     });
+  });
+});
+
+describe('classifyDashboardRequestError', () => {
+  const known = DASHBOARD_REQUEST_TYPE_SET;
+
+  it('flags an unknown dashboard type as unsupported_request_type', () => {
+    const frame = classifyDashboardRequestError(
+      { type: 'dashboard.future.feature', requestId: 'r1' },
+      known,
+      '0.1.20',
+    );
+    expect(frame).toMatchObject({
+      type: 'dashboard.future.feature.response',
+      requestId: 'r1',
+      code: 'unsupported_request_type',
+      orchVersion: '0.1.20',
+      requestType: 'dashboard.future.feature',
+    });
+    expect(frame.error).toContain('does not support');
+  });
+
+  it('flags a known dashboard type with a bad body as invalid_payload', () => {
+    const frame = classifyDashboardRequestError(
+      { type: 'dashboard.environments.bindings.set', requestId: 'r2' },
+      known,
+      '0.1.20',
+    );
+    expect(frame.code).toBe('invalid_payload');
+    expect(frame.error).toContain('invalid dashboard request payload');
+  });
+
+  it('omits orchVersion when the version is unknown', () => {
+    const frame = classifyDashboardRequestError(
+      { type: 'dashboard.future.feature', requestId: 'r3' },
+      known,
+      undefined,
+    );
+    expect(frame.orchVersion).toBeUndefined();
+    expect(frame.error).toContain('vunknown');
   });
 });

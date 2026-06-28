@@ -44,6 +44,8 @@ export interface ExecutionContext {
   provider: string;
   repoIdentifier: string;
   sha: string;
+  /** True when the run executed an uploaded local working tree (`kici run remote`). */
+  localWorkingTree?: boolean;
   installationId?: number;
   requestId?: string;
   routingKey?: string;
@@ -59,6 +61,14 @@ export interface ExecutionContext {
   originalRunId?: string | null;
   /** User identity that triggered this re-run (null/undefined for webhook-triggered). */
   triggeredBy?: string | null;
+  /**
+   * Provider login of the person who triggered the run (pusher / PR author).
+   * Captured for all event types; forwarded to the Platform run projection and
+   * used to resolve actor-scope notifications.
+   */
+  triggerActorUsername?: string | null;
+  /** Immutable provider user id of the triggering actor (preferred for resolution). */
+  triggerActorUserId?: string | null;
   /** Workflow-level concurrency config from the lock file. */
   concurrency?: {
     cancelInProgress?: boolean;
@@ -169,6 +179,8 @@ export interface ExecutionTrackerDeps {
      * jobs that never started. Persisted in execution_jobs.init_failure.
      */
     initFailure?: InitFailure,
+    /** Ordered bound deployment-environment names for this job (multi-env jobs). */
+    environments?: string[],
   ) => void;
   /**
    * Optional callback to emit run.event messages to Platform.
@@ -204,6 +216,8 @@ interface RunState {
   provider: string;
   repoIdentifier: string;
   sha: string;
+  /** True when the run executed an uploaded local working tree (`kici run remote`). */
+  localWorkingTree?: boolean;
   installationId?: number;
   requestId?: string;
   routingKey?: string;
@@ -213,6 +227,8 @@ interface RunState {
   parentRunId?: string | null;
   originalRunId?: string | null;
   triggeredBy?: string | null;
+  triggerActorUsername?: string | null;
+  triggerActorUserId?: string | null;
   concurrency?: { cancelInProgress?: boolean; max?: number };
   failureReason?: string;
   /** Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`). */
@@ -223,7 +239,14 @@ interface RunState {
   completedAt?: number;
   jobs: Map<
     string,
-    { name: string; status: string; startedAt?: number; agentId?: string; runsOnLabels?: string[] }
+    {
+      name: string;
+      status: string;
+      startedAt?: number;
+      agentId?: string;
+      runsOnLabels?: string[];
+      environments?: string[];
+    }
   >;
 }
 
@@ -326,6 +349,7 @@ export class ExecutionTracker {
       waveGated?: boolean;
       waveMaxParallel?: number;
       waveFailFast?: boolean;
+      environments?: string[];
     }>,
     routingKey?: string,
     /** Secret context names dispatched with jobs (for context-disable job lookup). */
@@ -346,6 +370,12 @@ export class ExecutionTracker {
     workflowTimeoutMs?: number,
     /** Run mode for idempotent steps; non-apply labels the run a check-mode preview. */
     checkMode?: string,
+    /** True when the run executes an uploaded local working tree (`kici run remote`). */
+    localWorkingTree?: boolean,
+    /** Provider login of the triggering actor (pusher / PR author). */
+    triggerActorUsername?: string | null,
+    /** Immutable provider user id of the triggering actor. */
+    triggerActorUserId?: string | null,
   ): Promise<void> {
     const now = new Date();
 
@@ -358,6 +388,7 @@ export class ExecutionTracker {
         startedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
+        environments?: string[];
       }
     >();
     for (const job of jobs) {
@@ -365,6 +396,7 @@ export class ExecutionTracker {
         name: job.jobName,
         status: ExecutionJobStatus.enum.pending,
         ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
+        ...(job.environments?.length && { environments: job.environments }),
       });
     }
 
@@ -380,6 +412,7 @@ export class ExecutionTracker {
       provider,
       repoIdentifier,
       sha,
+      ...(localWorkingTree && { localWorkingTree: true }),
       installationId,
       requestId: getRequestContext().requestId,
       routingKey,
@@ -389,6 +422,8 @@ export class ExecutionTracker {
       parentRunId,
       originalRunId,
       triggeredBy,
+      triggerActorUsername,
+      triggerActorUserId,
       concurrency,
       ...(checkMode != null && { checkMode }),
       startedAt: now.getTime(),
@@ -415,6 +450,11 @@ export class ExecutionTracker {
         ...(parentRunId != null && { parent_run_id: parentRunId }),
         ...(originalRunId != null && { original_run_id: originalRunId }),
         ...(triggeredBy != null && { triggered_by: triggeredBy }),
+        ...((triggerActorUsername != null || triggerActorUserId != null) && {
+          trigger_actor_provider: provider,
+        }),
+        ...(triggerActorUsername != null && { trigger_actor_username: triggerActorUsername }),
+        ...(triggerActorUserId != null && { trigger_actor_user_id: triggerActorUserId }),
         ...(workflowTimeoutMs != null && { workflow_timeout_ms: workflowTimeoutMs }),
         ...(checkMode != null && { check_mode: checkMode }),
       })
@@ -443,6 +483,7 @@ export class ExecutionTracker {
             ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
             ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
             ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
+            ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
             ...(dispatchedContexts?.length && {
               dispatched_contexts: JSON.stringify(dispatchedContexts),
             }),
@@ -457,6 +498,7 @@ export class ExecutionTracker {
               ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
               ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
               ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
+              ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
               ...(dispatchedContexts?.length && {
                 dispatched_contexts: JSON.stringify(dispatchedContexts),
               }),
@@ -493,6 +535,7 @@ export class ExecutionTracker {
         provider,
         repoIdentifier,
         sha,
+        ...(localWorkingTree && { localWorkingTree: true }),
         installationId,
         requestId: getRequestContext().requestId,
         routingKey,
@@ -502,6 +545,8 @@ export class ExecutionTracker {
         parentRunId,
         originalRunId,
         triggeredBy,
+        triggerActorUsername,
+        triggerActorUserId,
       },
       jobs.length,
       now.getTime(),
@@ -643,6 +688,7 @@ export class ExecutionTracker {
       baseJobName?: string;
       variantKind?: string;
       variantLabel?: string;
+      environments?: string[];
     }>,
     dispatchedContexts?: string[],
     /** Synthetic job ID to replace (e.g. needs-pending-deploy-{uuid}). */
@@ -666,6 +712,7 @@ export class ExecutionTracker {
       baseJobName?: string;
       variantKind?: string;
       variantLabel?: string;
+      environments?: string[];
     }>,
     dispatchedContexts?: string[],
     replaceSyntheticId?: string,
@@ -741,6 +788,7 @@ export class ExecutionTracker {
         ...(preservedStartedAt !== undefined && { startedAt: preservedStartedAt }),
         ...(preservedAgentId !== undefined && { agentId: preservedAgentId }),
         ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
+        ...(job.environments?.length && { environments: job.environments }),
       });
     }
 
@@ -761,6 +809,7 @@ export class ExecutionTracker {
             ...(job.variantKind && { variant_kind: job.variantKind }),
             ...(job.variantLabel && { variant_label: job.variantLabel }),
             ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
+            ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
             ...(dispatchedContexts?.length && {
               dispatched_contexts: JSON.stringify(dispatchedContexts),
             }),
@@ -772,6 +821,7 @@ export class ExecutionTracker {
               ...(job.variantKind && { variant_kind: job.variantKind }),
               ...(job.variantLabel && { variant_label: job.variantLabel }),
               ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
+              ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
               ...(dispatchedContexts?.length && {
                 dispatched_contexts: JSON.stringify(dispatchedContexts),
               }),
@@ -795,6 +845,7 @@ export class ExecutionTracker {
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
         sha: run.sha,
+        ...(run.localWorkingTree && { localWorkingTree: true }),
         installationId: run.installationId,
         requestId: run.requestId,
         routingKey: run.routingKey,
@@ -804,6 +855,8 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggerActorUsername: run.triggerActorUsername,
+        triggerActorUserId: run.triggerActorUserId,
       },
       run.jobs.size,
       run.startedAt,
@@ -1014,7 +1067,10 @@ export class ExecutionTracker {
         'parent_run_id',
         'original_run_id',
         'triggered_by',
+        'trigger_actor_username',
+        'trigger_actor_user_id',
         'check_mode',
+        'local_working_tree',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -1057,6 +1113,7 @@ export class ExecutionTracker {
       provider: dbRun.provider,
       repoIdentifier: dbRun.repo_identifier,
       sha: dbRun.sha,
+      ...(dbRun.local_working_tree === true && { localWorkingTree: true }),
       installationId,
       requestId: undefined,
       routingKey: dbRun.routing_key ?? undefined,
@@ -1066,6 +1123,8 @@ export class ExecutionTracker {
       parentRunId: dbRun.parent_run_id ?? undefined,
       originalRunId: dbRun.original_run_id ?? undefined,
       triggeredBy: dbRun.triggered_by ?? undefined,
+      triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
+      triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
       ...(dbRun.check_mode != null && { checkMode: dbRun.check_mode }),
       ...(recoveredDriftDetected && { driftDetected: true }),
       jobs: new Map(),
@@ -1273,6 +1332,8 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggerActorUsername: run.triggerActorUsername,
+        triggerActorUserId: run.triggerActorUserId,
       },
       run.jobs.size,
       run.startedAt,
@@ -1333,6 +1394,8 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggerActorUsername: run.triggerActorUsername,
+        triggerActorUserId: run.triggerActorUserId,
       },
       run.jobs.size,
       run.startedAt,
@@ -1425,6 +1488,7 @@ export class ExecutionTracker {
       // jobLogBytesTotal is set in the same TERMINAL_JOB_STATES branch above.
       jobLogBytesTotal,
       initFailure,
+      job.environments,
     );
   }
 
@@ -1823,6 +1887,8 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggerActorUsername: run.triggerActorUsername,
+        triggerActorUserId: run.triggerActorUserId,
       },
       run.jobs.size,
       startedAt,
@@ -1922,6 +1988,8 @@ export class ExecutionTracker {
           parentRunId: run.parentRunId,
           originalRunId: run.originalRunId,
           triggeredBy: run.triggeredBy,
+          triggerActorUsername: run.triggerActorUsername,
+          triggerActorUserId: run.triggerActorUserId,
         },
         run.jobs.size,
         run.startedAt,
@@ -2263,6 +2331,8 @@ export class ExecutionTracker {
           parentRunId: run.parentRunId,
           originalRunId: run.originalRunId,
           triggeredBy: run.triggeredBy,
+          triggerActorUsername: run.triggerActorUsername,
+          triggerActorUserId: run.triggerActorUserId,
         },
         run.jobs.size,
         run.startedAt,
@@ -2381,6 +2451,16 @@ export class ExecutionTracker {
       values.drift = JSON.stringify(data.drift);
     }
 
+    // Parallel step-group concurrency metadata (forwarded from the agent's
+    // step.start / step.complete IPC). Each parallel child has a distinct flat
+    // step_index, so the (run_id, job_id, step_index) upsert key stays unique.
+    if (data?.concurrencyKind !== undefined) {
+      values.concurrency_kind = String(data.concurrencyKind);
+    }
+    if (data?.groupId !== undefined) {
+      values.group_id = String(data.groupId);
+    }
+
     await this.db
       .insertInto('execution_steps')
       .values(values as any)
@@ -2457,6 +2537,8 @@ export class ExecutionTracker {
       installationId: run.installationId,
       routingKey: run.routingKey,
       concurrency: run.concurrency,
+      triggerActorUsername: run.triggerActorUsername,
+      triggerActorUserId: run.triggerActorUserId,
     };
   }
 
@@ -2607,6 +2689,7 @@ export class ExecutionTracker {
         completedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
+        environments?: string[];
       }>;
     }> = [];
 
@@ -2623,6 +2706,7 @@ export class ExecutionTracker {
         completedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
+        environments?: string[];
       }> = [];
 
       for (const [jobId, job] of run.jobs) {
@@ -2633,6 +2717,7 @@ export class ExecutionTracker {
           ...(job.startedAt !== undefined && { startedAt: job.startedAt }),
           ...(job.agentId && { agentId: job.agentId }),
           ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
+          ...(job.environments?.length && { environments: job.environments }),
         });
       }
 
@@ -2839,6 +2924,9 @@ export class ExecutionTracker {
       errorMessage,
       job?.agentId,
       job?.runsOnLabels,
+      undefined,
+      undefined,
+      job?.environments,
     );
   }
 
@@ -3009,6 +3097,7 @@ export class ExecutionTracker {
         provider: memRun.provider,
         repoIdentifier: memRun.repoIdentifier,
         sha: memRun.sha,
+        ...(memRun.localWorkingTree && { localWorkingTree: true }),
         installationId: memRun.installationId,
         requestId: memRun.requestId,
         routingKey: memRun.routingKey,
@@ -3025,6 +3114,7 @@ export class ExecutionTracker {
         provider: memRun.provider,
         repoIdentifier: memRun.repoIdentifier,
         sha: memRun.sha,
+        ...(memRun.localWorkingTree && { localWorkingTree: true }),
         installationId: memRun.installationId,
         requestId: memRun.requestId,
         routingKey: memRun.routingKey,
@@ -3034,6 +3124,8 @@ export class ExecutionTracker {
         parentRunId: memRun.parentRunId,
         originalRunId: memRun.originalRunId,
         triggeredBy: memRun.triggeredBy,
+        triggerActorUsername: memRun.triggerActorUsername,
+        triggerActorUserId: memRun.triggerActorUserId,
       },
       memRun.jobs.size,
       memRun.startedAt,
@@ -3110,6 +3202,8 @@ export class ExecutionTracker {
         'parent_run_id',
         'original_run_id',
         'triggered_by',
+        'trigger_actor_username',
+        'trigger_actor_user_id',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -3217,6 +3311,8 @@ export class ExecutionTracker {
         parentRunId: dbRun.parent_run_id ?? undefined,
         originalRunId: dbRun.original_run_id ?? undefined,
         triggeredBy: dbRun.triggered_by ?? undefined,
+        triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
+        triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
       },
       jobs.length,
       new Date(dbRun.started_at).getTime(),

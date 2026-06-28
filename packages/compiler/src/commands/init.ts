@@ -196,10 +196,10 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
       logger.info(
         pc.gray('  2. Run your package manager install in .kici/ to generate a lockfile'),
       );
-      logger.info(pc.gray('  3. Test locally: kici test push'));
+      logger.info(pc.gray('  3. Preview matching: kici preview push'));
       logger.info(pc.gray('  4. Commit .kici/ to your repository\n'));
     } else {
-      logger.info(pc.gray('  2. Test locally: kici test push'));
+      logger.info(pc.gray('  2. Preview matching: kici preview push'));
       logger.info(pc.gray('  3. Commit .kici/ to your repository\n'));
     }
 

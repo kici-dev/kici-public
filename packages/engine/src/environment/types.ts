@@ -4,6 +4,7 @@
  * Environments are org-level entities that group secrets, variables,
  * and protection rules for deployment targets (dev, staging, production).
  */
+import { z } from 'zod';
 import type { ApproverClause } from '../approval/types.js';
 
 /** Environment entity — org-level deployment target with protection rules. */
@@ -85,8 +86,9 @@ export interface EnvironmentSourceOverride {
   updatedAt: string;
 }
 
-/** Trust tier for contributor-based CI execution gating. */
-export type TrustTier = 'trusted' | 'known' | 'unknown';
+/** Trust tier for contributor-based CI execution gating (single source of truth). */
+export const TrustTierSchema = z.enum(['trusted', 'known', 'unknown']);
+export type TrustTier = z.infer<typeof TrustTierSchema>;
 
 /** Held run record for protection gate enforcement. */
 export interface HeldRun {

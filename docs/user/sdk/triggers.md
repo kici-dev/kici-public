@@ -507,6 +507,7 @@ interface ScheduleConfigInput {
   cron: string; // Required: cron expression (5-field)
   timezone?: string; // Timezone for cron evaluation (default: 'UTC')
   description?: string; // Human-readable description of the schedule
+  inputs?: DispatchInputsMap; // Optional: defaults-only typed inputs (see below)
 }
 ```
 
@@ -516,6 +517,41 @@ schedule({ cron: '0 0 * * *' }); // Daily at midnight UTC
 schedule({ cron: '0 9 * * 1', timezone: 'America/New_York' }); // Monday 9am ET
 schedule({ cron: '*/15 * * * *', description: 'health check every 15 min' });
 ```
+
+#### Schedule inputs (defaults-only)
+
+A `schedule()` trigger may declare typed `inputs`. A cron or dashboard
+"run now" fire carries **no operator-supplied values**, so each input resolves
+from its declared **default** and is exposed to steps and rules as
+`ctx.dispatchInputs` — the same surface as [typed dispatch inputs](#typed-dispatch-inputs).
+
+Because there is no operator to supply a value, every schedule input must
+declare a `.default()` **or** be `.optional()`. An input that is neither is
+rejected at `kici compile` time.
+
+```typescript
+import { workflow, job, schedule, z } from '@kici-dev/sdk';
+
+export default workflow('nightly', {
+  on: schedule({
+    cron: '0 3 * * *',
+    inputs: { mode: z.enum(['full', 'quick']).default('full') },
+  }),
+  jobs: [
+    job('build', {
+      runsOn: 'default',
+      run: async (ctx) => {
+        ctx.log(`mode = ${ctx.dispatchInputs.mode}`); // "full" on every fire
+      },
+    }),
+  ],
+});
+```
+
+You can also share a typed handle via `defineDispatchInputs(...)` and read it
+back with `.from(ctx)`, exactly as with `dispatch()`. The allowed input types
+are the same closed subset documented under
+[typed dispatch inputs](#typed-dispatch-inputs).
 
 ### lifecycle()
 

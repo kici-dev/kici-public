@@ -8,7 +8,8 @@ import { withTimeout } from './timeout-util.js';
  * Only fields that were flagged as dynamic and successfully resolved are set.
  */
 export interface InitResult {
-  environmentName?: string;
+  /** Resolved bound-environment names, in merge order (one per `environments` element). */
+  environmentNames?: string[];
   env?: Record<string, string>;
   concurrencyGroup?: string;
   /**
@@ -82,15 +83,26 @@ export async function evaluateDynamicFields(
     result.matrixValues = combos;
   }
 
-  if (flags.dynamicEnvironment && typeof job.environment === 'function') {
-    const value = await withTimeout(
-      () =>
-        (job.environment as (event: Record<string, unknown>) => string | Promise<string>)(event),
-      timeoutMs,
-      `dynamicEnvironment for job '${jobName}'`,
-    );
-    if (value !== undefined && value !== null) {
-      result.environmentName = value;
+  if (flags.dynamicEnvironment) {
+    // Resolve every bound-environment element in order (static verbatim, dynamic
+    // functions evaluated). Either spelling normalizes to one ordered list.
+    const envRefs =
+      job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
+    if (envRefs && envRefs.length > 0) {
+      const names: string[] = [];
+      for (const ref of envRefs) {
+        if (typeof ref === 'function') {
+          const value = await withTimeout(
+            () => (ref as (event: Record<string, unknown>) => string | Promise<string>)(event),
+            timeoutMs,
+            `dynamicEnvironment for job '${jobName}'`,
+          );
+          if (value !== undefined && value !== null) names.push(value);
+        } else if (typeof ref === 'string') {
+          names.push(ref);
+        }
+      }
+      if (names.length > 0) result.environmentNames = names;
     }
   }
 

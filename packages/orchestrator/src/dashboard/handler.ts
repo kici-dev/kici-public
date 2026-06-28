@@ -28,7 +28,10 @@ import type {
   DashboardSourcesListResponse,
   DashboardStepLogsRequest,
   DashboardAttestationsListRequest,
+  DashboardAttestationsListAllRequest,
+  DashboardAttestationGetRequest,
   AttestationListItem,
+  AttestationListSummary,
   DashboardPayloadRequest,
   DashboardOrchLogsRequest,
   DashboardEventLogListRequest,
@@ -45,13 +48,16 @@ import type {
   RunRerunRequest,
   RunCancelRequest,
   ManualScheduleRequest,
-  ExecutionJobStatus,
+  DashboardRunStructuredRequest,
 } from '@kici-dev/engine';
 import {
   AccessLogAction as AccessLogActionEnum,
   dashboardRunDetailApiResponseSchema,
   dashboardStepLogsApiResponseSchema,
   dashboardAttestationsListResponseSchema,
+  dashboardAttestationsListAllResponseSchema,
+  dashboardAttestationGetResponseSchema,
+  attestationVerifyStatusSchema,
   stringifyActor,
   EventLogStatus,
   EventLogSource,
@@ -62,6 +68,12 @@ import {
 import { gunzipSync } from 'node:zlib';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from './needs-edges.js';
+import { applyAttestationFilters, baseAttestationsQuery } from './attestation-filters.js';
+
+/** Page size for the org-wide attestations list (offset+count pagination). */
+const ATTESTATIONS_PAGE_SIZE = 25;
+import { buildRunDetailJobs, aggregateRunDetail } from '../reporting/run-aggregator.js';
+import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { CacheStorage } from '../storage/types.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
@@ -146,100 +158,6 @@ interface DashboardHandlerDeps {
    * deployments the store is wired by `bootstrapOrchestrator`.
    */
   eventStore?: EventStore | null;
-}
-
-/** A run-detail step row as queried by handleRunDetail (warm + cold paths). */
-interface RunDetailStepRow {
-  step_index: number;
-  step_name: string;
-  status: string;
-  started_at: Date | null;
-  completed_at: Date | null;
-  duration_ms: number | null;
-  exit_code: number | null;
-  error_message: string | null;
-  step_type: string;
-  secrets_accessed: string | null;
-  check_outcome: string | null;
-  drift_summary: string | null;
-}
-
-/** Map a step row to the dashboard run-detail step shape. */
-function mapRunDetailStep(step: RunDetailStepRow) {
-  return {
-    stepIndex: step.step_index,
-    stepName: step.step_name,
-    status: step.status,
-    startedAt: step.started_at ? step.started_at.getTime() : null,
-    completedAt: step.completed_at ? step.completed_at.getTime() : null,
-    durationMs: step.duration_ms ?? null,
-    exitCode: step.exit_code ?? null,
-    errorMessage: step.error_message ?? null,
-    ...(step.step_type !== 'step' && { stepType: step.step_type }),
-    secretsAccessed: step.secrets_accessed ?? null,
-    ...(step.check_outcome != null && { checkOutcome: step.check_outcome }),
-    ...(step.drift_summary != null && { driftSummary: step.drift_summary }),
-  };
-}
-
-/** A run-detail job row as queried by handleRunDetail (warm + cold paths). */
-interface RunDetailJobRow {
-  job_id: string;
-  job_name: string;
-  status: string;
-  matrix_values: unknown;
-  base_job_name: string | null;
-  variant_kind: string | null;
-  variant_label: string | null;
-  started_at: Date | null;
-  completed_at: Date | null;
-  duration_ms: number | null;
-  agent_id: string | null;
-  error_message: string | null;
-  runs_on_labels: unknown;
-  outputs: unknown;
-  init_failure: unknown;
-}
-
-/** Lookups threaded into {@link buildRunDetailJobs} from the per-run batch queries. */
-interface RunDetailJobLookups {
-  stepsByJob: Map<string, RunDetailStepRow[]>;
-  secretKeysByJob: Map<string, string[]>;
-  needsByJob: Map<string, Array<{ upstreamName: string; runOn: ExecutionJobStatus[] }>>;
-}
-
-/** Map queried job + step rows into the dashboard run-detail job DTO shape. */
-function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJobLookups) {
-  const { stepsByJob, secretKeysByJob, needsByJob } = lookups;
-  return jobs.map((job) => {
-    const jobSteps = stepsByJob.get(job.job_id) ?? [];
-    const jobInitFailure = (job.init_failure as InitFailure | null) ?? undefined;
-    return {
-      jobId: job.job_id,
-      jobName: job.job_name,
-      status: job.status,
-      matrixValues: (job.matrix_values as Record<string, unknown> | null) ?? null,
-      baseJobName: job.base_job_name ?? null,
-      variantKind: job.variant_kind ?? null,
-      variantLabel: job.variant_label ?? null,
-      startedAt: job.started_at ? job.started_at.getTime() : null,
-      completedAt: job.completed_at ? job.completed_at.getTime() : null,
-      durationMs: job.duration_ms ?? null,
-      agentId: job.agent_id ?? null,
-      orchestratorId: null,
-      errorMessage: job.error_message ?? null,
-      runsOnLabels: (job.runs_on_labels as string[] | null) ?? null,
-      outputs: job.outputs
-        ? typeof job.outputs === 'string'
-          ? JSON.parse(job.outputs)
-          : job.outputs
-        : null,
-      secretOutputKeys: secretKeysByJob.get(job.job_id) ?? null,
-      ...(jobInitFailure && { initFailure: jobInitFailure }),
-      needs: needsByJob.get(job.job_name) ?? null,
-      steps: jobSteps.map(mapRunDetailStep),
-    };
-  });
 }
 
 export class DashboardHandler {
@@ -492,6 +410,7 @@ export class DashboardHandler {
           'duration_ms',
           'error_message',
           'runs_on_labels',
+          'environments',
           'outputs',
           'init_failure',
         ])
@@ -516,6 +435,8 @@ export class DashboardHandler {
           'secrets_accessed',
           'check_outcome',
           'drift_summary',
+          'concurrency_kind',
+          'group_id',
         ])
         .where('run_id', '=', msg.runId)
         .orderBy('step_index', 'asc')
@@ -666,6 +587,54 @@ export class DashboardHandler {
   }
 
   /**
+   * Handle a dashboard.run.structured request — the user-plane equivalent of
+   * the orchestrator-admin `/runs/:id/structured` endpoint. Reuses the Phase-1
+   * aggregator + provenance mapper so the result is byte-identical to the admin
+   * surface; emits an `access_log` `run.structured.read` row (carrying the
+   * agent label when the actor came through an agent PAT).
+   */
+  async handleRunStructured(msg: DashboardRunStructuredRequest): Promise<void> {
+    const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
+    try {
+      const detail = await aggregateRunDetail(this.db, msg.runId);
+      const result = detail ? mapToAgentRunResult(detail) : null;
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        'run.structured.read',
+        { type: 'run', id: msg.runId },
+        msg.requestId,
+        'allowed',
+      );
+      this.send({
+        type: 'dashboard.run.structured.response',
+        requestId: msg.requestId,
+        result,
+      });
+    } catch (err) {
+      logger.error('Error handling dashboard.run.structured', {
+        runId: msg.runId,
+        error: toErrorMessage(err),
+      });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        'run.structured.read',
+        { type: 'run', id: msg.runId },
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.run.structured.response',
+        requestId: msg.requestId,
+        result: null,
+        error: 'Internal error querying structured run result',
+      });
+    }
+  }
+
+  /**
    * Resolve every routing key owned by an org by unioning both source
    * tables. The orchestrator is single-org but multi-routing-key: one org
    * owns one GitHub-app source plus N generic sources, each with its own
@@ -756,20 +725,25 @@ export class DashboardHandler {
    */
   private async resolveRunJobAggregates(
     runIds: string[],
-  ): Promise<Map<string, { jobCount: number; compileJobId: string | null }>> {
-    const map = new Map<string, { jobCount: number; compileJobId: string | null }>();
+  ): Promise<
+    Map<string, { jobCount: number; compileJobId: string | null; environments: string[] }>
+  > {
+    const map = new Map<
+      string,
+      { jobCount: number; compileJobId: string | null; environments: string[] }
+    >();
     if (runIds.length === 0) return map;
 
     const jobRows = await this.db
       .selectFrom('execution_jobs')
-      .select(['run_id', 'job_id', 'job_name'])
+      .select(['run_id', 'job_id', 'job_name', 'environments'])
       .where('run_id', 'in', runIds)
       .execute();
 
     for (const j of jobRows) {
       let agg = map.get(j.run_id);
       if (!agg) {
-        agg = { jobCount: 0, compileJobId: null };
+        agg = { jobCount: 0, compileJobId: null, environments: [] };
         map.set(j.run_id, agg);
       }
       agg.jobCount += 1;
@@ -778,6 +752,15 @@ export class DashboardHandler {
       // Platform run-list route's `job_name LIKE '__build__%'` definition.
       if (j.job_name.startsWith('__build__') && !agg.compileJobId) {
         agg.compileJobId = j.job_id;
+      }
+      // Distinct bound environments across the run's jobs, in first-seen order.
+      if (j.environments) {
+        const names = (
+          typeof j.environments === 'string'
+            ? (JSON.parse(j.environments) as string[])
+            : (j.environments as string[])
+        ).filter((n) => !agg!.environments.includes(n));
+        agg.environments.push(...names);
       }
     }
 
@@ -907,7 +890,10 @@ export class DashboardHandler {
               this.resolveSourceIdentities(pageRoutingKeys),
             ])
           : [
-              new Map<string, { jobCount: number; compileJobId: string | null }>(),
+              new Map<
+                string,
+                { jobCount: number; compileJobId: string | null; environments: string[] }
+              >(),
               new Map<string, { name: string | null; subtype: string; provider: string }>(),
             ];
 
@@ -1368,37 +1354,8 @@ export class DashboardHandler {
       const rows = await this.resolveAttestationsForRun(msg.runId);
       const attestations: AttestationListItem[] = [];
       for (const row of rows) {
-        const raw = await this.provenanceStorage.get(row.storageKey);
-        if (!raw) {
-          logger.warn('Attestation bundle missing from object storage', {
-            runId: msg.runId,
-            attestationId: row.id,
-            storageKey: row.storageKey,
-          });
-          continue;
-        }
-        let bundle: unknown;
-        try {
-          bundle = JSON.parse(raw.toString('utf-8'));
-        } catch (parseErr) {
-          logger.warn('Attestation bundle is not valid JSON', {
-            runId: msg.runId,
-            attestationId: row.id,
-            error: toErrorMessage(parseErr),
-          });
-          continue;
-        }
-        attestations.push({
-          id: row.id,
-          jobId: row.jobId,
-          jobName: row.jobName ?? null,
-          subjectName: row.subjectName,
-          subjectDigest: row.subjectDigest,
-          mode: row.mode,
-          mediaType: row.mediaType,
-          createdAt: new Date(row.createdAt).toISOString(),
-          bundle: bundle as AttestationListItem['bundle'],
-        });
+        const item = await this.inlineBundle(row);
+        if (item) attestations.push(item);
       }
 
       const validated = dashboardAttestationsListResponseSchema.safeParse({
@@ -1450,6 +1407,300 @@ export class DashboardHandler {
         requestId: msg.requestId,
         attestations: [],
         error: 'Internal error reading attestations',
+      });
+    }
+  }
+
+  /**
+   * Fetch + parse one attestation bundle from object storage. Returns the full
+   * detail item, or null when the bundle is missing or not valid JSON (logged).
+   * Shared by `handleAttestationsList` (per-run) and `handleAttestationGet`.
+   */
+  private async inlineBundle(row: {
+    id: string;
+    jobId: string;
+    jobName: string | null;
+    subjectName: string;
+    subjectDigest: string;
+    mode: string;
+    mediaType: string;
+    storageKey: string;
+    createdAt: Date | string;
+  }): Promise<AttestationListItem | null> {
+    if (!this.provenanceStorage) return null;
+    const raw = await this.provenanceStorage.get(row.storageKey);
+    if (!raw) {
+      logger.warn('Attestation bundle missing from object storage', {
+        attestationId: row.id,
+        storageKey: row.storageKey,
+      });
+      return null;
+    }
+    let bundle: unknown;
+    try {
+      bundle = JSON.parse(raw.toString('utf-8'));
+    } catch (parseErr) {
+      logger.warn('Attestation bundle is not valid JSON', {
+        attestationId: row.id,
+        error: toErrorMessage(parseErr),
+      });
+      return null;
+    }
+    return {
+      id: row.id,
+      jobId: row.jobId,
+      jobName: row.jobName ?? null,
+      subjectName: row.subjectName,
+      subjectDigest: row.subjectDigest,
+      mode: row.mode,
+      mediaType: row.mediaType,
+      createdAt: new Date(row.createdAt).toISOString(),
+      bundle: bundle as AttestationListItem['bundle'],
+    };
+  }
+
+  /**
+   * Org-wide attestations query: one page of metadata-only summaries (no bundle
+   * fetch) plus the total matching count. Filters/pagination/sort applied via
+   * the shared filter builder.
+   */
+  private async resolveAttestationsListAll(
+    filters: DashboardAttestationsListAllRequest['filters'],
+    page: number,
+  ): Promise<{ rows: AttestationListSummary[]; total: number; pageSize: number }> {
+    const offset = Math.max(0, page - 1) * ATTESTATIONS_PAGE_SIZE;
+    const rows = await applyAttestationFilters(baseAttestationsQuery(this.db), filters)
+      .select([
+        'attestations.id as id',
+        'attestations.run_id as runId',
+        'attestations.job_id as jobId',
+        'execution_jobs.job_name as jobName',
+        'attestations.subject_name as subjectName',
+        'attestations.subject_digest as subjectDigest',
+        'attestations.mode as mode',
+        'attestations.media_type as mediaType',
+        'attestations.created_at as createdAt',
+        'attestations.verify_status as verifyStatus',
+        'attestations.verify_reason as verifyReason',
+        'execution_runs.repo_identifier as repository',
+        'execution_runs.workflow_name as workflow',
+      ])
+      .orderBy('attestations.created_at', 'desc')
+      .limit(ATTESTATIONS_PAGE_SIZE)
+      .offset(offset)
+      .execute();
+
+    const countRow = await applyAttestationFilters(baseAttestationsQuery(this.db), filters)
+      .select((eb) => eb.fn.countAll<number>().as('count'))
+      .executeTakeFirst();
+
+    const summaries: AttestationListSummary[] = rows.map((row) => ({
+      id: row.id,
+      runId: row.runId,
+      jobId: row.jobId,
+      jobName: row.jobName ?? null,
+      subjectName: row.subjectName,
+      subjectDigest: row.subjectDigest,
+      mode: row.mode,
+      mediaType: row.mediaType,
+      createdAt: new Date(row.createdAt).toISOString(),
+      verifyStatus: attestationVerifyStatusSchema
+        .catch(attestationVerifyStatusSchema.enum.pending)
+        .parse(row.verifyStatus),
+      verifyReason: row.verifyReason ?? null,
+      repository: row.repository ?? null,
+      workflow: row.workflow ?? null,
+    }));
+    return {
+      rows: summaries,
+      total: Number(countRow?.count ?? 0),
+      pageSize: ATTESTATIONS_PAGE_SIZE,
+    };
+  }
+
+  /**
+   * Handle a dashboard.attestations.list.all request: org-wide, paginated,
+   * filtered list of attestation summaries (metadata only). Access-logged
+   * against the `attestation` target.
+   */
+  async handleAttestationsListAll(msg: DashboardAttestationsListAllRequest): Promise<void> {
+    const ctx = this.contextOrFallback(null);
+    const target = { type: 'attestation' as const, id: 'list' };
+    try {
+      const { rows, total, pageSize } = await this.resolveAttestationsListAll(
+        msg.filters,
+        msg.page,
+      );
+      const validated = dashboardAttestationsListAllResponseSchema.safeParse({
+        type: 'dashboard.attestations.list.all.response',
+        requestId: msg.requestId,
+        attestations: rows,
+        page: msg.page,
+        pageSize,
+        total,
+      });
+      if (!validated.success) {
+        logger.error('Outgoing dashboard.attestations.list.all response validation failed', {
+          errors: validated.error.issues,
+        });
+        this.recordAccess(
+          ctx,
+          msg.actor,
+          AccessLogActionEnum.enum['attestations.read'],
+          target,
+          msg.requestId,
+          'error',
+          'response validation failed',
+        );
+        this.send({
+          type: 'dashboard.attestations.list.all.response',
+          requestId: msg.requestId,
+          attestations: [],
+          page: msg.page,
+          pageSize: ATTESTATIONS_PAGE_SIZE,
+          total: 0,
+          error: 'Internal error: response validation failed',
+        });
+        return;
+      }
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'allowed',
+      );
+      this.send(validated.data);
+    } catch (err) {
+      logger.error('Error handling dashboard.attestations.list.all', {
+        error: toErrorMessage(err),
+      });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.attestations.list.all.response',
+        requestId: msg.requestId,
+        attestations: [],
+        page: msg.page,
+        pageSize: ATTESTATIONS_PAGE_SIZE,
+        total: 0,
+        error: 'Internal error reading attestations',
+      });
+    }
+  }
+
+  /**
+   * Handle a dashboard.attestation.get request: a single attestation by id with
+   * its bundle inlined for the detail page. Resolves the run-owning org for the
+   * access-log row, then logs against the `attestation` target.
+   */
+  async handleAttestationGet(msg: DashboardAttestationGetRequest): Promise<void> {
+    const target = { type: 'attestation' as const, id: msg.attestationId };
+    let ctx = this.contextOrFallback(null);
+    try {
+      const row = await this.db
+        .selectFrom('attestations')
+        .innerJoin('execution_jobs', (join) =>
+          join
+            .on(sql`execution_jobs.job_id::text`, '=', sql.ref('attestations.job_id'))
+            .on(sql`execution_jobs.run_id::text`, '=', sql.ref('attestations.run_id')),
+        )
+        .select([
+          'attestations.id as id',
+          'attestations.run_id as runId',
+          'attestations.job_id as jobId',
+          'execution_jobs.job_name as jobName',
+          'attestations.subject_name as subjectName',
+          'attestations.subject_digest as subjectDigest',
+          'attestations.mode as mode',
+          'attestations.media_type as mediaType',
+          'attestations.storage_key as storageKey',
+          'attestations.created_at as createdAt',
+          'attestations.verify_status as verifyStatus',
+          'attestations.verify_reason as verifyReason',
+        ])
+        .where('attestations.id', '=', msg.attestationId)
+        .executeTakeFirst();
+
+      if (row) ctx = this.contextOrFallback(await this.resolveOrgForRun(row.runId));
+
+      const inlined = row ? await this.inlineBundle(row) : null;
+      // Augment the detail item with the owning run id + stored verdict so the
+      // detail page can render the "view run" link and the recorded badge.
+      const attestation =
+        inlined && row
+          ? {
+              ...inlined,
+              runId: row.runId,
+              verifyStatus: attestationVerifyStatusSchema
+                .catch(attestationVerifyStatusSchema.enum.pending)
+                .parse(row.verifyStatus),
+              verifyReason: row.verifyReason ?? null,
+            }
+          : null;
+      const validated = dashboardAttestationGetResponseSchema.safeParse({
+        type: 'dashboard.attestation.get.response',
+        requestId: msg.requestId,
+        attestation,
+      });
+      if (!validated.success) {
+        logger.error('Outgoing dashboard.attestation.get response validation failed', {
+          attestationId: msg.attestationId,
+          errors: validated.error.issues,
+        });
+        this.recordAccess(
+          ctx,
+          msg.actor,
+          AccessLogActionEnum.enum['attestations.read'],
+          target,
+          msg.requestId,
+          'error',
+          'response validation failed',
+        );
+        this.send({
+          type: 'dashboard.attestation.get.response',
+          requestId: msg.requestId,
+          attestation: null,
+          error: 'Internal error: response validation failed',
+        });
+        return;
+      }
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'allowed',
+      );
+      this.send(validated.data);
+    } catch (err) {
+      logger.error('Error handling dashboard.attestation.get', {
+        attestationId: msg.attestationId,
+        error: toErrorMessage(err),
+      });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.attestation.get.response',
+        requestId: msg.requestId,
+        attestation: null,
+        error: 'Internal error reading attestation',
       });
     }
   }
@@ -2626,6 +2877,8 @@ export class DashboardHandler {
       secrets_accessed: string | null;
       check_outcome: string | null;
       drift_summary: string | null;
+      concurrency_kind: string | null;
+      group_id: string | null;
     }>;
   }> {
     const out = {
@@ -2669,6 +2922,8 @@ export class DashboardHandler {
         secrets_accessed: string | null;
         check_outcome: string | null;
         drift_summary: string | null;
+        concurrency_kind: string | null;
+        group_id: string | null;
       }>,
     };
     if (!this.coldStore) return out;
@@ -2730,6 +2985,7 @@ export class DashboardHandler {
       duration_ms: typeof r.duration_ms === 'number' ? r.duration_ms : null,
       error_message: typeof r.error_message === 'string' ? r.error_message : null,
       runs_on_labels: typeof r.runs_on_labels === 'string' ? r.runs_on_labels : null,
+      environments: typeof r.environments === 'string' ? r.environments : null,
       outputs: typeof r.outputs === 'string' ? r.outputs : null,
       init_failure: (r.init_failure as InitFailure | null) ?? null,
     }));
@@ -2749,6 +3005,8 @@ export class DashboardHandler {
       secrets_accessed: typeof r.secrets_accessed === 'string' ? r.secrets_accessed : null,
       check_outcome: typeof r.check_outcome === 'string' ? r.check_outcome : null,
       drift_summary: typeof r.drift_summary === 'string' ? r.drift_summary : null,
+      concurrency_kind: typeof r.concurrency_kind === 'string' ? r.concurrency_kind : null,
+      group_id: typeof r.group_id === 'string' ? r.group_id : null,
     }));
     return out;
   }
@@ -2880,7 +3138,10 @@ interface RunSummaryRow {
  */
 function mapRunSummary(
   r: RunSummaryRow,
-  jobAggregates: Map<string, { jobCount: number; compileJobId: string | null }>,
+  jobAggregates: Map<
+    string,
+    { jobCount: number; compileJobId: string | null; environments: string[] }
+  >,
   sourceIdentities: Map<string, { name: string | null; subtype: string; provider: string }>,
 ): DashboardRunSummary {
   const agg = jobAggregates.get(r.run_id);
@@ -2907,6 +3168,7 @@ function mapRunSummary(
     ...(r.failure_reason ? { failureReason: r.failure_reason } : {}),
     ...(agg ? { jobCount: agg.jobCount, hadCompileJob: agg.compileJobId !== null } : {}),
     ...(agg?.compileJobId ? { compileJobId: agg.compileJobId } : {}),
+    ...(agg && agg.environments.length > 0 ? { environments: agg.environments } : {}),
     source: {
       routingKey,
       name: identity?.name ?? null,

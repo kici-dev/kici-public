@@ -639,10 +639,23 @@ export class ContainerSandbox implements ExecutionSandbox {
         this.sendExecuteRequest(stream, options);
         return false;
 
-      case 'step.start':
+      case 'step.start': {
         stepNames.set(msg.stepIndex, msg.stepName);
-        options.onStepStatus(msg.stepIndex, msg.stepName, ExecutionStepStatus.enum.running);
+        const startState =
+          msg.state === 'pending'
+            ? ExecutionStepStatus.enum.pending
+            : ExecutionStepStatus.enum.running;
+        const startData = {
+          ...(msg.concurrencyKind && { concurrencyKind: msg.concurrencyKind }),
+          ...(msg.groupId && { groupId: msg.groupId }),
+        };
+        if (Object.keys(startData).length > 0) {
+          options.onStepStatus(msg.stepIndex, msg.stepName, startState, startData);
+        } else {
+          options.onStepStatus(msg.stepIndex, msg.stepName, startState);
+        }
         return false;
+      }
 
       case 'step.complete': {
         const name = stepNames.get(msg.stepIndex) ?? `step-${msg.stepIndex}`;
@@ -654,6 +667,8 @@ export class ContainerSandbox implements ExecutionSandbox {
           ...(msg.checkOutcome !== undefined && { checkOutcome: msg.checkOutcome }),
           ...(msg.driftSummary !== undefined && { driftSummary: msg.driftSummary }),
           ...(msg.drift !== undefined && { drift: msg.drift }),
+          ...(msg.concurrencyKind && { concurrencyKind: msg.concurrencyKind }),
+          ...(msg.groupId && { groupId: msg.groupId }),
           ...(msg.data && msg.data),
         });
 

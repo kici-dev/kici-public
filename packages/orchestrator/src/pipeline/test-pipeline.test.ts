@@ -1,8 +1,36 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import crypto from 'node:crypto';
 import { encryptJson } from '@kici-dev/shared';
-import { processTestTrigger, type TestTriggerInput } from './test-pipeline.js';
+import {
+  processTestTrigger,
+  repoIdentityFromInlineInput,
+  type TestTriggerInput,
+} from './test-pipeline.js';
 import type { ProcessingDeps } from './processor.js';
+
+describe('repoIdentityFromInlineInput', () => {
+  it('derives identity from the event payload, never the routing key', () => {
+    const result = repoIdentityFromInlineInput({
+      routingKey: 'remote:org_WDVAbHTQhWjK',
+      event: { payload: { repository: { full_name: 'acme/app', provider: 'github' } } },
+    } as never);
+    expect(result).toEqual({ repoIdentifier: 'acme/app', provider: 'github' });
+  });
+  it('falls back to local provider when payload has no provider', () => {
+    const result = repoIdentityFromInlineInput({
+      routingKey: 'remote:org_X',
+      event: { payload: { repository: { full_name: 'local/app' } } },
+    } as never);
+    expect(result).toEqual({ repoIdentifier: 'local/app', provider: 'local' });
+  });
+  it('falls back to local/unknown when payload lacks a repository', () => {
+    const result = repoIdentityFromInlineInput({
+      routingKey: 'remote:org_X',
+      event: { payload: {} },
+    } as never);
+    expect(result).toEqual({ repoIdentifier: 'local/unknown', provider: 'local' });
+  });
+});
 
 // --- Mock helpers ---
 
@@ -712,8 +740,80 @@ describe('processTestTrigger', () => {
     });
   });
 
-  describe('environment allowLocalExecution gate', () => {
-    it('rejects fullRepo run when environment disallows test runs', async () => {
+  describe('environment skip-on-test', () => {
+    /** matchEnvironment mock returning a full row with the given allowLocalExecution. */
+    function envStore(name: string, allowLocalExecution: boolean) {
+      return {
+        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+          n === name
+            ? {
+                id: `env-${name}`,
+                org_id: 'org-gate',
+                name,
+                type: 'deployment',
+                glob_pattern: null,
+                branch_restrictions: null,
+                trigger_type_filters: null,
+                repo_patterns: null,
+                concurrency_limit: null,
+                concurrency_strategy: null,
+                concurrency_timeout_ms: null,
+                required_reviewers: null,
+                wait_timer_seconds: null,
+                hold_expiry_seconds: null,
+                minimum_trust: null,
+                allow_local_execution: allowLocalExecution,
+                enabled: true,
+                created_at: new Date(),
+                updated_at: new Date(),
+                created_by: null,
+              }
+            : null,
+        ),
+      } as any;
+    }
+
+    function gateDb(envName: string, allowLocalExecution: boolean) {
+      return {
+        fn: { countAll: () => ({ as: () => ({}) }) },
+        selectFrom: vi.fn((table: string) => ({
+          select: vi.fn(() => {
+            let name: string | undefined;
+            const chain: any = {
+              where: vi.fn((col: string, _op: string, val: string) => {
+                if (col === 'name') name = val;
+                return chain;
+              }),
+              innerJoin: vi.fn(() => chain),
+              executeTakeFirst: vi.fn(async () => {
+                if (table === 'sources') return { customer_id: 'org-gate' };
+                if (table === 'generic_webhook_sources') return undefined;
+                if (table === 'environments')
+                  return name === envName
+                    ? { allow_local_execution: allowLocalExecution }
+                    : undefined;
+                if (table === 'execution_jobs') return { count: 0 };
+                return undefined;
+              }),
+            };
+            return chain;
+          }),
+        })),
+        insertInto: vi.fn(() => ({
+          values: vi.fn(() => ({
+            onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+            execute: vi.fn().mockResolvedValue(undefined),
+          })),
+        })),
+        updateTable: vi.fn(() => ({
+          set: vi.fn(() => ({
+            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+          })),
+        })),
+      };
+    }
+
+    it('skips a non-test-allowed bound env on a fullRepo run (no longer rejects)', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -722,26 +822,17 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environment: 'production',
+          environments: [{ value: 'production', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
-      const mockDb = {
-        selectFrom: vi.fn((table: string) => {
-          const chain: any = {
-            select: vi.fn(() => chain),
-            where: vi.fn(() => chain),
-            executeTakeFirst: vi.fn(async () => {
-              if (table === 'environments') return { allow_local_execution: false };
-              return undefined;
-            }),
-          };
-          return chain;
-        }),
-      };
-
-      deps.db = mockDb as any;
+      deps.db = gateDb('production', false) as any;
+      deps.environmentStore = envStore('production', false);
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
 
       const input = createMockInput({
         inlineLockFile: JSON.stringify(lockFile),
@@ -751,12 +842,15 @@ describe('processTestTrigger', () => {
 
       const result = await processTestTrigger(input, deps);
 
-      expect(result.status).toBe('rejected');
-      expect(result.reason).toContain('does not allow test runs');
-      expect(result.reason).toContain('production');
+      expect(result.status).toBe('accepted');
+      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
+      // The env is skipped on a test run: its vars do not flow, though the
+      // declared name is still recorded as the run environment.
+      expect(jobConfig.environment).toBe('production');
+      expect(jobConfig.environmentVars).toBeUndefined();
     });
 
-    it('allows fullRepo run when environment has allowLocalExecution=true', async () => {
+    it('applies a test-allowed bound env on a fullRepo run', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -765,26 +859,17 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environment: 'staging',
+          environments: [{ value: 'staging', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
-      const mockDb = {
-        selectFrom: vi.fn((table: string) => {
-          const chain: any = {
-            select: vi.fn(() => chain),
-            where: vi.fn(() => chain),
-            executeTakeFirst: vi.fn(async () => {
-              if (table === 'environments') return { allow_local_execution: true };
-              return undefined;
-            }),
-          };
-          return chain;
-        }),
-      };
-
-      deps.db = mockDb as any;
+      deps.db = gateDb('staging', true) as any;
+      deps.environmentStore = envStore('staging', true);
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
 
       const input = createMockInput({
         inlineLockFile: JSON.stringify(lockFile),
@@ -796,10 +881,10 @@ describe('processTestTrigger', () => {
 
       expect(result.status).toBe('accepted');
       expect(result.jobIds.length).toBeGreaterThan(0);
+      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.environment).toBe('staging');
     });
 
-    it('rejects real-repo (remote) run when environment disallows test runs', async () => {
-      const ORG = 'org-remote-gate';
+    it('skips a non-test-allowed bound env on a real-repo (remote) run', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -808,48 +893,29 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environment: 'production',
+          environments: [{ value: 'production', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
 
-      // db mock answering resolveOrgId (sources -> ORG) and the org-scoped
-      // environments lookup. Capture the org_id the gate filters on so we can
-      // assert it is the resolved org id, not a name-only query.
-      let envQueryOrgId: string | undefined;
-      const mockDb = {
-        selectFrom: vi.fn((table: string) => ({
-          select: vi.fn(() => {
-            const chain: any = {
-              where: vi.fn((col: string, _op: string, val: string) => {
-                if (table === 'environments' && col === 'org_id') envQueryOrgId = val;
-                return chain;
-              }),
-              executeTakeFirst: vi.fn(async () => {
-                if (table === 'sources') return { customer_id: ORG };
-                if (table === 'generic_webhook_sources') return undefined;
-                if (table === 'environments') return { allow_local_execution: false };
-                return undefined;
-              }),
-            };
-            return chain;
-          }),
-        })),
-      };
-
-      deps.db = mockDb as any;
+      deps.db = gateDb('production', false) as any;
+      deps.environmentStore = envStore('production', false);
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
 
       // fullRepo is NOT set -- this is a normal remote test run.
       const input = createMockInput({ routingKey: 'github:42' });
 
       const result = await processTestTrigger(input, deps);
 
-      expect(result.status).toBe('rejected');
-      expect(result.reason).toContain('does not allow test runs');
-      expect(result.reason).toContain('production');
-      // The env lookup must be scoped by the resolved org id.
-      expect(envQueryOrgId).toBe(ORG);
+      expect(result.status).toBe('accepted');
+      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
+      // Skipped on the test run: no env vars flow; declared name still recorded.
+      expect(jobConfig.environment).toBe('production');
+      expect(jobConfig.environmentVars).toBeUndefined();
     });
 
     it('skips environment gate when no db is provided', async () => {
@@ -991,7 +1057,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'echo', run: 'echo hi' }],
           needs: [],
           rules: [],
-          environment: 'test-database',
+          environments: [{ value: 'test-database', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
@@ -1093,7 +1159,7 @@ describe('processTestTrigger', () => {
     }
 
     /** Env store whose matchEnvironment returns a full row (no protection rules). */
-    function makeInlineEnvStore(name: string) {
+    function makeInlineEnvStore(name: string, allowLocalExecution = true) {
       return {
         matchEnvironment: vi.fn(async (_org: string, n: string) =>
           n === name
@@ -1113,7 +1179,7 @@ describe('processTestTrigger', () => {
                 wait_timer_seconds: null,
                 hold_expiry_seconds: null,
                 minimum_trust: null,
-                allow_local_execution: true,
+                allow_local_execution: allowLocalExecution,
                 enabled: true,
                 created_at: new Date(),
                 updated_at: new Date(),
@@ -1136,16 +1202,23 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          dynamicEnvironment: true,
-          environment: { _type: 'inline' as const, expression: inlineEnvExpression },
+          environments: [
+            { value: { _type: 'inline' as const, expression: inlineEnvExpression }, dynamic: true },
+          ],
         },
       ]);
     }
 
-    it('gates on the resolved inline environment name', async () => {
+    it('skips a non-test-allowed bound env resolved from an inline name (skip-on-test)', async () => {
       const lockFile = createMockLockFile([inlineEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeInlineDb({ 'test-db': { allow_local_execution: false } }) as any;
+      deps.environmentStore = makeInlineEnvStore('test-db', false);
+
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
 
       const input = createMockInput({
         routingKey: 'github:42',
@@ -1155,8 +1228,13 @@ describe('processTestTrigger', () => {
 
       const result = await processTestTrigger(input, deps);
 
-      expect(result.status).toBe('rejected');
-      expect(result.reason).toMatch(/test-db.*does not allow test runs/);
+      // Skip-on-test: the run is accepted (not rejected), and the dispatched job
+      // carries no environment vars (the only bound env disallows test runs); the
+      // inline-resolved name is still recorded as the run environment.
+      expect(result.status).toBe('accepted');
+      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
+      expect(jobConfig.environment).toBe('test-db');
+      expect(jobConfig.environmentVars).toBeUndefined();
     });
 
     it('resolves B1 secrets via the resolved inline environment name', async () => {
@@ -1257,8 +1335,12 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          dynamicEnvironment: true,
-          environment: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
+          environments: [
+            {
+              value: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
+              dynamic: true,
+            },
+          ],
         },
       ]);
       const lockFile = createMockLockFile([failingWorkflow]);
@@ -1371,7 +1453,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environment: 'test-db',
+          environments: [{ value: 'test-db', dynamic: false }],
           env: { FOO: 'bar' },
         },
       ]);

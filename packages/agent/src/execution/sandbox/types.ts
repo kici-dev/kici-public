@@ -181,8 +181,8 @@ export interface SandboxStepResult {
   name: string;
   /** Zero-based index of the step within the job. */
   stepIndex: number;
-  /** Step execution status. */
-  status: 'success' | 'failed' | 'skipped';
+  /** Step execution status. `cancelled` = a parallel sibling fail-fast cancel. */
+  status: 'success' | 'failed' | 'skipped' | 'cancelled';
   /** Step duration in milliseconds. */
   durationMs: number;
   /** Error details when status is 'failed'. */

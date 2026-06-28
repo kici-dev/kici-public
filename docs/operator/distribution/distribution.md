@@ -62,10 +62,12 @@ This pulls `@kici-dev/orchestrator` and runs the interactive setup wizard, which
 
 ### Agent bare-metal installation
 
-For the bare-metal scaler backend, install the agent globally:
+For the bare-metal scaler backend, install the agent globally. The `kici-admin`
+wrapper carries the agent and exposes the `kici-agent` binary the bare-metal
+scaler spawns:
 
 ```bash
-npm install -g @kici-dev/agent
+npm install -g kici-admin
 ```
 
 The agent requires `git`, a shell (`bash` on Linux/macOS, `pwsh` on Windows), `node`, and `npm` to be available on the host. See [Agent runtime dependencies](#agent-runtime-dependencies) below.
@@ -259,10 +261,10 @@ The container image includes git, bash, node, npm, and the native TypeScript loa
 
 ### npm package (bare-metal)
 
-Used by the **bare-metal scaler**. The agent is installed on the host machine and spawned as a process for each job.
+Used by the **bare-metal scaler**. The agent is installed on the host machine and spawned as a process for each job. The `kici-admin` wrapper carries the agent and exposes the `kici-agent` binary the scaler spawns.
 
 ```bash
-npm install -g @kici-dev/agent
+npm install -g kici-admin
 ```
 
 The host must have git, a shell (bash on Linux/macOS, pwsh on Windows), node, and npm available. The bare-metal scaler starts agent processes directly, passing job configuration via environment variables.

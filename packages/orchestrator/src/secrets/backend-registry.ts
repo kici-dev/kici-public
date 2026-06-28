@@ -13,7 +13,7 @@ import type {
   SecretStore,
 } from '@kici-dev/engine';
 import type { Logger } from '@kici-dev/shared';
-import { encrypt, decrypt, type EncryptedValue } from './crypto.js';
+import { encrypt, decrypt, type EncryptedValue } from '@kici-dev/shared';
 import { PgSecretStore } from './pg-secret-store.js';
 import { VaultSecretStore, type VaultConfig } from './vault-secret-store.js';
 import type { AuditLogger } from './audit-logger.js';

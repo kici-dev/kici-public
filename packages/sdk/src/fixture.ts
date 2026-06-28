@@ -2,7 +2,7 @@
  * Fixture factory for defining test event replicas.
  *
  * Fixtures declare which trigger event to simulate when running
- * `kici test <name>`. They are event replicas (not assertions) --
+ * `kici run remote <name>`. They are event replicas (not assertions) --
  * pass/fail is determined by the pipeline execution.
  */
 
@@ -28,7 +28,7 @@ export interface FixtureOptions {
 
 /** Resolved fixture definition */
 export interface Fixture {
-  /** Unique fixture ID used in `kici test <name>` */
+  /** Unique fixture ID used in `kici run remote <name>` */
   readonly id: string;
   /** Fixture options (plain object or async factory function) */
   readonly options: FixtureOptions | (() => FixtureOptions | Promise<FixtureOptions>);
@@ -37,7 +37,7 @@ export interface Fixture {
 /**
  * Create a test fixture definition.
  *
- * @param id - Unique fixture ID (no whitespace allowed, used in `kici test <name>`)
+ * @param id - Unique fixture ID (no whitespace allowed, used in `kici run remote <name>`)
  * @param options - Fixture configuration or async factory function
  * @returns Frozen fixture definition
  *

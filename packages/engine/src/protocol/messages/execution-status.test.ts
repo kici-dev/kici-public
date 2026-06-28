@@ -5,6 +5,8 @@ import {
   CacheStepType,
   ExecutionJobStatus,
   ExecutionRunStatus,
+  ExecutionStepStatus,
+  StepConcurrencyKind,
   InitFailureCategory,
   TERMINAL_JOB_STATES,
   TERMINAL_RUN_STATES,
@@ -12,7 +14,14 @@ import {
   executionStatusSchema,
   initFailureSchema,
   jobStatusForwardSchema,
+  stepStatusForwardSchema,
   stateReplaySchema,
+  STATUS_ID_MAX,
+  STATUS_FREE_TEXT_MAX,
+  REPO_IDENTIFIER_MAX,
+  STATE_REPLAY_MAX_RUNS,
+  MAX_JOBS_PER_RUN,
+  RUNS_ON_LABELS_MAX,
 } from './execution-status.js';
 import { orchestratorToPlatformMessageSchema } from './platform-orchestrator.js';
 
@@ -149,6 +158,34 @@ describe('executionStatusSchema logBytes', () => {
 
   it('rejects non-integer logBytes', () => {
     expect(() => executionStatusSchema.parse({ ...validExecutionStatus, logBytes: 1.5 })).toThrow();
+  });
+
+  it('accepts the trigger-actor fields', () => {
+    const msg = {
+      ...validExecutionStatus,
+      triggerActorProvider: 'github',
+      triggerActorUsername: 'octocat',
+      triggerActorUserId: '583231',
+    };
+    expect(executionStatusSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('bounds the trigger-actor username length', () => {
+    expect(() =>
+      executionStatusSchema.parse({
+        ...validExecutionStatus,
+        triggerActorUsername: 'x'.repeat(REPO_IDENTIFIER_MAX + 1),
+      }),
+    ).toThrow();
+  });
+
+  it('bounds the trigger-actor user id length', () => {
+    expect(() =>
+      executionStatusSchema.parse({
+        ...validExecutionStatus,
+        triggerActorUserId: 'x'.repeat(STATUS_ID_MAX + 1),
+      }),
+    ).toThrow();
   });
 });
 
@@ -494,6 +531,35 @@ describe('TimeoutReason', () => {
   });
 });
 
+describe('step concurrency (parallel groups)', () => {
+  it('ExecutionStepStatus accepts pending + cancelled', () => {
+    expect(ExecutionStepStatus.safeParse('pending').success).toBe(true);
+    expect(ExecutionStepStatus.safeParse('cancelled').success).toBe(true);
+    expect(ExecutionStepStatus.safeParse('bogus').success).toBe(false);
+  });
+
+  it('StepConcurrencyKind enumerates sequential/parallel-child/parallel-group', () => {
+    expect(StepConcurrencyKind.options).toEqual(['sequential', 'parallel-child', 'parallel-group']);
+  });
+
+  it('stepStatusForwardSchema accepts cancelled + concurrency fields end to end', () => {
+    const ok = stepStatusForwardSchema.safeParse({
+      type: 'step.status.forward',
+      messageId: 'm',
+      runId: 'r',
+      jobId: 'j',
+      jobName: 'n',
+      stepIndex: 1,
+      stepName: 'lint',
+      state: 'cancelled',
+      timestamp: 1,
+      concurrencyKind: 'parallel-child',
+      groupId: 'g0',
+    });
+    expect(ok.success).toBe(true);
+  });
+});
+
 describe('user-facing cache enums', () => {
   it('CacheStepType enumerates the two pseudo-step types', () => {
     expect(CacheStepType.options).toEqual(['cache:restore', 'cache:save']);
@@ -514,5 +580,156 @@ describe('user-facing cache enums', () => {
   it('rejects unknown cache enum values', () => {
     expect(CacheStepType.safeParse('cache:purge').success).toBe(false);
     expect(CacheOutcome.safeParse('partial').success).toBe(false);
+  });
+});
+
+describe('flood-hardening field bounds', () => {
+  const baseStatus = {
+    type: 'execution.status' as const,
+    messageId: 'm',
+    runId: 'r',
+    workflowName: 'w',
+    status: 'failed' as const,
+    startedAt: 1,
+    timestamp: 1,
+  };
+
+  it('accepts workflowName at the STATUS_ID_MAX limit', () => {
+    const r = executionStatusSchema.safeParse({
+      ...baseStatus,
+      workflowName: 'x'.repeat(STATUS_ID_MAX),
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects a workflowName one char over the limit', () => {
+    const r = executionStatusSchema.safeParse({
+      ...baseStatus,
+      workflowName: 'x'.repeat(STATUS_ID_MAX + 1),
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts a failureReason at STATUS_FREE_TEXT_MAX and rejects over', () => {
+    expect(
+      executionStatusSchema.safeParse({
+        ...baseStatus,
+        failureReason: 'x'.repeat(STATUS_FREE_TEXT_MAX),
+      }).success,
+    ).toBe(true);
+    expect(
+      executionStatusSchema.safeParse({
+        ...baseStatus,
+        failureReason: 'x'.repeat(STATUS_FREE_TEXT_MAX + 1),
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts a repoIdentifier at REPO_IDENTIFIER_MAX and rejects over', () => {
+    expect(
+      executionStatusSchema.safeParse({
+        ...baseStatus,
+        repoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX),
+      }).success,
+    ).toBe(true);
+    expect(
+      executionStatusSchema.safeParse({
+        ...baseStatus,
+        repoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX + 1),
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects an over-long errorMessage on job.status.forward', () => {
+    const r = jobStatusForwardSchema.safeParse({
+      type: 'job.status.forward',
+      messageId: 'm',
+      runId: 'r',
+      jobId: 'j',
+      jobName: 'build',
+      status: 'failed',
+      timestamp: 1,
+      errorMessage: 'x'.repeat(STATUS_FREE_TEXT_MAX + 1),
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a runsOnLabels array over RUNS_ON_LABELS_MAX', () => {
+    const r = jobStatusForwardSchema.safeParse({
+      type: 'job.status.forward',
+      messageId: 'm',
+      runId: 'r',
+      jobId: 'j',
+      jobName: 'build',
+      status: 'running',
+      timestamp: 1,
+      runsOnLabels: Array.from({ length: RUNS_ON_LABELS_MAX + 1 }, () => 'label'),
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a runsOnLabels element over STATUS_ID_MAX', () => {
+    const r = jobStatusForwardSchema.safeParse({
+      type: 'job.status.forward',
+      messageId: 'm',
+      runId: 'r',
+      jobId: 'j',
+      jobName: 'build',
+      status: 'running',
+      timestamp: 1,
+      runsOnLabels: ['x'.repeat(STATUS_ID_MAX + 1)],
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a state.replay runs array over STATE_REPLAY_MAX_RUNS', () => {
+    const runs = Array.from({ length: STATE_REPLAY_MAX_RUNS + 1 }, () => ({
+      runId: 'r',
+      workflowName: 'w',
+      status: 'failed' as const,
+      jobCount: 0,
+      startedAt: 1,
+      jobs: [],
+    }));
+    const r = stateReplaySchema.safeParse({
+      type: 'state.replay',
+      messageId: 'm',
+      runs,
+      timestamp: 1,
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts a state.replay runs array exactly at the cap', () => {
+    const runs = Array.from({ length: STATE_REPLAY_MAX_RUNS }, () => ({
+      runId: 'r',
+      workflowName: 'w',
+      status: 'failed' as const,
+      jobCount: 0,
+      startedAt: 1,
+      jobs: [],
+    }));
+    const r = stateReplaySchema.safeParse({
+      type: 'state.replay',
+      messageId: 'm',
+      runs,
+      timestamp: 1,
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects a per-run jobs array over MAX_JOBS_PER_RUN', () => {
+    const jobs = Array.from({ length: MAX_JOBS_PER_RUN + 1 }, () => ({
+      jobId: 'j',
+      jobName: 'build',
+      status: 'running',
+    }));
+    const r = stateReplaySchema.safeParse({
+      type: 'state.replay',
+      messageId: 'm',
+      runs: [{ runId: 'r', workflowName: 'w', status: 'running', jobCount: 1, startedAt: 1, jobs }],
+      timestamp: 1,
+    });
+    expect(r.success).toBe(false);
   });
 });
