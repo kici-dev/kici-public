@@ -55,6 +55,7 @@ interface ValidatedRequest {
 export async function handleManualSchedule(
   registrationId: string,
   triggeredBy: string | null,
+  triggeredByAgentLabel: string | null,
   deps: ManualScheduleDeps,
 ): Promise<{ newRunId: string }> {
   const { registration, commitSha, provider } = validateScheduleRequest(registrationId, deps);
@@ -80,6 +81,7 @@ export async function handleManualSchedule(
     commitSha,
     provider,
     triggeredBy,
+    triggeredByAgentLabel,
     deps,
   });
 
@@ -171,9 +173,19 @@ async function recordExecutionStart(args: {
   commitSha: string;
   provider: string;
   triggeredBy: string | null;
+  triggeredByAgentLabel: string | null;
   deps: ManualScheduleDeps;
 }): Promise<void> {
-  const { newRunId, workflow, registration, commitSha, provider, triggeredBy, deps } = args;
+  const {
+    newRunId,
+    workflow,
+    registration,
+    commitSha,
+    provider,
+    triggeredBy,
+    triggeredByAgentLabel,
+    deps,
+  } = args;
   await deps.executionTracker.onExecutionStarted(
     newRunId,
     workflow.name,
@@ -199,6 +211,11 @@ async function recordExecutionStart(args: {
         }
       : undefined,
     workflow.timeout, // workflowTimeoutMs
+    undefined, // checkMode
+    undefined, // localWorkingTree
+    undefined, // triggerActorUsername
+    undefined, // triggerActorUserId
+    triggeredByAgentLabel, // triggeredByAgentLabel
   );
 }
 

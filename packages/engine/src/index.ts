@@ -11,10 +11,14 @@
 
 // --- Protocol: version, common messages, auth ---
 export * from './protocol/version.js';
+export * from './protocol/source-origin.js';
+export * from './provenance/attestation-origin.js';
 export * from './protocol/messages/common.js';
 export * from './protocol/messages/actor.js';
 export * from './protocol/messages/pat-kind.js';
 export * from './mcp/tool-schemas.js';
+export * from './mcp/held-run-resolve.js';
+export * from './mcp/fence.js';
 export * from './protocol/messages/auth.js';
 export * from './protocol/messages/capabilities.js';
 
@@ -58,6 +62,12 @@ export * from './protocol/messages/execution-status.js';
 
 // --- Protocol: Agent-facing provenance-tagged run-result (read path) ---
 export * from './protocol/messages/agent-run-result.js';
+
+// --- Protocol: Agent-facing dev-ops read shapes (orgs, orchestrators, diagnostics, secrets) ---
+export * from './protocol/messages/agent-dev-ops.js';
+
+// --- Developer-operations API contract (registry + congruence helpers) ---
+export * from './dev-ops/operations.js';
 
 // --- Protocol: Orchestrator deployment identity (browser-safe, pure Zod) ---
 export * from './protocol/messages/deployment-identity.js';
@@ -137,7 +147,7 @@ export * from './state-machine/index.js';
 export * from './provider/index.js';
 
 // --- Webhook URL format (browser-safe; org-scoped route shape) ---
-export { githubWebhookPath } from './webhook/webhook-url-format.js';
+export { githubWebhookPath, githubIngressPath } from './webhook/webhook-url-format.js';
 
 // --- WebSocket types ---
 export type { WsLike } from './ws/ws-like.js';

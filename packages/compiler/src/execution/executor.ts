@@ -90,12 +90,11 @@ async function loadModule(
  * Execute a TypeScript config file and extract workflow definitions.
  *
  * Process:
- * 1. Read TypeScript source from disk
- * 2. Transform to ESM JavaScript via rolldown (in-memory)
- * 3. Write temp file for Node.js dynamic import (required by ESM spec)
- * 4. Dynamic import the compiled module
- * 5. Extract and return workflow definitions
- * 6. Clean up temp file
+ * 1. Resolve the path and verify the file exists and is readable
+ * 2. Register the oxc-transform TS loader hook and dynamic-import the module
+ *    (TypeScript compiled on the fly by the hook — no bundling, no temp files)
+ * 3. Extract workflow definitions from the module's default/named exports
+ * 4. Return the workflows with source tracking
  *
  * @param configPath - Path to workflow file (relative or absolute)
  * @returns Workflows exported from the config

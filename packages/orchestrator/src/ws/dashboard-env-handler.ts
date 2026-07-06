@@ -181,9 +181,10 @@ export class DashboardEnvHandler {
     responseType: string,
     action: AccessLogAction,
     target: { type: AccessLogTargetType; id: string } | null,
+    orgId: string = this.deps.orgId,
   ): Promise<boolean> {
     try {
-      await assertDashboardWriteAllowed(this.deps.db, this.deps.orgId, op);
+      await assertDashboardWriteAllowed(this.deps.db, orgId, op);
       return true;
     } catch (err) {
       if (err instanceof DashboardWritePolicyDisabledError) {
@@ -1382,7 +1383,7 @@ export class DashboardEnvHandler {
           'completed_at',
           'environment',
         ])
-        .where('environment', '=', msg.environmentName)
+        .where('environment_id', '=', msg.environmentId)
         .orderBy('started_at', 'desc')
         .limit(limit)
         .offset(offset)
@@ -1391,7 +1392,7 @@ export class DashboardEnvHandler {
       this.recordAccess(
         msg.actor,
         'environment.history.read',
-        { type: 'environment', id: msg.environmentName },
+        { type: 'environment', id: msg.environmentId },
         msg.requestId,
         'allowed',
       );
@@ -1421,7 +1422,7 @@ export class DashboardEnvHandler {
       this.recordAccess(
         msg.actor,
         'environment.history.read',
-        { type: 'environment', id: msg.environmentName },
+        { type: 'environment', id: msg.environmentId },
         msg.requestId,
         'error',
         toErrorMessage(err),
@@ -1433,6 +1434,13 @@ export class DashboardEnvHandler {
   // ── Held runs ─────────────────────────────────────────────────────
 
   private async handleHeldRunsList(msg: HeldRunsListRequest): Promise<void> {
+    // Scope to the request's target org when the Platform carries one
+    // (Platform-first `kici run remote` path), falling back to the
+    // connection-level org for the legacy customer-dashboard path. A remote
+    // run's hold lives under the run's own `remote_sources` org, which differs
+    // from this connection's primary webhook-source org, so honoring the
+    // requested org is what surfaces the hold to `kici approve` / `--approve-all`.
+    const orgId = msg.orgId ?? this.deps.orgId;
     try {
       let query = this.deps.db
         .selectFrom('held_runs')
@@ -1459,7 +1467,7 @@ export class DashboardEnvHandler {
           'execution_runs.contributor_username',
           'execution_runs.trust_tier',
         ])
-        .where('held_runs.org_id', '=', this.deps.orgId)
+        .where('held_runs.org_id', '=', orgId)
         .orderBy('held_runs.created_at', 'desc');
 
       if (msg.status) {
@@ -1589,12 +1597,12 @@ export class DashboardEnvHandler {
   }
 
   /** Read org_settings.allow_self_approval (default true). */
-  private async readAllowSelfApproval(): Promise<boolean> {
+  private async readAllowSelfApproval(orgId: string = this.deps.orgId): Promise<boolean> {
     try {
       const row = await this.deps.db
         .selectFrom('org_settings')
         .select('allow_self_approval')
-        .where('customer_id', '=', this.deps.orgId)
+        .where('customer_id', '=', orgId)
         .executeTakeFirst();
       return row?.allow_self_approval ?? true;
     } catch {
@@ -1610,6 +1618,7 @@ export class DashboardEnvHandler {
   private async applyApprovalDecision(
     msg: HeldRunApproveRequest | HeldRunRejectRequest,
     decision: 'approve' | 'reject',
+    orgId: string = this.deps.orgId,
   ): Promise<void> {
     const approvals = this.deps.approvals!;
     const responseType =
@@ -1630,10 +1639,10 @@ export class DashboardEnvHandler {
 
     const result = await applyDecision(
       {
-        orgId: this.deps.orgId,
+        orgId,
         store: approvals.store,
         teamMembershipLookup: approvals.teamMembershipLookup,
-        allowSelfApproval: await this.readAllowSelfApproval(),
+        allowSelfApproval: await this.readAllowSelfApproval(orgId),
         resolveTriggererSub: async (runId) => {
           const row = await this.deps.db
             .selectFrom('execution_runs')
@@ -1686,6 +1695,9 @@ export class DashboardEnvHandler {
   }
 
   private async handleHeldRunApprove(msg: HeldRunApproveRequest): Promise<void> {
+    // Honor the Platform-carried request org over the static connection org so a
+    // remote run's hold (recorded under the run's `remote_sources` org) resolves.
+    const orgId = msg.orgId ?? this.deps.orgId;
     if (
       !(await this.enforcePolicy(
         msg,
@@ -1693,13 +1705,14 @@ export class DashboardEnvHandler {
         'dashboard.held-runs.approve.response',
         'held_run.approve',
         { type: 'held_run', id: msg.heldRunId },
+        orgId,
       ))
     ) {
       return;
     }
     try {
       if (this.deps.approvals) {
-        await this.applyApprovalDecision(msg, 'approve');
+        await this.applyApprovalDecision(msg, 'approve', orgId);
         return;
       }
       const result = await this.deps.db
@@ -1710,7 +1723,7 @@ export class DashboardEnvHandler {
           approved_by: 'dashboard-user',
         })
         .where('id', '=', msg.heldRunId)
-        .where('org_id', '=', this.deps.orgId)
+        .where('org_id', '=', orgId)
         .where('status', '=', 'pending')
         .executeTakeFirst();
 
@@ -1756,6 +1769,9 @@ export class DashboardEnvHandler {
   }
 
   private async handleHeldRunReject(msg: HeldRunRejectRequest): Promise<void> {
+    // Honor the Platform-carried request org over the static connection org so a
+    // remote run's hold (recorded under the run's `remote_sources` org) resolves.
+    const orgId = msg.orgId ?? this.deps.orgId;
     if (
       !(await this.enforcePolicy(
         msg,
@@ -1763,13 +1779,14 @@ export class DashboardEnvHandler {
         'dashboard.held-runs.reject.response',
         'held_run.reject',
         { type: 'held_run', id: msg.heldRunId },
+        orgId,
       ))
     ) {
       return;
     }
     try {
       if (this.deps.approvals) {
-        await this.applyApprovalDecision(msg, 'reject');
+        await this.applyApprovalDecision(msg, 'reject', orgId);
         return;
       }
       const result = await this.deps.db
@@ -1780,7 +1797,7 @@ export class DashboardEnvHandler {
           reason: msg.reason ?? 'Rejected via dashboard',
         })
         .where('id', '=', msg.heldRunId)
-        .where('org_id', '=', this.deps.orgId)
+        .where('org_id', '=', orgId)
         .where('status', '=', 'pending')
         .executeTakeFirst();
 

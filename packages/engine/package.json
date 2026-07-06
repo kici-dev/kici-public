@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.1.24",
+  "version": "0.1.26",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -81,6 +81,10 @@
       "import": "./dist/protocol/messages/oidc-token-relay.js",
       "types": "./dist/protocol/messages/oidc-token-relay.d.ts"
     },
+    "./protocol/messages/oidc-mint": {
+      "import": "./dist/protocol/messages/oidc-mint.js",
+      "types": "./dist/protocol/messages/oidc-mint.d.ts"
+    },
     "./provenance/schema": {
       "import": "./dist/provenance/schema.js",
       "types": "./dist/provenance/schema.d.ts"
@@ -96,6 +100,10 @@
     "./provenance/verify": {
       "import": "./dist/provenance/verify.js",
       "types": "./dist/provenance/verify.d.ts"
+    },
+    "./provenance/statement-hash": {
+      "import": "./dist/provenance/statement-hash.js",
+      "types": "./dist/provenance/statement-hash.d.ts"
     },
     "./metrics/catalog": {
       "import": "./dist/metrics/metric-catalog.generated.js",

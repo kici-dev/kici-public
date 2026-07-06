@@ -6,6 +6,7 @@ import {
   ExecutionJobStatus,
   ExecutionRunStatus,
   ExecutionStepStatus,
+  statusOptionsForLevel,
   StepConcurrencyKind,
   InitFailureCategory,
   TERMINAL_JOB_STATES,
@@ -731,5 +732,24 @@ describe('flood-hardening field bounds', () => {
       timestamp: 1,
     });
     expect(r.success).toBe(false);
+  });
+});
+
+describe('statusOptionsForLevel', () => {
+  it('returns run statuses for run and job statuses for job', () => {
+    expect(statusOptionsForLevel('run')).toEqual(ExecutionRunStatus.options);
+    expect(statusOptionsForLevel('job')).toEqual(ExecutionJobStatus.options);
+  });
+
+  it('exposes job-only terminal statuses only at job level', () => {
+    expect(statusOptionsForLevel('job')).toContain('timed_out_stale');
+    expect(statusOptionsForLevel('job')).toContain('drift_dropped');
+    expect(statusOptionsForLevel('run')).not.toContain('timed_out_stale');
+    expect(statusOptionsForLevel('run')).not.toContain('drift_dropped');
+  });
+
+  it('keeps the run-only held status out of the job set', () => {
+    expect(statusOptionsForLevel('run')).toContain('held');
+    expect(statusOptionsForLevel('job')).not.toContain('held');
   });
 });

@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { z } from 'zod';
 import {
   createLogger,
   enrichRequestContext,
@@ -74,6 +75,22 @@ import {
 
 const logger = createLogger({ prefix: 'pipeline' });
 
+/**
+ * Outcome of a single inbound-webhook ingestion. `duplicate` lets a direct-
+ * ingress route return `{ duplicate: true }` to GitHub's Recent Deliveries
+ * panel; `skipped` covers unknown provider / unknown event / no-repo paths;
+ * `processed` means the pipeline matched and dispatched (or recorded a run).
+ */
+export const WebhookIngestOutcome = z.enum(['processed', 'duplicate', 'skipped']);
+export type WebhookIngestOutcome = z.infer<typeof WebhookIngestOutcome>;
+
+/** Map a dedup/provider skip reason onto the ingest outcome a route reports. */
+function skipReasonToOutcome(reason: 'duplicate' | 'unknown-provider'): WebhookIngestOutcome {
+  return reason === 'duplicate'
+    ? WebhookIngestOutcome.enum.duplicate
+    : WebhookIngestOutcome.enum.skipped;
+}
+
 // ---------------------------------------------------------------------------
 // Phase A — dedup + provider + normalize
 // ---------------------------------------------------------------------------
@@ -116,7 +133,9 @@ interface DedupAndProviderContinue {
   bundle: ProviderBundle;
 }
 
-type DedupAndProviderResult = DedupAndProviderContinue | { status: 'skip' };
+type DedupAndProviderResult =
+  | DedupAndProviderContinue
+  | { status: 'skip'; reason: 'duplicate' | 'unknown-provider' };
 
 /**
  * Phase A.1 — Dedup + provider lookup. Resolves org id, drops duplicates, and
@@ -129,13 +148,17 @@ async function dedupAndResolveProvider(
 ): Promise<DedupAndProviderResult> {
   const resolvedOrgId = await resolveOrgIdSafe(deps, info.routingKey);
 
-  if (await deps.dedup.exists(info.deliveryId)) {
+  // Atomic claim: true => we own this delivery, false => duplicate. This is the
+  // single dedup chokepoint shared by the relay, generic, and direct GitHub
+  // ingestion paths — it replaces the historic exists()-then-mark() race (see
+  // DedupCache.claim).
+  const claimed = await deps.dedup.claim(info.deliveryId);
+  if (!claimed) {
     logger.debug('Duplicate webhook, skipping', { deliveryId: info.deliveryId });
     dedupHitsTotal.add(1);
     await recordSkipEventLog(info, deps, resolvedOrgId, EventLogStatus.enum.duplicate);
-    return { status: 'skip' };
+    return { status: 'skip', reason: 'duplicate' };
   }
-  await deps.dedup.mark(info.deliveryId);
   webhooksReceivedTotal.add(1, { source: 'pipeline', event: info.event });
 
   const bundle = deps.providerRegistry.getByRoutingKey(info.routingKey);
@@ -147,7 +170,7 @@ async function dedupAndResolveProvider(
     });
     webhooksProcessedTotal.add(1, { result: 'skipped' });
     await recordSkipEventLog(info, deps, resolvedOrgId, EventLogStatus.enum.received);
-    return { status: 'skip' };
+    return { status: 'skip', reason: 'unknown-provider' };
   }
 
   return { status: 'continue', resolvedOrgId, bundle };
@@ -349,14 +372,13 @@ async function dispatchOneCrossSourceCandidate(args: {
   // Each registration gets its own slot so re-delivery of the inbound webhook
   // is still idempotent per fan-out target.
   const crossDedupKey = `${info.deliveryId}:${reg.id}`;
-  if (await deps.dedup.exists(crossDedupKey)) {
+  if (!(await deps.dedup.claim(crossDedupKey))) {
     logger.debug('Cross-source dispatch: composite dedup hit', {
       deliveryId: info.deliveryId,
       registrationId: reg.id,
     });
     return 0;
   }
-  await deps.dedup.mark(crossDedupKey);
 
   const regBundle = deps.providerRegistry.getByRoutingKey(reg.routingKey);
   if (!regBundle) {
@@ -1764,23 +1786,26 @@ async function forwardTracesAndRecordEventLog(args: {
  *   9. Match + dispatch global workflows for OTHER repos
  *  10. Forward Platform trace + record event log
  */
-export async function processWebhook(info: WebhookInfo, deps: ProcessingDeps): Promise<void> {
+export async function processWebhook(
+  info: WebhookInfo,
+  deps: ProcessingDeps,
+): Promise<WebhookIngestOutcome> {
   const provider = await dedupAndResolveProvider(info, deps);
-  if (provider.status === 'skip') return;
+  if (provider.status === 'skip') return skipReasonToOutcome(provider.reason);
   const { resolvedOrgId, bundle } = provider;
 
   invalidateContributorCacheForEvent(info, deps, bundle);
 
   const event = await normalizeWebhookEvent(info, deps, bundle, resolvedOrgId);
-  if (!event) return;
+  if (!event) return WebhookIngestOutcome.enum.skipped;
 
   if (info.provider === 'generic' && deps.registrationIndex) {
     const cs = await dispatchCrossSourceWorkflows(info, deps, event, resolvedOrgId);
-    if (cs.handled) return;
+    if (cs.handled) return WebhookIngestOutcome.enum.processed;
   }
 
   const repoCreds = await extractRepoAndCredentials(info, deps, bundle, resolvedOrgId);
-  if (!repoCreds) return;
+  if (!repoCreds) return WebhookIngestOutcome.enum.skipped;
   const { repoIdentifier, credentials } = repoCreds;
   const payload = info.payload as Record<string, unknown>;
 
@@ -1864,7 +1889,7 @@ export async function processWebhook(info: WebhookInfo, deps: ProcessingDeps): P
         ref,
       });
     }
-    return;
+    return WebhookIngestOutcome.enum.processed;
   }
 
   if (!lockOutcome.lockFile) {
@@ -1895,7 +1920,7 @@ export async function processWebhook(info: WebhookInfo, deps: ProcessingDeps): P
         ref,
       });
     }
-    return;
+    return WebhookIngestOutcome.enum.processed;
   }
 
   const fullLockFile = lockOutcome.lockFile as unknown as FullLockFile;
@@ -1978,4 +2003,5 @@ export async function processWebhook(info: WebhookInfo, deps: ProcessingDeps): P
     repoIdentifier,
     ref,
   });
+  return WebhookIngestOutcome.enum.processed;
 }

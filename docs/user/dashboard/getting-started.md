@@ -17,6 +17,8 @@ The six steps are:
 5. **Add a webhook source** -- register a source under **Settings → Sources** so pushes and pull requests trigger runs.
 6. **Trigger your first run** -- push to your repository to produce your first run through the relay.
 
+If the onboarding data can't be loaded (for example a transient network error), the checklist area shows a short message with a **Try again** button instead of loading indefinitely -- retry once the connection recovers.
+
 ## Organizations
 
 

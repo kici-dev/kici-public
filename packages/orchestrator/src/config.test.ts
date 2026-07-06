@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { loadConfig } from './config.js';
+import { DEFAULT_CACHE_STORAGE_S3_PREFIX, clusterSentinelKey } from './cluster/cluster-identity.js';
 
 /**
  * Mirrors the agent and platform config tests. Wipes process.env back to a
@@ -95,6 +96,19 @@ describe('orchestrator loadConfig', () => {
       expect(config.storage?.userCacheQuotaBytes).toBe(12345);
       expect(config.storage?.userCacheTtlMs).toBe(67890);
     });
+
+    it('maps KICI_TEST_MINT_DEFER_AUDIENCE to testMintDeferAudience', () => {
+      process.env.KICI_TEST_MODE = '1';
+      process.env.KICI_TEST_MINT_DEFER_AUDIENCE = 'kici-provenance';
+      const config = loadConfig();
+      expect(config.testMode).toBe(true);
+      expect(config.testMintDeferAudience).toBe('kici-provenance');
+    });
+
+    it('leaves testMintDeferAudience undefined when unset', () => {
+      const config = loadConfig();
+      expect(config.testMintDeferAudience).toBeUndefined();
+    });
   });
 
   describe('superRefine cross-field rules survive defineEnv migration', () => {
@@ -186,6 +200,34 @@ describe('orchestrator loadConfig', () => {
       expect(config.storage?.endpoint).toBe('http://seaweedfs:8333');
       expect(config.storage?.uploadEndpoint).toBe('http://localhost:8333');
       expect(config.storage?.externalEndpoint).toBe('http://host.docker.internal:8333');
+    });
+  });
+
+  // Drift guard: the S3 storage prefix the orchestrator boots with (and thus the
+  // cluster-identity sentinel key it validates) MUST match the shared
+  // DEFAULT_CACHE_STORAGE_S3_PREFIX that the reconcile paths — the
+  // `kici-admin cluster reconcile-identity` CLI and the staging deploy's
+  // self-heal step — fall back to when KICI_STORAGE_PREFIX is unset. A drift
+  // here (e.g. a hardcoded `kici-cache/` fallback) makes the reconcile step
+  // anchor a different sentinel object than the one the orchestrator validates,
+  // crash-looping the boot on a spurious "Cluster identity mismatch".
+  describe('cache storage S3 prefix default (sentinel-drift guard)', () => {
+    it('defaults storage.prefix to DEFAULT_CACHE_STORAGE_S3_PREFIX (bucket root)', () => {
+      process.env.KICI_STORAGE_TYPE = 's3';
+      process.env.KICI_STORAGE_BUCKET = 'kici-cache';
+      const config = loadConfig();
+      expect(config.storage?.prefix).toBe(DEFAULT_CACHE_STORAGE_S3_PREFIX);
+      // The shared default resolves to the bucket-root sentinel key.
+      expect(clusterSentinelKey(config.storage?.prefix)).toBe('.kici-cluster-id');
+    });
+
+    it('honors an explicit KICI_STORAGE_PREFIX override', () => {
+      process.env.KICI_STORAGE_TYPE = 's3';
+      process.env.KICI_STORAGE_BUCKET = 'kici-cache';
+      process.env.KICI_STORAGE_PREFIX = 'tenant-a/';
+      const config = loadConfig();
+      expect(config.storage?.prefix).toBe('tenant-a/');
+      expect(clusterSentinelKey(config.storage?.prefix)).toBe('tenant-a/.kici-cluster-id');
     });
   });
 });

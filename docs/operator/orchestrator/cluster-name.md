@@ -18,12 +18,11 @@ nothing silently collapses to "the first orch connected".
 ## Format
 
 A cluster name matches the regex
-`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`:
+`^[a-z][a-z0-9-]{0,62}$`:
 
 - Lowercase ASCII letters, digits, and dashes only.
 - 1 to 63 characters total.
-- Must start and end with a letter or digit (no leading or trailing
-  dashes).
+- Must start with a lowercase letter (no leading digit or dash).
 
 Examples: `production-arm`, `staging-x86`, `eu-west-1`,
 `cluster-a3f81c`.
@@ -93,11 +92,11 @@ orchestrator shares the same orchestrator database, resolves the same
 `cluster_meta.cluster_name` on boot, and opens its own Platform
 WebSocket. All of those connections register cleanly.
 
-The dashboard's `/orgs/:customerId/orchestrators` listing dedupes
+The dashboard's `/orgs/:customerId/infrastructure` listing dedupes
 server-side by `cluster_name`, so even with N sibling connections
 the operator sees **one card per logical cluster identity**. Per-orch
 panels addressed by URL segment
-(`/orgs/:customerId/orchestrators/:clusterName/...`) resolve to any
+(`/orgs/:customerId/infrastructure/:clusterName/...`) resolve to any
 connected sibling — every sibling shares the same orchestrator state
 and answers identically.
 
@@ -129,8 +128,8 @@ The same identifier surfaces in three places:
   carries `clusterName`. Platform persists it on
   `platform_connections.cluster_name`.
 - **Dashboard URL.** Per-orch panels live under
-  `/orgs/:customerId/orchestrators/:clusterName/...` — for example
-  `/orgs/acme/orchestrators/production-arm/settings/security/dashboard-policy`.
+  `/orgs/:customerId/infrastructure/:clusterName/...` — for example
+  `/orgs/acme/infrastructure/production-arm/settings/security/dashboard-policy`.
 - **Run metadata.** The run-detail page on the dashboard renders the
   executing orchestrator's cluster name as a link back to that orch's
   pages.

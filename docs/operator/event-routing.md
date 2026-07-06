@@ -20,6 +20,10 @@ Internal events flow through the orchestrator's event router:
 
 System events (`workflow_complete`, `job_complete`) are emitted automatically by the orchestrator when executions finish. No opt-in is required.
 
+### Downtime recovery
+
+On start, the orchestrator catches up on every internal event that was left unprocessed while it was down and dispatches each one. There is no cap on how many are recovered -- the catch-up pages through the entire backlog until it is drained, so an event-triggered downstream workflow fires even if a large number of events accumulated during a long outage. Events are only dropped once they pass the TTL (`eventTtlSeconds`, default 7 days).
+
 ### Circuit breaker
 
 The event router includes a circuit breaker to prevent event loops (e.g., Workflow A emits event X, Workflow B triggers on X and emits event Y, Workflow A triggers on Y):

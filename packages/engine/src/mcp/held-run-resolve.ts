@@ -1,16 +1,18 @@
 /**
- * Shared held-run resolution for the `kici approve` / `kici reject` commands.
+ * Shared held-run resolution for the `kici approve` / `kici reject` commands and
+ * the developer MCP `approve_run` / `reject_run` tools.
  *
- * Both commands first list the pending holds for a run, then resolve the one
- * the user named via `--job` / `--step` (or the sole pending hold when there is
+ * Both surfaces first list the pending holds for a run, then resolve the one
+ * the caller named via `job` / `step` (or the sole pending hold when there is
  * exactly one and no filter is given). The resolution is a pure function so it
- * can be unit-tested without HTTP.
+ * can be unit-tested without HTTP, and it stays import-free so it is safe to
+ * re-export from the browser-facing engine barrel.
  */
 
 /** Hold scope, mirroring the engine `HoldScope` enum. */
 export type HeldRunScope = 'workflow' | 'job' | 'step';
 
-/** A pending-hold row as returned by `GET /orgs/:orgId/held-runs`. */
+/** A pending-hold row as returned by the held-runs list. */
 export interface HeldRunSummary {
   id: string;
   runId: string;
@@ -22,7 +24,7 @@ export interface HeldRunSummary {
   payload?: { summaryMarkdown: string; drift?: unknown } | null;
 }
 
-/** Filters supplied on the command line. */
+/** Filters supplied by the caller. */
 export interface HeldRunFilter {
   /** Match a hold by its job name. */
   job?: string;
@@ -38,9 +40,9 @@ export type ResolveResult =
 /**
  * Resolve the held-run id matching the filter from a list of pending holds.
  *
- * - `--step` requires `--job` and matches a `step`-scoped hold whose step index
+ * - `step` requires `job` and matches a `step`-scoped hold whose step index
  *   equals the given value.
- * - `--job` alone matches a `job`/`workflow`-scoped hold for that job.
+ * - `job` alone matches a `job`/`workflow`-scoped hold for that job.
  * - With no filter, the sole pending hold is used; ambiguity is an error.
  */
 export function resolveHeldRunId(

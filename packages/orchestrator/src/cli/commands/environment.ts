@@ -23,6 +23,7 @@ import type { Command } from 'commander';
 import {
   createEnvironmentTemplateDirect,
   deleteEnvironmentDirect,
+  purgeEnvironmentsDirect,
   listEnvironmentsDirect,
   seedEnvironmentBindingDirect,
   seedEnvironmentDirect,
@@ -400,6 +401,37 @@ export function registerEnvironmentCommands(
           console.log(JSON.stringify({ deleted: true }));
         } else {
           console.log(`environment delete: deleted=true${dbUrl ? ' (direct)' : ''}`);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  // ── environment purge ───────────────────────────────────────────────────
+  env
+    .command('purge')
+    .description(
+      'Delete all environments (and held runs) for an org — direct-DB break-glass / warm-start reset',
+    )
+    .option('--database-url <url>', 'Use direct DB access (or KICI_DATABASE_URL)')
+    .option('--org <id>', 'Restrict purge to a single org (omit to purge all orgs)')
+    .option('--json', 'Emit JSON output')
+    .action(async (opts) => {
+      try {
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (!dbUrl) {
+          console.error('Error: --database-url or KICI_DATABASE_URL is required (direct-DB only)');
+          process.exit(1);
+        }
+        const result = await purgeEnvironmentsDirect(dbUrl, opts.org);
+        if (opts.json) {
+          console.log(JSON.stringify(result));
+        } else {
+          console.log(
+            `environment purge: environmentsDeleted=${result.environmentsDeleted} heldRunsDeleted=${result.heldRunsDeleted}` +
+              (opts.org ? ` (org ${opts.org})` : ' (all orgs)'),
+          );
         }
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

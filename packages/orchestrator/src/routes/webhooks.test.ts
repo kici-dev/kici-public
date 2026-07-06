@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createGenericWebhookRoutes, type GenericWebhookRoutesDeps } from './webhooks.js';
+import { WebhookIngestOutcome } from '../pipeline/process-webhook.js';
 
 function createMockDeps(
   overrides: Partial<GenericWebhookRoutesDeps> = {},
@@ -9,11 +10,9 @@ function createMockDeps(
       getByOrgAndName: vi.fn().mockResolvedValue(null),
       checkIdempotency: vi.fn().mockResolvedValue(false),
     } as any,
-    dedup: {
-      exists: vi.fn().mockResolvedValue(false),
-      mark: vi.fn().mockResolvedValue(undefined),
-    } as any,
-    onWebhook: vi.fn().mockResolvedValue(undefined),
+    // The route no longer dedups; the pipeline (behind onWebhook) owns the
+    // atomic dedup claim. The default onWebhook reports a processed delivery.
+    onWebhook: vi.fn().mockResolvedValue(WebhookIngestOutcome.enum.processed),
     ...overrides,
   };
 }
@@ -136,9 +135,6 @@ describe('generic webhook routes', () => {
       const sourceA = makeSource('src-a', 'source-a');
       const sourceB = makeSource('src-b', 'source-b');
 
-      // Track which deliveryIds are marked as processed
-      const markedIds = new Set<string>();
-
       const deps = createMockDeps({
         sourceManager: {
           getByOrgAndName: vi.fn().mockImplementation((_orgId: string, name: string) => {
@@ -153,13 +149,6 @@ describe('generic webhook routes', () => {
           }),
           checkIdempotency: vi.fn().mockResolvedValue(false),
           markIdempotency: vi.fn().mockResolvedValue(undefined),
-        } as any,
-        dedup: {
-          exists: vi.fn().mockImplementation((id: string) => Promise.resolve(markedIds.has(id))),
-          mark: vi.fn().mockImplementation((id: string) => {
-            markedIds.add(id);
-            return Promise.resolve();
-          }),
         } as any,
       });
 
@@ -193,6 +182,47 @@ describe('generic webhook routes', () => {
 
       // Both webhooks should have been processed
       expect(deps.onWebhook).toHaveBeenCalledTimes(2);
+    });
+
+    it('returns 200 { duplicate: true } when the pipeline reports a duplicate', async () => {
+      const source = {
+        id: 'src-dup',
+        customer_id: 'org-1',
+        name: 'dup-source',
+        routing_key: 'generic:org-1:src-dup',
+        enabled: true,
+        max_payload_bytes: 1048576,
+        rate_limit_rpm: 1000,
+        verification_method: 'none' as const,
+        verification_config: '{}',
+        event_type_header: 'x-event-type',
+        event_type_path: null,
+        idempotency_key_header: null,
+        idempotency_key_path: null,
+        dedup_window_seconds: 300,
+        allowed_events: null,
+        strip_headers: '[]',
+      };
+      const deps = createMockDeps({
+        sourceManager: {
+          getByOrgAndName: vi.fn().mockResolvedValue(source),
+          getByRoutingKey: vi.fn().mockResolvedValue(source),
+          checkIdempotency: vi.fn().mockResolvedValue(false),
+          markIdempotency: vi.fn().mockResolvedValue(undefined),
+        } as any,
+        // The pipeline's atomic claim lost => duplicate.
+        onWebhook: vi.fn().mockResolvedValue(WebhookIngestOutcome.enum.duplicate),
+      });
+
+      const app = createGenericWebhookRoutes(deps);
+      const res = await app.request('http://localhost/webhook/org-1/generic/dup-source', {
+        method: 'POST',
+        body: JSON.stringify({ data: 'x' }),
+        headers: { 'Content-Type': 'application/json', 'x-event-type': 'deploy' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ duplicate: true });
     });
   });
 

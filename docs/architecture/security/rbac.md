@@ -7,7 +7,7 @@ KiCI uses an in-house RBAC system for all authorization decisions. The OIDC issu
 
 ## Overview
 
-Every organization in KiCI has a set of roles. Each role defines a permission matrix mapping 17 resources to 5 access levels. Users can have multiple roles assigned simultaneously -- their effective permissions are computed as the union (most permissive wins) across all assigned roles.
+Every organization in KiCI has a set of roles. Each role defines a permission matrix mapping 18 resources to 5 access levels. Users can have multiple roles assigned simultaneously -- their effective permissions are computed as the union (most permissive wins) across all assigned roles.
 
 ```
 User -> [Role A, Role B, Role C] -> merge(permsA, permsB, permsC) -> Effective Permissions
@@ -38,6 +38,7 @@ This additive model means roles only grant access -- there are no deny rules. Ad
 | `support`           | Enable/disable KiCI support sessions for the org                  | Global      |
 | `teams`             | Operator-defined teams: membership and team-role grants           | Global      |
 | `fleet`             | Fleet management: host roster, host declare/remove, agent control | Global      |
+| `notifications`     | Notification channels and subscriptions (Slack, delivery config)  | Global      |
 
 ### Access levels
 
@@ -64,7 +65,7 @@ Repo-scoped resources (`runs`, `workflows`, `secrets`) are filtered by **repo gl
 - **API keys and service accounts** always get `['*']` — repo scoping applies only to role-based human users.
 - Pattern matching uses [picomatch](https://github.com/micromatch/picomatch) (same library as orchestrator environments).
 
-Global resources (`api_keys`, `webhook_sources`, `org_settings`, `members`, `billing`, `audit`, `environments`, `ci_trust`, `webhook_endpoints`, `event_log`, `event_dlq`, `support`, `teams`, `fleet`) are governed by permission level alone -- repo patterns do not apply.
+Global resources (`api_keys`, `webhook_sources`, `org_settings`, `members`, `billing`, `audit`, `environments`, `ci_trust`, `webhook_endpoints`, `event_log`, `event_dlq`, `support`, `teams`, `fleet`, `notifications`) are governed by permission level alone -- repo patterns do not apply.
 
 Every role has at least one repo pattern. The default pattern `*` matches all repositories.
 
@@ -74,7 +75,7 @@ Organizations can create unlimited custom roles. Each role has:
 
 - **Name** -- unique within the organization (max 100 characters)
 - **Description** -- optional (max 500 characters)
-- **Permission matrix** -- 17 resources x 5 levels
+- **Permission matrix** -- 18 resources x 5 levels
 - **Repo patterns** -- array of glob patterns for scoping repo-bound resources
 
 ### Additive stacking
@@ -99,7 +100,7 @@ Users with no role assignments see the dashboard shell but cannot access any org
 ### Owner
 
 - **Immutable** -- cannot be edited, deleted, or renamed
-- All 17 resources set to `admin`
+- All 18 resources set to `admin`
 - Repo pattern: `*`
 - Marked with `is_owner = true` in the database
 - Visible in the roles tab with a "Built-in" badge

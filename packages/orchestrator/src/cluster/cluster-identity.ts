@@ -37,6 +37,18 @@ export interface ClusterIdentityDeps {
 }
 
 /**
+ * Default cache-storage S3 prefix (mirrors the orchestrator config
+ * `cacheStorageS3Prefix` default). Empty means the cache blobs and the
+ * cluster-identity sentinel live at the bucket root — the bucket already scopes
+ * the cluster. Every place that resolves a sentinel prefix (the orchestrator
+ * runtime, the `kici-admin cluster reconcile-identity` CLI, and the staging
+ * deploy's self-heal step) MUST fall back to THIS value when no explicit prefix
+ * is set, otherwise they compute divergent sentinel keys and crash-loop the
+ * orchestrator boot on a spurious "Cluster identity mismatch".
+ */
+export const DEFAULT_CACHE_STORAGE_S3_PREFIX = '';
+
+/**
  * Build the S3 key for the cluster identity sentinel under an optional prefix.
  * Strips any trailing slash from the prefix so callers can pass either form.
  */

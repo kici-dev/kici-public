@@ -433,7 +433,7 @@ This is why a refused npm-source upgrade never leaves a "now running version X" 
 
 When the service was installed with an explicit `--binary` wrapper (or any launch target whose version can't be read), there is no package metadata to resolve, so the verification can't run. Passing `--force` bypasses the launch-target verification and restarts the service onto the installed package. Because the version could not be verified in that case, the upgrade deliberately leaves the manifest's recorded version unchanged rather than guessing. `--force` does not bypass the running-version check in step 1 — if the invoking `kici-admin`'s own version is itself unresolvable, the upgrade still refuses.
 
-The diagnostics page surfaces the latest published version next to each node's running version and reveals exactly this two-line command when an upgrade is available — see [Monitoring & tracing](../observability/monitoring.md).
+The infrastructure page surfaces the latest published version next to each node's running version and reveals exactly this two-line command when an upgrade is available — see [Monitoring & tracing](../observability/monitoring.md).
 
 ### Rollback
 

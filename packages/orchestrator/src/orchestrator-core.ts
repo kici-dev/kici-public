@@ -3366,9 +3366,16 @@ export async function bootstrapOrchestrator(
   // both the incoming peer-handler and outgoing peer-clients).
   cluster.fleetResponderRef.current = makeFleetCollectResponder(fleetRuntime);
 
+  // Warmth latch surfaced on `GET /ready`: flips true at the end of the boot
+  // sequence (after every subsystem starts and the HTTP server is serving), so
+  // an external gate can wait for the orchestrator to be ready to serve rather
+  // than merely process-live.
+  let warm = false;
+
   const { app, injectWebSocket, tryDispatchNextQueued } = createApp({
     config,
     db,
+    isWarm: () => warm,
     pool,
     registry: agentRegistry,
     hostRosterStore,
@@ -3405,6 +3412,12 @@ export async function bootstrapOrchestrator(
     eventStore,
     eventEmitter: eventEmitter!,
     genericSourceManager,
+    // Direct GitHub ingress deps (mounted only in hybrid/independent with a
+    // configured secret store — mirrors the relay path's onVerifyInbound guard).
+    githubSourceStore: pgSecretStore ? sourceStore : undefined,
+    githubVerifyDeps: pgSecretStore
+      ? { db, secretStore: pgSecretStore, genericSourceManager }
+      : undefined,
     trustStore,
     observerRegistry,
     tokenManager: adminDeps?.tokenManager,
@@ -3660,6 +3673,12 @@ export async function bootstrapOrchestrator(
 
   // 33. Mode-specific post-server-start hook
   await modeResult.onServerStarted?.();
+
+  // Boot sequence complete: every subsystem is started and the HTTP server is
+  // serving. Flip the warmth latch so `GET /ready` reports warm and any
+  // external readiness gate can stop waiting.
+  warm = true;
+  logger.info('Orchestrator warm — ready to serve', { port: config.port, mode: config.mode });
 
   // -- Graceful shutdown --
 

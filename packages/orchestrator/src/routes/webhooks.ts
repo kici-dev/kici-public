@@ -3,7 +3,6 @@ import { bodyLimit } from 'hono/body-limit';
 import { randomUUID } from 'node:crypto';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { SlidingWindowRateLimiter } from '../helpers/rate-limiter.js';
-import type { DedupCache } from '../webhook/dedup.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { GenericSourceManager } from '../webhook/generic-sources.js';
 import {
@@ -12,6 +11,7 @@ import {
 } from '../providers/generic/verification.js';
 import { GenericWebhookNormalizer, getNestedValue } from '../providers/generic/normalizer.js';
 import { webhooksReceivedTotal, dedupHitsTotal } from '../metrics/prometheus.js';
+import { WebhookIngestOutcome } from '../pipeline/process-webhook.js';
 
 const logger = createLogger({ prefix: 'orch:webhooks' });
 
@@ -21,10 +21,8 @@ const logger = createLogger({ prefix: 'orch:webhooks' });
 export interface GenericWebhookRoutesDeps {
   /** Generic source manager for source lookup and validation */
   sourceManager: GenericSourceManager;
-  /** Delivery ID deduplication cache */
-  dedup: DedupCache;
   /** Processing callback -- connects to the trigger matching pipeline */
-  onWebhook: (info: WebhookInfo) => Promise<void>;
+  onWebhook: (info: WebhookInfo) => Promise<WebhookIngestOutcome>;
 }
 
 /** In-memory sliding-window rate limiter for generic webhook sources */
@@ -227,24 +225,20 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           resolvedEvent = normalized.event;
         }
 
-        // 11. Dedup check via main dedup cache
-        if (await deps.dedup.exists(info.deliveryId)) {
-          dedupHitsTotal.add(1);
-          return c.json({ accepted: true, deliveryId: info.deliveryId, duplicate: true }, 200);
-        }
+        // 11. Process through the pipeline. The pipeline owns the atomic dedup
+        // claim now (a single chokepoint shared by the relay, generic, and
+        // direct GitHub ingestion paths), so the route no longer does its own
+        // check-then-act — that double-deduped against the pipeline and, with an
+        // atomic claim, a second claim would falsely mark the delivery a dupe.
+        const outcome = await deps.onWebhook(info);
 
-        // 12. Process through pipeline
-        await deps.onWebhook(info);
-
-        // 13. Mark as processed
-        await deps.dedup.mark(info.deliveryId);
-
-        // 13b. Record idempotency marker for source-specific dedup window
-        if (idempotencyKey) {
+        // 12. Record idempotency marker for the source-specific dedup window
+        // (only meaningful for an actually-processed delivery).
+        if (idempotencyKey && outcome !== WebhookIngestOutcome.enum.duplicate) {
           await deps.sourceManager.markIdempotency(source.id, idempotencyKey);
         }
 
-        // 14. Track metrics
+        // 13. Track metrics + respond.
         webhooksReceivedTotal.add(1, { source: 'generic', event: resolvedEvent });
 
         logger.info('Generic webhook accepted', {
@@ -256,6 +250,10 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           providerType: source.provider_type,
         });
 
+        if (outcome === WebhookIngestOutcome.enum.duplicate) {
+          dedupHitsTotal.add(1);
+          return c.json({ accepted: true, deliveryId: info.deliveryId, duplicate: true }, 200);
+        }
         return c.json({ accepted: true, deliveryId: info.deliveryId }, 202);
       } catch (err) {
         logger.error('Generic webhook processing error', {

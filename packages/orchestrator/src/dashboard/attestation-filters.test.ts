@@ -7,7 +7,11 @@ import {
   PostgresQueryCompiler,
 } from 'kysely';
 import type { Database } from '../db/types.js';
-import { applyAttestationFilters, baseAttestationsQuery } from './attestation-filters.js';
+import {
+  applyAttestationFilters,
+  baseAttestationsQuery,
+  basePendingAttestationsQuery,
+} from './attestation-filters.js';
 
 // Offline Kysely instance: compiles SQL without a DB connection.
 const db = new Kysely<Database>({
@@ -65,5 +69,30 @@ describe('applyAttestationFilters', () => {
     const sql = applyAttestationFilters(base(), {}).selectAll().compile().sql;
     expect(sql).toContain('from "attestations"');
     expect(sql).not.toContain('where');
+  });
+
+  it('base query casts execution_* uuid keys to text (uuid = text guard)', () => {
+    // Regression: Postgres rejects `uuid = text`, so both attestations base
+    // queries must cast the uuid side to text in every join predicate.
+    const sql = base().selectAll().compile().sql;
+    expect(sql).toContain('execution_jobs.job_id::text');
+    expect(sql).toContain('execution_jobs.run_id::text');
+    expect(sql).toContain('execution_runs.run_id::text');
+  });
+});
+
+describe('basePendingAttestationsQuery', () => {
+  it('joins execution_* with a ::text cast on every uuid key', () => {
+    // Regression for the org-wide attestations 500: joining the TEXT-keyed
+    // pending_attestations outbox to the uuid-keyed execution_runs /
+    // execution_jobs without a cast raised `operator does not exist: uuid = text`
+    // at runtime, returning a 500 from handleAttestationsListAll.
+    const sql = basePendingAttestationsQuery(db).selectAll().compile().sql;
+    expect(sql).toContain('from "pending_attestations"');
+    expect(sql).toContain('execution_runs.run_id::text');
+    expect(sql).toContain('execution_jobs.run_id::text');
+    expect(sql).toContain('execution_jobs.job_id::text');
+    // Both joins are LEFT joins (pending rows without a matching run/job still list).
+    expect(sql.toLowerCase()).toContain('left join');
   });
 });

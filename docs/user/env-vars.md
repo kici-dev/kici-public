@@ -3,7 +3,7 @@ title: Environment variables
 description: KICI_* environment variable reference for the CLI
 ---
 
-The KiCI CLI reads the following environment variables to customize its behavior. OAuth login (`kici login` without `--token`) defaults `KICI_PLATFORM_URL`, `KICI_OIDC_ISSUER`, and `KICI_OIDC_CLIENT_ID` to the hosted KiCI Platform, so `kici login` works with no configuration. Set them only to target a self-hosted Platform or a testing environment.
+The KiCI CLI reads the following environment variables to customize its behavior. OAuth login (`kici login` without `--token`) defaults `KICI_PLATFORM_URL`, `KICI_OIDC_ISSUER`, and `KICI_OIDC_CLIENT_ID` to the hosted KiCI Platform, so `kici login` works with no configuration. Set them only to target another KiCI environment (e.g. a testing instance) or a custom OIDC provider.
 
 ## Authentication
 
@@ -38,9 +38,9 @@ Authenticate with a pre-existing API key (no browser needed):
 kici login --token <<< "$KICI_API_KEY"
 ```
 
-### Self-hosted Platform or custom OIDC provider
+### Targeting another environment or custom OIDC provider
 
-`kici login` targets the hosted KiCI Platform by default. To point the CLI at a self-hosted Platform or a testing OIDC provider, override the defaults:
+`kici login` targets the hosted KiCI Platform by default. To point the CLI at another KiCI environment (e.g. a testing instance) or a custom OIDC provider, override the defaults:
 
 ```bash
 export KICI_OIDC_ISSUER=https://your-idp.example.com

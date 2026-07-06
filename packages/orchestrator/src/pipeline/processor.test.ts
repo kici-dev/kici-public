@@ -45,9 +45,13 @@ import { createMockDb } from '../__test-helpers__/mock-db.js';
 // -- Mock helpers --
 
 function createMockDedup(options: { exists?: boolean } = {}) {
+  const alreadySeen = options.exists ?? false;
   return {
-    exists: vi.fn().mockResolvedValue(options.exists ?? false),
+    exists: vi.fn().mockResolvedValue(alreadySeen),
     mark: vi.fn().mockResolvedValue(undefined),
+    // The pipeline dedups via the atomic claim: it wins (true) for a fresh
+    // delivery and loses (false) when the delivery already exists (duplicate).
+    claim: vi.fn().mockResolvedValue(!alreadySeen),
     cleanup: vi.fn().mockResolvedValue(0),
   };
 }
@@ -1018,12 +1022,12 @@ describe('processWebhook', () => {
     });
   });
 
-  it('marks dedup after check', async () => {
+  it('atomically claims the delivery id', async () => {
     const deps = createDeps();
     await processWebhook(basePrInfo(), deps);
 
-    expect(deps.dedup.exists).toHaveBeenCalledWith('delivery-123');
-    expect(deps.dedup.mark).toHaveBeenCalledWith('delivery-123');
+    // Single atomic claim replaces the historic exists()-then-mark().
+    expect(deps.dedup.claim).toHaveBeenCalledWith('delivery-123');
   });
 
   it('passes lock file fetcher to cache.get()', async () => {
@@ -2944,8 +2948,8 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       'generic:kiciStg00001:stg-generic:delivery-1:reg-C',
     ]);
 
-    // dedup.mark called once per registration with distinct composite keys
-    const markCalls = (deps.dedup.mark as any).mock.calls.map((c: any[]) => c[0]);
+    // dedup.claim called once per registration with distinct composite keys
+    const markCalls = (deps.dedup.claim as any).mock.calls.map((c: any[]) => c[0]);
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-A');
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-B');
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-C');
@@ -3145,16 +3149,17 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       events: ['foo'],
     });
 
-    // First delivery: dedup.exists -> false for both inbound and composite key
+    // First delivery: dedup.claim wins for both the inbound and composite key.
     const deps1 = makeCrossSourceDeps({ registrations: [reg] });
     await processWebhook(baseGenericInfo(), deps1);
     expect(deps1.dispatcher.dispatch).toHaveBeenCalledTimes(1);
 
-    // Second delivery: dedup.exists returns true for the composite key
-    // (simulating the row being persisted between deliveries).
+    // Second delivery: the composite key was already claimed (row persisted
+    // between deliveries), so its atomic claim loses; the inbound delivery is a
+    // fresh id and still wins so the pipeline proceeds to the cross-source step.
     const deps2 = makeCrossSourceDeps({ registrations: [reg] });
-    (deps2.dedup.exists as any).mockImplementation(async (key: string) => {
-      return key === 'generic:kiciStg00001:stg-generic:delivery-1:reg-replay';
+    (deps2.dedup.claim as any).mockImplementation(async (key: string) => {
+      return key !== 'generic:kiciStg00001:stg-generic:delivery-1:reg-replay';
     });
     await processWebhook(baseGenericInfo(), deps2);
     // dispatcher must NOT be called the second time
@@ -3435,8 +3440,8 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
       'generic:kiciStg00001:stg-generic:delivery-1:reg-C',
     ]);
 
-    // dedup.mark called once per registration with distinct composite keys
-    const markCalls = (deps.dedup.mark as any).mock.calls.map((c: unknown[]) => c[0]);
+    // dedup.claim called once per registration with distinct composite keys
+    const markCalls = (deps.dedup.claim as any).mock.calls.map((c: unknown[]) => c[0]);
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-A');
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-B');
     expect(markCalls).toContain('generic:kiciStg00001:stg-generic:delivery-1:reg-C');

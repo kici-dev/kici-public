@@ -9,7 +9,7 @@
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import { resolveHeldRunContext, listHeldRunsForRun, postReject } from './held-run-client.js';
-import { resolveHeldRunId } from './held-run-resolve.js';
+import { resolveHeldRunId } from '@kici-dev/engine';
 
 /** Options for the reject command. */
 export interface RejectOptions {

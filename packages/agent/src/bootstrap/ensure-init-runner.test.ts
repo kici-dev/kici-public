@@ -24,7 +24,7 @@ function makeSpawn(): {
   };
   const spawnFn: SpawnFn = vi.fn(async (command, args, opts) => {
     calls.push({ command, args, stdin: opts.stdin });
-    if (command === 'ssh-agent' && args[0] === '-s') return agentStart;
+    if (command === 'ssh-agent' && args[0] !== '-k') return agentStart;
     return { exitCode: 0, stdout: 'init-runner started pid=42', stderr: '' };
   });
   return { spawnFn, calls };
@@ -75,7 +75,7 @@ describe('ensureInitRunner (agent-side)', () => {
     const calls: Array<string> = [];
     const spawnFn: SpawnFn = vi.fn(async (command, args) => {
       calls.push(command);
-      if (command === 'ssh-agent' && args[0] === '-s') {
+      if (command === 'ssh-agent' && args[0] !== '-k') {
         return { exitCode: 0, stdout: 'SSH_AUTH_SOCK=/tmp/a.sock;\n', stderr: '' };
       }
       // push succeeds, run fails.

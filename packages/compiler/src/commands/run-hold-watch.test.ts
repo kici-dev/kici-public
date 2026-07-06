@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { classifyNewHolds, handleNewHolds } from './run-hold-watch.js';
-import type { HeldRunSummary } from './held-run-resolve.js';
+import type { HeldRunSummary } from '@kici-dev/engine';
 import type { HeldRunContext } from './held-run-client.js';
 
 const ctx: HeldRunContext = { endpoint: 'https://x', token: 't', orgId: 'org-1' };
@@ -98,6 +98,44 @@ describe('handleNewHolds', () => {
     expect(reject).not.toHaveBeenCalled();
     expect(approve).toHaveBeenNthCalledWith(1, ctx, 'h1', true);
     expect(approve).toHaveBeenNthCalledWith(2, ctx, 'h2', true);
+  });
+
+  it('quiet approveAll routes every line to the output sink and never prompts', async () => {
+    const lines: string[] = [];
+    const approve = vi.fn(async () => true);
+    const confirm = vi.fn(async () => true);
+    await handleNewHolds({
+      holds: [hold({ id: 'h1', payload: { summaryMarkdown: '## diff' } })],
+      seen: new Set(),
+      isTty: false,
+      approveAll: true,
+      output: (l) => lines.push(l),
+      confirm,
+      resolveContext: async () => ctx,
+      approve,
+    });
+    expect(approve).toHaveBeenCalledWith(ctx, 'h1', true);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(lines.join('\n')).toContain('Auto-approved');
+  });
+
+  it('quiet notify (no approveAll) routes the held guidance to the sink and does not approve', async () => {
+    const lines: string[] = [];
+    const approve = vi.fn(async () => true);
+    const confirm = vi.fn(async () => true);
+    await handleNewHolds({
+      holds: [hold({ id: 'h1' })],
+      seen: new Set(),
+      isTty: false,
+      approveAll: false,
+      output: (l) => lines.push(l),
+      confirm,
+      resolveContext: async () => ctx,
+      approve,
+    });
+    expect(approve).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(lines.join('\n')).toMatch(/held.*approve/i);
   });
 
   it('returns the updated seen-set so a hold is handled once', async () => {

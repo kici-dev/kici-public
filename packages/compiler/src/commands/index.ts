@@ -9,7 +9,7 @@ export type { FixtureOptions } from './fixture.js';
 export { previewCommand, previewEvent } from './preview.js';
 export type { PreviewOptions, RemoteRunOptions, RemoteRunResult } from './preview.js';
 
-export { runLocalCommand, runRemoteCommand } from './run.js';
+export { runLocalCommand, runRemoteCommand, printRunLocalUsage } from './run.js';
 
 export { initCommand } from './init.js';
 export type { InitOptions } from './init.js';

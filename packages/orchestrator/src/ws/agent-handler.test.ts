@@ -734,6 +734,96 @@ describe('createAgentWsHandler', () => {
     });
   });
 
+  describe('provenance.upload.defer', () => {
+    const deferMsg = {
+      type: 'provenance.upload.defer' as const,
+      messageId: 'msg-defer',
+      jobId: 'job-prov',
+      subjectName: 'artifact.bin',
+      subjectDigest: 'a'.repeat(64),
+      audience: 'kici-provenance',
+      mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+      statementHash: 'b'.repeat(64),
+      dsseEnvelope: {
+        payloadType: 'application/vnd.in-toto+json',
+        payload: 'eyJ4Ijoxf',
+        signatures: [{ keyid: 'k', sig: 's' }],
+      },
+      publicKey: { kty: 'EC', crv: 'P-256', x: 'a', y: 'b' },
+    };
+
+    it('captures the frozen envelope with runId resolved from the dispatch ref', async () => {
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
+
+      const captured: unknown[] = [];
+      const onProvenanceDefer = vi.fn(async (record: unknown) => {
+        captured.push(record);
+      });
+
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs,
+        onProvenanceDefer,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).toHaveBeenCalledTimes(1);
+      expect(captured[0]).toMatchObject({
+        runId: 'run-prov',
+        jobId: 'job-prov',
+        subjectDigest: 'a'.repeat(64),
+        statementHash: 'b'.repeat(64),
+        originKind: 'deferred',
+      });
+    });
+
+    it('honours classifyDeferOrigin (offline-backfill)', async () => {
+      const dispatchCacheRefs = new DispatchCacheRefTracker();
+      dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
+
+      const onProvenanceDefer = vi.fn(async () => {});
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs,
+        onProvenanceDefer,
+        classifyDeferOrigin: async () => 'offline-backfill',
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).toHaveBeenCalledWith(
+        expect.objectContaining({ originKind: 'offline-backfill' }),
+      );
+    });
+
+    it('drops a defer for an unresolvable job', async () => {
+      const onProvenanceDefer = vi.fn(async () => {});
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        dispatchCacheRefs: new DispatchCacheRefTracker(),
+        onProvenanceDefer,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(deferMsg), ws as any);
+
+      expect(onProvenanceDefer).not.toHaveBeenCalled();
+    });
+  });
+
   describe('invalid message', () => {
     it('logs warning and closes connection for malformed JSON', async () => {
       const handler = createAgentWsHandler({

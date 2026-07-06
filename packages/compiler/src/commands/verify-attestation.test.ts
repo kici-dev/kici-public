@@ -56,7 +56,14 @@ describe('kici verify-attestation', () => {
         buildContext: 'pass',
         digest: 'skipped',
       },
-      claims: { repository: 'github.com/acme/api', ref: 'refs/heads/main', sha: 'deadbeef' },
+      claims: {
+        repository: 'github.com/acme/api',
+        ref: 'refs/heads/main',
+        sha: 'deadbeef',
+        org_id: 'org_acme',
+        source_origin: 'triggered',
+        provider: 'github',
+      },
       failures: [],
     });
     const ok = await verifyAttestationCommand(undefined, {
@@ -66,6 +73,96 @@ describe('kici verify-attestation', () => {
     expect(ok).toBe(true);
     expect(logOutput.join('\n')).toContain('PASS');
     expect(logOutput.join('\n')).toContain('github.com/acme/api');
+    expect(logOutput.join('\n')).toContain('origin org=org_acme');
+    expect(logOutput.join('\n')).toContain('provider=github');
+  });
+
+  it('prints origin + an unmistakable run-remote source line', async () => {
+    mockVerify.mockResolvedValue({
+      verified: true,
+      mode: 'kici',
+      checks: {
+        schema: 'pass',
+        jwt: 'pass',
+        dsse: 'pass',
+        buildContext: 'pass',
+        digest: 'skipped',
+      },
+      claims: {
+        repository: 'local/x',
+        ref: 'main',
+        sha: 'main',
+        kici_run_id: 'r1',
+        kici_job_id: 'j1',
+        org_id: 'org_abc123',
+        source_origin: 'run-remote',
+        provider: 'local',
+      },
+      failures: [],
+    });
+    const ok = await verifyAttestationCommand(undefined, {
+      bundle: '/tmp/b.json',
+      trustRoot: 'https://api.kici.dev',
+    });
+    expect(ok).toBe(true);
+    const out = logOutput.join('\n');
+    expect(out).toContain('origin org=org_abc123');
+    expect(out.toLowerCase()).toContain('kici run remote');
+    expect(out).toContain('caller-supplied');
+  });
+
+  it('prints an offline-backfill marker on a PASS', async () => {
+    mockVerify.mockResolvedValue({
+      verified: true,
+      mode: 'kici',
+      checks: {
+        schema: 'pass',
+        jwt: 'pass',
+        dsse: 'pass',
+        buildContext: 'pass',
+        digest: 'skipped',
+      },
+      attestationOrigin: 'offline-backfill',
+      claims: {
+        repository: 'acme/app',
+        ref: 'main',
+        sha: 'deadbeef',
+        kici_run_id: 'r1',
+        kici_job_id: 'j1',
+      },
+      failures: [],
+    });
+    const ok = await verifyAttestationCommand(undefined, {
+      bundle: '/tmp/b.json',
+      trustRoot: 'https://api.kici.dev',
+    });
+    expect(ok).toBe(true);
+    const out = logOutput.join('\n').toLowerCase();
+    expect(out).toContain('offline-backfill');
+    expect(out).toContain('minted later');
+  });
+
+  it('prints a deferred marker on a PASS', async () => {
+    mockVerify.mockResolvedValue({
+      verified: true,
+      mode: 'kici',
+      checks: {
+        schema: 'pass',
+        jwt: 'pass',
+        dsse: 'pass',
+        buildContext: 'pass',
+        digest: 'skipped',
+      },
+      attestationOrigin: 'deferred',
+      claims: { repository: 'acme/app', kici_run_id: 'r1', kici_job_id: 'j1' },
+      failures: [],
+    });
+    const ok = await verifyAttestationCommand(undefined, {
+      bundle: '/tmp/b.json',
+      trustRoot: 'https://api.kici.dev',
+    });
+    expect(ok).toBe(true);
+    expect(logOutput.join('\n').toLowerCase()).toContain('deferred');
   });
 
   it('digest-checks the artifact when an artifact path is given', async () => {

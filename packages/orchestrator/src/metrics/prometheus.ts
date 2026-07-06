@@ -142,6 +142,44 @@ defineObservableGauge(
   (result) => result.observe(_staleRunsCurrentValue),
 );
 
+let _pendingAttestationsValue = 0;
+let _pendingAttestationOldestAgeSeconds = 0;
+let _rejectedAttestationsValue = 0;
+
+/** Set the current number of deferred attestations awaiting a later mint. */
+export function setPendingAttestations(value: number): void {
+  _pendingAttestationsValue = value;
+}
+
+/** Set the age (seconds) of the oldest deferred attestation in the outbox. */
+export function setPendingAttestationOldestAgeSeconds(value: number): void {
+  _pendingAttestationOldestAgeSeconds = value;
+}
+
+/** Set the current number of terminally-rejected deferred attestations. */
+export function setRejectedAttestations(value: number): void {
+  _rejectedAttestationsValue = value;
+}
+
+defineObservableGauge(
+  'kici_orch_pending_attestations_current',
+  { description: 'Deferred attestations awaiting a later mint' },
+  (result) => result.observe(_pendingAttestationsValue),
+);
+defineObservableGauge(
+  'kici_orch_pending_attestation_oldest_age_seconds',
+  { description: 'Age of the oldest deferred attestation in the outbox' },
+  (result) => result.observe(_pendingAttestationOldestAgeSeconds),
+);
+defineObservableGauge(
+  'kici_orch_rejected_attestations_current',
+  {
+    description:
+      'Deferred attestations permanently rejected (run/job absent on Platform); terminal, re-attempted only via kici-admin attestations retry --include-rejected',
+  },
+  (result) => result.observe(_rejectedAttestationsValue),
+);
+
 // ── Scaler resource usage (observable gauges with labels) ────────
 //
 // One CPU and one memory gauge fan out per (scaler, machinePool) combination

@@ -8,7 +8,8 @@
  *
  *   GET /api/v1/admin/access-log
  *     Filters: orgId, actorType, actorId, action, source, outcome,
- *              targetType, targetId, from, to, limit, cursor
+ *              targetType, targetId, from, to, q, agentLabel, agentOnly,
+ *              limit, cursor
  *     Requires: access_log.read
  *
  *   GET /api/v1/admin/access-log/:id
@@ -93,6 +94,8 @@ export function createAdminAccessLogRoutes(deps: AdminAccessLogRoutesDeps): Hono
       const from = c.req.query('from');
       const to = c.req.query('to');
       const q = c.req.query('q');
+      const agentLabel = c.req.query('agentLabel');
+      const agentOnly = c.req.query('agentOnly') === 'true';
       const limitRaw = c.req.query('limit');
       const cursor = c.req.query('cursor');
 
@@ -116,6 +119,8 @@ export function createAdminAccessLogRoutes(deps: AdminAccessLogRoutesDeps): Hono
         fromTimestamp: from,
         toTimestamp: to,
         q,
+        agentLabel,
+        agentOnly,
         limit,
         cursor,
       });

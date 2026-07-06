@@ -469,5 +469,29 @@ describe('admin registration routes', () => {
       expect(res.status).toBe(200);
       expect(deps.registrationStore.replaceAll).toHaveBeenCalled();
     });
+
+    it('accepts a binding to environments with no configured record (lenient)', async () => {
+      // Reproduces the scaler-container cross-source E2E: the lock binds env
+      // names that have no environment record in this orchestrator. matchEnvironment
+      // returns null → the binding is satisfiable (lenient), so register-manual 200s.
+      const matchEnvironment = vi.fn(async () => null);
+      deps = createMockDeps({
+        registrationStore: {
+          ...(createMockDeps().registrationStore as any),
+          replaceAll: vi.fn(),
+          bumpVersion: vi.fn().mockResolvedValue(9),
+        },
+        environmentStore: { matchEnvironment } as any,
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+
+      const res = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: lockBody(['production', 'test-pg']),
+      });
+      expect(res.status).toBe(200);
+      expect(deps.registrationStore.replaceAll).toHaveBeenCalled();
+    });
   });
 });

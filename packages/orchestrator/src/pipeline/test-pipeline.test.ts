@@ -848,6 +848,11 @@ describe('processTestTrigger', () => {
       // declared name is still recorded as the run environment.
       expect(jobConfig.environment).toBe('production');
       expect(jobConfig.environmentVars).toBeUndefined();
+      // Allow-and-warn: a user-visible warning names the skipped non-test env.
+      expect(result.warnings ?? []).toEqual(
+        expect.arrayContaining([expect.stringContaining('production')]),
+      );
+      expect(result.warnings?.[0]).toContain('unavailable for this test run');
     });
 
     it('applies a test-allowed bound env on a fullRepo run', async () => {
@@ -882,6 +887,8 @@ describe('processTestTrigger', () => {
       expect(result.status).toBe('accepted');
       expect(result.jobIds.length).toBeGreaterThan(0);
       expect(dispatch.mock.calls[0]?.[0]?.jobConfig.environment).toBe('staging');
+      // A test-allowed env participates normally — no skip, no warning.
+      expect(result.warnings ?? []).toEqual([]);
     });
 
     it('skips a non-test-allowed bound env on a real-repo (remote) run', async () => {
@@ -916,6 +923,115 @@ describe('processTestTrigger', () => {
       // Skipped on the test run: no env vars flow; declared name still recorded.
       expect(jobConfig.environment).toBe('production');
       expect(jobConfig.environmentVars).toBeUndefined();
+    });
+
+    /** matchEnvironment mock keyed by name → allowLocalExecution (missing name => null). */
+    function multiEnvStore(byName: Record<string, boolean>) {
+      return {
+        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+          n in byName
+            ? {
+                id: `env-${n}`,
+                org_id: 'org-gate',
+                name: n,
+                type: 'deployment',
+                glob_pattern: null,
+                branch_restrictions: null,
+                trigger_type_filters: null,
+                repo_patterns: null,
+                concurrency_limit: null,
+                concurrency_strategy: null,
+                concurrency_timeout_ms: null,
+                required_reviewers: null,
+                wait_timer_seconds: null,
+                hold_expiry_seconds: null,
+                minimum_trust: null,
+                allow_local_execution: byName[n],
+                enabled: true,
+                created_at: new Date(),
+                updated_at: new Date(),
+                created_by: null,
+              }
+            : null,
+        ),
+      } as any;
+    }
+
+    it('warns but dispatches with the test-allowed env when a job binds [test-allowed, non-test]', async () => {
+      const workflowWithEnv = createMockWorkflow('ci', [
+        {
+          _type: 'static' as const,
+          name: 'deploy-job',
+          runsOn: [{ kind: 'exact', value: 'default' }],
+          steps: [{ name: 'deploy', run: 'echo deploy' }],
+          needs: [],
+          rules: [],
+          environments: [
+            { value: 'staging', dynamic: false },
+            { value: 'production', dynamic: false },
+          ],
+        },
+      ]);
+      const lockFile = createMockLockFile([workflowWithEnv]);
+
+      deps.db = gateDb('staging', true) as any;
+      deps.environmentStore = multiEnvStore({ staging: true, production: false });
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
+
+      const input = createMockInput({
+        inlineLockFile: JSON.stringify(lockFile),
+        fullRepo: true,
+        routingKey: 'local:my-project',
+      });
+
+      const result = await processTestTrigger(input, deps);
+
+      expect(result.status).toBe('accepted');
+      // The non-test env is skipped and warned; the test-allowed env still runs.
+      expect(result.warnings ?? []).toEqual(
+        expect.arrayContaining([expect.stringContaining('production')]),
+      );
+      expect(result.warnings?.[0]).toContain('staging');
+      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.environment).toBe('staging');
+    });
+
+    it('warns (does not reject) when a bound env is unconfigured on a test run', async () => {
+      const workflowWithEnv = createMockWorkflow('ci', [
+        {
+          _type: 'static' as const,
+          name: 'deploy-job',
+          runsOn: [{ kind: 'exact', value: 'default' }],
+          steps: [{ name: 'deploy', run: 'echo deploy' }],
+          needs: [],
+          rules: [],
+          environments: [{ value: 'ghost-env', dynamic: false }],
+        },
+      ]);
+      const lockFile = createMockLockFile([workflowWithEnv]);
+
+      // gateDb answers no environments row; envStore returns null for the name.
+      deps.db = gateDb('nonexistent', true) as any;
+      deps.environmentStore = multiEnvStore({});
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
+      (deps.dispatcher as any).dispatch = dispatch;
+
+      const input = createMockInput({
+        inlineLockFile: JSON.stringify(lockFile),
+        fullRepo: true,
+        routingKey: 'local:my-project',
+      });
+
+      const result = await processTestTrigger(input, deps);
+
+      expect(result.status).toBe('accepted');
+      expect(result.warnings ?? []).toEqual(
+        expect.arrayContaining([expect.stringContaining('ghost-env')]),
+      );
     });
 
     it('skips environment gate when no db is provided', async () => {

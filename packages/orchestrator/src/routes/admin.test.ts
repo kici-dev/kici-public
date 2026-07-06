@@ -658,4 +658,44 @@ describe('admin routes', () => {
       expect(res.status).toBe(403);
     });
   });
+
+  // ── Attestations retry (deferred-attestation outbox drain) ──────
+  describe('attestations retry', () => {
+    it('forwards includeRejected + returns the rejected count', async () => {
+      const retryAttestations = vi.fn(async () => ({ minted: 1, stillPending: 2, rejected: 3 }));
+      const localDeps = createMockDeps({ retryAttestations });
+      const localApp = createAdminRoutes(localDeps);
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+
+      const res = await request(localApp, 'POST', '/attestations/retry', {
+        token: validToken,
+        body: { includeRejected: true },
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({ minted: 1, stillPending: 2, rejected: 3 });
+      expect(retryAttestations).toHaveBeenCalledWith({ includeRejected: true });
+    });
+
+    it('defaults includeRejected to false when the body omits it', async () => {
+      const retryAttestations = vi.fn(async () => ({ minted: 0, stillPending: 0, rejected: 0 }));
+      const localDeps = createMockDeps({ retryAttestations });
+      const localApp = createAdminRoutes(localDeps);
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+
+      const res = await request(localApp, 'POST', '/attestations/retry', { token: validToken });
+      expect(res.status).toBe(200);
+      expect(retryAttestations).toHaveBeenCalledWith({ includeRejected: false });
+    });
+  });
 });

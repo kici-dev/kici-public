@@ -692,6 +692,55 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(updates.some((u) => 'is_test_run' in u)).toBe(false);
   });
+
+  it('stamps the matched environment_id on the run-level UPDATE for an env-bound job', async () => {
+    // The History tab keys off environment_id, so the run-level write must carry
+    // the configured env's id alongside the declared environment name. The env
+    // store's matchEnvironment returns `id: env-<name>` for the bound name.
+    const { db, updates } = makeUpdateRecordingDb();
+    const envDb = {
+      ...(db as object),
+      fn: { countAll: () => ({ as: () => ({}) }) },
+      selectFrom: () => ({
+        select: () => ({
+          where: function (this: unknown) {
+            return this;
+          },
+          innerJoin: function (this: unknown) {
+            return this;
+          },
+          executeTakeFirst: async () => ({ count: 0 }),
+        }),
+      }),
+      insertInto: () => ({
+        values: () => ({
+          onConflict: () => ({ execute: async () => undefined }),
+          execute: async () => undefined,
+        }),
+      }),
+    };
+    const executionTracker = {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+    };
+    const { ctx } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      jobEnvironment: 'staging',
+      db: envDb,
+      executionTracker,
+      secretResolver: {
+        resolveForJob: async () => ({}),
+        resolveNamed: async () => null,
+        resolveForJobWithMeta: async () => ({}),
+      },
+    });
+    await dispatchMatchedWorkflow(ctx);
+    await vi.waitFor(() => {
+      expect(
+        updates.some((u) => u.environment === 'staging' && u.environment_id === 'env-staging'),
+      ).toBe(true);
+    });
+  });
 });
 
 describe('dispatchMatchedWorkflow — checkMode threading', () => {

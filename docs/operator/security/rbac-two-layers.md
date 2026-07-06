@@ -121,4 +121,4 @@ No. Orchestrator tokens are not path-scoped — a token's role (`admin`, `audito
 - [Dashboard-write policy](./dashboard-write-policy.md) — the per-operation policy that decides which surface a given mutation is reachable on.
 - [Secrets management](./secrets.md) — the secret store, master key rotation, multi-backend backends.
 - [Audit log](./audit-log.md) — querying `audit_log` and `access_log`.
-- [Role-based access control (architecture)](../../architecture/security/rbac.md) — the control-plane permission model: 17 resources, 5 access levels, custom roles, and enforcement.
+- [Role-based access control (architecture)](../../architecture/security/rbac.md) — the control-plane permission model: 18 resources, 5 access levels, custom roles, and enforcement.

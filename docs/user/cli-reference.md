@@ -262,6 +262,8 @@ kici run remote [fixture] [options]
 | `--fail-on-drift`           | `false` | In check mode, fail the run if any step reports drift (no effect without `--check`)                                                                                                                                                        |
 | `--approve-all, --yes`      | `false` | Auto-approve every [approval gate](approvals.md) this run holds on (run-scoped; eligibility still enforced)                                                                                                                                |
 
+`--approve-all` works in `--json` / `--quiet` mode: the run still auto-approves each gate it holds on, and the auto-approve diagnostics are written to stderr so stdout stays a pure JSON (or summary-only) payload. Without `--approve-all`, a `--json` / `--quiet` run that hits a gate stays held and prints a one-line "run held; approve via the dashboard or `kici approve <run-id>`" notice to stderr per hold.
+
 **Examples:**
 
 ```bash
@@ -490,7 +492,7 @@ By default, `kici login` opens your browser for OIDC authentication using PKCE. 
 
 After OAuth, the CLI exchanges the OIDC token for a personal access token (PAT) stored in the config directory (`~/.kici/config` by default, overridable with `KICI_CONFIG_DIR`).
 
-`kici login` targets the hosted KiCI Platform by default. To authenticate against another environment (a self-hosted Platform, for example), pass `--platform-endpoint` / `--oidc-issuer` or set `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
+`kici login` targets the hosted KiCI Platform by default. To authenticate against another KiCI environment (staging, or a testing OIDC provider, for example), pass `--platform-endpoint` / `--oidc-issuer` or set `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
 
 ```bash
 kici login [options]
@@ -510,9 +512,9 @@ kici login [options]
 
 | Variable              | Default                                      | Description                                                            |
 | --------------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
-| `KICI_PLATFORM_URL`   | `https://api.kici.dev`                       | Platform API base URL (override for a self-hosted Platform)            |
-| `KICI_OIDC_ISSUER`    | `https://auth.kici.dev/realms/kici-internal` | OIDC issuer URL (override for a self-hosted Platform)                  |
-| `KICI_OIDC_CLIENT_ID` | `kici-cli`                                   | OIDC client ID (override for a self-hosted Platform)                   |
+| `KICI_PLATFORM_URL`   | `https://api.kici.dev`                       | Platform API base URL (override to target another KiCI environment)    |
+| `KICI_OIDC_ISSUER`    | `https://auth.kici.dev/realms/kici-internal` | OIDC issuer URL (override to target another KiCI environment)          |
+| `KICI_OIDC_CLIENT_ID` | `kici-cli`                                   | OIDC client ID (override to target another KiCI environment)           |
 | `KICI_BROWSER_CMD`    | uses `open` package                          | Custom browser command with `{url}` placeholder, or `none` to suppress |
 | `KICI_CALLBACK_PORT`  | random                                       | Fixed port for OAuth PKCE callback server                              |
 | `KICI_CONFIG_DIR`     | `~/.kici`                                    | Override config directory                                              |
@@ -529,7 +531,7 @@ kici login --device
 # Legacy API key login
 kici login --token kici_sk_abc123...
 
-# Log in against a self-hosted Platform
+# Log in against another KiCI environment (e.g. a testing instance)
 kici login --platform-endpoint https://platform.example.com \
   --oidc-issuer https://auth.example.com/realms/kici-internal
 
@@ -618,7 +620,7 @@ kici org current
 ### kici diagnostics
 
 Show the orchestrators, scalers, and agents serving your organization — the
-terminal equivalent of the dashboard Diagnostics page. Reads the same
+terminal equivalent of the dashboard Infrastructure page. Reads the same
 org-scoped data the dashboard does, so it needs `kici login` and an active org
 (`kici org use <name>`).
 
@@ -1195,6 +1197,8 @@ kici admin drain-worker --url http://worker-2.internal:10143
 
 Verify a KiCI build-provenance attestation bundle offline. A bundle is the signed package a workflow step produces via `ctx.attestProvenance(...)`: a DSSE-wrapped SLSA in-toto statement, the ephemeral public key that signed it, and the KiCI identity token that anchors the build context. For the end-to-end attest → verify → view journey, see the [build provenance guide](./provenance.md). Verification establishes the full chain — the identity token verifies against the trusted issuer's JWKS, the DSSE signature verifies against the bundled key, and the statement's build context must match the token's claims (a mismatch is a hard failure). When an `[artifact]` is given, its SHA-256 digest is also matched against the attestation subject.
 
+On success the output prints the **origin org** (the customer's public org id — the authoritative "who built this" the platform vouches for) and a **source marker**. A `kici run remote` attestation is flagged unmistakably: its `repository`/`ref`/`sha` are caller-supplied from a local working-tree overlay, not a triggered VCS commit, so a verifier must treat those coordinates as org-asserted rather than VCS-verified. A normal triggered run carries the ordinary `triggered` source marker. See the [build provenance guide](./provenance.md) for the full trust model.
+
 ```bash
 kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-file>] [options]
 ```
@@ -1250,6 +1254,17 @@ kici verify-attestation ./dist/app.tgz \
 kici verify-attestation --bundle ./app.tgz.kici.json \
   --trust-root https://platform.example/issuer --json
 ```
+
+**Attestation origin marker.** On a PASS, the command surfaces when the identity
+token was minted relative to the build. A normal attestation prints no marker
+(the token was minted live). A **deferred** attestation prints an `ATTESTATION:
+deferred` line — the build facts were sealed at build time and the token was
+minted later, after a transient platform outage, bound to the frozen statement
+by its hash. An **offline-backfill** attestation prints an `ATTESTATION:
+offline-backfill` line — the run was ingested while the platform was down, so its
+run/job rows were backfilled before the token was minted. Both still verify
+(PASS); the marker discloses the temporal gap, and the organization id remains
+the authoritative anchor.
 
 **Exit codes:**
 

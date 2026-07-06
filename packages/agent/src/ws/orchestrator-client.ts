@@ -657,8 +657,32 @@ export class OrchestratorClient {
       );
       return { type: 'provenance.response', requestId: request.requestId };
     }
+    if (request.op === 'defer') {
+      this.sendProvenanceUploadDefer(jobId, request);
+      return { type: 'provenance.response', requestId: request.requestId };
+    }
     const uploadUrl = await this.requestProvenanceUploadUrl(jobId, request.subjectDigest);
     return { type: 'provenance.response', requestId: request.requestId, uploadUrl };
+  }
+
+  /**
+   * Capture a frozen, DSSE-signed attestation for later minting (transient
+   * mint-failure path). Fire-and-forget: the orchestrator persists it into the
+   * deferred-attestation outbox and the job stays green.
+   */
+  sendProvenanceUploadDefer(jobId: string, request: ProvenanceRequestIpc): void {
+    this.sendDirect({
+      type: 'provenance.upload.defer' as AgentToOrchestratorMessage['type'],
+      messageId: randomUUID(),
+      jobId,
+      subjectName: request.subjectName!,
+      subjectDigest: request.subjectDigest,
+      audience: request.audience!,
+      mediaType: request.mediaType!,
+      statementHash: request.statementHash!,
+      dsseEnvelope: request.dsseEnvelope,
+      publicKey: request.publicKey,
+    } as unknown as AgentToOrchestratorMessage);
   }
 
   /**

@@ -8,3 +8,13 @@
 export function githubWebhookPath(orgId: string): string {
   return `/webhook/${orgId}/github`;
 }
+
+/**
+ * Route shape for a direct GitHub-App webhook delivered straight to the
+ * orchestrator (bypassing the Platform relay). Per-source: the `:sourceId`
+ * segment identifies the local GitHub source. Shared by the orchestrator's
+ * ingress route handler and its local URL resolver so the two never drift.
+ */
+export function githubIngressPath(orgId: string, sourceId: string): string {
+  return `/webhook/${orgId}/github/${sourceId}`;
+}

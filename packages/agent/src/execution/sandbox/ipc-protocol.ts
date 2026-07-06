@@ -224,13 +224,17 @@ export interface StepApprovalRequestIpc {
 }
 
 /** Which provenance upload operation to relay. */
-export type ProvenanceRequestOp = 'requestUploadUrl' | 'complete';
+export type ProvenanceRequestOp = 'requestUploadUrl' | 'complete' | 'defer';
 
 /**
  * Request a provenance bundle upload operation (runner -> agent). The agent
- * relays it over the WS as a `provenance.upload.request` / `.complete` and pipes
- * the response back as a {@link ProvenanceResponseIpc}. Mirrors the
- * {@link CacheRequestIpc} relay pattern.
+ * relays it over the WS as a `provenance.upload.request` / `.complete` /
+ * `.defer` and pipes the response back as a {@link ProvenanceResponseIpc}.
+ * Mirrors the {@link CacheRequestIpc} relay pattern.
+ *
+ * `defer` captures a frozen, DSSE-signed statement for later minting (the
+ * transient mint-failure path): no upload happens; the orchestrator persists
+ * the envelope in its deferred-attestation outbox instead.
  */
 export interface ProvenanceRequestIpc {
   type: 'provenance.request';
@@ -240,10 +244,18 @@ export interface ProvenanceRequestIpc {
   op: ProvenanceRequestOp;
   /** Primary subject digest (lowercase hex) — the storage-key discriminator. */
   subjectDigest: string;
-  /** Caller-supplied artifact name. `complete` only. */
+  /** Caller-supplied artifact name. `complete` + `defer` only. */
   subjectName?: string;
-  /** Bundle media type. `complete` only. */
+  /** Bundle media type. `complete` + `defer` only. */
   mediaType?: string;
+  /** Requested token audience. `defer` only. */
+  audience?: string;
+  /** SHA-256 of the frozen DSSE statement payload. `defer` only. */
+  statementHash?: string;
+  /** Frozen, DSSE-signed statement envelope. `defer` only. */
+  dsseEnvelope?: unknown;
+  /** Ephemeral public key JWK the envelope was signed with. `defer` only. */
+  publicKey?: unknown;
 }
 
 export type RunnerToAgentMessage =
@@ -513,6 +525,15 @@ export interface JobExecutionRequest {
   event?: Record<string, unknown>;
   /** Git provider that originated the triggering event (e.g. 'github', 'forgejo'). */
   provider?: string;
+  /**
+   * Platform provenance issuer, threaded from the orchestrator for a deferred
+   * attestation's frozen `builder.id`. Best-effort: absent when the orchestrator
+   * has no issuer wired (e.g. never authenticated to the Platform), in which
+   * case the frozen statement records an unknown issuer honestly. Not
+   * verification load-bearing — a deferred bundle's later token binds to the
+   * frozen statement by hash, and the authoritative org id lives in that token.
+   */
+  provenanceIssuer?: string;
   /** Whether to checkout the repo (default: true). */
   checkout?: boolean;
   /** Whether this job is part of a developer-initiated run triggered by `kici run`. */

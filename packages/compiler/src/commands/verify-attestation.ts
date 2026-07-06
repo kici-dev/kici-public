@@ -92,10 +92,45 @@ export async function verifyAttestationCommand(
     if (result.verified) {
       logger.info(`${pc.green('PASS')} provenance verified (issuer ${issuer})`);
       const c = result.claims ?? {};
+      logger.info(pc.gray(`  origin org=${c.org_id ?? 'unknown'}`));
+      if (c.source_origin === 'run-remote') {
+        logger.info(
+          pc.bold(
+            pc.yellow(
+              `  SOURCE: kici run remote (local working-tree overlay — repository/ref/sha are ` +
+                `caller-supplied, not a triggered VCS commit)`,
+            ),
+          ),
+        );
+      } else {
+        logger.info(pc.gray(`  source: ${c.source_origin ?? 'triggered'}`));
+      }
+      const origin = result.attestationOrigin ?? 'live';
+      if (origin === 'deferred') {
+        logger.info(
+          pc.bold(
+            pc.yellow(
+              `  ATTESTATION: deferred — the build facts were sealed at build time; the identity ` +
+                `token was minted later (after a transient Platform outage), bound to the frozen ` +
+                `statement by hash.`,
+            ),
+          ),
+        );
+      } else if (origin === 'offline-backfill') {
+        logger.info(
+          pc.bold(
+            pc.yellow(
+              `  ATTESTATION: offline-backfill — the run was ingested while the Platform was down; ` +
+                `its run/job rows were backfilled and the token minted later. The org id is the ` +
+                `authoritative anchor; the temporal gap is disclosed.`,
+            ),
+          ),
+        );
+      }
       logger.info(
         pc.gray(
           `  repository=${c.repository} ref=${c.ref} sha=${c.sha}` +
-            ` run=${c.kici_run_id} job=${c.kici_job_id}`,
+            ` provider=${c.provider ?? 'unknown'} run=${c.kici_run_id} job=${c.kici_job_id}`,
         ),
       );
     } else {

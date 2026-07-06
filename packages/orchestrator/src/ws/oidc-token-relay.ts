@@ -4,75 +4,92 @@
  * Backs the `oidc.token.request` agent.api method: an agent asks for a
  * short-lived OIDC ID token for a job it is running; the orchestrator verifies
  * the agent owns that job, resolves its runId from its own dispatch state, and
- * relays a mint request to the Platform's token-mint endpoint over HTTPS using
- * the orchestrator's own `KICI_PLATFORM_TOKEN`. The agent never holds Platform
- * credentials and never asserts its own identity claims — the Platform derives
- * every identity claim from its own run/job rows.
+ * relays a mint request to the Platform over the authenticated orchestrator↔
+ * Platform WebSocket (orchestrator-initiated RPC). The agent never holds
+ * Platform credentials and never asserts its own identity claims — the Platform
+ * derives every identity claim from its own run/job rows.
  */
 
 import {
   oidcTokenRequestParamsSchema,
   oidcTokenResultSchema,
   type OidcTokenResult,
+  type DeferredMintParams,
 } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import type { OidcMintResponse } from '@kici-dev/engine/protocol/messages/oidc-mint';
+import { createLogger } from '@kici-dev/shared';
 
-/** 404 / 409: the run/job is missing on the Platform or the job is terminal. */
+const logger = createLogger({ prefix: 'oidc-token-relay' });
+
+/** rejected: the run/job is missing on the Platform or the job is terminal. */
 export class MintRejectedError extends Error {}
-/** 503: provenance signing is not configured / the Platform is unavailable. */
+/** unavailable: provenance signing is not configured / the Platform is unavailable. */
 export class MintUnavailableError extends Error {}
-/** Any other non-2xx from the mint endpoint. */
+/** Any other failure (transport or Platform-side). */
 export class MintRelayError extends Error {}
 
-/**
- * Turn the Platform WS URL (`wss://host[/base]/ws`) into its HTTP base
- * (`https://host[/base]`). Maps the scheme and strips a trailing `/ws` while
- * preserving the host and any basePath in front of it.
- */
-export function deriveHttpBaseFromWsUrl(wsUrl: string): string {
-  const url = new URL(wsUrl);
-  url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-  let path = url.pathname.replace(/\/ws\/?$/, '');
-  if (path === '/') path = '';
-  return `${url.origin}${path}`;
+/** Minimal surface the relay needs from the Platform WS client. */
+export interface MintPlatformClient {
+  sendRequestAndAwait<Res>(
+    type: 'oidc.mint.request',
+    payload: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<Res>;
 }
 
 export interface RequestMintArgs {
-  httpBase: string;
-  token: string;
+  platformClient: MintPlatformClient;
   orchestratorId: string;
   runId: string;
   jobId: string;
   audience: string;
+  /**
+   * Deferred *fulfilment* mint: when set, the request knowingly targets a
+   * completed (terminal) job and binds the frozen statement hash + origin so
+   * the Platform relaxes its live-job check and stamps the mint-timing marker.
+   * The live agent path never sets this.
+   */
+  deferred?: DeferredMintParams;
 }
 
 /**
- * Call the Platform token-mint endpoint over HTTPS using the orchestrator's
- * Platform token. Maps non-2xx responses to typed errors so the agent always
- * sees a clear message instead of a raw 5xx body.
+ * Send a mint request over the WS and map the typed response to either a result
+ * or one of the three error classes. The user-facing strings are produced here
+ * (client-side) so they stay stable regardless of Platform wording.
  */
 export async function requestMint(args: RequestMintArgs): Promise<OidcTokenResult> {
-  const res = await fetch(
-    `${args.httpBase}/internal/orchestrator/${args.orchestratorId}/mint-id-token`,
-    {
-      method: 'POST',
-      headers: { authorization: `Bearer ${args.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ run_id: args.runId, job_id: args.jobId, audience: args.audience }),
-    },
-  );
-  if (res.status === 404 || res.status === 409) {
-    throw new MintRejectedError(`token mint rejected (${res.status})`);
+  let res: OidcMintResponse;
+  try {
+    res = await args.platformClient.sendRequestAndAwait<OidcMintResponse>('oidc.mint.request', {
+      orchestratorId: args.orchestratorId,
+      runId: args.runId,
+      jobId: args.jobId,
+      audience: args.audience,
+      ...(args.deferred
+        ? {
+            deferred: true,
+            statementHash: args.deferred.statementHash,
+            origin: args.deferred.origin,
+          }
+        : {}),
+    });
+  } catch (err) {
+    throw new MintRelayError(
+      `token mint relay failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
-  if (res.status === 503) {
-    throw new MintUnavailableError('provenance signing is not configured on the Platform');
+  if (res.error) {
+    if (res.error.code === 'rejected') throw new MintRejectedError(res.error.message);
+    if (res.error.code === 'unavailable') {
+      throw new MintUnavailableError('provenance signing is not configured on the Platform');
+    }
+    throw new MintRelayError(res.error.message);
   }
-  if (!res.ok) {
-    throw new MintRelayError(`token mint failed (${res.status})`);
-  }
-  const json = (await res.json()) as { token: string; expires_in: number; jti: string };
+  if (!res.result) throw new MintRelayError('token mint response missing result');
   return oidcTokenResultSchema.parse({
-    token: json.token,
-    expiresIn: json.expires_in,
-    jti: json.jti,
+    token: res.result.token,
+    expiresIn: res.result.expiresIn,
+    jti: res.result.jti,
   });
 }
 
@@ -80,9 +97,15 @@ export interface OidcTokenHandlerDeps {
   dispatcher: {
     resolveOwnedJob(agentId: string, jobId: string): { runId: string } | undefined;
   };
-  platformToken: string;
-  platformHttpBase: string;
+  platformClient: MintPlatformClient;
   orchestratorId: string;
+  /** Test-only fault-injection master switch (config.testMode). */
+  testMode: boolean;
+  /**
+   * Test-only: force-defer the *initial* agent mint for any job requesting this
+   * OIDC audience (config.testMintDeferAudience). Ignored unless `testMode`.
+   */
+  testMintDeferAudience?: string;
 }
 
 /**
@@ -100,13 +123,35 @@ export function createOidcTokenHandler(
     if (!owned) {
       throw new MintRejectedError(`job ${jobId} not owned by agent ${agentId}`);
     }
-    return requestMint({
-      httpBase: deps.platformHttpBase,
-      token: deps.platformToken,
-      orchestratorId: deps.orchestratorId,
-      runId: owned.runId,
-      jobId,
-      audience,
-    });
+    // Test-only fault injection: force the initial agent mint to defer for a
+    // marker audience so an E2E can exercise the deferred-attestation retry +
+    // per-run serve path with a REAL run. Double-gated (testMode AND marker)
+    // so production deployments — which leave both unset — never reach it. The
+    // deferred result is exactly what the MintUnavailableError catch below
+    // returns; the retrier's re-mint uses requestMint directly and is exempt.
+    if (deps.testMode && deps.testMintDeferAudience && audience === deps.testMintDeferAudience) {
+      logger.warn(
+        'mint-defer fault-injection ACTIVE — forcing a transient mint failure. ' +
+          'Production deployments must clear KICI_TEST_MODE + KICI_TEST_MINT_DEFER_AUDIENCE.',
+        { jobId, audience },
+      );
+      return { deferred: true, code: 'unavailable' };
+    }
+    try {
+      return await requestMint({
+        platformClient: deps.platformClient,
+        orchestratorId: deps.orchestratorId,
+        runId: owned.runId,
+        jobId,
+        audience,
+      });
+    } catch (err) {
+      // A transient mint failure DEFERS: the agent freezes + DSSE-signs the
+      // statement and the job stays green. A permanent rejection still fails
+      // the step (rethrown below).
+      if (err instanceof MintUnavailableError) return { deferred: true, code: 'unavailable' };
+      if (err instanceof MintRelayError) return { deferred: true, code: 'failed' };
+      throw err;
+    }
   };
 }

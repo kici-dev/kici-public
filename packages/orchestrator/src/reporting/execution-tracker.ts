@@ -13,8 +13,8 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { sql, type Kysely } from 'kysely';
-import type { Database } from '../db/types.js';
+import { sql, type Kysely, type Updateable } from 'kysely';
+import type { Database, ExecutionJobTable } from '../db/types.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import {
   ExecutionJobStatus,
@@ -61,6 +61,8 @@ export interface ExecutionContext {
   originalRunId?: string | null;
   /** User identity that triggered this re-run (null/undefined for webhook-triggered). */
   triggeredBy?: string | null;
+  /** Agent provenance label when triggered through an agent credential. */
+  triggeredByAgentLabel?: string | null;
   /**
    * Provider login of the person who triggered the run (pusher / PR author).
    * Captured for all event types; forwarded to the Platform run projection and
@@ -227,6 +229,7 @@ interface RunState {
   parentRunId?: string | null;
   originalRunId?: string | null;
   triggeredBy?: string | null;
+  triggeredByAgentLabel?: string | null;
   triggerActorUsername?: string | null;
   triggerActorUserId?: string | null;
   concurrency?: { cancelInProgress?: boolean; max?: number };
@@ -248,6 +251,54 @@ interface RunState {
       environments?: string[];
     }
   >;
+}
+
+/** The per-job fields the tracker persists to an execution_jobs row. */
+interface TrackedJobRow {
+  jobId: string;
+  jobName: string;
+  matrixValues?: Record<string, unknown>;
+  runsOnLabels?: string[];
+  baseJobName?: string;
+  variantKind?: string;
+  variantLabel?: string;
+  waveGated?: boolean;
+  waveMaxParallel?: number;
+  waveFailFast?: boolean;
+  environments?: string[];
+  skippedEnvironments?: string[];
+  envWarning?: string;
+}
+
+/**
+ * Build the mutable column set for a tracked job's execution_jobs upsert — the
+ * fields written on both the initial INSERT and the (run_id, job_id) conflict
+ * update. `run_id` / `job_id` / `routing_key` / `matrix_values` are set by the
+ * caller (INSERT only).
+ */
+function trackedJobMutableColumns(
+  job: TrackedJobRow,
+  runsOnLabelsJson: string | null,
+  dispatchedContexts: string[] | undefined,
+): Updateable<ExecutionJobTable> & { job_name: string } {
+  return {
+    job_name: job.jobName,
+    ...(job.baseJobName && { base_job_name: job.baseJobName }),
+    ...(job.variantKind && { variant_kind: job.variantKind }),
+    ...(job.variantLabel && { variant_label: job.variantLabel }),
+    ...(job.waveGated && { wave_gated: true }),
+    ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
+    ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
+    ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
+    ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
+    ...(job.skippedEnvironments?.length && {
+      skipped_environments: JSON.stringify(job.skippedEnvironments),
+    }),
+    ...(job.envWarning && { env_warning: job.envWarning }),
+    ...(dispatchedContexts?.length && {
+      dispatched_contexts: JSON.stringify(dispatchedContexts),
+    }),
+  };
 }
 
 export class ExecutionTracker {
@@ -350,6 +401,8 @@ export class ExecutionTracker {
       waveMaxParallel?: number;
       waveFailFast?: boolean;
       environments?: string[];
+      skippedEnvironments?: string[];
+      envWarning?: string;
     }>,
     routingKey?: string,
     /** Secret context names dispatched with jobs (for context-disable job lookup). */
@@ -376,6 +429,8 @@ export class ExecutionTracker {
     triggerActorUsername?: string | null,
     /** Immutable provider user id of the triggering actor. */
     triggerActorUserId?: string | null,
+    /** Agent provenance label when triggered through an agent credential. */
+    triggeredByAgentLabel?: string | null,
   ): Promise<void> {
     const now = new Date();
 
@@ -422,6 +477,7 @@ export class ExecutionTracker {
       parentRunId,
       originalRunId,
       triggeredBy,
+      triggeredByAgentLabel,
       triggerActorUsername,
       triggerActorUserId,
       concurrency,
@@ -450,6 +506,9 @@ export class ExecutionTracker {
         ...(parentRunId != null && { parent_run_id: parentRunId }),
         ...(originalRunId != null && { original_run_id: originalRunId }),
         ...(triggeredBy != null && { triggered_by: triggeredBy }),
+        ...(triggeredByAgentLabel != null && {
+          triggered_by_agent_label: triggeredByAgentLabel,
+        }),
         ...((triggerActorUsername != null || triggerActorUserId != null) && {
           trigger_actor_provider: provider,
         }),
@@ -462,51 +521,7 @@ export class ExecutionTracker {
       .execute();
 
     // DB: insert execution jobs (upsert to handle race with onJobStatus)
-    if (jobs.length > 0) {
-      for (const job of jobs) {
-        const runsOnLabelsJson = job.runsOnLabels?.length ? JSON.stringify(job.runsOnLabels) : null;
-        await this.db
-          .insertInto('execution_jobs')
-          .values({
-            run_id: runId,
-            job_id: job.jobId,
-            job_name: job.jobName,
-            // Denormalized — see migration 006. Cold-store partitions by
-            // routing_key, and we don't want to JOIN execution_runs in
-            // every archive cycle.
-            routing_key: routingKey ?? null,
-            matrix_values: job.matrixValues ? JSON.stringify(job.matrixValues) : null,
-            ...(job.baseJobName && { base_job_name: job.baseJobName }),
-            ...(job.variantKind && { variant_kind: job.variantKind }),
-            ...(job.variantLabel && { variant_label: job.variantLabel }),
-            ...(job.waveGated && { wave_gated: true }),
-            ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
-            ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
-            ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
-            ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
-            ...(dispatchedContexts?.length && {
-              dispatched_contexts: JSON.stringify(dispatchedContexts),
-            }),
-          })
-          .onConflict((oc) =>
-            oc.columns(['run_id', 'job_id']).doUpdateSet({
-              job_name: job.jobName,
-              ...(job.baseJobName && { base_job_name: job.baseJobName }),
-              ...(job.variantKind && { variant_kind: job.variantKind }),
-              ...(job.variantLabel && { variant_label: job.variantLabel }),
-              ...(job.waveGated && { wave_gated: true }),
-              ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
-              ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
-              ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
-              ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
-              ...(dispatchedContexts?.length && {
-                dispatched_contexts: JSON.stringify(dispatchedContexts),
-              }),
-            }),
-          )
-          .execute();
-      }
-    }
+    await this.insertTrackedJobRows(runId, routingKey ?? null, dispatchedContexts, jobs);
 
     executionsTotal.add(1, { status: ExecutionRunStatus.enum.pending });
 
@@ -554,9 +569,34 @@ export class ExecutionTracker {
   }
 
   /**
-   * Add additional jobs to an already-started execution run.
-   * Used when build jobs are tracked early and regular jobs are dispatched later.
+   * Upsert one execution_jobs row per dispatched job (idempotent on
+   * (run_id, job_id) to tolerate a race with an early `onJobStatus`). The
+   * `routing_key` is denormalized (see migration 006) so cold-store archival
+   * partitions by it without joining execution_runs.
    */
+  private async insertTrackedJobRows(
+    runId: string,
+    routingKey: string | null,
+    dispatchedContexts: string[] | undefined,
+    jobs: TrackedJobRow[],
+  ): Promise<void> {
+    for (const job of jobs) {
+      const runsOnLabelsJson = job.runsOnLabels?.length ? JSON.stringify(job.runsOnLabels) : null;
+      const mutable = trackedJobMutableColumns(job, runsOnLabelsJson, dispatchedContexts);
+      await this.db
+        .insertInto('execution_jobs')
+        .values({
+          run_id: runId,
+          job_id: job.jobId,
+          routing_key: routingKey,
+          matrix_values: job.matrixValues ? JSON.stringify(job.matrixValues) : null,
+          ...mutable,
+        })
+        .onConflict((oc) => oc.columns(['run_id', 'job_id']).doUpdateSet(mutable))
+        .execute();
+    }
+  }
+
   /**
    * Find the synthetic needs-pending job ID for a given job name in a run.
    * Used by dispatchReadyJob to locate the placeholder entry before replacing it.
@@ -689,6 +729,8 @@ export class ExecutionTracker {
       variantKind?: string;
       variantLabel?: string;
       environments?: string[];
+      skippedEnvironments?: string[];
+      envWarning?: string;
     }>,
     dispatchedContexts?: string[],
     /** Synthetic job ID to replace (e.g. needs-pending-deploy-{uuid}). */
@@ -713,6 +755,8 @@ export class ExecutionTracker {
       variantKind?: string;
       variantLabel?: string;
       environments?: string[];
+      skippedEnvironments?: string[];
+      envWarning?: string;
     }>,
     dispatchedContexts?: string[],
     replaceSyntheticId?: string,
@@ -793,43 +837,7 @@ export class ExecutionTracker {
     }
 
     // DB: insert additional execution_jobs rows (upsert to handle race with onJobStatus)
-    if (jobs.length > 0) {
-      for (const job of jobs) {
-        const runsOnLabelsJson = job.runsOnLabels?.length ? JSON.stringify(job.runsOnLabels) : null;
-        await this.db
-          .insertInto('execution_jobs')
-          .values({
-            run_id: runId,
-            job_id: job.jobId,
-            job_name: job.jobName,
-            // Denormalized — see migration 006.
-            routing_key: run.routingKey ?? null,
-            matrix_values: job.matrixValues ? JSON.stringify(job.matrixValues) : null,
-            ...(job.baseJobName && { base_job_name: job.baseJobName }),
-            ...(job.variantKind && { variant_kind: job.variantKind }),
-            ...(job.variantLabel && { variant_label: job.variantLabel }),
-            ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
-            ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
-            ...(dispatchedContexts?.length && {
-              dispatched_contexts: JSON.stringify(dispatchedContexts),
-            }),
-          })
-          .onConflict((oc) =>
-            oc.columns(['run_id', 'job_id']).doUpdateSet({
-              job_name: job.jobName,
-              ...(job.baseJobName && { base_job_name: job.baseJobName }),
-              ...(job.variantKind && { variant_kind: job.variantKind }),
-              ...(job.variantLabel && { variant_label: job.variantLabel }),
-              ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
-              ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
-              ...(dispatchedContexts?.length && {
-                dispatched_contexts: JSON.stringify(dispatchedContexts),
-              }),
-            }),
-          )
-          .execute();
-      }
-    }
+    await this.insertTrackedJobRows(runId, run.routingKey ?? null, dispatchedContexts, jobs);
 
     // Write orchestration log for each new job
     for (const job of jobs) {
@@ -855,6 +863,7 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggeredByAgentLabel: run.triggeredByAgentLabel,
         triggerActorUsername: run.triggerActorUsername,
         triggerActorUserId: run.triggerActorUserId,
       },
@@ -1067,6 +1076,7 @@ export class ExecutionTracker {
         'parent_run_id',
         'original_run_id',
         'triggered_by',
+        'triggered_by_agent_label',
         'trigger_actor_username',
         'trigger_actor_user_id',
         'check_mode',
@@ -1123,6 +1133,7 @@ export class ExecutionTracker {
       parentRunId: dbRun.parent_run_id ?? undefined,
       originalRunId: dbRun.original_run_id ?? undefined,
       triggeredBy: dbRun.triggered_by ?? undefined,
+      triggeredByAgentLabel: dbRun.triggered_by_agent_label ?? undefined,
       triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
       triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
       ...(dbRun.check_mode != null && { checkMode: dbRun.check_mode }),
@@ -1332,6 +1343,7 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggeredByAgentLabel: run.triggeredByAgentLabel,
         triggerActorUsername: run.triggerActorUsername,
         triggerActorUserId: run.triggerActorUserId,
       },
@@ -1394,6 +1406,7 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggeredByAgentLabel: run.triggeredByAgentLabel,
         triggerActorUsername: run.triggerActorUsername,
         triggerActorUserId: run.triggerActorUserId,
       },
@@ -1887,6 +1900,7 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggeredByAgentLabel: run.triggeredByAgentLabel,
         triggerActorUsername: run.triggerActorUsername,
         triggerActorUserId: run.triggerActorUserId,
       },
@@ -1988,6 +2002,7 @@ export class ExecutionTracker {
           parentRunId: run.parentRunId,
           originalRunId: run.originalRunId,
           triggeredBy: run.triggeredBy,
+          triggeredByAgentLabel: run.triggeredByAgentLabel,
           triggerActorUsername: run.triggerActorUsername,
           triggerActorUserId: run.triggerActorUserId,
         },
@@ -2331,6 +2346,7 @@ export class ExecutionTracker {
           parentRunId: run.parentRunId,
           originalRunId: run.originalRunId,
           triggeredBy: run.triggeredBy,
+          triggeredByAgentLabel: run.triggeredByAgentLabel,
           triggerActorUsername: run.triggerActorUsername,
           triggerActorUserId: run.triggerActorUserId,
         },
@@ -2649,6 +2665,7 @@ export class ExecutionTracker {
     parentRunId?: string | null;
     originalRunId?: string | null;
     triggeredBy?: string | null;
+    triggeredByAgentLabel?: string | null;
     failureReason?: string;
     jobCount: number;
     startedAt: number;
@@ -2676,6 +2693,7 @@ export class ExecutionTracker {
       parentRunId?: string | null;
       originalRunId?: string | null;
       triggeredBy?: string | null;
+      triggeredByAgentLabel?: string | null;
       failureReason?: string;
       jobCount: number;
       startedAt: number;
@@ -2734,6 +2752,7 @@ export class ExecutionTracker {
         parentRunId: run.parentRunId,
         originalRunId: run.originalRunId,
         triggeredBy: run.triggeredBy,
+        triggeredByAgentLabel: run.triggeredByAgentLabel,
         ...(run.failureReason && { failureReason: run.failureReason }),
         jobCount: run.jobs.size,
         startedAt: run.startedAt,
@@ -2785,6 +2804,7 @@ export class ExecutionTracker {
       parent_run_id: string | null;
       original_run_id: string | null;
       triggered_by: string | null;
+      triggered_by_agent_label: string | null;
       failure_reason: string | null;
     }> = [];
 
@@ -2805,6 +2825,7 @@ export class ExecutionTracker {
           'parent_run_id',
           'original_run_id',
           'triggered_by',
+          'triggered_by_agent_label',
           'failure_reason',
         ])
         .where('status', 'in', [
@@ -2864,6 +2885,7 @@ export class ExecutionTracker {
         parentRunId: r.parent_run_id,
         originalRunId: r.original_run_id,
         triggeredBy: r.triggered_by,
+        triggeredByAgentLabel: r.triggered_by_agent_label,
         ...(r.failure_reason && { failureReason: r.failure_reason }),
         jobCount: jobs.length,
         startedAt: r.started_at.getTime(),
@@ -3124,6 +3146,7 @@ export class ExecutionTracker {
         parentRunId: memRun.parentRunId,
         originalRunId: memRun.originalRunId,
         triggeredBy: memRun.triggeredBy,
+        triggeredByAgentLabel: memRun.triggeredByAgentLabel,
         triggerActorUsername: memRun.triggerActorUsername,
         triggerActorUserId: memRun.triggerActorUserId,
       },
@@ -3202,6 +3225,7 @@ export class ExecutionTracker {
         'parent_run_id',
         'original_run_id',
         'triggered_by',
+        'triggered_by_agent_label',
         'trigger_actor_username',
         'trigger_actor_user_id',
       ])
@@ -3311,6 +3335,7 @@ export class ExecutionTracker {
         parentRunId: dbRun.parent_run_id ?? undefined,
         originalRunId: dbRun.original_run_id ?? undefined,
         triggeredBy: dbRun.triggered_by ?? undefined,
+        triggeredByAgentLabel: dbRun.triggered_by_agent_label ?? undefined,
         triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
         triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
       },

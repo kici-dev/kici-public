@@ -118,6 +118,8 @@ export const agentRunResultSchema = z.object({
   failureReason: untrustedStringNullable,
   /** Identity that triggered a re-run (null for webhook-triggered runs). */
   triggeredBy: z.string().nullable(),
+  /** Agent provenance label when the run was triggered through an agent credential. */
+  triggeredByAgentLabel: z.string().nullable().optional(),
   jobs: z.array(agentJobResultSchema),
 });
 export type AgentRunResult = z.infer<typeof agentRunResultSchema>;
@@ -132,3 +134,45 @@ export const agentStepLogsSchema = z.object({
   nextCursor: z.string().nullable(),
 });
 export type AgentStepLogs = z.infer<typeof agentStepLogsSchema>;
+
+/**
+ * Compact run-list row for the agent surface. KiCI ids/status/hashes are trusted
+ * (plain); the workflow name, repo identifier, and ref are user-controlled and
+ * wrapped untrusted so the fencing renderer keeps them out of the instruction
+ * channel.
+ */
+export const agentRunListItemSchema = z.object({
+  runId: z.string(),
+  status: ExecutionRunStatus,
+  sha: z.string().nullable(),
+  createdAt: z.string().nullable(),
+  workflowName: untrustedString,
+  repoIdentifier: untrustedStringNullable,
+  ref: untrustedStringNullable,
+});
+export type AgentRunListItem = z.infer<typeof agentRunListItemSchema>;
+
+/**
+ * Agent-facing workflow registration summary. Ids, flags, the commit sha, the
+ * KiCI trigger-type tags, and timestamps are trusted (plain); the workflow name,
+ * repo identifier, source repos, source file path, and friendly source name are
+ * user-controlled and wrapped untrusted.
+ */
+export const agentWorkflowSummarySchema = z.object({
+  id: z.string(),
+  workflowName: untrustedString,
+  repoIdentifier: untrustedString,
+  triggerTypes: z.array(z.string()),
+  sourceRepos: z.array(untrustedString),
+  disabled: z.boolean(),
+  commitSha: z.string().nullable(),
+  sourceFile: untrustedStringNullable,
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  lastTriggeredAt: z.string().nullable(),
+  nextFireAt: z.string().nullable(),
+  source: z
+    .object({ routingKey: z.string(), name: untrustedStringNullable, provider: z.string() })
+    .nullable(),
+});
+export type AgentWorkflowSummary = z.infer<typeof agentWorkflowSummarySchema>;

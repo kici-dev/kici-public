@@ -30,6 +30,7 @@ import type {
   DashboardAttestationsListRequest,
   DashboardAttestationsListAllRequest,
   DashboardAttestationGetRequest,
+  DashboardAttestationRetryRequest,
   AttestationListItem,
   AttestationListSummary,
   DashboardPayloadRequest,
@@ -58,17 +59,24 @@ import {
   dashboardAttestationsListAllResponseSchema,
   dashboardAttestationGetResponseSchema,
   attestationVerifyStatusSchema,
+  agentLabelOf,
   stringifyActor,
   EventLogStatus,
   EventLogSource,
   PayloadOmittedReason,
   EVENT_LOG_PAYLOAD_CHUNK_BYTES,
   EventLogPayloadStreamError,
+  SourceOrigin,
+  AttestationOrigin,
 } from '@kici-dev/engine';
 import { gunzipSync } from 'node:zlib';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from './needs-edges.js';
-import { applyAttestationFilters, baseAttestationsQuery } from './attestation-filters.js';
+import {
+  applyAttestationFilters,
+  baseAttestationsQuery,
+  basePendingAttestationsQuery,
+} from './attestation-filters.js';
 
 /** Page size for the org-wide attestations list (offset+count pagination). */
 const ATTESTATIONS_PAGE_SIZE = 25;
@@ -100,6 +108,14 @@ interface DashboardHandlerDeps {
    * (the same one P1.5 writes bundles to).
    */
   provenanceStorage?: CacheStorage | null;
+  /**
+   * Drain the deferred-attestation outbox on demand (mints in this process,
+   * which owns the Platform WS). Backs `dashboard.attestation.retry`. Optional —
+   * absent on orchestrators without the retrier wired.
+   */
+  retryAttestations?: (opts: {
+    runId?: string;
+  }) => Promise<{ minted: number; stillPending: number }>;
   /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
   /** This orchestrator's instance ID, included in job detail responses. */
@@ -131,6 +147,7 @@ interface DashboardHandlerDeps {
   onRerun: (
     runId: string,
     triggeredBy: string | null,
+    triggeredByAgentLabel: string | null,
     routingKey?: string,
   ) => Promise<{ newRunId: string }>;
   /**
@@ -141,6 +158,7 @@ interface DashboardHandlerDeps {
   onCancel: (
     runId: string,
     cancelledBy: string | null,
+    cancelledByAgentLabel: string | null,
     force?: boolean,
   ) => Promise<{ cancelledJobs: number }>;
   /**
@@ -150,6 +168,7 @@ interface DashboardHandlerDeps {
   onManualSchedule: (
     registrationId: string,
     triggeredBy: string | null,
+    triggeredByAgentLabel: string | null,
   ) => Promise<{ newRunId: string }>;
   /**
    * Event store for the per-org DLQ surface. Optional — when absent the
@@ -174,6 +193,7 @@ export class DashboardHandler {
   private readonly onManualSchedule: DashboardHandlerDeps['onManualSchedule'];
   private readonly coldStore: ColdStore | null;
   private readonly eventStore: EventStore | null;
+  private readonly retryAttestations: DashboardHandlerDeps['retryAttestations'];
 
   constructor(deps: DashboardHandlerDeps) {
     this.db = deps.db;
@@ -189,6 +209,7 @@ export class DashboardHandler {
     this.onManualSchedule = deps.onManualSchedule;
     this.coldStore = deps.coldStore ?? null;
     this.eventStore = deps.eventStore ?? null;
+    this.retryAttestations = deps.retryAttestations;
   }
 
   /**
@@ -411,6 +432,8 @@ export class DashboardHandler {
           'error_message',
           'runs_on_labels',
           'environments',
+          'skipped_environments',
+          'env_warning',
           'outputs',
           'init_failure',
         ])
@@ -594,9 +617,20 @@ export class DashboardHandler {
    * agent label when the actor came through an agent PAT).
    */
   async handleRunStructured(msg: DashboardRunStructuredRequest): Promise<void> {
-    const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
+    const start = Date.now();
+    // Resolve the run-owning org concurrently with the aggregate: the org
+    // context is only needed for the access-log row, not the response payload,
+    // so it need not precede the read. Combined with the concurrent child-row
+    // reads inside aggregateRunDetail, this keeps the structured read within
+    // the fixed relay-timeout budget even when the Postgres pool is contended
+    // by a concurrent execution.
+    const resolvedPromise = this.resolveOrgForRun(msg.runId);
     try {
-      const detail = await aggregateRunDetail(this.db, msg.runId);
+      const [detail, resolved] = await Promise.all([
+        aggregateRunDetail(this.db, msg.runId),
+        resolvedPromise,
+      ]);
+      const ctx = this.contextOrFallback(resolved);
       const result = detail ? mapToAgentRunResult(detail) : null;
       this.recordAccess(
         ctx,
@@ -606,14 +640,24 @@ export class DashboardHandler {
         msg.requestId,
         'allowed',
       );
+      logger.info('Served dashboard.run.structured', {
+        runId: msg.runId,
+        durationMs: Date.now() - start,
+        jobCount: detail?.jobs.length ?? 0,
+        stepCount: detail ? detail.jobs.reduce((n, j) => n + j.steps.length, 0) : 0,
+      });
       this.send({
         type: 'dashboard.run.structured.response',
         requestId: msg.requestId,
         result,
       });
     } catch (err) {
+      // The access-log row still needs org context; the org-resolve may have
+      // succeeded even if the aggregate failed.
+      const ctx = this.contextOrFallback(await resolvedPromise.catch(() => null));
       logger.error('Error handling dashboard.run.structured', {
         runId: msg.runId,
+        durationMs: Date.now() - start,
         error: toErrorMessage(err),
       });
       this.recordAccess(
@@ -846,7 +890,9 @@ export class DashboardHandler {
           'parent_run_id',
           'original_run_id',
           'triggered_by',
+          'triggered_by_agent_label',
           'cancelled_by',
+          'cancelled_by_agent_label',
           'failure_reason',
         ])
         .where('routing_key', 'in', routingKeys);
@@ -1216,12 +1262,21 @@ export class DashboardHandler {
 
       // Read the log file
       const result = await this.logStorage.read(step.log_path);
-      const lines = result.data.split('\n').filter(Boolean);
+      const allLines = result.data.split('\n').filter(Boolean);
+      const totalLines = allLines.length;
+
+      // Unbounded by default (the human dashboard relies on this); a caller
+      // (the MCP step-logs tool) opts into paging by sending an explicit limit.
+      const offset = msg.cursor ? Math.max(0, parseInt(msg.cursor, 10) || 0) : 0;
+      const page = msg.limit ? allLines.slice(offset, offset + msg.limit) : allLines.slice(offset);
+      const nextOffset = offset + page.length;
+      const nextCursor = nextOffset < totalLines ? String(nextOffset) : null;
 
       // Validate outgoing response against engine schema (double validation)
       const validated = dashboardStepLogsApiResponseSchema.safeParse({
-        lines,
-        totalLines: lines.length,
+        lines: page,
+        totalLines,
+        nextCursor,
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.step.logs response validation failed', {
@@ -1244,6 +1299,7 @@ export class DashboardHandler {
           requestId: msg.requestId,
           lines: [],
           totalLines: 0,
+          nextCursor: null,
           error: 'Internal error: response validation failed',
         });
         return;
@@ -1262,6 +1318,7 @@ export class DashboardHandler {
         requestId: msg.requestId,
         lines: validated.data.lines,
         totalLines: validated.data.totalLines,
+        nextCursor: validated.data.nextCursor ?? null,
       });
     } catch (err) {
       logger.error('Error handling dashboard.step.logs', {
@@ -1305,6 +1362,9 @@ export class DashboardHandler {
           .on(sql`execution_jobs.job_id::text`, '=', sql.ref('attestations.job_id'))
           .on(sql`execution_jobs.run_id::text`, '=', sql.ref('attestations.run_id')),
       )
+      .leftJoin('execution_runs', (join) =>
+        join.on(sql`execution_runs.run_id::text`, '=', sql.ref('attestations.run_id')),
+      )
       .select([
         'attestations.id as id',
         'attestations.job_id as jobId',
@@ -1315,6 +1375,7 @@ export class DashboardHandler {
         'attestations.media_type as mediaType',
         'attestations.storage_key as storageKey',
         'attestations.created_at as createdAt',
+        'execution_runs.local_working_tree as localWorkingTree',
       ])
       .where('attestations.run_id', '=', runId)
       .orderBy('attestations.created_at', 'asc')
@@ -1426,6 +1487,7 @@ export class DashboardHandler {
     mediaType: string;
     storageKey: string;
     createdAt: Date | string;
+    localWorkingTree?: boolean | null;
   }): Promise<AttestationListItem | null> {
     if (!this.provenanceStorage) return null;
     const raw = await this.provenanceStorage.get(row.storageKey);
@@ -1456,6 +1518,13 @@ export class DashboardHandler {
       mediaType: row.mediaType,
       createdAt: new Date(row.createdAt).toISOString(),
       bundle: bundle as AttestationListItem['bundle'],
+      // Source-origin brand: a kici run remote run executes a local working-tree
+      // overlay, so its repo/ref/sha are caller-supplied, not VCS-verified.
+      sourceOrigin: row.localWorkingTree
+        ? SourceOrigin.enum['run-remote']
+        : SourceOrigin.enum.triggered,
+      // Authoritative origin: this orchestrator's bound org id.
+      ...(this.orgId ? { originOrgId: this.orgId } : {}),
     };
   }
 
@@ -1484,6 +1553,7 @@ export class DashboardHandler {
         'attestations.verify_reason as verifyReason',
         'execution_runs.repo_identifier as repository',
         'execution_runs.workflow_name as workflow',
+        'execution_runs.local_working_tree as localWorkingTree',
       ])
       .orderBy('attestations.created_at', 'desc')
       .limit(ATTESTATIONS_PAGE_SIZE)
@@ -1510,12 +1580,66 @@ export class DashboardHandler {
       verifyReason: row.verifyReason ?? null,
       repository: row.repository ?? null,
       workflow: row.workflow ?? null,
+      sourceOrigin: row.localWorkingTree
+        ? SourceOrigin.enum['run-remote']
+        : SourceOrigin.enum.triggered,
     }));
+
+    // Surface deferred attestations still awaiting a mint, on page 1 only.
+    // These have no bundle yet; they render with a `pending` badge + a retry
+    // action. No status/name filter is applied (a pending row has no verdict).
+    const pendingSummaries =
+      page <= 1 && !filters.status ? await this.resolvePendingAttestationSummaries() : [];
+
     return {
-      rows: summaries,
-      total: Number(countRow?.count ?? 0),
+      rows: [...pendingSummaries, ...summaries],
+      total: Number(countRow?.count ?? 0) + pendingSummaries.length,
       pageSize: ATTESTATIONS_PAGE_SIZE,
     };
+  }
+
+  /** Map the deferred-attestation outbox into pending list summaries (page 1). */
+  private async resolvePendingAttestationSummaries(): Promise<AttestationListSummary[]> {
+    const rows = await basePendingAttestationsQuery(this.db)
+      .select([
+        'pending_attestations.id as id',
+        'pending_attestations.run_id as runId',
+        'pending_attestations.job_id as jobId',
+        'execution_jobs.job_name as jobName',
+        'pending_attestations.subject_name as subjectName',
+        'pending_attestations.subject_digest as subjectDigest',
+        'pending_attestations.media_type as mediaType',
+        'pending_attestations.origin_kind as originKind',
+        'pending_attestations.created_at as createdAt',
+        'execution_runs.repo_identifier as repository',
+        'execution_runs.workflow_name as workflow',
+        'execution_runs.local_working_tree as localWorkingTree',
+      ])
+      .orderBy('pending_attestations.created_at', 'desc')
+      .limit(ATTESTATIONS_PAGE_SIZE)
+      .execute();
+    return rows.map((row) => ({
+      id: row.id,
+      runId: row.runId,
+      jobId: row.jobId,
+      jobName: row.jobName ?? null,
+      subjectName: row.subjectName,
+      subjectDigest: row.subjectDigest,
+      mode: 'kici',
+      mediaType: row.mediaType,
+      createdAt: new Date(row.createdAt).toISOString(),
+      verifyStatus: attestationVerifyStatusSchema.enum.pending,
+      verifyReason: null,
+      repository: row.repository ?? null,
+      workflow: row.workflow ?? null,
+      sourceOrigin: row.localWorkingTree
+        ? SourceOrigin.enum['run-remote']
+        : SourceOrigin.enum.triggered,
+      attestationOrigin: AttestationOrigin.safeParse(row.originKind).success
+        ? (row.originKind as 'deferred' | 'offline-backfill')
+        : AttestationOrigin.enum.deferred,
+      pending: true,
+    }));
   }
 
   /**
@@ -1598,6 +1722,68 @@ export class DashboardHandler {
   }
 
   /**
+   * Handle a dashboard.attestation.retry request: drain the deferred-attestation
+   * outbox (optionally scoped to one run) and reply with the mint counts. The
+   * mint happens in this orchestrator process, which owns the Platform WS.
+   */
+  async handleAttestationRetry(msg: DashboardAttestationRetryRequest): Promise<void> {
+    const ctx = this.contextOrFallback(null);
+    const target = { type: 'attestation' as const, id: msg.runId ?? 'all' };
+    // Defense-in-depth: the orch refuses the drain when the operator has
+    // switched `attestations.retry` off (CLI-only). Keyed on the bound org.
+    if (
+      !(await this.enforcePolicy(
+        { actor: msg.actor, requestId: msg.requestId, orgId: this.orgId ?? '' },
+        'attestations.retry',
+        'dashboard.attestation.retry.response',
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        ctx,
+      ))
+    ) {
+      return;
+    }
+    try {
+      if (!this.retryAttestations) {
+        throw new Error('deferred-attestation retry is not available on this orchestrator');
+      }
+      const result = await this.retryAttestations(msg.runId ? { runId: msg.runId } : {});
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'allowed',
+      );
+      this.send({
+        type: 'dashboard.attestation.retry.response',
+        requestId: msg.requestId,
+        minted: result.minted,
+        stillPending: result.stillPending,
+      });
+    } catch (err) {
+      logger.error('Error handling dashboard.attestation.retry', { error: toErrorMessage(err) });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['attestations.read'],
+        target,
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.attestation.retry.response',
+        requestId: msg.requestId,
+        minted: 0,
+        stillPending: 0,
+        error: 'Failed to retry deferred attestations',
+      });
+    }
+  }
+
+  /**
    * Handle a dashboard.attestation.get request: a single attestation by id with
    * its bundle inlined for the detail page. Resolves the run-owning org for the
    * access-log row, then logs against the `attestation` target.
@@ -1613,6 +1799,9 @@ export class DashboardHandler {
             .on(sql`execution_jobs.job_id::text`, '=', sql.ref('attestations.job_id'))
             .on(sql`execution_jobs.run_id::text`, '=', sql.ref('attestations.run_id')),
         )
+        .leftJoin('execution_runs', (join) =>
+          join.on(sql`execution_runs.run_id::text`, '=', sql.ref('attestations.run_id')),
+        )
         .select([
           'attestations.id as id',
           'attestations.run_id as runId',
@@ -1626,6 +1815,7 @@ export class DashboardHandler {
           'attestations.created_at as createdAt',
           'attestations.verify_status as verifyStatus',
           'attestations.verify_reason as verifyReason',
+          'execution_runs.local_working_tree as localWorkingTree',
         ])
         .where('attestations.id', '=', msg.attestationId)
         .executeTakeFirst();
@@ -1911,7 +2101,12 @@ export class DashboardHandler {
     const ctx = this.contextOrFallback(resolved);
 
     try {
-      const result = await this.onRerun(msg.runId, stringifyActor(msg.actor), msg.routingKey);
+      const result = await this.onRerun(
+        msg.runId,
+        stringifyActor(msg.actor),
+        agentLabelOf(msg.actor),
+        msg.routingKey,
+      );
 
       this.recordAccess(
         ctx,
@@ -1969,7 +2164,12 @@ export class DashboardHandler {
   async handleCancelRequest(msg: RunCancelRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
-      const result = await this.onCancel(msg.runId, stringifyActor(msg.actor), msg.force);
+      const result = await this.onCancel(
+        msg.runId,
+        stringifyActor(msg.actor),
+        agentLabelOf(msg.actor),
+        msg.force,
+      );
 
       this.recordAccess(
         ctx,
@@ -2169,6 +2369,8 @@ export class DashboardHandler {
         fromTimestamp: msg.fromTimestamp,
         toTimestamp: msg.toTimestamp,
         q: msg.q,
+        agentLabel: msg.agentLabel,
+        agentOnly: msg.agentOnly,
         limit: msg.limit,
         cursor: msg.cursor,
       });
@@ -2788,7 +2990,11 @@ export class DashboardHandler {
   async handleManualScheduleRequest(msg: ManualScheduleRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRegistration(msg.registrationId));
     try {
-      const result = await this.onManualSchedule(msg.registrationId, stringifyActor(msg.actor));
+      const result = await this.onManualSchedule(
+        msg.registrationId,
+        stringifyActor(msg.actor),
+        agentLabelOf(msg.actor),
+      );
 
       this.recordAccess(
         ctx,
@@ -2986,6 +3192,9 @@ export class DashboardHandler {
       error_message: typeof r.error_message === 'string' ? r.error_message : null,
       runs_on_labels: typeof r.runs_on_labels === 'string' ? r.runs_on_labels : null,
       environments: typeof r.environments === 'string' ? r.environments : null,
+      skipped_environments:
+        typeof r.skipped_environments === 'string' ? r.skipped_environments : null,
+      env_warning: typeof r.env_warning === 'string' ? r.env_warning : null,
       outputs: typeof r.outputs === 'string' ? r.outputs : null,
       init_failure: (r.init_failure as InitFailure | null) ?? null,
     }));
@@ -3118,7 +3327,9 @@ interface RunSummaryRow {
   parent_run_id: string | null;
   original_run_id: string | null;
   triggered_by: string | null;
+  triggered_by_agent_label: string | null;
   cancelled_by: string | null;
+  cancelled_by_agent_label: string | null;
   failure_reason: string | null;
 }
 
@@ -3164,7 +3375,9 @@ function mapRunSummary(
     ...(r.parent_run_id ? { parentRunId: r.parent_run_id } : {}),
     ...(r.original_run_id ? { originalRunId: r.original_run_id } : {}),
     ...(r.triggered_by ? { triggeredBy: r.triggered_by } : {}),
+    ...(r.triggered_by_agent_label ? { triggeredByAgentLabel: r.triggered_by_agent_label } : {}),
     ...(r.cancelled_by ? { cancelledBy: r.cancelled_by } : {}),
+    ...(r.cancelled_by_agent_label ? { cancelledByAgentLabel: r.cancelled_by_agent_label } : {}),
     ...(r.failure_reason ? { failureReason: r.failure_reason } : {}),
     ...(agg ? { jobCount: agg.jobCount, hadCompileJob: agg.compileJobId !== null } : {}),
     ...(agg?.compileJobId ? { compileJobId: agg.compileJobId } : {}),

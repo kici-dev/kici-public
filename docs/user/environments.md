@@ -88,9 +88,9 @@ job('deploy', {
 
 **Merge order — last wins.** All bound environments are resolved on every dispatch (webhook, scheduled, and test runs alike) and merged in array order. When the same secret or variable key is defined in more than one environment, the later entry in the array wins. With `environments: ['staging', 'my-testing']`, a key defined in both resolves to `my-testing`'s value; keys defined in only one are preserved. The longest-scope-path-wins rule still applies _within_ each environment.
 
-**Protection rules combine all-must-pass.** A job must satisfy **every** bound environment's gates — adding an environment can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all environments; the minimum trust tier is the most restrictive across them; required reviewers are the union of all environments' reviewers; the wait timer is the longest; and the hold expiry is the shortest. If a run is gated out, the rejection names which environment and which rule rejected it (visible via `kici status` and the run's rejection reason), so a mutually-exclusive set of rules surfaces as a clear failure rather than a silent perpetual rejection.
+**Protection rules combine all-must-pass.** A job must satisfy **every** bound environment's gates — adding an environment can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all environments; the minimum trust tier is the most restrictive across them; required reviewers are the union of all environments' reviewers; the wait timer is the longest; and the hold expiry is the shortest. If a run is gated out, the rejection names which environment and which rule rejected it (visible via `kici runs show <run-id>` and the run's rejection reason), so a mutually-exclusive set of rules surfaces as a clear failure rather than a silent perpetual rejection.
 
-**Skip-on-test.** On a test or local run (`kici run remote`, `kici run local`), any bound environment that disallows local execution is skipped — its variables and secrets are omitted from the merge and its gates are not evaluated. This makes the test-only-variables pattern work: with `environments: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves just `my-testing`'s variables. If every bound environment disallows test runs, the job runs with no environment variables and a clear warning.
+**Skip-on-test (allow-and-warn).** On a test or local run (`kici run remote`, `kici run local`), a bound environment never rejects the run. Any bound environment that disallows local execution (`allowLocalExecution: false`) — or that is not configured — is **skipped**: its variables and secrets are omitted from the merge and its gates are not evaluated. The run proceeds, and a user-visible warning naming the skipped environment(s) is shown both on the `kici run remote` CLI output and on the dashboard run view. This makes the test-only-variables pattern work: with `environments: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves just `my-testing`'s variables and warns that `staging` was skipped. If every bound environment is skipped, the job runs with no environment variables. This is intentionally different from a fixture `secrets:` mapping, which is fail-closed — see the [testing guide](./testing-guide.md).
 
 **Unconfigured environments contribute nothing at dispatch.** At dispatch time a bound environment name with no matching configured environment (and no matching glob environment) simply adds no variables, secrets, or protection rules — the job still runs, exactly as a single dynamic environment resolving to an as-yet-unconfigured name does today.
 
@@ -141,19 +141,24 @@ If no `concurrencyGroup` is specified, the environment name is used as the defau
 
 Inside a step, the `ctx` object provides:
 
-| Property          | Type                                  | Description                                                                  |
-| ----------------- | ------------------------------------- | ---------------------------------------------------------------------------- |
-| `ctx.environment` | `string \| undefined`                 | Resolved environment name (undefined for jobs without environment)           |
-| `ctx.env`         | `Record<string, string \| undefined>` | Environment variables (merged from system, org, source, and job-level `env`) |
-| `ctx.secrets`     | `StepSecretsTyped`                    | Async accessor for bound secrets (get, expose, has, getMeta)                 |
+| Property          | Type                                  | Description                                                                               |
+| ----------------- | ------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `ctx.environment` | `string \| undefined`                 | Resolved environment name (undefined for jobs without environment)                        |
+| `ctx.env`         | `Record<string, string \| undefined>` | Environment variables (merged from system, org, source, and job-level `env`)              |
+| `ctx.secrets`     | `StepSecretsTyped`                    | Async accessor for bound secrets (get, expose, has, getMeta, list, mountFile, exposeFile) |
 
-| Method                          | Returns                   | Description                                                                                                                       |
-| ------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `await ctx.secrets.get(key)`    | `string`                  | Retrieve a secret value. Throws `SecretNotFoundError` if not found.                                                               |
-| `await ctx.secrets.expose(key)` | `void`                    | Inject a secret into the step's environment variables (`ctx.env`). Throws `SecretNotFoundError` if not found.                     |
-| `ctx.secrets.has(key)`          | `boolean`                 | Check if a secret key exists. Synchronous, never throws.                                                                          |
-| `ctx.secrets.getMeta(key)`      | `SecretMeta \| undefined` | Retrieve metadata (value, backend name, scope path) for a resolved secret. Returns `undefined` if not found.                      |
-| `ctx.setSecretOutput(key, val)` | `void`                    | Publish an encrypted secret output from this job, consumable by downstream jobs via `needs`. Never logged or stored in plaintext. |
+| Method                                       | Returns                   | Description                                                                                                                                                        |
+| -------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `await ctx.secrets.get(key)`                 | `string`                  | Retrieve a secret value. Throws `SecretNotFoundError` if not found.                                                                                                |
+| `await ctx.secrets.expose(key)`              | `void`                    | Set the secret as an environment variable for this step — visible via `ctx.env` and to child processes (`process.env`). Throws `SecretNotFoundError` if not found. |
+| `ctx.secrets.has(key)`                       | `boolean`                 | Check if a secret key exists. Synchronous, never throws.                                                                                                           |
+| `ctx.secrets.getMeta(key)`                   | `SecretMeta \| undefined` | Retrieve metadata (value, backend name, scope path) for a resolved secret. Returns `undefined` if not found.                                                       |
+| `ctx.secrets.list()`                         | `string[]`                | Every secret key available to the step, sorted alphabetically. Synchronous, never throws.                                                                          |
+| `await ctx.secrets.mountFile(opts)`          | `{ path }`                | Materialise one or more secrets to a per-step tmpfile (auto-removed at step end). See [Secrets → Mounting secrets as files](secrets.md#mounting-secrets-as-files). |
+| `await ctx.secrets.exposeFile(envVar, opts)` | `{ path }`                | `mountFile` plus `process.env[envVar] = path`; the env var is unset at step end.                                                                                   |
+| `ctx.setSecretOutput(key, val)`              | `void`                    | Publish an encrypted secret output from this job, consumable by downstream jobs via `needs`. Never logged or stored in plaintext.                                  |
+
+The full secrets API — including `SecretFileOptions`, log masking, and the canonical `sops` example — is documented in [Secrets](secrets.md).
 
 ## Environment variable merge precedence
 
@@ -280,7 +285,7 @@ Each environment has four tabs:
 
 A job's bound deployment environments are shown as chips on the run detail page (in the job metadata panel) in the order the job declared them, and the distinct set across a run's jobs appears as compact chips on the run list. For a multi-environment job the chips read left-to-right in merge order — later environments override earlier ones on key collisions. A `(dynamic)` chip marks an environment whose name is computed at runtime; it resolves to the real name once the run starts. A job that binds a single environment shows one chip; a job that binds none shows no chip.
 
-If a multi-environment binding is gated out, the run's failure banner names which environment and which rule rejected it (the same all-must-pass detail surfaced by `kici status`).
+If a multi-environment binding is gated out, the run's failure banner names which environment and which rule rejected it (the same all-must-pass detail surfaced by `kici runs show <run-id>`).
 
 ### Secrets management
 

@@ -3,7 +3,7 @@
  * env var (or the `--platform-endpoint` flag) is unset, login resolves
  * these so a developer targeting the hosted KiCI Platform authenticates
  * with no setup. Setting the env var overrides the default — staging E2E
- * and self-hosted Platforms depend on that override path.
+ * and other KiCI environments depend on that override path.
  *
  * Resolution is login-local: these are read into locals in `oauthLogin`,
  * never written back into `process.env`, so the orchestrator's separate

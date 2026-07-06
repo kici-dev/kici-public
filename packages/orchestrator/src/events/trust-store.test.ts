@@ -100,7 +100,9 @@ describe('TrustStore', () => {
       expect(result).toBe(false);
     });
 
-    it('should return true when allowed_events is an empty array', async () => {
+    it('denies all events when allowed_events is an empty array', async () => {
+      // A non-null empty allow-list is a deliberate deny-all: null is the
+      // allow-all sentinel, so an explicit [] must permit nothing.
       const { db } = createMockDb({
         selectFirstRow: { allowed_events: JSON.stringify([]) },
       });
@@ -114,7 +116,41 @@ describe('TrustStore', () => {
         'any-event',
       );
 
-      expect(result).toBe(true);
+      expect(result).toBe(false);
+    });
+
+    it('fails closed when allowed_events is unparseable JSON', async () => {
+      const { db } = createMockDb({
+        selectFirstRow: { allowed_events: 'not json' },
+      });
+      const store = new TrustStore(db);
+
+      const result = await store.isTrusted(
+        'org/repo-a',
+        'github:42',
+        'org/repo-b',
+        'github:99',
+        'any-event',
+      );
+
+      expect(result).toBe(false);
+    });
+
+    it('fails closed when allowed_events parses to a non-array', async () => {
+      const { db } = createMockDb({
+        selectFirstRow: { allowed_events: JSON.stringify({ not: 'an array' }) },
+      });
+      const store = new TrustStore(db);
+
+      const result = await store.isTrusted(
+        'org/repo-a',
+        'github:42',
+        'org/repo-b',
+        'github:99',
+        'any-event',
+      );
+
+      expect(result).toBe(false);
     });
 
     it('should handle allowed_events already parsed as array', async () => {
@@ -171,6 +207,25 @@ describe('TrustStore', () => {
       expect(mocks.insertValues).toHaveBeenCalledWith(
         expect.objectContaining({
           allowed_events: null,
+        }),
+      );
+    });
+
+    it('persists an empty allow-list as "[]" (deny-all), not null', async () => {
+      const { db, mocks } = createMockDb({ insertReturning: { id: 'trust-1' } });
+      const store = new TrustStore(db);
+
+      await store.addTrust(
+        { repo: 'org/repo-a', routingKey: 'github:42' },
+        { repo: 'org/repo-b', routingKey: 'github:99' },
+        [],
+      );
+
+      // The stored value must be the JSON empty array (not null), so isTrusted
+      // reads it back as a deny-all rather than the allow-all null sentinel.
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          allowed_events: JSON.stringify([]),
         }),
       );
     });

@@ -143,3 +143,55 @@ them. When the issuer is absent (provenance not configured), every verdict is
 recorded as `unverifiable` rather than silently `verified`. The orchestrator
 never mints tokens or holds signing material — it only consumes the public
 issuer + key set to check bundles.
+
+## Deferred attestations (attest-later)
+
+Minting the identity token is the one part of attestation that needs the hosted
+Platform. When the Platform is briefly unreachable during a build's mint, the
+attestation is **deferred** rather than lost, and the job stays green.
+
+The lifecycle:
+
+1. **Freeze at build time.** The agent builds the statement from its own job
+   context and DSSE-signs it with its ephemeral key immediately — no Platform
+   needed. The attested facts are sealed live; only the identity token is
+   deferred.
+2. **Capture to a durable outbox.** On a transient mint failure the agent
+   reports the frozen envelope, ephemeral public key, and a `statement_hash` to
+   the orchestrator, which records a row in the cluster-shared
+   `pending_attestations` outbox. A permanent rejection (a genuinely bad request)
+   still fails the step — only transient failures defer.
+3. **Fulfil later.** A Raft-leader-only retrier mints each pending attestation
+   exactly once — on a periodic sweep and immediately when the orchestrator's
+   Platform connection re-authenticates. It requests the identity token bound to
+   the frozen `statement_hash`, attaches it to the already-frozen envelope,
+   uploads the bundle, records the attestation with a verify-at-ingest verdict,
+   and drains the outbox row. Operators can trigger a drain on demand with
+   `kici-admin attestations retry`.
+4. **Run-sync backfill.** A run ingested while the Platform was fully down has no
+   Platform run/job records for the mint to read, so the retrier first replays
+   the run and job status the Platform missed (the same org-asserted data the
+   live path sends), then mints.
+
+### Truth contract
+
+Deferral preserves the attestation's truth:
+
+- **No tamper window.** The statement is frozen and DSSE-signed at build time;
+  the digest _is_ the artifact.
+- **Statement-hash binding.** The deferred identity token commits to the frozen
+  statement by hash, so the Platform identity cannot be re-bound to a different
+  artifact at retry time. A verifier recomputes the hash and hard-fails on a
+  mismatch.
+- **Temporal honesty.** The predicate keeps the true build timestamps; the token
+  is minted later against a knowingly-completed job (the Platform relaxes its
+  live-job check only for an explicitly-flagged deferred mint). The bundle
+  carries a mint-timing marker — `deferred`, or `offline-backfill` for a
+  fully-offline-ingested run — so the gap is disclosed, never hidden.
+- **Anchor preserved.** The organization id remains the only un-forgeable anchor,
+  exactly as in the live path; `repo` / `ref` / `sha` are organization-asserted
+  in both paths, so backfill concedes no independence the live path did not.
+
+`kici verify-attestation` surfaces the `deferred` / `offline-backfill` marker on
+a PASS; the orchestrator exposes `kici_orch_pending_attestations_current` and
+`kici_orch_pending_attestation_oldest_age_seconds` gauges for the outbox depth.

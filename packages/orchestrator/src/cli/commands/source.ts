@@ -60,8 +60,8 @@ function safeParse(value: string): unknown {
  */
 function webhookNoteReason(note: string | undefined): string {
   switch (note) {
-    case 'github-ingress-platform-only':
-      return 'this orchestrator runs in independent mode';
+    case 'no-public-url':
+      return 'KICI_WEBHOOK_PUBLIC_URL is not set on the orchestrator';
     case 'platform-no-public-url':
       return 'the Platform has no public webhook URL configured';
     case 'platform-unavailable':
@@ -74,8 +74,8 @@ function webhookNoteReason(note: string | undefined): string {
 /** Actionable next-step hint paired with {@link webhookNoteReason}. */
 function webhookNoteHint(note: string | undefined): string {
   switch (note) {
-    case 'github-ingress-platform-only':
-      return 'GitHub App ingress is served by the KiCI Platform; find the URL in the dashboard under Sources.';
+    case 'no-public-url':
+      return "Set KICI_WEBHOOK_PUBLIC_URL to the orchestrator's public base, then re-run; paste the printed URL into your GitHub App or repo webhook.";
     case 'platform-unavailable':
       return 'Retry once the orchestrator reconnects, or find the URL in the dashboard under Sources.';
     default:
@@ -371,6 +371,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
 
         const result = await getClient().post<{
           routingKey: string;
+          id: string;
           name: string;
           webhookUrl: string | null;
           webhookNote?: string;

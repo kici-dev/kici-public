@@ -74,7 +74,7 @@ The agent requires `git`, a shell (`bash` on Linux/macOS, `pwsh` on Windows), `n
 
 ### Publishing (maintainers)
 
-Packages are published in dependency order using `packages/ci/src/release.ts` (invoked as `pnpm release <pkg>` or `pnpm release --all`). The script publishes one or more workspace packages to the npm registry, then bumps every workspace `package.json` version (root + 8 publishables) so subsequent local builds emit prereleases against the new base. Each package's `prepublishOnly` script regenerates `sbom.spdx.json` before the tarball is packed, so the published SBOM always matches the published version.
+Packages are published in dependency order using `packages/ci/src/release.ts` (invoked as `pnpm release <pkg>` or `pnpm release --all`). The script publishes one or more workspace packages to the npm registry, then bumps every workspace `package.json` version (root + 8 publishables) so subsequent local builds emit prereleases against the new base. The bump level is derived automatically from the release's unreleased changelog fragments — a `feature` fragment produces a minor bump, anything else a patch — and can be overridden with `--minor` / `--patch`; the major version is locked behind `--major --allow-major` until a GA milestone. Each package's `prepublishOnly` script regenerates `sbom.spdx.json` before the tarball is packed, so the published SBOM always matches the published version.
 
 ### Public release phase (maintainers)
 

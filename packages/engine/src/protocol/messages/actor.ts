@@ -46,6 +46,17 @@ export const apiKeyActorSchema = z.object({
   keyId: z.string().min(1),
   /** Keycloak sub of the human who owns this key. */
   ownerSub: z.string().min(1),
+  /**
+   * Present when the org API key is agent-kind (e.g. a service account driving
+   * KiCI via the developer MCP server). Unlike the user actor's agent, no
+   * separate id is needed — `keyId` already identifies the credential. The key
+   * still inherits the org's permissions; the label is provenance only.
+   */
+  agent: z
+    .object({
+      label: z.string().min(1),
+    })
+    .optional(),
 });
 export type ApiKeyActor = z.infer<typeof apiKeyActorSchema>;
 
@@ -107,7 +118,9 @@ export function stringifyActor(actor: ActorPrincipal): string {
     case 'user':
       return actor.agent ? `user:${actor.sub} via agent:${actor.agent.label}` : `user:${actor.sub}`;
     case 'api_key':
-      return `api_key:${actor.keyId}`;
+      return actor.agent
+        ? `api_key:${actor.keyId} via agent:${actor.agent.label}`
+        : `api_key:${actor.keyId}`;
     case 'service_account':
       return `service_account:${actor.id}`;
     case 'platform_operator':
@@ -162,7 +175,9 @@ export function flattenActor(actor: ActorPrincipal): {
       return {
         actorType: 'api_key',
         actorId: actor.keyId,
-        actorMeta: { ownerSub: actor.ownerSub },
+        actorMeta: actor.agent
+          ? { ownerSub: actor.ownerSub, agentLabel: actor.agent.label }
+          : { ownerSub: actor.ownerSub },
       };
     case 'service_account':
       return { actorType: 'service_account', actorId: actor.id, actorMeta: null };
@@ -178,4 +193,15 @@ export function flattenActor(actor: ActorPrincipal): {
     case 'system':
       return { actorType: 'system', actorId: actor.component, actorMeta: null };
   }
+}
+
+/**
+ * Extract the agent provenance label from an actor, when present. Returns the
+ * label for agent-kind `user` (PAT) and `api_key` (org key) actors, else null.
+ * The single label extractor reused by run capture and the access-log writer so
+ * both credential families surface agent provenance identically.
+ */
+export function agentLabelOf(actor: ActorPrincipal): string | null {
+  if (actor.type === 'user' || actor.type === 'api_key') return actor.agent?.label ?? null;
+  return null;
 }

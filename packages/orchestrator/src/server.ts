@@ -101,6 +101,15 @@ const { getClusterId } = await import('./config/cluster-id.js');
 const { MetricsReporter } = await import('./metrics/metrics-reporter.js');
 const { getDashboardWritePolicy, dashboardWritePolicyEvents } =
   await import('./policy/dashboard-write-policy.js');
+const { AttestationRetrier } = await import('./provenance/attestation-retrier.js');
+const { PendingAttestationsRepo } = await import('./provenance/pending-attestations-repo.js');
+const { backfillRunToPlatform } = await import('./provenance/backfill-run.js');
+const { requestMint, MintUnavailableError, MintRelayError, MintRejectedError } =
+  await import('./ws/oidc-token-relay.js');
+const { computeAttestationVerdict } = await import('./provenance/verify-at-ingest.js');
+const { setPendingAttestations, setPendingAttestationOldestAgeSeconds, setRejectedAttestations } =
+  await import('./metrics/prometheus.js');
+const { provenanceStorageKey } = await import('@kici-dev/engine/provenance/bundle');
 
 // Type-only imports (safe as static — erased at runtime, no meter creation)
 import type { IdentityLink, PermissionLevel } from './security/trust-resolver.js';
@@ -112,6 +121,7 @@ import type { ReleaseSignal } from './environments/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import type { PeerClient as PeerClientT } from './cluster/peer-client.js';
 import { verifyInboundWebhook } from './webhook/verify-inbound.js';
+import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
 import type { DashboardWritePolicyMap } from '@kici-dev/engine/protocol/dashboard-write-operations';
 
 setServiceName('orchestrator');
@@ -175,6 +185,9 @@ await guardStartup(logger, async () => {
 
   // Platform-specific state (closures captured by hooks)
   let platformClient: InstanceType<typeof PlatformClient>;
+  // Deferred-attestation retrier: constructed after the platform client, driven
+  // on a timer (leader-gated) and on every Platform re-authentication.
+  let attestationRetrier: InstanceType<typeof AttestationRetrier> | undefined;
 
   const hooks: OrchestratorHooks = {
     logPrefix: 'server',
@@ -209,6 +222,9 @@ await guardStartup(logger, async () => {
             ...(context.parentRunId != null && { parentRunId: context.parentRunId }),
             ...(context.originalRunId != null && { originalRunId: context.originalRunId }),
             ...(context.triggeredBy != null && { triggeredBy: context.triggeredBy }),
+            ...(context.triggeredByAgentLabel != null && {
+              triggeredByAgentLabel: context.triggeredByAgentLabel,
+            }),
             ...((context.triggerActorUsername != null || context.triggerActorUserId != null) &&
               context.provider && { triggerActorProvider: context.provider }),
             ...(context.triggerActorUsername != null && {
@@ -526,13 +542,20 @@ await guardStartup(logger, async () => {
         provenanceStorage: sub.cacheStorage,
         coldStore: sub.coldStore,
         eventStore: sub.eventStore,
+        // Drains the deferred-attestation outbox in this process (owns the
+        // Platform WS). Wired lazily — the retrier is constructed below.
+        retryAttestations: (opts: { runId?: string; includeRejected?: boolean }) =>
+          attestationRetrier
+            ? attestationRetrier.runOnce(opts)
+            : Promise.resolve({ minted: 0, stillPending: 0, rejected: 0 }),
         send: (msg) => dashboardSendFn?.(msg),
         orchestratorId: config.instanceId,
         accessLog: sub.accessLogWriter,
-        onRerun: async (runId, triggeredBy, routingKey) => {
+        onRerun: async (runId, triggeredBy, triggeredByAgentLabel, routingKey) => {
           return handleRerun(
             runId,
             triggeredBy,
+            triggeredByAgentLabel,
             {
               db: sub.db,
               logStorage: sub.logStorage,
@@ -555,8 +578,8 @@ await guardStartup(logger, async () => {
             routingKey,
           );
         },
-        onManualSchedule: async (registrationId, triggeredBy) => {
-          return handleManualSchedule(registrationId, triggeredBy, {
+        onManualSchedule: async (registrationId, triggeredBy, triggeredByAgentLabel) => {
+          return handleManualSchedule(registrationId, triggeredBy, triggeredByAgentLabel, {
             db: sub.db,
             logStorage: sub.logStorage,
             providerRegistry: sub.providerRegistry,
@@ -577,7 +600,7 @@ await guardStartup(logger, async () => {
             coldStore: sub.coldStore,
           });
         },
-        onCancel: async (runId, cancelledBy, force) => {
+        onCancel: async (runId, cancelledBy, cancelledByAgentLabel, force) => {
           const jobIds = await sub.queue.getDispatchedJobIdsByRunId(runId);
           let sent = 0;
           const reason = cancelledBy
@@ -608,7 +631,12 @@ await guardStartup(logger, async () => {
             try {
               await sub.db
                 .updateTable('execution_runs')
-                .set({ cancelled_by: cancelledBy })
+                .set({
+                  cancelled_by: cancelledBy,
+                  ...(cancelledByAgentLabel != null && {
+                    cancelled_by_agent_label: cancelledByAgentLabel,
+                  }),
+                })
                 .where('run_id', '=', runId)
                 .execute();
             } catch (err) {
@@ -1037,6 +1065,7 @@ await guardStartup(logger, async () => {
         onDashboardAttestationsList: (msg) => dashboardHandler.handleAttestationsList(msg),
         onDashboardAttestationsListAll: (msg) => dashboardHandler.handleAttestationsListAll(msg),
         onDashboardAttestationGet: (msg) => dashboardHandler.handleAttestationGet(msg),
+        onDashboardAttestationRetry: (msg) => dashboardHandler.handleAttestationRetry(msg),
         onRunRerun: (msg) => dashboardHandler.handleRerunRequest(msg),
         onManualSchedule: (msg) => dashboardHandler.handleManualScheduleRequest(msg),
         onRunCancel: (msg) => dashboardHandler.handleCancelRequest(msg),
@@ -1460,6 +1489,10 @@ await guardStartup(logger, async () => {
               error: toErrorMessage(err),
             });
           }
+
+          // Platform is back: drain any deferred attestations now (leader-gated
+          // inside the retrier) rather than waiting for the next timer tick.
+          attestationRetrier?.triggerNow();
         },
         onVerifyInbound: async (meta, body) => {
           if (!sub.pgSecretStore) {
@@ -1601,6 +1634,152 @@ await guardStartup(logger, async () => {
       });
       metricsReporter.start();
 
+      // Deferred-attestation retrier. Leader-gated inside each tick, so it is
+      // safe to start on every coordinator; only the Raft leader mints, and the
+      // `attestations` unique index makes fulfilment idempotent cluster-wide.
+      const pendingAttestationsRepo = new PendingAttestationsRepo(sub.db);
+      const instanceId = config.instanceId;
+      attestationRetrier = new AttestationRetrier({
+        repo: pendingAttestationsRepo,
+        orchestratorId: instanceId,
+        intervalMs: 60_000,
+        isLeader: () => sub.raft.isLeader(),
+        provenanceStorageKey,
+        requestMint: async (a) => {
+          try {
+            return await requestMint({
+              platformClient,
+              orchestratorId: a.orchestratorId,
+              runId: a.runId,
+              jobId: a.jobId,
+              audience: a.audience,
+              deferred: a.deferred,
+            });
+          } catch (err) {
+            // A transient mint failure DEFERS (retried later). A definitive
+            // Platform rejection (run/job absent) is terminal — surfaced so the
+            // retrier stamps rejected_at and stops re-attempting it.
+            if (err instanceof MintUnavailableError) return { deferred: true, code: 'unavailable' };
+            if (err instanceof MintRelayError) return { deferred: true, code: 'failed' };
+            if (err instanceof MintRejectedError) return { rejected: true, reason: err.message };
+            throw err;
+          }
+        },
+        uploadBundle: async ({ bundle, storageKey }) => {
+          if (!sub.cacheStorage) throw new Error('provenance storage unavailable');
+          await sub.cacheStorage.put(storageKey, JSON.stringify(bundle));
+          await sub.cacheStorage.initMeta(storageKey);
+        },
+        computeVerdict: async (storageKey) => {
+          const v = await computeAttestationVerdict({
+            trustRoot: sub.provenanceTrustRoot,
+            storage: sub.cacheStorage,
+            storageKey,
+          });
+          return {
+            verifyStatus: v.verifyStatus,
+            verifyReason: v.verifyReason,
+            verifiedAt: v.verifiedAt,
+          };
+        },
+        recordAttestation: async (r) => {
+          // Idempotent across the cluster via the uq_attestations_run_job_subject
+          // unique index (migration 065).
+          await sub.db
+            .insertInto('attestations')
+            .values({
+              id: crypto.randomUUID(),
+              run_id: r.runId,
+              job_id: r.jobId,
+              subject_name: r.subjectName,
+              subject_digest: r.subjectDigest,
+              storage_key: r.storageKey,
+              mode: 'kici',
+              media_type: r.mediaType,
+              verify_status: r.verifyStatus,
+              verify_reason: r.verifyReason,
+              verified_at: r.verifiedAt,
+            })
+            .onConflict((oc) => oc.columns(['run_id', 'job_id', 'subject_digest']).doNothing())
+            .execute();
+        },
+        backfillRun: (runId) =>
+          backfillRunToPlatform(
+            {
+              send: (m) => platformClient.send(m),
+              loadRun: async (rid) => {
+                const row = await sub.db
+                  .selectFrom('execution_runs')
+                  .select([
+                    'run_id',
+                    'workflow_name',
+                    'status',
+                    'repo_identifier',
+                    'provider',
+                    'local_working_tree',
+                    'sha',
+                    'ref',
+                    'started_at',
+                    'completed_at',
+                    'duration_ms',
+                  ])
+                  .where('run_id', '=', rid)
+                  .executeTakeFirst();
+                return row
+                  ? {
+                      run_id: row.run_id,
+                      workflow_name: row.workflow_name,
+                      status: row.status,
+                      repo_identifier: row.repo_identifier,
+                      provider: row.provider,
+                      local_working_tree: row.local_working_tree,
+                      sha: row.sha,
+                      ref: row.ref,
+                      job_count: null,
+                      started_at: row.started_at,
+                      completed_at: row.completed_at,
+                      duration_ms: row.duration_ms,
+                    }
+                  : null;
+              },
+              loadJobs: async (rid) => {
+                const rows = await sub.db
+                  .selectFrom('execution_jobs')
+                  .select([
+                    'run_id',
+                    'job_id',
+                    'job_name',
+                    'status',
+                    'agent_id',
+                    'started_at',
+                    'completed_at',
+                  ])
+                  .where('run_id', '=', rid)
+                  .execute();
+                return rows.map((j) => ({
+                  run_id: j.run_id,
+                  job_id: j.job_id,
+                  job_name: j.job_name,
+                  status: j.status,
+                  started_at: j.started_at,
+                  completed_at: j.completed_at,
+                  agent_id: j.agent_id,
+                  orchestrator_id: instanceId,
+                }));
+              },
+            },
+            runId,
+          ),
+        setMetrics: (count, oldest, rejected) => {
+          setPendingAttestations(count);
+          setPendingAttestationOldestAgeSeconds(
+            oldest ? (Date.now() - oldest.getTime()) / 1000 : 0,
+          );
+          setRejectedAttestations(rejected);
+        },
+      });
+      attestationRetrier.start();
+
       // Static peer dial: when KICI_CLUSTER_PEERS is configured, dial each
       // listed peer directly so coord-to-coord WS mesh forms without waiting
       // on Platform-mediated discovery. Workers already use coordinatorUrls
@@ -1639,8 +1818,18 @@ await guardStartup(logger, async () => {
             fullSources,
             params.routingKey,
           );
-          return webhookUrl
-            ? { webhookUrl }
+          if (webhookUrl) {
+            return { webhookUrl };
+          }
+          // Platform relayed no public URL — fall back to this orchestrator's
+          // own direct GitHub ingress if a public base is configured.
+          const local = buildLocalGithubIngressUrl(
+            config.webhookPublicUrl,
+            resolvedOrgContext?.orgId ?? '__default__',
+            params.sourceId,
+          );
+          return local
+            ? { webhookUrl: local }
             : { webhookUrl: null, webhookNote: 'platform-no-public-url' };
         } catch (err) {
           logger.warn('Failed to resolve GitHub webhook URL from Platform', {
@@ -1675,6 +1864,10 @@ await guardStartup(logger, async () => {
       return {
         appDepsExtras: {
           platformClient,
+          retryAttestations: (opts: { runId?: string; includeRejected?: boolean }) =>
+            attestationRetrier
+              ? attestationRetrier.runOnce(opts)
+              : Promise.resolve({ minted: 0, stillPending: 0, rejected: 0 }),
           environmentStore,
           variableStore,
           heldRunStore,
@@ -1715,6 +1908,12 @@ await guardStartup(logger, async () => {
             label: 'Stopping metrics reporter',
             fn: () => {
               metricsReporter.stop();
+            },
+          },
+          {
+            label: 'Stopping attestation retrier',
+            fn: () => {
+              attestationRetrier?.stop();
             },
           },
           {

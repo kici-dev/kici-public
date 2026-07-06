@@ -2,11 +2,12 @@ import { SlidingWindowRateLimiter } from '../helpers/rate-limiter.js';
 import type { EventRouterConfig } from './types.js';
 
 /**
- * Circuit breaker for event loop detection and per-workflow rate limiting.
+ * Circuit breaker for event loop detection and user-event rate limiting.
  *
  * Two-layer protection:
  * 1. Chain depth: Rejects events exceeding configurable max chain depth.
- * 2. Rate limiting: Sliding-window per-workflow rate limiter.
+ * 2. Rate limiting: Sliding-window limiter keyed per (source routing key +
+ *    event name). System events (`__`-prefixed) are exempt upstream.
  */
 export class EventCircuitBreaker {
   private rateLimiter: SlidingWindowRateLimiter;
@@ -29,11 +30,13 @@ export class EventCircuitBreaker {
   }
 
   /**
-   * Check if a workflow is within its per-minute rate limit.
-   * Uses a sliding window of 60 seconds.
+   * Check whether a rate-limit key is within its per-minute allowance, using a
+   * sliding 60-second window. Callers key user events by
+   * `<sourceRoutingKey>:<eventName>`; system events (`__`-prefixed) are exempt
+   * upstream and never reach here.
    */
-  checkRateLimit(workflowKey: string): { allowed: boolean; retryAfterMs?: number } {
-    return this.rateLimiter.check(workflowKey);
+  checkRateLimit(rateKey: string): { allowed: boolean; retryAfterMs?: number } {
+    return this.rateLimiter.check(rateKey);
   }
 
   /**

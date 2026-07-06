@@ -146,6 +146,8 @@ This mapping is honored by **both** `kici run local` and `kici run remote`:
 - For **`kici run local`** (see [`kici run local`](cli-reference.md#kici-run-local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
 - For **`kici run remote`**, each named context maps to an orchestrator **environment**, and the orchestrator resolves that environment's secrets for the run. The target environment must be flagged `allowLocalExecution: true` — mapping a context to a missing or non-test environment rejects the run (see [Secret contexts for testing](#secret-contexts-for-testing) below).
 
+**A fixture `secrets:` mapping is fail-closed; a job's bound `environment:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that environment's secrets. A job's own bound `environment:` (`job('deploy', { environment: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured environment it is **skipped with a warning**, not rejected, so a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped environment(s), and the dashboard run view shows the same notice. See [Skip-on-test](environments.md#multiple-environments-per-job) in the environments guide.
+
 ### Async fixtures
 
 For dynamic fixture configuration, export an async function:

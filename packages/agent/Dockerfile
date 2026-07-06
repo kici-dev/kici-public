@@ -1,7 +1,7 @@
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM dhi.io/node:24.16.0-0-debian13-dev AS builder
+FROM dhi.io/node:24.18.0-0-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.3.0 to match the runtime stage (see below): the same
@@ -114,7 +114,7 @@ RUN cd packages/shared && node --input-type=module -e "import('oxc-transform').t
 # Runtime base is the -dev variant because the agent needs apt-installed
 # host tools (git/bash/iptables) at runtime. ca-certificates ships with
 # the DHI base, so it isn't installed here.
-FROM dhi.io/node:24.16.0-0-debian13-dev
+FROM dhi.io/node:24.18.0-0-debian13-dev
 WORKDIR /app
 
 # Install the CI userland, then strip perl ENTIRELY — including the Essential

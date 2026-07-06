@@ -375,8 +375,19 @@ export class StaleRunDetector {
 
     let markedCount = 0;
     for (const job of staleJobs) {
-      const marked = await this.markJobStale(job, affectedRunIds);
-      if (marked) markedCount++;
+      try {
+        const marked = await this.markJobStale(job, affectedRunIds);
+        if (marked) markedCount++;
+      } catch (err) {
+        // Log-and-continue: one job's failure must not abort the whole scan
+        // tick and strand the remaining jobs (same per-item guard as sub-scans
+        // C and D).
+        logger.error('Error marking job stale', {
+          runId: job.run_id,
+          jobId: job.job_id,
+          error: toErrorMessage(err),
+        });
+      }
     }
 
     return markedCount;
@@ -418,8 +429,19 @@ export class StaleRunDetector {
 
     let markedCount = 0;
     for (const job of staleJobs) {
-      const marked = await this.markJobStale(job, affectedRunIds);
-      if (marked) markedCount++;
+      try {
+        const marked = await this.markJobStale(job, affectedRunIds);
+        if (marked) markedCount++;
+      } catch (err) {
+        // Log-and-continue: one job's failure must not abort the whole scan
+        // tick and strand the remaining jobs (same per-item guard as sub-scans
+        // C and D).
+        logger.error('Error marking job stale', {
+          runId: job.run_id,
+          jobId: job.job_id,
+          error: toErrorMessage(err),
+        });
+      }
     }
 
     return markedCount;

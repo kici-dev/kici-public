@@ -8,6 +8,7 @@ import {
   parseDatabaseUrl,
   seedEnvironmentDirect,
   deleteEnvironmentDirect,
+  purgeEnvironmentsDirect,
   seedEnvironmentBindingDirect,
   setEnvironmentPolicyDirect,
   listEnvironmentsDirect,
@@ -177,6 +178,46 @@ function installPoolMock(responses: MockQueryResult[]): {
     },
   };
 }
+
+describe('purgeEnvironmentsDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  it('deletes held_runs then environments scoped to an org, in a transaction', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 1 }, // DELETE FROM held_runs
+      { rows: [], rowCount: 2 }, // DELETE FROM environments
+    ]);
+    const result = await purgeEnvironmentsDirect('postgresql://u:p@h:5432/d', 'orgA');
+    expect(result).toEqual({ environmentsDeleted: 2, heldRunsDeleted: 1 });
+    expect(pool.calls.map((c) => c.sql)).toEqual([
+      'BEGIN',
+      'DELETE FROM held_runs WHERE org_id = $1',
+      'DELETE FROM environments WHERE org_id = $1',
+      'COMMIT',
+    ]);
+    expect(pool.calls[1].params).toEqual(['orgA']);
+    expect(pool.calls[2].params).toEqual(['orgA']);
+    expect(pool.endCalls).toBe(1);
+  });
+
+  it('purges all orgs (no WHERE clause, empty params) when orgId is omitted', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 0 }, // DELETE FROM held_runs
+      { rows: [], rowCount: 5 }, // DELETE FROM environments
+    ]);
+    const result = await purgeEnvironmentsDirect('postgresql://u:p@h:5432/d');
+    expect(result).toEqual({ environmentsDeleted: 5, heldRunsDeleted: 0 });
+    expect(pool.calls.map((c) => c.sql)).toEqual([
+      'BEGIN',
+      'DELETE FROM held_runs ',
+      'DELETE FROM environments ',
+      'COMMIT',
+    ]);
+    expect(pool.calls[1].params).toEqual([]);
+    expect(pool.calls[2].params).toEqual([]);
+  });
+});
 
 describe('ensureDatabase', () => {
   let pool: ReturnType<typeof installPoolMock>;

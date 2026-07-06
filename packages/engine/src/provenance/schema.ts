@@ -16,6 +16,8 @@
  *  - SLSA v1.0 provenance:  https://slsa.dev/spec/v1.0/provenance
  */
 import { z } from 'zod';
+import { SourceOrigin } from '../protocol/source-origin.js';
+import { AttestationOrigin } from './attestation-origin.js';
 
 // --- Constant URIs (single source of truth; no repeated string literals) ---
 
@@ -143,6 +145,8 @@ export const kiciWorkflowExternalParametersSchema = z
       ref: z.string(),
       path: z.string(),
     }),
+    /** Informational source provider (github / gitlab / bitbucket / local). Not a trust signal. */
+    provider: z.string().optional(),
   })
   .passthrough();
 export type KiciWorkflowExternalParameters = z.infer<typeof kiciWorkflowExternalParametersSchema>;
@@ -153,6 +157,14 @@ export const kiciWorkflowInternalParametersSchema = z
     commit: z.string().optional(),
     runId: z.string().optional(),
     jobId: z.string().optional(),
+    /** Authoritative origin: the customer's public org id (Platform-asserted). */
+    orgId: z.string().optional(),
+    /** Source-origin brand: triggered vs kici run remote (local working-tree overlay). */
+    sourceOrigin: SourceOrigin.optional(),
+    /** Mint-timing marker frozen into a deferred statement at build time. */
+    attestationOrigin: AttestationOrigin.optional(),
+    /** SHA-256 of this statement's payload — the deferred-mint binding. */
+    statementHash: z.string().optional(),
   })
   .passthrough();
 export type KiciWorkflowInternalParameters = z.infer<typeof kiciWorkflowInternalParametersSchema>;

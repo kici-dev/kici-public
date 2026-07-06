@@ -3,6 +3,8 @@ import {
   OIDC_TOKEN_REQUEST_METHOD,
   oidcTokenRequestParamsSchema,
   oidcTokenResultSchema,
+  OidcMintErrorCode,
+  deferredMintParamsSchema,
 } from './oidc-token-relay.js';
 
 describe('oidc token relay contract', () => {
@@ -36,6 +38,28 @@ describe('oidc token relay contract', () => {
 
   it('rejects a non-positive expiresIn', () => {
     expect(oidcTokenResultSchema.safeParse({ token: 't', expiresIn: 0, jti: 'j' }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe('oidc-token-relay deferred contract', () => {
+  it('accepts a deferred result with a transient code', () => {
+    const r = oidcTokenResultSchema.parse({ deferred: true, code: 'unavailable' });
+    expect(r).toEqual({ deferred: true, code: 'unavailable' });
+  });
+  it('rejects a deferred result carrying the permanent code', () => {
+    expect(oidcTokenResultSchema.safeParse({ deferred: true, code: 'rejected' }).success).toBe(
+      false,
+    );
+  });
+  it('OidcMintErrorCode keeps the 3-way contract', () => {
+    expect(OidcMintErrorCode.options).toEqual(['rejected', 'unavailable', 'failed']);
+  });
+  it('deferredMintParamsSchema requires a statement hash + non-live origin', () => {
+    const p = deferredMintParamsSchema.parse({ statementHash: 'a'.repeat(64), origin: 'deferred' });
+    expect(p.origin).toBe('deferred');
+    expect(deferredMintParamsSchema.safeParse({ statementHash: 'x', origin: 'live' }).success).toBe(
       false,
     );
   });

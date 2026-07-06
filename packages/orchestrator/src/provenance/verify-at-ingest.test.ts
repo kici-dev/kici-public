@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   SignJWT,
   calculateJwkThumbprint,
@@ -186,5 +186,57 @@ describe('computeAttestationVerdict', () => {
     const verdict = await computeAttestationVerdict({ trustRoot, storage, storageKey: 'k' });
     expect(verdict.verifyStatus).toBe(status.unverifiable);
     expect(verdict.verifyReason).toBe('bundle_unreadable');
+  });
+
+  // A JWKS containing one key whose kid is guaranteed NOT to match the
+  // fixture token's kid — simulates the cached set from before a key rotation.
+  async function jwksWithoutFixtureKid(): Promise<JSONWebKeySet> {
+    const kp = await generateKeyPair('ES256', { extractable: true });
+    const jwk = (await exportJWK(kp.publicKey)) as JWK;
+    jwk.alg = 'ES256';
+    jwk.kid = 'stale-key-' + (await calculateJwkThumbprint(jwk, 'sha256'));
+    return { keys: [jwk] };
+  }
+
+  it('refetches on kid-miss and verifies a bundle signed by a rotated-in key', async () => {
+    const { bundle, jwks } = await makeFixture(); // jwks has the token's kid
+    const staleJwks = await jwksWithoutFixtureKid(); // cached set lacks it
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(staleJwks), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(jwks), { status: 200 }));
+    const trustRoot = createProvenanceTrustRoot({
+      issuer: ISSUER,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    await trustRoot.getJwks(); // prime the cache with the stale set (no kid)
+    const verdict = await computeAttestationVerdict({
+      trustRoot,
+      storage: storageReturning(bundle),
+      storageKey: 'k',
+    });
+    expect(verdict.verifyStatus).toBe(status.verified);
+    expect(verdict.verifyReason).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(2); // primed + kid-miss refetch
+  });
+
+  it('records unverifiable/signing_key_not_published when the kid is absent even after refetch', async () => {
+    const { bundle } = await makeFixture();
+    const staleJwks = await jwksWithoutFixtureKid();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify(staleJwks), { status: 200 }));
+    const trustRoot = createProvenanceTrustRoot({
+      issuer: ISSUER,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const verdict = await computeAttestationVerdict({
+      trustRoot,
+      storage: storageReturning(bundle),
+      storageKey: 'k',
+    });
+    expect(verdict.verifyStatus).toBe(status.unverifiable);
+    expect(verdict.verifyReason).toBe('signing_key_not_published');
+    expect(verdict.verifiedAt).toBeNull();
   });
 });

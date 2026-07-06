@@ -17,6 +17,13 @@ import { createCacheStorage } from '../../storage/index.js';
 import type { CacheStorage } from '../../storage/types.js';
 import { createProvenanceTrustRoot } from '../../provenance/trust-root.js';
 import { reverifyAttestations } from './attestations-reverify.js';
+import type { AdminApiClient } from '../api-client.js';
+import { runAttestationRetry } from './attestations-retry.js';
+import {
+  runAttestationList,
+  readAttestations,
+  type AttestationListItem,
+} from './attestations-list.js';
 
 const logger = createLogger({ prefix: 'kici-admin-attestations' });
 
@@ -65,10 +72,56 @@ async function confirmInteractive(prompt: string): Promise<boolean> {
   }
 }
 
-export function registerAttestationsCommands(program: Command): void {
+/** Render attestation rows as a compact human table (stderr note when empty). */
+function printAttestationTable(rows: AttestationListItem[]): void {
+  if (rows.length === 0) {
+    process.stderr.write('No attestations found.\n');
+    return;
+  }
+  for (const r of rows) {
+    console.log(
+      `${r.id}  ${r.verifyStatus.padEnd(12)}  run=${r.runId}  job=${r.jobId}  ${r.subjectName}  ${r.createdAt}`,
+    );
+  }
+}
+
+export function registerAttestationsCommands(
+  program: Command,
+  getClient: () => AdminApiClient,
+): void {
   const attestations = program
     .command('attestations')
     .description('Provenance-attestation maintenance (orchestrator DB)');
+
+  attestations
+    .command('retry')
+    .description('Mint deferred attestations now (drains the pending-attestations outbox)')
+    .option('--run-id <id>', 'Scope to a single run (else drains every pending attestation)')
+    .option('--all-pending', 'Drain every pending attestation (default when --run-id is absent)')
+    .option(
+      '--include-rejected',
+      'Also re-attempt rows previously marked terminally rejected (re-arm)',
+    )
+    .action(async (opts: { runId?: string; allPending?: boolean; includeRejected?: boolean }) => {
+      try {
+        const result = await runAttestationRetry(
+          (body) =>
+            getClient().post<{ minted: number; stillPending: number; rejected: number }>(
+              '/api/v1/admin/attestations/retry',
+              body,
+            ),
+          { runId: opts.runId, allPending: opts.allPending, includeRejected: opts.includeRejected },
+        );
+        logger.info('attestations retry complete', result);
+        process.stderr.write(
+          `Minted ${result.minted} deferred attestation(s); ` +
+            `${result.stillPending} still pending; ${result.rejected} rejected.\n`,
+        );
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
 
   attestations
     .command('reverify')
@@ -108,4 +161,51 @@ export function registerAttestationsCommands(program: Command): void {
         process.exit(1);
       }
     });
+
+  attestations
+    .command('list')
+    .description('List provenance attestations from the orchestrator DB (newest first)')
+    .option('--run-id <id>', 'Filter to a single run')
+    .option('--job-id <id>', 'Filter to a single job')
+    .option('--limit <n>', 'Max results (default 20, max 100)', '20')
+    .option('--json', 'Emit the raw JSON envelope instead of a table')
+    .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
+    .action(
+      async (opts: {
+        runId?: string;
+        jobId?: string;
+        limit: string;
+        json?: boolean;
+        databaseUrl?: string;
+      }) => {
+        try {
+          // Pure DB read — no storage / trust-root config needed, so resolve the
+          // URL directly from --database-url / KICI_DATABASE_URL (matching the
+          // sibling `host list` / `environment list` reads) rather than through
+          // loadConfig(), whose full validation would demand platform env vars.
+          const url = resolveDatabaseUrl(opts.databaseUrl);
+          const limit = Math.min(Math.max(Number.parseInt(opts.limit, 10) || 20, 1), 100);
+          const pool = createPool(url);
+          const db = createDb(pool);
+          try {
+            const result = await runAttestationList(readAttestations(db), {
+              limit,
+              runId: opts.runId,
+              jobId: opts.jobId,
+            });
+            if (opts.json) {
+              console.log(JSON.stringify(result, null, 2));
+            } else {
+              printAttestationTable(result.attestations);
+            }
+          } finally {
+            await db.destroy();
+            await pool.end().catch(() => {});
+          }
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      },
+    );
 }

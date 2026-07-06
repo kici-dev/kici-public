@@ -75,29 +75,6 @@ export interface AddBackendParams {
 }
 
 /**
- * Backend lifecycle manager interface.
- * Provides CRUD, health checks, and connection testing for secret backends.
- */
-export interface BackendManager {
-  /** Check backend connectivity. Returns health status. */
-  checkHealth(name: string): Promise<BackendHealthStatus>;
-  /** Trigger scope discovery sync for a backend (or all if name omitted). */
-  syncScopes(name?: string): Promise<void>;
-  /** List all registered backends (no credentials). */
-  listBackends(): Promise<BackendDescriptor[]>;
-  /** Get a single backend by name. */
-  getBackend(name: string): Promise<BackendDescriptor | null>;
-  /** Register a new backend. Returns the descriptor. */
-  addBackend(params: AddBackendParams): Promise<BackendDescriptor>;
-  /** Remove a backend by name. Returns true if removed. */
-  removeBackend(name: string): Promise<boolean>;
-  /** Test connectivity without persisting. */
-  testConnection(
-    params: AddBackendParams,
-  ): Promise<{ ok: boolean; error?: string; latencyMs: number }>;
-}
-
-/**
  * Periodic scope sync manager for secret backends.
  */
 export interface BackendSyncManager {

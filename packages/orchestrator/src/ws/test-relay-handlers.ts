@@ -90,6 +90,8 @@ export interface TestTriggerPayload {
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds: string[];
+  /** User-visible warnings on acceptance (e.g. skipped non-test bound environments). */
+  warnings?: string[];
 }
 
 /**
@@ -171,6 +173,7 @@ export async function handleTestTrigger(
     status: result.status,
     ...(result.reason ? { reason: result.reason } : {}),
     jobIds: result.jobIds,
+    ...(result.warnings?.length ? { warnings: result.warnings } : {}),
   };
 }
 

@@ -32,6 +32,8 @@ import {
 import { KICI_PROVENANCE_BUNDLE_MEDIA_TYPE, kiciBundleSchema } from './bundle.js';
 import { dssePae } from './dsse.js';
 import { kiciProvenanceStatementSchema, type KiciProvenanceStatement } from './schema.js';
+import { AttestationOrigin } from './attestation-origin.js';
+import { computeStatementHash } from './statement-hash.js';
 
 /** Tri-state outcome of a single verification check. */
 export type CheckStatus = 'pass' | 'fail' | 'skipped';
@@ -58,6 +60,12 @@ export interface VerifyResult {
   claims?: Record<string, unknown>;
   statement?: KiciProvenanceStatement;
   failures: string[];
+  /**
+   * Mint-timing origin of the identity token: `live` (minted during the build,
+   * cross-checked field-by-field), or `deferred` / `offline-backfill` (minted
+   * later, bound to the frozen statement by hash — the temporal gap is disclosed).
+   */
+  attestationOrigin?: AttestationOrigin;
 }
 
 export interface VerifyKiciBundleOptions {
@@ -108,17 +116,26 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
   const bundle = parsed.data;
   checks.schema = 'pass';
 
-  // Decode + parse the in-toto statement carried in the DSSE payload.
-  const statementBytes = b64ToBytes(bundle.dsseEnvelope.payload);
+  // Decode + parse the in-toto statement carried in the DSSE payload. A
+  // malformed payload (non-base64, or base64 of non-JSON bytes) makes `atob`
+  // or `JSON.parse` throw — guard it so a bad payload becomes a verification
+  // failure (`verified:false`), never a thrown error (the never-throw contract).
   let statement: KiciProvenanceStatement | undefined;
-  const stmt = kiciProvenanceStatementSchema.safeParse(
-    JSON.parse(new TextDecoder().decode(statementBytes)),
-  );
-  if (!stmt.success) {
+  let statementBytes: Uint8Array | undefined;
+  try {
+    statementBytes = b64ToBytes(bundle.dsseEnvelope.payload);
+    const stmt = kiciProvenanceStatementSchema.safeParse(
+      JSON.parse(new TextDecoder().decode(statementBytes)),
+    );
+    if (!stmt.success) {
+      checks.schema = 'fail';
+      failures.push('statement_schema_invalid');
+    } else {
+      statement = stmt.data;
+    }
+  } catch {
     checks.schema = 'fail';
-    failures.push('statement_schema_invalid');
-  } else {
-    statement = stmt.data;
+    failures.push('statement_payload_invalid');
   }
 
   // Identity token: verify against the trusted JWKS, pinning iss + checking aud.
@@ -139,6 +156,7 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
   // DSSE signature over PAE(payloadType, statementBytes) by the ephemeral key,
   // whose keyid must equal its RFC 7638 thumbprint.
   try {
+    if (!statementBytes) throw new Error('no statement bytes');
     const pubJwk = bundle.verificationMaterial.publicKey as JWK;
     const thumbprint = await calculateJwkThumbprint(pubJwk, 'sha256');
     if (bundle.dsseEnvelope.signatures[0].keyid !== thumbprint) {
@@ -160,11 +178,29 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
     failures.push('dsse_signature_invalid');
   }
 
-  // Build-context cross-check: the statement must agree with the trusted claims.
-  if (statement && claims) {
-    const ok = crossCheckBuildContext(statement, claims);
-    checks.buildContext = ok ? 'pass' : 'fail';
-    if (!ok) failures.push('build_context_mismatch');
+  // Mint-timing origin: prefer the token claim, fall back to the frozen
+  // statement's internal parameter, else `live`.
+  const attestationOrigin = resolveAttestationOrigin(claims, statement);
+
+  // Build-context check. A `live` token was minted during the build, so the
+  // statement must equal the token claims field-by-field. A `deferred` /
+  // `offline-backfill` token was minted AFTER the statement was frozen, so it
+  // cannot repeat the build facts — instead it commits to the frozen statement
+  // by hash (truth-contract property 2); a mismatch is a HARD FAIL.
+  // `statementBytes` is defined whenever `statement` is (both are assigned
+  // together above), so gating on it here only aids TS narrowing for the
+  // deferred hash path — it never changes the runtime branch taken.
+  if (statement && claims && statementBytes) {
+    if (attestationOrigin === AttestationOrigin.enum.live) {
+      const ok = crossCheckBuildContext(statement, claims);
+      checks.buildContext = ok ? 'pass' : 'fail';
+      if (!ok) failures.push('build_context_mismatch');
+    } else {
+      const actual = await computeStatementHash(statementBytes);
+      const ok = typeof claims.statement_hash === 'string' && claims.statement_hash === actual;
+      checks.buildContext = ok ? 'pass' : 'fail';
+      if (!ok) failures.push('statement_hash_mismatch');
+    }
   } else {
     checks.buildContext = 'fail';
     failures.push('build_context_uncheckable');
@@ -183,10 +219,38 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
     checks.dsse === 'pass' &&
     checks.buildContext === 'pass' &&
     checks.digest !== 'fail';
-  return { verified, mode: 'kici', checks, claims, statement, failures };
+  return { verified, mode: 'kici', checks, claims, statement, failures, attestationOrigin };
 }
 
-/** The statement's build context must equal the (server-truth) JWT claims. */
+/** Derive the mint-timing origin from the token claim, then the frozen statement. */
+function resolveAttestationOrigin(
+  claims: Record<string, unknown> | undefined,
+  statement: KiciProvenanceStatement | undefined,
+): AttestationOrigin {
+  const fromClaim = AttestationOrigin.safeParse(claims?.attestation_origin);
+  if (fromClaim.success) return fromClaim.data;
+  const internal = statement?.predicate.buildDefinition.internalParameters as
+    | Record<string, unknown>
+    | undefined;
+  const fromStatement = AttestationOrigin.safeParse(internal?.attestationOrigin);
+  return fromStatement.success ? fromStatement.data : AttestationOrigin.enum.live;
+}
+
+/**
+ * The statement's build context must equal the (server-truth) JWT claims.
+ *
+ * Only the **claims** side is normalized (`?? ''`): the producer coerces a
+ * null/absent `repository` / `ref` / `workflow_ref` claim into the
+ * schema-required empty string and omits `commit` entirely when `sha` is
+ * falsy, so a null/absent claim is compared against that coerced `''` /
+ * omitted-commit. The **statement** side stays strict — a non-empty
+ * attacker-controlled statement field never matches a null claim
+ * (`'evil/repo' === (null ?? '')` → `'evil/repo' === ''` → false), and an
+ * empty statement field never matches a non-null claim — so this relaxation
+ * is forgery-safe in exactly one direction: empty/absent statement ⇔
+ * null/absent claim, and nothing else. `runId` / `jobId` are always minted,
+ * so they stay strict.
+ */
 function crossCheckBuildContext(
   statement: KiciProvenanceStatement,
   claims: Record<string, unknown>,
@@ -195,10 +259,10 @@ function crossCheckBuildContext(
   const wf = bd.externalParameters.workflow;
   const ip = bd.internalParameters ?? {};
   return (
-    wf.repository === claims.repository &&
-    wf.ref === claims.ref &&
-    wf.path === claims.workflow_ref &&
-    ip.commit === claims.sha &&
+    wf.repository === (claims.repository ?? '') &&
+    wf.ref === (claims.ref ?? '') &&
+    wf.path === (claims.workflow_ref ?? '') &&
+    (ip.commit ?? '') === (claims.sha ?? '') &&
     ip.runId === claims.kici_run_id &&
     ip.jobId === claims.kici_job_id
   );

@@ -10,6 +10,5 @@ export type {
   BackendHealthStatus,
   BackendDescriptor,
   AddBackendParams,
-  BackendManager,
   BackendSyncManager,
 } from './types.js';

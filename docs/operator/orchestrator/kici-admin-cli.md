@@ -229,7 +229,7 @@ kici-admin api-key add-routing-key <id> <pattern>
 - `--routing-keys` accepts comma-separated routing key patterns (e.g., `github:42,github:99`).
 - The key is shown once on creation -- save it immediately.
 
-### attestations -- provenance verdict backfill
+### attestations -- provenance verdict backfill and listing
 
 ```bash
 kici-admin attestations reverify [--all] [--database-url <url>]
@@ -248,6 +248,18 @@ kici-admin attestations reverify [--all] [--database-url <url>]
 - Direct orchestrator DB + object storage. The provenance trust root comes from
   the orchestrator's `KICI_PROVENANCE_ISSUER` config; when it is unset every
   verdict is `unverifiable`.
+
+```bash
+kici-admin attestations list [--run-id <id>] [--job-id <id>] [--limit <n>] [--json] [--database-url <url>]
+```
+
+- `list` reads recorded provenance attestations from the orchestrator DB, newest
+  first. `--run-id` / `--job-id` scope to a single run or job; `--limit` caps the
+  result count (default 20, max 100). `--json` emits `{ "attestations": [ ... ] }`
+  with `id`, `runId`, `jobId`, `subjectName`, `verifyStatus`, and `createdAt`
+  fields; without it the rows print as a compact table.
+- Direct orchestrator DB read — no orchestrator HTTP call. The DB URL comes from
+  `--database-url` or `KICI_DATABASE_URL` (else the orchestrator config).
 
 ### audit -- secrets audit log
 
@@ -303,6 +315,20 @@ Manages external secret backends (PostgreSQL or Vault/OpenBao) for multi-source 
 | ----------------- | -------- | ---------------------------------- |
 | `--scope-filter`  | `**`     | Scope filter glob pattern          |
 | `--sync-interval` | `300000` | Sync interval in milliseconds (5m) |
+
+### cluster -- cluster identity recovery (direct DB + S3)
+
+```bash
+kici-admin cluster reconcile-identity [--adopt-db] [--dry-run] [--yes] [--database-url <url>] [--bucket <bucket>] [--prefix <prefix>] [--region <region>] [--endpoint <url>] [--force-path-style]
+```
+
+Reconciles the orchestrator's `cluster_meta.cluster_id` with the durable S3 sentinel — the cross-restart / peer anchor that lets a redeployed orchestrator reclaim its identity. Talks **directly** to the orchestrator Postgres and the same S3 bucket the running process uses (no HTTP admin path), so it works while the orchestrator is offline. Requires `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for the sentinel.
+
+- Default direction **restores the DB from the sentinel** (`db-from-sentinel`) — the common recovery after a database was rebuilt but the durable identity in object storage is authoritative.
+- `--adopt-db` reverses the direction (`sentinel-from-db`): rewrite the sentinel from the DB's current `cluster_id`.
+- `--dry-run` reports drift and exits without changing anything.
+- `--yes` skips the confirmation prompt and applies on drift (scripted use).
+- Storage flags fall back to the orchestrator's `KICI_DATABASE_URL` / `KICI_STORAGE_BUCKET` / `KICI_STORAGE_PREFIX` (default empty = bucket root) / `KICI_STORAGE_REGION` / `KICI_STORAGE_ENDPOINT` when omitted. `--force-path-style` selects S3 path-style addressing.
 
 ### cluster-name -- orchestrator cluster identity
 
@@ -470,6 +496,7 @@ kici-admin environment list --org <id> [--database-url <url>] [--json]
 kici-admin environment show --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin environment delete --org <id> --name <name> [--database-url <url>] [--json]
 kici-admin environment create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--variables <json>] [--database-url <url>] [--json]
+kici-admin environment purge [--org <id>] [--database-url <url>] [--json]
 ```
 
 Seeds and mutates environment rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed envs before the orchestrator is up.
@@ -480,6 +507,7 @@ Seeds and mutates environment rows (plus their variables and scope bindings). De
 - `list` / `show` read back the current state; `show` also returns variables and bindings.
 - `delete` removes an environment and cascades its bindings, variables, and overrides. Reports `deleted=true` on success and exits non-zero if no matching environment exists. Pending held runs block the deletion with a clear error (HTTP mode returns 409) — approve or reject them first; resolved held-run history survives the deletion with its environment reference cleared.
 - `create-template` creates/updates a template environment and seeds its variables in one call (`--variables '{"K":"V"}'`).
+- `purge` (direct-DB only) bulk-deletes every environment for an org (cascading bindings, variables, and overrides) and removes the org's held runs for a clean slate. Omit `--org` to clear all orgs. Destructive break-glass / test-reset verb with no orchestrator HTTP wire; requires `--database-url` (or `KICI_DATABASE_URL`). Reports `{ environmentsDeleted, heldRunsDeleted }` with `--json`.
 
 See [Environments](../environments.md) for the broader feature walkthrough.
 

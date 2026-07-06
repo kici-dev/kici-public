@@ -18,14 +18,30 @@ export interface AttestProvenanceOptions {
   audience?: string;
 }
 
-export interface AttestProvenanceResult {
-  /** Object-storage key the signed bundle was written to. */
-  storageKey: string;
-  /** Primary subject digest (lowercase hex). */
-  subjectDigest: string;
-  /** Media type of the persisted bundle. */
-  bundleMediaType: string;
-}
+export type AttestProvenanceResult =
+  | {
+      /** Absent/false: the identity token was minted live and the bundle uploaded. */
+      deferred?: false;
+      /** Object-storage key the signed bundle was written to. */
+      storageKey: string;
+      /** Primary subject digest (lowercase hex). */
+      subjectDigest: string;
+      /** Media type of the persisted bundle. */
+      bundleMediaType: string;
+    }
+  | {
+      /**
+       * The Platform mint failed transiently, so only the identity token is
+       * deferred: the statement was frozen + signed at build time and is minted
+       * later (automatically on Platform recovery, or via
+       * `kici-admin attestations retry`). The job still completes successfully.
+       */
+      deferred: true;
+      /** Primary subject digest (lowercase hex). */
+      subjectDigest: string;
+      /** SHA-256 of the frozen statement the later token will bind to. */
+      statementHash: string;
+    };
 
 /** Discriminate a path subject from a precomputed-digest subject. */
 export function provenanceSubjectIsPath(

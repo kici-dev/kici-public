@@ -28,6 +28,30 @@ export function baseAttestationsQuery(db: Kysely<Database>) {
 export type AttestationsBaseQuery = ReturnType<typeof baseAttestationsQuery>;
 
 /**
+ * Base query for the deferred-attestation outbox (`pending_attestations`),
+ * joined to `execution_jobs` (job name) and `execution_runs` (repo / workflow
+ * context) for the org-wide list's pending summaries.
+ *
+ * Same uuid/text mismatch as `baseAttestationsQuery`: `pending_attestations`
+ * `run_id` / `job_id` are TEXT while the `execution_*` keys are `uuid`, and
+ * Postgres won't compare `uuid = text` implicitly — so the joins cast the uuid
+ * side to text. Both joins are LEFT joins so a pending row with no matching
+ * run / job still lists (repository / workflow / job name come back null).
+ */
+export function basePendingAttestationsQuery(db: Kysely<Database>) {
+  return db
+    .selectFrom('pending_attestations')
+    .leftJoin('execution_runs', (join) =>
+      join.on(sql`execution_runs.run_id::text`, '=', sql.ref('pending_attestations.run_id')),
+    )
+    .leftJoin('execution_jobs', (join) =>
+      join
+        .on(sql`execution_jobs.run_id::text`, '=', sql.ref('pending_attestations.run_id'))
+        .on(sql`execution_jobs.job_id::text`, '=', sql.ref('pending_attestations.job_id')),
+    );
+}
+
+/**
  * Apply org-wide attestation filters to the base query. Digest is exact-match;
  * name is an ILIKE substring; status / repository / workflow / job are equality;
  * created_at gets `>=` / `<=` bounds for the date range. Absent filters are

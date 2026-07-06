@@ -17,6 +17,9 @@
  * input on stdin and uses a transient host key distinct from the OS sshd key).
  */
 import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { HostReach } from './reach.js';
 
 /** Host-key verification mode for the SSH connection. */
@@ -175,6 +178,16 @@ export async function sshPush(
 /**
  * Start a per-call ephemeral ssh-agent, load the key via stdin (never a file),
  * run `body` with `SSH_AUTH_SOCK` in env, and kill the agent in `finally`.
+ *
+ * The agent is bound to a socket inside a private `kici-bootstrap-ssh-*`
+ * directory (`ssh-agent -a <dir>/agent.sock`) rather than the default
+ * `/tmp/ssh-XXXX`. `ssh-agent` daemonizes into its own session, so it does NOT
+ * die with this process — a SIGKILL of the agent (routine when an ephemeral
+ * bring-up runner is torn down) skips the `finally` and orphans the daemon.
+ * The namespaced socket path is how `kici-leak-sweep` reaps such orphans
+ * precisely: it can distinguish a KiCI bring-up agent from an operator's login
+ * agent, which a bare `/tmp/ssh-XXXX` socket cannot. The private dir is removed
+ * in an outer `finally` so the normal path leaves nothing behind.
  */
 async function withEphemeralAgent<T>(
   privateKey: string,
@@ -182,43 +195,45 @@ async function withEphemeralAgent<T>(
   body: (env: NodeJS.ProcessEnv) => Promise<T>,
 ): Promise<T> {
   const baseEnv = { ...process.env };
-  const start = await spawnFn('ssh-agent', ['-s'], { env: baseEnv });
-  if (start.exitCode !== 0) {
-    throw new Error(`ssh-agent start failed: exit ${start.exitCode}\n${start.stderr}`);
-  }
-  const sock = parseAgentSocket(start.stdout);
-  const pid = parseAgentPid(start.stdout);
-  // SSH_ASKPASS=/bin/false makes a passphrase-protected key fail fast instead
-  // of hanging on a TTY prompt — same contract as ssh.sh.
-  const agentEnv: NodeJS.ProcessEnv = {
-    ...baseEnv,
-    SSH_AUTH_SOCK: sock,
-    ...(pid ? { SSH_AGENT_PID: pid } : {}),
-    SSH_ASKPASS: '/bin/false',
-    DISPLAY: '',
-  };
+  const agentDir = await mkdtemp(join(tmpdir(), 'kici-bootstrap-ssh-'));
+  const sock = join(agentDir, 'agent.sock');
   try {
-    // Key on stdin, ending with a newline (ssh-add expects a complete PEM).
-    const add = await spawnFn('ssh-add', ['-'], {
-      env: agentEnv,
-      stdin: privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`,
-    });
-    if (add.exitCode !== 0) {
-      throw new Error(`ssh-add failed: exit ${add.exitCode}\n${add.stderr}`);
+    const start = await spawnFn('ssh-agent', ['-a', sock, '-s'], { env: baseEnv });
+    if (start.exitCode !== 0) {
+      throw new Error(`ssh-agent start failed: exit ${start.exitCode}\n${start.stderr}`);
     }
-    return await body(agentEnv);
+    const pid = parseAgentPid(start.stdout);
+    // SSH_ASKPASS=/bin/false makes a passphrase-protected key fail fast instead
+    // of hanging on a TTY prompt — same contract as ssh.sh. SSH_AUTH_SOCK is the
+    // socket we bound above, not whatever ssh-agent echoed.
+    const agentEnv: NodeJS.ProcessEnv = {
+      ...baseEnv,
+      SSH_AUTH_SOCK: sock,
+      ...(pid ? { SSH_AGENT_PID: pid } : {}),
+      SSH_ASKPASS: '/bin/false',
+      DISPLAY: '',
+    };
+    try {
+      // Key on stdin, ending with a newline (ssh-add expects a complete PEM).
+      const add = await spawnFn('ssh-add', ['-'], {
+        env: agentEnv,
+        stdin: privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`,
+      });
+      if (add.exitCode !== 0) {
+        throw new Error(`ssh-add failed: exit ${add.exitCode}\n${add.stderr}`);
+      }
+      return await body(agentEnv);
+    } finally {
+      await spawnFn('ssh-agent', ['-k'], { env: agentEnv }).catch(() => {
+        // Best-effort teardown; if this process is SIGKILLed before it runs,
+        // kici-leak-sweep reaps the orphan via the kici-bootstrap-ssh socket.
+      });
+    }
   } finally {
-    await spawnFn('ssh-agent', ['-k'], { env: agentEnv }).catch(() => {
-      // Best-effort teardown; the agent dies with the process anyway.
+    await rm(agentDir, { recursive: true, force: true }).catch(() => {
+      // Best-effort; a leaked dir is swept by kici-leak-sweep.
     });
   }
-}
-
-/** Extract `SSH_AUTH_SOCK=<path>;` from `ssh-agent -s` output. */
-function parseAgentSocket(out: string): string {
-  const m = out.match(/SSH_AUTH_SOCK=([^;\n]+)/);
-  if (!m) throw new Error('ssh-agent -s did not emit SSH_AUTH_SOCK');
-  return m[1];
 }
 
 /** Extract `SSH_AGENT_PID=<n>;` from `ssh-agent -s` output (best-effort). */

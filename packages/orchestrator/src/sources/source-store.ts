@@ -121,6 +121,21 @@ export class SourceStore {
   }
 
   /**
+   * Get a single source by its UUID primary key, or null if not found. Used by
+   * the direct GitHub ingress route, which receives the source id in the URL
+   * (`/webhook/:orgId/github/:sourceId`).
+   */
+  async getSourceById(id: string): Promise<Source | null> {
+    const source = await this.db
+      .selectFrom('sources')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+
+    return source ?? null;
+  }
+
+  /**
    * Get a source with its decrypted secrets.
    */
   async getSourceWithSecrets(routingKey: string): Promise<SourceWithSecrets | null> {

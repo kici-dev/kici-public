@@ -42,6 +42,20 @@ function createMockDb() {
               expires_at: String(values.expires_at),
             });
           }),
+          // Models INSERT … ON CONFLICT (delivery_id) DO NOTHING: inserts when
+          // absent (numInsertedOrUpdatedRows = 1), no-ops when present (= 0).
+          onConflict: vi.fn().mockImplementation(() => ({
+            executeTakeFirst: vi.fn().mockImplementation(async () => {
+              if (store.has(values.delivery_id)) {
+                return { numInsertedOrUpdatedRows: 0n };
+              }
+              store.set(values.delivery_id, {
+                delivery_id: values.delivery_id,
+                expires_at: String(values.expires_at),
+              });
+              return { numInsertedOrUpdatedRows: 1n };
+            }),
+          })),
         })),
     })),
     deleteFrom: vi.fn().mockImplementation(() => ({
@@ -128,6 +142,33 @@ describe('DedupCache', () => {
       const expectedMax = Date.now() + 25 * 60 * 60 * 1000;
       expect(expiresAt.getTime()).toBeGreaterThan(expectedMin);
       expect(expiresAt.getTime()).toBeLessThan(expectedMax);
+    });
+  });
+
+  describe('claim()', () => {
+    it('first claim wins (true), second claim on the same id is a duplicate (false)', async () => {
+      expect(await dedup.claim('delivery-001')).toBe(true);
+      expect(await dedup.claim('delivery-001')).toBe(false);
+    });
+
+    it('distinct delivery ids both win', async () => {
+      expect(await dedup.claim('k-a')).toBe(true);
+      expect(await dedup.claim('k-b')).toBe(true);
+    });
+
+    it('a delivery already present in the shared table loses the claim', async () => {
+      // Simulate a row written by another instance directly into the DB.
+      const expiresAt = new Date(Date.now() + 86400000).toISOString();
+      db._store.set('other-instance', { delivery_id: 'other-instance', expires_at: expiresAt });
+      expect(await dedup.claim('other-instance')).toBe(false);
+    });
+
+    it('a subsequent claim after a win is served from the memory fast path', async () => {
+      expect(await dedup.claim('mem-1')).toBe(true);
+      vi.mocked(db.insertInto).mockClear();
+      expect(await dedup.claim('mem-1')).toBe(false);
+      // Local duplicate short-circuits before touching the DB.
+      expect(db.insertInto).not.toHaveBeenCalled();
     });
   });
 

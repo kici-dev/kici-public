@@ -18,7 +18,7 @@ vi.mock('@kici-dev/core', () => ({
 import { loadGlobalConfig } from '../remote/config.js';
 import { approveCommand } from './approve.js';
 import { rejectCommand } from './reject.js';
-import { resolveHeldRunId, type HeldRunSummary } from './held-run-resolve.js';
+import { resolveHeldRunId, type HeldRunSummary } from '@kici-dev/engine';
 
 const mockedLoadConfig = vi.mocked(loadGlobalConfig);
 

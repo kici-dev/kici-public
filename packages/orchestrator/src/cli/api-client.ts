@@ -812,6 +812,8 @@ export class AdminApiClient {
     from?: string;
     to?: string;
     q?: string;
+    agentLabel?: string;
+    agentOnly?: boolean;
     limit?: number;
     cursor?: string;
   }): Promise<{
@@ -830,6 +832,8 @@ export class AdminApiClient {
     if (opts?.from) params.set('from', opts.from);
     if (opts?.to) params.set('to', opts.to);
     if (opts?.q) params.set('q', opts.q);
+    if (opts?.agentLabel) params.set('agentLabel', opts.agentLabel);
+    if (opts?.agentOnly) params.set('agentOnly', 'true');
     if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
     if (opts?.cursor) params.set('cursor', opts.cursor);
     const qs = params.toString();

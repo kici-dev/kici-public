@@ -438,6 +438,68 @@ describe('StaleRunDetector', () => {
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).not.toHaveBeenCalledWith('run-2');
   });
 
+  it('scan() continues processing remaining jobs when one job fails to mark (sub-scan A)', async () => {
+    const mocks = createDeps();
+
+    // Three stale jobs in sub-scan A. The middle job's mark throws, but the
+    // per-item try/catch must keep the scan going so job-1 and job-3 are still
+    // processed (the resilience guarantee: one bad job cannot abort the tick).
+    const job1 = staleJob({ run_id: 'run-1', job_id: 'job-1' });
+    const job2 = staleJob({ run_id: 'run-2', job_id: 'job-2' });
+    const job3 = staleJob({ run_id: 'run-3', job_id: 'job-3' });
+
+    // Sub-scan A returns all three jobs; B and C return empty. The first job's
+    // UPDATE succeeds, the second throws (simulating a DB failure inside
+    // markJobStale), the third succeeds — updateTable is called in mark order,
+    // so the throw lands on job-2 alone.
+    let selectCall = 0;
+    let updateCall = 0;
+    const db = {
+      selectFrom: vi.fn(() => {
+        const idx = selectCall++;
+        if (idx === 0) return createChainableMock({ executeResult: [job1, job2, job3] });
+        return createChainableMock({ executeResult: [] });
+      }),
+      updateTable: vi.fn(() => {
+        const idx = updateCall++;
+        if (idx === 1) {
+          const chain = createChainableMock({});
+          chain.executeTakeFirst = vi.fn(async () => {
+            throw new Error('DB update failed for job-2');
+          });
+          return chain;
+        }
+        return createChainableMock({ executeTakeFirstResult: { numUpdatedRows: 1n } });
+      }),
+    } as unknown as StaleRunDetectorDeps['db'];
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    // Must not throw — the scan survives the middle job's failure.
+    await expect(detector.scan()).resolves.toBeUndefined();
+
+    // job-1 and job-3 were still marked despite job-2 throwing.
+    expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
+      'run-1',
+      'job-1',
+      'timed_out_stale',
+    );
+    expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
+      'run-3',
+      'job-3',
+      'timed_out_stale',
+    );
+    // job-2 never completed its mark, so no in-memory update for it.
+    expect(mocks.executionTracker.updateInMemoryJob).not.toHaveBeenCalledWith(
+      'run-2',
+      'job-2',
+      'timed_out_stale',
+    );
+
+    // Run-completion is still checked for the successfully-marked runs.
+    expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
+    expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-3');
+  });
+
   it('scan() handles NULL last_heartbeat_at fallback', async () => {
     const mocks = createDeps();
     const nullHeartbeatJob = staleJob({

@@ -60,7 +60,28 @@ describe('dashboard-write policy orch-side gate coverage', () => {
       //   enforcePolicy(<msg>, '<op>', ...) — the per-handler helper.
       //   assertDashboardWriteAllowed(<db>, <orgId>, '<op>') — the
       //   underlying primitive (in case a caller bypasses the helper).
-      const enforcePattern = new RegExp(`enforcePolicy\\([\\s\\S]*?['"\`]${escaped}['"\`]`);
+      //
+      // The op literal MUST be the direct 2nd argument of an enforcePolicy
+      // call — not merely present somewhere after an enforcePolicy( token.
+      // A lazy `[\s\S]*?` wildcard would span the whole joined corpus and
+      // let an op string appearing anywhere (another handler, the registry,
+      // a comment) satisfy the gate for an operation that is actually
+      // un-gated. Anchoring on `enforcePolicy(<first-arg>, '<op>'` keeps the
+      // match scoped to a genuine gate call site.
+      //
+      // The first argument is either a simple expression (`msg`) or an inline
+      // object literal that itself contains commas
+      // (`{ actor: msg.actor, requestId: msg.requestId, orgId: ... }`, as in
+      // handleAttestationRetry). So FIRST_ARG accepts a single-level `{...}`
+      // object OR a run of non-comma/brace/paren chars — but not a bare
+      // comma-spanning wildcard, which is what would re-open the false-green.
+      // A future first-arg shape with nested braces or a paren call would fail
+      // to match (safe direction: it surfaces as an apparent gap to inspect,
+      // never a silent false-green).
+      const FIRST_ARG = '(?:\\{[^{}]*\\}|[^,{}()]+)';
+      const enforcePattern = new RegExp(
+        `enforcePolicy\\(\\s*${FIRST_ARG},\\s*['"\`]${escaped}['"\`]`,
+      );
       const assertPattern = new RegExp(
         `assertDashboardWriteAllowed\\([^,]+,[^,]+,\\s*['"\`]${escaped}['"\`]`,
       );
@@ -75,9 +96,15 @@ describe('dashboard-write policy orch-side gate coverage', () => {
   it('every orch-side gate call targets a known operation', () => {
     const sources = loadHandlerSources();
     const known = new Set(DASHBOARD_WRITE_OPERATIONS.map((d) => d.name));
-    const calls = [...sources.matchAll(/enforcePolicy\(\s*[^,]+,\s*['"`]([a-z_.]+)['"`]\s*,/g)].map(
-      (m) => m[1],
-    );
+    // Same first-arg shape as the coverage regex above: the op is the direct
+    // 2nd argument, and the first argument may be an inline object literal
+    // carrying commas (handleAttestationRetry) — so we must not stop the
+    // first-arg match at the first comma.
+    const calls = [
+      ...sources.matchAll(
+        /enforcePolicy\(\s*(?:\{[^{}]*\}|[^,{}()]+),\s*['"`]([a-z_.]+)['"`]\s*,/g,
+      ),
+    ].map((m) => m[1]);
 
     const unknown = calls.filter((op) => !known.has(op as never));
     expect(unknown, `enforcePolicy called with unknown ops: ${unknown.join(', ')}`).toEqual([]);

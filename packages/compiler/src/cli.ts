@@ -3,12 +3,45 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
-import { Command, Argument, Option } from 'commander';
+import { Command, Argument, Option, CommanderError } from 'commander';
 import pc from 'picocolors';
 import { shouldSuppressBanner } from './cli-banner.js';
 
 declare const KICI_VERSION: string;
 const version = typeof KICI_VERSION !== 'undefined' ? KICI_VERSION : '0.0.1';
+
+/**
+ * Top-level commands that were removed, mapped to their current equivalent.
+ * Consulted when the CLI hits an unknown command so the user gets a precise
+ * redirect instead of a bare "unknown command" dead end. The redirect text
+ * lives here once; every consumer reads it from this map.
+ */
+export const RETIRED_COMMANDS: Record<string, string> = {
+  status:
+    '`kici status` is no longer a command. Use `kici runs list` / ' +
+    '`kici runs show <run-id>` to inspect runs, or `kici diagnostics` for ' +
+    'orchestrator, scaler, and agent health.',
+  cancel: '`kici cancel` is no longer a command. Use `kici runs cancel <run-id>`.',
+};
+
+/**
+ * Redirect message for a retired top-level command, or undefined if the name is
+ * not a known-retired command.
+ */
+export function retiredCommandHint(commandName: string | undefined): string | undefined {
+  return commandName ? RETIRED_COMMANDS[commandName] : undefined;
+}
+
+/**
+ * Derive the command name a user attempted from the parsed operands, falling
+ * back to the first non-option token in the raw argv. Used to look up a retired
+ * command after commander rejects an unknown command.
+ */
+export function attemptedCommand(program: Command, argv: string[]): string | undefined {
+  const firstOperand = program.args[0];
+  if (firstOperand) return firstOperand;
+  return argv.slice(2).find((token) => !token.startsWith('-'));
+}
 
 /**
  * Build the kici Commander program with every command registered. Exported so
@@ -33,6 +66,11 @@ export function buildProgram(): Command {
       write(pc.red(str));
     },
   });
+
+  // Any unknown command or option ends with a near-match suggestion (when one
+  // exists) plus a pointer to the full command list.
+  program.showSuggestionAfterError(true);
+  program.showHelpAfterError('(run `kici --help` to see all commands)');
 
   program
     .command('compile')
@@ -134,7 +172,8 @@ export function buildProgram(): Command {
         process.exit(2);
       }
       if (!options.pick && !event) {
-        console.error('Error: missing event argument. Pass an event or use --pick.');
+        const { printRunLocalUsage } = await import('./commands/index.js');
+        printRunLocalUsage();
         process.exit(2);
       }
       const { runLocalCommand } = await import('./commands/index.js');
@@ -222,7 +261,10 @@ export function buildProgram(): Command {
       [] as string[],
     )
     .option(
-      '--approve-all, --yes',
+      // `--yes` is listed first so Commander derives the option property from
+      // the last long flag (`--approve-all` → `options.approveAll`); both flags
+      // remain accepted aliases.
+      '--yes, --approve-all',
       'Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)',
       false,
     )
@@ -704,9 +746,33 @@ Environment variables:
   return program;
 }
 
+/**
+ * Handle a commander parse exit thrown under `exitOverride`. Help and version
+ * requests exit cleanly; an unknown command is augmented with a retired-command
+ * redirect when one applies (commander already wrote the generic error,
+ * suggestion, and help pointer before throwing); every other parse error keeps
+ * commander's own exit code and already-printed message.
+ */
+function handleCliParseExit(err: CommanderError, argv: string[], program: Command): void {
+  if (err.code === 'commander.helpDisplayed' || err.code === 'commander.version') {
+    process.exit(0);
+  }
+  if (err.code === 'commander.unknownCommand') {
+    const hint = retiredCommandHint(attemptedCommand(program, argv));
+    if (hint) process.stderr.write(pc.red(`${hint}\n`));
+  }
+  process.exit(err.exitCode ?? 1);
+}
+
 /** Build the program and parse argv — the bin-shim entry point. */
 export function runCli(argv: string[] = process.argv): void {
-  buildProgram().parse(argv);
+  const program = buildProgram();
+  program.exitOverride();
+  try {
+    program.parse(argv);
+  } catch (err) {
+    handleCliParseExit(err as CommanderError, argv, program);
+  }
 }
 
 /**

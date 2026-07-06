@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { AttestationOrigin } from '../../provenance/attestation-origin.js';
 
 /**
  * agent.api method name for the provenance ID-token relay.
@@ -21,13 +22,39 @@ export const oidcTokenRequestParamsSchema = z.object({
 });
 export type OidcTokenRequestParams = z.infer<typeof oidcTokenRequestParamsSchema>;
 
-/**
- * Result the orchestrator returns to the agent: the minted short-lived JWT
- * plus its lifetime and identifier.
- */
-export const oidcTokenResultSchema = z.object({
+// The 3-way mint error contract lives with the WS-RPC mint message
+// (`oidc-mint.ts`); re-export it so this file stays the single import surface
+// for the relay contract.
+export { OidcMintErrorCode } from './oidc-mint.js';
+export type { OidcMintErrorCode as OidcMintErrorCodeType } from './oidc-mint.js';
+
+/** A successfully minted ID token bound to a job. */
+export const oidcMintedTokenSchema = z.object({
   token: z.string(),
   expiresIn: z.number().int().positive(),
   jti: z.string(),
 });
+export type OidcMintedToken = z.infer<typeof oidcMintedTokenSchema>;
+
+/**
+ * Result the orchestrator returns to the agent: either the minted short-lived
+ * JWT, or — when the mint failed transiently (`unavailable`/`failed`, never
+ * `rejected`) — a `deferred` signal so the agent freezes the statement and
+ * reports it for later fulfilment. A permanent `rejected` is thrown, never
+ * returned, so it is not part of this union.
+ */
+export const oidcTokenResultSchema = z.union([
+  oidcMintedTokenSchema,
+  z.object({
+    deferred: z.literal(true),
+    code: z.enum(['unavailable', 'failed']),
+  }),
+]);
 export type OidcTokenResult = z.infer<typeof oidcTokenResultSchema>;
+
+/** Extra fields a deferred *fulfilment* mint carries (orchestrator -> Platform). */
+export const deferredMintParamsSchema = z.object({
+  statementHash: z.string(),
+  origin: AttestationOrigin.extract(['deferred', 'offline-backfill']),
+});
+export type DeferredMintParams = z.infer<typeof deferredMintParamsSchema>;

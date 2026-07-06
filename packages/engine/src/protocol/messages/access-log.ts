@@ -180,6 +180,12 @@ export const accessLogItemSchema = z.object({
   source: AccessLogSource,
   outcome: AccessLogOutcome,
   errorMessage: z.string().nullable(),
+  /**
+   * Agent provenance label promoted from the dedicated `agent_label` column
+   * (not parsed out of `actor_meta`) so consumers can filter/display it
+   * directly. Null for ordinary human / API-key / system actors.
+   */
+  agentLabel: z.string().nullable().optional(),
   createdAt: z.string(),
 });
 export type AccessLogItem = z.infer<typeof accessLogItemSchema>;
@@ -195,6 +201,8 @@ export const accessLogFilterSchema = z.object({
   targetId: z.string().optional(),
   fromTimestamp: z.string().optional(),
   toTimestamp: z.string().optional(),
+  agentLabel: z.string().optional(),
+  agentOnly: z.boolean().optional(),
   limit: z.number().int().positive().max(200).optional(),
   cursor: z.string().optional(),
 });
@@ -218,6 +226,10 @@ export const dashboardAccessLogListRequestSchema = z.object({
   toTimestamp: z.string().optional(),
   /** Full-text search over `error_message` (trigram-indexed via migration 009). */
   q: z.string().optional(),
+  /** Exact-match filter on the agent provenance label (`agent_label` column). */
+  agentLabel: z.string().max(255).optional(),
+  /** When true, return only agent-attributed rows (`agent_label IS NOT NULL`). */
+  agentOnly: z.boolean().optional(),
   limit: z.number().int().positive().max(200).optional(),
   cursor: z.string().optional(),
 });

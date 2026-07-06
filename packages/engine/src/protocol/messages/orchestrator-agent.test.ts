@@ -13,6 +13,7 @@ import {
   agentStepStatusSchema,
   configAckSchema,
   eventEmitSchema,
+  provenanceUploadDeferSchema,
   eventEmitResponseSchema,
   agentAuthRequestSchema,
   agentAuthSuccessSchema,
@@ -1653,5 +1654,40 @@ describe('step approval round-trip', () => {
         outcome: 'maybe',
       }),
     ).toThrow();
+  });
+});
+
+describe('provenanceUploadDeferSchema', () => {
+  const msg = {
+    type: 'provenance.upload.defer' as const,
+    messageId: 'm1',
+    jobId: 'j1',
+    subjectName: 'art',
+    subjectDigest: 'a'.repeat(64),
+    audience: 'kici-provenance',
+    mediaType: 'application/vnd.kici.provenance.bundle+json;version=0.1',
+    statementHash: 'b'.repeat(64),
+    dsseEnvelope: {
+      payloadType: 'application/vnd.in-toto+json',
+      payload: 'eyJ4Ijoxf',
+      signatures: [{ keyid: 'k', sig: 's' }],
+    },
+    publicKey: { kty: 'EC', crv: 'P-256', x: 'a', y: 'b' },
+  };
+
+  it('round-trips a defer message', () => {
+    expect(provenanceUploadDeferSchema.parse(msg).statementHash).toBe('b'.repeat(64));
+  });
+
+  it('is accepted by the agent->orchestrator union', () => {
+    expect(agentToOrchestratorMessageSchema.parse(msg)).toMatchObject({
+      type: 'provenance.upload.defer',
+    });
+  });
+
+  it('rejects a missing statement hash', () => {
+    const { statementHash, ...rest } = msg;
+    void statementHash;
+    expect(provenanceUploadDeferSchema.safeParse(rest).success).toBe(false);
   });
 });

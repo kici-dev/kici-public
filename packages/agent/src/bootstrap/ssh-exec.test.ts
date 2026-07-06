@@ -14,9 +14,10 @@ const KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE 
 /** Record every spawn call; return canned results per command. */
 function makeSpawn(results: Partial<Record<string, SshResult>> = {}): {
   spawnFn: SpawnFn;
-  calls: Array<{ command: string; args: string[]; stdin?: string }>;
+  calls: Array<{ command: string; args: string[]; stdin?: string; env: NodeJS.ProcessEnv }>;
 } {
-  const calls: Array<{ command: string; args: string[]; stdin?: string }> = [];
+  const calls: Array<{ command: string; args: string[]; stdin?: string; env: NodeJS.ProcessEnv }> =
+    [];
   const ok: SshResult = { exitCode: 0, stdout: '', stderr: '' };
   const agentStart: SshResult = {
     exitCode: 0,
@@ -25,8 +26,10 @@ function makeSpawn(results: Partial<Record<string, SshResult>> = {}): {
     stderr: '',
   };
   const spawnFn: SpawnFn = vi.fn(async (command, args, opts) => {
-    calls.push({ command, args, stdin: opts.stdin });
-    if (command === 'ssh-agent' && args[0] === '-s') return agentStart;
+    calls.push({ command, args, stdin: opts.stdin, env: opts.env });
+    // The agent start invocation is any ssh-agent call that is not the `-k`
+    // teardown (start now carries `-a <sock> -s`, not just `-s`).
+    if (command === 'ssh-agent' && args[0] !== '-k') return agentStart;
     return results[command] ?? ok;
   });
   return { spawnFn, calls };
@@ -54,6 +57,24 @@ describe('sshExec', () => {
 
     // The ephemeral agent is torn down.
     expect(calls.filter((c) => c.command === 'ssh-agent' && c.args[0] === '-k')).toHaveLength(1);
+  });
+
+  it('binds the ephemeral agent to a KiCI-namespaced socket so leaked daemons are reapable', async () => {
+    const { spawnFn, calls } = makeSpawn();
+    await sshExec(reach, KEY, 'true', {}, { spawnFn });
+
+    // ssh-agent is started with `-a <sock>` pointing at a kici-bootstrap-ssh-*
+    // private dir — never the default /tmp/ssh-XXXX. kici-leak-sweep keys off
+    // this prefix to reap orphans a SIGKILL left behind.
+    const start = calls.find((c) => c.command === 'ssh-agent' && c.args[0] !== '-k');
+    const bindIdx = start!.args.indexOf('-a');
+    expect(bindIdx).toBeGreaterThanOrEqual(0);
+    const sock = start!.args[bindIdx + 1];
+    expect(sock).toMatch(/kici-bootstrap-ssh-[^/]+\/agent\.sock$/);
+
+    // ssh runs against that same socket, not the value ssh-agent printed.
+    const ssh = calls.find((c) => c.command === 'ssh');
+    expect(ssh?.env.SSH_AUTH_SOCK).toBe(sock);
   });
 
   it('pipes opts.stdin to the remote command and overrides the port', async () => {

@@ -56,6 +56,7 @@ export interface Database {
   scaler_agent_jobs: ScalerAgentJobsTable;
   scaler_reservations: ScalerReservationsTable;
   attestations: AttestationsTable;
+  pending_attestations: PendingAttestationsTable;
   remote_sources: RemoteSourcesTable;
   host_roster: HostRosterTable;
 }
@@ -301,10 +302,16 @@ export interface ExecutionRunTable {
   original_run_id: string | null;
   /** User identity that triggered this re-run (null for webhook-triggered). Format: "user:email" or "key:name". */
   triggered_by: string | null;
+  /** Agent provenance label when the run was triggered through an agent credential (null otherwise). */
+  triggered_by_agent_label: string | null;
   /** User identity that cancelled this run (null for non-cancelled). */
   cancelled_by: string | null;
+  /** Agent provenance label when the run was cancelled through an agent credential (null otherwise). */
+  cancelled_by_agent_label: string | null;
   /** Environment name for this run (null if no environment applies) */
   environment: string | null;
+  /** Matched environment id for this run (null if no/unresolved environment). */
+  environment_id: string | null;
   /** Trust tier of the contributor for PR runs (null for non-PR events) */
   trust_tier: string | null;
   /** Lock file source: 'head' or 'base' (null for non-PR events) */
@@ -416,6 +423,13 @@ export interface ExecutionJobTable {
    * overwritten with the agent-resolved list for dynamic environments.
    */
   environments: string | null;
+  /**
+   * Bound environments skipped on a test/local run (non-test or unconfigured),
+   * JSON-encoded `string[]`. NULL = nothing skipped.
+   */
+  skipped_environments: string | null;
+  /** User-visible warning naming the skipped test-run environments. NULL = none. */
+  env_warning: string | null;
   /** Whether all upstream needs edges are satisfied (dispatch gate). */
   needs_satisfied: Generated<boolean>;
   /** Timestamp when needs_satisfied first flipped to true. */
@@ -1795,6 +1809,51 @@ export interface AttestationsTable {
 // Convenience types for attestations
 export type AttestationRow = Selectable<AttestationsTable>;
 export type NewAttestationRow = Insertable<AttestationsTable>;
+
+/**
+ * Deferred-attestation outbox: a build whose provenance mint failed transiently
+ * freezes its DSSE-signed statement here; a leader-only retrier mints the token
+ * later and records the fulfilled `attestations` row.
+ */
+export interface PendingAttestationsTable {
+  /** Random id (primary key). */
+  id: string;
+  /** KiCI run this deferred attestation belongs to. */
+  run_id: string;
+  /** KiCI job this deferred attestation was produced by. */
+  job_id: string;
+  /** Caller-supplied artifact name. */
+  subject_name: string;
+  /** Primary subject digest (lowercase hex). */
+  subject_digest: string;
+  /** Requested token audience. */
+  audience: string;
+  /** The frozen, agent-signed DSSE envelope (JSONB). */
+  dsse_envelope: unknown;
+  /** The ephemeral public-key JWK (JSONB). */
+  public_key: unknown;
+  /** Bundle media type. */
+  media_type: string;
+  /** SHA-256 of the frozen statement payload — the later-mint binding. */
+  statement_hash: string;
+  /** Non-`live` AttestationOrigin: `deferred` | `offline-backfill`. */
+  origin_kind: string;
+  /** Retry attempts so far. */
+  attempt_count: Generated<number>;
+  /** First-capture time = the true build-time anchor. */
+  created_at: Generated<Date>;
+  /** When fulfilment was last attempted. */
+  last_attempt_at: Date | null;
+  /** Last fulfilment error, or NULL. */
+  last_error: string | null;
+  /**
+   * Terminal-rejection time: the Platform definitively rejected the mint
+   * (run/job absent). NULL while the row is still pending a later mint.
+   */
+  rejected_at: Date | null;
+}
+export type PendingAttestationRow = Selectable<PendingAttestationsTable>;
+export type NewPendingAttestationRow = Insertable<PendingAttestationsTable>;
 
 /**
  * Remote-source table (remote_sources).

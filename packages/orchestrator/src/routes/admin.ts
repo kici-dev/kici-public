@@ -122,6 +122,16 @@ export interface AdminRouteDeps {
    * write is best-effort, never gating.
    */
   accessLog?: AccessLogWriter;
+  /**
+   * Optional -- fulfil deferred attestations on demand (mints in the running
+   * orchestrator process, which owns the Platform WS). Backs
+   * `POST /api/v1/admin/attestations/retry` (the `kici-admin attestations retry`
+   * command). Unset on a WS-only / non-coordinator admin.
+   */
+  retryAttestations?: (opts: {
+    runId?: string;
+    includeRejected?: boolean;
+  }) => Promise<{ minted: number; stillPending: number; rejected: number }>;
 }
 
 /** Hono env type for admin routes with context variables. */
@@ -642,6 +652,32 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Optional -- only when db is provided (never a WS-only admin).
   if (deps.db) {
     app.route('/api/v1/admin', createMaintenanceRoutes({ db: deps.db }));
+  }
+
+  // Mount the deferred-attestation retry route. Optional -- only when the
+  // retrier is wired (coordinator with a Platform connection).
+  if (deps.retryAttestations) {
+    const retry = deps.retryAttestations;
+    app.post('/api/v1/admin/attestations/retry', async (c) => {
+      let runId: string | undefined;
+      let includeRejected = false;
+      try {
+        const raw = (await c.req.json().catch(() => ({}))) as {
+          runId?: unknown;
+          includeRejected?: unknown;
+        };
+        runId = typeof raw.runId === 'string' && raw.runId.length > 0 ? raw.runId : undefined;
+        includeRejected = raw.includeRejected === true;
+      } catch {
+        runId = undefined;
+      }
+      try {
+        const result = await retry({ ...(runId ? { runId } : {}), includeRejected });
+        return c.json(result);
+      } catch (err) {
+        return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+      }
+    });
   }
 
   // Mount environment management routes (create/bind/set-policy/list/show/template).

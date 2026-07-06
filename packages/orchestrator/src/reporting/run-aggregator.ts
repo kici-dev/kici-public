@@ -71,6 +71,8 @@ export interface RunDetailJobRow {
   error_message: string | null;
   runs_on_labels: unknown;
   environments: unknown;
+  skipped_environments: unknown;
+  env_warning: string | null;
   outputs: unknown;
   init_failure: unknown;
 }
@@ -108,6 +110,12 @@ export function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJo
           ? (JSON.parse(job.environments) as string[])
           : (job.environments as string[])
         : null,
+      skippedEnvironments: job.skipped_environments
+        ? typeof job.skipped_environments === 'string'
+          ? (JSON.parse(job.skipped_environments) as string[])
+          : (job.skipped_environments as string[])
+        : null,
+      envWarning: job.env_warning ?? null,
       outputs: job.outputs
         ? typeof job.outputs === 'string'
           ? JSON.parse(job.outputs)
@@ -207,64 +215,71 @@ export async function aggregateRunDetail(
     .executeTakeFirst();
   if (!run) return null;
 
-  const jobs = await db
-    .selectFrom('execution_jobs')
-    .select([
-      'job_id',
-      'job_name',
-      'status',
-      'matrix_values',
-      'base_job_name',
-      'variant_kind',
-      'variant_label',
-      'agent_id',
-      'started_at',
-      'completed_at',
-      'duration_ms',
-      'error_message',
-      'runs_on_labels',
-      'environments',
-      'outputs',
-      'init_failure',
-    ])
-    .where('run_id', '=', runId)
-    .orderBy('created_at', 'asc')
-    .execute();
-
-  const steps = await db
-    .selectFrom('execution_steps')
-    .select([
-      'job_id',
-      'step_index',
-      'step_name',
-      'status',
-      'started_at',
-      'completed_at',
-      'duration_ms',
-      'exit_code',
-      'error_message',
-      'step_type',
-      'secrets_accessed',
-      'check_outcome',
-      'drift_summary',
-      'concurrency_kind',
-      'group_id',
-    ])
-    .where('run_id', '=', runId)
-    .orderBy('step_index', 'asc')
-    .execute();
-
-  const secretOutputRows = await db
-    .selectFrom('run_secret_outputs')
-    .select(['job_id', 'output_key'])
-    .where('run_id', '=', runId)
-    .execute();
-
-  const needsRows = await db
-    .selectFrom('execution_job_needs')
-    .select(['job_name', 'upstream_name', 'run_on'])
-    .where('run_id', '=', runId)
-    .execute();
+  // The four child-row reads are independent of one another once the run row
+  // gates existence, so they run in one concurrent wave instead of four serial
+  // round-trips. This keeps the structured read (relayed to the user-plane MCP
+  // under a fixed timeout budget) fast even when the orchestrator's Postgres
+  // pool is contended by a concurrent execution. The result assembly below is
+  // identical to a serial fetch.
+  const [jobs, steps, secretOutputRows, needsRows] = await Promise.all([
+    db
+      .selectFrom('execution_jobs')
+      .select([
+        'job_id',
+        'job_name',
+        'status',
+        'matrix_values',
+        'base_job_name',
+        'variant_kind',
+        'variant_label',
+        'agent_id',
+        'started_at',
+        'completed_at',
+        'duration_ms',
+        'error_message',
+        'runs_on_labels',
+        'environments',
+        'skipped_environments',
+        'env_warning',
+        'outputs',
+        'init_failure',
+      ])
+      .where('run_id', '=', runId)
+      .orderBy('created_at', 'asc')
+      .execute(),
+    db
+      .selectFrom('execution_steps')
+      .select([
+        'job_id',
+        'step_index',
+        'step_name',
+        'status',
+        'started_at',
+        'completed_at',
+        'duration_ms',
+        'exit_code',
+        'error_message',
+        'step_type',
+        'secrets_accessed',
+        'check_outcome',
+        'drift_summary',
+        'concurrency_kind',
+        'group_id',
+      ])
+      .where('run_id', '=', runId)
+      .orderBy('step_index', 'asc')
+      .execute(),
+    db
+      .selectFrom('run_secret_outputs')
+      .select(['job_id', 'output_key'])
+      .where('run_id', '=', runId)
+      .execute(),
+    db
+      .selectFrom('execution_job_needs')
+      .select(['job_name', 'upstream_name', 'run_on'])
+      .where('run_id', '=', runId)
+      .execute(),
+  ]);
 
   const stepsByJob = new Map<string, RunDetailStepRow[]>();
   for (const step of steps) {

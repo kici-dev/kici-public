@@ -8,10 +8,37 @@ import {
   inTotoStatementSchema,
   kiciBuildDefinitionSchema,
   kiciProvenanceStatementSchema,
+  kiciWorkflowExternalParametersSchema,
+  kiciWorkflowInternalParametersSchema,
   resourceDescriptorSchema,
   slsaProvenancePredicateSchema,
   subjectSchema,
 } from './schema.js';
+
+describe('KiCI provenance params: origin + brand + provider', () => {
+  it('types orgId + sourceOrigin on internal params', () => {
+    const parsed = kiciWorkflowInternalParametersSchema.parse({
+      runId: 'r1',
+      jobId: 'j1',
+      orgId: 'org_abc123',
+      sourceOrigin: 'run-remote',
+    });
+    expect(parsed.orgId).toBe('org_abc123');
+    expect(parsed.sourceOrigin).toBe('run-remote');
+  });
+  it('rejects an invalid sourceOrigin', () => {
+    expect(kiciWorkflowInternalParametersSchema.safeParse({ sourceOrigin: 'nope' }).success).toBe(
+      false,
+    );
+  });
+  it('types provider on external params', () => {
+    const parsed = kiciWorkflowExternalParametersSchema.parse({
+      workflow: { repository: 'local/x', ref: 'main', path: 'wf@main' },
+      provider: 'local',
+    });
+    expect(parsed.provider).toBe('local');
+  });
+});
 
 describe('constants', () => {
   it('exposes the pinned in-toto / SLSA / KiCI URIs', () => {
@@ -226,5 +253,23 @@ describe('kiciBuildDefinitionSchema', () => {
       resolvedDependencies: [{ uri: 'git+https://x', digest: { gitCommit: 'beef' } }],
     };
     expect(kiciBuildDefinitionSchema.safeParse(bd).success).toBe(true);
+  });
+});
+
+describe('KiCI provenance internal params: deferred markers', () => {
+  it('types attestationOrigin + statementHash', () => {
+    const parsed = kiciWorkflowInternalParametersSchema.parse({
+      runId: 'r1',
+      jobId: 'j1',
+      attestationOrigin: 'deferred',
+      statementHash: 'a'.repeat(64),
+    });
+    expect(parsed.attestationOrigin).toBe('deferred');
+    expect(parsed.statementHash).toBe('a'.repeat(64));
+  });
+  it('rejects an invalid attestationOrigin', () => {
+    expect(
+      kiciWorkflowInternalParametersSchema.safeParse({ attestationOrigin: 'nope' }).success,
+    ).toBe(false);
   });
 });

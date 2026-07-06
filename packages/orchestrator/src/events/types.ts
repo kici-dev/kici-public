@@ -8,7 +8,12 @@
 export interface EventRouterConfig {
   /** Maximum allowed chain depth before circuit breaker trips (default: 10) */
   maxChainDepth: number;
-  /** Maximum event emissions per workflow per minute (default: 100) */
+  /**
+   * Max user-event emissions per (source routing key + event name) per minute
+   * (sliding 60s window). System events (`__`-prefixed, e.g. __workflow_complete)
+   * are EXEMPT -- they are orchestrator-emitted once per completion and cannot
+   * loop, so the storm guard does not apply. Default 100.
+   */
   rateLimitPerWorkflowPerMinute: number;
   /** TTL for persisted events in seconds (default: 604800 = 7 days) */
   eventTtlSeconds: number;

@@ -41,6 +41,7 @@ import { registerPeerCommands } from './commands/peer.js';
 import { registerHostCommands } from './commands/host.js';
 import { registerOrgSettingsCommands } from './commands/org-settings.js';
 import { registerClusterNameCommands } from './commands/cluster-name.js';
+import { registerClusterCommands } from './commands/cluster.js';
 import { registerMaintenanceCommands } from './commands/maintenance.js';
 import { registerEnvironmentCommands } from './commands/environment.js';
 import { registerVariableCommands } from './commands/variable.js';
@@ -101,7 +102,7 @@ export function buildProgram(): Command {
   registerRemoteSourceCommands(program);
   registerWorkflowCommands(program, getClient);
   registerRunsCommands(program, getClient);
-  registerAttestationsCommands(program);
+  registerAttestationsCommands(program, getClient);
   registerEventLogCommands(program, getClient);
   registerAccessLogCommands(program, getClient);
   registerBackendCommands(program, getClient);
@@ -124,6 +125,10 @@ export function buildProgram(): Command {
   registerHostCommands(program);
   registerOrgSettingsCommands(program, getClient);
   registerClusterNameCommands(program, getClient);
+  // Cluster identity recovery (reconcile-identity) is DB + S3 direct — no admin
+  // HTTP client — so it works while the orchestrator is crash-looping on a
+  // cluster identity mismatch.
+  registerClusterCommands(program);
   // Maintenance commands extend `secret` and `source` namespaces with purge
   // verbs, so must run after registerSecretCommands / registerSourceCommands.
   registerMaintenanceCommands(program, getClient);

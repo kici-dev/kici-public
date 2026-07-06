@@ -490,6 +490,62 @@ describe('DashboardHandler', () => {
         agent: { patId: 'p1', label: 'e2e-agent' },
       });
     });
+
+    it('serves a found run and records the read as allowed (concurrent org-resolve is behavior-neutral)', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst },
+      } = createMockDb({ selectRows: [] });
+      const send = vi.fn();
+      const record = vi.fn();
+
+      // First executeTakeFirst → resolveOrgForRun's routing-key probe (null →
+      // fall back to bound context). Second → aggregateRunDetail's run header.
+      mockNoopResolveOrgForRun(selectExecuteTakeFirst);
+      selectExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-9',
+        workflow_name: 'ci',
+        status: 'success',
+        provider: 'github',
+        repo_identifier: 'owner/repo',
+        ref: 'refs/heads/main',
+        sha: 'headsha',
+        started_at: null,
+        completed_at: null,
+        duration_ms: null,
+        trust_tier: null,
+        contributor_username: null,
+        triggered_by: null,
+        failure_reason: null,
+        init_failure: null,
+        provider_context: '{}',
+        routing_key: 'rk-9',
+      });
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage(),
+        send,
+        accessLog: { record } as never,
+        ...noopCallbacks,
+      });
+
+      await handler.handleRunStructured({
+        type: 'dashboard.run.structured',
+        requestId: 'req-s2',
+        runId: 'run-9',
+        actor: { type: 'user', sub: 'u1' },
+      });
+
+      expect(send).toHaveBeenCalledOnce();
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.run.structured.response');
+      expect(response.error).toBeUndefined();
+      expect(response.result).not.toBeNull();
+      expect(response.result.runId).toBe('run-9');
+      expect(record).toHaveBeenCalledOnce();
+      expect(record.mock.calls[0][0].action).toBe('run.structured.read');
+    });
   });
 
   describe('handleStepLogs', () => {
@@ -534,6 +590,71 @@ describe('DashboardHandler', () => {
 
       // Verify log storage was read with correct path
       expect(logStorage.read).toHaveBeenCalledWith('executions/run-42/job-test/step-0.log');
+      // Unbounded read (no limit): all lines, nextCursor null.
+      expect(response.nextCursor).toBeNull();
+    });
+
+    it('paginates step logs by cursor and limit', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+
+      const fiveLines = { data: 'a\nb\nc\nd\ne\n', cursor: 10, complete: true };
+
+      // First page: limit 2 from the start → ['a','b'], nextCursor '2'.
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce({ log_path: 'p.log' });
+      logStorage.read.mockResolvedValueOnce(fiveLines);
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'pg-1',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: 0,
+        limit: 2,
+      } as DashboardStepLogsRequest);
+      const first = send.mock.calls[0][0];
+      expect(first.lines).toEqual(['a', 'b']);
+      expect(first.totalLines).toBe(5);
+      expect(first.nextCursor).toBe('2');
+
+      // Second page: cursor '2', limit 2 → ['c','d'], nextCursor '4'.
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce({ log_path: 'p.log' });
+      logStorage.read.mockResolvedValueOnce(fiveLines);
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'pg-2',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: 0,
+        cursor: '2',
+        limit: 2,
+      } as DashboardStepLogsRequest);
+      const second = send.mock.calls[1][0];
+      expect(second.lines).toEqual(['c', 'd']);
+      expect(second.nextCursor).toBe('4');
+
+      // Last page: cursor '4', limit 2 → ['e'], nextCursor null (reached end).
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce({ log_path: 'p.log' });
+      logStorage.read.mockResolvedValueOnce(fiveLines);
+      await handler.handleStepLogs({
+        type: 'dashboard.step.logs',
+        requestId: 'pg-3',
+        runId: 'run-42',
+        jobId: 'j1',
+        stepIndex: 0,
+        cursor: '4',
+        limit: 2,
+      } as DashboardStepLogsRequest);
+      const third = send.mock.calls[2][0];
+      expect(third.lines).toEqual(['e']);
+      expect(third.nextCursor).toBeNull();
     });
 
     it('returns error when step not found', async () => {
@@ -748,7 +869,38 @@ describe('DashboardHandler', () => {
       expect(response.attestations).toHaveLength(1);
       expect(response.attestations[0].jobName).toBe('publish');
       expect(response.attestations[0].bundle.mediaType).toContain('kici.provenance.bundle');
+      expect(response.attestations[0].sourceOrigin).toBe('triggered');
       expect(response.error).toBeUndefined();
+    });
+
+    it('brands a local-working-tree attestation as run-remote', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
+      } = createMockDb();
+      const send = vi.fn();
+      const provenanceStorage = createMockProvenanceStorage();
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage(),
+        provenanceStorage,
+        send,
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      selectExecute.mockResolvedValueOnce([{ ...attestationRow, localWorkingTree: true }]);
+
+      await handler.handleAttestationsList({
+        type: 'dashboard.attestations.list',
+        requestId: 'req-att-rr',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-42',
+      } as DashboardAttestationsListRequest);
+
+      const response = send.mock.calls[0][0];
+      expect(response.attestations[0].sourceOrigin).toBe('run-remote');
     });
 
     it('returns an empty list when the run has no attestations', async () => {
@@ -864,6 +1016,7 @@ describe('DashboardHandler', () => {
       subjectName: 'pkg-b',
       verifyStatus: 'failed',
       verifyReason: 'dsse_signature_invalid',
+      localWorkingTree: true,
     };
 
     it('returns metadata-only summaries, paginated, and access-logged', async () => {
@@ -903,6 +1056,9 @@ describe('DashboardHandler', () => {
       expect(response.attestations[0]).not.toHaveProperty('bundle');
       expect(response.attestations[0].verifyStatus).toBe('verified');
       expect(response.attestations[1].verifyStatus).toBe('failed');
+      // Brand derived from the run's local_working_tree flag.
+      expect(response.attestations[0].sourceOrigin).toBe('triggered');
+      expect(response.attestations[1].sourceOrigin).toBe('run-remote');
       expect(accessLog.record).toHaveBeenCalled();
       const logged = accessLog.record.mock.calls[0][0];
       expect(logged.target.type).toBe('attestation');
@@ -1654,9 +1810,14 @@ describe('DashboardHandler', () => {
 
       await handler.handleRerunRequest(msg);
 
-      // Phase F: third arg is `routingKey` from the WS payload; the test
-      // message has no routingKey field so the callback receives `undefined`.
-      expect(onRerun).toHaveBeenCalledWith('original-run-123', 'user:user@test.com', undefined);
+      // Third arg is the agent provenance label (null for a plain user); the
+      // fourth is `routingKey` from the WS payload (absent here → undefined).
+      expect(onRerun).toHaveBeenCalledWith(
+        'original-run-123',
+        'user:user@test.com',
+        null,
+        undefined,
+      );
       expect(send).toHaveBeenCalledOnce();
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('run.rerun.response');
@@ -1708,7 +1869,12 @@ describe('DashboardHandler', () => {
 
       await handler.handleCancelRequest(msg);
 
-      expect(onCancel).toHaveBeenCalledWith('run-to-cancel', 'user:admin@company.com', undefined);
+      expect(onCancel).toHaveBeenCalledWith(
+        'run-to-cancel',
+        'user:admin@company.com',
+        null,
+        undefined,
+      );
       expect(send).toHaveBeenCalledOnce();
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('run.cancel.response');
@@ -1735,7 +1901,12 @@ describe('DashboardHandler', () => {
 
       await handler.handleCancelRequest(msg);
 
-      expect(onCancel).toHaveBeenCalledWith('run-force-cancel', 'user:admin@company.com', true);
+      expect(onCancel).toHaveBeenCalledWith(
+        'run-force-cancel',
+        'user:admin@company.com',
+        null,
+        true,
+      );
       const response = send.mock.calls[0][0];
       expect(response.cancelledJobs).toBe(2);
     });
@@ -1906,7 +2077,7 @@ describe('DashboardHandler', () => {
 
       await handler.handleManualScheduleRequest(msg);
 
-      expect(onManualSchedule).toHaveBeenCalledWith('reg-abc', 'user:user@test.com');
+      expect(onManualSchedule).toHaveBeenCalledWith('reg-abc', 'user:user@test.com', null);
       expect(send).toHaveBeenCalledOnce();
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('run.manual_schedule.response');

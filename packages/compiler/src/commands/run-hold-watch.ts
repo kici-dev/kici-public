@@ -13,7 +13,7 @@
 
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
-import type { HeldRunSummary } from './held-run-resolve.js';
+import type { HeldRunSummary } from '@kici-dev/engine';
 import {
   resolveHeldRunContext,
   postApprove,
@@ -23,6 +23,10 @@ import {
 
 /** A yes/no prompt; injected so the poll branch is unit-testable. */
 export type ConfirmPrompt = (message: string) => Promise<boolean>;
+
+/** Where hold/approve text is written. Injected so callers can route it to
+ *  stderr in quiet/json mode (keeping stdout a pure JSON channel). */
+export type HoldOutput = (line: string) => void;
 
 /** What to do with a newly-observed hold. Pure — no IO. */
 export type HoldAction =
@@ -50,8 +54,8 @@ export function classifyNewHolds(
   return { actions, seen: next };
 }
 
-/** Print a hold's identity + its drift payload (when present) to stdout. */
-function printHold(hold: HeldRunSummary): void {
+/** Print a hold's identity + its drift payload (when present) via `out`. */
+function printHold(hold: HeldRunSummary, out: HoldOutput): void {
   const scope = hold.holdScope ?? 'job';
   const where =
     scope === 'step' && hold.stepIndex != null
@@ -59,11 +63,11 @@ function printHold(hold: HeldRunSummary): void {
       : hold.jobId
         ? `job '${hold.jobId}'`
         : scope;
-  logger.info(pc.yellow(`\n[kici] Run held for approval (${where}).`));
+  out(pc.yellow(`\n[kici] Run held for approval (${where}).`));
   if (hold.payload?.summaryMarkdown) {
-    logger.info(pc.dim('Computed drift — review before approving:'));
+    out(pc.dim('Computed drift — review before approving:'));
     for (const line of hold.payload.summaryMarkdown.split('\n')) {
-      logger.info(pc.dim(`    ${line}`));
+      out(pc.dim(`    ${line}`));
     }
   }
 }
@@ -85,6 +89,12 @@ export async function handleNewHolds(args: {
    * audits it distinctly. Eligibility is still enforced server-side.
    */
   approveAll?: boolean;
+  /**
+   * Where hold/approve text goes. Defaults to `logger.info` (stdout). Quiet /
+   * `--json` callers pass a stderr sink so the machine-readable stdout payload
+   * stays pure.
+   */
+  output?: HoldOutput;
   /** Override for tests; defaults to the shared Platform held-run context. */
   resolveContext?: () => Promise<HeldRunContext | null>;
   /** Override for tests. */
@@ -94,12 +104,13 @@ export async function handleNewHolds(args: {
   const { actions, seen } = classifyNewHolds(args.holds, args.seen, args.isTty);
   if (actions.length === 0) return seen;
 
+  const out = args.output ?? ((line: string) => logger.info(line));
   const resolveCtx = args.resolveContext ?? resolveHeldRunContext;
   const doApprove = args.approve ?? postApprove;
   const doReject = args.reject ?? postReject;
   let ctx: HeldRunContext | null = null;
   if (args.approveAll) {
-    logger.info(
+    out(
       pc.yellow(
         '[kici] --approve-all: auto-approving every gate for this run (eligibility enforced).',
       ),
@@ -107,23 +118,21 @@ export async function handleNewHolds(args: {
   }
 
   for (const action of actions) {
-    printHold(action.hold);
+    printHold(action.hold, out);
     ctx = ctx ?? (await resolveCtx());
     if (!ctx) {
-      logger.info(pc.dim(`Run held; approve via \`kici approve ${action.hold.runId}\`.`));
+      out(pc.dim(`Run held; approve via \`kici approve ${action.hold.runId}\`.`));
       continue;
     }
     if (args.approveAll) {
       // Breakglass: auto-approve (run-scoped); eligibility enforced server-side.
       if (await doApprove(ctx, action.hold.id, true)) {
-        logger.info(pc.green('[kici] Auto-approved.'));
+        out(pc.green('[kici] Auto-approved.'));
       }
       continue;
     }
     if (action.kind === 'notify') {
-      logger.info(
-        pc.dim(`Run held; approve via the dashboard or \`kici approve ${action.hold.runId}\`.`),
-      );
+      out(pc.dim(`Run held; approve via the dashboard or \`kici approve ${action.hold.runId}\`.`));
       continue;
     }
     const approved = await args.confirm('Approve this gate?');
@@ -131,7 +140,7 @@ export async function handleNewHolds(args: {
       ? await doApprove(ctx, action.hold.id)
       : await doReject(ctx, action.hold.id, 'rejected via kici run');
     if (ok) {
-      logger.info(approved ? pc.green('[kici] Approved.') : pc.red('[kici] Rejected.'));
+      out(approved ? pc.green('[kici] Approved.') : pc.red('[kici] Rejected.'));
     }
   }
   return seen;

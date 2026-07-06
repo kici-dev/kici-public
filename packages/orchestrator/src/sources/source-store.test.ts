@@ -205,6 +205,35 @@ describe('SourceStore', () => {
     });
   });
 
+  describe('getSourceById()', () => {
+    it('returns a single source by its UUID', async () => {
+      const source = {
+        id: 'src-uuid-1',
+        provider: 'github',
+        name: 'App 1',
+        routing_key: 'github:111',
+        config: '{}',
+        created_at: new Date(),
+        updated_at: new Date(),
+      };
+      const { db } = createMockDb({ selectFirstRow: source });
+      const store = new SourceStore(db, secretStore as any);
+
+      const result = await store.getSourceById('src-uuid-1');
+
+      expect(result).toEqual(source);
+    });
+
+    it('returns null when the id is not found', async () => {
+      const { db } = createMockDb({ selectFirstRow: undefined });
+      const store = new SourceStore(db, secretStore as any);
+
+      const result = await store.getSourceById('00000000-0000-0000-0000-000000000000');
+
+      expect(result).toBeNull();
+    });
+  });
+
   describe('getSourceWithSecrets()', () => {
     it('returns source merged with decrypted secrets', async () => {
       const source = {

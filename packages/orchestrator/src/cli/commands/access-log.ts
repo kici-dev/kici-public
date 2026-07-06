@@ -43,6 +43,7 @@ interface AccessLogItem {
   source: string;
   outcome: string;
   errorMessage: string | null;
+  agentLabel: string | null;
   createdAt: string;
 }
 
@@ -87,6 +88,8 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
     .option('--from <ts>', 'ISO timestamp lower bound (inclusive)')
     .option('--to <ts>', 'ISO timestamp upper bound (exclusive)')
     .option('--q <text>', 'Filter by substring of error_message (trigram-indexed full-text search)')
+    .option('--agent-label <label>', 'Filter by exact agent label')
+    .option('--agent-only', 'Only agent-attributed rows')
     .option('--limit <n>', 'Max results (default 50, max 200)', '50')
     .option('--cursor <c>', 'Opaque cursor from a previous nextCursor')
     .option('--json', 'Emit raw JSON instead of a table')
@@ -104,6 +107,8 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
           from: opts.from,
           to: opts.to,
           q: opts.q,
+          agentLabel: opts.agentLabel,
+          agentOnly: opts.agentOnly,
           limit: parseInt(opts.limit, 10),
           cursor: opts.cursor,
         })) as unknown as ListResponse;
@@ -121,6 +126,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
         const headers = [
           'created_at',
           'actor',
+          'agent',
           'action',
           'source',
           'outcome',
@@ -130,6 +136,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
         const rows = response.items.map((r) => [
           r.createdAt,
           `${r.actorType}:${r.actorId}`,
+          r.agentLabel ?? '',
           r.action,
           r.source,
           r.outcome,
@@ -172,6 +179,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
         console.log(`  Org:           ${response.orgId ?? '(none)'}`);
         if (response.routingKey) console.log(`  Routing key:   ${response.routingKey}`);
         console.log(`  Actor:         ${response.actorType}:${response.actorId}`);
+        console.log(`  Agent label:   ${response.agentLabel ?? '-'}`);
         if (response.actorMeta) {
           console.log(`  Actor meta:    ${JSON.stringify(response.actorMeta)}`);
         }

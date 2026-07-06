@@ -22,7 +22,7 @@ function makeSpawn(): {
   };
   const spawnFn: SpawnFn = vi.fn(async (command, args, opts) => {
     calls.push({ command, args, stdin: opts.stdin });
-    if (command === 'ssh-agent' && args[0] === '-s') return agentStart;
+    if (command === 'ssh-agent' && args[0] !== '-k') return agentStart;
     // The unlock session drops — model a non-zero exit; preBootSend ignores it.
     if (command === 'ssh') return { exitCode: 255, stdout: '', stderr: 'connection closed' };
     return { exitCode: 0, stdout: '', stderr: '' };

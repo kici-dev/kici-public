@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   actorPrincipalSchema,
+  apiKeyActorSchema,
+  agentLabelOf,
   flattenActor,
   parseActor,
   stringifyActor,
@@ -108,6 +110,40 @@ describe('ActorPrincipal schema', () => {
     });
     expect(r.success).toBe(false);
   });
+
+  it('api_key actor accepts optional agent provenance', () => {
+    const a = apiKeyActorSchema.parse({
+      type: 'api_key',
+      keyId: 'k1',
+      ownerSub: 'u1',
+      agent: { label: 'ci-bot' },
+    });
+    expect(a.agent?.label).toBe('ci-bot');
+  });
+
+  it('rejects an api_key agent annotation with an empty label', () => {
+    const r = apiKeyActorSchema.safeParse({
+      type: 'api_key',
+      keyId: 'k1',
+      ownerSub: 'u1',
+      agent: { label: '' },
+    });
+    expect(r.success).toBe(false);
+  });
+});
+
+describe('agentLabelOf', () => {
+  it('returns the label for user and api_key agents, null otherwise', () => {
+    expect(agentLabelOf({ type: 'user', sub: 'u1', agent: { patId: 'p1', label: 'cc' } })).toBe(
+      'cc',
+    );
+    expect(
+      agentLabelOf({ type: 'api_key', keyId: 'k1', ownerSub: 'u1', agent: { label: 'ci' } }),
+    ).toBe('ci');
+    expect(agentLabelOf({ type: 'user', sub: 'u1' })).toBeNull();
+    expect(agentLabelOf({ type: 'api_key', keyId: 'k1', ownerSub: 'u1' })).toBeNull();
+    expect(agentLabelOf({ type: 'system', component: 'scheduler' })).toBeNull();
+  });
 });
 
 describe('stringifyActor / parseActor', () => {
@@ -184,6 +220,22 @@ describe('flattenActor', () => {
       actorId: 'ak1',
       actorMeta: { ownerSub: 'z1' },
     });
+  });
+
+  it('flattens an agent-annotated api_key → ownerSub + agentLabel in meta', () => {
+    expect(
+      flattenActor({ type: 'api_key', keyId: 'ak1', ownerSub: 'z1', agent: { label: 'ci-bot' } }),
+    ).toEqual({
+      actorType: 'api_key',
+      actorId: 'ak1',
+      actorMeta: { ownerSub: 'z1', agentLabel: 'ci-bot' },
+    });
+  });
+
+  it('stringifies an agent-annotated api_key with the agent label', () => {
+    expect(
+      stringifyActor({ type: 'api_key', keyId: 'ak1', ownerSub: 'z1', agent: { label: 'ci-bot' } }),
+    ).toBe('api_key:ak1 via agent:ci-bot');
   });
 
   it('flattens platform_operator → reason in meta', () => {

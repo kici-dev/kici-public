@@ -777,4 +777,49 @@ describe('DashboardEnvHandler', () => {
       expect(orgIdArg).not.toBe('other-tenant-org');
     });
   });
+
+  describe('held runs request-org scoping', () => {
+    it('scopes the held-runs list query to the request orgId when the Platform carries one', async () => {
+      // A remote run's hold lives under the run's own `remote_sources` org,
+      // which differs from this connection's primary webhook-source org.
+      // Honoring the Platform-carried org is what surfaces the hold to
+      // `kici approve` / `--approve-all` instead of an empty list.
+      const handled = await handler.handleMessage({
+        type: 'dashboard.held-runs.list',
+        requestId: 'req-hr-list',
+        runId: 'run-remote-1',
+        orgId: 'org-remote',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      expect(deps.db.where).toHaveBeenCalledWith('held_runs.org_id', '=', 'org-remote');
+      expect(deps.db.where).not.toHaveBeenCalledWith('held_runs.org_id', '=', 'org-1');
+      expect(deps.db.where).toHaveBeenCalledWith('held_runs.run_id', '=', 'run-remote-1');
+    });
+
+    it('falls back to the connection org for the held-runs list when no orgId is carried', async () => {
+      const handled = await handler.handleMessage({
+        type: 'dashboard.held-runs.list',
+        requestId: 'req-hr-list-legacy',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      expect(deps.db.where).toHaveBeenCalledWith('held_runs.org_id', '=', 'org-1');
+    });
+
+    it('scopes a held-runs approve to the request orgId when the Platform carries one', async () => {
+      const handled = await handler.handleMessage({
+        type: 'dashboard.held-runs.approve',
+        requestId: 'req-hr-approve',
+        heldRunId: 'hold-1',
+        orgId: 'org-remote',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      // The update path filters by the request org so a remote run's hold
+      // (recorded under its `remote_sources` org) is resolvable.
+      expect(deps.db.where).toHaveBeenCalledWith('org_id', '=', 'org-remote');
+      expect(deps.db.where).not.toHaveBeenCalledWith('org_id', '=', 'org-1');
+    });
+  });
 });

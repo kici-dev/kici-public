@@ -1,5 +1,5 @@
 ---
-title: Workflows, diagnostics, and orchestrators
+title: Workflows and infrastructure
 description: Registered workflows, infrastructure health, and the per-cluster orchestrator views.
 ---
 
@@ -11,9 +11,12 @@ Each row is expandable to show trigger configuration details. Rows include actio
 
 Filters include trigger type, repository, and workflow name.
 
-## Diagnostics
+## Infrastructure
 
-The diagnostics page (`/orgs/:customerId/diagnostics`) provides infrastructure health monitoring. It has four sections:
+The infrastructure page (`/orgs/:customerId/infrastructure`) provides infrastructure health monitoring. The orchestrator → scaler → agent tree is the canonical list of every orchestrator connected to this org — each top-level row carries a **Manage →** link into that cluster's per-cluster views. It has four sections plus a filter:
+
+
+- **Filter** -- a search box plus Status and Scaler-type facets above the tree. Typing narrows the tree to matching orchestrators, scalers, and agents (a node stays visible if it or any descendant matches), auto-expands branches that match on a descendant, and shows a running result count. While a filter is active, every scaler's agents are loaded up front so agent-level matches resolve across collapsed branches; with no filter the tree loads agents lazily on expand.
 
 1. **Execution metrics** -- cards showing total runs (24h), success rate, average duration, and active jobs (queued + running). Refreshes every 30 seconds.
 2. **Infrastructure alerts** -- banner summarizing any critical or warning alerts from connected orchestrators
@@ -28,6 +31,7 @@ The diagnostics page (`/orgs/:customerId/diagnostics`) provides infrastructure h
 
 4. **Secret backends** -- health cards for each configured secret backend (e.g. OpenBao), showing connection status with sync and test actions. Allows triggering a manual sync or connectivity test per backend.
 
-## Orchestrators
+## Per-cluster views
 
+Click an orchestrator's **Manage →** link in the infrastructure tree to drill into that cluster's per-orch surfaces (security policy, environments, secrets, DLQ, registrations, global workflows), keyed by **cluster name** — the human-friendly name set on the orch via `kici-admin cluster-name set <name>`, or an auto-generated `cluster-<6hex>` if no operator has renamed it. Different clusters in the same org can have different settings, so the tree row is the entry point that lets you pick which cluster you're configuring.
 

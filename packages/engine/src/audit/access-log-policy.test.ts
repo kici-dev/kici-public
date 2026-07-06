@@ -117,6 +117,21 @@ describe('shouldRecordAccess — overrides', () => {
     }
   });
 
+  it('records agent-attributed api_key activity in full for sampled actions', () => {
+    // The agent override covers org-key (api_key) agents too, not just PATs.
+    const apiKeyAgentActor = {
+      type: 'api_key' as const,
+      keyId: 'key-1',
+      ownerSub: 'u1',
+      agent: { label: 'ci-bot' },
+    };
+    for (let i = 0; i < 100; i++) {
+      expect(
+        shouldRecordAccess('run.detail.read', 'allowed', apiKeyAgentActor, `req-${i}`, limiter),
+      ).toBe(true);
+    }
+  });
+
   it('records agent-attributed activity even for rate-limited actions', () => {
     const blocking = new NeverAllowLimiter();
     const agentActor = {

@@ -29,7 +29,7 @@ vi.mock('kysely', async (importOriginal) => {
 
 import { EventRouter, type EmitEventInput, type EventRouterOptions } from './event-router.js';
 import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig, type StoredEvent } from './types.js';
-import type { EventStore } from './event-store.js';
+import { EVENT_CATCHUP_BATCH_SIZE, type EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
 import type { LockFile, LockWorkflow, WorkflowDecision } from '@kici-dev/engine';
@@ -427,9 +427,70 @@ describe('EventRouter', () => {
       const opts = createRouterOptions({ circuitBreaker });
       const router = new EventRouter(opts);
 
+      // A user event (no `__` prefix) is keyed `unknown:spam-event` and still
+      // throws when the breaker rejects.
       await expect(router.emit({ eventName: 'spam-event', payload: {} })).rejects.toThrow(
         'Rate limit exceeded',
       );
+    });
+
+    it('exempts system events from the rate limit', async () => {
+      const circuitBreaker = createMockCircuitBreaker({ rateAllowed: false });
+      const opts = createRouterOptions({ circuitBreaker });
+      const router = new EventRouter(opts);
+
+      // Even though the breaker would reject, a __-prefixed system event must
+      // neither throw nor consult the rate limiter -- so >100 completions/min
+      // across the cluster never collapse into one global bucket.
+      await expect(
+        router.emit({
+          eventName: '__workflow_complete',
+          payload: {},
+          sourceRoutingKey: 'rk1',
+          chainDepth: 0,
+        }),
+      ).resolves.toBeDefined();
+      expect(circuitBreaker.checkRateLimit).not.toHaveBeenCalled();
+    });
+
+    it('does not globally cap system completions across distinct workflows', async () => {
+      // The bug: >100 workflow completions/min sharing the constant event name
+      // `__workflow_complete` used to exhaust one global 100/min bucket and
+      // silently drop the rest. Emit 150 completions across distinct
+      // workflows/sources; every one must emit and none may consult the limiter.
+      const circuitBreaker = createMockCircuitBreaker({ rateAllowed: false });
+      const opts = createRouterOptions({ circuitBreaker });
+      const router = new EventRouter(opts);
+
+      for (let i = 0; i < 150; i++) {
+        await expect(
+          router.emit({
+            eventName: '__workflow_complete',
+            payload: { runId: `run-${i}` },
+            sourceRoutingKey: `rk-${i}`,
+            chainDepth: 0,
+          }),
+        ).resolves.toBeDefined();
+      }
+      expect(circuitBreaker.checkRateLimit).not.toHaveBeenCalled();
+    });
+
+    it('rate-limits a user event keyed by source routing key + event name', async () => {
+      const circuitBreaker = createMockCircuitBreaker(); // rateAllowed: true
+      const opts = createRouterOptions({ circuitBreaker });
+      const router = new EventRouter(opts);
+
+      await router.emit({ eventName: 'deploy-done', payload: {}, sourceRoutingKey: 'rk1' });
+      expect(circuitBreaker.checkRateLimit).toHaveBeenCalledWith('rk1:deploy-done');
+    });
+
+    it('keys a user event without a routing key as unknown:<eventName>', async () => {
+      const circuitBreaker = createMockCircuitBreaker();
+      const opts = createRouterOptions({ circuitBreaker });
+      const router = new EventRouter(opts);
+
+      await router.emit({ eventName: 'deploy-done', payload: {} });
+      expect(circuitBreaker.checkRateLimit).toHaveBeenCalledWith('unknown:deploy-done');
     });
   });
 
@@ -446,7 +507,7 @@ describe('EventRouter', () => {
       // Should register notification handler
       expect(opts.mockPool.client.on).toHaveBeenCalledWith('notification', expect.any(Function));
       // Should run catch-up (getUnprocessedSince called)
-      expect(eventStore.getUnprocessedSince).toHaveBeenCalledWith(null);
+      expect(eventStore.getUnprocessedSince).toHaveBeenCalledWith(null, EVENT_CATCHUP_BATCH_SIZE);
     });
 
     it('should set up notification handler on start', async () => {
@@ -756,7 +817,7 @@ describe('EventRouter', () => {
 
       await router.start();
 
-      expect(eventStore.getUnprocessedSince).toHaveBeenCalledWith(null);
+      expect(eventStore.getUnprocessedSince).toHaveBeenCalledWith(null, EVENT_CATCHUP_BATCH_SIZE);
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledTimes(2);
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-missed-1', 'test-node-A');
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-missed-2', 'test-node-A');
@@ -773,6 +834,58 @@ describe('EventRouter', () => {
 
       expect(eventStore.getUnprocessedSince).toHaveBeenCalled();
       expect(eventStore.tryLeaseForProcessing).not.toHaveBeenCalled();
+    });
+
+    it('should paginate and dispatch ALL missed events when more than one batch accumulated', async () => {
+      const total = EVENT_CATCHUP_BATCH_SIZE * 2 + 5; // 205 — spans three pages
+      const base = new Date('2026-02-22T10:00:00Z').getTime();
+      const allEvents = Array.from({ length: total }, (_, i) =>
+        makeStoredEvent({
+          id: `evt-missed-${String(i).padStart(4, '0')}`,
+          // Force same-created_at ties across the 100/200 page boundaries so the
+          // composite cursor is genuinely exercised (many events per timestamp).
+          createdAt: new Date(base + Math.floor(i / 50) * 60_000),
+        }),
+      );
+
+      const eventStore = createMockEventStore({ events: allEvents });
+      // Real keyset pagination: return the page strictly after `sinceId`,
+      // ordered by (createdAt, id), capped at `limit`. allEvents is already in
+      // (createdAt, id) order by construction.
+      (eventStore.getUnprocessedSince as any).mockImplementation(
+        (sinceId: string | null, limit: number) => {
+          const start = sinceId === null ? 0 : allEvents.findIndex((e) => e.id === sinceId) + 1;
+          return Promise.resolve(allEvents.slice(start, start + limit));
+        },
+      );
+
+      const reg = makeRegisteredWorkflow('on-deploy', 'deploy-complete');
+      const mockIndex = createMockRegistrationIndex([reg]);
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      const opts = createRouterOptions({
+        eventStore,
+        onEventMatched,
+        registrationIndex: mockIndex,
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+
+      // Every one of the 205 events was leased and dispatched — nothing stranded.
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledTimes(total);
+      expect(eventStore.markProcessed).toHaveBeenCalledTimes(total);
+      expect(onEventMatched).toHaveBeenCalledTimes(total);
+      // First and last events both came through.
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith(
+        'evt-missed-0000',
+        'test-node-A',
+      );
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith(
+        `evt-missed-${String(total - 1).padStart(4, '0')}`,
+        'test-node-A',
+      );
+      // At least three fetches: two full pages + a short final page.
+      expect((eventStore.getUnprocessedSince as any).mock.calls.length).toBeGreaterThanOrEqual(3);
     });
   });
 

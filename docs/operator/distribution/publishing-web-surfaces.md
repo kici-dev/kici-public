@@ -21,8 +21,8 @@ pointer and its own publishing cadence:
 | Marketing       | `kici.dev` / `www.kici.dev` | `pnpm publish:marketing`                         | Independent only                |
 | Docs            | `docs.kici.dev`             | A production release **and** `pnpm publish:docs` | Release-coupled and independent |
 
-- **App and marketing splash** ship together with a production release. The app
-  bundle is rebuilt at the release commit and goes live as part of that release.
+- **App** ships together with a production release. The app bundle is rebuilt
+  at the release commit and goes live as part of that release.
 - **Docs** ship with every production release (docs describe current product
   behavior, so a release rebuilds and republishes them at the release commit),
   **and** can be published independently between releases. A docs-only fix —

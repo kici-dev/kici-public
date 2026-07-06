@@ -858,7 +858,7 @@ describe('platformToOrchestratorMessageSchema', () => {
       type: 'dashboard.environments.history',
       requestId: 'req-env-hist',
       actor: { type: 'user', sub: 'zsub-test' },
-      environmentName: 'production',
+      environmentId: 'env-prod-1',
       limit: 10,
       offset: 0,
     };

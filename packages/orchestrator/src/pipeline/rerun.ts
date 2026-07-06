@@ -124,6 +124,7 @@ interface RejectedJob {
 export async function handleRerun(
   originalRunId: string,
   triggeredBy: string | null,
+  triggeredByAgentLabel: string | null,
   deps: RerunDeps,
   /**
    * Phase F — routing key for the original run, forwarded by Platform
@@ -176,6 +177,7 @@ export async function handleRerun(
     workflow: resolved.workflow,
     providerContext: resolved.providerContext,
     triggeredBy,
+    triggeredByAgentLabel,
     commitMessage,
   });
 
@@ -400,6 +402,7 @@ async function recordRerunExecutionStart(opts: {
   workflow: LockWorkflow;
   providerContext: Record<string, unknown>;
   triggeredBy: string | null;
+  triggeredByAgentLabel: string | null;
   commitMessage: string | undefined;
 }): Promise<void> {
   const {
@@ -411,6 +414,7 @@ async function recordRerunExecutionStart(opts: {
     workflow,
     providerContext,
     triggeredBy,
+    triggeredByAgentLabel,
     commitMessage,
   } = opts;
 
@@ -439,6 +443,11 @@ async function recordRerunExecutionStart(opts: {
         }
       : undefined,
     workflow.timeout, // workflowTimeoutMs
+    undefined, // checkMode
+    undefined, // localWorkingTree
+    undefined, // triggerActorUsername
+    undefined, // triggerActorUserId
+    triggeredByAgentLabel, // triggeredByAgentLabel
   );
 }
 

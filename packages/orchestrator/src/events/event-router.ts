@@ -4,6 +4,7 @@ import type { Database } from '../db/types.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LockFile, SimulatedEvent, WorkflowDecision } from '@kici-dev/engine';
 import { matchAllWorkflows, SCHEMA_VERSION } from '@kici-dev/engine';
+import { EVENT_CATCHUP_BATCH_SIZE } from './event-store.js';
 import type { EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
@@ -182,12 +183,20 @@ export class EventRouter {
       throw new Error(`Circuit breaker tripped: ${depthCheck.reason}`);
     }
 
-    // Check circuit breaker -- rate limit (keyed by eventName)
-    const rateCheck = this.circuitBreaker.checkRateLimit(event.eventName);
-    if (!rateCheck.allowed) {
-      throw new Error(
-        `Rate limit exceeded for event '${event.eventName}'. Retry after ${rateCheck.retryAfterMs}ms`,
-      );
+    // Check circuit breaker -- rate limit.
+    // System events (__-prefixed) are orchestrator-emitted exactly once per
+    // workflow/job completion with chainDepth 0 -- they cannot loop, so the
+    // event-storm rate limiter (a guard for user ctx.emit) does not apply.
+    // User events are keyed per (source routing key + event name) so the limit
+    // is genuinely per-workflow-source, not one global bucket per event name.
+    if (!event.eventName.startsWith('__')) {
+      const rateKey = `${event.sourceRoutingKey ?? 'unknown'}:${event.eventName}`;
+      const rateCheck = this.circuitBreaker.checkRateLimit(rateKey);
+      if (!rateCheck.allowed) {
+        throw new Error(
+          `Rate limit exceeded for event '${event.eventName}'. Retry after ${rateCheck.retryAfterMs}ms`,
+        );
+      }
     }
 
     // Persist event
@@ -498,37 +507,62 @@ export class EventRouter {
   }
 
   /**
-   * Catch-up: process unprocessed events missed during downtime.
+   * Catch-up: process every unprocessed event missed during downtime.
    *
-   * Uses lease-based dispatch identical to the live path, so a catch-up
-   * dispatch failure schedules a retry via the leader-only scanner instead
-   * of being silently dropped.
+   * Pages through the backlog with a keyset cursor: fetch a batch, dispatch
+   * each event (lease-based, identical failure semantics to the live path),
+   * advance the cursor to the last event of the batch, and repeat until a
+   * batch returns fewer than EVENT_CATCHUP_BATCH_SIZE rows. Without this loop
+   * only the oldest page (100 events) would be dispatched and the remainder
+   * would sit unprocessed — invisible to both the live NOTIFY path and the
+   * retry scanner — until the TTL cleanup deleted them undelivered.
+   *
+   * The store's cursor is strictly monotone over (created_at, id), so a
+   * still-unprocessed retrying event at or before the cursor is never
+   * re-fetched — that strict advance is what guarantees this loop terminates.
    */
   private async catchUp(): Promise<void> {
-    const events = await this.eventStore.getUnprocessedSince(this.lastProcessedEventId);
+    let totalChecked = 0;
+    let processedCount = 0;
 
-    if (events.length === 0) {
+    for (;;) {
+      const events = await this.eventStore.getUnprocessedSince(
+        this.lastProcessedEventId,
+        EVENT_CATCHUP_BATCH_SIZE,
+      );
+
+      if (events.length === 0) {
+        break;
+      }
+
+      totalChecked += events.length;
+
+      for (const event of events) {
+        const leased = await this.eventStore.tryLeaseForProcessing(event.id, this.nodeId);
+        if (!leased) {
+          logger.debug('Catch-up event already leased or terminal', { eventId: event.id });
+          this.lastProcessedEventId = event.id;
+          continue;
+        }
+
+        await this.dispatchAndRecord(leased);
+        this.lastProcessedEventId = event.id;
+        processedCount++;
+      }
+
+      // A short page means we've drained the backlog. A full page means there
+      // may be more — the cursor advanced to this page's last event above.
+      if (events.length < EVENT_CATCHUP_BATCH_SIZE) {
+        break;
+      }
+    }
+
+    if (totalChecked === 0) {
       logger.info('Event catch-up complete, no missed events');
       return;
     }
 
-    logger.info('Catching up on missed events', { count: events.length });
-
-    let processedCount = 0;
-    for (const event of events) {
-      const leased = await this.eventStore.tryLeaseForProcessing(event.id, this.nodeId);
-      if (!leased) {
-        logger.debug('Catch-up event already leased or terminal', { eventId: event.id });
-        this.lastProcessedEventId = event.id;
-        continue;
-      }
-
-      await this.dispatchAndRecord(leased);
-      this.lastProcessedEventId = event.id;
-      processedCount++;
-    }
-
-    logger.info('Event catch-up complete', { processedCount, totalChecked: events.length });
+    logger.info('Event catch-up complete', { processedCount, totalChecked });
   }
 }
 

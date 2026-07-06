@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { EventStore, type NewEventInput } from './event-store.js';
+import { EventStore, EVENT_CATCHUP_BATCH_SIZE, type NewEventInput } from './event-store.js';
 import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig } from './types.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
@@ -176,7 +176,7 @@ describe('EventStore', () => {
   });
 
   describe('getUnprocessedSince', () => {
-    it('should return unprocessed events ordered by created_at ASC', async () => {
+    it('should return unprocessed events ordered by created_at ASC then id ASC', async () => {
       const rows = [
         makeDbRow({ id: 'evt-1', created_at: new Date('2026-02-22T10:00:00Z') }),
         makeDbRow({ id: 'evt-2', created_at: new Date('2026-02-22T10:01:00Z') }),
@@ -190,6 +190,9 @@ describe('EventStore', () => {
       expect(events[0].id).toBe('evt-1');
       expect(events[1].id).toBe('evt-2');
       expect(mocks.selectWhere).toHaveBeenCalledWith('processed', '=', false);
+      // Deterministic keyset ordering: created_at is the primary sort, id the tiebreaker.
+      expect(mocks.selectOrderBy).toHaveBeenCalledWith('created_at', 'asc');
+      expect(mocks.selectOrderBy).toHaveBeenCalledWith('id', 'asc');
     });
 
     it('should respect the limit parameter', async () => {
@@ -201,13 +204,33 @@ describe('EventStore', () => {
       expect(mocks.selectLimit).toHaveBeenCalledWith(50);
     });
 
-    it('should default limit to 100', async () => {
+    it('should default limit to EVENT_CATCHUP_BATCH_SIZE (100)', async () => {
       const { db, mocks } = createMockDb({ selectManyResult: [] });
       const store = new EventStore(db, config);
 
       await store.getUnprocessedSince(null);
 
-      expect(mocks.selectLimit).toHaveBeenCalledWith(100);
+      expect(mocks.selectLimit).toHaveBeenCalledWith(EVENT_CATCHUP_BATCH_SIZE);
+      expect(EVENT_CATCHUP_BATCH_SIZE).toBe(100);
+    });
+
+    it('should look up the reference event to build a composite (created_at, id) cursor when sinceId is given', async () => {
+      // selectOneResult feeds the executeTakeFirst() ref-lookup for created_at;
+      // selectManyResult feeds the final .execute() page.
+      const { db, mocks } = createMockDb({
+        selectOneResult: { created_at: new Date('2026-02-22T10:00:00Z') },
+        selectManyResult: [
+          makeDbRow({ id: 'evt-3', created_at: new Date('2026-02-22T10:02:00Z') }),
+        ],
+      });
+      const store = new EventStore(db, config);
+
+      const events = await store.getUnprocessedSince('evt-boundary');
+
+      // The ref event's created_at was fetched to anchor the keyset cursor.
+      expect(mocks.selectWhere).toHaveBeenCalledWith('id', '=', 'evt-boundary');
+      expect(events).toHaveLength(1);
+      expect(events[0].id).toBe('evt-3');
     });
   });
 

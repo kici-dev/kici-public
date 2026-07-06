@@ -49,6 +49,28 @@ describe('activityFilterSchema', () => {
   it('rejects unknown actor types', () => {
     expect(() => activityFilterSchema.parse({ actorType: 'martian' })).toThrow();
   });
+
+  it('accepts the agent provenance filters (label + agent-only)', () => {
+    const parsed = activityFilterSchema.parse({ agentLabel: 'claude-code', agentOnly: 'true' });
+    expect(parsed.agentLabel).toBe('claude-code');
+    expect(parsed.agentOnly).toBe(true);
+  });
+
+  it('parses agentOnly query strings correctly (no z.coerce.boolean footgun)', () => {
+    // `?agentOnly=false` MUST parse to false. z.coerce.boolean('false') === true,
+    // which would silently invert the filter and force agent-only on every request.
+    expect(activityFilterSchema.parse({ agentOnly: 'false' }).agentOnly).toBe(false);
+    expect(activityFilterSchema.parse({ agentOnly: 'true' }).agentOnly).toBe(true);
+  });
+
+  it('accepts a native boolean agentOnly (programmatic callers)', () => {
+    expect(activityFilterSchema.parse({ agentOnly: false }).agentOnly).toBe(false);
+    expect(activityFilterSchema.parse({ agentOnly: true }).agentOnly).toBe(true);
+  });
+
+  it('leaves agentOnly undefined when absent (default)', () => {
+    expect(activityFilterSchema.parse({}).agentOnly).toBeUndefined();
+  });
 });
 
 describe('activityRowSchema', () => {

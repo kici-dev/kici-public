@@ -40,7 +40,7 @@ The `secret_audit_log` writer applies the same override layers, then samples `re
 
 Why this shape:
 
-- **Volume.** Before sampling, every dashboard render of a run-detail page produced ~5 `access_log` rows; the diagnostics page (an internal-ops view that no human ever audits) was the worst offender. Sampling and rate-limiting cut this by an estimated 80% without losing a single forensically-interesting event.
+- **Volume.** Before sampling, every dashboard render of a run-detail page produced ~5 `access_log` rows; the infrastructure page (an internal-ops view that no human ever audits) was the worst offender. Sampling and rate-limiting cut this by an estimated 80% without losing a single forensically-interesting event.
 - **Compliance preserved.** Denied/error and platform_operator overrides keep the events that matter — failed attempts, support-read break-glass — at full fidelity regardless of sampling.
 - **Mutations untouched.** The sampler never drops a mutation. Every `run.cancel`, `secret.set`, `held_run.approve`, etc. always records.
 
@@ -124,11 +124,45 @@ Common flags for `list`:
 | `--target-id`   | Target identifier                                                                       |
 | `--from`        | ISO-8601 lower bound (inclusive)                                                        |
 | `--to`          | ISO-8601 upper bound (exclusive)                                                        |
+| `--agent-label` | Only rows whose acting credential carried this exact agent label                        |
+| `--agent-only`  | Only agent-attributed rows (any agent label present)                                    |
 | `--limit`       | Max results, default 50, max 200                                                        |
 | `--cursor`      | Opaque cursor from a previous `nextCursor`                                              |
 | `--json`        | Emit raw JSON                                                                           |
 
 Enum values are source-of-truth defined in `packages/engine/src/protocol/messages/access-log.ts` — see that file for the full list of dotted actions and target types.
+
+### Filtering agent activity
+
+When a read or admin action is driven by an **agent-kind credential** — either a
+user's agent personal access token (PAT) or an org agent API key — the
+orchestrator records the credential's **agent label** in a dedicated
+`agent_label` column on the `access_log` row. Two filters narrow the log to that
+activity:
+
+```bash
+# Everything a specific agent did, by its label:
+kici-admin access-log list --agent-label claude-code
+
+# Every agent-attributed row, across all agents:
+kici-admin access-log list --agent-only --json
+```
+
+Both filters work for **either** agent actor kind — a user-PAT agent (the row's
+`actor_type` is `user`, the human owner is `actor_id`) and an org-API-key agent
+(the row's `actor_type` is `api_key`, the key is `actor_id`). The agent label is
+the discriminator, not the actor type, so `--agent-label` / `--agent-only` catch
+both. The same two filters are exposed as the `?agentLabel=<label>` and
+`?agentOnly=true` query parameters on the orchestrator admin endpoint
+`GET /api/v1/admin/access-log`, which is what the CLI and the dashboard both call.
+
+An agent-attributed row is visually distinguished on both surfaces:
+
+- In the CLI's table output, the **`agent`** column carries the agent label
+  (blank for non-agent rows).
+- On the dashboard's [Activity](#dashboard-activity-page) page, the row renders an
+  **agent badge**, and a run's **Triggered by** shows the same badge when an
+  agent triggered or cancelled the run.
 
 ## Retention — cold-store archival
 

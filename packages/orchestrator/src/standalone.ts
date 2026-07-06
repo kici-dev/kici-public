@@ -53,6 +53,7 @@ const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
+import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'standalone' });
@@ -223,19 +224,34 @@ await guardStartup(logger, async () => {
         // constructed by orchestrator-core and passed through createApp()
         // automatically.
         appDepsExtras: {
-          // Independent mode has no GitHub-App webhook ingress (that route is
-          // Platform-only). `source add` must print an honest "unavailable"
-          // note rather than a fabricated URL.
-          resolveSourceWebhookUrl: async (params: { provider: string }) =>
-            params.provider === 'github'
-              ? { webhookUrl: null, webhookNote: 'github-ingress-platform-only' }
-              : { webhookUrl: null, webhookNote: 'unsupported-provider' },
-          // Independent mode has no GitHub-App webhook ingress (Platform-only),
-          // so the manifest setup flow's pre-flight returns an honest note.
-          resolveGithubWebhookUrl: async () => ({
-            webhookUrl: null,
-            webhookNote: 'github-ingress-platform-only',
-          }),
+          // Independent mode serves its OWN direct GitHub ingress route
+          // (`/webhook/:orgId/github/:sourceId`), so `source add github`
+          // resolves the ingress URL locally from KICI_WEBHOOK_PUBLIC_URL — no
+          // Platform round-trip. The orgId comes from the source's customer_id.
+          resolveSourceWebhookUrl: async (params: {
+            routingKey: string;
+            provider: string;
+            sourceId: string;
+          }) => {
+            if (params.provider !== 'github') {
+              return { webhookUrl: null, webhookNote: 'unsupported-provider' };
+            }
+            const source = await sub.sourceStore?.getSourceById(params.sourceId);
+            const orgId = source?.customer_id ?? '__default__';
+            const url = buildLocalGithubIngressUrl(config.webhookPublicUrl, orgId, params.sourceId);
+            return url ? { webhookUrl: url } : { webhookUrl: null, webhookNote: 'no-public-url' };
+          },
+          // Manifest setup pre-flight: the org-scoped GitHub webhook URL is
+          // resolvable locally once a public base is configured. Independent
+          // mode has no central org, so an App-level manifest is org-scoped by
+          // the operator-provided org id when one is known; absent that we
+          // return an honest note rather than a fabricated URL.
+          resolveGithubWebhookUrl: async () => {
+            if (!config.webhookPublicUrl) {
+              return { webhookUrl: null, webhookNote: 'no-public-url' };
+            }
+            return { webhookUrl: null, webhookNote: 'org-not-identified' };
+          },
         },
 
         configReloaderExtras: {

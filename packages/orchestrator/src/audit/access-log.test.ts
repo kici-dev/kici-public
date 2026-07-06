@@ -112,6 +112,54 @@ describe.skipIf(!DATABASE_URL)('AccessLogWriter', () => {
     expect(cancelOnly.items).toHaveLength(1);
     expect(cancelOnly.items[0].action).toBe('run.cancel');
   });
+
+  it('filters by agentLabel, agentOnly, and surfaces agentLabel on result items', async () => {
+    const writer = new AccessLogWriter(db);
+    const agentActor: ActorPrincipal = {
+      type: 'api_key',
+      keyId: 'ak-cc',
+      ownerSub: 'u1',
+      agent: { label: 'cc' },
+    };
+
+    await writer.record({
+      orgId: 'org-1',
+      routingKey: null,
+      actor: agentActor,
+      action: 'run.detail.read',
+      target: { type: 'run', id: 'run-1' },
+      requestId: '00000000-0000-0000-0000-0000000000aa',
+      source: 'platform_proxy',
+      outcome: 'allowed',
+    });
+    // `run.cancel` is an always-recorded action, so this plain-user row lands
+    // deterministically with a null agent_label (no sampling involved).
+    await writer.record({
+      orgId: 'org-1',
+      routingKey: null,
+      actor: { type: 'user', sub: 'plain' },
+      action: 'run.cancel',
+      target: { type: 'run', id: 'run-2' },
+      requestId: '00000000-0000-0000-0000-0000000000bb',
+      source: 'platform_proxy',
+      outcome: 'allowed',
+    });
+
+    // (b) exact label filter narrows to the agent row and carries the label.
+    const byLabel = await writer.query({ orgId: 'org-1', agentLabel: 'cc' });
+    expect(byLabel.items).toHaveLength(1);
+    expect(byLabel.items[0].agentLabel).toBe('cc');
+
+    // (c) agentOnly drops the plain-user row.
+    const agentOnly = await writer.query({ orgId: 'org-1', agentOnly: true });
+    expect(agentOnly.items).toHaveLength(1);
+    expect(agentOnly.items[0].agentLabel).toBe('cc');
+
+    // (d) the plain-user row reports a null agentLabel.
+    const all = await writer.query({ orgId: 'org-1' });
+    const plain = all.items.find((i) => i.actorId === 'plain');
+    expect(plain?.agentLabel).toBeNull();
+  });
 });
 
 describe('AccessLogWriter (mocked — failure swallow)', () => {
@@ -164,6 +212,21 @@ describe('AccessLogWriter (mocked — agent label column)', () => {
       outcome: 'denied',
     });
     expect(valuesFn.mock.calls[0][0]).toMatchObject({ agent_label: 'e2e-agent' });
+  });
+
+  it('writes agent_label when the actor is an agent-annotated api_key', async () => {
+    const { writer, valuesFn } = captureWriter();
+    await writer.record({
+      orgId: 'org-1',
+      routingKey: 'rk',
+      actor: { type: 'api_key', keyId: 'key-1', ownerSub: 'u1', agent: { label: 'ci-bot' } },
+      action: 'run.structured.read',
+      target: { type: 'run', id: 'run-1' },
+      requestId: 'req-1',
+      source: 'platform_proxy',
+      outcome: 'denied',
+    });
+    expect(valuesFn.mock.calls[0][0]).toMatchObject({ agent_label: 'ci-bot' });
   });
 
   it('writes null agent_label for a plain user actor', async () => {

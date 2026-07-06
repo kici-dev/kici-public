@@ -110,6 +110,13 @@ describe('orchestrator OTel metrics', () => {
     expect(m.setDispatchQueueDepthBreakdown).toBeTypeOf('function');
   });
 
+  it('exposes pending-attestation gauge setters', async () => {
+    const m = await import('./prometheus.js');
+    expect(() => m.setPendingAttestations(3)).not.toThrow();
+    expect(() => m.setPendingAttestationOldestAgeSeconds(42)).not.toThrow();
+    expect(() => m.setRejectedAttestations(2)).not.toThrow();
+  });
+
   it('setDispatchQueueDepthBreakdown normalizes missing buckets to 0 and tolerates multiple labels', async () => {
     const m = await import('./prometheus.js');
 

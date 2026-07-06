@@ -19,6 +19,16 @@ import type { JobQueue } from '../queue/job-queue.js';
 
 const logger = createLogger({ prefix: 'workflow-deadline-detector' });
 
+/**
+ * Recency window for the deadline-bounded scan: a run stays in scope while its
+ * deadline (`started_at + workflow_timeout_ms`) lapsed within this window. 24h is
+ * the crash-recovery horizon — a run whose deadline lapsed while the orchestrator
+ * was down for less than this is still caught by the immediate `start()` scan; a
+ * deadline that lapsed longer ago is out of scope (separate stale-recovery concern).
+ * The window bounds the DEADLINE, not `started_at`, so timeouts >= 24h are enforced.
+ */
+export const DEADLINE_RECENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export interface WorkflowDeadlineDetectorDeps {
   db: Kysely<Database>;
   /**
@@ -73,22 +83,7 @@ export class WorkflowDeadlineDetector {
    */
   async scan(): Promise<void> {
     try {
-      // Time-bound to the last 24h, same guard as the stale detector — avoids
-      // re-scanning ancient history every tick.
-      const timeBound = new Date(Date.now() - 24 * 60 * 60 * 1000);
-      const overdue = await this.db
-        .selectFrom('execution_runs')
-        .select(['run_id', 'workflow_timeout_ms', 'started_at'])
-        .where('status', 'in', [
-          ExecutionRunStatus.enum.pending,
-          ExecutionRunStatus.enum.running,
-          ExecutionRunStatus.enum.cancelling,
-        ])
-        .where('workflow_timeout_ms', 'is not', null)
-        .where('started_at', '>', timeBound)
-        // started_at + (workflow_timeout_ms milliseconds) < now()
-        .where(sql<boolean>`started_at + (workflow_timeout_ms * interval '1 millisecond') < now()`)
-        .execute();
+      const overdue = await this.buildOverdueQuery().execute();
 
       for (const run of overdue) {
         await this.cancelOverdueRun(run.run_id, Number(run.workflow_timeout_ms));
@@ -100,6 +95,43 @@ export class WorkflowDeadlineDetector {
     } catch (err) {
       logger.error('Workflow deadline scan error', { error: toErrorMessage(err) });
     }
+  }
+
+  /**
+   * Build the SELECT for overdue runs. Extracted so a unit test can compile the
+   * exact predicate set (Kysely `.compile()`) and assert the deadline-recency
+   * bound without a live database.
+   *
+   * Bound the scan to runs whose DEADLINE lapsed within the recency window:
+   * overdue (deadline < now) AND recent (deadline > now - window). Bounding by
+   * the deadline (`started_at + workflow_timeout_ms`) rather than `started_at`
+   * keeps long-timeout runs (timeout >= the window, e.g. >= 24h) in scope once
+   * overdue — a `started_at > (now - window)` guard silently excluded those
+   * forever because their deadline only lapses after `started_at` has already
+   * aged past the window — while still skipping runs whose deadline passed long
+   * ago (already handled), preserving the "don't re-scan ancient history every
+   * tick" performance intent.
+   */
+  private buildOverdueQuery() {
+    const deadline = sql`started_at + (workflow_timeout_ms * interval '1 millisecond')`;
+    return (
+      this.db
+        .selectFrom('execution_runs')
+        .select(['run_id', 'workflow_timeout_ms', 'started_at'])
+        .where('status', 'in', [
+          ExecutionRunStatus.enum.pending,
+          ExecutionRunStatus.enum.running,
+          ExecutionRunStatus.enum.cancelling,
+        ])
+        .where('workflow_timeout_ms', 'is not', null)
+        // deadline < now() — the run is overdue.
+        .where(sql<boolean>`${deadline} < now()`)
+        // deadline > now() - <recency window> — the deadline lapsed recently; replaces
+        // the old started_at > (now - window) guard so long-timeout runs stay in scope.
+        .where(
+          sql<boolean>`${deadline} > now() - (${DEADLINE_RECENCY_WINDOW_MS} * interval '1 millisecond')`,
+        )
+    );
   }
 
   private async cancelOverdueRun(runId: string, timeoutMs: number): Promise<void> {

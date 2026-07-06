@@ -283,6 +283,12 @@ export interface DispatchMatchedWorkflowResult {
   dispatchedJobIds: string[];
   /** True when the workflow install gate paused the dispatch (held run). */
   held?: boolean;
+  /**
+   * User-visible warnings aggregated from dispatched jobs — today, one per job
+   * whose bound test-run environment(s) were unavailable and skipped. Surfaced
+   * on the accepted trigger response so the CLI can print them.
+   */
+  envWarnings?: string[];
 }
 
 /** Options controlling a (re-)dispatch of a matched workflow. */
@@ -375,6 +381,8 @@ interface SecretBundle {
 
 interface JobEnvData {
   environmentName?: string;
+  /** Configured env id matched for the first declared environment name. */
+  environmentId?: string;
   /**
    * Ordered bound-environment names persisted on the job row (`(dynamic)`
    * placeholder for elements unresolved at dispatch; overwritten with the
@@ -398,7 +406,11 @@ interface JobEnvData {
   pendingInit?: boolean;
   /** Bound environments skipped on a test/local run because they disallow local execution. */
   skippedEnvs?: string[];
-  /** Warning surfaced when every bound environment was skipped on a test run. */
+  /**
+   * User-visible warning set whenever any bound environment was unavailable for
+   * a test run (non-test or unconfigured) and skipped — surfaced on the CLI run
+   * output and the dashboard run view.
+   */
   envWarning?: string;
 }
 
@@ -420,6 +432,7 @@ interface JobEnvEvalResult {
   jobEnvironmentData: Map<string, JobEnvData>;
   deferredInitJobs: DeferredInitJob[];
   runEnvironmentName: string | undefined;
+  runEnvironmentId: string | undefined;
 }
 
 interface DispatchedJob {
@@ -438,6 +451,10 @@ interface DispatchedJob {
   waveFailFast?: boolean;
   /** Ordered bound-environment names persisted on the job row (multi-env jobs). */
   environments?: string[];
+  /** Bound environments skipped on a test run (non-test / unconfigured). */
+  skippedEnvironments?: string[];
+  /** User-visible warning naming the skipped test-run environments. */
+  envWarning?: string;
 }
 
 interface RejectedJob {
@@ -1929,6 +1946,19 @@ export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
  * Apply per-job environment data: protection rules, hold creation, environment
  * variables, and per-job secret resolution. Mutates `jobEnvData` in place.
  */
+/**
+ * User-facing warning naming bound environments that cannot participate in a
+ * test run — non-test (`allowLocalExecution=false`) or unconfigured — plus which
+ * test-allowed environments (if any) the job runs with instead.
+ */
+function formatTestRunUnavailableEnvWarning(unavailable: string[], remaining: string[]): string {
+  const names = unavailable.map((n) => `'${n}'`).join(', ');
+  const tail = remaining.length
+    ? `running with ${remaining.map((n) => `'${n}'`).join(', ')}`
+    : 'running with no environment variables';
+  return `bound environment(s) ${names} are unavailable for this test run and were skipped; ${tail}`;
+}
+
 async function applyEnvironmentRulesAndSecrets(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
@@ -1953,6 +1983,11 @@ async function applyEnvironmentRulesAndSecrets(args: {
   // The run's environment column / concurrency grouping uses the first declared
   // bound name, even if some bound environments have no configured record.
   jobEnvData.environmentName = environmentNames[0];
+  // Record the id of the configured env matched for the first declared name —
+  // tied to the same name written into the run's `environment` column. Captured
+  // before the missing/test-skip filtering below, which only governs
+  // protection rules / secrets, not history identity.
+  jobEnvData.environmentId = matched[0]?.env?.id;
 
   // Lenient missing-environment handling: a bound name with no configured record
   // simply does not contribute protection rules / vars (the established
@@ -1969,26 +2004,33 @@ async function applyEnvironmentRulesAndSecrets(args: {
     matched = matched.filter((m) => m.env);
   }
 
-  // Skip-on-test: a test/local run drops bound environments that disallow local
-  // execution (their vars/secrets and gates do not participate). If every bound
-  // env is skipped, the job runs with no environment vars and a clear warning.
+  // Skip-on-test (allow-and-warn): a test/local run never rejects on a bound
+  // environment. Bound environments that cannot participate in a test run —
+  // non-test (`allowLocalExecution === false`) or unconfigured (missing above) —
+  // are dropped (their vars/secrets and gates do not participate) and named in a
+  // single user-visible warning. The fixture `secrets:` gate stays fail-closed;
+  // a bound `environment:` only warns. If every bound env is unavailable, the
+  // job runs with no environment vars.
   if (ctx.testRun) {
     const skipped = matched.filter((m) => m.env && m.env.allowLocalExecution === false);
     if (skipped.length > 0) {
       jobEnvData.skippedEnvs = skipped.map((m) => m.name);
       matched = matched.filter((m) => !(m.env && m.env.allowLocalExecution === false));
-      if (matched.length === 0) {
-        jobEnvData.envWarning =
-          'all bound environments disallow test runs; running with no environment variables';
-        logger.warn('multi-env skip-on-test: all bound environments skipped', {
-          runId,
-          workflow: workflow.name,
-          job: lockJob.name,
-          skippedEnvs: jobEnvData.skippedEnvs,
-        });
-        return;
-      }
     }
+    const unavailable = [...missing, ...skipped.map((m) => m.name)];
+    if (unavailable.length > 0) {
+      jobEnvData.envWarning = formatTestRunUnavailableEnvWarning(
+        unavailable,
+        matched.map((m) => m.name),
+      );
+      logger.warn('test-run: bound environment(s) unavailable for this test run; skipped', {
+        runId,
+        workflow: workflow.name,
+        job: lockJob.name,
+        unavailable,
+      });
+    }
+    if (matched.length === 0) return; // dispatch with no env vars — never reject
   }
 
   // No configured environment participates (all missing and/or test-skipped):
@@ -2171,6 +2213,7 @@ async function evaluateJobEnvironments(args: {
   const jobEnvironmentData = new Map<string, JobEnvData>();
   const deferredInitJobs: DeferredInitJob[] = [];
   let runEnvironmentName: string | undefined;
+  let runEnvironmentId: string | undefined;
 
   for (const mat of buildPrep.materializedJobs) {
     const lockJob = mat.lockJob;
@@ -2224,7 +2267,8 @@ async function evaluateJobEnvironments(args: {
 
     if (jobEnv) jobEnvData.jobEnv = jobEnv;
     if (environmentNames.length > 0) {
-      if (!runEnvironmentName) runEnvironmentName = environmentNames[0];
+      // Run the matcher first so jobEnvData.environmentId is populated, then
+      // capture the run-level name + id from the first env-bearing job.
       await applyEnvironmentRulesAndSecrets({
         ctx,
         lockJob,
@@ -2233,6 +2277,10 @@ async function evaluateJobEnvironments(args: {
         jobEnvData,
         hostCtx: hostCtxFromMat(mat),
       });
+      if (!runEnvironmentName) {
+        runEnvironmentName = environmentNames[0];
+        runEnvironmentId = jobEnvData.environmentId;
+      }
     }
     // Explicit SDK requireApproval on a job with no environment-driven hold:
     // hold the job with trigger_source='explicit'.
@@ -2263,7 +2311,7 @@ async function evaluateJobEnvironments(args: {
     }
     jobEnvironmentData.set(mat.expandedName, jobEnvData);
   }
-  return { jobEnvironmentData, deferredInitJobs, runEnvironmentName };
+  return { jobEnvironmentData, deferredInitJobs, runEnvironmentName, runEnvironmentId };
 }
 
 // ---------------------------------------------------------------------------
@@ -3078,9 +3126,18 @@ async function recordRunStart(args: {
   buildPrep: BuildPrepResult;
   declaredContexts: readonly string[];
   runEnvironmentName: string | undefined;
+  runEnvironmentId: string | undefined;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
-  const { ctx, setup, buildPrep, declaredContexts, runEnvironmentName, dispatchedJobs } = args;
+  const {
+    ctx,
+    setup,
+    buildPrep,
+    declaredContexts,
+    runEnvironmentName,
+    runEnvironmentId,
+    dispatchedJobs,
+  } = args;
   const {
     deps,
     workflow,
@@ -3135,7 +3192,7 @@ async function recordRunStart(args: {
   if (runEnvironmentName && deps.db) {
     deps.db
       .updateTable('execution_runs')
-      .set({ environment: runEnvironmentName })
+      .set({ environment: runEnvironmentName, environment_id: runEnvironmentId ?? null })
       .where('run_id', '=', runId)
       .execute()
       .catch((err) => {
@@ -5097,10 +5154,18 @@ export async function dispatchMatchedWorkflow(
     );
   }
   // Stamp each dispatched job with its ordered bound-environment list so the
-  // job row persists it for the dashboard (keyed by expanded job name).
+  // job row persists it for the dashboard (keyed by expanded job name). Test-run
+  // skipped environments + their warning ride along the same map and are also
+  // aggregated for the accepted trigger response (the CLI surface).
+  const envWarnings: string[] = [];
   for (const dj of dispatchedJobs) {
     const ed = evalResult.jobEnvironmentData.get(dj.jobName);
     if (ed?.environmentNames?.length) dj.environments = ed.environmentNames;
+    if (ed?.skippedEnvs?.length) dj.skippedEnvironments = ed.skippedEnvs;
+    if (ed?.envWarning) {
+      dj.envWarning = ed.envWarning;
+      envWarnings.push(ed.envWarning);
+    }
   }
   await recordRunStart({
     ctx,
@@ -5108,6 +5173,7 @@ export async function dispatchMatchedWorkflow(
     buildPrep,
     declaredContexts: secrets.declaredContexts,
     runEnvironmentName: evalResult.runEnvironmentName,
+    runEnvironmentId: evalResult.runEnvironmentId,
     dispatchedJobs,
   });
   await insertEdgesAndMarkRejected({
@@ -5187,5 +5253,6 @@ export async function dispatchMatchedWorkflow(
   return {
     dispatchedJobCount: dispatchedJobs.length,
     dispatchedJobIds: dispatchedJobs.map((j) => j.jobId),
+    ...(envWarnings.length > 0 && { envWarnings }),
   };
 }

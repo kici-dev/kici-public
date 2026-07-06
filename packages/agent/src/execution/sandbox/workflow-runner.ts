@@ -58,7 +58,10 @@ import type {
   StepSecretsHandle,
   StepSecretsFileHost,
 } from '@kici-dev/sdk';
-import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import {
+  OIDC_TOKEN_REQUEST_METHOD,
+  type OidcTokenResult,
+} from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { sha256File } from '@kici-dev/core';
 import type { AttestProvenanceOptions } from '@kici-dev/sdk';
 import { attestProvenance as runAttest } from '../../provenance/attest.js';
@@ -755,16 +758,26 @@ async function relayProvenanceIpc(
 }
 
 /**
+ * Extract an `owner/repo` identifier from a git clone URL for a deferred
+ * statement's `externalParameters.workflow.repository` (the live path reads this
+ * from the minted token claim; the deferred path has no token yet).
+ */
+function extractRepoIdentifier(repoUrl: string): string {
+  const match = repoUrl.match(/(?:github|gitlab|bitbucket)\.\w+\/([^/]+\/[^/.]+)/);
+  return match ? match[1] : 'unknown/unknown';
+}
+
+/**
  * Build the `ctx.attestProvenance` step helper. Resolves a `path` subject to a
  * SHA-256 digest, threads the identity token via the supplied OIDC getter, and
- * persists the bundle over the IPC -> WS provenance-upload relay.
+ * persists the bundle over the IPC -> WS provenance-upload relay. On a transient
+ * mint failure the statement is frozen + reported for later minting (deferred);
+ * the step still completes.
  */
 function buildAttestProvenanceFn(
   request: JobExecutionRequest,
   workDir: string,
-  getIdToken: (opts: {
-    audience: string;
-  }) => Promise<{ token: string; expiresIn: number; jti: string }>,
+  getIdToken: (opts: { audience: string }) => Promise<OidcTokenResult>,
 ): StepContext['attestProvenance'] {
   return async (opts: AttestProvenanceOptions) => {
     const subject = provenanceSubjectIsPath(opts.subject)
@@ -778,6 +791,29 @@ function buildAttestProvenanceFn(
       {
         getIdToken,
         builderVersions: { 'kici-agent': AGENT_VERSION, 'kici-orchestrator': 'unknown' },
+        localContext: {
+          repository: extractRepoIdentifier(request.repoUrl),
+          ref: request.ref,
+          sha: request.sha || null,
+          workflowRef: request.workflowRef ?? request.workflowName,
+          runId: request.runId,
+          jobId: request.jobId,
+          issuer: request.provenanceIssuer ?? '',
+        },
+        // Transient mint failure: relay the frozen envelope for later minting
+        // instead of uploading a bundle. The job stays green.
+        reportDeferred: async (report) => {
+          await relayProvenanceIpc({
+            op: 'defer',
+            subjectDigest: report.subjectDigest,
+            subjectName: report.subjectName,
+            mediaType: report.mediaType,
+            audience: report.audience,
+            statementHash: report.statementHash,
+            dsseEnvelope: report.dsseEnvelope,
+            publicKey: report.publicKey,
+          });
+        },
         persist: async (bundle, subjectDigest) => {
           const urlResponse = await relayProvenanceIpc({ op: 'requestUploadUrl', subjectDigest });
           if (!urlResponse.uploadUrl) {
@@ -798,6 +834,13 @@ function buildAttestProvenanceFn(
       { subject, ...(opts.audience !== undefined && { audience: opts.audience }) },
     );
 
+    if ('deferred' in result) {
+      return {
+        deferred: true as const,
+        subjectDigest: result.subjectDigest,
+        statementHash: result.statementHash,
+      };
+    }
     return {
       storageKey: result.storageKey,
       subjectDigest: result.subjectDigest,

@@ -46,10 +46,11 @@ import type { PendingInitTracker, InitResult } from './cache/index.js';
 import type { PendingDynamicTracker } from './cache/index.js';
 import type { CacheStorage } from './storage/types.js';
 import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
+import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.js';
 import { registerBlobRoutes } from './storage/blob-routes.js';
 import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
-import { createOidcTokenHandler, deriveHttpBaseFromWsUrl } from './ws/oidc-token-relay.js';
+import { createOidcTokenHandler } from './ws/oidc-token-relay.js';
 import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
 import { createEnsureInitRunnerHandler, createPreBootSendHandler } from './ws/bringup-api.js';
 import { resolveScalerOrchestratorUrl } from './scaler/manager.js';
@@ -79,6 +80,9 @@ import type { TokenManager } from './secrets/token-manager.js';
 import type { SecretResolver } from './secrets/secret-resolver.js';
 import { forwardLine } from './scaler/log-forwarder.js';
 import { createGenericWebhookRoutes } from './routes/webhooks.js';
+import { createGithubWebhookRoutes, shouldServeGithubIngress } from './routes/github-webhook.js';
+import type { VerifyInboundDeps } from './webhook/verify-inbound.js';
+import type { SourceStore } from './sources/source-store.js';
 import { createAdminRoutes, type AdminRouteDeps } from './routes/admin.js';
 import { createAdminEventRoutes } from './routes/admin-events.js';
 import { createAdminRegistrationRoutes } from './routes/admin-registrations.js';
@@ -96,6 +100,8 @@ import { createMetricsRoutes } from '@kici-dev/shared';
 import { createDiagnosticsRoutes } from './routes/diagnostics.js';
 import { createFleetRoutes } from './routes/fleet.js';
 import { processWebhook } from './pipeline/processor.js';
+import { WebhookIngestOutcome } from './pipeline/process-webhook.js';
+import type { WebhookInfo } from './webhook/handler.js';
 import type { ConcurrencyGroupTracker } from './concurrency/group-tracker.js';
 import type { ConcurrencyQueueManager } from './concurrency/queue-manager.js';
 import { ConcurrencyWaiters } from './concurrency/waiters.js';
@@ -136,6 +142,12 @@ export interface AppDependencies {
   db: Kysely<Database>;
   pool: pg.Pool;
   registry: AgentRegistry;
+  /**
+   * Warmth latch surfaced on `GET /ready`. Returns `true` only once the
+   * orchestrator boot sequence has finished. When provided, `/ready` returns
+   * `503` until boot completes. Absent → warm defaults to `true`.
+   */
+  isWarm?: () => boolean;
   /** Host roster store for runsOnAll fan-out resolution. */
   hostRosterStore?: HostRosterStore;
   dispatcher: Dispatcher;
@@ -144,6 +156,15 @@ export interface AppDependencies {
   lockFileCache: LockFileCache;
   providerRegistry: ProviderRegistry;
   platformClient?: PlatformClient;
+  /**
+   * Fulfil deferred attestations on demand (mints in this process, which owns
+   * the Platform WS). Backs `POST /api/v1/admin/attestations/retry`. Wired only
+   * in coordinator mode where the retrier exists.
+   */
+  retryAttestations?: (opts: {
+    runId?: string;
+    includeRejected?: boolean;
+  }) => Promise<{ minted: number; stillPending: number; rejected: number }>;
   scalerManager?: ScalerManager;
   /** Bundle cache for compiled workflow bundles. Optional — requires S3 storage. */
   sourceCache?: SourceCache;
@@ -223,6 +244,9 @@ export interface AppDependencies {
   eventEmitter?: EventEmitter;
   /** Generic webhook source manager. Optional -- if not set, generic webhooks are disabled. */
   genericSourceManager?: GenericSourceManager;
+  /** GitHub direct-ingress route deps (hybrid/independent only). Optional -- if not set, the direct GitHub ingress route is not mounted. */
+  githubSourceStore?: SourceStore;
+  githubVerifyDeps?: VerifyInboundDeps;
   /** Trust store for cross-repo event trust. Optional -- if not set, trust management admin routes are unavailable. */
   trustStore?: TrustStore;
   /** Observer registry for broadcasting status/log updates to CLI observers. Optional -- if not set, observer features are inactive. */
@@ -525,20 +549,22 @@ export function createApp(deps: AppDependencies) {
     }
   }
 
-  // Register the provenance ID-token relay (read role). The relay drives the
-  // Platform's token-mint endpoint, so it is only meaningful when this
-  // orchestrator is connected to a Platform (platform/hybrid mode). In
-  // independent mode (no platformUrl/platformToken) the method is not
-  // registered and a request returns a clear "unknown method" error.
-  if (deps.config.platformUrl && deps.config.platformToken) {
+  // Register the provenance ID-token relay (read role). The relay mints over the
+  // authenticated orchestrator↔Platform WebSocket, so it is only meaningful when
+  // this orchestrator is connected to a Platform (platform/hybrid mode) and the
+  // WS client exists. In independent mode (no platformUrl/platformToken/client)
+  // the method is not registered and a request returns a clear "unknown method"
+  // error.
+  if (deps.config.platformUrl && deps.config.platformToken && deps.platformClient) {
     agentApiRegistry.register(
       OIDC_TOKEN_REQUEST_METHOD,
       'read',
       createOidcTokenHandler({
         dispatcher: deps.dispatcher,
-        platformToken: deps.config.platformToken,
-        platformHttpBase: deriveHttpBaseFromWsUrl(deps.config.platformUrl),
+        platformClient: deps.platformClient,
         orchestratorId: deps.config.instanceId,
+        testMode: deps.config.testMode,
+        testMintDeferAudience: deps.config.testMintDeferAudience,
       }),
     );
   }
@@ -926,6 +952,24 @@ export function createApp(deps: AppDependencies) {
             })
             .execute();
         },
+        onProvenanceDefer: async (record) => {
+          // A transient mint failure: persist the frozen envelope into the
+          // deferred-attestation outbox. The Raft-leader-only retrier mints the
+          // token later and drains the row.
+          await new PendingAttestationsRepo(deps.db).insert({
+            id: randomUUID(),
+            runId: record.runId,
+            jobId: record.jobId,
+            subjectName: record.subjectName,
+            subjectDigest: record.subjectDigest,
+            audience: record.audience,
+            dsseEnvelope: record.dsseEnvelope,
+            publicKey: record.publicKey,
+            mediaType: record.mediaType,
+            statementHash: record.statementHash,
+            originKind: record.originKind,
+          });
+        },
         onConcurrencyReport:
           deps.concurrencyTracker && deps.concurrencyQueueManager
             ? async (agentId, msg) => {
@@ -1247,73 +1291,98 @@ export function createApp(deps: AppDependencies) {
   });
 
   // Generic webhook routes (mounted when generic source manager is available)
+  // Shared inbound-webhook ingest closure. Both the generic direct-ingress
+  // route and the direct GitHub ingress route feed the same universal
+  // `processWebhook` pipeline (which owns the atomic dedup claim); keeping one
+  // closure means the two ingestion surfaces can never drift on the dep map or
+  // the failure event-log handling. Returns the pipeline's ingest outcome so a
+  // route can answer `{ duplicate: true }` on a dedup hit.
+  const runWebhookIngest = async (info: WebhookInfo): Promise<WebhookIngestOutcome> => {
+    const reqId = randomUUID();
+    return requestContext.run({ requestId: reqId, routingKey: info.routingKey }, async () => {
+      try {
+        return await processWebhook(info, {
+          dedup: deps.dedup,
+          providerRegistry: deps.providerRegistry,
+          lockFileCache: deps.lockFileCache,
+          dispatcher: deps.dispatcher,
+          platformClient: deps.platformClient,
+          sourceCache: deps.sourceCache,
+          buildCoordinator: deps.buildCoordinator,
+          depCache: deps.depCache,
+          pendingBuilds: deps.pendingBuilds,
+          pendingInits: deps.pendingInits,
+          pendingDynamics: deps.pendingDynamics,
+          checkRunReporter: deps.checkRunReporter,
+          executionTracker: deps.executionTracker,
+          onSourceLocationsExtracted,
+          eventRouter: deps.eventRouter,
+          registrationStore: deps.registrationStore,
+          registrationIndex: deps.registrationIndex,
+          db: deps.db,
+          secretKey: deps.config.secretKey,
+          secretResolver: deps.secretResolver,
+          logStorage: deps.logStorage,
+          environmentStore: deps.environmentStore,
+          variableStore: deps.variableStore,
+          heldRunStore: deps.heldRunStore,
+          coordinator: deps.coordinator,
+          cronScheduler: deps.cronScheduler,
+          globalWorkflowPolicy: deps.globalWorkflowPolicy,
+          eventLog: deps.eventLogWriter,
+          eventLogSource: 'direct',
+          contributorCache: deps.contributorCache,
+          accessLogWriter: deps.accessLogWriter,
+          hostRosterStore: deps.hostRosterStore,
+          instanceId: deps.config.instanceId,
+          rosterGraceMs: deps.config.rosterGraceMs,
+          maxFanoutHosts: deps.config.maxFanoutHosts,
+        });
+      } catch (err) {
+        if (deps.eventLogWriter) {
+          try {
+            await deps.eventLogWriter.record(info, payloadFromObject(info.payload), {
+              orgId: '__default__',
+              source: 'direct',
+              status: 'failed',
+              errorMessage: toErrorMessage(err),
+            });
+          } catch (recordErr) {
+            logger.warn('Failed to record failed event-log row for direct ingest path', {
+              deliveryId: info.deliveryId,
+              error: toErrorMessage(recordErr),
+            });
+          }
+        }
+        throw err;
+      }
+    });
+  };
+
   if (deps.genericSourceManager) {
     app.route(
       '/',
       createGenericWebhookRoutes({
         sourceManager: deps.genericSourceManager,
-        dedup: deps.dedup,
-        onWebhook: async (info) => {
-          const reqId = randomUUID();
-          await requestContext.run({ requestId: reqId, routingKey: info.routingKey }, async () => {
-            try {
-              await processWebhook(info, {
-                dedup: deps.dedup,
-                providerRegistry: deps.providerRegistry,
-                lockFileCache: deps.lockFileCache,
-                dispatcher: deps.dispatcher,
-                platformClient: deps.platformClient,
-                sourceCache: deps.sourceCache,
-                buildCoordinator: deps.buildCoordinator,
-                depCache: deps.depCache,
-                pendingBuilds: deps.pendingBuilds,
-                pendingInits: deps.pendingInits,
-                pendingDynamics: deps.pendingDynamics,
-                checkRunReporter: deps.checkRunReporter,
-                executionTracker: deps.executionTracker,
-                onSourceLocationsExtracted,
-                eventRouter: deps.eventRouter,
-                registrationStore: deps.registrationStore,
-                registrationIndex: deps.registrationIndex,
-                db: deps.db,
-                secretKey: deps.config.secretKey,
-                secretResolver: deps.secretResolver,
-                logStorage: deps.logStorage,
-                environmentStore: deps.environmentStore,
-                variableStore: deps.variableStore,
-                heldRunStore: deps.heldRunStore,
-                coordinator: deps.coordinator,
-                cronScheduler: deps.cronScheduler,
-                globalWorkflowPolicy: deps.globalWorkflowPolicy,
-                eventLog: deps.eventLogWriter,
-                eventLogSource: 'direct',
-                contributorCache: deps.contributorCache,
-                accessLogWriter: deps.accessLogWriter,
-                hostRosterStore: deps.hostRosterStore,
-                instanceId: deps.config.instanceId,
-                rosterGraceMs: deps.config.rosterGraceMs,
-                maxFanoutHosts: deps.config.maxFanoutHosts,
-              });
-            } catch (err) {
-              if (deps.eventLogWriter) {
-                try {
-                  await deps.eventLogWriter.record(info, payloadFromObject(info.payload), {
-                    orgId: '__default__',
-                    source: 'direct',
-                    status: 'failed',
-                    errorMessage: toErrorMessage(err),
-                  });
-                } catch (recordErr) {
-                  logger.warn('Failed to record failed event-log row for generic path', {
-                    deliveryId: info.deliveryId,
-                    error: toErrorMessage(recordErr),
-                  });
-                }
-              }
-              throw err;
-            }
-          });
-        },
+        onWebhook: runWebhookIngest,
+      }),
+    );
+  }
+
+  // Direct GitHub-App ingress (mounted on EVERY instance in hybrid/independent
+  // modes so an external LB/DNS can front-end the whole cluster). Platform mode
+  // is relay-only and has no local GitHub source config.
+  if (
+    deps.githubSourceStore &&
+    deps.githubVerifyDeps &&
+    shouldServeGithubIngress(deps.config.mode)
+  ) {
+    app.route(
+      '/',
+      createGithubWebhookRoutes({
+        sourceStore: deps.githubSourceStore,
+        verifyDeps: deps.githubVerifyDeps,
+        onWebhook: runWebhookIngest,
       }),
     );
   }
@@ -1330,6 +1399,7 @@ export function createApp(deps: AppDependencies) {
         accessLog: deps.accessLogWriter,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
+        retryAttestations: deps.retryAttestations,
       }),
     );
   }
@@ -1557,6 +1627,7 @@ export function createApp(deps: AppDependencies) {
     '/',
     createHealthRoutes({
       db: deps.db,
+      isWarm: deps.isWarm,
     }),
   );
 

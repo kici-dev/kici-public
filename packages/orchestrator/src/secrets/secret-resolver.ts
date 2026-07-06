@@ -388,16 +388,7 @@ export class SecretResolver implements SecretResolverApi {
         throw new Error(`No store found for backend '${backendName}'`);
       }
       const unprefixedScope = colonIdx >= 0 ? secret.scope.slice(colonIdx + 1) : secret.scope;
-      if ('decrypt' in store && typeof store.decrypt === 'function') {
-        return store.decrypt({ ...secret, scope: unprefixedScope });
-      }
-      return (store as any).decryptValue(
-        secret.orgId,
-        unprefixedScope,
-        secret.key,
-        secret.encryptedValue,
-        secret.keyVersion,
-      );
+      return store.decrypt({ ...secret, scope: unprefixedScope });
     };
   }
 

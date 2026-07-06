@@ -45,6 +45,8 @@ export const DashboardWriteOperation = z.enum([
   // DLQ — replay or drop failed webhooks.
   'event_dlq.retry',
   'event_dlq.discard',
+  // Attestations — drain the deferred-attestation outbox (mints deferred tokens).
+  'attestations.retry',
   // Registrations — DoS-shaped or destructive.
   'registration.disable',
   'registration.delete',
@@ -80,6 +82,7 @@ export const DASHBOARD_WRITE_OPERATION_VALUES: readonly DashboardWriteOperation[
   'held_runs.reject',
   'event_dlq.retry',
   'event_dlq.discard',
+  'attestations.retry',
   'registration.disable',
   'registration.delete',
   'global_workflows.update',
@@ -97,6 +100,7 @@ export const DashboardWriteCategory = z.enum([
   'Bindings',
   'Held runs',
   'DLQ',
+  'Attestations',
   'Registrations',
   'Topology',
   'Fleet',
@@ -273,6 +277,14 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       cliEquivalent: 'kici-admin event-dlq discard',
     },
     {
+      name: 'attestations.retry',
+      wireMessageType: 'dashboard.attestation.retry',
+      category: 'Attestations',
+      label: 'Retry deferred attestations',
+      sensitivity: 'dispatch',
+      cliEquivalent: 'kici-admin attestations retry',
+    },
+    {
       name: 'registration.disable',
       wireMessageType: 'dashboard.registration.disable',
       category: 'Registrations',
@@ -405,7 +417,7 @@ export function isDashboardWriteOperationEnabled(
 
 /**
  * Expand a (possibly sparse) policy map into the full effective state
- * for all 26 operations. Operations the policy doesn't mention come
+ * for all 27 operations. Operations the policy doesn't mention come
  * back as `true` (permissive). Used by the orch HTTP admin response,
  * the WS `orch.capabilities` broadcast, and the dashboard's policy
  * page so consumers see the full picture, not the sparse storage shape.

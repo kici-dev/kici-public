@@ -498,6 +498,44 @@ export async function purgeScopedSecretsDirect(
   }
 }
 
+/**
+ * Bulk-delete `environments` (and their FK-dependent rows) for an org, or for
+ * every org when `orgId` is omitted. `environment_bindings` /
+ * `environment_variables` / `environment_source_overrides` cascade
+ * automatically (ON DELETE CASCADE). `held_runs` and `execution_runs` reference
+ * `environments(id)` with ON DELETE SET NULL, so deleting environments alone
+ * would leave orphaned `held_runs` rows carrying a null environment reference;
+ * this helper deletes the org's `held_runs` too so a warm-start reset gets a
+ * clean slate. Runs in a transaction so both deletes commit atomically. Used by
+ * the E2E warm-start reset (so seeded environments don't leak between
+ * categories) and exposed via `kici-admin environment purge`.
+ */
+export async function purgeEnvironmentsDirect(
+  databaseUrl: string,
+  orgId?: string,
+): Promise<{ environmentsDeleted: number; heldRunsDeleted: number }> {
+  const pool = createPool(databaseUrl);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const where = orgId ? 'WHERE org_id = $1' : '';
+    const params = orgId ? [orgId] : [];
+    const held = await client.query(`DELETE FROM held_runs ${where}`, params);
+    const envs = await client.query(`DELETE FROM environments ${where}`, params);
+    await client.query('COMMIT');
+    return {
+      environmentsDeleted: envs.rowCount ?? 0,
+      heldRunsDeleted: held.rowCount ?? 0,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+    await pool.end();
+  }
+}
+
 // ── environment ops ────────────────────────────────────────────────────
 //
 // Direct-DB helpers backing `kici-admin environment` (Stage 5a #1). These
@@ -2912,6 +2950,97 @@ export async function deleteKiciEventsDirect(
       ? await pool.query(`DELETE FROM kici_events WHERE id = $1`, [opts.id])
       : await pool.query(`DELETE FROM kici_events WHERE event_name = $1`, [opts.eventName]);
     return { deleted: result.rowCount ?? 0 };
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * INSERT a kici_events row with an explicit created_at. Lets a test place
+ * many events on the exact same timestamp so the catch-up keyset cursor's
+ * same-created_at tie handling is genuinely exercised (the default-NOW insert
+ * path cannot force ties deterministically). Returns the inserted id.
+ */
+export async function insertKiciEventAtDirect(
+  databaseUrl: string,
+  opts: {
+    eventName: string;
+    createdAt: Date;
+    payload?: Record<string, unknown>;
+    chainDepth?: number;
+    sourceRoutingKey?: string | null;
+    expiresIn?: string;
+  },
+): Promise<{ id: string }> {
+  const expiresIn = opts.expiresIn ?? '7 days';
+  const pool = createPool(databaseUrl);
+  try {
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO kici_events
+         (event_name, payload, source_routing_key, chain_depth, processed, created_at, expires_at)
+       VALUES ($1, $2::jsonb, $3, $4, false, $5::timestamptz, NOW() + ($6)::interval)
+       RETURNING id`,
+      [
+        opts.eventName,
+        JSON.stringify(opts.payload ?? {}),
+        opts.sourceRoutingKey ?? null,
+        opts.chainDepth ?? 0,
+        opts.createdAt.toISOString(),
+        expiresIn,
+      ],
+    );
+    return { id: result.rows[0].id };
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * Page through unprocessed, non-DLQ kici_events for a given event_name using
+ * the same composite `(created_at, id)` keyset cursor + `ORDER BY created_at
+ * ASC, id ASC` that EventStore.getUnprocessedSince runs. Keep this SQL in sync
+ * with `packages/orchestrator/src/events/event-store.ts`.
+ *
+ * Returns every id seen across all pages in traversal order (with duplicates
+ * preserved so the caller can assert none occur) plus the page count. This is
+ * the real-Postgres guard that the keyset cursor pages the entire backlog —
+ * including same-created_at ties across a page boundary — with no skip and no
+ * duplicate.
+ */
+export async function paginateUnprocessedEventsKeysetDirect(
+  databaseUrl: string,
+  opts: { eventName: string; batchSize?: number },
+): Promise<{ ids: string[]; pages: number }> {
+  const batchSize = Math.max(1, Math.min(10_000, opts.batchSize ?? 100));
+  const pool = createPool(databaseUrl);
+  try {
+    const ids: string[] = [];
+    let cursor: { createdAt: string; id: string } | null = null;
+    let pages = 0;
+
+    for (;;) {
+      const params: unknown[] = [opts.eventName];
+      let cursorClause = '';
+      if (cursor) {
+        cursorClause = `AND (created_at, id) > ($2::timestamptz, $3::uuid)`;
+        params.push(cursor.createdAt, cursor.id);
+      }
+      const { rows } = await pool.query<{ id: string; created_at: string }>(
+        `SELECT id, created_at FROM kici_events
+          WHERE event_name = $1 AND processed = false AND dlq_at IS NULL ${cursorClause}
+          ORDER BY created_at ASC, id ASC
+          LIMIT ${batchSize}`,
+        params,
+      );
+      if (rows.length === 0) break;
+      pages += 1;
+      for (const r of rows) ids.push(r.id);
+      const last = rows[rows.length - 1];
+      cursor = { createdAt: new Date(last.created_at).toISOString(), id: last.id };
+      if (rows.length < batchSize) break;
+    }
+
+    return { ids, pages };
   } finally {
     await pool.end();
   }

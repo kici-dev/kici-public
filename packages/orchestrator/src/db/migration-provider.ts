@@ -65,6 +65,12 @@ import * as m057 from './migrations/057_step_concurrency.js';
 import * as m058 from './migrations/058_access_log_agent_label.js';
 import * as m059 from './migrations/059_attestation_verdict.js';
 import * as m060 from './migrations/060_run_trigger_actor.js';
+import * as m061 from './migrations/061_execution_runs_environment_id.js';
+import * as m062 from './migrations/062_execution_runs_agent_label.js';
+import * as m063 from './migrations/063_access_log_agent_label_index.js';
+import * as m064 from './migrations/064_execution_jobs_skipped_environments.js';
+import * as m065 from './migrations/065_pending_attestations.js';
+import * as m066 from './migrations/066_pending_attestations_rejected.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -130,6 +136,12 @@ export function createMigrationProvider(): MigrationProvider {
         '058_access_log_agent_label': m058,
         '059_attestation_verdict': m059,
         '060_run_trigger_actor': m060,
+        '061_execution_runs_environment_id': m061,
+        '062_execution_runs_agent_label': m062,
+        '063_access_log_agent_label_index': m063,
+        '064_execution_jobs_skipped_environments': m064,
+        '065_pending_attestations': m065,
+        '066_pending_attestations_rejected': m066,
       };
     },
   };

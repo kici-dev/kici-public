@@ -132,6 +132,8 @@ export interface PlatformTriggerResponse {
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds?: string[];
+  /** User-visible warnings on acceptance (e.g. skipped non-test bound environments). */
+  warnings?: string[];
 }
 
 export interface PlatformRunStatusResponse {

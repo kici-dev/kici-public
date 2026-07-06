@@ -264,7 +264,7 @@ Key metric prefixes:
 
 ## In-app diagnostics
 
-The KiCI dashboard includes a built-in diagnostics page at `/orgs/:orgId/diagnostics`.
+The KiCI dashboard includes a built-in infrastructure page at `/orgs/:orgId/infrastructure`.
 
 ### Features
 

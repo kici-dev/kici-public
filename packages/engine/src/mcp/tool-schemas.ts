@@ -1,10 +1,10 @@
 /**
- * Zod argument schemas for the KiCI MCP tools.
+ * Zod argument schemas for the KiCI developer MCP tools.
  *
- * Browser-safe (zod only) and shared between the Platform-hosted developer MCP
- * and the sibling orchestrator-side admin MCP so both expose an identical tool
- * argument contract. Each export is a Zod *raw shape* (a plain object of Zod
- * fields) so it can be passed directly as an MCP tool `inputSchema`.
+ * Browser-safe (zod only) so they live in the shared engine barrel. Each export
+ * is a Zod *raw shape* (a plain object of Zod fields) so it can be passed
+ * directly as an MCP tool `inputSchema`. The Platform-hosted developer MCP
+ * server (packages/platform/src/mcp/server.ts) is the consumer.
  */
 import { z } from 'zod';
 
@@ -40,9 +40,40 @@ export const getStepLogsToolSchema = {
   runId: z.string().min(1).describe('The run id.'),
   jobId: z.string().min(1).describe('The job id within the run.'),
   stepIndex: z.number().int().min(0).describe('Zero-based step index within the job.'),
+  cursor: z
+    .string()
+    .optional()
+    .describe('Opaque pagination cursor from a prior response nextCursor.'),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe('Maximum number of log lines to return (capped server-side).'),
 };
 
 export const listWorkflowsToolSchema = {
+  orgId: orgIdArg,
+  stale: z
+    .string()
+    .optional()
+    .describe('Only workflows not triggered within this duration (e.g. 30d, 7d, 24h, 2h).'),
+  triggerType: z.string().optional().describe('Filter by trigger type (e.g. push, pull_request).'),
+  repo: z.string().optional().describe('Filter by repository identifier.'),
+};
+
+/** No arguments — lists the organizations the calling user belongs to. */
+export const listOrgsToolSchema = {};
+
+export const listSecretsToolSchema = {
+  orgId: orgIdArg,
+};
+
+export const listOrchestratorsToolSchema = {
+  orgId: orgIdArg,
+};
+
+export const getDiagnosticsToolSchema = {
   orgId: orgIdArg,
 };
 
@@ -60,4 +91,30 @@ export const rerunRunToolSchema = {
 export const triggerRunToolSchema = {
   orgId: orgIdArg,
   registrationId: z.string().min(1).describe('The workflow registration id to trigger.'),
+};
+
+export const approveRunToolSchema = {
+  orgId: orgIdArg,
+  runId: z.string().min(1).describe('The run whose held approval gate to approve.'),
+  job: z.string().optional().describe('Job name, to disambiguate when the run has multiple holds.'),
+  step: z
+    .string()
+    .optional()
+    .describe('Zero-based step index (requires job) for a step-scoped hold.'),
+};
+
+export const rejectRunToolSchema = {
+  orgId: orgIdArg,
+  runId: z.string().min(1).describe('The run whose held approval gate to reject.'),
+  job: z.string().optional().describe('Job name, to disambiguate when the run has multiple holds.'),
+  step: z
+    .string()
+    .optional()
+    .describe('Zero-based step index (requires job) for a step-scoped hold.'),
+  reason: z.string().min(1).describe('Why the gate is rejected (required).'),
+};
+
+export const cancelRunsByBranchToolSchema = {
+  orgId: orgIdArg,
+  branch: z.string().min(1).describe('Cancel all in-progress runs on this branch (ref).'),
 };

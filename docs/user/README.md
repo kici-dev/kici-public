@@ -41,7 +41,7 @@ Configure deployment environments (staging, production, review/\*) with variable
 
 ### [Environment variables](env-vars.md)
 
-Reference for all `KICI_*` environment variables supported by the CLI. Covers authentication overrides (OIDC issuer, client ID, project ID), browser behavior (custom browser command, fixed callback port), development mode, and usage examples for CI/CD, self-hosted, and headless environments.
+Reference for all `KICI_*` environment variables supported by the CLI. Covers authentication overrides (OIDC issuer, client ID, project ID), browser behavior (custom browser command, fixed callback port), development mode, and usage examples for CI/CD, alternate environments, and headless setups.
 
 ### [CLI authentication](cli-auth.md)
 

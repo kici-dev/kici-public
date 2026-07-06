@@ -99,6 +99,24 @@ describe('admin access-log routes', () => {
     expect(deps.query.mock.calls[0]![0].q).toBeUndefined();
   });
 
+  it('forwards agentLabel to accessLog.query when ?agentLabel=<label> is supplied', async () => {
+    const res = await request(app, '/api/v1/admin/access-log?agentLabel=claude-code', {
+      token: TOKEN,
+    });
+    expect(res.status).toBe(200);
+    expect(deps.query.mock.calls[0]![0]).toMatchObject({ agentLabel: 'claude-code' });
+  });
+
+  it('forwards agentOnly: true only when ?agentOnly=true', async () => {
+    const res = await request(app, '/api/v1/admin/access-log?agentOnly=true', { token: TOKEN });
+    expect(res.status).toBe(200);
+    expect(deps.query.mock.calls[0]![0].agentOnly).toBe(true);
+
+    const res2 = await request(app, '/api/v1/admin/access-log', { token: TOKEN });
+    expect(res2.status).toBe(200);
+    expect(deps.query.mock.calls[1]![0].agentOnly).toBe(false);
+  });
+
   it('forwards the full filter set when every flag is supplied', async () => {
     const res = await request(
       app,

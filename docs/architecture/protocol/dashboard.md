@@ -491,6 +491,58 @@ Cache upload response from coordinator to worker. Pre-signed upload URL for the 
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerCacheUploadResponseSchema`
 
+### Fleet log collection across peers
+
+When an operator collects a debug bundle that spans the cluster, a coordinator fans a collection request down the peer mesh and each peer assembles and streams back the ZIP for its own subtree.
+
+#### peer.logs.collect.request
+
+Ask a peer to assemble and stream back the log bundle for its downstream subtree.
+
+| Field                  | Type                          | Required | Description                                                                          |
+| ---------------------- | ----------------------------- | -------- | ------------------------------------------------------------------------------------ |
+| type                   | `"peer.logs.collect.request"` | Yes      | Message discriminator                                                                |
+| messageId              | string                        | Yes      | Unique message ID                                                                    |
+| logWindowHours         | number                        | Yes      | How many hours of logs to gather                                                     |
+| includeCoordinatorMesh | boolean                       | Yes      | Loop guard: `false` on every downstream request so the coordinator mesh never echoes |
+| selection              | FleetSelection                | Yes      | Which downstream nodes to gather                                                     |
+
+Each FleetSelection:
+
+| Field             | Type     | Required | Description                                                |
+| ----------------- | -------- | -------- | ---------------------------------------------------------- |
+| all               | boolean  | Yes      | Gather every downstream node; ignores the id lists below   |
+| agentIds          | string[] | No       | Specific agent IDs to gather (defaults to empty)           |
+| workerInstanceIds | string[] | No       | Specific worker instance IDs to gather (defaults to empty) |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerLogsCollectRequestSchema`
+
+#### peer.logs.collect.chunk
+
+One base64-encoded frame of a peer's subtree ZIP, streamed back to the requesting coordinator.
+
+| Field     | Type                        | Required | Description                                    |
+| --------- | --------------------------- | -------- | ---------------------------------------------- |
+| type      | `"peer.logs.collect.chunk"` | Yes      | Message discriminator                          |
+| messageId | string                      | Yes      | Unique message ID (matches the request)        |
+| seq       | number                      | Yes      | Zero-based, non-negative frame sequence number |
+| isLast    | boolean                     | Yes      | Whether this is the final frame                |
+| dataB64   | string                      | Yes      | Base64-encoded ZIP frame                       |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerLogsCollectChunkSchema`
+
+#### peer.logs.collect.error
+
+Sent when a peer fails to assemble or stream its subtree bundle.
+
+| Field     | Type                        | Required | Description                             |
+| --------- | --------------------------- | -------- | --------------------------------------- |
+| type      | `"peer.logs.collect.error"` | Yes      | Message discriminator                   |
+| messageId | string                      | Yes      | Unique message ID (matches the request) |
+| message   | string                      | Yes      | Failure reason                          |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerLogsCollectErrorSchema`
+
 ### Config reload (per-instance targeting)
 
 #### peer.config.reload
@@ -721,7 +773,7 @@ KiCI defines custom close codes in the 4000-4999 range (reserved for application
 | 4010 | `WS_CLOSE_AGENT_AUTH_FAILED`     | Agent token authentication failed                                                                                                                                                    | Server  |
 | 4011 | `WS_CLOSE_CLUSTER_NAME_CONFLICT` | Reserved constant; no Platform code path emits this today. Platform accepts N connected orchestrators per `(org_id, cluster_name)` and the dashboard listing dedupes by cluster name | —       |
 | 4020 | `WS_CLOSE_PLAN_LIMIT`            | Organization has reached its plan limit                                                                                                                                              | Server  |
-| 4030 | `WS_CLOSE_RUN_NOT_FOUND`         | Requested run was not found                                                                                                                                                          | Server  |
+| 4030 | `WS_CLOSE_REBALANCE`             | Connection rebalancing: a newly-joined Platform instance asked peers holding excess connections to shed some; the orchestrator reconnects immediately and load redistributes evenly  | Server  |
 | 4031 | `WS_CLOSE_DISPATCH_ACK_TIMEOUT`  | A dispatched job went unacknowledged past its deadline; the orchestrator requeues the job and disconnects the unresponsive agent                                                     | Server  |
 
 > Authoritative source: `packages/engine/src/ws/close-codes.ts`
@@ -737,7 +789,7 @@ All protocol messages are validated at runtime using Zod discriminated unions. E
 
 **Peer-to-peer layer:**
 
-- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
+- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
 
 The upstream layers (orchestrator↔KiCI and browser↔KiCI) have their own discriminated unions.
 

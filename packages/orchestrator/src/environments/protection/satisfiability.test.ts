@@ -40,14 +40,39 @@ describe('checkBindingSatisfiable', () => {
     expect(r?.message).toContain('mutually exclusive');
   });
 
-  it('flags a missing environment', () => {
+  it('treats a missing environment as satisfiable (lenient, matches dispatch)', () => {
+    // A bound name with no resolved record contributes no protection rules and
+    // is skipped at dispatch (dispatch-matched-workflow.ts), so registration
+    // must not reject it. Single present env + one missing → satisfiable.
     const r = checkBindingSatisfiable(
       'deploy',
       [env('staging', { branchRestrictions: ['main'] }), undefined],
       ['staging', 'ghost'],
     );
-    expect(r?.rule).toBe('existence');
-    expect(r?.message).toContain('ghost');
+    expect(r).toBeNull();
+  });
+
+  it('treats a single bound missing environment as satisfiable', () => {
+    // The exact E2E shape: a job binds one static env the orchestrator never
+    // seeded → no record → lenient (the dispatch gate handles it at run time).
+    const r = checkBindingSatisfiable('deploy', [undefined], ['production']);
+    expect(r).toBeNull();
+  });
+
+  it('ignores missing envs but still flags a real conflict among present ones', () => {
+    // One missing env must not suppress a genuine multi-env conflict between the
+    // environments that DO resolve.
+    const r = checkBindingSatisfiable(
+      'deploy',
+      [
+        undefined,
+        env('staging', { branchRestrictions: ['main'] }),
+        env('testing', { branchRestrictions: ['develop'] }),
+      ],
+      ['ghost', 'staging', 'testing'],
+    );
+    expect(r?.rule).toBe('branch');
+    expect(r?.message).toContain('mutually exclusive');
   });
 
   it('flags a disabled environment', () => {
@@ -58,6 +83,15 @@ describe('checkBindingSatisfiable', () => {
     );
     expect(r?.rule).toBe('enabled');
     expect(r?.message).toContain('testing');
+  });
+
+  it('flags a single bound disabled environment (matches dispatch hard-reject)', () => {
+    // A present-but-disabled env is a dispatch-time hard reject (env_disabled),
+    // so registration rejects it even as the sole binding. Deliberate decision:
+    // disabled (present) state is rejected; missing (absent) state is lenient.
+    const r = checkBindingSatisfiable('deploy', [env('staging', { enabled: false })], ['staging']);
+    expect(r?.rule).toBe('enabled');
+    expect(r?.message).toContain('staging');
   });
 
   it('flags disjoint fixed trigger filters', () => {

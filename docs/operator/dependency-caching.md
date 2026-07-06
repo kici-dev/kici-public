@@ -89,17 +89,17 @@ All cache configuration is set via environment variables on the orchestrator.
 
 ### Storage backend
 
-| Variable                         | Default       | Description                                                                                              |
-| -------------------------------- | ------------- | -------------------------------------------------------------------------------------------------------- |
-| `KICI_STORAGE_TYPE`              | (optional)    | Storage backend: `s3`                                                                                    |
-| `KICI_STORAGE_BUCKET`            | (required)    | S3 bucket name                                                                                           |
-| `KICI_STORAGE_PREFIX`            | `kici-cache/` | Key prefix within the bucket                                                                             |
-| `KICI_STORAGE_REGION`            | (optional)    | AWS region                                                                                               |
-| `KICI_STORAGE_ENDPOINT`          | (optional)    | Custom S3 endpoint URL (for SeaweedFS, LocalStack)                                                       |
-| `KICI_STORAGE_EXTERNAL_ENDPOINT` | (optional)    | Separate S3 endpoint baked into pre-signed URLs handed to **agents**                                     |
-| `KICI_STORAGE_UPLOAD_ENDPOINT`   | (optional)    | Separate S3 endpoint baked into the pre-signed upload URL handed to the **host CLI** (`kici run remote`) |
-| `KICI_STORAGE_FORCE_PATH_STYLE`  | (optional)    | Set to `true` for path-style access (required for SeaweedFS)                                             |
-| `KICI_STORAGE_LOG_BUCKET`        | (optional)    | Separate S3 bucket for log storage (when logs and cache use different buckets)                           |
+| Variable                         | Default    | Description                                                                                              |
+| -------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------- |
+| `KICI_STORAGE_TYPE`              | (optional) | Storage backend: `s3`                                                                                    |
+| `KICI_STORAGE_BUCKET`            | (required) | S3 bucket name                                                                                           |
+| `KICI_STORAGE_PREFIX`            | (empty)    | Key prefix within the bucket (empty = bucket root; the bucket already scopes the cache)                  |
+| `KICI_STORAGE_REGION`            | (optional) | AWS region                                                                                               |
+| `KICI_STORAGE_ENDPOINT`          | (optional) | Custom S3 endpoint URL (for SeaweedFS, LocalStack)                                                       |
+| `KICI_STORAGE_EXTERNAL_ENDPOINT` | (optional) | Separate S3 endpoint baked into pre-signed URLs handed to **agents**                                     |
+| `KICI_STORAGE_UPLOAD_ENDPOINT`   | (optional) | Separate S3 endpoint baked into the pre-signed upload URL handed to the **host CLI** (`kici run remote`) |
+| `KICI_STORAGE_FORCE_PATH_STYLE`  | (optional) | Set to `true` for path-style access (required for SeaweedFS)                                             |
+| `KICI_STORAGE_LOG_BUCKET`        | (optional) | Separate S3 bucket for log storage (when logs and cache use different buckets)                           |
 
 ### Cache behavior
 
@@ -116,9 +116,12 @@ For production deployments with multiple orchestrator instances or when persiste
 ```bash
 KICI_STORAGE_TYPE=s3
 KICI_STORAGE_BUCKET=my-kici-cache
-KICI_STORAGE_PREFIX=kici-cache/
 KICI_STORAGE_REGION=us-east-1
 ```
+
+`KICI_STORAGE_PREFIX` is optional and defaults to empty (objects live at the
+bucket root). Set it only to share one bucket across multiple clusters by giving
+each a distinct prefix.
 
 Agents receive pre-signed S3 URLs (15-minute expiry) for direct download from S3.
 

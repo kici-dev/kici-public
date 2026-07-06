@@ -11,16 +11,18 @@
  *
  * This module intersects the statically-decidable set rules (branch, trigger
  * type, repository — only when every pattern is a literal, never a glob) plus
- * existence and enabled across the bound environments, and reports the first
- * provably-empty intersection. Any glob in a rule makes that rule undecidable,
- * so it is skipped here and left to the dispatch-time catch-all
+ * the `enabled` gate across the **resolved** bound environments, and reports the
+ * first provably-empty intersection. Bound names that resolve to no environment
+ * record are lenient — skipped, never rejected — matching the dispatch-time
+ * behavior in `dispatch-matched-workflow.ts`. Any glob in a rule makes that rule
+ * undecidable, so it is skipped here and left to the dispatch-time catch-all
  * (`evaluateMultiEnvGates`).
  */
 import { z } from 'zod';
 import type { Environment } from '@kici-dev/engine';
 
 /** Which decidable rule made a binding unsatisfiable. */
-export const UnsatisfiableRule = z.enum(['existence', 'enabled', 'branch', 'trigger', 'repo']);
+export const UnsatisfiableRule = z.enum(['enabled', 'branch', 'trigger', 'repo']);
 export type UnsatisfiableRule = z.infer<typeof UnsatisfiableRule>;
 
 /** A provably-unsatisfiable multi-environment binding, naming the rule + reason. */
@@ -61,9 +63,12 @@ function intersectFixedRule(
 
 /**
  * Returns a precise problem when the bound environments can NEVER be jointly
- * satisfied (a provably-empty intersection on a decidable rule, a missing
- * environment, or a disabled one), else `null`. Glob / undecidable cases return
- * `null` and are caught at dispatch by `evaluateMultiEnvGates`.
+ * satisfied (a disabled environment, or mutually-exclusive fixed restrictions
+ * among the resolved environments), else `null`. Missing (unresolved) names are
+ * skipped — a bound name with no environment record contributes no protection
+ * rules and is lenient at dispatch, so it is not rejected here. Glob /
+ * undecidable cases also return `null` and are caught at dispatch by
+ * `evaluateMultiEnvGates`.
  *
  * `envs[i]` is the resolved `Environment` for `envNames[i]` (undefined when the
  * name has no environment record). Only the statically-known (non-dynamic) bound
@@ -75,19 +80,16 @@ export function checkBindingSatisfiable(
   envs: ReadonlyArray<Environment | undefined>,
   envNames: readonly string[],
 ): UnsatisfiableBinding | null {
-  // Existence: a bound name with no environment record can never pass.
-  const missingIdx = envs.findIndex((e) => !e);
-  if (missingIdx !== -1) {
-    return {
-      jobName,
-      environments: [...envNames],
-      rule: UnsatisfiableRule.enum.existence,
-      message: `job '${jobName}' binds environment '${envNames[missingIdx]}' which does not exist`,
-    };
-  }
-  const present = envs as Environment[];
+  // Lenient missing-environment handling — matches dispatch
+  // (dispatch-matched-workflow.ts): a bound name with no configured record
+  // contributes no protection rules and is skipped, NOT rejected. Only the
+  // environments that actually resolve participate in the satisfiability check.
+  const present = envs.filter((e): e is Environment => !!e);
+  if (present.length === 0) return null;
 
-  // Enabled: a disabled environment never passes.
+  // Enabled: a disabled present environment is a dispatch-time hard reject
+  // (aggregate.ts evaluateMultiEnvGates → env_disabled), so a binding that
+  // includes one can never pass.
   const disabled = present.find((e) => !e.enabled);
   if (disabled) {
     return {
@@ -148,8 +150,9 @@ function staticBoundNames(job: SatisfiabilityLockJob): string[] {
 
 /**
  * Walk every workflow's static jobs and reject the registration when a bound
- * environment list is provably unsatisfiable (missing/disabled environment, or
- * mutually-exclusive fixed branch/trigger/repo restrictions). Dynamic elements
+ * environment list is provably unsatisfiable (a disabled environment, or
+ * mutually-exclusive fixed branch/trigger/repo restrictions among the resolved
+ * environments — missing names are lenient, never rejected). Dynamic elements
  * are skipped (unresolvable at registration); the all-must-pass semantics keep
  * the static subset's exclusivity sound. Throws the first
  * `UnsatisfiableBinding.message` so the registration route / direct helper

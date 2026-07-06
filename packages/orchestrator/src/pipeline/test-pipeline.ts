@@ -115,6 +115,12 @@ interface TestTriggerResult {
   reason?: string;
   /** Dispatched job IDs. */
   jobIds: string[];
+  /**
+   * User-visible warnings on an accepted run — today, one per job whose bound
+   * test-run environment(s) were unavailable (non-test or unconfigured) and
+   * skipped. Printed by the CLI on acceptance.
+   */
+  warnings?: string[];
 }
 
 type ProviderBundle = ReturnType<ProviderRegistry['getByRoutingKey']>;
@@ -583,6 +589,7 @@ export async function processTestTrigger(
   };
 
   const jobIds: string[] = [];
+  const warnings: string[] = [];
   for (const decision of matchedDecisions) {
     const workflow = fullLockFile.workflows.find(
       (w: LockWorkflow) => w.name === decision.workflowName,
@@ -591,6 +598,7 @@ export async function processTestTrigger(
     const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
     const result = await dispatchMatchedWorkflow(ctx);
     jobIds.push(...result.dispatchedJobIds);
+    if (result.envWarnings?.length) warnings.push(...result.envWarnings);
   }
 
   if (jobIds.length === 0) {
@@ -603,5 +611,5 @@ export async function processTestTrigger(
     };
   }
 
-  return { runId, status: 'accepted', jobIds };
+  return { runId, status: 'accepted', jobIds, ...(warnings.length > 0 && { warnings }) };
 }

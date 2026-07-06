@@ -273,7 +273,7 @@ The `s3LogAccess` flag is `true` whenever `storage.type=s3` is configured (the s
 
 Single-orchestrator deployments can use filesystem storage with no penalty -- the same orch ingests, executes, and serves logs.
 
-The `s3LogAccess` field is sent in the `source.register` message (and in peer heartbeats), so the Platform records it per connection and surfaces it on the diagnostics page.
+The `s3LogAccess` field is sent in the `source.register` message (and in peer heartbeats), so the Platform records it per connection and surfaces it on the infrastructure page.
 
 ### SharedConfig storage migration
 

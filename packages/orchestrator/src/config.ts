@@ -19,6 +19,7 @@ import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/shared/env';
+import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from './cluster/cluster-identity.js';
 
 const baseSchema = z.object({
   // Operating mode
@@ -94,7 +95,7 @@ const baseSchema = z.object({
   cacheStorageType: z.enum(['s3', 'filesystem']).optional(),
   cacheStoragePath: z.string().optional(), // legacy, used for log storage filesystem fallback
   cacheStorageS3Bucket: z.string().optional(), // S3 only
-  cacheStorageS3Prefix: z.string().default(''), // S3 only — empty; the bucket already scopes the cache
+  cacheStorageS3Prefix: z.string().default(DEFAULT_CACHE_STORAGE_S3_PREFIX), // S3 only — empty; the bucket already scopes the cache
   cacheStorageS3Region: z.string().optional(), // S3 only
   cacheStorageS3Endpoint: z.string().optional(), // S3-compatible endpoint (SeaweedFS, LocalStack)
   cacheStorageS3ExternalEndpoint: z.string().optional(), // Separate endpoint for pre-signed URLs (agents)
@@ -218,6 +219,15 @@ const baseSchema = z.object({
    * `event.attempts <= N`. Ignored unless `KICI_TEST_MODE=1`.
    */
   testEventFailFirstN: z.string().optional(),
+  /**
+   * **Test-only.** When set (and `KICI_TEST_MODE=1`), the orchestrator forces
+   * the *initial* agent provenance mint to fail transiently (defer) for any job
+   * whose requested OIDC `audience` equals this value, so an E2E can exercise
+   * the deferred-attestation retry + per-run serve path with a REAL run. The
+   * retrier's re-mint uses a different call site and is unaffected. Ignored
+   * unless `KICI_TEST_MODE=1`. Production deployments leave this unset.
+   */
+  testMintDeferAudience: z.string().optional(),
   // Inbound webhook delivery log (event_log table). Default soft-cap 5MB.
   // Phase E retired the row TTL: rows are now archived to cold-store after
   // 30 days rather than hard-deleted. Oversized payloads are still recorded
@@ -512,6 +522,7 @@ export const envDef = defineEnv({
     eventRouterRetryScanIntervalMs: 'KICI_EVENT_ROUTER_RETRY_SCAN_INTERVAL_MS',
     testMode: 'KICI_TEST_MODE',
     testEventFailFirstN: 'KICI_TEST_EVENT_FAIL_FIRST_N',
+    testMintDeferAudience: 'KICI_TEST_MINT_DEFER_AUDIENCE',
     eventLogMaxPayloadBytes: 'KICI_EVENT_LOG_MAX_PAYLOAD_BYTES',
     logLevel: 'KICI_LOG_LEVEL',
     nodeEnv: 'NODE_ENV',

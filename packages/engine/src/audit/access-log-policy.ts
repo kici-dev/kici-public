@@ -23,7 +23,7 @@
  */
 import { z } from 'zod';
 import { AccessLogAction, type AccessLogOutcome } from '../protocol/messages/access-log.js';
-import { type ActorPrincipal } from '../protocol/messages/actor.js';
+import { agentLabelOf, type ActorPrincipal } from '../protocol/messages/actor.js';
 
 /** Discriminator for the per-action policy entry. */
 export const AccessLogPolicyKind = z.enum(['always', 'sample', 'rate_limit']);
@@ -186,8 +186,9 @@ export function shouldRecordAccess(
 
   // Override 3: agent-attributed actions always recorded — the agent-provenance
   // guarantee (every action an agent takes is fully auditable) requires the
-  // complete trail, never a sampled subset.
-  if (actor.type === 'user' && actor.agent) return true;
+  // complete trail, never a sampled subset. Covers both credential families
+  // (`user` PATs and `api_key` org keys) via the single label extractor.
+  if (agentLabelOf(actor) !== null) return true;
 
   const policy = POLICY_BY_ACTION[action];
   switch (policy.kind) {

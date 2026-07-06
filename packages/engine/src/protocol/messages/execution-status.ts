@@ -66,6 +66,19 @@ export const ExecutionJobStatus = z.enum([
 export type ExecutionJobStatus = z.infer<typeof ExecutionJobStatus>;
 
 /**
+ * The status values a notification subscription may target at the given level.
+ *
+ * A run-level subscription matches against an `ExecutionRunStatus`; a job-level
+ * subscription matches against an `ExecutionJobStatus` (which carries job-only
+ * terminal states like `timed_out_stale` / `drift_dropped` / `skipped`). Both
+ * the Platform validation and the dashboard editor derive their allowed set
+ * from this single helper so server validation and UI options cannot diverge.
+ */
+export function statusOptionsForLevel(level: 'run' | 'job'): readonly string[] {
+  return level === 'job' ? ExecutionJobStatus.options : ExecutionRunStatus.options;
+}
+
+/**
  * Status values for execution steps (execution_steps table + step.status protocol messages).
  *
  *  - `pending`   — a parallel-group child queued behind `maxParallel`, not yet launched.
@@ -224,6 +237,8 @@ export const executionStatusSchema = z.object({
   originalRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** User identity that triggered this re-run (null/undefined for webhook-triggered). */
   triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
+  /** Agent provenance label when the run was triggered through an agent credential. */
+  triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /**
    * Triggering-actor identity captured from the provider event (the pusher / PR
    * author), distinct from `triggeredBy` (the KiCI re-run user). Provider
@@ -326,6 +341,7 @@ export const stateReplaySchema = z.object({
         parentRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
         originalRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
         triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
+        triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
         /** Human-readable reason why the run failed (only present for failed runs). */
         failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
         jobs: z

@@ -11,6 +11,8 @@ import { dashboardOrchLogsRequestSchema, dashboardOrchLogsResponseSchema } from 
 import { EventLogStatus, PayloadOmittedReason, EventLogSource } from './event-log.js';
 import { initFailureSchema, StepConcurrencyKind } from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
+import { SourceOrigin } from '../source-origin.js';
+import { AttestationOrigin } from '../../provenance/attestation-origin.js';
 import { DeploymentModeSchema, DeploymentContainerRuntimeSchema } from './deployment-identity.js';
 import { ScalerBackendType } from '../../scaler/scaler-backend-type.js';
 import { HoldScope, ApprovalDecision, approverClauseSchema } from '../../approval/types.js';
@@ -71,6 +73,16 @@ export const dashboardStepLogsRequestSchema = z.object({
   runId: z.string(),
   jobId: z.string(),
   stepIndex: z.number(),
+  /**
+   * Optional line-offset cursor (a prior response's `nextCursor`). Absent reads
+   * from the start.
+   */
+  cursor: z.string().optional(),
+  /**
+   * Optional max lines to return. Absent = unbounded (the human dashboard relies
+   * on this); the MCP layer opts into paging by sending an explicit limit.
+   */
+  limit: z.number().int().positive().optional(),
 });
 
 // --- Orchestrator -> Platform: response messages ---
@@ -125,6 +137,13 @@ export const dashboardJobDetailSchema = z.object({
    * entry marks an element resolved at runtime. null/absent = no binding.
    */
   environments: z.array(z.string()).nullable().optional(),
+  /**
+   * Bound environments skipped on a test/local run (non-test or unconfigured).
+   * null/absent when nothing was skipped.
+   */
+  skippedEnvironments: z.array(z.string()).nullable().optional(),
+  /** User-visible warning naming the skipped test-run environments. null/absent when none. */
+  envWarning: z.string().nullable().optional(),
   /** Aggregated step outputs (step-keyed map). Present when job completed successfully with outputs. */
   outputs: z.record(z.string(), z.record(z.string(), z.unknown())).nullable().optional(),
   /** Secret output key names produced by this job (values are NOT included -- display masked). */
@@ -180,6 +199,8 @@ export const dashboardStepLogsResponseSchema = z.object({
   requestId: z.string(),
   lines: z.array(z.string()),
   totalLines: z.number(),
+  /** Next line-offset cursor, or null when the page reached the end. */
+  nextCursor: z.string().nullable().optional(),
   error: z.string().optional(),
 });
 
@@ -245,6 +266,18 @@ export const attestationListItemSchema = z.object({
   verifyStatus: attestationVerifyStatusSchema.optional(),
   /** First failure reason for the stored verdict, when failed (detail get only). */
   verifyReason: z.string().nullable().optional(),
+  /**
+   * Source-origin brand: triggered vs kici run remote (local working-tree
+   * overlay). Read from the signed statement's internalParameters.
+   */
+  sourceOrigin: SourceOrigin.optional(),
+  /** Authoritative origin: the customer's public org id (from the signed statement). */
+  originOrgId: z.string().optional(),
+  /**
+   * Mint-timing origin: live / deferred / offline-backfill. Read from the token
+   * claim or the signed statement's internalParameters; absent defaults to live.
+   */
+  attestationOrigin: AttestationOrigin.optional(),
 });
 export type AttestationListItem = z.infer<typeof attestationListItemSchema>;
 
@@ -286,6 +319,18 @@ export const attestationListSummarySchema = z.object({
   verifyReason: z.string().nullable(),
   repository: z.string().nullable(),
   workflow: z.string().nullable(),
+  /**
+   * Source-origin brand: triggered vs kici run remote (local working-tree
+   * overlay). Derived from the run's local_working_tree flag.
+   */
+  sourceOrigin: SourceOrigin.optional(),
+  /** Mint-timing origin: live / deferred / offline-backfill. */
+  attestationOrigin: AttestationOrigin.optional(),
+  /**
+   * True for a row still in the deferred-attestation outbox (not yet minted):
+   * `verifyStatus: 'pending'`, no bundle. The page offers a retry action.
+   */
+  pending: z.boolean().optional(),
 });
 export type AttestationListSummary = z.infer<typeof attestationListSummarySchema>;
 
@@ -347,6 +392,30 @@ export const dashboardAttestationGetResponseSchema = z.object({
 });
 export type DashboardAttestationGetResponse = z.infer<typeof dashboardAttestationGetResponseSchema>;
 
+/** Request an on-demand drain of the deferred-attestation outbox (optionally one run). */
+export const dashboardAttestationRetryRequestSchema = z.object({
+  type: z.literal('dashboard.attestation.retry'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  /** Scope to a single run; omitted drains every pending attestation. */
+  runId: z.string().optional(),
+});
+export type DashboardAttestationRetryRequest = z.infer<
+  typeof dashboardAttestationRetryRequestSchema
+>;
+
+/** Response with the drain counts. */
+export const dashboardAttestationRetryResponseSchema = z.object({
+  type: z.literal('dashboard.attestation.retry.response'),
+  requestId: z.string(),
+  minted: z.number().int(),
+  stillPending: z.number().int(),
+  error: z.string().optional(),
+});
+export type DashboardAttestationRetryResponse = z.infer<
+  typeof dashboardAttestationRetryResponseSchema
+>;
+
 // --- Run list request/response (REST-over-WS proxy) ---
 //
 // Operator-console read of the orchestrator's run list. Like the run-detail
@@ -383,7 +452,9 @@ export const dashboardRunSummarySchema = z.object({
   parentRunId: z.string().optional(),
   originalRunId: z.string().optional(),
   triggeredBy: z.string().optional(),
+  triggeredByAgentLabel: z.string().nullable().optional(),
   cancelledBy: z.string().optional(),
+  cancelledByAgentLabel: z.string().nullable().optional(),
   failureReason: z.string().optional(),
   hadCompileJob: z.boolean().optional(),
   compileJobId: z.string().optional(),
@@ -524,6 +595,8 @@ export const manualScheduleRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   registrationId: z.string(),
+  /** Agent provenance label when triggered through an agent credential. */
+  triggeredByAgentLabel: z.string().nullable().optional(),
 });
 
 /** Response to a manual schedule trigger request. */
@@ -1325,12 +1398,12 @@ const envSecretScopeDeleteResponseSchema = z.object({
 
 // -- Environment history --
 
-/** Fetch runs that targeted a specific environment. */
+/** Fetch runs that targeted a specific environment, keyed by environment id. */
 export const envHistoryRequestSchema = z.object({
   type: z.literal('dashboard.environments.history'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentName: z.string(),
+  environmentId: z.string(),
   limit: z.number().optional(),
   offset: z.number().optional(),
 });
@@ -1374,6 +1447,16 @@ export const heldRunsListRequestSchema = z.object({
   status: HeldRunStatus.optional(),
   queueType: HeldRunQueueType.optional(),
   runId: z.string().optional(),
+  /**
+   * Target org the read must be scoped to, carried per-request by the Platform
+   * (the validated `:orgId` path param). The orchestrator honors this over its
+   * static connection-level org so a Platform-first `kici run remote` org —
+   * anchored only by `remote_sources` — sees its own held runs even when the
+   * orchestrator's connection also serves a webhook source for a different org.
+   * Absent on the legacy customer-dashboard path, where the connection org is
+   * already the request org.
+   */
+  orgId: z.string().optional(),
 });
 
 const heldRunsListResponseSchema = z.object({
@@ -1446,6 +1529,14 @@ export const heldRunApproveRequestSchema = z.object({
    * `held_run.auto_approve`); it is never a bypass.
    */
   autoApprove: z.boolean().optional(),
+  /**
+   * Target org the decision must be scoped to, carried per-request by the
+   * Platform (the validated `:orgId` path param). Honored over the static
+   * connection-level org so a remote run's hold — recorded under the run's own
+   * `remote_sources` org — is resolvable even when the orchestrator's
+   * connection also serves a webhook source for a different org.
+   */
+  orgId: z.string().optional(),
 });
 
 const heldRunApproveResponseSchema = z.object({
@@ -1461,6 +1552,14 @@ export const heldRunRejectRequestSchema = z.object({
   actor: actorPrincipalSchema,
   heldRunId: z.string(),
   reason: z.string().optional(),
+  /**
+   * Target org the decision must be scoped to, carried per-request by the
+   * Platform (the validated `:orgId` path param). Honored over the static
+   * connection-level org so a remote run's hold — recorded under the run's own
+   * `remote_sources` org — is resolvable even when the orchestrator's
+   * connection also serves a webhook source for a different org.
+   */
+  orgId: z.string().optional(),
 });
 
 const heldRunRejectResponseSchema = z.object({
@@ -2112,6 +2211,8 @@ export const testRelayTriggerResponseSchema = z.object({
   status: z.enum(['accepted', 'rejected']).optional(),
   reason: z.string().optional(),
   jobIds: z.array(z.string()).optional(),
+  /** User-visible warnings on acceptance (e.g. skipped non-test bound environments). */
+  warnings: z.array(z.string()).optional(),
   error: z.string().optional(),
 });
 export type TestRelayTriggerResponse = z.infer<typeof testRelayTriggerResponseSchema>;
@@ -2205,6 +2306,7 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   dashboardAttestationsListRequestSchema,
   dashboardAttestationsListAllRequestSchema,
   dashboardAttestationGetRequestSchema,
+  dashboardAttestationRetryRequestSchema,
   dashboardRunsListRequestSchema,
   dashboardRunsFiltersRequestSchema,
   dashboardSourcesListRequestSchema,
@@ -2299,6 +2401,7 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   dashboardAttestationsListResponseSchema,
   dashboardAttestationsListAllResponseSchema,
   dashboardAttestationGetResponseSchema,
+  dashboardAttestationRetryResponseSchema,
   dashboardRunsListResponseSchema,
   dashboardRunsFiltersResponseSchema,
   dashboardSourcesListResponseSchema,
@@ -2497,6 +2600,8 @@ export const dashboardRunDetailApiResponseSchema = z.object({
 export const dashboardStepLogsApiResponseSchema = z.object({
   lines: z.array(z.string()),
   totalLines: z.number(),
+  /** Next line-offset cursor, or null when the page reached the end. */
+  nextCursor: z.string().nullable().optional(),
 });
 
 /**
@@ -2552,8 +2657,10 @@ export const runListItemSchema = z.object({
   parentRunId: z.string().nullable(),
   originalRunId: z.string().nullable(),
   triggeredBy: z.string().nullable(),
+  triggeredByAgentLabel: z.string().nullable().optional(),
   triggeredByUser: runListPrincipalUserSchema.nullable(),
   cancelledBy: z.string().nullable(),
+  cancelledByAgentLabel: z.string().nullable().optional(),
   cancelledByUser: runListPrincipalUserSchema.nullable(),
   failureReason: z.string().optional(),
   hadCompileJob: z.boolean(),

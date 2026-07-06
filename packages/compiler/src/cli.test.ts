@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { isMainEntryPoint } from './cli.js';
+import { isMainEntryPoint, buildProgram } from './cli.js';
+import type { Command } from 'commander';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -109,11 +110,50 @@ describe('CLI argument errors', () => {
   );
 
   it(
-    'kici run local with no event and no --pick exits 2',
+    'kici run local with no event and no --pick prints usage and exits 2',
     () => {
       const result = runCli('run local');
       expect(result.exitCode).toBe(2);
-      expect(result.stderr).toContain('missing event argument');
+      // Usage goes to stdout via logger.info; assert on combined output so the
+      // check is stream-agnostic.
+      const out = `${result.stdout}\n${result.stderr}`;
+      expect(out).toContain('Usage: kici run local <event> [options]');
+      expect(out).toContain('kici run local pr:open');
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    'kici status prints a retired-command redirect to kici runs and a help pointer',
+    () => {
+      const result = runCli('status');
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain("unknown command 'status'");
+      expect(result.stderr).toContain('kici runs');
+      expect(result.stderr).toContain('kici --help');
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    'kici cancel redirects to kici runs cancel',
+    () => {
+      const result = runCli('cancel');
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('kici runs cancel');
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+
+  it(
+    'kici with an unknown command shows the help pointer but no retired redirect',
+    () => {
+      const result = runCli('bogus');
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stderr).toContain('kici --help');
+      // The retired-command map is scoped, not a catch-all: an unrelated typo
+      // must not print a redirect that names kici runs.
+      expect(result.stderr).not.toContain('kici runs');
     },
     SPAWN_TIMEOUT_MS,
   );
@@ -150,6 +190,43 @@ describe('version banner', () => {
     },
     SPAWN_TIMEOUT_MS,
   );
+});
+
+describe('run remote --approve-all / --yes option wiring', () => {
+  function runRemoteCommand(): Command {
+    const program = buildProgram();
+    const run = program.commands.find((c) => c.name() === 'run');
+    if (!run) throw new Error('run command not found');
+    const remote = run.commands.find((c) => c.name() === 'remote');
+    if (!remote) throw new Error('run remote command not found');
+    return remote;
+  }
+
+  it('binds the approve-all/--yes flags to the approveAll property (not `yes`)', () => {
+    // Commander derives an option's property name from its LAST long flag. If the
+    // flag string lists `--approve-all` last, the property is `approveAll`; had it
+    // listed `--yes` last, `options.approveAll` would silently be undefined and the
+    // breakglass would never fire. This asserts the correct binding.
+    const remote = runRemoteCommand();
+    const opt = remote.options.find((o) => o.attributeName() === 'approveAll');
+    expect(opt, 'run remote must expose an --approve-all option bound to approveAll').toBeDefined();
+    expect(opt!.long).toBe('--approve-all');
+    // Both spellings remain accepted aliases.
+    expect(opt!.flags).toContain('--approve-all');
+    expect(opt!.flags).toContain('--yes');
+    // The mis-binding would have produced a `yes` attribute instead.
+    expect(remote.options.some((o) => o.attributeName() === 'yes')).toBe(false);
+  });
+
+  it('parses --approve-all and --yes to approveAll:true', () => {
+    for (const flag of ['--approve-all', '--yes']) {
+      const remote = runRemoteCommand();
+      // Neutralise the action so parsing does not execute the real command.
+      remote.action(() => {});
+      remote.parse(['fixture-id', flag], { from: 'user' });
+      expect(remote.opts().approveAll, `${flag} should set approveAll`).toBe(true);
+    }
+  });
 });
 
 describe('isMainEntryPoint (symlink-tolerant entry-point guard)', () => {

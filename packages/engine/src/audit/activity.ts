@@ -98,6 +98,20 @@ export const activityFilterSchema = z.object({
   runId: z.string().optional(),
   /** Full-text search over access_log.error_message and audit_log.details::text. */
   q: z.string().optional(),
+  /**
+   * Exact-match filter on the agent provenance label. Only the access_log half
+   * of the federation carries an agent label, so an agent filter restricts the
+   * stream to agent-attributed access-log rows.
+   */
+  agentLabel: z.string().max(255).optional(),
+  /**
+   * When true, return only agent-attributed rows (access_log `agent_label IS NOT NULL`).
+   * Arrives as a query string (`?agentOnly=false`), so parse it with `z.stringbool()`
+   * — NOT `z.coerce.boolean()`, whose `z.coerce.boolean('false') === true` is a
+   * confirmed footgun. The `z.boolean()` arm keeps a native boolean acceptable for
+   * programmatic callers (mirrors how `limit` tolerates both a number and a string).
+   */
+  agentOnly: z.union([z.boolean(), z.stringbool()]).optional(),
   /** ISO timestamp lower bound (inclusive). */
   from: z.string().optional(),
   /** ISO timestamp upper bound (exclusive). */

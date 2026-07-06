@@ -47,6 +47,27 @@ import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
 
+/**
+ * Print a usage block for `kici run local` when the event argument is missing.
+ *
+ * Mirrors the discoverable help `kici preview` prints for a missing event: a
+ * bold synopsis line, a one-line description, and a few concrete event
+ * examples. The caller exits non-zero after printing — a missing event is a
+ * usage error, unlike `kici preview` which treats no-event as help.
+ */
+export function printRunLocalUsage(): void {
+  logger.info(pc.bold('\nUsage: kici run local <event> [options]\n'));
+  logger.info(
+    pc.gray('Execute workflows locally for a given event, without orchestrator infrastructure.\n'),
+  );
+  logger.info(pc.gray('Examples:'));
+  logger.info(pc.gray('  kici run local push'));
+  logger.info(pc.gray('  kici run local pr:open'));
+  logger.info(pc.gray('  kici run local schedule'));
+  logger.info(pc.gray('  kici run local lifecycle:workflow_complete\n'));
+  logger.info(pc.gray('Or pick a workflow interactively: kici run local --pick\n'));
+}
+
 /** Terminal run statuses returned by the Platform run-status snapshot. */
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled', 'error']);
 
@@ -673,6 +694,9 @@ async function runSingleFixture(
 
     if (!options.quiet) {
       logger.info(pc.green(`Run started: ${triggerResult.runId}`));
+      for (const warning of triggerResult.warnings ?? []) {
+        logger.warn(pc.yellow(`⚠ ${warning}`));
+      }
     }
 
     await history.addEntry({
@@ -786,9 +810,11 @@ async function pollRunToCompletion(
         return finishRun(fixtureId, runId, lastStatus, startTime, tailLines, options);
       }
 
-      // Surface any approval holds for this run: print the (drift) payload and,
-      // in a TTY, prompt approve/reject inline. Reuses the `kici approve` path.
-      if (!terminal && !options.quiet) {
+      // Surface any approval holds for this run every non-terminal tick. Quiet /
+      // --json runs are handled inside watchRunHolds: it routes hold text to
+      // stderr (keeping stdout pure JSON) and forces the non-interactive path so
+      // --approve-all auto-approves instead of the run hanging on a gate.
+      if (!terminal) {
         await watchRunHolds(
           runId,
           seenHolds,
@@ -835,11 +861,21 @@ async function watchRunHolds(
     if (!ctx) return;
     const holds = await listHeldRunsForRun(ctx, runId);
     if (holds.length === 0) return;
-    const isTty = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
+    const quiet = Boolean(options.quiet);
+    // Quiet / --json: never block on a stdin prompt (would hang the machine-
+    // readable run) — force the notify path — and never write hold text to
+    // stdout (the pure-JSON channel) — route it to stderr.
+    const isTty = quiet ? false : Boolean(process.stdin.isTTY && process.stdout.isTTY);
+    const output = quiet
+      ? (line: string) => void process.stderr.write(line + '\n')
+      : (line: string) => logger.info(line);
+
     await handleNewHolds({
       holds,
       seen: seenHolds,
       isTty,
+      output,
       approveAll: Boolean(options.approveAll),
       confirm: (message) => inquirerConfirm({ message, default: false }),
     });

@@ -1,119 +1,218 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import {
   MintRejectedError,
   MintRelayError,
   MintUnavailableError,
   createOidcTokenHandler,
-  deriveHttpBaseFromWsUrl,
   requestMint,
 } from './oidc-token-relay.js';
 
-describe('deriveHttpBaseFromWsUrl', () => {
-  it('maps wss/ws and strips a trailing /ws', () => {
-    expect(deriveHttpBaseFromWsUrl('wss://host.example/ws')).toBe('https://host.example');
-    expect(deriveHttpBaseFromWsUrl('ws://host.example:3000/ws')).toBe('http://host.example:3000');
-  });
-  it('preserves a basePath before /ws', () => {
-    expect(deriveHttpBaseFromWsUrl('wss://host.example/kici-stg/ws')).toBe(
-      'https://host.example/kici-stg',
-    );
-  });
-  it('handles a bare host with no /ws suffix', () => {
-    expect(deriveHttpBaseFromWsUrl('wss://host.example')).toBe('https://host.example');
-  });
-});
+function stubClient(response: unknown) {
+  return {
+    sendRequestAndAwait: async () => response,
+  } as unknown as Parameters<typeof requestMint>[0]['platformClient'];
+}
 
-describe('requestMint', () => {
-  afterEach(() => vi.restoreAllMocks());
+describe('requestMint over WS', () => {
+  const base = { orchestratorId: 'orch-1', runId: 'run-1', jobId: 'job-1', audience: 'sigstore' };
 
-  const args = {
-    httpBase: 'https://host.example',
-    token: 'tok',
-    orchestratorId: 'orch-1',
-    runId: 'run-1',
-    jobId: 'job-1',
-    audience: 'sigstore',
-  };
-
-  it('POSTs the mint endpoint with Bearer auth and parses the result', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ token: 'eyJ.a.b', expires_in: 600, jti: 'run-1:job-1' }), {
-        status: 200,
-      }),
-    );
-    const res = await requestMint(args);
-    expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toBe('https://host.example/internal/orchestrator/orch-1/mint-id-token');
-    expect((init as RequestInit).method).toBe('POST');
-    expect((init as RequestInit).headers).toMatchObject({ authorization: 'Bearer tok' });
-    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
-      run_id: 'run-1',
-      job_id: 'job-1',
-      audience: 'sigstore',
+  it('returns the token on a result response', async () => {
+    const client = stubClient({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+    });
+    await expect(requestMint({ platformClient: client, ...base })).resolves.toEqual({
+      token: 'eyJ.a.b',
+      expiresIn: 600,
+      jti: 'run-1:job-1',
     });
   });
 
-  it('maps 404/409 to MintRejectedError, 503 to MintUnavailableError, other 5xx to MintRelayError', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', { status: 404 }));
-    await expect(requestMint(args)).rejects.toBeInstanceOf(MintRejectedError);
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', { status: 409 }));
-    await expect(requestMint(args)).rejects.toBeInstanceOf(MintRejectedError);
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', { status: 503 }));
-    await expect(requestMint(args)).rejects.toBeInstanceOf(MintUnavailableError);
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('boom', { status: 500 }));
-    await expect(requestMint(args)).rejects.toBeInstanceOf(MintRelayError);
+  it('maps error.code=rejected to MintRejectedError', async () => {
+    const client = stubClient({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'rejected', message: 'no such job' },
+    });
+    await expect(requestMint({ platformClient: client, ...base })).rejects.toBeInstanceOf(
+      MintRejectedError,
+    );
+  });
+
+  it('maps error.code=unavailable to MintUnavailableError with the stable message', async () => {
+    const client = stubClient({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'unavailable', message: 'whatever the platform says' },
+    });
+    await expect(requestMint({ platformClient: client, ...base })).rejects.toThrow(
+      'provenance signing is not configured on the Platform',
+    );
+  });
+
+  it('maps error.code=failed to MintRelayError', async () => {
+    const client = stubClient({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'failed', message: 'boom' },
+    });
+    await expect(requestMint({ platformClient: client, ...base })).rejects.toBeInstanceOf(
+      MintRelayError,
+    );
+  });
+
+  it('wraps a transport rejection (timeout/close) as MintRelayError', async () => {
+    const client = {
+      sendRequestAndAwait: async () => {
+        throw new Error('platform connection closed');
+      },
+    } as unknown as Parameters<typeof requestMint>[0]['platformClient'];
+    await expect(requestMint({ platformClient: client, ...base })).rejects.toBeInstanceOf(
+      MintRelayError,
+    );
   });
 });
 
 describe('createOidcTokenHandler', () => {
-  afterEach(() => vi.restoreAllMocks());
-
   const dispatcher = {
     resolveOwnedJob: (agentId: string, jobId: string) =>
       agentId === 'agent-1' && jobId === 'job-1' ? { runId: 'run-1' } : undefined,
   };
 
-  const handler = createOidcTokenHandler({
-    dispatcher,
-    platformToken: 'tok',
-    platformHttpBase: 'https://host.example',
-    orchestratorId: 'orch-1',
-  });
+  function buildHandler(
+    response: unknown,
+    calls?: { count: number },
+    extra?: { testMode?: boolean; testMintDeferAudience?: string },
+  ) {
+    const platformClient = {
+      sendRequestAndAwait: async (_type: string, payload: Record<string, unknown>) => {
+        if (calls) calls.count++;
+        // Expose the relayed payload for ownership assertions.
+        (buildHandler as unknown as { lastPayload?: unknown }).lastPayload = payload;
+        return response;
+      },
+    } as unknown as OidcTokenHandlerClient;
+    return createOidcTokenHandler({
+      dispatcher,
+      platformClient,
+      orchestratorId: 'orch-1',
+      testMode: extra?.testMode ?? false,
+      testMintDeferAudience: extra?.testMintDeferAudience,
+    });
+  }
 
   it('mints for an owned job, supplying the dispatcher-resolved runId', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ token: 'eyJ.a.b', expires_in: 600, jti: 'run-1:job-1' }), {
-        status: 200,
-      }),
-    );
+    const handler = buildHandler({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+    });
     const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
     expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
-    expect(JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string)).toEqual({
-      run_id: 'run-1',
-      job_id: 'job-1',
-      audience: 'sigstore',
-    });
+    expect(
+      (buildHandler as unknown as { lastPayload?: { runId: string } }).lastPayload,
+    ).toMatchObject({ runId: 'run-1', jobId: 'job-1', audience: 'sigstore' });
   });
 
   it('rejects a job the agent does not own without calling the Platform', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    const calls = { count: 0 };
+    const handler = buildHandler({ type: 'oidc.mint.response', requestId: 'x' }, calls);
     await expect(handler('agent-1', { jobId: 'nope', audience: 'sigstore' })).rejects.toThrow(
       /not owned/i,
     );
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(calls.count).toBe(0);
   });
 
   it('rejects malformed params', async () => {
+    const handler = buildHandler({ type: 'oidc.mint.response', requestId: 'x' });
     await expect(
       handler('agent-1', { audience: 'sigstore' } as Record<string, unknown>),
     ).rejects.toBeTruthy();
   });
 
   it('propagates a mint error as a clean typed error', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('{}', { status: 409 }));
+    const handler = buildHandler({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'rejected', message: 'job not active' },
+    });
     await expect(
       handler('agent-1', { jobId: 'job-1', audience: 'sigstore' }),
     ).rejects.toBeInstanceOf(MintRejectedError);
   });
+
+  it('defers (unavailable) instead of failing when the Platform signer is down', async () => {
+    const handler = buildHandler({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'unavailable', message: 'oidc_not_configured' },
+    });
+    await expect(handler('agent-1', { jobId: 'job-1', audience: 'sigstore' })).resolves.toEqual({
+      deferred: true,
+      code: 'unavailable',
+    });
+  });
+
+  it('defers (failed) on a transport / relay failure', async () => {
+    const handler = buildHandler({
+      type: 'oidc.mint.response',
+      requestId: 'x',
+      error: { code: 'failed', message: 'boom' },
+    });
+    await expect(handler('agent-1', { jobId: 'job-1', audience: 'sigstore' })).resolves.toEqual({
+      deferred: true,
+      code: 'failed',
+    });
+  });
+
+  describe('mint-defer fault injection (test-only)', () => {
+    it('force-defers the initial mint when test-mode + audience matches the marker', async () => {
+      const calls = { count: 0 };
+      // A result response would normally succeed; the injection must short-circuit
+      // BEFORE the Platform relay, so the client is never called.
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        calls,
+        { testMode: true, testMintDeferAudience: 'kici-provenance' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance' });
+      expect(res).toEqual({ deferred: true, code: 'unavailable' });
+      expect(calls.count).toBe(0);
+    });
+
+    it('does NOT defer when test-mode is off even if the marker env is set', async () => {
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        undefined,
+        { testMode: false, testMintDeferAudience: 'kici-provenance' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance' });
+      expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+    });
+
+    it('does NOT defer a non-matching audience under test-mode', async () => {
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        undefined,
+        { testMode: true, testMintDeferAudience: 'kici-provenance' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
+      expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+    });
+  });
 });
+
+type OidcTokenHandlerClient = Parameters<typeof createOidcTokenHandler>[0]['platformClient'];

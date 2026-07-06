@@ -9,6 +9,15 @@ export type DbExecutor = Kysely<Database> | Transaction<Database>;
 const LAST_ERROR_MAX_BYTES = 4096;
 
 /**
+ * Default page size for unprocessed-event catch-up scans.
+ *
+ * Shared with EventRouter.catchUp so the paginating loop's "a short batch
+ * means we're done" termination check compares against the same value the
+ * store slices by.
+ */
+export const EVENT_CATCHUP_BATCH_SIZE = 100;
+
+/**
  * Input shape for writing a new event. Excludes columns the DB fills in
  * itself (id, processed, created_at, attempts, claimed_*, last_error,
  * next_retry_at, dlq_*).
@@ -101,21 +110,36 @@ export class EventStore {
   }
 
   /**
-   * Get unprocessed events for catch-up on reconnect.
-   * If sinceId is null, returns all unprocessed events.
-   * Ordered by created_at ASC. Excludes DLQ rows.
+   * Get a page of unprocessed events for catch-up on start.
+   *
+   * Rows are ordered by a deterministic keyset `(created_at ASC, id ASC)` and
+   * exclude processed + DLQ rows. When `sinceId` is null, returns the first
+   * page from the oldest event. When `sinceId` is given, returns the page
+   * strictly after that event's `(created_at, id)` — a composite cursor so
+   * that events sharing the reference event's `created_at` are NOT skipped
+   * (a bare `created_at > ref` predicate drops same-timestamp siblings) and a
+   * still-unprocessed retrying event at or before the cursor is never
+   * re-fetched (which is what makes the caller's pagination loop terminate).
+   *
+   * The caller advances `sinceId` to the last event of each returned page and
+   * re-queries until a page returns fewer than `limit` rows.
    */
-  async getUnprocessedSince(sinceId: string | null, limit: number = 100): Promise<StoredEvent[]> {
+  async getUnprocessedSince(
+    sinceId: string | null,
+    limit: number = EVENT_CATCHUP_BATCH_SIZE,
+  ): Promise<StoredEvent[]> {
     let query = this.db
       .selectFrom('kici_events')
       .selectAll()
       .where('processed', '=', false)
       .where('dlq_at', 'is', null)
       .orderBy('created_at', 'asc')
+      .orderBy('id', 'asc')
       .limit(limit);
 
     if (sinceId) {
-      // Get the created_at of the reference event, then fetch events after it
+      // Anchor the keyset cursor on the reference event's created_at. The id
+      // half of the cursor is sinceId itself, so we only need created_at here.
       const refEvent = await this.db
         .selectFrom('kici_events')
         .select('created_at')
@@ -123,7 +147,11 @@ export class EventStore {
         .executeTakeFirst();
 
       if (refEvent) {
-        query = query.where('created_at', '>', refEvent.created_at);
+        // Postgres row-value comparison: strictly greater than the tuple
+        // (ref.created_at, sinceId) under the same (created_at, id) ordering.
+        // Includes same-created_at siblings with a larger id; excludes the
+        // reference row and everything before it.
+        query = query.where(sql<boolean>`(created_at, id) > (${refEvent.created_at}, ${sinceId})`);
       }
     }
 

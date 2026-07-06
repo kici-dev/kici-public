@@ -4,6 +4,8 @@ import {
   AgentFailureCategory,
   agentRunResultSchema,
   agentStepLogsSchema,
+  agentRunListItemSchema,
+  agentWorkflowSummarySchema,
 } from './agent-run-result.js';
 
 describe('Untrusted envelope', () => {
@@ -53,6 +55,30 @@ describe('agentRunResultSchema', () => {
   it('rejects an untrusted field passed as a bare string', () => {
     const bad = { runId: 'r', workflowName: 'ci' } as unknown;
     expect(agentRunResultSchema.safeParse(bad).success).toBe(false);
+  });
+
+  it('carries triggeredByAgentLabel when present', () => {
+    const parsed = agentRunResultSchema.parse({
+      runId: 'r_3',
+      workflowName: wrapUntrusted('ci'),
+      status: 'success',
+      provider: 'github',
+      repoIdentifier: wrapUntrusted('owner/repo'),
+      ref: wrapUntrusted('main'),
+      sha: 'abc',
+      baseSha: null,
+      startedAt: null,
+      completedAt: null,
+      durationMs: null,
+      trustTier: null,
+      contributorUsername: null,
+      failureCategory: null,
+      failureReason: null,
+      triggeredBy: 'user:u1',
+      triggeredByAgentLabel: 'claude-code',
+      jobs: [],
+    });
+    expect(parsed.triggeredByAgentLabel).toBe('claude-code');
   });
 
   it('accepts a full job with untrusted-wrapped step + need fields', () => {
@@ -121,5 +147,59 @@ describe('agentStepLogsSchema', () => {
       nextCursor: null,
     });
     expect(parsed.lines[0]).toEqual({ untrusted: true, value: 'line one' });
+  });
+});
+
+describe('agentRunListItemSchema', () => {
+  it('accepts trusted ids/status plain and user fields enveloped', () => {
+    const item = {
+      runId: 'r1',
+      status: 'failed',
+      sha: 'abc123',
+      createdAt: '2026-06-29T00:00:00.000Z',
+      workflowName: wrapUntrusted('deploy'),
+      repoIdentifier: wrapUntrusted('acme/app'),
+      ref: wrapUntrusted('refs/heads/main'),
+    };
+    expect(agentRunListItemSchema.parse(item)).toEqual(item);
+  });
+
+  it('rejects a plain (un-enveloped) workflowName', () => {
+    expect(() =>
+      agentRunListItemSchema.parse({
+        runId: 'r1',
+        status: 'failed',
+        sha: null,
+        createdAt: null,
+        workflowName: 'deploy',
+        repoIdentifier: null,
+        ref: null,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('agentWorkflowSummarySchema', () => {
+  it('envelopes the user-controlled fields, keeps ids/flags plain', () => {
+    const wf = {
+      id: 'reg1',
+      workflowName: wrapUntrusted('ci'),
+      repoIdentifier: wrapUntrusted('acme/app'),
+      triggerTypes: ['push'],
+      sourceRepos: [wrapUntrusted('acme/app')],
+      disabled: false,
+      commitSha: 'deadbeef',
+      sourceFile: wrapUntrusted('.kici/workflows/ci.ts'),
+      createdAt: '2026-06-29T00:00:00.000Z',
+      updatedAt: '2026-06-29T00:00:00.000Z',
+      lastTriggeredAt: null,
+      nextFireAt: null,
+      source: {
+        routingKey: 'generic:org:abc',
+        name: wrapUntrusted('stg-generic'),
+        provider: 'generic',
+      },
+    };
+    expect(agentWorkflowSummarySchema.parse(wf)).toEqual(wf);
   });
 });

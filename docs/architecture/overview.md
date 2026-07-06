@@ -31,7 +31,7 @@ flowchart LR
 
 **Why three tiers?** Trust boundaries. The Platform relay never sees customer code -- it only verifies webhook signatures and forwards payloads. The orchestrator matches triggers against the lock file without cloning repositories. Only the agent, running on customer infrastructure, clones code and executes steps.
 
-This model also enables fully self-hosted deployment: all three tiers can run on customer infrastructure, with the Platform tier receiving webhooks directly from GitHub.
+This model also supports an independent deployment without the hosted Platform: the orchestrator and agent run on customer infrastructure, with the orchestrator receiving webhooks directly from GitHub instead of through the Platform relay.
 
 ## Component responsibilities
 

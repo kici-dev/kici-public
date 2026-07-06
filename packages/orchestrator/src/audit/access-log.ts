@@ -1,6 +1,7 @@
 import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import {
+  agentLabelOf,
   flattenActor,
   minAccessLogWarmDays,
   shouldRecordAccess,
@@ -56,6 +57,10 @@ export interface AccessLogQueryFilter {
   toTimestamp?: Date | string;
   /** Full-text search over error_message (trigram-indexed). */
   q?: string;
+  /** Exact-match filter on the agent provenance label (`agent_label` column). */
+  agentLabel?: string;
+  /** When true, return only agent-attributed rows (`agent_label IS NOT NULL`). */
+  agentOnly?: boolean;
   limit?: number;
   cursor?: string;
 }
@@ -124,10 +129,10 @@ export class AccessLogWriter {
       }
       const { actorType, actorId, actorMeta } = flattenActor(entry.actor);
       const mergedMeta = entry.meta ? { ...(actorMeta ?? {}), ...entry.meta } : actorMeta;
-      // An agent-kind PAT carries its label on the user actor; promote it to a
-      // queryable column so the access log can be filtered by agent.
-      const agentLabel =
-        entry.actor.type === 'user' ? (entry.actor.agent?.label ?? null) : null;
+      // An agent-kind credential carries its label on the user (PAT) or api_key
+      // actor; promote it to a queryable column so the access log can be
+      // filtered by agent regardless of credential family.
+      const agentLabel = agentLabelOf(entry.actor);
       await this.db
         .insertInto('access_log')
         .values({
@@ -179,6 +184,8 @@ export class AccessLogWriter {
         fromTimestamp: filter.fromTimestamp,
         toTimestamp: filter.toTimestamp,
         q: filter.q,
+        agentLabel: filter.agentLabel,
+        agentOnly: filter.agentOnly,
       },
       limit,
       cursor: filter.cursor,

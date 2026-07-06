@@ -29,9 +29,13 @@ function isInCidr(ip: string, cidr: string): boolean {
   const [subnet, bits] = cidr.split('/');
   const maskBits = parseInt(bits!, 10);
   if (!isIPv4(normalized) || !isIPv4(subnet!)) return false;
+  if (!Number.isInteger(maskBits) || maskBits < 0 || maskBits > 32) return false;
   const ipNum = ipToInt(normalized);
   const subnetNum = ipToInt(subnet!);
-  const mask = ~((1 << (32 - maskBits)) - 1) >>> 0;
+  // A /0 prefix means "match every address": the mask must be 0. The shift
+  // form `1 << (32 - 0)` is `1 << 32`, which wraps to 1 in 32-bit arithmetic
+  // and yields an all-ones mask (match nothing) — so prefix 0 is special-cased.
+  const mask = maskBits === 0 ? 0 : ~((1 << (32 - maskBits)) - 1) >>> 0;
   return (ipNum & mask) === (subnetNum & mask);
 }
 

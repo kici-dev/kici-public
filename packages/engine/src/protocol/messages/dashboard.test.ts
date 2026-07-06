@@ -3,6 +3,9 @@ import {
   DASHBOARD_REQUEST_TYPES,
   DASHBOARD_REQUEST_TYPE_SET,
   DashboardResponseErrorCode,
+  attestationListSummarySchema,
+  dashboardAttestationRetryRequestSchema,
+  dashboardAttestationRetryResponseSchema,
   dashboardRunDetailRequestSchema,
   dashboardRunDetailResponseSchema,
   dashboardRunDetailApiResponseSchema,
@@ -1163,5 +1166,47 @@ describe('dashboard request-type registry', () => {
       'unsupported_request_type',
     );
     expect(DashboardResponseErrorCode.options).toContain('invalid_payload');
+  });
+});
+
+describe('attestation deferred-marker schemas', () => {
+  it('attestation list summary accepts attestationOrigin + pending', () => {
+    const parsed = attestationListSummarySchema.parse({
+      id: 'a1',
+      runId: 'r1',
+      jobId: 'j1',
+      jobName: 'build',
+      subjectName: 'art',
+      subjectDigest: 'd',
+      mode: 'kici',
+      mediaType: 'm',
+      createdAt: '0',
+      verifyStatus: 'pending',
+      verifyReason: null,
+      repository: 'acme/app',
+      workflow: 'ci',
+      attestationOrigin: 'offline-backfill',
+      pending: true,
+    });
+    expect(parsed.attestationOrigin).toBe('offline-backfill');
+    expect(parsed.pending).toBe(true);
+  });
+
+  it('round-trips the retry request + response and includes retry in the request registry', () => {
+    const req = dashboardAttestationRetryRequestSchema.parse({
+      type: 'dashboard.attestation.retry',
+      requestId: 'q1',
+      actor: { type: 'user', sub: 'u1' },
+      runId: 'r1',
+    });
+    expect(req.runId).toBe('r1');
+    const res = dashboardAttestationRetryResponseSchema.parse({
+      type: 'dashboard.attestation.retry.response',
+      requestId: 'q1',
+      minted: 2,
+      stillPending: 1,
+    });
+    expect(res).toMatchObject({ minted: 2, stillPending: 1 });
+    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.attestation.retry')).toBe(true);
   });
 });

@@ -25,7 +25,7 @@ environments
   concurrency_timeout_ms INTEGER DEFAULT 1800000
   required_reviewers     JSONB
   wait_timer_seconds     INTEGER
-  hold_expiry_seconds    INTEGER DEFAULT 3600
+  hold_expiry_seconds    INTEGER DEFAULT 86400
   allow_local_execution  BOOLEAN DEFAULT false
   created_by     TEXT
   created_at     TIMESTAMPTZ

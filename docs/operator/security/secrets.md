@@ -577,7 +577,7 @@ Sync behavior:
 
 ### Health monitoring
 
-Backend health is visible on the dashboard diagnostics page:
+Backend health is visible on the dashboard infrastructure page:
 
 - **Green:** Backend reachable, auth valid, last sync successful
 - **Yellow:** Backend reachable but last sync had warnings

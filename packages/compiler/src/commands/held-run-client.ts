@@ -9,7 +9,7 @@
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
 import { loadGlobalConfig } from '../remote/config.js';
-import type { HeldRunSummary } from './held-run-resolve.js';
+import type { HeldRunSummary } from '@kici-dev/engine';
 
 /** Resolved auth context for a held-run command. */
 export interface HeldRunContext {

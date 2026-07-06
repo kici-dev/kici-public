@@ -147,7 +147,7 @@ On wide desktop (>= 1200px), Metadata is shown in a dedicated sidebar panel inst
 
 The metadata panel shows detailed information organized into sections:
 
-- **Run metadata** -- run ID, status, trigger event, branch, commit SHA (linked to provider), workflow name (linked to source file on provider), duration, and timestamps
+- **Run metadata** -- run ID, status, trigger event, branch, commit SHA (linked to provider), workflow name (linked to source file on provider), duration, and timestamps. The **Triggered by** line carries an **agent badge** (with the agent's label) when the run was triggered or cancelled through an agent credential — an agent PAT or an agent org key — so an agent-driven run is obvious from its detail page
 - **Job metadata** -- job name, status, agent ID, matrix values (if present), duration
 - **Step metadata** -- step name, step index, status, duration
 - **Trust context** (PR-triggered runs only) -- shows the contributor's trust tier (trusted, known, or unknown), lock file source (head or base branch), and secrets access level
@@ -156,10 +156,20 @@ Provider-specific links (e.g., GitHub commit URL, branch URL, PR link, workflow 
 
 ### WebSocket connection indicator
 
-A small indicator in the sidebar footer shows the real-time WebSocket connection status:
+A small indicator in the sidebar footer shows the status of the live-updates
+connection -- the real-time stream that pushes run, step, and log changes to the
+page as they happen. It has three states:
 
-- **Green dot** -- connected and receiving live updates
-- **Red dot (pulsing)** -- disconnected
+- **Green dot** -- connected; the dashboard is receiving live updates.
+- **Amber dot (pulsing)** -- reconnecting; the connection dropped and is being
+  retried automatically.
+- **Red dot (pulsing)** -- disconnected; live updates are paused.
+
+Hovering (or focusing) the indicator opens a short explanation of what live
+updates are, the impact while they are paused (pages won't refresh on their own
+-- reload to catch up), and the auto-retry status. When the connection is not
+active, the popover also offers a **Retry now** control that forces an immediate
+reconnection instead of waiting for the next automatic retry.
 
 ## Log viewer
 

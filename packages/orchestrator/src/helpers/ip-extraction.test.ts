@@ -67,6 +67,34 @@ describe('isTrustedProxy', () => {
     expect(isTrustedProxy('10.0.0.1', ['10.0.0.1/32'])).toBe(true);
     expect(isTrustedProxy('10.0.0.2', ['10.0.0.1/32'])).toBe(false);
   });
+
+  it('handles /0 CIDR (matches every address)', () => {
+    // A /0 trusted-proxy CIDR must trust ALL proxies. Previously the 32-bit
+    // mask wrapped to all-ones, silently matching NONE — this asserts the fix.
+    expect(isTrustedProxy('8.8.8.8', ['0.0.0.0/0'])).toBe(true);
+    expect(isTrustedProxy('0.0.0.0', ['0.0.0.0/0'])).toBe(true);
+    expect(isTrustedProxy('255.255.255.255', ['0.0.0.0/0'])).toBe(true);
+    expect(isTrustedProxy('127.0.0.1', ['0.0.0.0/0'])).toBe(true);
+    expect(isTrustedProxy('::ffff:203.0.113.9', ['0.0.0.0/0'])).toBe(true);
+  });
+
+  it('handles /24 CIDR (in-range vs out-of-range, incl. boundaries)', () => {
+    // Every address in 192.168.1.0/24 matches, including the boundaries.
+    expect(isTrustedProxy('192.168.1.0', ['192.168.1.0/24'])).toBe(true);
+    expect(isTrustedProxy('192.168.1.1', ['192.168.1.0/24'])).toBe(true);
+    expect(isTrustedProxy('192.168.1.255', ['192.168.1.0/24'])).toBe(true);
+    // Just outside the range on either side.
+    expect(isTrustedProxy('192.168.0.255', ['192.168.1.0/24'])).toBe(false);
+    expect(isTrustedProxy('192.168.2.0', ['192.168.1.0/24'])).toBe(false);
+  });
+
+  it('rejects CIDRs with an out-of-range prefix length', () => {
+    // Prefix > 32 is invalid and must never spuriously match.
+    expect(isTrustedProxy('8.8.8.8', ['10.0.0.0/40'])).toBe(false);
+    expect(isTrustedProxy('10.0.0.5', ['10.0.0.0/33'])).toBe(false);
+    // A negative / non-numeric prefix is rejected too.
+    expect(isTrustedProxy('10.0.0.5', ['10.0.0.0/-1'])).toBe(false);
+  });
 });
 
 describe('extractRemoteIp', () => {

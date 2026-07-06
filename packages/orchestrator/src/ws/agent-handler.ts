@@ -386,6 +386,29 @@ export interface AgentWsHandlerDeps {
     verifyReason: string | null;
     verifiedAt: Date | null;
   }) => Promise<void>;
+  /**
+   * Optional callback when an agent reports a deferred attestation (transient
+   * mint failure). Persists the frozen envelope into the deferred-attestation
+   * outbox; the job stays green and the token is minted later.
+   */
+  onProvenanceDefer?: (record: {
+    runId: string;
+    jobId: string;
+    subjectName: string;
+    subjectDigest: string;
+    audience: string;
+    mediaType: string;
+    statementHash: string;
+    dsseEnvelope: unknown;
+    publicKey: unknown;
+    originKind: 'deferred' | 'offline-backfill';
+  }) => Promise<void>;
+  /**
+   * Classify a deferred attestation's origin from the local run row: a run
+   * ingested while the Platform was down is `offline-backfill`, otherwise a
+   * transient blip is `deferred`. Defaults to always-`deferred` when unset.
+   */
+  classifyDeferOrigin?: (runId: string) => Promise<'deferred' | 'offline-backfill'>;
   /** Optional rate limiter configuration. */
   rateLimiterConfig?: RateLimiterConfig;
   /** Optional ownership tracker for validating job-related messages. */
@@ -595,6 +618,8 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     provenanceTrustRoot,
     provenanceStorage,
     onProvenanceUpload,
+    onProvenanceDefer,
+    classifyDeferOrigin,
     rateLimiterConfig,
     ownershipTracker,
     pendingBuilds,
@@ -1995,6 +2020,57 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             });
           } catch (err) {
             logger.error('Failed to record provenance attestation', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+          }
+          break;
+        }
+
+        case 'provenance.upload.defer': {
+          // Ownership: silently drop if the agent does not own this job.
+          if (
+            ownershipTracker &&
+            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'provenance.upload.defer')
+          )
+            break;
+
+          const ref = dispatchCacheRefs?.get(msg.jobId);
+          if (!onProvenanceDefer || !ref) {
+            if (onProvenanceDefer && !ref) {
+              logger.warn('provenance defer for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            break;
+          }
+          try {
+            // Default a live run whose mint blipped to `deferred`; a run ingested
+            // while the Platform was down classifies as `offline-backfill`.
+            const originKind = classifyDeferOrigin
+              ? await classifyDeferOrigin(ref.runId)
+              : 'deferred';
+            await onProvenanceDefer({
+              runId: ref.runId,
+              jobId: msg.jobId,
+              subjectName: msg.subjectName,
+              subjectDigest: msg.subjectDigest,
+              audience: msg.audience,
+              mediaType: msg.mediaType,
+              statementHash: msg.statementHash,
+              dsseEnvelope: msg.dsseEnvelope,
+              publicKey: msg.publicKey,
+              originKind,
+            });
+            logger.info('Deferred attestation captured', {
+              agentId,
+              jobId: msg.jobId,
+              originKind,
+            });
+          } catch (err) {
+            logger.error('Failed to capture deferred attestation', {
               agentId,
               jobId: msg.jobId,
               error: toErrorMessage(err),

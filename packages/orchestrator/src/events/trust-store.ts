@@ -1,6 +1,9 @@
 import { type Kysely } from 'kysely';
 import picomatch from 'picomatch';
+import { createLogger } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
+
+const logger = createLogger({ prefix: 'trust-store' });
 
 /**
  * Trust entry representing a cross-repo trust relationship.
@@ -20,7 +23,12 @@ interface TrustEntry {
  *
  * Same-repo events (same routing key) are always trusted without a DB lookup.
  * Cross-repo events require an explicit enabled row in the cross_repo_trust table.
- * Glob-based event filtering is supported via the allowed_events column.
+ * Glob-based event filtering is supported via the allowed_events column, whose
+ * value carries a three-way meaning:
+ *   - `null`       — filter unset: every event name is allowed (allow-all).
+ *   - `'[]'`       — an explicit empty allow-list: no event is allowed (deny-all).
+ *   - `'["glob"]'` — only event names matching one of the globs are allowed.
+ * Malformed (unparseable / non-array) allowed_events fails closed (deny).
  */
 export class TrustStore {
   constructor(private readonly db: Kysely<Database>) {}
@@ -58,21 +66,36 @@ export class TrustStore {
       return false;
     }
 
-    // null allowed_events = all events allowed
+    // null allowed_events = all events allowed (filter unset)
     if (row.allowed_events === null) {
       return true;
     }
 
-    // Parse allowed_events (stored as JSON array of glob patterns)
-    const patterns: string[] =
-      typeof row.allowed_events === 'string' ? JSON.parse(row.allowed_events) : row.allowed_events;
+    // Parse the stored JSON allow-list. Malformed data fails closed (deny)
+    // rather than silently granting every event on a trust boundary.
+    let patterns: unknown;
+    try {
+      patterns =
+        typeof row.allowed_events === 'string'
+          ? JSON.parse(row.allowed_events)
+          : row.allowed_events;
+    } catch {
+      logger.warn('cross_repo_trust.allowed_events is not valid JSON — denying', {
+        sourceRoutingKey,
+        targetRoutingKey,
+      });
+      return false;
+    }
 
+    // A non-array (corrupt) OR an explicitly EMPTY allow-list denies every
+    // event. null (handled above) is the allow-all sentinel; an empty [] is a
+    // deliberate deny-all.
     if (!Array.isArray(patterns) || patterns.length === 0) {
-      return true;
+      return false;
     }
 
     // Check if eventName matches any allowed glob pattern
-    return patterns.some((pattern) => picomatch.isMatch(eventName, pattern));
+    return patterns.some((pattern) => picomatch.isMatch(eventName, String(pattern)));
   }
 
   /**

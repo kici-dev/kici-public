@@ -8,6 +8,6 @@ onlyBuiltDependencies:
   - protobufjs
   - ssh2
 
-minimumReleaseAge: 10080 # 7 days
+minimumReleaseAge: 2880 # 48 hours
 minimumReleaseAgeExclude:
   - '@kici-dev/*'

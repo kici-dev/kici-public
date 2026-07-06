@@ -41,6 +41,8 @@ export interface CancelRunOptions {
   force?: boolean;
   /** Attribution stamped into execution_runs.cancelled_by. */
   cancelledBy?: string;
+  /** Agent provenance label stamped into execution_runs.cancelled_by_agent_label. */
+  cancelledByAgentLabel?: string | null;
 }
 
 export interface CancelRunResult {
@@ -130,7 +132,12 @@ export async function cancelRunWithReason(
   if (options.cancelledBy) {
     await db
       .updateTable('execution_runs')
-      .set({ cancelled_by: options.cancelledBy })
+      .set({
+        cancelled_by: options.cancelledBy,
+        ...(options.cancelledByAgentLabel != null && {
+          cancelled_by_agent_label: options.cancelledByAgentLabel,
+        }),
+      })
       .where('run_id', '=', runId)
       .execute();
   }

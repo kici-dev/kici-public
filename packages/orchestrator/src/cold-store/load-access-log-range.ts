@@ -76,6 +76,10 @@ export interface LoadAccessLogRangeArgs {
      * `009_access_log_trigram.ts`. Min ~3 chars for the index to help.
      */
     q?: string;
+    /** Exact-match filter on the agent provenance label (`agent_label` column). */
+    agentLabel?: string;
+    /** When true, return only agent-attributed rows (`agent_label IS NOT NULL`). */
+    agentOnly?: boolean;
   };
   limit: number;
   cursor?: string;
@@ -123,6 +127,8 @@ export async function loadAccessLogRange(
     if (filter.outcome) q = q.where('outcome', '=', filter.outcome);
     if (filter.targetType) q = q.where('target_type', '=', filter.targetType);
     if (filter.targetId) q = q.where('target_id', '=', filter.targetId);
+    if (filter.agentLabel) q = q.where('agent_label', '=', filter.agentLabel);
+    if (filter.agentOnly) q = q.where('agent_label', 'is not', null);
     if (filter.q && filter.q.length > 0) {
       // Trigram-indexed ILIKE on error_message (migration 009).
       q = q.where(sql<boolean>`error_message ILIKE ${'%' + filter.q + '%'}`);
@@ -189,6 +195,8 @@ export async function loadAccessLogRange(
       if (filter.outcome && row.outcome !== filter.outcome) continue;
       if (filter.targetType && row.target_type !== filter.targetType) continue;
       if (filter.targetId && row.target_id !== filter.targetId) continue;
+      if (filter.agentLabel && row.agent_label !== filter.agentLabel) continue;
+      if (filter.agentOnly && row.agent_label == null) continue;
       if (filter.q && filter.q.length > 0) {
         const haystack = (row.error_message ?? '').toLowerCase();
         if (!haystack.includes(filter.q.toLowerCase())) continue;
@@ -274,6 +282,7 @@ export function toAccessLogItem(row: AccessLogColdRow): AccessLogItem {
     source: row.source as AccessLogSource,
     outcome: row.outcome as AccessLogOutcome,
     errorMessage: row.error_message,
+    agentLabel: row.agent_label ?? null,
     createdAt:
       row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
   };

@@ -6,6 +6,7 @@ import {
   buildTargetSelector,
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
+  printRunLocalUsage,
   withStdoutOnStderr,
 } from './run.js';
 
@@ -275,6 +276,25 @@ describe('kici run command', () => {
         platformEndpoint: 'https://api.kici.dev',
         token: 'test-pat',
       });
+    });
+
+    it('prints skipped-environment warnings from the accepted trigger response', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      mockClient.trigger.mockResolvedValueOnce({
+        runId: 'run-123',
+        status: 'accepted',
+        warnings: [
+          "bound environment(s) 'production' are unavailable for this test run and were skipped; running with no environment variables",
+        ],
+      });
+
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(result).toBe(true);
+      const warned = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(warned.some((m) => m.includes('unavailable for this test run'))).toBe(true);
+      expect(warned.some((m) => m.includes('production'))).toBe(true);
     });
 
     it('prefers --org over config.activeOrgId and passes --orchestrator through', async () => {
@@ -777,5 +797,27 @@ describe('withStdoutOnStderr', () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe('printRunLocalUsage', () => {
+  beforeEach(() => {
+    // logger.info is mocked (vi.fn) by the module-level @kici-dev/core mock;
+    // picocolors auto-disables ANSI in a non-TTY test process, so the captured
+    // strings are plain text.
+    vi.mocked(logger.info).mockClear();
+  });
+
+  it('prints a usage synopsis and concrete event examples', () => {
+    printRunLocalUsage();
+    const out = vi
+      .mocked(logger.info)
+      .mock.calls.map((c) => String(c[0]))
+      .join('\n');
+    expect(out).toContain('Usage: kici run local <event> [options]');
+    expect(out).toContain('kici run local push');
+    expect(out).toContain('kici run local pr:open');
+    // Discoverability parity with `kici preview`: interactive escape hatch shown.
+    expect(out).toContain('--pick');
   });
 });

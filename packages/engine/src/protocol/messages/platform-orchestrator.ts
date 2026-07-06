@@ -16,6 +16,7 @@ import {
 } from './source-registration.js';
 import { dashboardPlatformToOrchSchema } from './dashboard.js';
 import { runEventMessageSchema, jobContextMessageSchema } from './run-events.js';
+import { oidcMintRequestSchema, oidcMintResponseSchema } from './oidc-mint.js';
 
 // --- Platform -> Orchestrator messages ---
 
@@ -373,6 +374,7 @@ export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', 
   peerDiscoverSchema,
   peerUpdateSchema,
   staleCheckrunCleanupSchema,
+  oidcMintResponseSchema,
   // Every dashboard request the Platform can proxy to the orchestrator.
   // Derived from the dashboard-direction union so the two can never drift:
   // a dashboard request type absent from this wire union is silently
@@ -405,6 +407,7 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   runEventMessageSchema,
   jobContextMessageSchema,
   orchMetricsSchema,
+  oidcMintRequestSchema,
 ]);
 
 // --- Inferred types ---

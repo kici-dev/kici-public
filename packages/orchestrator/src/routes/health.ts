@@ -18,6 +18,15 @@ declare const KICI_ENGINE_BUNDLE_HASH: string;
 export interface HealthRoutesDeps {
   /** Optional DB instance for readiness checks */
   db?: Kysely<Database>;
+  /**
+   * Optional warmth latch. Returns `true` only once the orchestrator boot
+   * sequence has finished (all subsystems started, HTTP server serving). When
+   * provided, `/ready` returns `503` until it flips `true`, so a caller can
+   * gate on the orchestrator being ready to serve rather than merely live.
+   * Absent → warm defaults to `true` (callers that don't wire the latch are
+   * unaffected).
+   */
+  isWarm?: () => boolean;
 }
 
 /**
@@ -56,6 +65,9 @@ export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
           } catch {
             checks.database = false;
           }
+          // Boot-completion latch: false until every startup subsystem is wired
+          // and the HTTP server is serving. Absent latch defaults to warm.
+          checks.warm = deps.isWarm ? deps.isWarm() : true;
           return checks;
         }
       : undefined,

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/orchestrator",
-  "version": "0.1.24",
+  "version": "0.1.26",
   "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
   "keywords": [
     "ci",
@@ -80,6 +80,7 @@
     "dockerode": "^5.0.0",
     "hashi-vault-js": "^0.5.1",
     "hono": "^4.12.25",
+    "jose": "^6.1.0",
     "jsonpath-plus": "^10.4.0",
     "jszip": "^3.10.1",
     "kysely": "^0.29.2",
@@ -105,7 +106,6 @@
     "@kici-dev/agent": "workspace:*",
     "@types/archiver": "^8.0.0",
     "@types/dockerode": "^4.0.1",
-    "jose": "^6.1.0",
     "kysely-ctl": "^0.21.0"
   }
 }

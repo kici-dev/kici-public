@@ -97,6 +97,84 @@ describe('attestProvenance', () => {
   });
 });
 
+describe('attestProvenance deferred path', () => {
+  const localContext = {
+    repository: 'acme/app',
+    ref: 'refs/heads/main',
+    sha: 'deadbeef',
+    workflowRef: '.kici/workflows/ci.ts@deadbeef',
+    runId: 'run-1',
+    jobId: 'job-1',
+    issuer: 'https://issuer',
+  };
+
+  it('freezes + reports a deferred attestation without persisting when the relay defers', async () => {
+    const reportDeferred = vi.fn(async () => {});
+    const persist = vi.fn();
+    const result = await attestProvenance(
+      {
+        getIdToken: async () => ({ deferred: true, code: 'unavailable' }),
+        persist,
+        reportDeferred,
+        localContext,
+        builderVersions: { 'kici-agent': '1', 'kici-orchestrator': 'unknown' },
+        now: () => '2026-06-29T00:00:00.000Z',
+      },
+      { subject: { name: 'art', digest: { sha256: 'a'.repeat(64) } } },
+    );
+
+    expect(result).toMatchObject({ deferred: true, subjectDigest: 'a'.repeat(64) });
+    expect(persist).not.toHaveBeenCalled();
+    expect(reportDeferred).toHaveBeenCalledOnce();
+    const reported = reportDeferred.mock.calls[0][0];
+    expect(reported.subjectDigest).toBe('a'.repeat(64));
+    expect(reported.statementHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(reported.dsseEnvelope.signatures.length).toBeGreaterThan(0);
+    expect(reported.mediaType).toBe(KICI_PROVENANCE_BUNDLE_MEDIA_TYPE);
+
+    // The frozen statement's payload hashes to the reported statementHash: the
+    // binding the later token commits to (truth-contract property 2).
+    const payload = Buffer.from(reported.dsseEnvelope.payload, 'base64');
+    const digest = await crypto.subtle.digest('SHA-256', payload);
+    const hex = Buffer.from(digest).toString('hex');
+    expect(reported.statementHash).toBe(hex);
+    // The frozen statement is marked deferred, not live.
+    const statement = JSON.parse(payload.toString('utf8'));
+    expect(statement.predicate.buildDefinition.internalParameters.attestationOrigin).toBe(
+      'deferred',
+    );
+  });
+
+  it('still uploads normally when a token is minted', async () => {
+    const persist = vi.fn(async () => 'provenance/run-1/job-1/aaa.kici.json');
+    const result = await attestProvenance(
+      {
+        getIdToken: async () => ({ token: fakeToken(), expiresIn: 600, jti: 'run-1:job-1' }),
+        persist,
+        reportDeferred: vi.fn(),
+        localContext,
+        builderVersions: { 'kici-agent': '1', 'kici-orchestrator': 'unknown' },
+      },
+      { subject: { name: 'art', digest: { sha256: 'a'.repeat(64) } } },
+    );
+    expect('deferred' in result).toBe(false);
+    expect(persist).toHaveBeenCalledOnce();
+  });
+
+  it('throws if the relay defers but no capture is wired', async () => {
+    await expect(
+      attestProvenance(
+        {
+          getIdToken: async () => ({ deferred: true, code: 'failed' }),
+          persist: vi.fn(),
+          builderVersions: { 'kici-agent': '1', 'kici-orchestrator': 'unknown' },
+        },
+        { subject: { name: 'art', digest: { sha256: 'a'.repeat(64) } } },
+      ),
+    ).rejects.toThrow(/no reportDeferred/);
+  });
+});
+
 describe('subjectDigestString', () => {
   it('prefers sha256 and falls back to the first available algorithm', () => {
     expect(subjectDigestString({ name: 'x', digest: { sha256: 'a'.repeat(64) } })).toBe(

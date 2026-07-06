@@ -40,8 +40,14 @@ export const WS_CLOSE_PLAN_LIMIT = 4020;
  */
 export const WS_CLOSE_CLUSTER_NAME_CONFLICT = 4011;
 
-/** The connection was closed because the requested run was not found. */
-export const WS_CLOSE_RUN_NOT_FOUND = 4030;
+/**
+ * The connection was closed to rebalance load across Platform instances. A
+ * newly-joined Platform instance asks peers holding excess connections to shed
+ * some; the affected orchestrators reconnect immediately and redistribute
+ * evenly. Not an error — the orchestrator treats it as a transient close and
+ * reconnects.
+ */
+export const WS_CLOSE_REBALANCE = 4030;
 
 /**
  * The connection was closed because a job dispatch went unacknowledged past

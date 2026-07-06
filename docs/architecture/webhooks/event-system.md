@@ -139,7 +139,7 @@ Cross-repo events require an explicit enabled row in the `cross_repo_trust` tabl
 
 ### Glob-based event filtering
 
-The `allowed_events` column in the trust table supports glob patterns via the `picomatch` library. For example, `["deploy-*", "release-*"]` allows only events matching those patterns to cross the repo boundary. A `null` `allowed_events` value means all events are allowed.
+The `allowed_events` column in the trust table supports glob patterns via the `picomatch` library. For example, `["deploy-*", "release-*"]` allows only events matching those patterns to cross the repo boundary. A `null` `allowed_events` value means all events are allowed (the filter is unset). An explicitly empty list (`[]`) is the opposite: it allows no events at all (deny-all). Malformed `allowed_events` data fails closed — no event is allowed to cross the boundary.
 
 ## Registration model
 

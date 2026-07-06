@@ -2,6 +2,69 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.26 — 2026-07-06
+
+### Other
+
+- Maintenance release.
+
+## v0.1.25 — 2026-07-05
+
+### Features
+
+- kici-admin environment purge: bulk-delete environments + held runs (direct-DB)
+- kici-admin cluster reconcile-identity: recover a stuck orchestrator by reconciling cluster_meta.cluster_id with the durable S3 sentinel
+- agent provenance can ride on org API key actors and run records
+- Marketing landing now positions KiCI as an alternative to common CI tools, linking the comparison pages
+- kici-admin access-log list --agent-label/--agent-only filter agent-attributed rows
+- Provenance attestations carry a source-origin brand (triggered vs kici run remote) and the origin org id
+- kici verify-attestation shows the origin org and flags kici run remote attestations
+- MCP server: new developer agent tools — list_orgs, list_secrets (key names only), list_orchestrators, get_diagnostics, plus list_workflows filters
+- Direct GitHub webhook ingress: deliver GitHub-App webhooks straight to your self-hosted orchestrator, bypassing the hosted Platform relay, with cluster-wide dedup and full job processing while the Platform is offline
+- Provenance attestations carry a mint-timing origin (live, deferred, offline-backfill)
+- kici verify-attestation flags deferred and offline-backfill attestations
+- kici-admin attestations retry mints deferred attestations on demand
+- Attestations surface deferred/pending state, an origin badge, and an on-demand retry
+- Deferred attestations can be retried from the dashboard
+- Coding agents can now approve, reject, and cancel-by-branch runs over the MCP server (approve_run / reject_run / cancel_runs_by_branch)
+- kici-admin attestations list lists an orchestrator's attestations
+
+### Fixes
+
+- Public OIDC discovery + JWKS endpoints now reachable for build-provenance attestation verification
+- External orchestrators can mint build-provenance identity tokens (route /internal/orchestrator/\* through the edge)
+- New organization owners can again create API keys and service accounts with default permissions (the built-in Owner/Member roles now carry the full current permission set)
+- Orchestrator no longer rejects manual workflow registration when a job binds an environment that has no protection-gate record
+- Legal acceptance gate no longer deadlocks when a document version is published while you are reviewing it
+- Test runs now warn (and skip) when a bound environment is unavailable (non-test or unconfigured) instead of silently dropping it — the warning appears on the kici run remote output and the dashboard run view
+- `kici-admin cluster reconcile-identity` now defaults the storage prefix to the bucket root (matching the orchestrator default) instead of `kici-cache/`, so recovery reconciles the same sentinel the orchestrator validates at startup
+- Firecracker microVM agents now bake the complete `@kici-dev/core` loader-hook layer into the rootfs — the shared rolldown runtime chunk was previously omitted, which made workflow execution inside a microVM fail with a missing-module error
+- A transient provenance mint failure no longer fails the job; the attestation is minted later
+- Fix a 500 error when browsing the org-wide attestations page (including filtering by digest).
+- kici now points you at the current command (kici runs / kici diagnostics) when you type a retired command like kici status, and suggests near-matches for any mistyped command
+- Events missed during an orchestrator restart are now all delivered on catch-up, not just the first 100
+- kici run local prints discoverable usage when the event is missing
+- system-completion events are no longer dropped by the per-workflow rate limit at scale
+- an empty cross-repo trust allow-list now denies all events instead of allowing all
+- kici run remote --approve-all now auto-approves holds in --json/--quiet mode instead of hanging
+- kici run remote --approve-all / --yes now correctly binds the auto-approve flag (was silently ignored due to option aliasing)
+- provenance ingest refetches JWKS on a kid-miss so a signing-key rotation no longer marks attestations failed
+- Deferred attestations that the hosted platform can never mint (run/job absent) stop retrying forever; operators can re-arm them with kici-admin attestations retry --include-rejected
+- Provenance verification no longer fails a live bundle whose repository/ref/sha/workflow_ref identity-token claim is null
+- workflow timeouts of 24h or longer are now enforced by the stale-run scan
+- Orchestrator container image now ships the jose dependency, fixing a startup crash (ERR_MODULE_NOT_FOUND: jose) when the orchestrator runs as a container
+- kici approve/reject and run remote --approve-all now work for remote runs
+
+### Documentation
+
+- Document the agent safety model — least-privilege, fail-closed, audited
+- Document agent prompt-injection defense (untrusted-content fencing)
+- Document the deferred-attestation lifecycle, run-sync backfill, retry CLI, and truth contract
+
+### Other
+
+- Provenance ID-token minting now rides the authenticated orchestrator-to-Platform WebSocket, so external orchestrators can attest provenance without a separate public HTTP endpoint.
+
 ## v0.1.24 — 2026-06-28
 
 ### Features

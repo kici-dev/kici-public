@@ -1,6 +1,7 @@
 import { z } from 'zod';
 
 import { approverClauseSchema } from '../../approval/types.js';
+import { dsseEnvelopeSchema } from '../../provenance/dsse.js';
 import {
   ExecutionJobStatus,
   ExecutionStepStatus,
@@ -606,6 +607,33 @@ export const provenanceUploadCompleteSchema = z.object({
   mediaType: z.string(),
 });
 
+/**
+ * Agent -> Orchestrator: capture a frozen, DSSE-signed provenance statement for
+ * later minting (the transient mint-failure path). No upload happens; the
+ * orchestrator persists the envelope in its deferred-attestation outbox and the
+ * job completes green. The identity token is minted later and bound to the
+ * frozen statement by `statementHash`.
+ */
+export const provenanceUploadDeferSchema = z.object({
+  type: z.literal('provenance.upload.defer'),
+  messageId: z.string(),
+  jobId: z.string(),
+  /** Caller-supplied artifact name. */
+  subjectName: z.string(),
+  /** Primary subject digest (lowercase hex). */
+  subjectDigest: z.string(),
+  /** Requested token audience for the later mint. */
+  audience: z.string(),
+  /** Bundle media type. */
+  mediaType: z.string(),
+  /** SHA-256 of the frozen DSSE statement payload — the later-mint binding. */
+  statementHash: z.string(),
+  /** The frozen, DSSE-signed statement envelope. */
+  dsseEnvelope: dsseEnvelopeSchema,
+  /** Ephemeral public key JWK the envelope was signed with. */
+  publicKey: z.record(z.string(), z.unknown()),
+});
+
 // --- Event emit protocol (custom event emission from workflow steps) ---
 
 /** Agent -> Orchestrator: emit a custom event from a running workflow step. */
@@ -856,6 +884,7 @@ export const agentToOrchestratorMessageSchema = z.discriminatedUnion('type', [
   cacheUserSaveCompleteSchema,
   provenanceUploadRequestSchema,
   provenanceUploadCompleteSchema,
+  provenanceUploadDeferSchema,
   eventEmitSchema,
   agentApiRequestSchema,
   agentMetricsSchema,
@@ -883,6 +912,7 @@ export type CacheUserSaveComplete = z.infer<typeof cacheUserSaveCompleteSchema>;
 export type ProvenanceUploadRequest = z.infer<typeof provenanceUploadRequestSchema>;
 export type ProvenanceUploadResponse = z.infer<typeof provenanceUploadResponseSchema>;
 export type ProvenanceUploadComplete = z.infer<typeof provenanceUploadCompleteSchema>;
+export type ProvenanceUploadDefer = z.infer<typeof provenanceUploadDeferSchema>;
 export type FleetLogsRequest = z.infer<typeof fleetLogsRequestSchema>;
 export type FleetBundleChunk = z.infer<typeof fleetBundleChunkSchema>;
 export type FleetBundleError = z.infer<typeof fleetBundleErrorSchema>;

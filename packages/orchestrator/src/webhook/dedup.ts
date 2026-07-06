@@ -91,6 +91,42 @@ export class DedupCache {
   }
 
   /**
+   * Atomically claim a delivery ID. Returns `true` when this call inserted the
+   * row (the caller owns this delivery — proceed), `false` when a row already
+   * existed (duplicate — drop it).
+   *
+   * This replaces the historic `exists()`-then-`mark()` check-then-act, which
+   * raced across cluster instances: behind an external load balancer, GitHub's
+   * own retries and LB retries can fan the same `X-GitHub-Delivery` to two
+   * instances concurrently — both passed `exists()` and both dispatched. The
+   * single `INSERT … ON CONFLICT (delivery_id) DO NOTHING` is the atomic
+   * arbiter backed by the `dedup_cache` primary key, so exactly one caller
+   * wins regardless of how many instances receive the same delivery.
+   */
+  async claim(deliveryId: string): Promise<boolean> {
+    // Fast path: a delivery this instance already claimed is a local duplicate.
+    if (this.memoryCache.has(deliveryId)) {
+      return false;
+    }
+
+    const expiresAt = new Date(Date.now() + DEFAULT_TTL_MS).toISOString();
+    const result = await this.db
+      .insertInto('dedup_cache')
+      .values({
+        delivery_id: deliveryId,
+        expires_at: expiresAt as unknown as Date,
+      })
+      .onConflict((oc) => oc.column('delivery_id').doNothing())
+      .executeTakeFirst();
+
+    // Promote regardless of winner so a later same-instance redelivery short-
+    // circuits on the memory fast path.
+    this.addToMemoryCache(deliveryId);
+
+    return Number(result?.numInsertedOrUpdatedRows ?? 0n) > 0;
+  }
+
+  /**
    * Remove expired entries from the database.
    * Also trims the in-memory cache to MAX_MEMORY_CACHE_SIZE.
    *
