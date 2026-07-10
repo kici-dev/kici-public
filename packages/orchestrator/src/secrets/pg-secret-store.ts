@@ -14,7 +14,7 @@ import type { AuditLogger } from './audit-logger.js';
 
 /**
  * Thrown by `renameScope` when the named scope has no secret rows and no
- * environment binding — i.e. there is nothing to rename. Consumers map this to
+ * context binding — i.e. there is nothing to rename. Consumers map this to
  * a 404 (admin HTTP route) or a structured not-found response (dashboard path).
  */
 export class SecretScopeNotFoundError extends Error {
@@ -287,7 +287,7 @@ export class PgSecretStore implements SecretStore {
   }
 
   /**
-   * Rename a scope -- atomically update scoped_secrets and environment_bindings.
+   * Rename a scope -- atomically update scoped_secrets and context_bindings.
    */
   async renameScope(orgId: string, oldScope: string, newScope: string): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
@@ -301,12 +301,12 @@ export class PgSecretStore implements SecretStore {
         .execute();
 
       // A scope exists when it has at least one secret row (empty scopes carry
-      // an `__empty__` sentinel) or an environment binding references it.
+      // an `__empty__` sentinel) or an context binding references it.
       // Renaming a scope that exists in neither would silently commit zero
       // changes and report success — reject it so the caller gets a 4xx
       // instead of a misleading 200.
       const bindings = await trx
-        .selectFrom('environment_bindings')
+        .selectFrom('context_bindings')
         .select('id')
         .where('org_id', '=', orgId)
         .where('scope_pattern', '=', oldScope)
@@ -336,9 +336,9 @@ export class PgSecretStore implements SecretStore {
           .execute();
       }
 
-      // Update environment bindings referencing the old scope
+      // Update context bindings referencing the old scope
       await trx
-        .updateTable('environment_bindings')
+        .updateTable('context_bindings')
         .set({ scope_pattern: newScope })
         .where('org_id', '=', orgId)
         .where('scope_pattern', '=', oldScope)
@@ -347,7 +347,7 @@ export class PgSecretStore implements SecretStore {
   }
 
   /**
-   * Delete a scope and all its secrets, plus any environment bindings referencing it.
+   * Delete a scope and all its secrets, plus any context bindings referencing it.
    */
   async deleteScope(orgId: string, scope: string): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
@@ -357,7 +357,7 @@ export class PgSecretStore implements SecretStore {
         .where('scope', '=', scope)
         .execute();
       await trx
-        .deleteFrom('environment_bindings')
+        .deleteFrom('context_bindings')
         .where('org_id', '=', orgId)
         .where('scope_pattern', '=', scope)
         .execute();

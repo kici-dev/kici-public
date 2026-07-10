@@ -558,10 +558,10 @@ export interface JobExecutionRequest {
   /** Base64-encoded X25519 public key for the run (for encrypting secret outputs). */
   runPublicKey?: string;
 
-  /** Deployment environment name (resolved by orchestrator). */
-  environment?: string;
+  /** Resolved context name (resolved by orchestrator). */
+  context?: string;
   /** Environment variables from orchestrator (org-level + source overrides, layers 4-5). */
-  environmentVars?: Record<string, string>;
+  contextVars?: Record<string, string>;
   /** Job env from lock file env field (layer 6, evaluated by orchestrator). */
   jobEnv?: Record<string, string>;
 

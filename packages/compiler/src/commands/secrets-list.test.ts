@@ -63,7 +63,7 @@ describe('kici secrets list', () => {
 
       mockFetch.mockResolvedValue(
         jsonOk({
-          environments: [
+          contexts: [
             {
               name: 'test-database',
               secretKeys: ['host', 'port', 'password'],
@@ -90,7 +90,7 @@ describe('kici secrets list', () => {
 
       expect(result).toBe(true);
       expect(mockFetch).toHaveBeenCalledWith(
-        'https://platform.example.com/api/v1/orgs/org-1/environments?includeSecrets=true',
+        'https://platform.example.com/api/v1/orgs/org-1/contexts?includeSecrets=true',
         expect.objectContaining({
           headers: expect.objectContaining({ Authorization: 'Bearer kici_pat_abc' }),
         }),
@@ -112,7 +112,7 @@ describe('kici secrets list', () => {
   describe('handles empty context list', () => {
     it('shows message when no contexts are available', async () => {
       await writeConfig(platformConfig);
-      mockFetch.mockResolvedValue(jsonOk({ environments: [] }));
+      mockFetch.mockResolvedValue(jsonOk({ contexts: [] }));
 
       const result = await secretsListCommand();
 
@@ -125,7 +125,7 @@ describe('kici secrets list', () => {
       await writeConfig(platformConfig);
       mockFetch.mockResolvedValue(
         jsonOk({
-          environments: [
+          contexts: [
             { name: 'production', secretKeys: ['x'], allowLocalExecution: false, enabled: true },
           ],
         }),
@@ -146,14 +146,14 @@ describe('kici secrets list', () => {
       mockFetch.mockResolvedValue({
         ok: false,
         status: 403,
-        json: async () => ({ error: 'Insufficient permission: environments.read needed' }),
+        json: async () => ({ error: 'Insufficient permission: contexts.read needed' }),
       });
 
       const result = await secretsListCommand();
 
       expect(result).toBe(false);
       const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
-      expect(errors).toContain('environments.read');
+      expect(errors).toContain('contexts.read');
     });
   });
 

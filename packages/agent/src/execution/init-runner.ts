@@ -8,8 +8,8 @@ import { withTimeout } from './timeout-util.js';
  * Only fields that were flagged as dynamic and successfully resolved are set.
  */
 export interface InitResult {
-  /** Resolved bound-environment names, in merge order (one per `environments` element). */
-  environmentNames?: string[];
+  /** Resolved bound-context names, in merge order (one per `contexts` element). */
+  contextNames?: string[];
   env?: Record<string, string>;
   concurrencyGroup?: string;
   /**
@@ -33,7 +33,7 @@ function findJobByName(workflow: Workflow, jobName: string): Job {
 }
 
 /**
- * Evaluate dynamic fields (environment, env, concurrencyGroup) on a job.
+ * Evaluate dynamic fields (context, env, concurrencyGroup) on a job.
  *
  * Only fields with their corresponding flag set to true AND whose property
  * on the job is a function will be evaluated. All evaluations happen in a
@@ -54,7 +54,7 @@ export async function evaluateDynamicFields(
   jobName: string,
   event: Record<string, unknown>,
   flags: {
-    dynamicEnvironment: boolean;
+    dynamicContext: boolean;
     dynamicEnv: boolean;
     dynamicConcurrencyGroup: boolean;
     dynamicMatrix?: boolean;
@@ -83,11 +83,10 @@ export async function evaluateDynamicFields(
     result.matrixValues = combos;
   }
 
-  if (flags.dynamicEnvironment) {
-    // Resolve every bound-environment element in order (static verbatim, dynamic
+  if (flags.dynamicContext) {
+    // Resolve every bound-context element in order (static verbatim, dynamic
     // functions evaluated). Either spelling normalizes to one ordered list.
-    const envRefs =
-      job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
+    const envRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
     if (envRefs && envRefs.length > 0) {
       const names: string[] = [];
       for (const ref of envRefs) {
@@ -95,14 +94,14 @@ export async function evaluateDynamicFields(
           const value = await withTimeout(
             () => (ref as (event: Record<string, unknown>) => string | Promise<string>)(event),
             timeoutMs,
-            `dynamicEnvironment for job '${jobName}'`,
+            `dynamicContext for job '${jobName}'`,
           );
           if (value !== undefined && value !== null) names.push(value);
         } else if (typeof ref === 'string') {
           names.push(ref);
         }
       }
-      if (names.length > 0) result.environmentNames = names;
+      if (names.length > 0) result.contextNames = names;
     }
   }
 

@@ -91,14 +91,14 @@ describe('evaluateInlineFields', () => {
     payload: { pull_request: { number: 7 }, ref: undefined },
   };
 
-  it('evaluates inline environment/env/concurrencyGroup against the normalized envelope', () => {
+  it('evaluates inline context/env/concurrencyGroup against the normalized envelope', () => {
     const lockJob = {
       _type: 'static',
       name: 'deploy',
       runsOn: 'default',
       needs: [],
       steps: [],
-      environments: [
+      contexts: [
         {
           value: {
             _type: 'inline',
@@ -118,7 +118,7 @@ describe('evaluateInlineFields', () => {
     } as unknown as LockJob;
 
     const result = evaluateInlineFields(lockJob, envelope);
-    expect(result.inlineEnvironmentNames).toEqual(['preview']);
+    expect(result.inlineContextNames).toEqual(['preview']);
     expect(result.inlineEnv).toEqual({ PR: '7' });
     expect(result.inlineConcurrencyGroup).toBe('cg-main');
   });
@@ -130,7 +130,7 @@ describe('evaluateInlineFields', () => {
       runsOn: 'default',
       needs: [],
       steps: [],
-      environments: [
+      contexts: [
         { value: { _type: 'inline', expression: '(event) => event.nope.deref' }, dynamic: true },
       ],
     } as unknown as LockJob;

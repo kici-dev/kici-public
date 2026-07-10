@@ -24,8 +24,15 @@ describe('retiredCommandHint', () => {
     expect(retiredCommandHint(undefined)).toBeUndefined();
   });
 
-  it('seeds status and cancel in the retired-command map', () => {
-    expect(Object.keys(RETIRED_COMMANDS).sort()).toEqual(['cancel', 'status']);
+  it('names the routed replacement for the retired run local subcommand', () => {
+    const hint = retiredCommandHint('run local');
+    expect(hint).toBeDefined();
+    expect(hint).toContain('`kici run local` is retired');
+    expect(hint).toContain('kici run <event> --local');
+  });
+
+  it('seeds status, cancel, and run local in the retired-command map', () => {
+    expect(Object.keys(RETIRED_COMMANDS).sort()).toEqual(['cancel', 'run local', 'status']);
   });
 });
 

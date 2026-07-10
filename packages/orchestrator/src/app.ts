@@ -47,10 +47,11 @@ import type { PendingDynamicTracker } from './cache/index.js';
 import type { CacheStorage } from './storage/types.js';
 import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
 import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.js';
-import { registerBlobRoutes } from './storage/blob-routes.js';
+import { registerBlobRoutes, CACHE_BLOB_PATH_PREFIX } from './storage/blob-routes.js';
 import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
-import { createOidcTokenHandler } from './ws/oidc-token-relay.js';
+import { selectOidcMintRegistration } from './oidc/oidc-mint-registration.js';
+import type { LocalSigner } from './oidc/local-dev-signer.js';
 import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
 import { createEnsureInitRunnerHandler, createPreBootSendHandler } from './ws/bringup-api.js';
 import { resolveScalerOrchestratorUrl } from './scaler/manager.js';
@@ -119,9 +120,9 @@ import type { AccessLogWriter } from './audit/access-log.js';
 import { payloadFromObject } from './webhook/event-log.js';
 import type { GenericSourceManager } from './webhook/generic-sources.js';
 import type { TrustStore } from './events/trust-store.js';
-import type { EnvironmentStore } from './environments/environment-store.js';
-import type { VariableStore } from './environments/variable-store.js';
-import type { HeldRunStore } from './environments/held-runs.js';
+import type { ContextStore } from './contexts/context-store.js';
+import type { VariableStore } from './contexts/variable-store.js';
+import type { HeldRunStore } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import type { ContributorCache } from './security/contributor-cache.js';
 import {
@@ -186,6 +187,13 @@ export interface AppDependencies {
   /** Provenance trust root used to verify build-provenance bundles at ingest. */
   provenanceTrustRoot?: ProvenanceTrustRoot;
   /**
+   * In-process dev-signed identity signer for the offline local dev plane.
+   * Present ONLY in independent mode with KICI_INDEPENDENT_IDENTITY=1. When set
+   * (and NOT Platform-connected), the local mint path for `OIDC_TOKEN_REQUEST_METHOD`
+   * is registered so `ctx.kici.oidc.token()` mints a `kici-local` dev token.
+   */
+  localOidcSigner?: LocalSigner;
+  /**
    * Filesystem cache backend handle. Only set when KICI_STORAGE_TYPE is
    * `filesystem`. Drives the /api/v1/cache/blob/* HTTP route that serves and
    * receives signed-URL blob traffic the filesystem backend mints.
@@ -194,6 +202,7 @@ export interface AppDependencies {
     basePath: string;
     signingSecret: string;
     ttlMs: number;
+    maxUploadBytes: number;
   };
   /** Pending build tracker for build-then-execute coordination. Optional — requires bundle cache. */
   pendingBuilds?: PendingBuildTracker;
@@ -262,7 +271,7 @@ export interface AppDependencies {
   /** Registration index for admin registration routes. Optional -- mounted when registration system is initialized. */
   registrationIndex?: RegistrationIndex;
   /** Environment store for resolving environment configs. Optional -- if not set, environment resolution is inactive. */
-  environmentStore?: EnvironmentStore;
+  contextStore?: ContextStore;
   /** Variable store for resolving environment variables. Optional -- if not set, environment vars are not merged. */
   variableStore?: VariableStore;
   /** Held run store for persisting protection rule holds. Optional -- if not set, holds are not persisted. */
@@ -549,24 +558,27 @@ export function createApp(deps: AppDependencies) {
     }
   }
 
-  // Register the provenance ID-token relay (read role). The relay mints over the
-  // authenticated orchestrator↔Platform WebSocket, so it is only meaningful when
-  // this orchestrator is connected to a Platform (platform/hybrid mode) and the
-  // WS client exists. In independent mode (no platformUrl/platformToken/client)
-  // the method is not registered and a request returns a clear "unknown method"
-  // error.
-  if (deps.config.platformUrl && deps.config.platformToken && deps.platformClient) {
-    agentApiRegistry.register(
-      OIDC_TOKEN_REQUEST_METHOD,
-      'read',
-      createOidcTokenHandler({
-        dispatcher: deps.dispatcher,
-        platformClient: deps.platformClient,
-        orchestratorId: deps.config.instanceId,
-        testMode: deps.config.testMode,
-        testMintDeferAudience: deps.config.testMintDeferAudience,
-      }),
-    );
+  // Register the OIDC ID-token mint handler (read role). The choice of handler —
+  // Platform relay vs local dev-signed — is the anti-forgery choke point, made
+  // by `selectOidcMintRegistration`: a Platform-connected orchestrator ALWAYS
+  // relays to the Platform (the local signer is UNREACHABLE); the offline local
+  // dev plane mints locally with issuer `kici-local`; a bare independent
+  // orchestrator registers nothing (the method returns "unknown method").
+  const oidcMintReg = selectOidcMintRegistration({
+    platformUrl: deps.config.platformUrl,
+    platformToken: deps.config.platformToken,
+    platformClient: deps.platformClient,
+    independentIdentity: deps.config.independentIdentity,
+    localOidcSigner: deps.localOidcSigner,
+    dispatcher: deps.dispatcher,
+    db: deps.db,
+    orchestratorId: deps.config.instanceId,
+    testMode: deps.config.testMode,
+    testMintDeferAudience: deps.config.testMintDeferAudience,
+    testMintRejectAudience: deps.config.testMintRejectAudience,
+  });
+  if (oidcMintReg) {
+    agentApiRegistry.register(OIDC_TOKEN_REQUEST_METHOD, 'read', oidcMintReg.handler);
   }
 
   // Source location store for check run annotations
@@ -903,8 +915,14 @@ export function createApp(deps: AppDependencies) {
         onEventEmit:
           deps.eventRouter && deps.executionTracker
             ? async (_agentId, msg) => {
-                const execContext = deps.executionTracker!.getExecutionContext(msg.jobId);
-                if (!execContext) {
+                // `event.emit` is job-scoped; map the emitting jobId back to its
+                // run so the run-keyed execution context resolves (works for
+                // every dispatch path, independent/local-source included).
+                const runId = deps.executionTracker!.getRunIdForJob(msg.jobId);
+                const execContext = runId
+                  ? deps.executionTracker!.getExecutionContext(runId)
+                  : undefined;
+                if (!execContext || !runId) {
                   return { error: 'Unknown job context' };
                 }
                 try {
@@ -913,7 +931,7 @@ export function createApp(deps: AppDependencies) {
                     payload: msg.payload,
                     sourceRepo: execContext.repoIdentifier,
                     sourceRoutingKey: execContext.routingKey,
-                    sourceRunId: msg.jobId, // jobId is used as source reference
+                    sourceRunId: runId,
                     sourceJobId: msg.jobId,
                     chainDepth: 1, // Agent-emitted events start at chain depth 1
                     ...(msg.target && { target: msg.target }),
@@ -1145,8 +1163,16 @@ export function createApp(deps: AppDependencies) {
     });
   });
 
-  // Global middleware: Body size limit (25MB)
-  app.use('*', bodyLimit({ maxSize: 25 * 1024 * 1024 }));
+  // Global middleware: Body size limit (25MB) for tenant-facing routes.
+  // Internal cache-blob transfers (dependency tarballs up to
+  // cacheMaxTarballBytes, 500MB default) are exempt — they enforce their own
+  // bound in registerBlobRoutes, matching the S3 backend's uncapped
+  // direct-to-S3 upload path. Webhook routes carry their own tighter per-route
+  // caps (see routes/webhooks.ts, routes/github-webhook.ts).
+  const webhookBodyLimit = bodyLimit({ maxSize: 25 * 1024 * 1024 });
+  app.use('*', (c, next) =>
+    c.req.path.startsWith(CACHE_BLOB_PATH_PREFIX) ? next() : webhookBodyLimit(c, next),
+  );
 
   // The legacy single-secret /webhook/:orgId/github direct endpoint has been
   // removed. Direct HTTP webhook ingestion now flows exclusively through the
@@ -1323,7 +1349,7 @@ export function createApp(deps: AppDependencies) {
           secretKey: deps.config.secretKey,
           secretResolver: deps.secretResolver,
           logStorage: deps.logStorage,
-          environmentStore: deps.environmentStore,
+          contextStore: deps.contextStore,
           variableStore: deps.variableStore,
           heldRunStore: deps.heldRunStore,
           coordinator: deps.coordinator,
@@ -1435,7 +1461,7 @@ export function createApp(deps: AppDependencies) {
         registrationIndex: deps.registrationIndex,
         tokenManager: deps.adminDeps.tokenManager,
         rbac: deps.adminDeps.rbac,
-        ...(deps.environmentStore && { environmentStore: deps.environmentStore }),
+        ...(deps.contextStore && { contextStore: deps.contextStore }),
       }),
     );
   }

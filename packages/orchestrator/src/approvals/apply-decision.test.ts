@@ -163,7 +163,7 @@ describe('applyDecision', () => {
         scope: 'workflow',
         stepIndex: null,
         // Install-gate holds are environment-triggered.
-        triggerSource: 'environment',
+        triggerSource: 'context',
       }),
     });
     const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);

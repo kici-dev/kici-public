@@ -9,7 +9,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { setEnvironmentSecretDirect, toErrorMessage } from '@kici-dev/shared';
+import { setContextSecretDirect, toErrorMessage } from '@kici-dev/shared';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
 
 function resolveDirectDbUrl(explicit?: string): string | null {
@@ -61,20 +61,20 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
     .command('set [orgId] [scope] [key]')
     .description(
       'Set a secret value. Positional form: "set <orgId> <scope> <key>". ' +
-        'Sugar form (environment scope): "set --org <id> --environment <env> --key <k>". ' +
+        'Sugar form (context scope): "set --org <id> --context <env> --key <k>". ' +
         'Value comes from one of: --prompt (default on TTY), --from-stdin (default on pipe), ' +
         '--from-file <path>, --from-env <VAR>, --value <plaintext> (discouraged).',
     )
     .option('--value <value>', 'Secret value via argv (visible in shell history; prefer --prompt)')
     .option(
       '--org <orgId>',
-      'Org ID (use with --environment + --key; mutually exclusive with positional form)',
+      'Org ID (use with --context + --key; mutually exclusive with positional form)',
     )
     .option(
-      '--environment <name>',
-      'Environment scope — sugar for positional <scope>. Requires --org and --key.',
+      '--context <name>',
+      'Context scope — sugar for positional <scope>. Requires --org and --key.',
     )
-    .option('--key <key>', 'Secret key name (use with --org + --environment)')
+    .option('--key <key>', 'Secret key name (use with --org + --context)')
     .option('--prompt', 'Interactive no-echo prompt (requires TTY)')
     .option('--from-stdin', 'Read value from piped stdin until EOF')
     .option('--from-file <path>', 'Read value from a file (trailing newline trimmed)')
@@ -98,7 +98,7 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
           value?: string;
           databaseUrl?: string;
           org?: string;
-          environment?: string;
+          context?: string;
           key?: string;
           prompt?: boolean;
           fromStdin?: boolean;
@@ -112,28 +112,28 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         try {
           // Resolve (orgId, scope, key) from positional OR sugar form.
           const hasPositional = Boolean(posOrgId || posScope || posKey);
-          const hasSugar = Boolean(opts.org || opts.environment || opts.key);
+          const hasSugar = Boolean(opts.org || opts.context || opts.key);
           if (hasPositional && hasSugar) {
             throw new Error(
-              'Cannot mix positional <orgId> <scope> <key> form with --org/--environment/--key flags. Pick one.',
+              'Cannot mix positional <orgId> <scope> <key> form with --org/--context/--key flags. Pick one.',
             );
           }
           let orgId: string;
           let scope: string;
           let key: string;
           if (hasSugar) {
-            if (!opts.org) throw new Error('--org is required when using --environment sugar form');
-            if (!opts.environment) {
-              throw new Error('--environment is required in sugar form (use --environment <name>)');
+            if (!opts.org) throw new Error('--org is required when using --context sugar form');
+            if (!opts.context) {
+              throw new Error('--context is required in sugar form (use --context <name>)');
             }
-            if (!opts.key) throw new Error('--key is required when using --environment sugar form');
+            if (!opts.key) throw new Error('--key is required when using --context sugar form');
             orgId = opts.org;
-            scope = opts.environment;
+            scope = opts.context;
             key = opts.key;
           } else {
             if (!posOrgId || !posScope || !posKey) {
               throw new Error(
-                'Missing arguments: supply either <orgId> <scope> <key> positionally, or --org + --environment + --key.',
+                'Missing arguments: supply either <orgId> <scope> <key> positionally, or --org + --context + --key.',
               );
             }
             orgId = posOrgId;
@@ -153,9 +153,9 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
 
           const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
           if (dbUrl) {
-            await setEnvironmentSecretDirect(dbUrl, {
+            await setContextSecretDirect(dbUrl, {
               orgId,
-              environment: scope,
+              context: scope,
               key,
               encryptedValue: value,
             });

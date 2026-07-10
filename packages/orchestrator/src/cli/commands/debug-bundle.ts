@@ -10,7 +10,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { ZipArchive } from 'archiver';
 import type { AdminApiClient, FleetTopologyResponse } from '../api-client.js';
 import { toErrorMessage, addLogsToArchive } from '@kici-dev/shared';
@@ -36,10 +36,14 @@ export function registerDebugBundleCommand(
   program
     .command('debug-bundle')
     .description('Generate a diagnostic debug bundle ZIP for troubleshooting')
-    .option(
-      '-o, --output <path>',
-      'Output ZIP file path',
-      `kici-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`,
+    .addOption(
+      // The literal default is a fresh timestamped filename; pair it with a
+      // stable defaultValueDescription so --help and the generated CLI docs
+      // stay deterministic (the runtime default value is unchanged).
+      new Option('-o, --output <path>', 'Output ZIP file path').default(
+        `kici-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`,
+        'kici-debug-<timestamp>.zip',
+      ),
     )
     .option(
       '--log-dir <path>',

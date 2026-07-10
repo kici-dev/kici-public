@@ -14,11 +14,11 @@ The left sidebar provides persistent navigation across all org-scoped pages:
 - **Runs** -- the default landing page, showing your workflow run history
 - **Workflows** -- permanently registered workflows listening for events
 - **Fleet** -- read-only view of the organization's declared host fleet, listing each host's status, labels, and a per-host detail page (shown directly below Workflows, only when fleet management is enabled for the org and you hold `fleet:read`)
-- **Diagnostics** -- infrastructure health, execution metrics, and recent errors
+- **Attestations** -- build-provenance attestations produced by workflow runs, with a verify-status filter and a per-attestation detail page
+- **Infrastructure** -- per-org infrastructure health: an orchestrator → scaler → agent tree, execution metrics, infrastructure alerts, and secret-backend health. Each orchestrator cluster is a row keyed by cluster name with a **Manage** link into its per-cluster scoped views (overview, contexts, secrets, DLQ, workflows)
 - **Metrics** -- time-series charts of orchestrator health (dispatch & agents, execution, webhooks, caching, logs, errors), scoped to this org
-- **Orchestrators** -- the orchestrator clusters connected to this org, keyed by cluster name; selecting one opens its per-cluster scoped views (overview, environments, secrets, DLQ, workflows)
-- **Environments** -- deployment environments with protection rules
-- **Secrets** -- secret scope management with environment bindings
+- **Contexts** -- deployment contexts with protection rules
+- **Secrets** -- secret scope management with context bindings
 - **Approval queue** -- held runs pending approval (shows a badge with pending count)
 - **Activity** -- forensic log merging tenant-plane mutations and orchestrator reads into one chronological stream
 - **DLQ** -- dead-letter queue of internal events whose dispatch retries were exhausted (shows a badge with the current depth)
@@ -29,7 +29,7 @@ The sidebar footer shows the WebSocket connection indicator, your user profile, 
 
 ### Mobile navigation
 
-On screens narrower than 768px (the `sm` breakpoint), the sidebar collapses and is replaced by a bottom tab bar with six navigation items: Runs, Workflows, Envs (environments), Secrets, Health (diagnostics), and Settings. Note that the mobile tab bar shows a subset of the full sidebar navigation -- activity and approval queue are only available in the full desktop sidebar.
+On screens narrower than 768px (the `sm` breakpoint), the sidebar collapses and is replaced by a bottom tab bar with seven navigation items: Runs, Attest (attestations), Workflows, Envs (contexts), Secrets, Infra (infrastructure), and Settings. Note that the mobile tab bar shows a subset of the full sidebar navigation -- activity and approval queue are only available in the full desktop sidebar.
 
 ## Theme
 

@@ -45,6 +45,32 @@ describe('refreshGithubSourceIdentity', () => {
     expect(store.updateSource).toHaveBeenCalledWith('github:1', { name: 'New', slug: 'new' });
   });
 
+  it('handles config already parsed as an object (jsonb read shape)', async () => {
+    // The `sources.config` column is jsonb, so the DB driver returns it as an
+    // already-parsed object on read. A blind JSON.parse of that object stringifies
+    // it to "[object Object]" and throws — this covers the object path.
+    const store: RefreshableSourceStore & { updateSource: ReturnType<typeof vi.fn> } = {
+      listSources: vi
+        .fn()
+        .mockResolvedValue([
+          { routing_key: 'github:1', provider: 'github', name: 'Old', slug: 'old' },
+        ]),
+      getSourceWithSecrets: vi.fn().mockResolvedValue({
+        provider: 'github',
+        config: { appId: '3863473' }, // object, not a JSON string
+        privateKey: 'pem',
+      }),
+      updateSource: vi.fn().mockResolvedValue(undefined),
+    };
+    const fetchIdentity = vi.fn().mockResolvedValue({ name: 'New', slug: 'new' });
+
+    const result = await refreshGithubSourceIdentity(store, 'github:1', fetchIdentity);
+
+    expect(fetchIdentity).toHaveBeenCalledWith({ appId: '3863473', privateKey: 'pem' });
+    expect(result.changed).toBe(true);
+    expect(store.updateSource).toHaveBeenCalledWith('github:1', { name: 'New', slug: 'new' });
+  });
+
   it('does not write when name + slug are unchanged', async () => {
     const store = makeStore(
       [{ routing_key: 'github:1', provider: 'github', name: 'Same', slug: 'same' }],

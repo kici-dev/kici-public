@@ -33,13 +33,16 @@ export type Permission =
   | 'event_log.read_payload'
   | 'access_log.read'
   | 'scheduled_job.trigger'
+  | 'attestation.retry'
   | 'event_dlq.read'
   | 'event_dlq.manage';
 
 /**
  * Role-to-permission mapping.
- * owner gets everything, admin gets context/secret/audit,
- * auditor gets context.read + audit.read + run.read.
+ * owner gets everything, admin gets context/secret/audit + attestation.retry,
+ * auditor gets context.read + audit.read + run.read (read-only — no
+ * attestation.retry, so a read-only role can never drain / re-arm the
+ * deferred-attestation outbox).
  */
 const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
   owner: new Set<Permission>([
@@ -60,6 +63,7 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'event_log.read_payload',
     'access_log.read',
     'scheduled_job.trigger',
+    'attestation.retry',
     'event_dlq.read',
     'event_dlq.manage',
   ]),
@@ -79,6 +83,7 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'event_log.read_payload',
     'access_log.read',
     'scheduled_job.trigger',
+    'attestation.retry',
     'event_dlq.read',
     'event_dlq.manage',
   ]),

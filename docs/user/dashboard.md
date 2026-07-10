@@ -14,6 +14,6 @@ This guide is split across the following pages:
 | [Runs and logs](./dashboard/runs.md)                                                  | Run list, run detail, the log viewer                                    |
 | [Settings](./dashboard/settings.md)                                                   | Members, roles, teams, keys, sources, billing, security, support access |
 | [Workflows, diagnostics, and orchestrators](./dashboard/workflows-and-diagnostics.md) | Registered workflows, infra health, per-cluster views                   |
-| [Environments, secrets, and approvals](./dashboard/environments-and-secrets.md)       | Environments, secret scopes, approval queue                             |
+| [Contexts, secrets, and approvals](./dashboard/contexts-and-secrets.md)               | Contexts, secret scopes, approval queue                                 |
 | [Activity and DLQ](./dashboard/activity-and-dlq.md)                                   | Forensic activity log and dead-letter queue                             |
 | [Account](./dashboard/account.md)                                                     | Personal account settings                                               |

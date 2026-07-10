@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import type { JobDispatch, AgentToOrchestratorMessage } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
-import { JobRunner, type JobRunnerDeps, buildEvalNeedsContext } from './job-runner.js';
+import {
+  JobRunner,
+  type JobRunnerDeps,
+  buildEvalNeedsContext,
+  resolveJobWorkDir,
+} from './job-runner.js';
 import type { JobExecutionResult } from './sandbox/types.js';
 
 // --- vi.hoisted shared mock state ---
@@ -953,7 +958,7 @@ describe('JobRunner', () => {
         targetJobName: 'deploy',
         workflowName: 'test-workflow',
         source: '.kici/workflows/ci.ts',
-        dynamicEnvironment: false,
+        dynamicContext: false,
         dynamicEnv: false,
         dynamicConcurrencyGroup: false,
         event: {},
@@ -1190,5 +1195,42 @@ describe('buildEvalNeedsContext', () => {
       upstreamSnapshot: { jobs: { build: {} }, groups: {} },
     });
     expect((needs!.build as { status: string }).status).toBe('success');
+  });
+});
+
+describe('resolveJobWorkDir', () => {
+  it('in-place + file:// source → uses the decoded repo path, no-op cleanup', async () => {
+    const { workDir, inPlace, cleanup } = await resolveJobWorkDir(
+      true,
+      'file:///home/op/devel/myci26',
+    );
+    expect(inPlace).toBe(true);
+    expect(workDir).toBe('/home/op/devel/myci26');
+    // Cleanup must be a no-op — never remove the operator's real tree.
+    await expect(cleanup()).resolves.toBeUndefined();
+  });
+
+  it('in-place + non-file:// source → still mkdtemps (gate: only file://)', async () => {
+    const { workDir, inPlace } = await resolveJobWorkDir(true, 'https://github.com/acme/repo.git');
+    expect(inPlace).toBe(false);
+    // The mocked mkdtemp value, NOT the operator tree.
+    expect(workDir).toBe('/tmp/kici-test123');
+  });
+
+  it('in-place disabled → mkdtemps + removes even for a file:// source', async () => {
+    const fsPromises = (await import('node:fs/promises')).default;
+    (fsPromises.rm as unknown as Mock).mockClear();
+    const { workDir, inPlace, cleanup } = await resolveJobWorkDir(
+      false,
+      'file:///home/op/devel/myci26',
+    );
+    expect(inPlace).toBe(false);
+    expect(workDir).toBe('/tmp/kici-test123');
+    await cleanup();
+    // Cleanup removes the throwaway workDir.
+    expect(fsPromises.rm).toHaveBeenCalledWith(
+      '/tmp/kici-test123',
+      expect.objectContaining({ recursive: true, force: true }),
+    );
   });
 });

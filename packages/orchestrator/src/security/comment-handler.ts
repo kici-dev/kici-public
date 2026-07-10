@@ -7,7 +7,7 @@
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import type { HeldRunStore } from '../environments/held-runs.js';
+import type { HeldRunStore } from '../contexts/held-runs.js';
 import { findIdentityLink, type IdentityLink, type PermissionLevel } from './trust-resolver.js';
 import type { CheckStatusPoster as EngineCheckStatusPoster } from '@kici-dev/engine';
 

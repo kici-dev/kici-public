@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/compiler",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
   "keywords": [
     "ci",
@@ -57,10 +57,13 @@
   },
   "dependencies": {
     "@inquirer/prompts": "^8.5.2",
+    "@kici-dev/agent": "workspace:*",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
+    "@kici-dev/orchestrator": "workspace:*",
     "chokidar": "^5.0.0",
     "commander": "^15.0.0",
+    "embedded-postgres": "18.4.0-beta.17",
     "fast-glob": "^3.3.3",
     "open": "^11.0.0",
     "picocolors": "^1.1.1",

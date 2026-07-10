@@ -3,7 +3,7 @@
  *
  * Handles everything that happens AFTER a workflow has been matched against an
  * incoming webhook: payload storage, cache + build coordination, secret
- * resolution, per-job environment evaluation, static job dispatch (cluster +
+ * resolution, per-job context evaluation, static job dispatch (cluster +
  * single-orch paths), execution-tracker registration, deferred init dispatch
  * for jobs with dynamic fields, and deferred dynamic-job-fn dispatch for
  * `_type:'dynamic'` lock entries.
@@ -56,7 +56,7 @@ import type {
   ResolvedHostAgent,
   UpstreamSnapshot,
   HostFacts,
-  Environment as EngineEnvironment,
+  Context as EngineContext,
 } from '@kici-dev/engine';
 import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/host-roster.js';
 import { flattenLockSteps } from './flatten-lock-steps.js';
@@ -69,23 +69,23 @@ import type { Dispatcher } from '../agent/dispatcher.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { RunContext, JobToRoute } from '../cluster/coordinator.js';
 import type { TrustResolution } from '../security/trust-resolver.js';
-import type { CreateHeldRunData } from '../environments/held-runs.js';
+import type { CreateHeldRunData } from '../contexts/held-runs.js';
 import {
   evaluateProtectionRules,
   type JobDispatchContext,
-} from '../environments/protection/pipeline.js';
+} from '../contexts/protection/pipeline.js';
 import {
-  evaluateMultiEnvGates,
+  evaluateMultiContextGates,
   aggregateProtectionParams,
-  buildEffectiveEnvironment,
-  formatMultiEnvRejection,
-} from '../environments/protection/aggregate.js';
+  buildEffectiveContext,
+  formatMultiContextRejection,
+} from '../contexts/protection/aggregate.js';
 import {
-  buildJobEnvironmentDisplayNames,
-  resolveJobEnvironmentNames,
+  buildJobContextDisplayNames,
+  resolveJobContextNames,
   resolveMultiEnvMergedData,
-} from './job-environments.js';
-import { toEnvironment } from '../environments/environment-store.js';
+} from './job-contexts.js';
+import { toContext } from '../contexts/context-store.js';
 import { resolveInstallSecrets, type NpmRegistrySpec } from './install-secrets-resolver.js';
 import { storePendingWorkflowContext, toSerializableInputs } from './pending-workflow-context.js';
 import { generateRunKeyPair, encryptPrivateKey } from '../secrets/ephemeral-keys.js';
@@ -257,7 +257,7 @@ export interface WorkflowDispatchContext {
    * Run-wide flat secrets layered onto EVERY dispatched job's `jobConfig.secrets`
    * (env-declaring or not). Used by the test path to deliver `kici run --secret`
    * / `--env` CLI flat secrets, which must reach a job regardless of whether it
-   * declares an `environment:`. Merged UNDER the per-job env-resolved secrets so
+   * declares an `context:`. Merged UNDER the per-job env-resolved secrets so
    * the CLI value wins on a key collision (matching the prior B1-env -> A-CLI
    * precedence). Undefined for webhook runs.
    */
@@ -285,7 +285,7 @@ export interface DispatchMatchedWorkflowResult {
   held?: boolean;
   /**
    * User-visible warnings aggregated from dispatched jobs — today, one per job
-   * whose bound test-run environment(s) were unavailable and skipped. Surfaced
+   * whose bound test-run context(s) were unavailable and skipped. Surfaced
    * on the accepted trigger response so the CLI can print them.
    */
   envWarnings?: string[];
@@ -380,22 +380,22 @@ interface SecretBundle {
 }
 
 interface JobEnvData {
-  environmentName?: string;
-  /** Configured env id matched for the first declared environment name. */
-  environmentId?: string;
+  contextName?: string;
+  /** Configured env id matched for the first declared context name. */
+  contextId?: string;
   /**
-   * Ordered bound-environment names persisted on the job row (`(dynamic)`
+   * Ordered bound-context names persisted on the job row (`(dynamic)`
    * placeholder for elements unresolved at dispatch; overwritten with the
-   * agent-resolved list for dynamic environments). Empty/undefined = no binding.
+   * agent-resolved list for dynamic contexts). Empty/undefined = no binding.
    */
-  environmentNames?: string[];
-  environmentVars?: Record<string, string>;
+  contextNames?: string[];
+  contextVars?: Record<string, string>;
   jobEnv?: Record<string, string>;
   jobSecrets?: Record<string, string>;
   jobNamespacedSecrets?: Record<string, Record<string, string>>;
   held?: boolean;
   /**
-   * Pending approval hold for this job, set when an environment policy or
+   * Pending approval hold for this job, set when a context policy or
    * explicit lock `approval` requires human sign-off. The dispatch loop turns
    * this into a `held_runs` row + a stored pending job context so `release()`
    * can re-dispatch after approval.
@@ -404,10 +404,10 @@ interface JobEnvData {
   rejected?: boolean;
   rejectReason?: string;
   pendingInit?: boolean;
-  /** Bound environments skipped on a test/local run because they disallow local execution. */
+  /** Bound contexts skipped on a test/local run because they disallow local execution. */
   skippedEnvs?: string[];
   /**
-   * User-visible warning set whenever any bound environment was unavailable for
+   * User-visible warning set whenever any bound context was unavailable for
    * a test run (non-test or unconfigured) and skipped — surfaced on the CLI run
    * output and the dashboard run view.
    */
@@ -419,8 +419,8 @@ interface PendingApprovalHold {
   scope: HoldScope;
   triggerSource: TriggerSource;
   requirement: ApprovalRequirement;
-  environmentId: string | null;
-  queueType: 'environment' | 'security';
+  contextId: string | null;
+  queueType: 'context' | 'security';
 }
 
 interface DeferredInitJob {
@@ -429,10 +429,10 @@ interface DeferredInitJob {
 }
 
 interface JobEnvEvalResult {
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
   deferredInitJobs: DeferredInitJob[];
-  runEnvironmentName: string | undefined;
-  runEnvironmentId: string | undefined;
+  runContextName: string | undefined;
+  runContextId: string | undefined;
 }
 
 interface DispatchedJob {
@@ -449,11 +449,11 @@ interface DispatchedJob {
   waveMaxParallel?: number;
   /** The base's failFast policy, stamped on every child of a bounded wave. */
   waveFailFast?: boolean;
-  /** Ordered bound-environment names persisted on the job row (multi-env jobs). */
-  environments?: string[];
-  /** Bound environments skipped on a test run (non-test / unconfigured). */
-  skippedEnvironments?: string[];
-  /** User-visible warning naming the skipped test-run environments. */
+  /** Ordered bound-context names persisted on the job row (multi-env jobs). */
+  contexts?: string[];
+  /** Bound contexts skipped on a test run (non-test / unconfigured). */
+  skippedContexts?: string[];
+  /** User-visible warning naming the skipped test-run contexts. */
   envWarning?: string;
 }
 
@@ -633,9 +633,10 @@ async function probeCaches(
   let sourceHit = false;
   let depHit = false;
   // Local-repo runs (no bundle) carry their source as a working-tree overlay,
-  // not a cacheable provider build — skip the source/dep cache probe entirely so
-  // a stale cached tarball never shadows the overlay.
-  if (!ctx.bundle) {
+  // and `file://` in-place runs (`localWorkingTree`) run the operator's real
+  // tree directly — neither is a cacheable provider build, so skip the source/dep
+  // cache probe entirely (a stale cached tarball must never shadow the tree).
+  if (!ctx.bundle || ctx.localWorkingTree) {
     return { sourceHit, depHit };
   }
   if (!crossSource && contentHash && deps.sourceCache) {
@@ -1380,7 +1381,7 @@ async function prepareCacheAndBuild(
   ctx: WorkflowDispatchContext,
   setup: DispatchSetup,
 ): Promise<BuildPrepResult> {
-  const { deps, workflow, fullLockFile, crossSource } = ctx;
+  const { deps, workflow, fullLockFile, crossSource, localWorkingTree } = ctx;
   const contentHash = workflow.contentHash;
   const lockfileHash = fullLockFile.lockfileHash;
   const hasDynamicEntries = workflow.jobs.some(isLockDynamicJobFn);
@@ -1413,8 +1414,17 @@ async function prepareCacheAndBuild(
   // working tree carried as an overlay) has no remote source to build, so it
   // skips the build and dispatches its static jobs directly. The webhook path
   // always has a bundle, so its build behavior is unchanged.
+  //
+  // A local `file://` IN-PLACE run (`localWorkingTree`) likewise skips the
+  // source-pack build: the agent runs the operator's real tree directly (under
+  // its KICI_IN_PLACE profile — no clone, no source-restore), so packing a
+  // source tarball is both wasteful and wrong (it would carry a dist-less clone).
   const cacheInfraAvailable =
-    !crossSource && !!ctx.bundle && deps.buildCoordinator && (deps.sourceCache || deps.depCache);
+    !crossSource &&
+    !localWorkingTree &&
+    !!ctx.bundle &&
+    deps.buildCoordinator &&
+    (deps.sourceCache || deps.depCache);
   const buildNeeded = cacheInfraAvailable && !sourceHit && !!contentHash;
 
   if (buildNeeded) {
@@ -1652,7 +1662,7 @@ async function resolveWorkflowSecretsAndKey(
 
 /**
  * Resolve the workflow's `registries:` and `installEnv:` declarations into
- * per-dispatch fields. Fires per-environment protection rules, looks up
+ * per-dispatch fields. Fires per-context protection rules, looks up
  * each `<env>:<secret>` reference via the secret resolver, validates registry
  * URL schemes, and applies the contributor-trust strip.
  *
@@ -1665,9 +1675,9 @@ async function resolveWorkflowSecretsAndKey(
 interface InstallGateHold {
   action: 'hold' | 'wait' | 'queue';
   envName: string;
-  environmentId: string;
+  contextId: string;
   holdType: string;
-  queueType: 'environment' | 'security';
+  queueType: 'context' | 'security';
   requirement: ApprovalRequirement;
 }
 
@@ -1719,7 +1729,7 @@ async function resolveWorkflowInstallSecrets(
     allowHttpNpmRegistries: allowHttp,
     resolvedOrgId,
     trustResolution,
-    environmentStore: deps.environmentStore,
+    contextStore: deps.contextStore,
     secretResolver: deps.secretResolver,
     protectionContext,
     skipProtectionGate,
@@ -1738,7 +1748,7 @@ async function resolveWorkflowInstallSecrets(
       hold: {
         action: result.action,
         envName: result.envName,
-        environmentId: result.environmentId,
+        contextId: result.contextId,
         holdType: result.holdType,
         queueType: result.queueType,
         requirement: result.requirement,
@@ -1783,7 +1793,7 @@ async function resolveWorkflowInstallSecrets(
 }
 
 // ---------------------------------------------------------------------------
-// Phase D — per-job environment evaluation
+// Phase D — per-job context evaluation
 // ---------------------------------------------------------------------------
 
 /**
@@ -1815,7 +1825,7 @@ function buildDeferredInitJob(args: {
       targetJobName: mat.baseName,
       workflowName: workflow.name,
       source: workflow.source?.file ?? fullLockFile.source.file,
-      dynamicEnvironment: (lockJob.environments ?? []).some((e) => e.dynamic),
+      dynamicContext: (lockJob.contexts ?? []).some((e) => e.dynamic),
       dynamicEnv: lockJob.dynamicEnv ?? false,
       dynamicConcurrencyGroup: lockJob.dynamicConcurrencyGroup ?? false,
       dynamicMatrix: mat.pendingDynamicMatrix === true,
@@ -1863,7 +1873,7 @@ async function resolveApprovalExpiry(ctx: WorkflowDispatchContext): Promise<numb
 }
 
 /**
- * Union the explicit lock approval clauses with the environment reviewer
+ * Union the explicit lock approval clauses with the context reviewer
  * clauses into a single AND list (deduped). Both sets must be satisfied.
  */
 function unionApprovalClauses(
@@ -1891,8 +1901,8 @@ function buildExplicitJobHold(
   return {
     scope: HoldScope.enum.job,
     triggerSource: TriggerSource.enum.explicit,
-    environmentId: null,
-    queueType: 'environment',
+    contextId: null,
+    queueType: 'context',
     requirement: {
       clauses: approval.clauses,
       expiresAt: new Date(Date.now() + expirySeconds * 1000).toISOString(),
@@ -1915,8 +1925,8 @@ function buildExplicitWorkflowHold(
   return {
     scope: HoldScope.enum.workflow,
     triggerSource: TriggerSource.enum.explicit,
-    environmentId: null,
-    queueType: 'environment',
+    contextId: null,
+    queueType: 'context',
     requirement: {
       clauses: approval.clauses,
       expiresAt: new Date(Date.now() + expirySeconds * 1000).toISOString(),
@@ -1943,59 +1953,59 @@ export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
 }
 
 /**
- * Apply per-job environment data: protection rules, hold creation, environment
+ * Apply per-job context data: protection rules, hold creation, context
  * variables, and per-job secret resolution. Mutates `jobEnvData` in place.
  */
 /**
- * User-facing warning naming bound environments that cannot participate in a
+ * User-facing warning naming bound contexts that cannot participate in a
  * test run — non-test (`allowLocalExecution=false`) or unconfigured — plus which
- * test-allowed environments (if any) the job runs with instead.
+ * test-allowed contexts (if any) the job runs with instead.
  */
 function formatTestRunUnavailableEnvWarning(unavailable: string[], remaining: string[]): string {
   const names = unavailable.map((n) => `'${n}'`).join(', ');
   const tail = remaining.length
     ? `running with ${remaining.map((n) => `'${n}'`).join(', ')}`
-    : 'running with no environment variables';
-  return `bound environment(s) ${names} are unavailable for this test run and were skipped; ${tail}`;
+    : 'running with no context variables';
+  return `bound context(s) ${names} are unavailable for this test run and were skipped; ${tail}`;
 }
 
-async function applyEnvironmentRulesAndSecrets(args: {
+async function applyContextRulesAndSecrets(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
-  environmentNames: readonly string[];
+  contextNames: readonly string[];
   concurrencyGroup: string | undefined;
   jobEnvData: JobEnvData;
   hostCtx?: HostFacts;
 }): Promise<void> {
-  const { ctx, lockJob, environmentNames, concurrencyGroup, jobEnvData, hostCtx } = args;
+  const { ctx, lockJob, contextNames, concurrencyGroup, jobEnvData, hostCtx } = args;
   const { deps, repoIdentifier, credentials, event, ref, runId, workflow, resolvedOrgId, bundle } =
     ctx;
   const { trustResolution } = ctx;
-  if (!deps.environmentStore) return;
+  if (!deps.contextStore) return;
 
-  // Match each bound environment by name (in order).
-  let matched: Array<{ name: string; env: EngineEnvironment | undefined }> = [];
-  for (const name of environmentNames) {
-    const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
-    matched.push({ name, env: cfg ? toEnvironment(cfg) : undefined });
+  // Match each bound context by name (in order).
+  let matched: Array<{ name: string; env: EngineContext | undefined }> = [];
+  for (const name of contextNames) {
+    const cfg = await deps.contextStore.matchContext(resolvedOrgId, name);
+    matched.push({ name, env: cfg ? toContext(cfg) : undefined });
   }
 
-  // The run's environment column / concurrency grouping uses the first declared
-  // bound name, even if some bound environments have no configured record.
-  jobEnvData.environmentName = environmentNames[0];
+  // The run's context column / concurrency grouping uses the first declared
+  // bound name, even if some bound contexts have no configured record.
+  jobEnvData.contextName = contextNames[0];
   // Record the id of the configured env matched for the first declared name —
-  // tied to the same name written into the run's `environment` column. Captured
+  // tied to the same name written into the run's `context` column. Captured
   // before the missing/test-skip filtering below, which only governs
   // protection rules / secrets, not history identity.
-  jobEnvData.environmentId = matched[0]?.env?.id;
+  jobEnvData.contextId = matched[0]?.env?.id;
 
-  // Lenient missing-environment handling: a bound name with no configured record
+  // Lenient missing-context handling: a bound name with no configured record
   // simply does not contribute protection rules / vars (the established
-  // single-environment behavior). Proactive rejection of a provably-missing
-  // environment is the deferred registration-time satisfiability check.
+  // single-context behavior). Proactive rejection of a provably-missing
+  // context is the deferred registration-time satisfiability check.
   const missing = matched.filter((m) => !m.env).map((m) => m.name);
   if (missing.length > 0) {
-    logger.warn('bound environment(s) not configured; skipping', {
+    logger.warn('bound context(s) not configured; skipping', {
       runId,
       workflow: workflow.name,
       job: lockJob.name,
@@ -2005,12 +2015,12 @@ async function applyEnvironmentRulesAndSecrets(args: {
   }
 
   // Skip-on-test (allow-and-warn): a test/local run never rejects on a bound
-  // environment. Bound environments that cannot participate in a test run —
+  // context. Bound contexts that cannot participate in a test run —
   // non-test (`allowLocalExecution === false`) or unconfigured (missing above) —
   // are dropped (their vars/secrets and gates do not participate) and named in a
   // single user-visible warning. The fixture `secrets:` gate stays fail-closed;
-  // a bound `environment:` only warns. If every bound env is unavailable, the
-  // job runs with no environment vars.
+  // a bound `context:` only warns. If every bound env is unavailable, the
+  // job runs with no context vars.
   if (ctx.testRun) {
     const skipped = matched.filter((m) => m.env && m.env.allowLocalExecution === false);
     if (skipped.length > 0) {
@@ -2023,7 +2033,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
         unavailable,
         matched.map((m) => m.name),
       );
-      logger.warn('test-run: bound environment(s) unavailable for this test run; skipped', {
+      logger.warn('test-run: bound context(s) unavailable for this test run; skipped', {
         runId,
         workflow: workflow.name,
         job: lockJob.name,
@@ -2033,8 +2043,8 @@ async function applyEnvironmentRulesAndSecrets(args: {
     if (matched.length === 0) return; // dispatch with no env vars — never reject
   }
 
-  // No configured environment participates (all missing and/or test-skipped):
-  // dispatch with the job's own env only, no environment-scoped vars/secrets.
+  // No configured context participates (all missing and/or test-skipped):
+  // dispatch with the job's own env only, no context-scoped vars/secrets.
   if (matched.length === 0) return;
 
   const jobId = randomUUID();
@@ -2047,12 +2057,12 @@ async function applyEnvironmentRulesAndSecrets(args: {
   };
 
   // All-must-pass hard reject gates (enabled/branch/trigger/repo) across every
-  // configured bound environment. When any rejects, the run is rejected with a
-  // reason naming the offending environment and rule.
-  const rejections = evaluateMultiEnvGates(matched, dispatchCtx);
+  // configured bound context. When any rejects, the run is rejected with a
+  // reason naming the offending context and rule.
+  const rejections = evaluateMultiContextGates(matched, dispatchCtx);
   if (rejections.length > 0) {
     jobEnvData.rejected = true;
-    jobEnvData.rejectReason = formatMultiEnvRejection(rejections);
+    jobEnvData.rejectReason = formatMultiContextRejection(rejections);
     logger.warn('multi-env gate rejection', {
       runId,
       workflow: workflow.name,
@@ -2062,12 +2072,12 @@ async function applyEnvironmentRulesAndSecrets(args: {
     return;
   }
 
-  // Every remaining bound environment is configured and passed the reject gates.
-  const present = matched.map((m) => ({ name: m.name, env: m.env as EngineEnvironment }));
-  // The configured primary environment drives the merged-data resolution below.
-  jobEnvData.environmentName = present[0].name;
+  // Every remaining bound context is configured and passed the reject gates.
+  const present = matched.map((m) => ({ name: m.name, env: m.env as EngineContext }));
+  // The configured primary context drives the merged-data resolution below.
+  jobEnvData.contextName = present[0].name;
   const eff = aggregateProtectionParams(present.map((p) => p.env));
-  const env = buildEffectiveEnvironment(present[0].env, eff);
+  const env = buildEffectiveContext(present[0].env, eff);
 
   const effectiveConcurrencyGroup = concurrencyGroup ?? present[0].name;
   let runningCount = 0;
@@ -2077,7 +2087,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
       .select(deps.db.fn.countAll<number>().as('count'))
       .where('execution_jobs.status', '=', ExecutionJobStatus.enum.running)
       .innerJoin('execution_runs', 'execution_runs.run_id', 'execution_jobs.run_id')
-      .where('execution_runs.environment', '=', effectiveConcurrencyGroup)
+      .where('execution_runs.context', '=', effectiveConcurrencyGroup)
       .executeTakeFirst();
     runningCount = Number(result?.count ?? 0);
   }
@@ -2115,9 +2125,9 @@ async function applyEnvironmentRulesAndSecrets(args: {
       const explicit = unionApprovalClauses(lockJob.approval, gateResult.clauses);
       jobEnvData.approvalHold = {
         scope: HoldScope.enum.job,
-        triggerSource: TriggerSource.enum.environment,
-        environmentId: env.id,
-        queueType: 'environment',
+        triggerSource: TriggerSource.enum.context,
+        contextId: env.id,
+        queueType: 'context',
         requirement: {
           clauses: explicit,
           expiresAt,
@@ -2128,9 +2138,9 @@ async function applyEnvironmentRulesAndSecrets(args: {
       const heldRunData: CreateHeldRunData = {
         runId,
         jobId,
-        environmentId: env.id,
+        contextId: env.id,
         holdType: gateResult.holdType ?? 'reviewer',
-        queueType: gateResult.holdType === 'security' ? 'security' : 'environment',
+        queueType: gateResult.holdType === 'security' ? 'security' : 'context',
         reason: gateResult.reason ?? `Held by ${gateResult.action} gate`,
         expiresAt: new Date(expiresAt),
       };
@@ -2147,7 +2157,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
     });
     if (gateResult.holdType === 'security' && bundle?.checkStatusPoster) {
       const holdSummary = buildSecurityHoldSummary(
-        'environment_trust',
+        'context_trust',
         trustResolution?.tier ?? 'unknown',
         trustResolution?.contributorUsername,
       );
@@ -2179,7 +2189,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
         hostCtx,
         routingKey: ctx.info.routingKey,
       });
-      if (merged.environmentVars) jobEnvData.environmentVars = merged.environmentVars;
+      if (merged.contextVars) jobEnvData.contextVars = merged.contextVars;
       if (merged.jobSecrets) jobEnvData.jobSecrets = merged.jobSecrets;
       if (merged.jobNamespacedSecrets)
         jobEnvData.jobNamespacedSecrets = merged.jobNamespacedSecrets;
@@ -2188,7 +2198,7 @@ async function applyEnvironmentRulesAndSecrets(args: {
         runId,
         workflow: workflow.name,
         job: lockJob.name,
-        environment: present.map((p) => p.name).join(','),
+        context: present.map((p) => p.name).join(','),
         error: toErrorMessage(err),
       });
     }
@@ -2196,11 +2206,11 @@ async function applyEnvironmentRulesAndSecrets(args: {
 }
 
 /**
- * Phase D — evaluate static jobs' environment data, queue deferred-init jobs
- * for jobs with dynamic fields, and pick the first `runEnvironmentName` for
+ * Phase D — evaluate static jobs' context data, queue deferred-init jobs
+ * for jobs with dynamic fields, and pick the first `runContextName` for
  * the run.
  */
-async function evaluateJobEnvironments(args: {
+async function evaluateJobContexts(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
@@ -2210,30 +2220,30 @@ async function evaluateJobEnvironments(args: {
   // Dynamic functions receive the normalized event envelope (same shape as
   // rules' ctx.event); the raw provider payload stays at event.payload.
   const inlineEvent: object = ctx.event;
-  const jobEnvironmentData = new Map<string, JobEnvData>();
+  const jobContextData = new Map<string, JobEnvData>();
   const deferredInitJobs: DeferredInitJob[] = [];
-  let runEnvironmentName: string | undefined;
-  let runEnvironmentId: string | undefined;
+  let runContextName: string | undefined;
+  let runContextId: string | undefined;
 
   for (const mat of buildPrep.materializedJobs) {
     const lockJob = mat.lockJob;
     const jobEnvData: JobEnvData = {};
-    const { inlineEnvironmentNames, inlineEnv, inlineConcurrencyGroup } = evaluateInlineFields(
+    const { inlineContextNames, inlineEnv, inlineConcurrencyGroup } = evaluateInlineFields(
       lockJob,
       inlineEvent,
     );
-    const { names: environmentNames, needsInit: envNeedsInit } = resolveJobEnvironmentNames(
+    const { names: contextNames, needsInit: envNeedsInit } = resolveJobContextNames(
       lockJob,
-      inlineEnvironmentNames,
+      inlineContextNames,
     );
     // Ordered display list persisted on the job row (placeholder for unresolved
     // dynamic elements; the deferred-init flow-back overwrites it once resolved).
-    const displayEnvNames = buildJobEnvironmentDisplayNames(lockJob, inlineEnvironmentNames);
-    if (displayEnvNames.length > 0) jobEnvData.environmentNames = displayEnvNames;
-    if (inlineEnvironmentNames.some(Boolean) || inlineEnv || inlineConcurrencyGroup) {
+    const displayEnvNames = buildJobContextDisplayNames(lockJob, inlineContextNames);
+    if (displayEnvNames.length > 0) jobEnvData.contextNames = displayEnvNames;
+    if (inlineContextNames.some(Boolean) || inlineEnv || inlineConcurrencyGroup) {
       logger.debug('Inline evaluation resolved dynamic fields', {
         job: mat.expandedName,
-        environment: inlineEnvironmentNames.some(Boolean),
+        context: inlineContextNames.some(Boolean),
         env: !!inlineEnv,
         concurrencyGroup: !!inlineConcurrencyGroup,
       });
@@ -2250,7 +2260,7 @@ async function evaluateJobEnvironments(args: {
     if (needsInit && deps.pendingInits) {
       jobEnvData.pendingInit = true;
       deferredInitJobs.push(buildDeferredInitJob({ ctx, setup, buildPrep, mat }));
-      jobEnvironmentData.set(mat.expandedName, jobEnvData);
+      jobContextData.set(mat.expandedName, jobEnvData);
       continue;
     }
 
@@ -2266,23 +2276,23 @@ async function evaluateJobEnvironments(args: {
           : undefined);
 
     if (jobEnv) jobEnvData.jobEnv = jobEnv;
-    if (environmentNames.length > 0) {
-      // Run the matcher first so jobEnvData.environmentId is populated, then
+    if (contextNames.length > 0) {
+      // Run the matcher first so jobEnvData.contextId is populated, then
       // capture the run-level name + id from the first env-bearing job.
-      await applyEnvironmentRulesAndSecrets({
+      await applyContextRulesAndSecrets({
         ctx,
         lockJob,
-        environmentNames,
+        contextNames,
         concurrencyGroup,
         jobEnvData,
         hostCtx: hostCtxFromMat(mat),
       });
-      if (!runEnvironmentName) {
-        runEnvironmentName = environmentNames[0];
-        runEnvironmentId = jobEnvData.environmentId;
+      if (!runContextName) {
+        runContextName = contextNames[0];
+        runContextId = jobEnvData.contextId;
       }
     }
-    // Explicit SDK requireApproval on a job with no environment-driven hold:
+    // Explicit SDK requireApproval on a job with no context-driven hold:
     // hold the job with trigger_source='explicit'.
     if (lockJob.approval && !jobEnvData.approvalHold && !jobEnvData.rejected && deps.heldRunStore) {
       jobEnvData.held = true;
@@ -2309,9 +2319,9 @@ async function evaluateJobEnvironments(args: {
         await resolveApprovalExpiry(ctx),
       );
     }
-    jobEnvironmentData.set(mat.expandedName, jobEnvData);
+    jobContextData.set(mat.expandedName, jobEnvData);
   }
-  return { jobEnvironmentData, deferredInitJobs, runEnvironmentName, runEnvironmentId };
+  return { jobContextData, deferredInitJobs, runContextName, runContextId };
 }
 
 // ---------------------------------------------------------------------------
@@ -2321,7 +2331,7 @@ async function evaluateJobEnvironments(args: {
 function makeBuildJobConfig(args: {
   workflow: LockWorkflow;
   fullLockFile: WorkflowDispatchContext['fullLockFile'];
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
   resolvedSecrets: Record<string, string> | undefined;
   resolvedNamespacedSecrets: Record<string, Record<string, string>> | undefined;
   runPublicKeyBase64: string | undefined;
@@ -2357,7 +2367,7 @@ function makeBuildJobConfig(args: {
   const {
     workflow,
     fullLockFile,
-    jobEnvironmentData,
+    jobContextData,
     resolvedSecrets,
     resolvedNamespacedSecrets,
     runPublicKeyBase64,
@@ -2373,7 +2383,7 @@ function makeBuildJobConfig(args: {
   } = args;
   return (mat: MaterializedJob): Record<string, unknown> => {
     const lockJob = mat.lockJob;
-    const envData = jobEnvironmentData.get(mat.expandedName);
+    const envData = jobContextData.get(mat.expandedName);
     // Run-wide CLI flat secrets are spread LAST so they win on a key collision
     // with the per-job env-resolved set, and so they reach an env-less job too.
     const mergedSecrets = {
@@ -2425,8 +2435,8 @@ function makeBuildJobConfig(args: {
       ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
       ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
       ...(installEnvSecrets && Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
-      ...(envData?.environmentName && { environment: envData.environmentName }),
-      ...(envData?.environmentVars && { environmentVars: envData.environmentVars }),
+      ...(envData?.contextName && { context: envData.contextName }),
+      ...(envData?.contextVars && { contextVars: envData.contextVars }),
       ...(envData?.jobEnv && { jobEnv: envData.jobEnv }),
       ...(lockJob.resources && { resources: lockJob.resources }),
       // Job-level wall-clock timeout (ms). The agent reads jobConfig.timeout in
@@ -2548,7 +2558,7 @@ async function holdJobForApproval(args: {
     scope: hold.scope,
     triggerSource: hold.triggerSource,
     requirement: hold.requirement,
-    environmentId: hold.environmentId,
+    contextId: hold.contextId,
     queueType: hold.queueType,
   });
   // Audit the hold creation. The orchestrator's dispatch subsystem creates the
@@ -2888,19 +2898,12 @@ async function dispatchSingleOrchPath(args: {
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
   dispatchedJobs: DispatchedJob[];
   rejectedJobs: RejectedJob[];
 }): Promise<void> {
-  const {
-    ctx,
-    setup,
-    buildPrep,
-    buildJobConfig,
-    jobEnvironmentData,
-    dispatchedJobs,
-    rejectedJobs,
-  } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, jobContextData, dispatchedJobs, rejectedJobs } =
+    args;
   const { deps, workflow, runId } = ctx;
   const wavePlan = computeWavePlan(buildPrep.materializedJobs);
   /** The wave-policy fields persisted on a bounded-wave child's execution_jobs row. */
@@ -2911,7 +2914,7 @@ async function dispatchSingleOrchPath(args: {
   for (const mat of buildPrep.materializedJobs) {
     const lockJob = mat.lockJob;
     const matrixValues = mat.variantValues;
-    const envData = jobEnvironmentData.get(mat.expandedName);
+    const envData = jobContextData.get(mat.expandedName);
     if (envData?.rejected) {
       logger.info('Job skipped (rejected by protection rules)', {
         runId,
@@ -3041,7 +3044,7 @@ async function dispatchSingleOrchPath(args: {
       status: result.status,
       sourceTarUrl: buildPrep.sourceTarUrl ? 'yes' : 'no',
       depsUrl: buildPrep.depsUrl ? 'yes' : 'no',
-      environment: envData?.environmentName,
+      context: envData?.contextName,
     });
   }
 }
@@ -3056,19 +3059,12 @@ async function dispatchStaticJobs(args: {
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
   dispatchedJobs: DispatchedJob[];
   rejectedJobs: RejectedJob[];
 }): Promise<void> {
-  const {
-    ctx,
-    setup,
-    buildPrep,
-    buildJobConfig,
-    jobEnvironmentData,
-    dispatchedJobs,
-    rejectedJobs,
-  } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, jobContextData, dispatchedJobs, rejectedJobs } =
+    args;
   const { deps, workflow, runId } = ctx;
   if (buildPrep.buildFailed) {
     logger.info('Skipping static job dispatch due to build failure', {
@@ -3080,7 +3076,7 @@ async function dispatchStaticJobs(args: {
   }
   if (deps.coordinator && deps.coordinator.hasConnectedPeers()) {
     const dispatchableJobs = buildPrep.materializedJobs.filter((mj) => {
-      const envData = jobEnvironmentData.get(mj.expandedName);
+      const envData = jobContextData.get(mj.expandedName);
       return !envData?.rejected && !envData?.held && !envData?.pendingInit;
     });
     const rootDispatchableJobs = dispatchableJobs.filter((mj) => isRootJob(mj.lockJob));
@@ -3110,7 +3106,7 @@ async function dispatchStaticJobs(args: {
     setup,
     buildPrep,
     buildJobConfig,
-    jobEnvironmentData,
+    jobContextData,
     dispatchedJobs,
     rejectedJobs,
   });
@@ -3125,19 +3121,12 @@ async function recordRunStart(args: {
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   declaredContexts: readonly string[];
-  runEnvironmentName: string | undefined;
-  runEnvironmentId: string | undefined;
+  runContextName: string | undefined;
+  runContextId: string | undefined;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
-  const {
-    ctx,
-    setup,
-    buildPrep,
-    declaredContexts,
-    runEnvironmentName,
-    runEnvironmentId,
-    dispatchedJobs,
-  } = args;
+  const { ctx, setup, buildPrep, declaredContexts, runContextName, runContextId, dispatchedJobs } =
+    args;
   const {
     deps,
     workflow,
@@ -3189,16 +3178,16 @@ async function recordRunStart(args: {
       event.senderUserId ?? undefined,
     );
   }
-  if (runEnvironmentName && deps.db) {
+  if (runContextName && deps.db) {
     deps.db
       .updateTable('execution_runs')
-      .set({ environment: runEnvironmentName, environment_id: runEnvironmentId ?? null })
+      .set({ context: runContextName, context_id: runContextId ?? null })
       .where('run_id', '=', runId)
       .execute()
       .catch((err) => {
-        logger.error('Failed to set environment on execution run', {
+        logger.error('Failed to set context on execution run', {
           runId,
-          environment: runEnvironmentName,
+          context: runContextName,
           error: toErrorMessage(err),
         });
       });
@@ -3251,7 +3240,7 @@ async function recordRunStart(args: {
 function categorizeRejectReason(reason: string): InitFailureCategory {
   const lower = reason.toLowerCase();
   if (/no\s+agent|no\s+matching\s+backend/.test(lower)) return InitFailureCategory.enum.no_agent;
-  return InitFailureCategory.enum.environment_rules;
+  return InitFailureCategory.enum.context_rules;
 }
 
 async function insertEdgesAndMarkRejected(args: {
@@ -3309,34 +3298,34 @@ async function insertEdgesAndMarkRejected(args: {
 // ---------------------------------------------------------------------------
 
 /**
- * After init finishes, resolve the new environment and update jobEnvData with
- * the resolved environment + vars + secrets.
+ * After init finishes, resolve the new context and update jobEnvData with
+ * the resolved context + vars + secrets.
  */
-async function applyInitResultEnvironment(args: {
+async function applyInitResultContext(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
-  initResult: { environmentNames?: string[]; env?: Record<string, string> } | undefined;
+  initResult: { contextNames?: string[]; env?: Record<string, string> } | undefined;
   jobEnvData: JobEnvData;
   hostCtx?: HostFacts;
 }): Promise<void> {
   const { ctx, lockJob, initResult, jobEnvData, hostCtx } = args;
   const { deps, runId, resolvedOrgId } = ctx;
-  const anyDynamic = (lockJob.environments ?? []).some((e) => e.dynamic);
-  const resolvedNames = initResult?.environmentNames ?? [];
-  if (anyDynamic && resolvedNames.length > 0 && deps.environmentStore) {
-    jobEnvData.environmentName = resolvedNames[0];
+  const anyDynamic = (lockJob.contexts ?? []).some((e) => e.dynamic);
+  const resolvedNames = initResult?.contextNames ?? [];
+  if (anyDynamic && resolvedNames.length > 0 && deps.contextStore) {
+    jobEnvData.contextName = resolvedNames[0];
     // Overwrite the dispatch-time placeholder list with the agent-resolved one.
-    jobEnvData.environmentNames = [...resolvedNames];
-    const present: Array<{ name: string; env: EngineEnvironment }> = [];
+    jobEnvData.contextNames = [...resolvedNames];
+    const present: Array<{ name: string; env: EngineContext }> = [];
     for (const name of resolvedNames) {
-      const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
+      const cfg = await deps.contextStore.matchContext(resolvedOrgId, name);
       if (cfg) {
-        const env = toEnvironment(cfg);
+        const env = toContext(cfg);
         present.push({ name: env.name, env });
       }
     }
     if (present.length > 0) {
-      jobEnvData.environmentName = present[0].name;
+      jobEnvData.contextName = present[0].name;
       try {
         const merged = await resolveMultiEnvMergedData({
           deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
@@ -3345,7 +3334,7 @@ async function applyInitResultEnvironment(args: {
           hostCtx,
           routingKey: ctx.info.routingKey,
         });
-        if (merged.environmentVars) jobEnvData.environmentVars = merged.environmentVars;
+        if (merged.contextVars) jobEnvData.contextVars = merged.contextVars;
         if (merged.jobSecrets) jobEnvData.jobSecrets = merged.jobSecrets;
         if (merged.jobNamespacedSecrets) {
           jobEnvData.jobNamespacedSecrets = merged.jobNamespacedSecrets;
@@ -3374,11 +3363,11 @@ async function dispatchExecutionAfterInit(args: {
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
   mat: MaterializedJob;
-  /** Agent-resolved ordered bound-environment names, persisted on the real job row. */
-  environments?: string[];
+  /** Agent-resolved ordered bound-context names, persisted on the real job row. */
+  contexts?: string[];
 }): Promise<void> {
-  const { ctx, setup, buildPrep, buildJobConfig, mat, environments } = args;
-  const envFields = environments?.length ? { environments } : {};
+  const { ctx, setup, buildPrep, buildJobConfig, mat, contexts } = args;
+  const envFields = contexts?.length ? { contexts } : {};
   const lockJob = mat.lockJob;
   const matrixValues = mat.variantValues;
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
@@ -3526,9 +3515,9 @@ async function dispatchResolvedDynamicMatrix(args: {
   buildJobConfig: BuildJobConfigFn;
   mat: MaterializedJob;
   combos: Array<Record<string, string | undefined>>;
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
 }): Promise<void> {
-  const { ctx, setup, buildPrep, buildJobConfig, mat, combos, jobEnvironmentData } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, mat, combos, jobContextData } = args;
   const { deps, workflow, runId } = ctx;
 
   let result: ReturnType<typeof materializeResolvedMatrix>;
@@ -3558,16 +3547,16 @@ async function dispatchResolvedDynamicMatrix(args: {
 
   // Each child inherits the base job's resolved env data (env/secrets resolved
   // during init), keyed by its expanded name so makeBuildJobConfig finds it.
-  const baseEnvData = jobEnvironmentData.get(mat.expandedName) ?? {};
+  const baseEnvData = jobContextData.get(mat.expandedName) ?? {};
   for (const child of result.jobs) {
-    jobEnvironmentData.set(child.expandedName, { ...baseEnvData });
+    jobContextData.set(child.expandedName, { ...baseEnvData });
     await dispatchExecutionAfterInit({
       ctx,
       setup,
       buildPrep,
       buildJobConfig,
       mat: child,
-      environments: baseEnvData.environmentNames,
+      contexts: baseEnvData.contextNames,
     });
   }
 
@@ -3592,10 +3581,10 @@ function startDeferredInitDispatch(args: {
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
-  jobEnvironmentData: Map<string, JobEnvData>;
+  jobContextData: Map<string, JobEnvData>;
   deferredInitJobs: DeferredInitJob[];
 }): void {
-  const { ctx, setup, buildPrep, buildJobConfig, jobEnvironmentData, deferredInitJobs } = args;
+  const { ctx, setup, buildPrep, buildJobConfig, jobContextData, deferredInitJobs } = args;
   const { deps, workflow, runId } = ctx;
   if (deferredInitJobs.length === 0 || !deps.pendingInits) return;
   logger.info('Starting deferred init dispatch', { runId, count: deferredInitJobs.length });
@@ -3615,16 +3604,16 @@ function startDeferredInitDispatch(args: {
           throw new Error(`Init job dispatch rejected: ${dispatchResult.status}`);
         }
         const initResult = await pendingInits.track(dispatchResult.jobId);
-        const jobEnvData = jobEnvironmentData.get(mat.expandedName) ?? {};
+        const jobEnvData = jobContextData.get(mat.expandedName) ?? {};
         jobEnvData.pendingInit = false;
-        await applyInitResultEnvironment({
+        await applyInitResultContext({
           ctx,
           lockJob,
           initResult,
           jobEnvData,
           hostCtx: hostCtxFromMat(mat),
         });
-        jobEnvironmentData.set(mat.expandedName, jobEnvData);
+        jobContextData.set(mat.expandedName, jobEnvData);
         if (mat.pendingDynamicMatrix && initResult.matrixValues) {
           // The agent resolved the dynamic matrix to N combinations — materialize
           // them and dispatch one child per combination, just like a static matrix.
@@ -3635,7 +3624,7 @@ function startDeferredInitDispatch(args: {
             buildJobConfig,
             mat,
             combos: initResult.matrixValues,
-            jobEnvironmentData,
+            jobContextData,
           });
         } else {
           await dispatchExecutionAfterInit({
@@ -3644,7 +3633,7 @@ function startDeferredInitDispatch(args: {
             buildPrep,
             buildJobConfig,
             mat,
-            environments: jobEnvData.environmentNames,
+            contexts: jobEnvData.contextNames,
           });
         }
       } catch (err) {
@@ -3938,26 +3927,26 @@ async function resolveGeneratedJobConfigs(args: {
   for (const mat of fanout.jobs) {
     const genJob = mat.lockJob;
     try {
-      let genEnvironmentName: string | undefined;
-      let genEnvironmentVars: Record<string, string> | undefined;
+      let genContextName: string | undefined;
+      let genContextVars: Record<string, string> | undefined;
       let genSecrets: Record<string, string> = { ...resolvedSecrets };
       let genNamespacedSecrets: Record<string, Record<string, string>> = {
         ...resolvedNamespacedSecrets,
       };
-      const genEnvNames = (genJob.environments ?? [])
+      const genEnvNames = (genJob.contexts ?? [])
         .filter((e) => !e.dynamic && typeof e.value === 'string')
         .map((e) => e.value as string);
-      if (genEnvNames.length > 0 && deps.environmentStore) {
-        const present: Array<{ name: string; env: EngineEnvironment }> = [];
+      if (genEnvNames.length > 0 && deps.contextStore) {
+        const present: Array<{ name: string; env: EngineContext }> = [];
         for (const name of genEnvNames) {
-          const cfg = await deps.environmentStore.matchEnvironment(resolvedOrgId, name);
+          const cfg = await deps.contextStore.matchContext(resolvedOrgId, name);
           if (cfg) {
-            const env = toEnvironment(cfg);
+            const env = toContext(cfg);
             present.push({ name: env.name, env });
           }
         }
         if (present.length > 0) {
-          genEnvironmentName = present[0].name;
+          genContextName = present[0].name;
           try {
             const merged = await resolveMultiEnvMergedData({
               deps: { variableStore: deps.variableStore, secretResolver: deps.secretResolver },
@@ -3966,7 +3955,7 @@ async function resolveGeneratedJobConfigs(args: {
               hostCtx: hostCtxFromMat(mat),
               routingKey: ctx.info.routingKey,
             });
-            if (merged.environmentVars) genEnvironmentVars = merged.environmentVars;
+            if (merged.contextVars) genContextVars = merged.contextVars;
             if (merged.jobSecrets) genSecrets = { ...genSecrets, ...merged.jobSecrets };
             if (merged.jobNamespacedSecrets) {
               genNamespacedSecrets = { ...genNamespacedSecrets, ...merged.jobNamespacedSecrets };
@@ -4008,8 +3997,8 @@ async function resolveGeneratedJobConfigs(args: {
         ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
         ...(installEnvSecrets &&
           Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
-        ...(genEnvironmentName && { environment: genEnvironmentName }),
-        ...(genEnvironmentVars && { environmentVars: genEnvironmentVars }),
+        ...(genContextName && { context: genContextName }),
+        ...(genContextVars && { contextVars: genContextVars }),
         ...(genJob.env &&
           typeof genJob.env === 'object' && {
             jobEnv: genJob.env as Record<string, string>,
@@ -4948,7 +4937,7 @@ async function ensureExecutionRunForDeferred(args: {
 /**
  * Persist a failed `execution_runs` row for a pre-dispatch early-exit so the
  * dashboard's Runs view surfaces secret_resolution / install_secrets /
- * environment_rules rejections instead of leaving the run with zero trace.
+ * context_rules rejections instead of leaving the run with zero trace.
  *
  * Called from each of the three early-exit sites in `dispatchMatchedWorkflow`
  * (workflow secrets, install secrets, all-jobs-rejected). The helper is a
@@ -5010,7 +4999,7 @@ async function holdWorkflowForInstallGate(args: {
       deliveryId: setup.effectiveDeliveryId,
       providerContext: (credentials ?? {}) as Record<string, unknown>,
       routingKey: setup.info.routingKey,
-      environmentName: hold.envName,
+      contextName: hold.envName,
       reason: hold.requirement.reason,
       triggerEvent: buildTriggerEvent(event.type, event.action),
       commitMessage: extractCommitMessage(setup.info.event, setup.info.payload),
@@ -5022,8 +5011,8 @@ async function holdWorkflowForInstallGate(args: {
       runId,
       jobId: `__install__${workflow.name}`,
       scope: HoldScope.enum.workflow,
-      triggerSource: TriggerSource.enum.environment,
-      environmentId: hold.environmentId,
+      triggerSource: TriggerSource.enum.context,
+      contextId: hold.contextId,
       queueType: hold.queueType,
       holdType: hold.holdType,
       requirement: hold.requirement,
@@ -5102,11 +5091,11 @@ export async function dispatchMatchedWorkflow(
     await ctx.deps.executionTracker.resumeHeldRun(opts.reuseRunId);
   }
 
-  const evalResult = await evaluateJobEnvironments({ ctx, setup, buildPrep });
+  const evalResult = await evaluateJobContexts({ ctx, setup, buildPrep });
   const buildJobConfig = makeBuildJobConfig({
     workflow: ctx.workflow,
     fullLockFile: ctx.fullLockFile,
-    jobEnvironmentData: evalResult.jobEnvironmentData,
+    jobContextData: evalResult.jobContextData,
     resolvedSecrets: secrets.resolvedSecrets,
     resolvedNamespacedSecrets: secrets.resolvedNamespacedSecrets,
     runPublicKeyBase64: secrets.runPublicKeyBase64,
@@ -5136,7 +5125,7 @@ export async function dispatchMatchedWorkflow(
     setup,
     buildPrep,
     buildJobConfig,
-    jobEnvironmentData: evalResult.jobEnvironmentData,
+    jobContextData: evalResult.jobContextData,
     dispatchedJobs,
     rejectedJobs,
   });
@@ -5153,15 +5142,15 @@ export async function dispatchMatchedWorkflow(
         : { ...failure, category: InitFailureCategory.enum.matrix_expansion },
     );
   }
-  // Stamp each dispatched job with its ordered bound-environment list so the
+  // Stamp each dispatched job with its ordered bound-context list so the
   // job row persists it for the dashboard (keyed by expanded job name). Test-run
-  // skipped environments + their warning ride along the same map and are also
+  // skipped contexts + their warning ride along the same map and are also
   // aggregated for the accepted trigger response (the CLI surface).
   const envWarnings: string[] = [];
   for (const dj of dispatchedJobs) {
-    const ed = evalResult.jobEnvironmentData.get(dj.jobName);
-    if (ed?.environmentNames?.length) dj.environments = ed.environmentNames;
-    if (ed?.skippedEnvs?.length) dj.skippedEnvironments = ed.skippedEnvs;
+    const ed = evalResult.jobContextData.get(dj.jobName);
+    if (ed?.contextNames?.length) dj.contexts = ed.contextNames;
+    if (ed?.skippedEnvs?.length) dj.skippedContexts = ed.skippedEnvs;
     if (ed?.envWarning) {
       dj.envWarning = ed.envWarning;
       envWarnings.push(ed.envWarning);
@@ -5172,8 +5161,8 @@ export async function dispatchMatchedWorkflow(
     setup,
     buildPrep,
     declaredContexts: secrets.declaredContexts,
-    runEnvironmentName: evalResult.runEnvironmentName,
-    runEnvironmentId: evalResult.runEnvironmentId,
+    runContextName: evalResult.runContextName,
+    runContextId: evalResult.runContextId,
     dispatchedJobs,
   });
   await insertEdgesAndMarkRejected({
@@ -5183,11 +5172,11 @@ export async function dispatchMatchedWorkflow(
     rejectedJobs,
   });
 
-  // All-rejected guard: every static job was rejected by per-job environment
+  // All-rejected guard: every static job was rejected by per-job context
   // rules AND there is no deferred recovery path (no deferred-init jobs, no
   // dynamic entries). recordRunStart short-circuits in this case
   // (dispatchedJobs.length === 0), so without this branch the run leaves no
-  // trace. Insert a failed run row tagged environment_rules so the dashboard
+  // trace. Insert a failed run row tagged context_rules so the dashboard
   // surfaces it.
   if (
     dispatchedJobs.length === 0 &&
@@ -5198,7 +5187,7 @@ export async function dispatchMatchedWorkflow(
     await recordInitFailureFromSkip({
       ctx,
       setup,
-      category: InitFailureCategory.enum.environment_rules,
+      category: InitFailureCategory.enum.context_rules,
       reason: rejectedJobs[0].reason,
     });
   }
@@ -5221,7 +5210,7 @@ export async function dispatchMatchedWorkflow(
     setup,
     buildPrep,
     buildJobConfig,
-    jobEnvironmentData: evalResult.jobEnvironmentData,
+    jobContextData: evalResult.jobContextData,
     deferredInitJobs: evalResult.deferredInitJobs,
   });
 

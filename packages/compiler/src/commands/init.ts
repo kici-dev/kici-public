@@ -446,7 +446,7 @@ async function writePrivateRegistryScaffold(
 //
 // The agent renders these into the .kici/.npmrc before running \`npm install\`.
 // The token is resolved from the qualified secret reference at dispatch time
-// (the orchestrator looks it up under the named environment's scoped secrets).
+// (the orchestrator looks it up under the named context's scoped secrets).
 import { workflow, job, step } from '@kici-dev/sdk';
 
 export default workflow('private-registry-example', {

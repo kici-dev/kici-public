@@ -6,6 +6,7 @@
 
 import pc from 'picocolors';
 import { loadGlobalConfig, saveGlobalConfig, getConfigPath } from '../remote/config.js';
+import { planeStatus, detachPlane } from '../local-plane/plane-manager.js';
 
 /**
  * Logout from KiCI.
@@ -50,6 +51,18 @@ export async function logoutCommand(): Promise<boolean> {
         pc.yellow('Warning: could not revoke PAT on server (will expire automatically).'),
       );
     }
+  }
+
+  // Detach the local dev plane if attached, so a logged-out user isn't left
+  // with a hybrid plane holding a now-orphaned orchestrator key. Best-effort:
+  // the revoke uses the still-present PAT; a failure is non-fatal.
+  try {
+    if ((await planeStatus()).mode === 'hybrid') {
+      await detachPlane({ pat: config.pat });
+      console.log(pc.gray('Local dev plane detached (back to offline).'));
+    }
+  } catch {
+    // Non-fatal — logout proceeds regardless.
   }
 
   // Clear all auth fields from config, preserving connection settings

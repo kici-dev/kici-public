@@ -1,6 +1,6 @@
 /**
  * Behaviour test for the orch-side dashboard-write policy gate. Wires a
- * real `DashboardEnvHandler` with a stubbed `db` that returns a policy
+ * real `DashboardContextHandler` with a stubbed `db` that returns a policy
  * row disabling `secrets.set`, drives the mutating handler, and asserts
  * that:
  *
@@ -14,11 +14,14 @@
  * guards what the gate actually does at runtime.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { DashboardEnvHandler, type DashboardEnvHandlerDeps } from '../ws/dashboard-env-handler.js';
+import {
+  DashboardContextHandler,
+  type DashboardContextHandlerDeps,
+} from '../ws/dashboard-context-handler.js';
 import { invalidateDashboardWritePolicyCache } from './dashboard-write-policy.js';
 
 function buildDepsWithDisabledPolicy(disabled: Record<string, boolean>): {
-  deps: DashboardEnvHandlerDeps;
+  deps: DashboardContextHandlerDeps;
   sent: unknown[];
   setSecret: ReturnType<typeof vi.fn>;
   deleteSecret: ReturnType<typeof vi.fn>;
@@ -37,10 +40,10 @@ function buildDepsWithDisabledPolicy(disabled: Record<string, boolean>): {
     executeTakeFirst: vi.fn().mockResolvedValue({ dashboard_write_policy: disabled }),
   };
 
-  const deps: DashboardEnvHandlerDeps = {
+  const deps: DashboardContextHandlerDeps = {
     orgId: 'org-disabled',
     send: (msg) => sent.push(msg),
-    environmentStore: {} as never,
+    contextStore: {} as never,
     variableStore: {} as never,
     bindingStore: {} as never,
     secretStore: {
@@ -59,10 +62,10 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
   it('short-circuits secrets.set when policy has the op disabled', async () => {
     invalidateDashboardWritePolicyCache();
     const { deps, sent, setSecret } = buildDepsWithDisabledPolicy({ 'secrets.set': false });
-    const handler = new DashboardEnvHandler(deps);
+    const handler = new DashboardContextHandler(deps);
 
     await handler.handleMessage({
-      type: 'dashboard.environments.secrets.set',
+      type: 'dashboard.contexts.secrets.set',
       requestId: 'req-1',
       actor: { type: 'user', id: 'u-1', sub: 'sub-1' },
       scope: 'pg:aws/prod',
@@ -73,7 +76,7 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
     expect(setSecret).not.toHaveBeenCalled();
     expect(sent).toHaveLength(1);
     const response = sent[0] as Record<string, unknown>;
-    expect(response.type).toBe('dashboard.environments.secrets.set.response');
+    expect(response.type).toBe('dashboard.contexts.secrets.set.response');
     expect(response.error).toBe('operation_disabled');
     expect(response.operation).toBe('secrets.set');
     expect(response.cliEquivalent).toBe('kici-admin secret set');
@@ -85,10 +88,10 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
     const { deps, sent, deleteSecret } = buildDepsWithDisabledPolicy({
       'secrets.delete': false,
     });
-    const handler = new DashboardEnvHandler(deps);
+    const handler = new DashboardContextHandler(deps);
 
     await handler.handleMessage({
-      type: 'dashboard.environments.secrets.delete',
+      type: 'dashboard.contexts.secrets.delete',
       requestId: 'req-2',
       actor: { type: 'user', id: 'u-1', sub: 'sub-1' },
       scope: 'pg:aws/prod',
@@ -105,10 +108,10 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
     invalidateDashboardWritePolicyCache();
     // Empty policy row → permissive default. The setSecret stub should fire.
     const { deps, sent, setSecret } = buildDepsWithDisabledPolicy({});
-    const handler = new DashboardEnvHandler(deps);
+    const handler = new DashboardContextHandler(deps);
 
     await handler.handleMessage({
-      type: 'dashboard.environments.secrets.set',
+      type: 'dashboard.contexts.secrets.set',
       requestId: 'req-3',
       actor: { type: 'user', id: 'u-1', sub: 'sub-1' },
       scope: 'pg:aws/prod',
@@ -119,6 +122,6 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
     expect(setSecret).toHaveBeenCalledOnce();
     const response = sent[0] as Record<string, unknown>;
     expect(response.error).toBeUndefined();
-    expect(response.type).toBe('dashboard.environments.secrets.set.response');
+    expect(response.type).toBe('dashboard.contexts.secrets.set.response');
   });
 });

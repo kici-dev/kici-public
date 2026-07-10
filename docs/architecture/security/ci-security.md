@@ -109,7 +109,7 @@ When a PR modifies workflows, the orchestrator detects this by directly comparin
 Security holds are stored in the `held_runs` table with `queue_type = 'security'`, separate from environment approval holds (`queue_type = 'environment'`). This separation ensures:
 
 - Security approvals require ci_trust:write+ permission
-- Environment approvals require environments:write+ permission
+- Environment approvals require contexts:write+ permission
 - Cross-queue approval is prevented (the `approveByQueueType` method enforces queue_type matching)
 
 ### Hold reasons

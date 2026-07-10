@@ -7,14 +7,14 @@ import type { GenericInitConfig } from './types.js';
 import type { EventPayload } from './events/event-payloads.js';
 
 describe('dynamic function event fields', () => {
-  it('stores environment/env/concurrencyGroup dynamic functions on the job', () => {
-    // Runtime contract: dynamic environment / env / concurrencyGroup functions
+  it('stores context/env/concurrencyGroup dynamic functions on the job', () => {
+    // Runtime contract: dynamic context / env / concurrencyGroup functions
     // are stored verbatim on the job. The compile-time guarantee that these
     // functions receive the narrowable EventPayload union lives in
     // events/event-payloads.test-d.ts (run through Vitest's typecheck runner).
     const j = job('typed-dynamic', {
       runsOn: 'default',
-      environment: (event: EventPayload) =>
+      context: (event: EventPayload) =>
         event.type === 'pull_request'
           ? `preview-${event.payload.pull_request.number}`
           : 'production',
@@ -25,7 +25,7 @@ describe('dynamic function event fields', () => {
       steps: [step('noop', async () => {})],
     });
     expect(j.name).toBe('typed-dynamic');
-    expect(typeof j.environment).toBe('function');
+    expect(typeof j.context).toBe('function');
     expect(typeof j.env).toBe('function');
     expect(typeof j.concurrencyGroup).toBe('function');
   });
@@ -639,44 +639,44 @@ describe('job()', () => {
     });
   });
 
-  describe('multiple environments', () => {
-    it('accepts an environments array', () => {
+  describe('multiple contexts', () => {
+    it('accepts an contexts array', () => {
       const j = job('deploy', {
         runsOn: 'role:web',
         run: async () => {},
-        environments: ['staging', 'my-testing'],
+        contexts: ['staging', 'my-testing'],
       });
-      expect(j.environments).toEqual(['staging', 'my-testing']);
-      expect(j.environment).toBeUndefined();
+      expect(j.contexts).toEqual(['staging', 'my-testing']);
+      expect(j.context).toBeUndefined();
     });
 
-    it('throws when both environment and environments are set', () => {
+    it('throws when both context and contexts are set', () => {
       expect(() =>
         job('deploy', {
           runsOn: 'role:web',
           run: async () => {},
-          environment: 'staging',
-          environments: ['my-testing'],
+          context: 'staging',
+          contexts: ['my-testing'],
         }),
       ).toThrow(/mutually exclusive/);
     });
 
-    it('accepts dynamic function elements in environments', () => {
+    it('accepts dynamic function elements in contexts', () => {
       const fn = (event: EventPayload) => event.targetBranch ?? 'fallback';
       const j = job('deploy', {
         runsOn: 'role:web',
         run: async () => {},
-        environments: ['staging', fn],
+        contexts: ['staging', fn],
       });
-      expect(j.environments?.[0]).toBe('staging');
-      expect(typeof j.environments?.[1]).toBe('function');
+      expect(j.contexts?.[0]).toBe('staging');
+      expect(typeof j.contexts?.[1]).toBe('function');
     });
 
-    it('defaults concurrencyGroup to the first bound environment', () => {
+    it('defaults concurrencyGroup to the first bound context', () => {
       const j = job('deploy', {
         runsOn: 'role:web',
         run: async () => {},
-        environments: ['staging', 'my-testing'],
+        contexts: ['staging', 'my-testing'],
       });
       expect(j.concurrencyGroup).toBe('staging');
     });
@@ -685,17 +685,17 @@ describe('job()', () => {
       const j = job('deploy', {
         runsOn: 'role:web',
         run: async () => {},
-        environments: ['staging'],
+        contexts: ['staging'],
         concurrencyGroup: 'custom',
       });
       expect(j.concurrencyGroup).toBe('custom');
     });
 
-    it('leaves concurrencyGroup undefined when the first environment is dynamic', () => {
+    it('leaves concurrencyGroup undefined when the first context is dynamic', () => {
       const j = job('deploy', {
         runsOn: 'role:web',
         run: async () => {},
-        environments: [(event: EventPayload) => event.targetBranch ?? 'x'],
+        contexts: [(event: EventPayload) => event.targetBranch ?? 'x'],
       });
       expect(j.concurrencyGroup).toBeUndefined();
     });

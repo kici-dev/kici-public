@@ -141,12 +141,12 @@ export const pushWithSecrets = fixture('push-with-secrets', {
 
 This maps the `db` secret context to the `test-database` context, and `api` to `test-api-keys`.
 
-This mapping is honored by **both** `kici run local` and `kici run remote`:
+This mapping is honored by **both** `kici run <event> --local` and `kici run remote`:
 
-- For **`kici run local`** (see [`kici run local`](cli-reference.md#kici-run-local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
-- For **`kici run remote`**, each named context maps to an orchestrator **environment**, and the orchestrator resolves that environment's secrets for the run. The target environment must be flagged `allowLocalExecution: true` — mapping a context to a missing or non-test environment rejects the run (see [Secret contexts for testing](#secret-contexts-for-testing) below).
+- For a local **`kici run <event> --local`** (see [`kici run <event> --local`](cli-reference.md#kici-run-event---local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
+- For **`kici run remote`**, each named context maps to an orchestrator **context**, and the orchestrator resolves that context's secrets for the run. The target context must be flagged `allowLocalExecution: true` — mapping a context to a missing or non-test context rejects the run (see [Secret contexts for testing](#secret-contexts-for-testing) below).
 
-**A fixture `secrets:` mapping is fail-closed; a job's bound `environment:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that environment's secrets. A job's own bound `environment:` (`job('deploy', { environment: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured environment it is **skipped with a warning**, not rejected, so a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped environment(s), and the dashboard run view shows the same notice. See [Skip-on-test](environments.md#multiple-environments-per-job) in the environments guide.
+**A fixture `secrets:` mapping is fail-closed; a job's bound `context:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that context's secrets. A job's own bound `context:` (`job('deploy', { context: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured context it is **skipped with a warning**, not rejected, so a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped context(s), and the dashboard run view shows the same notice. See [Skip-on-test](contexts.md#multiple-contexts-per-job) in the contexts guide.
 
 ### Async fixtures
 
@@ -281,14 +281,14 @@ The goal of the test-secret model is to let test runs reach **test-only credenti
 
 ### CLI-uploaded local secrets
 
-`kici run remote` collects the same local secret values that `kici run local` reads — `.kici/.secrets`, `.kici/.env.local`, `.kici/secrets.yaml`, and any `--env KEY=VALUE` flags — and uploads them **encrypted** to the orchestrator alongside the run. The orchestrator decrypts them only to inject them into the agent for that run; the control plane never sees the values.
+`kici run remote` collects the same local secret values that `kici run <event> --local` reads — `.kici/.secrets`, `.kici/.env.local`, `.kici/secrets.yaml`, and any `--env KEY=VALUE` flags — and uploads them **encrypted** to the orchestrator alongside the run. The orchestrator decrypts them only to inject them into the agent for that run; the control plane never sees the values.
 
 ```bash
 # Provide an ad-hoc test value for a single remote run
 kici run remote push-main --env KICI_DATABASE_URL=postgresql://localhost/test
 ```
 
-`--env` provides a **flat** per-run override; `--context <ctx>.<KEY>=<value>` is its sibling for a **namespaced** per-run override, placing the value under the named context `ctx`. Both are uploaded **encrypted** and follow the same precedence rule below — a CLI-supplied value wins over the orchestrator test-environment secret on a key collision.
+`--env` provides a **flat** per-run override; `--context <ctx>.<KEY>=<value>` is its sibling for a **namespaced** per-run override, placing the value under the named context `ctx`. Both are uploaded **encrypted** and follow the same precedence rule below — a CLI-supplied value wins over the orchestrator test-context secret on a key collision.
 
 ```bash
 # Provide a namespaced per-run value under the 'db' context
@@ -297,14 +297,14 @@ kici run remote push-db --context db.KICI_DATABASE_URL=postgresql://localhost/te
 
 Because these values originate on your machine, they are the natural place to put throwaway test credentials without touching any orchestrator-stored secret.
 
-### Orchestrator test-environment secrets
+### Orchestrator test-context secrets
 
 In addition to your uploaded values, the orchestrator resolves test-scoped secrets from its own store for a remote test run:
 
-- The job's own declared `environment` contributes its resolved secrets (flat). Static strings and **pure dynamic functions** both participate: a pure `environment:` function (see [Dynamic values](dynamic-values.md)) is evaluated against the fixture's simulated event, and the resolved name is gated and resolved like a static one. Impure dynamic functions (those requiring an init job) are not evaluated for test runs — use a fixture `secrets:` mapping (or `--context`) to supply such a job's secrets.
-- Each fixture `secrets: { ctx: envName }` mapping resolves the named environment's secrets under the namespaced context `ctx`.
+- The job's own declared `context` contributes its resolved secrets (flat). Static strings and **pure dynamic functions** both participate: a pure `context:` function (see [Dynamic values](dynamic-values.md)) is evaluated against the fixture's simulated event, and the resolved name is gated and resolved like a static one. Impure dynamic functions (those requiring an init job) are not evaluated for test runs — use a fixture `secrets:` mapping (or `--context`) to supply such a job's secrets.
+- Each fixture `secrets: { ctx: envName }` mapping resolves the named context's secrets under the namespaced context `ctx`.
 
-Both paths are restricted to environments flagged `allowLocalExecution: true`. A production environment left at the default `false` is never resolvable for a test run.
+Both paths are restricted to contexts flagged `allowLocalExecution: true`. A production context left at the default `false` is never resolvable for a test run.
 
 ```typescript
 export const pushWithDb = fixture('push-db', {
@@ -322,31 +322,31 @@ step('migrate', async (ctx) => {
 
 ### Precedence: CLI values win
 
-When a key exists in both sources, the **CLI-uploaded local value wins** over the orchestrator test-environment value. This makes a local override a per-run knob: set `--env KICI_DATABASE_URL=...` (or put it in `.kici/.secrets`) to shadow the test environment's value for just that run, without changing anything on the orchestrator.
+When a key exists in both sources, the **CLI-uploaded local value wins** over the orchestrator test-context value. This makes a local override a per-run knob: set `--env KICI_DATABASE_URL=...` (or put it in `.kici/.secrets`) to shadow the test context's value for just that run, without changing anything on the orchestrator.
 
-### Fail-closed on non-test environments
+### Fail-closed on non-test contexts
 
 Test-run secret resolution is fail-closed:
 
-- If a fixture maps a context to an environment that does not exist, the run is **rejected**.
-- If a fixture maps a context to an environment whose `allowLocalExecution` is `false`, the run is **rejected**.
-- The `allowLocalExecution` gate applies to **all** remote test runs: a run whose matched workflow targets an environment with the flag off is rejected, so a test run can never resolve production secrets.
+- If a fixture maps to a context that does not exist, the run is **rejected**.
+- If a fixture maps to a context whose `allowLocalExecution` is `false`, the run is **rejected**.
+- The `allowLocalExecution` gate applies to **all** remote test runs: a run whose matched workflow targets a context with the flag off is rejected, so a test run can never resolve production secrets.
 
-### The `allowLocalExecution` environment flag
+### The `allowLocalExecution` context flag
 
-Each environment carries an `allowLocalExecution` flag (default `false`) that controls test-run access to that environment and to its secrets. Production environments should leave it at `false`; create a dedicated test environment with `allowLocalExecution: true` that binds only test-only secret scopes for the contexts you want test runs to use.
+Each context carries an `allowLocalExecution` flag (default `false`) that controls test-run access to that context and to its secrets. Production contexts should leave it at `false`; create a dedicated test context with `allowLocalExecution: true` that binds only test-only secret scopes for the jobs you want test runs to use.
 
 The flag is set by the orchestrator operator, either via the CLI:
 
 ```bash
-kici-admin environment set-policy --env test-database --allow-local-execution true
+kici-admin context set-policy --env test-database --allow-local-execution true
 ```
 
-or via the dashboard's "Test runs" toggle on the environment detail page. `kici secrets list` only surfaces contexts whose owning environment has `allowLocalExecution: true`, so production environments are never advertised as test-accessible.
+or via the dashboard's "Test runs" toggle on the context detail page. `kici secrets list` only surfaces contexts whose `allowLocalExecution` is `true`, so production contexts are never advertised as test-accessible.
 
 ### Local execution as an alternative
 
-`kici run local` resolves the same local secret files entirely on your machine and honors the fixture `secrets: { ... }` mapping to pick which local context backs each name (see [`kici run local`](cli-reference.md#kici-run-local)). Because the values never leave your machine, it's a good fit when you want to exercise secret-dependent steps without involving the orchestrator at all.
+`kici run <event> --local` resolves the same local secret files entirely on your machine and honors the fixture `secrets: { ... }` mapping to pick which local context backs each name (see [`kici run <event> --local`](cli-reference.md#kici-run-event---local)). Because the values never leave your machine, it's a good fit when you want to exercise secret-dependent steps without involving the orchestrator at all.
 
 ### Discovering available contexts
 

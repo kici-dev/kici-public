@@ -440,7 +440,7 @@ describe('initFailureSchema', () => {
       [
         'build_coordination',
         'dynamic_eval',
-        'environment_rules',
+        'context_rules',
         'install_secrets',
         'lock_resolution',
         'matrix_expansion',
@@ -499,12 +499,12 @@ describe('jobStatusForwardSchema with initFailure', () => {
       timestamp: 1,
       initFailure: {
         scope: 'job' as const,
-        category: InitFailureCategory.enum.environment_rules,
+        category: InitFailureCategory.enum.context_rules,
         message: 'Rejected by protection rules',
         jobName: 'deploy',
       },
     };
-    expect(jobStatusForwardSchema.parse(msg).initFailure?.category).toBe('environment_rules');
+    expect(jobStatusForwardSchema.parse(msg).initFailure?.category).toBe('context_rules');
   });
 
   it('omits initFailure on normal job status messages', () => {

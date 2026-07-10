@@ -172,7 +172,7 @@ The dashboard is a browser SPA on top of the same `/api/v1/*` surface, so anythi
 
 - **Auth & identity:** `/cli/exchange-token`, `/pats`, `/user`, `/identity-links`, `/github-oauth`, `/invites`, `/invites/pending`, `/invites/:inviteId/{accept,decline}`
 - **Org & membership:** `/orgs`, `/orgs/:customerId`, `/orgs/:customerId/{members,roles,api-keys,orchestrator-keys,service-accounts,billing,trust-policies}`
-- **Workflows & runs:** `/orgs/:customerId/{runs,registrations,workflows,held-runs,environments,secrets,global-workflows}`
+- **Workflows & runs:** `/orgs/:customerId/{runs,registrations,workflows,held-runs,contexts,secrets,global-workflows}`
 - **Webhooks & event log:** `/orgs/:customerId/{sources,webhook-endpoints,event-log}`
 - **Diagnostics & activity:** `/orgs/:customerId/{diagnostics,activity,access-log}`
 

@@ -20,11 +20,11 @@ export interface Database {
   execution_steps: ExecutionStepTable;
   raft_state: RaftStateTable;
   secret_audit_log: SecretAuditLogTable;
-  environments: EnvironmentsTable;
+  contexts: ContextsTable;
   scoped_secrets: ScopedSecretsTable;
-  environment_bindings: EnvironmentBindingsTable;
-  environment_variables: EnvironmentVariablesTable;
-  environment_source_overrides: EnvironmentSourceOverridesTable;
+  context_bindings: ContextBindingsTable;
+  context_variables: ContextVariablesTable;
+  context_source_overrides: ContextSourceOverridesTable;
   held_runs: HeldRunsTable;
   held_run_approvals: HeldRunApprovalsTable;
   admin_tokens: AdminTokenTable;
@@ -59,7 +59,29 @@ export interface Database {
   pending_attestations: PendingAttestationsTable;
   remote_sources: RemoteSourcesTable;
   host_roster: HostRosterTable;
+  request_idempotency: RequestIdempotencyTable;
 }
+
+/**
+ * Request idempotency claim table.
+ * Keyed on the Platform `requestId`; makes run-minting dashboard requests
+ * (`run.rerun.request`, `run.manual_schedule.request`) idempotent across an HA
+ * relay failover so a re-sent request returns the first coordinator's
+ * `new_run_id` instead of creating a second run. Pruned after 1h.
+ */
+export interface RequestIdempotencyTable {
+  /** Platform-minted requestId for the run-minting request (primary key / idempotency key). */
+  request_id: string;
+  /** The run id the winning coordinator created for this requestId. */
+  new_run_id: string;
+  /** When the claim was recorded. */
+  created_at: Generated<Date>;
+}
+
+// Convenience types for request_idempotency
+export type RequestIdempotency = Selectable<RequestIdempotencyTable>;
+export type NewRequestIdempotency = Insertable<RequestIdempotencyTable>;
+export type RequestIdempotencyUpdate = Updateable<RequestIdempotencyTable>;
 
 /**
  * Cluster metadata table
@@ -308,10 +330,10 @@ export interface ExecutionRunTable {
   cancelled_by: string | null;
   /** Agent provenance label when the run was cancelled through an agent credential (null otherwise). */
   cancelled_by_agent_label: string | null;
-  /** Environment name for this run (null if no environment applies) */
-  environment: string | null;
-  /** Matched environment id for this run (null if no/unresolved environment). */
-  environment_id: string | null;
+  /** Context name for this run (null if no context applies) */
+  context: string | null;
+  /** Matched context id for this run (null if no/unresolved context). */
+  context_id: string | null;
   /** Trust tier of the contributor for PR runs (null for non-PR events) */
   trust_tier: string | null;
   /** Lock file source: 'head' or 'base' (null for non-PR events) */
@@ -418,17 +440,17 @@ export interface ExecutionJobTable {
   /** Aggregated step outputs JSONB (step-keyed map of outputs). Populated on job success. */
   outputs: string | null;
   /**
-   * Ordered bound deployment-environment names for this job, JSON-encoded
+   * Ordered bound deployment-context names for this job, JSON-encoded
    * `string[]` (null when the job binds none). Written at dispatch and
-   * overwritten with the agent-resolved list for dynamic environments.
+   * overwritten with the agent-resolved list for dynamic contexts.
    */
-  environments: string | null;
+  contexts: string | null;
   /**
-   * Bound environments skipped on a test/local run (non-test or unconfigured),
+   * Bound contexts skipped on a test/local run (non-test or unconfigured),
    * JSON-encoded `string[]`. NULL = nothing skipped.
    */
-  skipped_environments: string | null;
-  /** User-visible warning naming the skipped test-run environments. NULL = none. */
+  skipped_contexts: string | null;
+  /** User-visible warning naming the skipped test-run contexts. NULL = none. */
   env_warning: string | null;
   /** Whether all upstream needs edges are satisfied (dispatch gate). */
   needs_satisfied: Generated<boolean>;
@@ -596,20 +618,20 @@ export type RaftState = Selectable<RaftStateTable>;
 export type RaftStateUpdate = Updateable<RaftStateTable>;
 
 /**
- * Environments table
- * Named deployment environments with concurrency, branch restrictions, and approval rules.
+ * Contexts table
+ * Named deployment contexts with concurrency, branch restrictions, and approval rules.
  * Scoped to an organization.
  */
-export interface EnvironmentsTable {
+export interface ContextsTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Organization ID */
   org_id: string;
-  /** Environment name (unique within org) */
+  /** Context name (unique within org) */
   name: string;
-  /** Environment type: 'fixed' | 'dynamic' */
+  /** Context type: 'fixed' | 'dynamic' */
   type: Generated<string>;
-  /** Glob pattern for dynamic environments (null for fixed) */
+  /** Glob pattern for dynamic contexts (null for fixed) */
   glob_pattern: string | null;
   /** JSONB array of branch restriction patterns */
   branch_restrictions: Generated<string>;
@@ -631,33 +653,33 @@ export interface EnvironmentsTable {
   hold_expiry_seconds: Generated<number>;
   /** Minimum trust tier required for CI execution (null = no trust requirement) */
   minimum_trust: string | null;
-  /** Whether this environment allows local (no-remote) executions. Default false. */
+  /** Whether this context allows local (no-remote) executions. Default false. */
   allow_local_execution: Generated<boolean>;
-  /** Whether this environment is active */
+  /** Whether this context is active */
   enabled: Generated<boolean>;
-  /** When this environment was created */
+  /** When this context was created */
   created_at: Generated<Date>;
-  /** When this environment was last updated */
+  /** When this context was last updated */
   updated_at: Generated<Date>;
-  /** Who created this environment */
+  /** Who created this context */
   created_by: string | null;
 }
 
-// Convenience types for environments
-export type Environment = Selectable<EnvironmentsTable>;
-export type NewEnvironment = Insertable<EnvironmentsTable>;
-export type EnvironmentUpdate = Updateable<EnvironmentsTable>;
+// Convenience types for contexts
+export type Context = Selectable<ContextsTable>;
+export type NewContext = Insertable<ContextsTable>;
+export type ContextUpdate = Updateable<ContextsTable>;
 
 /**
  * Scoped secrets table
- * Encrypted key-value pairs scoped to org + scope (e.g. environment name, repo pattern).
+ * Encrypted key-value pairs scoped to org + scope (e.g. context name, repo pattern).
  */
 export interface ScopedSecretsTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Organization ID */
   org_id: string;
-  /** Scope identifier (e.g. environment name, repo pattern) */
+  /** Scope identifier (e.g. context name, repo pattern) */
   scope: string;
   /** Secret key name */
   key: string;
@@ -679,16 +701,16 @@ export type NewScopedSecret = Insertable<ScopedSecretsTable>;
 export type ScopedSecretUpdate = Updateable<ScopedSecretsTable>;
 
 /**
- * Environment bindings table
- * Links environments to scope patterns (e.g. workflow names, repo identifiers).
+ * Context bindings table
+ * Links contexts to scope patterns (e.g. workflow names, repo identifiers).
  */
-export interface EnvironmentBindingsTable {
+export interface ContextBindingsTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Organization ID */
   org_id: string;
-  /** Environment ID (FK to environments.id, cascade delete) */
-  environment_id: string;
+  /** Context ID (FK to contexts.id, cascade delete) */
+  context_id: string;
   /** Scope pattern for matching (e.g. workflow name glob, repo pattern) */
   scope_pattern: string;
   /**
@@ -701,21 +723,21 @@ export interface EnvironmentBindingsTable {
   created_at: Generated<Date>;
 }
 
-// Convenience types for environment_bindings
-export type EnvironmentBinding = Selectable<EnvironmentBindingsTable>;
-export type NewEnvironmentBinding = Insertable<EnvironmentBindingsTable>;
+// Convenience types for context_bindings
+export type ContextBinding = Selectable<ContextBindingsTable>;
+export type NewContextBinding = Insertable<ContextBindingsTable>;
 
 /**
- * Environment variables table
- * Non-secret key-value pairs attached to an environment.
+ * Context variables table
+ * Non-secret key-value pairs attached to a context.
  */
-export interface EnvironmentVariablesTable {
+export interface ContextVariablesTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Organization ID */
   org_id: string;
-  /** Environment ID (FK to environments.id, cascade delete) */
-  environment_id: string;
+  /** Context ID (FK to contexts.id, cascade delete) */
+  context_id: string;
   /** Variable key name */
   key: string;
   /** Variable value */
@@ -728,22 +750,22 @@ export interface EnvironmentVariablesTable {
   updated_at: Generated<Date>;
 }
 
-// Convenience types for environment_variables
-export type EnvironmentVariable = Selectable<EnvironmentVariablesTable>;
-export type NewEnvironmentVariable = Insertable<EnvironmentVariablesTable>;
-export type EnvironmentVariableUpdate = Updateable<EnvironmentVariablesTable>;
+// Convenience types for context_variables
+export type ContextVariable = Selectable<ContextVariablesTable>;
+export type NewContextVariable = Insertable<ContextVariablesTable>;
+export type ContextVariableUpdate = Updateable<ContextVariablesTable>;
 
 /**
- * Environment source overrides table
- * Per-source (routing key) variable overrides within an environment.
+ * Context source overrides table
+ * Per-source (routing key) variable overrides within a context.
  */
-export interface EnvironmentSourceOverridesTable {
+export interface ContextSourceOverridesTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Organization ID */
   org_id: string;
-  /** Environment ID (FK to environments.id, cascade delete) */
-  environment_id: string;
+  /** Context ID (FK to contexts.id, cascade delete) */
+  context_id: string;
   /** Routing key for the source */
   routing_key: string;
   /** Override key name */
@@ -756,10 +778,10 @@ export interface EnvironmentSourceOverridesTable {
   updated_at: Generated<Date>;
 }
 
-// Convenience types for environment_source_overrides
-export type EnvironmentSourceOverride = Selectable<EnvironmentSourceOverridesTable>;
-export type NewEnvironmentSourceOverride = Insertable<EnvironmentSourceOverridesTable>;
-export type EnvironmentSourceOverrideUpdate = Updateable<EnvironmentSourceOverridesTable>;
+// Convenience types for context_source_overrides
+export type ContextSourceOverride = Selectable<ContextSourceOverridesTable>;
+export type NewContextSourceOverride = Insertable<ContextSourceOverridesTable>;
+export type ContextSourceOverrideUpdate = Updateable<ContextSourceOverridesTable>;
 
 /**
  * Held runs table
@@ -774,13 +796,13 @@ export interface HeldRunsTable {
   run_id: string;
   /** Job ID within the run */
   job_id: string;
-  /** Environment ID (FK to environments.id); null once the environment is deleted */
-  environment_id: string | null;
+  /** Context ID (FK to contexts.id); null once the context is deleted */
+  context_id: string | null;
   /** Hold type: 'approval' | 'wait_timer' | 'concurrency' */
   hold_type: string;
   /** Hold status: 'pending' | 'approved' | 'rejected' | 'expired' | 'released' */
   status: Generated<string>;
-  /** Queue type: 'environment' | 'security' */
+  /** Queue type: 'context' | 'security' */
   queue_type: Generated<string>;
   /** Reason for hold or resolution */
   reason: string | null;
@@ -794,13 +816,13 @@ export interface HeldRunsTable {
   resolved_at: Date | null;
   /**
    * Hold granularity: 'workflow' | 'job' | 'step' (engine `HoldScope`).
-   * Existing environment holds are job-scoped, hence the 'job' default.
+   * Existing context holds are job-scoped, hence the 'job' default.
    */
   hold_scope: Generated<string>;
   /** Step index within the job for step-scoped holds; null otherwise. */
   step_index: number | null;
   /**
-   * What created the hold: 'environment' (mandatory env policy) | 'explicit'
+   * What created the hold: 'context' (mandatory env policy) | 'explicit'
    * (SDK `approval`). Engine `TriggerSource`.
    */
   trigger_source: Generated<string>;
@@ -1414,7 +1436,7 @@ export interface SourcesTable {
    * is the source of truth for both `name` and `slug` on GitHub-App sources.
    */
   slug: string | null;
-  /** Customer/org identifier for secret and environment scoping */
+  /** Customer/org identifier for secret and context scoping */
   customer_id: Generated<string>;
   /** When this source was created */
   created_at: Generated<Date>;

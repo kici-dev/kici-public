@@ -29,7 +29,7 @@ function normalizeTriggers(on?: Trigger | Trigger[]): TriggerConfig[] | undefine
  * });
  */
 /**
- * Validates a `<environment>:<secret-name>` qualified secret reference.
+ * Validates a `<context>:<secret-name>` qualified secret reference.
  * Both halves must be non-empty and free of additional colons.
  */
 function isQualifiedSecretRef(value: string): boolean {
@@ -52,7 +52,7 @@ export function workflow(name: string, options: WorkflowOptions): Workflow {
       }
       if (!isQualifiedSecretRef(reg.tokenSecret)) {
         throw new Error(
-          `workflow('${name}'): registries[${i}].tokenSecret must use qualified <environment>:<secret-name> syntax (got: ${reg.tokenSecret})`,
+          `workflow('${name}'): registries[${i}].tokenSecret must use qualified <context>:<secret-name> syntax (got: ${reg.tokenSecret})`,
         );
       }
       if (reg.scope === undefined) {
@@ -81,7 +81,7 @@ export function workflow(name: string, options: WorkflowOptions): Workflow {
     for (const [i, ref] of options.installEnv.entries()) {
       if (!isQualifiedSecretRef(ref)) {
         throw new Error(
-          `workflow('${name}'): installEnv[${i}] must use qualified <environment>:<secret-name> syntax (got: ${ref})`,
+          `workflow('${name}'): installEnv[${i}] must use qualified <context>:<secret-name> syntax (got: ${ref})`,
         );
       }
     }

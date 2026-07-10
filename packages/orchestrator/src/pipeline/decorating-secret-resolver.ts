@@ -1,13 +1,13 @@
 /**
  * CLI-secret overlay for `kici run` test dispatch.
  *
- * Wraps the orchestrator's environment `SecretResolver` and overlays the
+ * Wraps the orchestrator's context `SecretResolver` and overlays the
  * developer's CLI-uploaded local secrets on top of the env-resolved secrets,
  * with CLI winning on collision. Passed to the shared dispatch core via
  * `ProcessingDeps.secretResolver`, so the core's secret-resolution path is
  * unchanged and oblivious to "test secrets".
  *
- * Precedence: env-resolved secrets → CLI context for the requested environment
+ * Precedence: env-resolved secrets → CLI context for the requested context
  * → CLI flat. The CLI flat overlay is applied last so a CLI flat key always
  * wins.
  */
@@ -26,11 +26,11 @@ export class DecoratingSecretResolver implements SecretResolverApi {
     private readonly cli: CliSecrets,
   ) {}
 
-  async resolveForJob(orgId: string, environmentName: string): Promise<Record<string, string>> {
-    const envSecrets = await this.base.resolveForJob(orgId, environmentName);
+  async resolveForJob(orgId: string, contextName: string): Promise<Record<string, string>> {
+    const envSecrets = await this.base.resolveForJob(orgId, contextName);
     return {
       ...envSecrets,
-      ...(this.cli.contexts[environmentName] ?? {}),
+      ...(this.cli.contexts[contextName] ?? {}),
       ...this.cli.flat,
     };
   }
@@ -46,8 +46,8 @@ export class DecoratingSecretResolver implements SecretResolverApi {
 
   resolveForJobWithMeta(
     orgId: string,
-    environmentName: string,
+    contextName: string,
   ): Promise<Record<string, ResolvedSecretMeta>> {
-    return this.base.resolveForJobWithMeta(orgId, environmentName);
+    return this.base.resolveForJobWithMeta(orgId, contextName);
   }
 }

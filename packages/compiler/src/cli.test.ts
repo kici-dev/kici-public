@@ -100,25 +100,16 @@ describe('CLI argument errors', () => {
   );
 
   it(
-    'kici run local --pick combined with --workflow exits 2',
+    'kici run local is retired and redirects to the routed run (exit 2)',
     () => {
-      const result = runCli('run local --pick --workflow ci');
-      expect(result.exitCode).toBe(2);
-      expect(result.stderr).toContain('mutually exclusive');
-    },
-    SPAWN_TIMEOUT_MS,
-  );
-
-  it(
-    'kici run local with no event and no --pick prints usage and exits 2',
-    () => {
+      // The `local` subcommand is gone; `kici run local` reaches the parent
+      // `kici run` action (event === 'local'), which prints the retirement hint
+      // pointing at `kici run <event> --local` and exits non-zero.
       const result = runCli('run local');
       expect(result.exitCode).toBe(2);
-      // Usage goes to stdout via logger.info; assert on combined output so the
-      // check is stream-agnostic.
       const out = `${result.stdout}\n${result.stderr}`;
-      expect(out).toContain('Usage: kici run local <event> [options]');
-      expect(out).toContain('kici run local pr:open');
+      expect(out).toContain('`kici run local` is retired');
+      expect(out).toContain('kici run <event> --local');
     },
     SPAWN_TIMEOUT_MS,
   );

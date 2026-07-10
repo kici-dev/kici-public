@@ -148,12 +148,11 @@ async function serializeJob(
     `generated job '${job.name}' runsOn`,
   );
 
-  // Resolve dynamic environment/env/concurrencyGroup against the eval context.
-  // Either spelling (`environment` or `environments`) normalizes to an ordered
-  // list of resolved names emitted as static lock environments entries.
-  const envRefs =
-    job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
-  let resolvedEnvironments: Array<{ value: string; dynamic: boolean }> | undefined;
+  // Resolve dynamic context/env/concurrencyGroup against the eval context.
+  // Either spelling (`context` or `contexts`) normalizes to an ordered
+  // list of resolved names emitted as static lock contexts entries.
+  const envRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
+  let resolvedContexts: Array<{ value: string; dynamic: boolean }> | undefined;
   if (envRefs !== undefined && envRefs.length > 0) {
     const resolved: Array<{ value: string; dynamic: boolean }> = [];
     for (const ref of envRefs) {
@@ -168,7 +167,7 @@ async function serializeJob(
         resolved.push({ value: ref, dynamic: false });
       }
     }
-    if (resolved.length > 0) resolvedEnvironments = resolved;
+    if (resolved.length > 0) resolvedContexts = resolved;
   }
 
   let resolvedEnv: Record<string, string> | undefined;
@@ -230,7 +229,7 @@ async function serializeJob(
     ...(job.include ? { include: job.include } : {}),
     ...(job.exclude ? { exclude: job.exclude } : {}),
     ...(job.description ? { description: job.description } : {}),
-    ...(resolvedEnvironments !== undefined ? { environments: resolvedEnvironments } : {}),
+    ...(resolvedContexts !== undefined ? { contexts: resolvedContexts } : {}),
     ...(resolvedEnv !== undefined ? { env: resolvedEnv } : {}),
     ...(resolvedConcurrencyGroup !== undefined
       ? { concurrencyGroup: resolvedConcurrencyGroup }

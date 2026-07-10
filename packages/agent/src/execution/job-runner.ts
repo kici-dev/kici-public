@@ -27,6 +27,7 @@ import { evaluateDynamicFields } from './init-runner.js';
 import { withBootstrapInterception } from '../bootstrap/api-intercept.js';
 import { ensureInitRunner } from '../bootstrap/ensure-init-runner.js';
 import { withTimeout } from './timeout-util.js';
+import { makeStreamingZxLog } from './streaming-zx-log.js';
 import { serializeJobsToLock, MatrixExpansionError } from './dynamic-job-serializer.js';
 import { buildKiciApi, buildNeedsContext } from '@kici-dev/sdk';
 import type { EventPayload, DynamicJobNeed } from '@kici-dev/sdk';
@@ -301,6 +302,40 @@ export function buildEvalNeedsContext(config: {
 }
 
 /**
+ * Resolve a job's workDir and its cleanup.
+ *
+ * - Default: a fresh `mkdtemp` the agent clones into and removes after the job.
+ * - **In-place profile** (`inPlace` config + a `file://` source): the source's
+ *   real repo path used directly as the workDir, with **no clone** and **no
+ *   removal**. This is the routed `deploy:stg` profile — the operator runs their
+ *   own already-built working tree (module-relative `MONOREPO_ROOT`,
+ *   `node_modules`, `dist` all present). Gated to `file://` so a
+ *   Platform-connected agent (https sources) can never be pushed onto a tree,
+ *   and read only from agent config (never a dispatch/wire value).
+ */
+export async function resolveJobWorkDir(
+  inPlace: boolean,
+  repoUrl: string | undefined,
+): Promise<{ workDir: string; cleanup: () => Promise<void>; inPlace: boolean }> {
+  if (inPlace && repoUrl && repoUrl.startsWith('file://')) {
+    return {
+      workDir: fileURLToPath(repoUrl),
+      // Never remove the operator's real working tree.
+      cleanup: async () => {},
+      inPlace: true,
+    };
+  }
+  const workDir = await fs.mkdtemp(join(tmpdir(), 'kici-'));
+  return {
+    workDir,
+    cleanup: async () => {
+      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    },
+    inPlace: false,
+  };
+}
+
+/**
  * Top-level job execution orchestrator for the agent.
  *
  * When a `job.dispatch` is received, the runner:
@@ -365,15 +400,26 @@ export class JobRunner {
     const { runId: _runId, jobId, jobConfig: _jobConfig } = dispatch;
     const abortController = new AbortController();
 
-    // Create temp work directory
-    const workDir = await fs.mkdtemp(join(tmpdir(), 'kici-'));
+    // Resolve the work directory: a fresh temp clone (default) or — under the
+    // in-place profile with a file:// source — the operator's real repo path
+    // used directly with no clone.
+    const { workDir, cleanup, inPlace } = await resolveJobWorkDir(
+      this.config.inPlace,
+      dispatch.repoUrl,
+    );
+    // In-place: skip the git clone so the pre-built working tree is used as-is.
+    // `checkout` is an agent-launch decision here (config-derived), never a
+    // wire/jobConfig value that a workflow could set.
+    if (inPlace) {
+      (dispatch.jobConfig as Record<string, unknown>).checkout = false;
+    }
 
     // Track this job
     const completionPromise = this.runJob(dispatch, workDir, abortController).finally(async () => {
       this.activeJobs.delete(jobId);
       this.activeSandbox = null;
-      // Always clean up work directory
-      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      // Clean up work directory (no-op for the in-place profile).
+      await cleanup();
     });
 
     this.activeJobs.set(jobId, { abortController, completionPromise, runId: dispatch.runId });
@@ -572,8 +618,11 @@ export class JobRunner {
     // Secrets are NOT injected into env vars -- they flow through IPC to ctx.secrets.
     const typedConfig = jobConfig as Record<string, unknown>;
     const sanitizedEnv = buildSanitizedEnv((typedConfig.env as Record<string, string>) ?? {}, {
-      environmentVars: (typedConfig.environmentVars as Record<string, string>) ?? undefined,
+      contextVars: (typedConfig.contextVars as Record<string, string>) ?? undefined,
       jobEnv: (typedConfig.jobEnv as Record<string, string>) ?? undefined,
+      // Trusted-env is an agent-launch property read ONLY from agent config —
+      // never from the dispatch/jobConfig, so a workflow cannot self-elevate.
+      trustedEnv: this.config.trustedEnv,
     });
 
     logger.info('Creating execution sandbox', { executionMode, jobId, runnerPath });
@@ -1197,7 +1246,7 @@ export class JobRunner {
       targetJobName: string;
       workflowName: string;
       source: string;
-      dynamicEnvironment: boolean;
+      dynamicContext: boolean;
       dynamicEnv: boolean;
       dynamicConcurrencyGroup: boolean;
       dynamicMatrix?: boolean;
@@ -1304,14 +1353,14 @@ export class JobRunner {
         );
         const workflow = extractWorkflow(module, config.workflowName);
         initLog(
-          `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} environment=${config.dynamicEnvironment} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false})`,
+          `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} context=${config.dynamicContext} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false})`,
         );
         return evaluateDynamicFields(
           workflow,
           config.targetJobName,
           config.event,
           {
-            dynamicEnvironment: config.dynamicEnvironment,
+            dynamicContext: config.dynamicContext,
             dynamicEnv: config.dynamicEnv,
             dynamicConcurrencyGroup: config.dynamicConcurrencyGroup,
             dynamicMatrix: config.dynamicMatrix ?? false,
@@ -1322,7 +1371,7 @@ export class JobRunner {
 
       logger.info('Init job completed successfully', {
         jobId,
-        hasEnvironment: initResult.environmentNames !== undefined,
+        hasContext: initResult.contextNames !== undefined,
         hasEnv: initResult.env !== undefined,
         hasConcurrencyGroup: initResult.concurrencyGroup !== undefined,
       });
@@ -1482,22 +1531,18 @@ export class JobRunner {
       //    invisible (zx pipes child stdio to an internal VoidStream and only
       //    surfaces it through the log callback).
       const { $: zx$ } = await import('zx');
-      let zxLineBuf = '';
+      // `verbose: true` + `makeStreamingZxLog` honors the per-invocation
+      // quiet/verbose intent: a `$({ quiet: true })` call (e.g. a sops decrypt)
+      // is flagged `verbose: false` by zx and dropped from the streamed log,
+      // so a decrypted secret never leaks into the eval log.
       const scopedDollar = zx$({
         cwd: workDir,
         env: { ...process.env } as Record<string, string>,
-        verbose: false,
+        verbose: true,
         quiet: false,
-        log: ((entry: { kind: string; data: unknown }) => {
-          if (entry.kind !== 'stdout' && entry.kind !== 'stderr') return;
-          const text = typeof entry.data === 'string' ? entry.data : String(entry.data ?? '');
-          zxLineBuf += text;
-          const lines = zxLineBuf.split('\n');
-          zxLineBuf = lines.pop()!;
-          for (const line of lines) {
-            if (line) evalStreamer.addLine(line);
-          }
-        }) as unknown as (entry: unknown) => void,
+        log: makeStreamingZxLog((line) => evalStreamer.addLine(line)) as unknown as (
+          entry: unknown,
+        ) => void,
       }) as unknown as typeof zx$;
 
       const evalSink: CaptureSink = { addLine: (line) => evalStreamer.addLine(line) };

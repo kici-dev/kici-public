@@ -442,6 +442,28 @@ describe('ExecutionTracker', () => {
       expect(ctx?.triggerActorUserId).toBe('583231');
     });
 
+    it('getRunIdForJob maps a dispatched jobId back to its owning run', async () => {
+      await tracker.onExecutionStarted(
+        'run-emit',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+      );
+
+      // Both dispatched jobs resolve to the owning run (the agent's event.emit
+      // is job-scoped; this is what lets the run-keyed context resolve).
+      expect(tracker.getRunIdForJob('job-1')).toBe('run-emit');
+      expect(tracker.getRunIdForJob('job-2')).toBe('run-emit');
+      // Unknown jobId → undefined (handler returns 'Unknown job context').
+      expect(tracker.getRunIdForJob('job-missing')).toBeUndefined();
+    });
+
     it('inserts execution_jobs rows in DB', async () => {
       await tracker.onExecutionStarted(
         'run-1',
@@ -690,7 +712,7 @@ describe('ExecutionTracker', () => {
         undefined, // runsOnLabels
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
-        undefined, // environments (only set for multi-env jobs)
+        undefined, // contexts (only set for multi-context jobs)
       );
 
       const secondRunning = firstRunning + 4000;
@@ -715,7 +737,7 @@ describe('ExecutionTracker', () => {
         undefined, // runsOnLabels
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
-        undefined, // environments (only set for multi-env jobs)
+        undefined, // contexts (only set for multi-context jobs)
       );
     });
 
@@ -2910,7 +2932,7 @@ describe('ExecutionTracker', () => {
           error: 'Rejected by protection rules',
           initFailure: {
             scope: 'job',
-            category: InitFailureCategory.enum.environment_rules,
+            category: InitFailureCategory.enum.context_rules,
             message: 'Rejected by protection rules',
             jobName: 'deploy',
           },
@@ -2932,7 +2954,7 @@ describe('ExecutionTracker', () => {
       expect(jobUpdate!.values.init_failure).toBe(
         JSON.stringify({
           scope: 'job',
-          category: 'environment_rules',
+          category: 'context_rules',
           message: 'Rejected by protection rules',
           jobName: 'deploy',
         }),
@@ -2943,7 +2965,7 @@ describe('ExecutionTracker', () => {
       const lastCall = onJobStatusChange.mock.calls.at(-1)!;
       expect(lastCall[3]).toBe(ExecutionJobStatus.enum.failed);
       expect(lastCall.at(-2)).toMatchObject({
-        category: 'environment_rules',
+        category: 'context_rules',
         scope: 'job',
         jobName: 'deploy',
       });

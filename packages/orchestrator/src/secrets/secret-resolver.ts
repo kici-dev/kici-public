@@ -1,13 +1,13 @@
 /**
  * Secret resolver for dispatch-time secret resolution.
  *
- * Uses environment bindings + scope resolver to match secrets from multiple backends.
- * When a job dispatches with an environment name, the resolver:
- * 1. Looks up the environment by name
- * 2. Gets bindings for that environment
+ * Uses context bindings + scope resolver to match secrets from multiple backends.
+ * When a job dispatches with a context name, the resolver:
+ * 1. Looks up the context by name
+ * 2. Gets bindings for that context
  * 3. Queries ALL registered backend stores for secrets
  * 4. Prefixes each secret's scope with the backend name (e.g., pg:aws/prod)
- * 5. Uses resolveSecretsForEnvironment to match bindings against prefixed secrets
+ * 5. Uses resolveSecretsForContext to match bindings against prefixed secrets
  * 6. Returns a flat decrypted key-value map
  *
  * unreachable backends cause job failure (not silent skip).
@@ -16,22 +16,22 @@
  * audit log includes backend name.
  */
 import {
-  resolveSecretsForEnvironment,
+  resolveSecretsForContext,
   matchScopePattern,
   stripScopePrefix,
-  type EnvironmentBinding,
+  type ContextBinding,
   type HostFacts,
   type ScopedSecret,
 } from '@kici-dev/engine';
-import { hostSpecificity, matchHostPattern } from '@kici-dev/engine/environment/host-match';
-import { substituteScopePattern } from '@kici-dev/engine/environment/scope-template';
+import { hostSpecificity, matchHostPattern } from '@kici-dev/engine/context/host-match';
+import { substituteScopePattern } from '@kici-dev/engine/context/scope-template';
 import type { Logger } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 /**
- * Minimal environment store interface (subset needed by resolver).
+ * Minimal context store interface (subset needed by resolver).
  */
-export interface EnvironmentStoreLike {
+export interface ContextStoreLike {
   getByName(
     orgId: string,
     name: string,
@@ -42,7 +42,7 @@ export interface EnvironmentStoreLike {
  * Minimal binding store interface (subset needed by resolver).
  */
 export interface BindingStoreLike {
-  getByEnvironmentId(environmentId: string): Promise<EnvironmentBinding[]>;
+  getByContextId(contextId: string): Promise<ContextBinding[]>;
 }
 
 /**
@@ -61,7 +61,7 @@ export interface SecretStoreLike {
  * Dependencies for the SecretResolver.
  */
 export interface SecretResolverDeps {
-  environmentStore: EnvironmentStoreLike;
+  contextStore: ContextStoreLike;
   bindingStore: BindingStoreLike;
   /** Map of backend name to store. Replaces single secretStore. */
   backendStores: Map<string, SecretStoreLike>;
@@ -85,7 +85,7 @@ export interface ResolvedSecretMeta {
 export interface SecretResolverApi {
   resolveForJob(
     orgId: string,
-    environmentName: string,
+    contextName: string,
     hostCtx?: HostFacts,
   ): Promise<Record<string, string>>;
   resolveNamed(
@@ -96,13 +96,13 @@ export interface SecretResolverApi {
   ): Promise<string | null>;
   resolveForJobWithMeta(
     orgId: string,
-    environmentName: string,
+    contextName: string,
     hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>>;
 }
 
 /**
- * Resolves secrets for a job by matching environment bindings against scoped secrets
+ * Resolves secrets for a job by matching context bindings against scoped secrets
  * from multiple backends.
  *
  * All backend stores are queried. Each secret's scope is prefixed with the backend
@@ -111,14 +111,14 @@ export interface SecretResolverApi {
  * stripping the backend prefix.
  */
 export class SecretResolver implements SecretResolverApi {
-  private readonly environmentStore: EnvironmentStoreLike;
+  private readonly contextStore: ContextStoreLike;
   private readonly bindingStore: BindingStoreLike;
   private readonly backendStores: Map<string, SecretStoreLike>;
   private readonly auditLogger: AuditLogger;
   private readonly logger: Logger;
 
   constructor(deps: SecretResolverDeps) {
-    this.environmentStore = deps.environmentStore;
+    this.contextStore = deps.contextStore;
     this.bindingStore = deps.bindingStore;
     this.backendStores = deps.backendStores;
     this.auditLogger = deps.auditLogger;
@@ -129,7 +129,7 @@ export class SecretResolver implements SecretResolverApi {
    * Resolve secrets for a job dispatch.
    *
    * @param orgId - Organization ID
-   * @param environmentName - Environment name to resolve secrets for
+   * @param contextName - Context name to resolve secrets for
    * @param hostCtx - Optional fan-out child identity for per-host resolution.
    *   When supplied, each binding is gated by its `host_pattern` and its
    *   `scope_pattern` is templated per-child; when omitted, only fleet-wide
@@ -138,17 +138,17 @@ export class SecretResolver implements SecretResolverApi {
    */
   async resolveForJob(
     orgId: string,
-    environmentName: string,
+    contextName: string,
     hostCtx?: HostFacts,
   ): Promise<Record<string, string>> {
-    // 1. Look up environment by name
-    const env = await this.environmentStore.getByName(orgId, environmentName);
+    // 1. Look up context by name
+    const env = await this.contextStore.getByName(orgId, contextName);
     if (!env) {
       return {};
     }
 
-    // 2. Get bindings for this environment
-    const bindings = await this.bindingStore.getByEnvironmentId(env.id);
+    // 2. Get bindings for this context
+    const bindings = await this.bindingStore.getByContextId(env.id);
     if (bindings.length === 0) {
       return {};
     }
@@ -159,7 +159,7 @@ export class SecretResolver implements SecretResolverApi {
     // 4. Scoped failure check: fail only when a failed backend
     //    could affect THIS job's bindings and no healthy backend satisfies them.
     if (failedBackends.size > 0) {
-      this.checkScopedFailure(bindings, allPrefixedSecrets, failedBackends, environmentName);
+      this.checkScopedFailure(bindings, allPrefixedSecrets, failedBackends, contextName);
     }
 
     // 5. Build a decrypt function that dispatches to the correct backend
@@ -167,7 +167,7 @@ export class SecretResolver implements SecretResolverApi {
 
     // 6. Use engine scope resolver to match and merge (longest-path-wins after prefix strip,
     //    host-specificity-wins when a hostCtx is supplied)
-    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn, hostCtx);
+    const resolved = resolveSecretsForContext(bindings, allPrefixedSecrets, decryptFn, hostCtx);
 
     // 7. Audit log the resolution (include backend name)
     if (Object.keys(resolved).length > 0) {
@@ -183,7 +183,7 @@ export class SecretResolver implements SecretResolverApi {
 
       await this.auditLogger.log({
         action: 'resolve',
-        contextName: environmentName,
+        contextName: contextName,
         routingKey: null,
         secretKeys: Object.keys(resolved),
         outcome: 'allowed',
@@ -207,7 +207,7 @@ export class SecretResolver implements SecretResolverApi {
 
   /**
    * Resolve a single named secret by (orgId, scope, key), optionally scoped to
-   * a specific backend. Bypasses environment bindings — this is a direct
+   * a specific backend. Bypasses context bindings — this is a direct
    * lookup used for source-scoped credentials (e.g. universal-git PAT/SSH
    * keys stored under `__source__/<sourceId>`).
    *
@@ -300,26 +300,26 @@ export class SecretResolver implements SecretResolverApi {
    */
   async resolveForJobWithMeta(
     orgId: string,
-    environmentName: string,
+    contextName: string,
     hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>> {
-    const env = await this.environmentStore.getByName(orgId, environmentName);
+    const env = await this.contextStore.getByName(orgId, contextName);
     if (!env) return {};
 
-    const bindings = await this.bindingStore.getByEnvironmentId(env.id);
+    const bindings = await this.bindingStore.getByContextId(env.id);
     if (bindings.length === 0) return {};
 
     const { secrets: allPrefixedSecrets, failedBackends } = await this.collectAllSecrets(orgId);
 
     // Apply scoped failure check
     if (failedBackends.size > 0) {
-      this.checkScopedFailure(bindings, allPrefixedSecrets, failedBackends, environmentName);
+      this.checkScopedFailure(bindings, allPrefixedSecrets, failedBackends, contextName);
     }
 
     const decryptFn = this.buildDecryptFn();
 
     // Resolve using engine (returns flat key-value)
-    const resolved = resolveSecretsForEnvironment(bindings, allPrefixedSecrets, decryptFn, hostCtx);
+    const resolved = resolveSecretsForContext(bindings, allPrefixedSecrets, decryptFn, hostCtx);
 
     // Enrich with metadata: find which secret provided each key
     const meta: Record<string, ResolvedSecretMeta> = {};
@@ -393,16 +393,16 @@ export class SecretResolver implements SecretResolverApi {
   }
 
   /**
-   * Check if any failed backend could affect the job's environment bindings.
+   * Check if any failed backend could affect the job's context bindings.
    * throw when a failed backend's scopes could match a binding and
    * no healthy backend already satisfies that binding.
    * jobs referencing only healthy backends succeed normally.
    */
   private checkScopedFailure(
-    bindings: EnvironmentBinding[],
+    bindings: ContextBinding[],
     healthySecrets: ScopedSecret[],
     failedBackends: Map<string, string>,
-    environmentName: string,
+    contextName: string,
   ): void {
     for (const [backendName, errorMsg] of failedBackends) {
       for (const binding of bindings) {
@@ -421,8 +421,8 @@ export class SecretResolver implements SecretResolverApi {
           );
           if (!hasHealthyMatch) {
             throw new Error(
-              `Secret backend '${backendName}' is unreachable (${errorMsg}) and job environment ` +
-                `'${environmentName}' has binding '${binding.scopePattern}' that may depend on it. ` +
+              `Secret backend '${backendName}' is unreachable (${errorMsg}) and job context ` +
+                `'${contextName}' has binding '${binding.scopePattern}' that may depend on it. ` +
                 `No other backend provides matching secrets.`,
             );
           }
@@ -439,7 +439,7 @@ export class SecretResolver implements SecretResolverApi {
    */
   private findWinningSecret(
     key: string,
-    bindings: EnvironmentBinding[],
+    bindings: ContextBinding[],
     secrets: ScopedSecret[],
     hostCtx?: HostFacts,
   ): ScopedSecret | null {
@@ -472,7 +472,7 @@ export class SecretResolver implements SecretResolverApi {
    * scope resolver's `bindingScopeForHost`. Returns `null` to skip the binding.
    */
   private bindingScopeForHost(
-    binding: EnvironmentBinding,
+    binding: ContextBinding,
     hostCtx: HostFacts | undefined,
   ): string | null {
     if (hostCtx) {

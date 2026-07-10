@@ -76,7 +76,7 @@ sequenceDiagram
     Note over Agent: runs earlier steps
     Agent->>Orchestrator: step.approval-request<br/>(runId, jobId, stepIndex, requirement)
     Note over Orchestrator: create step-scoped held element
-    Note over Agent: blocks step loop;<br/>keeps heartbeating
+    Note over Agent: blocks step loop,<br/>keeps heartbeating
     Approver->>Orchestrator: approve (dashboard / kici approve)
     Note over Orchestrator: all clauses satisfied → release
     Orchestrator->>Agent: step.approval-resolved<br/>(outcome: approved)

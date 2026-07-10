@@ -178,7 +178,7 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/<org-id>/production/KICI_DAT
 An environment owns a set of scope-pattern bindings over the secret tree. When a job targets an environment, every secret whose scope matches a binding is resolved into the flat map shipped to the agent (read via `ctx.secrets.get('KEY')`). Bind a scope pattern to an environment with:
 
 ```bash
-kici-admin environment bind --org <org-id> --env production --scope "aws/prod/**"
+kici-admin context bind --org <org-id> --env production --scope "aws/prod/**"
 ```
 
 ```bash
@@ -210,8 +210,8 @@ Each substituted value is inserted as a single literal path segment (sanitized t
 
 ```bash
 # Two bindings cover any fleet size:
-kici-admin environment bind --org <org-id> --env production --scope "prod/shared/**"            # fleet-wide
-kici-admin environment bind --org <org-id> --env production --scope 'prod/hosts/${agentId}/**'  # per-host
+kici-admin context bind --org <org-id> --env production --scope "prod/shared/**"            # fleet-wide
+kici-admin context bind --org <org-id> --env production --scope 'prod/hosts/${agentId}/**'  # per-host
 ```
 
 With a secret tree of `prod/shared` (a fleet-wide `PATRONI_REPL_PASSWORD`) and `prod/hosts/box-00002`, `prod/hosts/box-00003` (each a distinct `WG_PRIVATE_KEY`), a `runsOnAll role:db` job resolves the shared password identically on every host while each host gets only its own `WG_PRIVATE_KEY` — the templated `${agentId}` binding selects each host's own subtree, so growing the fleet adds zero bindings (only secret rows). The workflow author writes the unchanged `await ctx.secrets.get('WG_PRIVATE_KEY')`; the per-host differentiation lives entirely in the binding plus per-host resolution.
@@ -357,10 +357,10 @@ Set the flag with `kici-admin`:
 
 ```bash
 # Enable test-run access on a dedicated test environment
-kici-admin environment set-policy --env test-database --allow-local-execution true
+kici-admin context set-policy --env test-database --allow-local-execution true
 
 # Keep production locked down (explicit, though false is the default)
-kici-admin environment set-policy --env production --allow-local-execution false
+kici-admin context set-policy --env production --allow-local-execution false
 ```
 
 The same toggle is available on the environment detail page in the dashboard (the "Test runs" switch), gated by the same permission as writing a secret. Whether the dashboard surface accepts the change is decided by the [dashboard-write policy](./dashboard-write-policy.md) operation `environments.test_access.set`.

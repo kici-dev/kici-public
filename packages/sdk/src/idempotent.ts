@@ -144,8 +144,8 @@ export interface CheckStepOptions<TDrift, TInSync = void, TApplied = void> exten
  *
  * It desugars to the `step()` check facet
  * (`run: (ctx, drift) => apply(ctx, drift)`), so it inherits the agent
- * step-loop and local-executor check-mode drive for free — no engine, agent,
- * orchestrator, or lockfile change.
+ * step-loop check-mode drive for free — no engine, agent, orchestrator, or
+ * lockfile change.
  */
 export function checkStep<TDrift, TInSync = void, TApplied = void>(
   name: string,

@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import { loadGlobalConfig } from '../remote/config.js';
 import { DashboardClient, DashboardClientError } from '../remote/dashboard-client.js';
 import { generateSecretsDts } from '../generators/secrets-dts.js';
-import type { EnvironmentMetadata } from '../generators/secrets-dts.js';
+import type { ContextMetadata } from '../generators/secrets-dts.js';
 import { toErrorMessage } from '@kici-dev/core';
 
 export interface TypesOptions {
@@ -15,11 +15,11 @@ export interface TypesOptions {
 }
 
 /**
- * Generate TypeScript declarations for environment secrets.
+ * Generate TypeScript declarations for context secrets.
  *
- * Fetches environment metadata (with secret key names) through the Platform
+ * Fetches context metadata (with secret key names) through the Platform
  * and generates .kici/types/secrets.d.ts with module augmentation for
- * KnownSecretKeys and EnvironmentSecrets.
+ * KnownSecretKeys and ContextSecrets.
  *
  * @param options - Command options
  * @returns true on success, false on error
@@ -28,16 +28,16 @@ export async function typesCommand(options: TypesOptions = {}): Promise<boolean>
   try {
     const config = await loadGlobalConfig();
     const client = DashboardClient.fromConfig(config);
-    const environments = await client.listEnvironments(true);
+    const contexts = await client.listContexts(true);
 
-    const metadata: EnvironmentMetadata[] = environments.map((e) => ({
+    const metadata: ContextMetadata[] = contexts.map((e) => ({
       name: e.name,
       keys: e.secretKeys ?? [],
     }));
 
     const source = config.platformEndpoint ?? config.endpoint ?? 'kici Platform';
     const dtsContent = generateSecretsDts({
-      environments: metadata,
+      contexts: metadata,
       endpoint: source.replace(/\/+$/, ''),
       generatedAt: new Date(),
     });

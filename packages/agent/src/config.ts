@@ -65,6 +65,30 @@ const configSchema = z.object({
     .string()
     .default('false')
     .transform((s) => s === 'true'),
+  // Trusted fleet-agent execution profile (default false). When true, the step
+  // sandbox passes the ambient host env through (minus the agent's own KiCI
+  // identity/operational secrets) instead of restricting to the system-var
+  // allowlist. Orthogonal to KICI_SANDBOX (bwrap namespace isolation). Set ONLY
+  // by the operator at agent/scaler launch — never derivable from a dispatch
+  // payload or workflow. Intended for trusted host-configuration / fleet agents.
+  trustedEnv: z
+    .string()
+    .default('false')
+    .transform((s) => s === 'true'),
+  // In-place no-clone execution profile (default false). When true, and the
+  // dispatched source is a `file://` local source, the agent uses the source's
+  // real repo path as the job workDir and skips the git clone (checkout=false)
+  // instead of cloning into a throwaway tmpdir. This lets an operator run their
+  // own already-built working tree directly (module-relative paths, node_modules,
+  // dist all present) — the profile KiCI's own routed `deploy:stg` uses. Gated to
+  // `file://` sources and set ONLY by the operator at agent/scaler launch (the
+  // local dev plane's trusted+in-place label set) — never derivable from a
+  // dispatch payload, so a Platform-connected agent (https sources) can never be
+  // pushed onto the operator's tree.
+  inPlace: z
+    .string()
+    .default('false')
+    .transform((s) => s === 'true'),
   // 'isolated' (default when sandbox=true): bwrap --unshare-net, loopback only,
   // strongest isolation, but breaks workflows that need to talk to npm/git/etc.
   // 'host': keep host network namespace, allow outbound traffic. Use this when
@@ -131,6 +155,8 @@ export const envDef = defineEnv({
     jobHeartbeatIntervalMs: 'KICI_JOB_HEARTBEAT_INTERVAL_MS',
     backpressureMode: 'KICI_BACKPRESSURE_MODE',
     sandbox: 'KICI_SANDBOX',
+    trustedEnv: 'KICI_TRUSTED_ENV',
+    inPlace: 'KICI_IN_PLACE',
     sandboxNetwork: 'KICI_SANDBOX_NETWORK',
     scalerManaged: 'KICI_SCALER_MANAGED',
     scalerIdleTimeoutMs: 'KICI_SCALER_IDLE_TIMEOUT',
@@ -160,6 +186,8 @@ export const envDef = defineEnv({
  * - KICI_JOB_HEARTBEAT_INTERVAL_MS (default: 60000)
  * - KICI_BACKPRESSURE_MODE (default: pause, options: pause | drop)
  * - KICI_SANDBOX (default: false) — enable bubblewrap (bwrap) namespace isolation for bare-metal execution
+ * - KICI_TRUSTED_ENV (default: false) — trusted fleet-agent profile: pass the ambient host env (minus the agent's own KiCI identity secrets) through to steps
+ * - KICI_IN_PLACE (default: false) — in-place no-clone profile: for a file:// source, use the real repo path as workDir and skip the clone (the routed deploy:stg profile)
  * - KICI_SANDBOX_NETWORK (default: isolated, options: isolated | host) — when sandbox=true, controls bwrap network namespace
  * - KICI_SCALER_MANAGED (set to "1" by the orchestrator's auto-scaler — agent self-shuts down on idle)
  * - KICI_SCALER_IDLE_TIMEOUT (ms, default 5000) — how long a scaler-managed agent waits before shutdown after going idle

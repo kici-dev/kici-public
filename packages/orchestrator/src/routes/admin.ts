@@ -26,7 +26,7 @@ import { createBackendRoutes } from './admin-backends.js';
 import { createOrgSettingsRoutes } from './admin-org-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
-import { createAdminEnvironmentRoutes } from './admin-environments.js';
+import { createAdminContextRoutes } from './admin-contexts.js';
 import { createAdminQueueExecutionRoutes } from './admin-queue-execution.js';
 import type { SourceStore } from '../sources/source-store.js';
 import type { JoinTokenManager } from '../cluster/join-token.js';
@@ -672,18 +672,43 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         runId = undefined;
       }
       try {
+        // Cluster-wide mutating op: draining / re-arming the deferred-attestation
+        // outbox affects the whole orchestrator, so require an unscoped token and
+        // the dedicated attestation.retry permission (owner+admin, not auditor).
+        const denied = requireUnscopedToken(c);
+        if (denied) return denied;
+        deps.rbac.requirePermission(c.get('role'), 'attestation.retry');
         const result = await retry({ ...(runId ? { runId } : {}), includeRejected });
+        // Audit every retry — especially the include_rejected re-arm, which
+        // clears a terminal rejection marker.
+        await deps.accessLog?.record({
+          orgId: null,
+          routingKey: null,
+          actor: { type: 'service_account' as const, id: c.get('userId') as string },
+          action: 'attestation.retry',
+          target: { type: 'attestation', id: runId ?? 'all-pending' },
+          requestId: null,
+          source: 'admin_http',
+          outcome: 'allowed',
+          meta: {
+            include_rejected: includeRejected,
+            run_id: runId ?? null,
+            minted: result.minted,
+            still_pending: result.stillPending,
+            rejected: result.rejected,
+          },
+        });
         return c.json(result);
       } catch (err) {
-        return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+        return handleError(c, err);
       }
     });
   }
 
-  // Mount environment management routes (create/bind/set-policy/list/show/template).
+  // Mount context management routes (create/bind/set-policy/list/show/template).
   // Optional -- only when db is provided.
   if (deps.db) {
-    app.route('/api/v1/admin', createAdminEnvironmentRoutes({ db: deps.db, rbac: deps.rbac }));
+    app.route('/api/v1/admin', createAdminContextRoutes({ db: deps.db, rbac: deps.rbac }));
   }
 
   // Mount queue + execution read routes (5a #3 /).

@@ -30,6 +30,7 @@ import type { SourceCache } from '../cache/index.js';
 import type { BuildCoordinator } from '../cache/index.js';
 import type { DepCache } from '../cache/index.js';
 import type { PendingBuildTracker } from '../cache/index.js';
+import { claimRequestId } from './request-idempotency.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { JobToRoute, RunContext } from '../cluster/coordinator.js';
 import {
@@ -127,6 +128,14 @@ export async function handleRerun(
   triggeredByAgentLabel: string | null,
   deps: RerunDeps,
   /**
+   * Platform-minted `requestId` for this rerun. Stable across an HA relay
+   * failover re-send (the Platform re-sends the same message verbatim to a
+   * sibling coordinator on a timeout), so it is the idempotency key: after the
+   * read-only validation, the first coordinator to claim it creates the run and
+   * a failover re-send returns that same run instead of minting a second one.
+   */
+  requestId: string,
+  /**
    * Phase F — routing key for the original run, forwarded by Platform
    * via the WS `run.rerun.request` payload. Required to address the
    * cold-store chunk under the right tenant prefix.
@@ -142,8 +151,22 @@ export async function handleRerun(
   // 5. Re-fetch lock file at original SHA + resolve provider bundle.
   const resolved = await resolveRerunWorkflow(originalRun, deps);
 
-  // 6. Build new-run identity (commit message, lineage chain).
-  const newRunId = randomUUID();
+  // 6. Claim this rerun by its Platform `requestId` BEFORE the first write.
+  // Validation above (load/replay/resolve) is read-only and identical across
+  // failover hops, so it throws consistently on both and is never masked by a
+  // claim. The atomic claim guards only the create+dispatch: on a relay
+  // failover re-send a sibling coordinator already owns this requestId, so we
+  // return its run id without minting a second run.
+  const { newRunId, claimed } = await claimRequestId(deps.db, requestId);
+  if (!claimed) {
+    logger.info('Rerun requestId already claimed by a sibling; returning existing run', {
+      originalRunId,
+      requestId,
+      newRunId,
+    });
+    return { newRunId };
+  }
+
   const rootRunId = originalRun.original_run_id ?? originalRunId;
   const commitMessage = extractCommitMessage(payload);
 

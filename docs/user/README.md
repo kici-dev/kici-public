@@ -35,7 +35,7 @@ Guide to the KiCI web dashboard. Covers navigation (sidebar, org switcher, mobil
 
 How to run and write tests for KiCI workflows, including remote test execution with `kici run remote`, fixture-based testing, and overlay mode for uncommitted changes.
 
-### [Environments](environments.md)
+### [Contexts](contexts.md)
 
 Configure deployment environments (staging, production, review/\*) with variables, scoped secrets, and protection rules. Covers the SDK API (`environment`, `env`, `concurrencyGroup` on jobs), the 8-layer variable merge precedence, protection rules (branch restrictions, required reviewers, wait timers, concurrency), dashboard management, type generation, and migration from the legacy contexts system.
 

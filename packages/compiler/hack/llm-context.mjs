@@ -79,12 +79,12 @@ export const SCOPE_GROUPS = [
   {
     id: 'features',
     label: 'Workflow features',
-    purpose: 'Workflow features: concurrency, environments, secrets, approvals, provenance, events',
+    purpose: 'Workflow features: concurrency, contexts, secrets, approvals, provenance, events',
     dir: 'docs/user',
     recurse: false,
     only: [
       'concurrency.md',
-      'environments.md',
+      'contexts.md',
       'dynamic-values.md',
       'events.md',
       'secrets.md',

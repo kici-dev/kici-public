@@ -27,7 +27,7 @@ A team member must also be a member of the org. Membership changes propagate to 
 
 ### Who may approve
 
-Releasing any held element requires the `environments:write` or `ci_trust:write` permission **and** eligibility for at least one unsatisfied clause (membership in a named team, or being a named user). The coarse permission is the gate to act on approvals at all; the per-clause eligibility is the fine-grained check on top. Naming a team in a workflow does not grant anyone approval rights — it only restricts which already-permitted users can release that specific gate.
+Releasing any held element requires the `contexts:write` or `ci_trust:write` permission **and** eligibility for at least one unsatisfied clause (membership in a named team, or being a named user). The coarse permission is the gate to act on approvals at all; the per-clause eligibility is the fine-grained check on top. Naming a team in a workflow does not grant anyone approval rights — it only restricts which already-permitted users can release that specific gate.
 
 ## Org settings
 
@@ -87,6 +87,6 @@ Plan capacity accordingly:
 ## See also
 
 - [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
-- [Environments](environments.md) — required reviewers and the held-run lifecycle.
+- [Contexts](contexts.md) — required reviewers and the held-run lifecycle.
 - [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.
 - [kici-admin CLI](orchestrator/kici-admin-cli.md) — the `org-settings approval` subcommand.

@@ -43,7 +43,7 @@ Multi-orchestrator clustering architecture. Covers the coordinator/worker model,
 
 Deep-dive into the secrets management subsystem. Covers the AES-256-GCM encryption model (wire format, AAD binding, key versioning), multi-backend architecture (PgSecretStore, VaultSecretStore), access rule evaluation, secret resolution flow at dispatch time, RBAC model with permission matrix, audit logging schema, and security considerations (Platform isolation, log masking, AAD swap prevention).
 
-### [Environments architecture](environments.md)
+### [Contexts architecture](contexts.md)
 
 Data model, protection rule pipeline, scope resolution algorithm, and state machine extensions for deployment environments. Covers the orchestrator DB schema (environments, variables, overrides, held_runs), the sequential protection gate pipeline (branch -> concurrency -> reviewer -> timer), the longest-path-wins scope resolution algorithm, the 8-layer environment variable merge, held/waiting state machine extensions, the WS proxy pattern for dashboard CRUD, and lock file v6 schema changes.
 

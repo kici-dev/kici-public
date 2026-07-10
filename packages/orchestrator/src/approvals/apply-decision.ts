@@ -21,7 +21,7 @@ import {
   type ApprovalRequirement,
 } from '@kici-dev/engine';
 
-import type { HeldRunStore, ReleaseSignal } from '../environments/held-runs.js';
+import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import {
   canApprove,
   evaluate,
@@ -171,7 +171,7 @@ export async function applyDecision(
     await deps.onStepRelease?.(signal);
   } else if (
     signal.scope === HoldScope.enum.workflow &&
-    signal.triggerSource === TriggerSource.enum.environment
+    signal.triggerSource === TriggerSource.enum.context
   ) {
     // Only the workflow install gate (env approval / wait-timer / concurrency)
     // resumes by rebuilding the workflow dispatch context. An explicit

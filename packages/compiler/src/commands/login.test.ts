@@ -28,8 +28,25 @@ vi.mock('../auth/headless-detect.js', () => ({
   isHeadless: vi.fn().mockReturnValue(false),
 }));
 
+// Mock the local dev plane (attach prompt).
+const planeStatusMock = vi.fn().mockResolvedValue({ running: false, mode: 'independent' });
+const attachPlaneMock = vi.fn().mockResolvedValue({ mode: 'hybrid', url: 'http://127.0.0.1:4319' });
+vi.mock('../local-plane/plane-manager.js', () => ({
+  planeStatus: (...a: unknown[]) => planeStatusMock(...a),
+  attachPlane: (...a: unknown[]) => attachPlaneMock(...a),
+}));
+
+// Mock readline so the [Y/n] attach prompt returns a scripted answer.
+let scriptedAnswer = 'y';
+vi.mock('node:readline', () => ({
+  createInterface: () => ({
+    question: (_q: string, cb: (a: string) => void) => cb(scriptedAnswer),
+    close: () => {},
+  }),
+}));
+
 import { loginCommand } from './login.js';
-import { loadGlobalConfig } from '../remote/config.js';
+import { loadGlobalConfig, saveGlobalConfig } from '../remote/config.js';
 import { pkceFlow, deviceFlow, exchangeTokenForPat } from '../remote/oauth.js';
 import {
   PROD_PLATFORM_URL,
@@ -575,6 +592,67 @@ describe('kici login', () => {
       // Verify it's in the custom dir
       const config = await loadGlobalConfig();
       expect(config.token).toBe('first-key');
+    });
+  });
+
+  describe('post-login attach prompt', () => {
+    const savedTTY = process.stdin.isTTY;
+    beforeEach(async () => {
+      vi.clearAllMocks();
+      vi.mocked(os.homedir).mockReturnValue(tempDir);
+      vi.mocked(os.hostname).mockReturnValue('test-machine');
+      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(pkceFlow).mockResolvedValue('oidc');
+      vi.mocked(exchangeTokenForPat).mockResolvedValue({
+        id: 'pat-1',
+        token: 'kici_pat_abc',
+        expiresAt: '2027-01-01T00:00:00Z',
+      });
+      planeStatusMock.mockResolvedValue({ running: false, mode: 'independent' });
+      attachPlaneMock.mockResolvedValue({ mode: 'hybrid', url: 'http://127.0.0.1:4319' });
+      process.env.KICI_PLATFORM_URL = 'https://platform.example.com';
+      // Seed an existing config with an active org + same endpoint so the
+      // login preserves activeOrgId (the prompt only fires with an org).
+      await saveGlobalConfig({
+        platformEndpoint: 'https://platform.example.com',
+        activeOrgId: 'org-1',
+      });
+    });
+    afterEach(() => {
+      Object.defineProperty(process.stdin, 'isTTY', { value: savedTTY, configurable: true });
+      delete process.env.KICI_PLATFORM_URL;
+    });
+
+    it('attaches on Y when interactive with an active org', async () => {
+      Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+      scriptedAnswer = 'y';
+      await loginCommand({});
+      expect(attachPlaneMock).toHaveBeenCalledWith({
+        apiBase: 'https://platform.example.com',
+        pat: 'kici_pat_abc',
+        orgId: 'org-1',
+      });
+    });
+
+    it('does not attach on n', async () => {
+      Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+      scriptedAnswer = 'n';
+      await loginCommand({});
+      expect(attachPlaneMock).not.toHaveBeenCalled();
+    });
+
+    it('does not prompt in non-interactive (piped) input', async () => {
+      Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
+      scriptedAnswer = 'y';
+      await loginCommand({});
+      expect(attachPlaneMock).not.toHaveBeenCalled();
+    });
+
+    it('does not prompt when --no-attach is set', async () => {
+      Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+      scriptedAnswer = 'y';
+      await loginCommand({ noAttachPrompt: true });
+      expect(attachPlaneMock).not.toHaveBeenCalled();
     });
   });
 });

@@ -12,7 +12,7 @@ The six steps are:
 
 1. **Install the kici CLI** -- `npm install -g kici`.
 2. **Create a workflow** -- `kici init` scaffolds a `.kici/` directory in your repository.
-3. **Run a workflow locally** -- `kici run local pr:open` executes a workflow on your machine with no orchestrator required.
+3. **Run a workflow locally** -- `kici run pr:open --local` executes a workflow on your machine with no orchestrator deployment required.
 4. **Connect an orchestrator** -- deploy an orchestrator and connect it with a join token from **Settings → Orchestrator keys**.
 5. **Add a webhook source** -- register a source under **Settings → Sources** so pushes and pull requests trigger runs.
 6. **Trigger your first run** -- push to your repository to produce your first run through the relay.

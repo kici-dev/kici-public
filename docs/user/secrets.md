@@ -7,11 +7,11 @@ KiCI provides an explicit secrets API that gives workflow steps controlled acces
 
 ## Overview
 
-Secrets are managed per-environment in the orchestrator (see [operator docs](/operator/orchestrator/configuration) for setup). When a job runs with an `environment` binding, the agent receives the secret keys available for that environment but does **not** inject their values into the step's process environment. Instead, steps access secrets through the `ctx.secrets` API.
+Secrets are managed per-context in the orchestrator (see [operator docs](/operator/orchestrator/configuration) for setup). When a job runs with a `context` binding, the agent receives the secret keys available for that context but does **not** inject their values into the step's process environment. Instead, steps access secrets through the `ctx.secrets` API.
 
 This design prevents accidental secret leakage through child processes, log output, or error messages. Only secrets you explicitly request are loaded into memory.
 
-A job can bind several environments with `environments: ['staging', 'my-testing']`; the secret keys from all bound environments are merged in array order, with a later environment's value winning on a key collision. See [Multiple environments per job](environments.md#multiple-environments-per-job).
+A job can bind several contexts with `contexts: ['staging', 'my-testing']`; the secret keys from all bound contexts are merged in array order, with a later context's value winning on a key collision. See [Multiple contexts per job](contexts.md#multiple-contexts-per-job).
 
 ## Where secret values come from
 
@@ -79,7 +79,7 @@ export default workflow('deploy', {
   jobs: [
     job('deploy', {
       runsOn: 'default',
-      environment: 'production',
+      context: 'production',
       steps: [
         step('deploy', async (ctx) => {
           const token = await ctx.secrets.get('DEPLOY_TOKEN');
@@ -203,7 +203,7 @@ export default workflow('deploy', {
   jobs: [
     job('decrypt-and-deploy', {
       runsOn: 'default',
-      environment: 'production',
+      context: 'production',
       steps: [
         step('decrypt', async (ctx) => {
           const ageKeys = ctx.secrets.list().filter((k) => k.startsWith('AGE_KEY_'));
@@ -235,7 +235,7 @@ export default workflow('deploy', {
   jobs: [
     job('decrypt-and-deploy', {
       runsOn: 'default',
-      environment: 'production',
+      context: 'production',
       steps: [
         step('decrypt-to-env', async (ctx) => {
           await ctx.secrets.exposeFile('SOPS_AGE_KEY_FILE', {

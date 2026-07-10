@@ -98,9 +98,9 @@ describe('context types', () => {
     });
   });
 
-  describe('StepContext.environment', () => {
-    it('has environment property that is string or undefined', () => {
-      expectTypeOf<StepContext['environment']>().toEqualTypeOf<string | undefined>();
+  describe('StepContext.context', () => {
+    it('has context property that is string or undefined', () => {
+      expectTypeOf<StepContext['context']>().toEqualTypeOf<string | undefined>();
     });
 
     it('does not have contexts property', () => {

@@ -371,7 +371,7 @@ describe('DashboardHandler', () => {
           outputs: null,
           init_failure: {
             scope: 'job',
-            category: InitFailureCategory.enum.environment_rules,
+            category: InitFailureCategory.enum.context_rules,
             message: 'Rejected by protection rules',
             jobName: 'deploy',
           },
@@ -393,13 +393,11 @@ describe('DashboardHandler', () => {
       expect(response.jobs).toHaveLength(1);
       expect(response.jobs[0].initFailure).toBeDefined();
       expect(response.jobs[0].initFailure.scope).toBe('job');
-      expect(response.jobs[0].initFailure.category).toBe(
-        InitFailureCategory.enum.environment_rules,
-      );
+      expect(response.jobs[0].initFailure.category).toBe(InitFailureCategory.enum.context_rules);
       expect(response.error).toBeUndefined();
     });
 
-    it('returns the bound environment list (parsed from jsonb text) on the run-detail job', async () => {
+    it('returns the bound context list (parsed from jsonb text) on the run-detail job', async () => {
       const {
         db,
         mocks: { selectExecute: execute },
@@ -421,7 +419,7 @@ describe('DashboardHandler', () => {
           duration_ms: null,
           error_message: null,
           runs_on_labels: null,
-          environments: JSON.stringify(['staging', 'my-testing']),
+          contexts: JSON.stringify(['staging', 'my-testing']),
           outputs: null,
           init_failure: null,
         },
@@ -440,7 +438,7 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('dashboard.run.detail.response');
       expect(response.jobs).toHaveLength(1);
-      expect(response.jobs[0].environments).toEqual(['staging', 'my-testing']);
+      expect(response.jobs[0].contexts).toEqual(['staging', 'my-testing']);
       expect(response.error).toBeUndefined();
     });
   });
@@ -1811,11 +1809,13 @@ describe('DashboardHandler', () => {
       await handler.handleRerunRequest(msg);
 
       // Third arg is the agent provenance label (null for a plain user); the
-      // fourth is `routingKey` from the WS payload (absent here → undefined).
+      // fourth is the Platform `requestId` (idempotency key); the fifth is
+      // `routingKey` from the WS payload (absent here → undefined).
       expect(onRerun).toHaveBeenCalledWith(
         'original-run-123',
         'user:user@test.com',
         null,
+        'req-r1',
         undefined,
       );
       expect(send).toHaveBeenCalledOnce();
@@ -2077,7 +2077,12 @@ describe('DashboardHandler', () => {
 
       await handler.handleManualScheduleRequest(msg);
 
-      expect(onManualSchedule).toHaveBeenCalledWith('reg-abc', 'user:user@test.com', null);
+      expect(onManualSchedule).toHaveBeenCalledWith(
+        'reg-abc',
+        'user:user@test.com',
+        null,
+        'req-ms1',
+      );
       expect(send).toHaveBeenCalledOnce();
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('run.manual_schedule.response');

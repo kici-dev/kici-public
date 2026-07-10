@@ -1,6 +1,6 @@
 import { CheckMode } from '@kici-dev/engine';
 
-/** The two run-mode flags shared by `kici run local` and `kici run remote`. */
+/** The two check-mode flags accepted by `kici run remote`. */
 export interface CheckModeFlags {
   /** --check: report drift, change nothing. */
   check?: boolean;

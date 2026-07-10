@@ -157,6 +157,32 @@ describe('loadConfig', () => {
     expect(config.sandbox).toBe(false);
   });
 
+  it('defaults KICI_TRUSTED_ENV to false when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.trustedEnv).toBe(false);
+  });
+
+  it('parses KICI_TRUSTED_ENV=true as boolean true (accepted known var)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_TRUSTED_ENV = 'true';
+    const config = loadConfig();
+    expect(config.trustedEnv).toBe(true);
+  });
+
+  it('defaults KICI_IN_PLACE to false when unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    const config = loadConfig();
+    expect(config.inPlace).toBe(false);
+  });
+
+  it('parses KICI_IN_PLACE=true as boolean true (accepted known var)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_IN_PLACE = 'true';
+    const config = loadConfig();
+    expect(config.inPlace).toBe(true);
+  });
+
   it('defaults KICI_SANDBOX_NETWORK to "isolated" when unset', () => {
     process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
 

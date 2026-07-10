@@ -131,8 +131,8 @@ export interface MaterializedJob {
  * multi-child fan-out. `fanoutIndex` is the child's rank in the order defined by
  * `keyOf` (host: `agentId`; matrix: variant label), independent of emission
  * order — the orchestrator's wave dispatch keys on `fanoutIndex`, so emission
- * order need not be touched (this preserves the local-executor matrix naming
- * order). A single child gets no position (non-fan-out job; `ctx.fanout` stays
+ * order need not be touched (this preserves the matrix naming order). A single
+ * child gets no position (non-fan-out job; `ctx.fanout` stays
  * undefined). Mutates and returns the same array.
  */
 function assignFanoutPositions(

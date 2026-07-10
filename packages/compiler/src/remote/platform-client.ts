@@ -132,7 +132,7 @@ export interface PlatformTriggerResponse {
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds?: string[];
-  /** User-visible warnings on acceptance (e.g. skipped non-test bound environments). */
+  /** User-visible warnings on acceptance (e.g. skipped non-test bound contexts). */
   warnings?: string[];
 }
 
@@ -322,7 +322,7 @@ export class PlatformRunClient {
       }
       // A 422 from the trigger relay (status === 'rejected') carries the run
       // body whose `reason` holds the fail-closed gate message (e.g. the
-      // environment "does not allow test runs"). Surface that reason — it is
+      // context "does not allow test runs"). Surface that reason — it is
       // the actionable text, not the generic HTTP status.
       throw new Error(body.reason ?? body.message ?? body.error ?? 'Request rejected (422)');
     }

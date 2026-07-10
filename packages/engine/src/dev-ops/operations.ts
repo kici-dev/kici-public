@@ -24,7 +24,7 @@
 export type DeveloperOpDomain =
   | 'runs'
   | 'workflows'
-  | 'environments'
+  | 'contexts'
   | 'secrets'
   | 'held-runs'
   | 'diagnostics'
@@ -170,10 +170,10 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     false,
     null,
   ),
-  // environments (destructive delete is never an agent tool)
+  // contexts (destructive delete is never an agent tool)
   op(
-    'environments.delete',
-    'environments',
+    'contexts.delete',
+    'contexts',
     'write',
     { http: true, cli: false, mcp: false, ui: true },
     false,

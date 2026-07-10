@@ -120,7 +120,7 @@ When all jobs in a run reach a terminal state (including `timed_out_stale`), the
 
 ### Held run expiry
 
-The stale detector also handles expiring overdue held runs (runs awaiting environment approval that exceed their hold expiry timeout). When a `HeldRunStore` is configured, each scan calls `expireOverdue()` to transition expired pending holds to `expired` status, cancelling the associated jobs. See [Environments](environments.md) for details on hold expiry configuration.
+The stale detector also handles expiring overdue held runs (runs awaiting environment approval that exceed their hold expiry timeout). When a `HeldRunStore` is configured, each scan calls `expireOverdue()` to transition expired pending holds to `expired` status, cancelling the associated jobs. See [Contexts](contexts.md) for details on hold expiry configuration.
 
 ### Orphaned recovery jobs
 

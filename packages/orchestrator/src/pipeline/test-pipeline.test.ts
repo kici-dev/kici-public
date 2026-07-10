@@ -657,7 +657,7 @@ describe('processTestTrigger', () => {
     const dispatchSpy = deps.dispatcher.dispatch as any;
     await processTestTrigger(input, deps);
 
-    // The fixture mapping { contextName: environmentName } is resolved into
+    // The fixture mapping { contextName: contextName } is resolved into
     // namespaced secrets, never forwarded verbatim as the dead `testSecrets`
     // field (which only the local test-runner ever consumed).
     const jobConfig = dispatchSpy.mock.calls[0][0].jobConfig;
@@ -740,11 +740,11 @@ describe('processTestTrigger', () => {
     });
   });
 
-  describe('environment skip-on-test', () => {
-    /** matchEnvironment mock returning a full row with the given allowLocalExecution. */
+  describe('context skip-on-test', () => {
+    /** matchContext mock returning a full row with the given allowLocalExecution. */
     function envStore(name: string, allowLocalExecution: boolean) {
       return {
-        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+        matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
             ? {
                 id: `env-${name}`,
@@ -788,7 +788,7 @@ describe('processTestTrigger', () => {
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: 'org-gate' };
                 if (table === 'generic_webhook_sources') return undefined;
-                if (table === 'environments')
+                if (table === 'contexts')
                   return name === envName
                     ? { allow_local_execution: allowLocalExecution }
                     : undefined;
@@ -822,13 +822,13 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'production', dynamic: false }],
+          contexts: [{ value: 'production', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
       deps.db = gateDb('production', false) as any;
-      deps.environmentStore = envStore('production', false);
+      deps.contextStore = envStore('production', false);
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -845,9 +845,9 @@ describe('processTestTrigger', () => {
       expect(result.status).toBe('accepted');
       const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
       // The env is skipped on a test run: its vars do not flow, though the
-      // declared name is still recorded as the run environment.
-      expect(jobConfig.environment).toBe('production');
-      expect(jobConfig.environmentVars).toBeUndefined();
+      // declared name is still recorded as the run context.
+      expect(jobConfig.context).toBe('production');
+      expect(jobConfig.contextVars).toBeUndefined();
       // Allow-and-warn: a user-visible warning names the skipped non-test env.
       expect(result.warnings ?? []).toEqual(
         expect.arrayContaining([expect.stringContaining('production')]),
@@ -864,13 +864,13 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'staging', dynamic: false }],
+          contexts: [{ value: 'staging', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
       deps.db = gateDb('staging', true) as any;
-      deps.environmentStore = envStore('staging', true);
+      deps.contextStore = envStore('staging', true);
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -886,7 +886,7 @@ describe('processTestTrigger', () => {
 
       expect(result.status).toBe('accepted');
       expect(result.jobIds.length).toBeGreaterThan(0);
-      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.environment).toBe('staging');
+      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.context).toBe('staging');
       // A test-allowed env participates normally — no skip, no warning.
       expect(result.warnings ?? []).toEqual([]);
     });
@@ -900,14 +900,14 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'production', dynamic: false }],
+          contexts: [{ value: 'production', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
 
       deps.db = gateDb('production', false) as any;
-      deps.environmentStore = envStore('production', false);
+      deps.contextStore = envStore('production', false);
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -921,14 +921,14 @@ describe('processTestTrigger', () => {
       expect(result.status).toBe('accepted');
       const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
       // Skipped on the test run: no env vars flow; declared name still recorded.
-      expect(jobConfig.environment).toBe('production');
-      expect(jobConfig.environmentVars).toBeUndefined();
+      expect(jobConfig.context).toBe('production');
+      expect(jobConfig.contextVars).toBeUndefined();
     });
 
-    /** matchEnvironment mock keyed by name → allowLocalExecution (missing name => null). */
+    /** matchContext mock keyed by name → allowLocalExecution (missing name => null). */
     function multiEnvStore(byName: Record<string, boolean>) {
       return {
-        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+        matchContext: vi.fn(async (_org: string, n: string) =>
           n in byName
             ? {
                 id: `env-${n}`,
@@ -966,7 +966,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [
+          contexts: [
             { value: 'staging', dynamic: false },
             { value: 'production', dynamic: false },
           ],
@@ -975,7 +975,7 @@ describe('processTestTrigger', () => {
       const lockFile = createMockLockFile([workflowWithEnv]);
 
       deps.db = gateDb('staging', true) as any;
-      deps.environmentStore = multiEnvStore({ staging: true, production: false });
+      deps.contextStore = multiEnvStore({ staging: true, production: false });
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -995,7 +995,7 @@ describe('processTestTrigger', () => {
         expect.arrayContaining([expect.stringContaining('production')]),
       );
       expect(result.warnings?.[0]).toContain('staging');
-      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.environment).toBe('staging');
+      expect(dispatch.mock.calls[0]?.[0]?.jobConfig.context).toBe('staging');
     });
 
     it('warns (does not reject) when a bound env is unconfigured on a test run', async () => {
@@ -1007,14 +1007,14 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'ghost-env', dynamic: false }],
+          contexts: [{ value: 'ghost-env', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
-      // gateDb answers no environments row; envStore returns null for the name.
+      // gateDb answers no contexts row; envStore returns null for the name.
       deps.db = gateDb('nonexistent', true) as any;
-      deps.environmentStore = multiEnvStore({});
+      deps.contextStore = multiEnvStore({});
       const dispatch = vi
         .fn()
         .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
@@ -1034,7 +1034,7 @@ describe('processTestTrigger', () => {
       );
     });
 
-    it('skips environment gate when no db is provided', async () => {
+    it('skips context gate when no db is provided', async () => {
       const lockFile = createMockLockFile([createMockWorkflow('ci')]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
 
@@ -1068,7 +1068,7 @@ describe('processTestTrigger', () => {
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: TEST_ORG };
                 if (table === 'generic_webhook_sources') return undefined;
-                if (table === 'environments') return envName ? envRows[envName] : undefined;
+                if (table === 'contexts') return envName ? envRows[envName] : undefined;
                 if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
               }),
@@ -1090,10 +1090,10 @@ describe('processTestTrigger', () => {
       };
     }
 
-    /** Env store whose matchEnvironment returns a full row (no protection rules). */
+    /** Env store whose matchContext returns a full row (no protection rules). */
     function makeTestEnvStore(name: string) {
       return {
-        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+        matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
             ? {
                 id: `env-${name}`,
@@ -1173,7 +1173,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'echo', run: 'echo hi' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'test-database', dynamic: false }],
+          contexts: [{ value: 'test-database', dynamic: false }],
         },
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
@@ -1181,7 +1181,7 @@ describe('processTestTrigger', () => {
         ['test-database', { KICI_DATABASE_URL: 'shared' }],
       ]);
       deps.db = makeSecretDb({ 'test-database': { allow_local_execution: true } }) as any;
-      deps.environmentStore = makeTestEnvStore('test-database');
+      deps.contextStore = makeTestEnvStore('test-database');
       deps.secretResolver = {
         resolveForJob: vi.fn(async (_org: string, env: string) => perEnv.get(env) ?? {}),
       } as any;
@@ -1211,7 +1211,7 @@ describe('processTestTrigger', () => {
       expect(getJobConfig().secrets.KICI_DATABASE_URL).toBe('local');
     });
 
-    it('rejects when a fixture maps to a non-test-allowed environment', async () => {
+    it('rejects when a fixture maps to a non-test-allowed context', async () => {
       const lockFile = createMockLockFile([createMockWorkflow('ci')]);
       deps.db = makeSecretDb({ production: { allow_local_execution: false } }) as any;
       deps.secretResolver = {
@@ -1232,11 +1232,11 @@ describe('processTestTrigger', () => {
     });
   });
 
-  describe('inline (pure dynamic) environment resolution', () => {
+  describe('inline (pure dynamic) context resolution', () => {
     const INLINE_ORG = 'org-inline';
 
     // db mock answering resolveOrgId (sources -> ORG) and the org-scoped
-    // environments lookup keyed on the env name.
+    // contexts lookup keyed on the env name.
     function makeInlineDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
         fn: { countAll: () => ({ as: () => ({}) }) },
@@ -1252,7 +1252,7 @@ describe('processTestTrigger', () => {
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: INLINE_ORG };
                 if (table === 'generic_webhook_sources') return undefined;
-                if (table === 'environments') return envName ? envRows[envName] : undefined;
+                if (table === 'contexts') return envName ? envRows[envName] : undefined;
                 if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
               }),
@@ -1274,10 +1274,10 @@ describe('processTestTrigger', () => {
       };
     }
 
-    /** Env store whose matchEnvironment returns a full row (no protection rules). */
+    /** Env store whose matchContext returns a full row (no protection rules). */
     function makeInlineEnvStore(name: string, allowLocalExecution = true) {
       return {
-        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+        matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
             ? {
                 id: `env-${name}`,
@@ -1318,7 +1318,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [
+          contexts: [
             { value: { _type: 'inline' as const, expression: inlineEnvExpression }, dynamic: true },
           ],
         },
@@ -1329,7 +1329,7 @@ describe('processTestTrigger', () => {
       const lockFile = createMockLockFile([inlineEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeInlineDb({ 'test-db': { allow_local_execution: false } }) as any;
-      deps.environmentStore = makeInlineEnvStore('test-db', false);
+      deps.contextStore = makeInlineEnvStore('test-db', false);
 
       const dispatch = vi
         .fn()
@@ -1345,19 +1345,19 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       // Skip-on-test: the run is accepted (not rejected), and the dispatched job
-      // carries no environment vars (the only bound env disallows test runs); the
-      // inline-resolved name is still recorded as the run environment.
+      // carries no context vars (the only bound env disallows test runs); the
+      // inline-resolved name is still recorded as the run context.
       expect(result.status).toBe('accepted');
       const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
-      expect(jobConfig.environment).toBe('test-db');
-      expect(jobConfig.environmentVars).toBeUndefined();
+      expect(jobConfig.context).toBe('test-db');
+      expect(jobConfig.contextVars).toBeUndefined();
     });
 
-    it('resolves B1 secrets via the resolved inline environment name', async () => {
+    it('resolves B1 secrets via the resolved inline context name', async () => {
       const lockFile = createMockLockFile([inlineEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeInlineDb({ 'test-db': { allow_local_execution: true } }) as any;
-      deps.environmentStore = makeInlineEnvStore('test-db');
+      deps.contextStore = makeInlineEnvStore('test-db');
 
       const resolveForJob = vi.fn(async (_org: string, env: string) =>
         env === 'test-db' ? { DB_URL: 'x' } : {},
@@ -1383,7 +1383,7 @@ describe('processTestTrigger', () => {
       expect(jobConfig.secrets.DB_URL).toBe('x');
     });
 
-    it('skips impure dynamic environments (marker set, no inline value)', async () => {
+    it('skips impure dynamic contexts (marker set, no inline value)', async () => {
       const impureWorkflow = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -1392,8 +1392,8 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          dynamicEnvironment: true,
-          // NO environment field -- impure dynamic environment.
+          dynamicContext: true,
+          // NO context field -- impure dynamic context.
         },
       ]);
       const lockFile = createMockLockFile([impureWorkflow]);
@@ -1405,7 +1405,7 @@ describe('processTestTrigger', () => {
           select: vi.fn(() => {
             const chain: any = {
               where: vi.fn((col: string, _op: string, val: string) => {
-                if (table === 'environments' && col === 'name') envQueries.push(val);
+                if (table === 'contexts' && col === 'name') envQueries.push(val);
                 return chain;
               }),
               executeTakeFirst: vi.fn(async () => {
@@ -1436,13 +1436,13 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       expect(result.status).toBe('accepted');
-      // No environment gate query happened for the impure job.
+      // No context gate query happened for the impure job.
       expect(envQueries).toEqual([]);
-      // resolveForJob was never called with an environment for this job.
+      // resolveForJob was never called with a context for this job.
       expect(resolveForJob).not.toHaveBeenCalled();
     });
 
-    it('rejects the run when inline environment evaluation fails', async () => {
+    it('rejects the run when inline context evaluation fails', async () => {
       const failingWorkflow = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -1451,7 +1451,7 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [
+          contexts: [
             {
               value: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
               dynamic: true,
@@ -1480,7 +1480,7 @@ describe('processTestTrigger', () => {
     const ORG = 'org-parity';
 
     // db mock answering resolveOrgId (sources -> ORG) and the org-scoped
-    // environments gate lookup keyed on the env name.
+    // contexts gate lookup keyed on the env name.
     function makeParityDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
         fn: { countAll: () => ({ as: () => ({}) }) },
@@ -1496,7 +1496,7 @@ describe('processTestTrigger', () => {
               executeTakeFirst: vi.fn(async () => {
                 if (table === 'sources') return { customer_id: ORG };
                 if (table === 'generic_webhook_sources') return undefined;
-                if (table === 'environments') return envName ? envRows[envName] : undefined;
+                if (table === 'contexts') return envName ? envRows[envName] : undefined;
                 // execution_jobs running-count query → no concurrent jobs.
                 if (table === 'execution_jobs') return { count: 0 };
                 return undefined;
@@ -1528,10 +1528,10 @@ describe('processTestTrigger', () => {
       return () => dispatch.mock.calls[0]?.[0]?.jobConfig;
     }
 
-    /** Env store whose matchEnvironment returns a full row (no protection rules). */
-    function makeEnvironmentStore(name: string, id: string) {
+    /** Env store whose matchContext returns a full row (no protection rules). */
+    function makeContextStore(name: string, id: string) {
       return {
-        matchEnvironment: vi.fn(async (_org: string, n: string) =>
+        matchContext: vi.fn(async (_org: string, n: string) =>
           n === name
             ? {
                 id,
@@ -1569,17 +1569,17 @@ describe('processTestTrigger', () => {
           steps: [{ name: 'deploy', run: 'echo deploy' }],
           needs: [],
           rules: [],
-          environments: [{ value: 'test-db', dynamic: false }],
+          contexts: [{ value: 'test-db', dynamic: false }],
           env: { FOO: 'bar' },
         },
       ]);
     }
 
-    it('passes the fixture envelope, resolved environment, jobEnv and environmentVars to the agent', async () => {
+    it('passes the fixture envelope, resolved context, jobEnv and contextVars to the agent', async () => {
       const lockFile = createMockLockFile([staticEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeParityDb({ 'test-db': { allow_local_execution: true } }) as any;
-      deps.environmentStore = makeEnvironmentStore('test-db', 'env-1');
+      deps.contextStore = makeContextStore('test-db', 'env-1');
       deps.variableStore = {
         getResolvedVars: vi.fn(async (_org: string, _envId: string, _rk?: string) => ({
           STAGE: 'test',
@@ -1609,8 +1609,8 @@ describe('processTestTrigger', () => {
         payload: { ref: 'refs/heads/master' },
         changedFiles: undefined,
       });
-      expect(jobConfig.environment).toBe('test-db');
-      expect(jobConfig.environmentVars).toEqual({ STAGE: 'test' });
+      expect(jobConfig.context).toBe('test-db');
+      expect(jobConfig.contextVars).toEqual({ STAGE: 'test' });
       expect(jobConfig.jobEnv).toEqual({ FOO: 'bar' });
       // variable store resolved against the env row's id + routing key.
       expect(deps.variableStore!.getResolvedVars).toHaveBeenCalledWith(ORG, 'env-1', 'github:42');
@@ -1649,11 +1649,11 @@ describe('processTestTrigger', () => {
       expect(getJobConfig().jobEnv).toEqual({ BRANCH: 'master' });
     });
 
-    it('omits environmentVars when no variable store is wired', async () => {
+    it('omits contextVars when no variable store is wired', async () => {
       const lockFile = createMockLockFile([staticEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeParityDb({ 'test-db': { allow_local_execution: true } }) as any;
-      deps.environmentStore = makeEnvironmentStore('test-db', 'env-1');
+      deps.contextStore = makeContextStore('test-db', 'env-1');
       // No variableStore wired.
       const getJobConfig = captureDispatchedJobConfig(deps);
 
@@ -1667,7 +1667,7 @@ describe('processTestTrigger', () => {
 
       expect(result.status).toBe('accepted');
       const jobConfig = getJobConfig();
-      expect(jobConfig.environmentVars).toBeUndefined();
+      expect(jobConfig.contextVars).toBeUndefined();
       expect(jobConfig.event).toEqual({
         type: 'push',
         action: undefined,
@@ -1676,7 +1676,7 @@ describe('processTestTrigger', () => {
         payload: { ref: 'refs/heads/master' },
         changedFiles: undefined,
       });
-      expect(jobConfig.environment).toBe('test-db');
+      expect(jobConfig.context).toBe('test-db');
       expect(jobConfig.jobEnv).toEqual({ FOO: 'bar' });
     });
   });

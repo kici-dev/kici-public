@@ -71,6 +71,8 @@ import * as m063 from './migrations/063_access_log_agent_label_index.js';
 import * as m064 from './migrations/064_execution_jobs_skipped_environments.js';
 import * as m065 from './migrations/065_pending_attestations.js';
 import * as m066 from './migrations/066_pending_attestations_rejected.js';
+import * as m067 from './migrations/067_environments_to_contexts.js';
+import * as m068 from './migrations/068_request_idempotency.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -142,6 +144,8 @@ export function createMigrationProvider(): MigrationProvider {
         '064_execution_jobs_skipped_environments': m064,
         '065_pending_attestations': m065,
         '066_pending_attestations_rejected': m066,
+        '067_environments_to_contexts': m067,
+        '068_request_idempotency': m068,
       };
     },
   };

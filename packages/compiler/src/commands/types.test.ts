@@ -63,7 +63,7 @@ describe('kici types', () => {
 
       mockFetch.mockResolvedValue(
         jsonOk({
-          environments: [
+          contexts: [
             {
               name: 'production',
               secretKeys: ['DB_HOST', 'DB_PASS'],
@@ -81,7 +81,7 @@ describe('kici types', () => {
 
       expect(result).toBe(true);
       expect(mockFetch).toHaveBeenCalledWith(
-        'https://platform.example.com/api/v1/orgs/org-1/environments?includeSecrets=true',
+        'https://platform.example.com/api/v1/orgs/org-1/contexts?includeSecrets=true',
         expect.objectContaining({
           headers: expect.objectContaining({ Authorization: 'Bearer kici_pat_abc' }),
         }),
@@ -94,12 +94,12 @@ describe('kici types', () => {
       expect(content).toContain('DB_PASS: string;');
     });
 
-    it('generated file contains KnownSecretKeys and EnvironmentSecrets', async () => {
+    it('generated file contains KnownSecretKeys and ContextSecrets', async () => {
       await writeConfig(platformConfig);
 
       mockFetch.mockResolvedValue(
         jsonOk({
-          environments: [
+          contexts: [
             { name: 'staging', secretKeys: ['KEY1'], allowLocalExecution: true, enabled: true },
           ],
         }),
@@ -114,7 +114,7 @@ describe('kici types', () => {
       const outputPath = path.join(kiciDir, 'types', 'secrets.d.ts');
       const content = await fs.readFile(outputPath, 'utf-8');
       expect(content).toContain('interface KnownSecretKeys');
-      expect(content).toContain('interface EnvironmentSecrets');
+      expect(content).toContain('interface ContextSecrets');
       expect(content).not.toContain('KnownContexts');
     });
 
@@ -123,7 +123,7 @@ describe('kici types', () => {
 
       mockFetch.mockResolvedValue(
         jsonOk({
-          environments: [
+          contexts: [
             { name: 'staging', secretKeys: ['KEY1'], allowLocalExecution: true, enabled: true },
           ],
         }),
@@ -170,14 +170,14 @@ describe('kici types', () => {
       mockFetch.mockResolvedValue({
         ok: false,
         status: 403,
-        json: async () => ({ error: 'Insufficient permission: environments.read needed' }),
+        json: async () => ({ error: 'Insufficient permission: contexts.read needed' }),
       });
 
       const result = await typesCommand({});
 
       expect(result).toBe(false);
       const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
-      expect(errors).toContain('environments.read');
+      expect(errors).toContain('contexts.read');
     });
   });
 

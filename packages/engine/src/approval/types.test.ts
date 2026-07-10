@@ -33,8 +33,8 @@ describe('approval types', () => {
     expect(HoldScope.options).toEqual(['workflow', 'job', 'step']);
   });
 
-  it('TriggerSource is exactly environment|explicit', () => {
-    expect(TriggerSource.options).toEqual(['environment', 'explicit']);
+  it('TriggerSource is exactly context|explicit', () => {
+    expect(TriggerSource.options).toEqual(['context', 'explicit']);
   });
 
   it('ApprovalDecision is exactly approve|reject', () => {

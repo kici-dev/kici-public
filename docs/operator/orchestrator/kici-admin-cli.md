@@ -51,12 +51,6 @@ kici-admin token create compliance-bot --role auditor
 
 ## Global options
 
-| Option                  | Env var            | Default                 | Description            |
-| ----------------------- | ------------------ | ----------------------- | ---------------------- |
-| `--url <url>`, `-u`     | `KICI_ADMIN_URL`   | `http://localhost:8080` | Orchestrator HTTP URL  |
-| `--token <token>`, `-t` | `KICI_ADMIN_TOKEN` | (required)              | Admin API Bearer token |
-| `-V`, `--cli-version`   |                    |                         | Show CLI version       |
-
 Running `--help` on any command works without a token.
 
 ## RBAC roles
@@ -95,6 +89,3118 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 
 ## Command reference
 
+The exhaustive, always-current list of every `kici-admin` command with its arguments and options, generated from the CLI's command tree so it never drifts from the shipped binary. The [command guide](#command-guide) below adds per-namespace concepts and worked examples; the reference here is the authoritative signature list.
+
+<!-- BEGIN GENERATED: kici-admin-commands (do not edit; run the doc generator) -->
+
+### `kici-admin access-log`
+
+Inspect the read / admin-mutation access log
+
+Synopsis: `kici-admin access-log`
+
+### `kici-admin access-log list`
+
+List access-log rows (dogfooded via /api/v1/admin/access-log)
+
+Synopsis: `kici-admin access-log list [options]`
+
+**Options**
+
+| Option                  | Default | Description                                                                      |
+| ----------------------- | ------- | -------------------------------------------------------------------------------- |
+| `--org-id <orgId>`      |         | Filter by org/tenant ID                                                          |
+| `--actor-type <t>`      |         | Filter by actor type (user\|api_key\|service_account\|platform_operator\|system) |
+| `--actor-id <id>`       |         | Filter by actor id (zsub, keyId, service_account id, ...)                        |
+| `--action <action>`     |         | Filter by dotted action (e.g. run.detail.read, run.cancel)                       |
+| `--source <s>`          |         | Filter by source (platform_proxy\|admin_http\|admin_cli)                         |
+| `--outcome <o>`         |         | Filter by outcome (allowed\|denied\|error)                                       |
+| `--target-type <t>`     |         | Filter by target type (run\|step\|event_log\|secret_scope\|...)                  |
+| `--target-id <id>`      |         | Filter by target id                                                              |
+| `--from <ts>`           |         | ISO timestamp lower bound (inclusive)                                            |
+| `--to <ts>`             |         | ISO timestamp upper bound (exclusive)                                            |
+| `--q <text>`            |         | Filter by substring of error_message (trigram-indexed full-text search)          |
+| `--agent-label <label>` |         | Filter by exact agent label                                                      |
+| `--agent-only`          |         | Only agent-attributed rows                                                       |
+| `--limit <n>`           | `50`    | Max results (default 50, max 200)                                                |
+| `--cursor <c>`          |         | Opaque cursor from a previous nextCursor                                         |
+| `--json`                |         | Emit raw JSON instead of a table                                                 |
+
+### `kici-admin access-log show`
+
+Show a single access-log entry by id
+
+Synopsis: `kici-admin access-log show <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option             | Default | Description                                                                                                                                                                                                                                                                                |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--org-id <orgId>` |         | Tenant scope for cold-store fallback when the row is archived (>30d old). Without this hint, only the synthetic **orchestrator** tenant is scanned, so a row whose org_id is set won't be found. Single-tenant cold scans typically take seconds-to-minutes for one-shot operator queries. |
+| `--json`           |         | Emit raw JSON instead of formatted output                                                                                                                                                                                                                                                  |
+
+### `kici-admin agent`
+
+Manage agent authentication tokens
+
+Synopsis: `kici-admin agent`
+
+### `kici-admin agent install`
+
+Install the agent as a system service
+
+Synopsis: `kici-admin agent install [options]`
+
+**Options**
+
+| Option                     | Default      | Description                                                                               |
+| -------------------------- | ------------ | ----------------------------------------------------------------------------------------- |
+| `--platform <type>`        |              | Service platform (systemd, launchd, windows, compose)                                     |
+| `--env-file <path>`        |              | Path to existing env/config file to use                                                   |
+| `--binary <path>`          |              | Path to agent binary (default: current executable)                                        |
+| `--name <name>`            | `kici-agent` | Service name                                                                              |
+| `--orchestrator-url <url>` |              | URL of the orchestrator to connect to                                                     |
+| `--token <token>`          |              | Agent authentication token                                                                |
+| `--labels <labels>`        |              | Comma-separated agent labels for routing                                                  |
+| `--wizard`                 |              | Interactive wizard for guided setup                                                       |
+| `--system`                 |              | Install as system-level service (requires root)                                           |
+| `--user-level`             |              | Install as user-level service (no root required)                                          |
+| `--instance-dir <path>`    |              | Deploy folder; the instance manifest is written here (default: current working directory) |
+| `--force`                  |              | Overwrite an existing same-named foreign instance                                         |
+
+### `kici-admin agent list`
+
+List agent tokens
+
+Synopsis: `kici-admin agent list [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                                                                          |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `--type <type>`        |         | Filter by type: static or ephemeral                                                                                                  |
+| `--include-pending`    |         | Include agents that have connected via WS but have not completed registration (HTTP mode only; direct-DB cannot see in-memory state) |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)                                                                                  |
+| `--json`               |         | Emit JSON output                                                                                                                     |
+
+### `kici-admin agent logs`
+
+Tail and follow agent service logs
+
+Synopsis: `kici-admin agent logs [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance whose logs to read         |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+| `--since <duration>`    |         | Show logs since duration (e.g. 1h, 30m)                  |
+| `--level <level>`       |         | Filter by log level (error\|warn\|info)                  |
+| `--json`                |         | Output as structured JSON                                |
+| `--no-follow`           |         | Snapshot mode (do not tail)                              |
+
+### `kici-admin agent register`
+
+Create a static agent token
+
+Synopsis: `kici-admin agent register [options]`
+
+**Options**
+
+| Option                      | Default | Description                                                                                                           |
+| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `--labels <labels>`         |         | Comma-separated agent labels (e.g. linux,x64)                                                                         |
+| `--mandatory-label <label>` |         | Taint label the agent only accepts jobs demanding (repeatable). Also authorized as an advertised label.               |
+| `--privileged-root`         |         | Shorthand for --mandatory-label kici:privileged:root: mint a confined root agent token (the agent must run as uid 0). |
+
+### `kici-admin agent restart`
+
+Restart the agent service
+
+Synopsis: `kici-admin agent restart [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to restart                 |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin agent revoke`
+
+Revoke an agent token by ID
+
+Synopsis: `kici-admin agent revoke <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin agent start`
+
+Start the agent service
+
+Synopsis: `kici-admin agent start [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to start                   |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin agent status`
+
+Show agent service status and health information
+
+Synopsis: `kici-admin agent status [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to inspect                 |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+| `--json`                |         | Output as JSON                                           |
+
+### `kici-admin agent stop`
+
+Stop the agent service
+
+Synopsis: `kici-admin agent stop [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to stop                    |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin agent uninstall`
+
+Remove the agent service registration
+
+Synopsis: `kici-admin agent uninstall [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to uninstall               |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin agent upgrade`
+
+Upgrade agent to a new version using versioned directory layout
+
+Synopsis: `kici-admin agent upgrade [options]`
+
+**Options**
+
+| Option                  | Default | Description                                           |
+| ----------------------- | ------- | ----------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose) |
+| `--instance-dir <path>` |         | Deploy folder of the instance to upgrade              |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD) |
+| `--from <path>`         |         | Path to package archive (.tar.gz or .zip)             |
+| `--url <url>`           |         | URL to download package archive from                  |
+| `--version <version>`   |         | Target version string (e.g., 0.3.0)                   |
+| `--yes`                 |         | Skip confirmation prompt                              |
+| `--force`               |         | Overwrite existing versioned directory                |
+| `--cleanup`             |         | Remove old versions (keeps current and previous)      |
+| `--rollback`            |         | Roll back to the previous version                     |
+| `--pick`                |         | Interactively pick an installed version to activate   |
+
+### `kici-admin api-key`
+
+Manage Platform API keys and routing keys
+
+Synopsis: `kici-admin api-key`
+
+### `kici-admin api-key add-routing-key`
+
+Add a routing key permission pattern to an API key
+
+Synopsis: `kici-admin api-key add-routing-key <id> <pattern>`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `id`      | yes      | no       |             |
+| `pattern` | yes      | no       |             |
+
+### `kici-admin api-key create`
+
+Create a new API key with optional routing key permissions
+
+Synopsis: `kici-admin api-key create [options]`
+
+**Options**
+
+| Option                  | Default   | Description                                                     |
+| ----------------------- | --------- | --------------------------------------------------------------- |
+| `--label <label>`       | `unnamed` | Label for the API key                                           |
+| `--routing-keys <keys>` |           | Comma-separated routing key patterns (e.g. github:42,github:99) |
+
+### `kici-admin attestations`
+
+Provenance-attestation maintenance (orchestrator DB)
+
+Synopsis: `kici-admin attestations`
+
+### `kici-admin attestations list`
+
+List provenance attestations from the orchestrator DB (newest first)
+
+Synopsis: `kici-admin attestations list [options]`
+
+**Options**
+
+| Option                 | Default | Description                                   |
+| ---------------------- | ------- | --------------------------------------------- |
+| `--run-id <id>`        |         | Filter to a single run                        |
+| `--job-id <id>`        |         | Filter to a single job                        |
+| `--limit <n>`          | `20`    | Max results (default 20, max 100)             |
+| `--json`               |         | Emit the raw JSON envelope instead of a table |
+| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)  |
+
+### `kici-admin attestations retry`
+
+Mint deferred attestations now (drains the pending-attestations outbox)
+
+Synopsis: `kici-admin attestations retry [options]`
+
+**Options**
+
+| Option               | Default | Description                                                         |
+| -------------------- | ------- | ------------------------------------------------------------------- |
+| `--run-id <id>`      |         | Scope to a single run (else drains every pending attestation)       |
+| `--all-pending`      |         | Drain every pending attestation (default when --run-id is absent)   |
+| `--include-rejected` |         | Also re-attempt rows previously marked terminally rejected (re-arm) |
+
+### `kici-admin attestations reverify`
+
+Recompute stored attestation verdicts (verify-at-ingest backfill)
+
+Synopsis: `kici-admin attestations reverify [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                        |
+| ---------------------- | ------- | ------------------------------------------------------------------ |
+| `--all`                |         | Re-evaluate every attestation (default: only pending/unverifiable) |
+| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)                       |
+| `--yes`                |         | Skip the --all confirmation prompt                                 |
+
+### `kici-admin audit`
+
+Query the secrets audit log
+
+Synopsis: `kici-admin audit [options]`
+
+**Options**
+
+| Option               | Default | Description                                          |
+| -------------------- | ------- | ---------------------------------------------------- |
+| `--context <name>`   |         | Filter by context name                               |
+| `--routing-key <rk>` |         | Filter by routing key (required for cold-store scan) |
+| `--action <action>`  |         | Filter by action type                                |
+| `--from <date>`      |         | From date (ISO 8601)                                 |
+| `--to <date>`        |         | To date (ISO 8601)                                   |
+| `--limit <n>`        | `100`   | Max entries to return                                |
+| `--offset <n>`       |         | Offset for pagination                                |
+| `--include-archived` | `false` | Include rows from cold storage (Phase D)             |
+
+### `kici-admin backend`
+
+Manage secret backends
+
+Synopsis: `kici-admin backend`
+
+### `kici-admin backend add`
+
+Register a new secret backend
+
+Synopsis: `kici-admin backend add <name> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | yes      | no       |             |
+
+**Options**
+
+| Option                      | Default   | Description                                            |
+| --------------------------- | --------- | ------------------------------------------------------ |
+| `--type <type>`             |           | Backend type: pg or vault                              |
+| `--vault-url <url>`         |           | Vault/OpenBao URL (env: KICI_BACKEND_VAULT_URL)        |
+| `--auth-method <method>`    | `approle` | Vault auth method: approle or token (default: approle) |
+| `--role-id <id>`            |           | Vault AppRole role ID (env: KICI_BACKEND_ROLE_ID)      |
+| `--secret-id <id>`          |           | Vault AppRole secret ID (env: KICI_BACKEND_SECRET_ID)  |
+| `--secret-id-file <path>`   |           | Read Vault secret ID from file (avoids shell history)  |
+| `--token <token>`           |           | Vault token (env: KICI_BACKEND_TOKEN)                  |
+| `--namespace <ns>`          |           | Vault namespace                                        |
+| `--mount-path <path>`       | `secret`  | Vault mount path (default: secret)                     |
+| `--base-path <path>`        |           | Vault base path for secrets                            |
+| `--connection-string <url>` |           | PG connection string (env: KICI_BACKEND_PG_URL)        |
+| `--scope-filter <pattern>`  | `**`      | Scope filter glob pattern (default: \*\*)              |
+| `--sync-interval <ms>`      | `300000`  | Sync interval in milliseconds (default: 300000)        |
+
+### `kici-admin backend list`
+
+List all registered secret backends
+
+Synopsis: `kici-admin backend list`
+
+### `kici-admin backend purge-stale`
+
+Delete backends with encrypted config that can no longer be decrypted (direct-DB, pre-orchestrator)
+
+Synopsis: `kici-admin backend purge-stale [options]`
+
+**Options**
+
+| Option                 | Default | Description                                               |
+| ---------------------- | ------- | --------------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator DB URL (or KICI_DATABASE_URL / DATABASE_URL) |
+| `--json`               |         | Emit JSON output                                          |
+
+### `kici-admin backend remove`
+
+Remove a registered secret backend
+
+Synopsis: `kici-admin backend remove <name> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | yes      | no       |             |
+
+**Options**
+
+| Option  | Default | Description              |
+| ------- | ------- | ------------------------ |
+| `--yes` |         | Skip confirmation prompt |
+
+### `kici-admin backend sync`
+
+Trigger scope discovery sync (all backends if name omitted)
+
+Synopsis: `kici-admin backend sync [name]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | no       | no       |             |
+
+### `kici-admin backend test`
+
+Test backend connectivity (by name or inline config)
+
+Synopsis: `kici-admin backend test [name] [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | no       | no       |             |
+
+**Options**
+
+| Option                      | Default   | Description                                           |
+| --------------------------- | --------- | ----------------------------------------------------- |
+| `--type <type>`             |           | Backend type: pg or vault                             |
+| `--vault-url <url>`         |           | Vault/OpenBao URL (env: KICI_BACKEND_VAULT_URL)       |
+| `--auth-method <method>`    | `approle` | Vault auth method: approle or token                   |
+| `--role-id <id>`            |           | Vault AppRole role ID (env: KICI_BACKEND_ROLE_ID)     |
+| `--secret-id <id>`          |           | Vault AppRole secret ID (env: KICI_BACKEND_SECRET_ID) |
+| `--secret-id-file <path>`   |           | Read Vault secret ID from file                        |
+| `--token <token>`           |           | Vault token (env: KICI_BACKEND_TOKEN)                 |
+| `--namespace <ns>`          |           | Vault namespace                                       |
+| `--mount-path <path>`       | `secret`  | Vault mount path                                      |
+| `--base-path <path>`        |           | Vault base path                                       |
+| `--connection-string <url>` |           | PG connection string (env: KICI_BACKEND_PG_URL)       |
+
+### `kici-admin cluster`
+
+Cluster identity recovery (DB <-> S3 sentinel reconcile).
+
+Synopsis: `kici-admin cluster`
+
+### `kici-admin cluster reconcile-identity`
+
+Reconcile cluster_meta.cluster_id with the S3 sentinel. Default restores the DB from the sentinel.
+
+Synopsis: `kici-admin cluster reconcile-identity [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                            |
+| ---------------------- | ------- | ---------------------------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)                           |
+| `--bucket <bucket>`    |         | S3 bucket (else KICI_STORAGE_BUCKET)                                   |
+| `--prefix <prefix>`    |         | Storage prefix (else KICI_STORAGE_PREFIX, default empty = bucket root) |
+| `--region <region>`    |         | S3 region (else KICI_STORAGE_REGION)                                   |
+| `--endpoint <url>`     |         | S3 endpoint (else KICI_STORAGE_ENDPOINT)                               |
+| `--force-path-style`   |         | Use S3 path-style addressing                                           |
+| `--adopt-db`           |         | Reverse direction: rewrite the sentinel from the DB cluster_id         |
+| `--dry-run`            |         | Report drift and exit without changing anything                        |
+| `--yes`                |         | Skip confirmation and apply on drift                                   |
+
+### `kici-admin cluster-name`
+
+Manage this orchestrator's cluster name (Platform-visible identifier)
+
+Synopsis: `kici-admin cluster-name`
+
+### `kici-admin cluster-name get`
+
+Print the current cluster name.
+
+Synopsis: `kici-admin cluster-name get [options]`
+
+**Options**
+
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--format <format>` | `table` | Output format: json\|table |
+
+### `kici-admin cluster-name set`
+
+Rename the cluster. Cluster name must match ^[a-z][a-z0-9-]{0,62}$ (lowercase letters, digits, hyphens; start with a letter; ≤63 chars).
+
+Synopsis: `kici-admin cluster-name set <name> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | yes      | no       |             |
+
+**Options**
+
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--format <format>` | `table` | Output format: json\|table |
+
+### `kici-admin cold-store`
+
+Inspect and operate the orchestrator-side cold-storage archival
+
+Synopsis: `kici-admin cold-store`
+
+### `kici-admin cold-store archive-now`
+
+Run one archive cycle synchronously for a single registered adapter
+
+Synopsis: `kici-admin cold-store archive-now <table> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `table`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                        |
+| ---------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+
+### `kici-admin cold-store dry-run-archive`
+
+Show what would be archived (no S3 writes, no PG writes)
+
+Synopsis: `kici-admin cold-store dry-run-archive <table> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `table`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                        |
+| ---------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+| `--tenant <rk>`        |         | Scope to a single routing key                      |
+| `--from <date>`        |         | Lower bound on partition column (ISO date)         |
+| `--to <date>`          |         | Upper bound on partition column (ISO date)         |
+
+### `kici-admin cold-store list-chunks`
+
+List archived chunks (one JSON object per line) for a table
+
+Synopsis: `kici-admin cold-store list-chunks <table> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `table`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                                   |
+| ---------------------- | ------- | ------------------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)            |
+| `--missing-data`       |         | Only list chunks whose data file is missing in object storage |
+| `--missing-manifest`   |         | Only list chunks whose manifest is missing in object storage  |
+| `--tenant <rk>`        |         | Scope to a single routing key                                 |
+| `--from <date>`        |         | Lower bound on partition column (ISO date)                    |
+| `--to <date>`          |         | Upper bound on partition column (ISO date)                    |
+
+### `kici-admin cold-store list-purgeable`
+
+Phase 2: list chunks past their cold-retention horizon (read-only)
+
+Synopsis: `kici-admin cold-store list-purgeable [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)    |
+| `--table <table>`      |         | Filter to a single adapter table (else all)           |
+| `--bucket <bucket>`    |         | Filter to a single cold-bucket (30d / 180d / 1y / 2y) |
+| `--limit <n>`          | `1000`  | Max candidates to inspect                             |
+
+### `kici-admin cold-store peek-chunk`
+
+Stream the first N rows of a chunk to stdout (for debugging)
+
+Synopsis: `kici-admin cold-store peek-chunk <chunkId> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `chunkId` | yes      | no       |             |
+
+**Options**
+
+| Option                          | Default | Description                                        |
+| ------------------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>`          |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+| `--table <table>`               |         | Adapter table name                                 |
+| `--tenant <rk>`                 |         | Routing key for the chunk                          |
+| `--partition-date <YYYY-MM-DD>` |         | Partition date for the chunk                       |
+| `--limit <n>`                   | `10`    | Number of rows to print                            |
+
+### `kici-admin cold-store purge-now`
+
+Phase 2: purge expired chunks from S3 + PG bookkeeping. DRY-RUN by default — pass --apply to actually delete.
+
+Synopsis: `kici-admin cold-store purge-now [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)    |
+| `--table <table>`      |         | Filter to a single adapter table (else all)           |
+| `--bucket <bucket>`    |         | Filter to a single cold-bucket (30d / 180d / 1y / 2y) |
+| `--limit <n>`          | `1000`  | Max candidates to process                             |
+| `--apply`              |         | Actually delete (default is dry-run)                  |
+
+### `kici-admin cold-store reconcile`
+
+Walk S3 prefix and rebuild missing manifests from data files
+
+Synopsis: `kici-admin cold-store reconcile <table> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `table`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                             |
+| ---------------------- | ------- | ------------------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)      |
+| `--tenant <rk>`        |         | Scope to a single routing key                           |
+| `--confirm-cleanup`    |         | Also delete chunk_counts rows whose S3 objects are gone |
+
+### `kici-admin cold-store replay-chunk`
+
+Re-run UPDATE+DELETE+audit for a chunk that landed in S3 but not in PG
+
+Synopsis: `kici-admin cold-store replay-chunk <chunkId> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `chunkId` | yes      | no       |             |
+
+**Options**
+
+| Option                          | Default | Description                                        |
+| ------------------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>`          |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+| `--table <table>`               |         | Adapter table name                                 |
+| `--tenant <rk>`                 |         | Routing key for the chunk                          |
+| `--partition-date <YYYY-MM-DD>` |         | Partition date for the chunk                       |
+
+### `kici-admin cold-store replay-into-pg`
+
+Phase F: promote every row in a chunk BACK into orchestrator PG (clear archived_at, write replay audit)
+
+Synopsis: `kici-admin cold-store replay-into-pg <chunkId> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `chunkId` | yes      | no       |             |
+
+**Options**
+
+| Option                          | Default | Description                                        |
+| ------------------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>`          |         | Orchestrator Postgres URL (else KICI_DATABASE_URL) |
+| `--table <table>`               |         | Adapter table name (currently: execution_runs)     |
+| `--tenant <rk>`                 |         | Routing key for the chunk                          |
+| `--partition-date <YYYY-MM-DD>` |         | Partition date for the chunk                       |
+
+### `kici-admin cold-store verify-chunk`
+
+Recompute the gzipped contentHash for a chunk and compare to its manifest
+
+Synopsis: `kici-admin cold-store verify-chunk <chunkId> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `chunkId` | yes      | no       |             |
+
+**Options**
+
+| Option                          | Default | Description                                         |
+| ------------------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>`          |         | Orchestrator Postgres URL (else KICI_DATABASE_URL)  |
+| `--table <table>`               |         | Adapter table name (chunkId is unique within table) |
+| `--tenant <rk>`                 |         | Routing key for the chunk (from list-chunks output) |
+| `--partition-date <YYYY-MM-DD>` |         | Partition date (from list-chunks output)            |
+
+### `kici-admin config`
+
+Manage orchestrator configuration
+
+Synopsis: `kici-admin config`
+
+### `kici-admin config delete`
+
+Remove a field from the shared config
+
+Synopsis: `kici-admin config delete <path> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `path`   | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                      |
+| ---------------------- | ------- | -------------------------------- |
+| `--description <desc>` |         | Change description               |
+| `--format <format>`    | `json`  | Output format: json\|yaml\|table |
+
+### `kici-admin config diff`
+
+Compare local YAML config vs shared DB config
+
+Synopsis: `kici-admin config diff [options]`
+
+**Options**
+
+| Option              | Default | Description                      |
+| ------------------- | ------- | -------------------------------- |
+| `--format <format>` | `table` | Output format: json\|yaml\|table |
+
+### `kici-admin config export`
+
+Export shared config (sensitive values redacted)
+
+Synopsis: `kici-admin config export [options]`
+
+**Options**
+
+| Option              | Default | Description               |
+| ------------------- | ------- | ------------------------- |
+| `--format <format>` | `yaml`  | Output format: json\|yaml |
+
+### `kici-admin config get`
+
+Get current effective config (merged local + shared + env)
+
+Synopsis: `kici-admin config get [path] [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `path`   | no       | no       |             |
+
+**Options**
+
+| Option              | Default | Description                      |
+| ------------------- | ------- | -------------------------------- |
+| `--format <format>` | `json`  | Output format: json\|yaml\|table |
+
+### `kici-admin config history`
+
+Show config version history
+
+Synopsis: `kici-admin config history [options]`
+
+**Options**
+
+| Option              | Default | Description                      |
+| ------------------- | ------- | -------------------------------- |
+| `--limit <n>`       | `20`    | Maximum versions to show         |
+| `--format <format>` | `table` | Output format: json\|yaml\|table |
+
+### `kici-admin config init`
+
+Generate a starter orchestrator.yaml with commented defaults
+
+Synopsis: `kici-admin config init [options]`
+
+**Options**
+
+| Option            | Default               | Description      |
+| ----------------- | --------------------- | ---------------- |
+| `--output <path>` | `./orchestrator.yaml` | Output file path |
+
+### `kici-admin config reload`
+
+Trigger config reload across the cluster
+
+Synopsis: `kici-admin config reload [options]`
+
+**Options**
+
+| Option                   | Default | Description                           |
+| ------------------------ | ------- | ------------------------------------- |
+| `--drain`                |         | Drain in-flight work before reloading |
+| `--target <instance-id>` |         | Target specific instance              |
+| `--format <format>`      | `json`  | Output format: json\|yaml\|table      |
+
+### `kici-admin config rollback`
+
+Rollback shared config to a specific version
+
+Synopsis: `kici-admin config rollback [options]`
+
+**Options**
+
+| Option              | Default | Description                      |
+| ------------------- | ------- | -------------------------------- |
+| `--to <version>`    |         | Target version number            |
+| `--format <format>` | `json`  | Output format: json\|yaml\|table |
+
+### `kici-admin config seed`
+
+Bulk import shared config from a YAML file
+
+Synopsis: `kici-admin config seed [options]`
+
+**Options**
+
+| Option                 | Default | Description                      |
+| ---------------------- | ------- | -------------------------------- |
+| `--file <path>`        |         | Path to YAML config file         |
+| `--description <desc>` |         | Change description               |
+| `--format <format>`    | `json`  | Output format: json\|yaml\|table |
+
+### `kici-admin config set`
+
+Set a single field in the shared config
+
+Synopsis: `kici-admin config set <path> <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `path`   | yes      | no       |             |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                      |
+| ---------------------- | ------- | -------------------------------- |
+| `--description <desc>` |         | Change description               |
+| `--format <format>`    | `json`  | Output format: json\|yaml\|table |
+
+### `kici-admin config validate`
+
+Validate a config file against schema
+
+Synopsis: `kici-admin config validate [options]`
+
+**Options**
+
+| Option              | Default  | Description                                      |
+| ------------------- | -------- | ------------------------------------------------ |
+| `--file <path>`     |          | Path to config file                              |
+| `--type <type>`     | `shared` | Schema type: local\|shared\|full                 |
+| `--offline`         |          | Validate locally without contacting orchestrator |
+| `--format <format>` | `json`   | Output format: json\|yaml\|table                 |
+
+### `kici-admin context`
+
+Context management (dual-mode)
+
+Synopsis: `kici-admin context`
+
+### `kici-admin context bind`
+
+Upsert a context_bindings row (scope_pattern → context)
+
+Synopsis: `kici-admin context bind [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                   |
+| ---------------------- | ------- | ----------------------------------------------------------------------------- |
+| `--org <id>`           |         | Org ID                                                                        |
+| `--env <name>`         |         | Context name                                                                  |
+| `--scope <pattern>`    |         | Scope pattern (e.g. "staging" or "aws/prod/\*\*")                             |
+| `--host <pattern>`     | `**`    | Host selector (exact/glob/regex over agentId/host/labels); "\*\*" = all hosts |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)                           |
+| `--json`               |         | Emit JSON output                                                              |
+
+### `kici-admin context create`
+
+Upsert a context (idempotent by org+name)
+
+Synopsis: `kici-admin context create [options]`
+
+**Options**
+
+| Option                         | Default | Description                                                                     |
+| ------------------------------ | ------- | ------------------------------------------------------------------------------- |
+| `--org <id>`                   |         | Org ID                                                                          |
+| `--name <name>`                |         | Context name                                                                    |
+| `--type <t>`                   | `fixed` | Context type (fixed\|glob\|template)                                            |
+| `--glob-pattern <pattern>`     |         | Glob pattern matched against declared context names (required with --type glob) |
+| `--enabled <bool>`             | `true`  | Enabled flag (true\|false)                                                      |
+| `--branch-restrictions <json>` |         | JSON array of allowed branches (e.g. '["main"]')                                |
+| `--required-reviewers <csv>`   |         | CSV of required reviewer user IDs (or empty to clear)                           |
+| `--wait-timer <seconds>`       |         | Wait timer before release (seconds)                                             |
+| `--hold-expiry <seconds>`      |         | Hold expiry TTL (seconds)                                                       |
+| `--minimum-trust <level>`      |         | Minimum trust (known\|trusted)                                                  |
+| `--database-url <url>`         |         | Use direct DB access instead of HTTP (offline mode)                             |
+| `--json`                       |         | Emit JSON output                                                                |
+
+### `kici-admin context create-template`
+
+Create or update a context template + its seed variables
+
+Synopsis: `kici-admin context create-template [options]`
+
+**Options**
+
+| Option                         | Default    | Description                                             |
+| ------------------------------ | ---------- | ------------------------------------------------------- |
+| `--org <id>`                   |            | Org ID                                                  |
+| `--template <name>`            |            | Template name                                           |
+| `--type <t>`                   | `template` | Context type (defaults to "template")                   |
+| `--branch-restrictions <json>` |            | JSON array of allowed branches                          |
+| `--required-reviewers <csv>`   |            | CSV of required reviewer user IDs                       |
+| `--wait-timer <seconds>`       |            | Wait timer (seconds)                                    |
+| `--hold-expiry <seconds>`      |            | Hold expiry TTL (seconds)                               |
+| `--minimum-trust <level>`      |            | Minimum trust (known\|trusted)                          |
+| `--variables <json>`           |            | JSON object of env variables to seed (e.g. '{"K":"V"}') |
+| `--database-url <url>`         |            | Use direct DB access instead of HTTP (offline mode)     |
+| `--json`                       |            | Emit JSON output                                        |
+
+### `kici-admin context delete`
+
+Delete a context (cascades bindings, variables, overrides; held-run history survives; pending held runs block with a clear error, resolved holds do not)
+
+Synopsis: `kici-admin context delete [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--org <id>`           |         | Org ID                                              |
+| `--name <name>`        |         | Context name                                        |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin context list`
+
+List contexts for an org
+
+Synopsis: `kici-admin context list [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--org <id>`           |         | Org ID                                              |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin context purge`
+
+Delete all contexts (and held runs) for an org — direct-DB break-glass / warm-start reset
+
+Synopsis: `kici-admin context purge [options]`
+
+**Options**
+
+| Option                 | Default | Description                                             |
+| ---------------------- | ------- | ------------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access (or KICI_DATABASE_URL)             |
+| `--org <id>`           |         | Restrict purge to a single org (omit to purge all orgs) |
+| `--json`               |         | Emit JSON output                                        |
+
+### `kici-admin context set-policy`
+
+Update policy fields on a context (only provided fields change)
+
+Synopsis: `kici-admin context set-policy [options]`
+
+**Options**
+
+| Option                           | Default | Description                                           |
+| -------------------------------- | ------- | ----------------------------------------------------- |
+| `--org <id>`                     |         | Org ID                                                |
+| `--env <name>`                   |         | Context name                                          |
+| `--branch-restrictions <json>`   |         | JSON array of allowed branches                        |
+| `--required-reviewers <csv>`     |         | CSV of required reviewer user IDs (empty to clear)    |
+| `--wait-timer <seconds>`         |         | Wait timer before release (seconds)                   |
+| `--hold-expiry <seconds>`        |         | Hold expiry TTL (seconds)                             |
+| `--minimum-trust <level>`        |         | Minimum trust (known\|trusted, or "null" to clear)    |
+| `--enabled <bool>`               |         | Enabled flag (true\|false)                            |
+| `--allow-local-execution <bool>` |         | Allow CLI/test runs to resolve this env (true\|false) |
+| `--database-url <url>`           |         | Use direct DB access instead of HTTP (offline mode)   |
+| `--json`                         |         | Emit JSON output                                      |
+
+### `kici-admin context show`
+
+Show a single context with variables + bindings
+
+Synopsis: `kici-admin context show [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--org <id>`           |         | Org ID                                              |
+| `--name <name>`        |         | Context name                                        |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin db`
+
+Database management
+
+Synopsis: `kici-admin db`
+
+### `kici-admin db check-schema`
+
+Compare bundled migrations vs live schema. Exit 2 on drift.
+
+Synopsis: `kici-admin db check-schema [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--json`               | `false` | Emit JSON instead of a human-readable line            |
+
+### `kici-admin db collation-check`
+
+Compare pg_database.datcollversion against the running libc collation version. Exit 2 on drift.
+
+Synopsis: `kici-admin db collation-check [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--json`               | `false` | Emit JSON instead of a human-readable line            |
+
+### `kici-admin db create-readonly-user`
+
+Create a read-only role with SELECT on all tables + default privileges
+
+Synopsis: `kici-admin db create-readonly-user [options]`
+
+**Options**
+
+| Option                  | Default | Description                           |
+| ----------------------- | ------- | ------------------------------------- |
+| `--database-url <url>`  |         | Target DB URL (must connect as owner) |
+| `--user <name>`         |         | Read-only role name                   |
+| `--password <password>` |         | Role password                         |
+
+### `kici-admin db create-role`
+
+CREATE / ALTER ROLE with LOGIN [+ CREATEDB] (idempotent)
+
+Synopsis: `kici-admin db create-role [options]`
+
+**Options**
+
+| Option                  | Default | Description                                          |
+| ----------------------- | ------- | ---------------------------------------------------- |
+| `--database-url <url>`  |         | Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--user <name>`         |         | Role name to create or update                        |
+| `--password <password>` |         | Role password (raw — quote as needed)                |
+| `--createdb`            | `false` | Grant CREATEDB to the new role                       |
+
+### `kici-admin db ensure`
+
+CREATE DATABASE IF NOT EXISTS (idempotent)
+
+Synopsis: `kici-admin db ensure <name> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | yes      | no       |             |
+
+**Options**
+
+| Option                        | Default | Description                                                                                                                                       |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--database-url <url>`        |         | Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL)                                                                                              |
+| `--owner <role>`              |         | DB owner role (default: URL user). Pass when the admin connection is privileged but the new DB should be owned by a separate non-privileged role. |
+| `--revoke-connect-public`     |         | After ensure, REVOKE CONNECT ON DATABASE "<name>" FROM PUBLIC (recommended on shared clusters).                                                   |
+| `--grant-connect-role <role>` |         | After ensure (and any --revoke-connect-public), GRANT CONNECT ON DATABASE "<name>" TO "<role>". Repeatable.                                       |
+
+### `kici-admin db fresh`
+
+DROP + CREATE the orchestrator DB, run migrations, record content hash
+
+Synopsis: `kici-admin db fresh [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                 |
+| ---------------------- | ------- | ----------------------------------------------------------- |
+| `--database-url <url>` |         | Target database URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--confirm`            |         | Explicit confirmation (destructive)                         |
+| `--yes`                |         | Skip interactive confirmation (for scripted use)            |
+
+### `kici-admin db migrate`
+
+Run pending database migrations (via orchestrator HTTP admin API)
+
+Synopsis: `kici-admin db migrate [options]`
+
+**Options**
+
+| Option     | Default | Description                            |
+| ---------- | ------- | -------------------------------------- |
+| `--status` |         | Show migration status without applying |
+
+### `kici-admin db refresh-collation-version`
+
+ALTER DATABASE <db> REFRESH COLLATION VERSION. Metadata-only bump; pair with db reindex after a libc-base image rebuild.
+
+Synopsis: `kici-admin db refresh-collation-version [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--reason <text>`      |         | Reason (recorded in stderr banner)                    |
+
+### `kici-admin db reindex`
+
+REINDEX DATABASE CONCURRENTLY <db>. Rebuilds every index under the running libc collation rules. Non-blocking but takes minutes + ~2× temp disk.
+
+Synopsis: `kici-admin db reindex [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--confirm`            |         | Explicit confirmation (destructive — long-running)    |
+| `--reason <text>`      |         | Reason (recorded in stderr banner)                    |
+
+### `kici-admin debug-bundle`
+
+Generate a diagnostic debug bundle ZIP for troubleshooting
+
+Synopsis: `kici-admin debug-bundle [options]`
+
+**Options**
+
+| Option                      | Default                      | Description                                                                                                   |
+| --------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `-o, --output <path>`       | `kici-debug-<timestamp>.zip` | Output ZIP file path                                                                                          |
+| `--log-dir <path>`          |                              | Directory with rotated \*.log files to include (defaults to $KICI_LOG_DIR)                                    |
+| `--log-window <hours>`      | `4`                          | Hours of log history to include in the bundle                                                                 |
+| `--fleet`                   |                              | Collect logs from every node in the cluster (server-side fan-out)                                             |
+| `--list`                    |                              | With --fleet: print the fleet topology and exit (no collection)                                               |
+| `--json`                    |                              | With --fleet --list: emit the topology as JSON                                                                |
+| `--pick [selectors]`        |                              | With --fleet: comma-separated selectors (id/host\*/label:k=v); bare flag opens an interactive picker on a TTY |
+| `--fleet-timeout <seconds>` | `60`                         | Per-node deadline for --fleet                                                                                 |
+
+### `kici-admin diagnose`
+
+Run diagnostic health checks on the orchestrator
+
+Synopsis: `kici-admin diagnose [options]`
+
+**Options**
+
+| Option   | Default | Description                                |
+| -------- | ------- | ------------------------------------------ |
+| `--json` |         | Output raw JSON instead of formatted table |
+
+### `kici-admin event`
+
+Internal event emission (kici_events)
+
+Synopsis: `kici-admin event`
+
+### `kici-admin event emit`
+
+INSERT a row into kici_events and fire pg_notify — simulates agent ctx.emit() for e2e tests
+
+Synopsis: `kici-admin event emit <name> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `name`   | yes      | no       |             |
+
+**Options**
+
+| Option                     | Default | Description                                                       |
+| -------------------------- | ------- | ----------------------------------------------------------------- |
+| `--payload-file <path>`    |         | Path to JSON file whose contents become the event payload         |
+| `--source-routing-key <k>` |         | Source routing key for cross-repo event matching (default: empty) |
+| `--source-repo <r>`        |         | Source repo identifier for cross-repo matching (default: empty)   |
+| `--database-url <url>`     |         | Use direct DB access instead of HTTP (offline mode)               |
+| `--json`                   | `false` | Emit JSON output { eventId } on stdout                            |
+
+### `kici-admin event-dlq`
+
+Inspect / retry / discard events in the DLQ (at-least-once delivery)
+
+Synopsis: `kici-admin event-dlq`
+
+### `kici-admin event-dlq count`
+
+Print the total number of events in the DLQ
+
+Synopsis: `kici-admin event-dlq count`
+
+### `kici-admin event-dlq discard`
+
+Permanently delete an event from the DLQ
+
+Synopsis: `kici-admin event-dlq discard <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin event-dlq list`
+
+List events currently in the DLQ (most recent first)
+
+Synopsis: `kici-admin event-dlq list [options]`
+
+**Options**
+
+| Option           | Default | Description                                          |
+| ---------------- | ------- | ---------------------------------------------------- |
+| `--limit <n>`    | `50`    | Max rows (default 50, max 200)                       |
+| `--before <iso>` |         | Cursor: list events with dlq_at < this ISO timestamp |
+| `--json`         | `false` | Print raw JSON instead of a formatted table          |
+
+### `kici-admin event-dlq retry`
+
+Clear the DLQ flag, reset attempts, and schedule the event for immediate retry
+
+Synopsis: `kici-admin event-dlq retry <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin event-log`
+
+Inspect the inbound webhook delivery log
+
+Synopsis: `kici-admin event-log`
+
+### `kici-admin event-log list`
+
+List inbound webhook deliveries (dogfooded via /api/v1/admin/event-log)
+
+Synopsis: `kici-admin event-log list [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                                              |
+| ------------------------ | ------- | ---------------------------------------------------------------------------------------- |
+| `--org <orgId>`          |         | Filter by org/tenant ID                                                                  |
+| `--routing-key <key>`    |         | Filter by routing key (e.g. github:42)                                                   |
+| `--event <type>`         |         | Filter by event type (e.g. push, pull_request)                                           |
+| `--action <action>`      |         | Filter by event action (e.g. opened, closed, synchronize for pull_request)               |
+| `--status <s>`           |         | Filter by outcome status (received\|processed\|duplicate\|lockfile_missing\|failed)      |
+| `--from <ts>`            |         | ISO timestamp lower bound (inclusive)                                                    |
+| `--to <ts>`              |         | ISO timestamp upper bound (exclusive)                                                    |
+| `--delivery-id <substr>` |         | Substring filter on delivery_id                                                          |
+| `--limit <n>`            | `50`    | Max results (default 50, max 200)                                                        |
+| `--offset <n>`           | `0`     | Skip first N results                                                                     |
+| `--include-archived`     |         | Merge cold-store archived rows into the result (requires --routing-key for cold scoping) |
+| `--json`                 |         | Emit raw JSON instead of a table                                                         |
+
+### `kici-admin event-log show`
+
+Show a single delivery (optionally including the payload body)
+
+Synopsis: `kici-admin event-log show <deliveryId> [options]`
+
+**Arguments**
+
+| Argument     | Required | Variadic | Description |
+| ------------ | -------- | -------- | ----------- |
+| `deliveryId` | yes      | no       |             |
+
+**Options**
+
+| Option                | Default | Description                                                     |
+| --------------------- | ------- | --------------------------------------------------------------- |
+| `--org <orgId>`       |         | Org/tenant ID for the delivery                                  |
+| `--include-payload`   |         | Also fetch the payload body (requires event_log.read_payload)   |
+| `--routing-key <key>` |         | Routing key hint for cold-store fallback (scopes the cold scan) |
+| `--json`              |         | Emit raw JSON instead of formatted output                       |
+
+### `kici-admin execution`
+
+Execution data maintenance
+
+Synopsis: `kici-admin execution`
+
+### `kici-admin execution list`
+
+List execution_runs (read-only)
+
+Synopsis: `kici-admin execution list [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--routing-key <k>`    |         | Filter by routing_key                               |
+| `--status <s>`         |         | Filter by status                                    |
+| `--workflow-name <n>`  |         | Filter by workflow_name                             |
+| `--limit <n>`          |         | Max rows to return (default 100, max 1000)          |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin execution purge-stale`
+
+DELETE execution_runs/jobs whose routing_key differs from the current cluster
+
+Synopsis: `kici-admin execution purge-stale [options]`
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--routing-key <key>`  |         | Current routing key to preserve                     |
+| `--confirm`            |         | Explicit confirmation flag                          |
+
+### `kici-admin execution show`
+
+Show one run + its jobs (by run_id)
+
+Synopsis: `kici-admin execution show <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin firecracker`
+
+Provision and verify Firecracker host networking
+
+Synopsis: `kici-admin firecracker`
+
+### `kici-admin firecracker provision`
+
+Create/heal a Firecracker host bridge (NAT + egress isolation)
+
+Synopsis: `kici-admin firecracker provision [options]`
+
+**Options**
+
+| Option                 | Default | Description                                             |
+| ---------------------- | ------- | ------------------------------------------------------- |
+| `--bridge <name>`      |         | bridge interface name (e.g. kici-br0)                   |
+| `--cidr <cidr>`        |         | gateway IP + prefix (e.g. 10.0.0.1/24)                  |
+| `--table <name>`       | `kici`  | nft table name                                          |
+| `--host-iface <iface>` |         | NAT egress interface (auto-detected if omitted)         |
+| `--persist`            |         | install a systemd oneshot so the bridge survives reboot |
+| `--sudo`               |         | wrap privileged commands with sudo -n (non-root host)   |
+
+### `kici-admin firecracker teardown`
+
+Remove a Firecracker host bridge + its nft table (leaves NM conf in place)
+
+Synopsis: `kici-admin firecracker teardown [options]`
+
+**Options**
+
+| Option            | Default     | Description                                            |
+| ----------------- | ----------- | ------------------------------------------------------ |
+| `--bridge <name>` |             | bridge interface name                                  |
+| `--cidr <cidr>`   | `0.0.0.0/0` | gateway IP + prefix (unused but accepted for symmetry) |
+| `--table <name>`  | `kici`      | nft table name                                         |
+| `--sudo`          |             | wrap privileged commands with sudo -n                  |
+
+### `kici-admin firecracker verify`
+
+Check a Firecracker host bridge is up with its addr + nft table
+
+Synopsis: `kici-admin firecracker verify [options]`
+
+**Options**
+
+| Option            | Default | Description                           |
+| ----------------- | ------- | ------------------------------------- |
+| `--bridge <name>` |         | bridge interface name                 |
+| `--cidr <cidr>`   |         | gateway IP + prefix                   |
+| `--table <name>`  | `kici`  | nft table name                        |
+| `--sudo`          |         | wrap privileged commands with sudo -n |
+
+### `kici-admin host`
+
+Inspect and declare the host roster
+
+Synopsis: `kici-admin host`
+
+### `kici-admin host declare`
+
+Pre-declare a static host before it connects
+
+Synopsis: `kici-admin host declare [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                              |
+| ------------------------ | ------- | ------------------------------------------------------------------------ |
+| `--agent-id <id>`        |         | Agent id the host will register as                                       |
+| `--labels <labels>`      |         | Comma-separated labels                                                   |
+| `--hostname <name>`      |         | Hostname                                                                 |
+| `--prop <key=value>`     |         | Typed host property (repeatable; true/false ⇒ boolean, numeric ⇒ number) |
+| `--address <host>`       |         | Pre-agent SSH reach address (IP / hostname) for bootstrap                |
+| `--ssh-user <user>`      |         | SSH login user for bootstrap bring-up                                    |
+| `--ssh-port <port>`      |         | SSH port for bootstrap bring-up                                          |
+| `--ssh-key-secret <ref>` |         | Scoped-secret ref (scope/key) holding the bring-up private key           |
+
+### `kici-admin host get`
+
+Show one roster host
+
+Synopsis: `kici-admin host get [options]`
+
+**Options**
+
+| Option            | Default | Description |
+| ----------------- | ------- | ----------- |
+| `--agent-id <id>` |         | Agent id    |
+| `--json`          |         | Output JSON |
+
+### `kici-admin host list`
+
+List all roster hosts
+
+Synopsis: `kici-admin host list [options]`
+
+**Options**
+
+| Option   | Default | Description |
+| -------- | ------- | ----------- |
+| `--json` |         | Output JSON |
+
+### `kici-admin host remove`
+
+Remove a host from the roster
+
+Synopsis: `kici-admin host remove [options]`
+
+**Options**
+
+| Option            | Default | Description        |
+| ----------------- | ------- | ------------------ |
+| `--agent-id <id>` |         | Agent id to remove |
+
+### `kici-admin inspect-bundle`
+
+Parse and display a structured summary of a debug bundle
+
+Synopsis: `kici-admin inspect-bundle <path>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `path`   | yes      | no       |             |
+
+### `kici-admin join`
+
+Join an existing orchestrator cluster using a join token
+
+Synopsis: `kici-admin join [options]`
+
+**Options**
+
+| Option             | Default                    | Description                                                              |
+| ------------------ | -------------------------- | ------------------------------------------------------------------------ |
+| `--token <token>`  |                            | Join token (kici_join_v1.<routing>.<secret>)                             |
+| `--platform <url>` |                            | Platform WebSocket URL for relay mode (e.g., wss://platform.kici.dev/ws) |
+| `--peer <url>`     |                            | Peer HTTP URL for direct mode (e.g., https://orch-1:8080)                |
+| `--api-key <key>`  |                            | API key for Platform authentication (required for --platform mode)       |
+| `--config <path>`  | `./kici-orchestrator.yaml` | Path to write the resulting local config YAML                            |
+
+### `kici-admin orchestrator`
+
+Manage orchestrator service installation and lifecycle
+
+Synopsis: `kici-admin orchestrator`
+
+### `kici-admin orchestrator install`
+
+Install the orchestrator as a system service
+
+Synopsis: `kici-admin orchestrator install [options]`
+
+**Options**
+
+| Option                  | Default             | Description                                                                                                          |
+| ----------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `--platform <type>`     |                     | Service platform (systemd, launchd, windows, compose)                                                                |
+| `--env-file <path>`     |                     | Path to existing env/config file to use                                                                              |
+| `--binary <path>`       |                     | Path to orchestrator binary (default: current executable)                                                            |
+| `--dev`                 |                     | Dev mode: spin up PostgreSQL container on port 15432                                                                 |
+| `--wizard`              |                     | Interactive wizard for guided setup                                                                                  |
+| `--name <name>`         | `kici-orchestrator` | Service name                                                                                                         |
+| `--system`              |                     | Install as system-level service (requires root)                                                                      |
+| `--user-level`          |                     | Install as user-level service (no root required)                                                                     |
+| `--user <name>`         |                     | Run the service as the named user (system-level launchd only; sets UserName in plist so the daemon drops privileges) |
+| `--instance-dir <path>` |                     | Deploy folder; the instance manifest is written here (default: current working directory)                            |
+| `--force`               |                     | Overwrite an existing same-named foreign instance                                                                    |
+
+### `kici-admin orchestrator logs`
+
+Tail and follow orchestrator service logs
+
+Synopsis: `kici-admin orchestrator logs [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance whose logs to read         |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+| `--since <duration>`    |         | Show logs since duration (e.g. 1h, 30m)                  |
+| `--level <level>`       |         | Filter by log level (error\|warn\|info)                  |
+| `--json`                |         | Output as structured JSON                                |
+| `--no-follow`           |         | Snapshot mode (do not tail)                              |
+
+### `kici-admin orchestrator restart`
+
+Restart the orchestrator service
+
+Synopsis: `kici-admin orchestrator restart [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to restart                 |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin orchestrator start`
+
+Start the orchestrator service
+
+Synopsis: `kici-admin orchestrator start [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to start                   |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin orchestrator status`
+
+Show orchestrator service status and health information
+
+Synopsis: `kici-admin orchestrator status [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to inspect                 |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+| `--json`                |         | Output as JSON                                           |
+
+### `kici-admin orchestrator stop`
+
+Stop the orchestrator service
+
+Synopsis: `kici-admin orchestrator stop [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to stop                    |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin orchestrator uninstall`
+
+Remove the orchestrator service registration
+
+Synopsis: `kici-admin orchestrator uninstall [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd, launchd, windows, compose)    |
+| `--instance-dir <path>` |         | Deploy folder of the instance to uninstall               |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)    |
+| `--system`              |         | Operate against the system-level service (requires root) |
+| `--user-level`          |         | Operate against the user-level service                   |
+
+### `kici-admin orchestrator upgrade`
+
+Upgrade orchestrator to a new version using versioned directory layout
+
+Synopsis: `kici-admin orchestrator upgrade [options]`
+
+**Options**
+
+| Option                  | Default | Description                                           |
+| ----------------------- | ------- | ----------------------------------------------------- |
+| `--platform <type>`     |         | Service platform (systemd\|launchd\|windows\|compose) |
+| `--instance-dir <path>` |         | Deploy folder of the instance to upgrade              |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD) |
+| `--from <path>`         |         | Path to package archive (.tar.gz or .zip)             |
+| `--url <url>`           |         | URL to download package archive from                  |
+| `--version <version>`   |         | Target version string (e.g., 0.3.0)                   |
+| `--yes`                 |         | Skip confirmation prompt                              |
+| `--force`               |         | Overwrite existing versioned directory                |
+| `--cleanup`             |         | Remove old versions (keeps current and previous)      |
+| `--rollback`            |         | Roll back to the previous version                     |
+| `--pick`                |         | Interactively pick an installed version to activate   |
+
+### `kici-admin org-settings`
+
+Manage org-level security settings
+
+Synopsis: `kici-admin org-settings`
+
+### `kici-admin org-settings allow-http-npm`
+
+Permit plain http:// npm registry URLs in workflow registries:. Default false; loopback / \*.local are always allowed regardless.
+
+Synopsis: `kici-admin org-settings allow-http-npm <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings approval`
+
+Manage the per-org held-approval expiry + self-approval policy
+
+Synopsis: `kici-admin org-settings approval`
+
+### `kici-admin org-settings approval set-expiry`
+
+Set the per-org held-approval expiry (integer seconds, >= 1)
+
+Synopsis: `kici-admin org-settings approval set-expiry <seconds> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `seconds` | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings approval set-self-approval`
+
+Allow or forbid a run triggerer approving its own held elements (true|false)
+
+Synopsis: `kici-admin org-settings approval set-self-approval <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings approval show`
+
+Print the current per-org approval policy
+
+Synopsis: `kici-admin org-settings approval show [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings dashboard-writes`
+
+Manage per-orch dashboard write policy (which Platform-routed dashboard.\* writes the orch accepts)
+
+Synopsis: `kici-admin org-settings dashboard-writes`
+
+### `kici-admin org-settings dashboard-writes reset`
+
+Reset all operations to enabled (permissive default).
+
+Synopsis: `kici-admin org-settings dashboard-writes reset [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings dashboard-writes set`
+
+Set one or more operations. Use --op <name>=<true|false> per operation. Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
+
+Synopsis: `kici-admin org-settings dashboard-writes set [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                              |
+| ---------------------- | ------- | ---------------------------------------------------------------------------------------- |
+| `--customer-id <id>`   |         | Customer / org id (alias: --org)                                                         |
+| `--org <id>`           |         | Alias for --customer-id                                                                  |
+| `--op <op=bool>`       |         | Single operation flip; repeatable (e.g. --op secrets.set=false --op variables.set=false) |
+| `--category <name>`    |         | Apply --enabled to every operation in this category                                      |
+| `--sensitivity <name>` |         | Apply --enabled to every operation in this sensitivity bucket                            |
+| `--enabled <bool>`     |         | Pair with --category or --sensitivity to flip the whole group                            |
+| `--format <format>`    | `table` | Output format: json\|table                                                               |
+
+### `kici-admin org-settings dashboard-writes show`
+
+Print current dashboard-write policy. Empty = all enabled.
+
+Synopsis: `kici-admin org-settings dashboard-writes show [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                                                    |
+| ---------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
+| `--customer-id <id>`   |         | Customer / org id (alias: --org)                                                                               |
+| `--org <id>`           |         | Alias for --customer-id                                                                                        |
+| `--category <name>`    |         | Filter to one category (Secrets\|Variables\|Environments\|Bindings\|"Held runs"\|DLQ\|Registrations\|Topology) |
+| `--sensitivity <name>` |         | Filter to one sensitivity bucket (plaintext\|authority\|dispatch)                                              |
+| `--format <format>`    | `table` | Output format: json\|table                                                                                     |
+
+### `kici-admin org-settings dispatch-ack`
+
+Manage the per-org dispatch-acknowledgment deadline (null = cluster default)
+
+Synopsis: `kici-admin org-settings dispatch-ack`
+
+### `kici-admin org-settings dispatch-ack reset`
+
+Clear the per-org dispatch-ack deadline override (fall back to the cluster default)
+
+Synopsis: `kici-admin org-settings dispatch-ack reset [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings dispatch-ack set`
+
+Set the per-org dispatch-acknowledgment deadline (integer milliseconds, >= 1000)
+
+Synopsis: `kici-admin org-settings dispatch-ack set <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings dispatch-ack show`
+
+Print the current per-org dispatch-acknowledgment deadline
+
+Synopsis: `kici-admin org-settings dispatch-ack show [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings global-workflows`
+
+Manage per-org global workflow policy
+
+Synopsis: `kici-admin org-settings global-workflows`
+
+### `kici-admin org-settings global-workflows allow-add`
+
+Add a glob pattern to the workflow-author allow-list. Use --source to qualify the entry to one webhook source.
+
+Synopsis: `kici-admin org-settings global-workflows allow-add <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                |
+| ----------------------- | ------- | -------------------------------------------------------------------------- |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
+| `--org <id>`            |         | Alias for --customer-id                                                    |
+| `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
+| `--format <format>`     | `table` | Output format: json\|table                                                 |
+
+### `kici-admin org-settings global-workflows allow-remove`
+
+Remove a glob pattern from the workflow-author allow-list. Use --source to target a source-qualified entry.
+
+Synopsis: `kici-admin org-settings global-workflows allow-remove <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                    |
+| ----------------------- | ------- | ------------------------------------------------------------------------------ |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
+| `--org <id>`            |         | Alias for --customer-id                                                        |
+| `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
+| `--format <format>`     | `table` | Output format: json\|table                                                     |
+
+### `kici-admin org-settings global-workflows deny-add`
+
+Add a glob pattern to the source-repo deny-list. Use --source to qualify the entry to one webhook source.
+
+Synopsis: `kici-admin org-settings global-workflows deny-add <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                |
+| ----------------------- | ------- | -------------------------------------------------------------------------- |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
+| `--org <id>`            |         | Alias for --customer-id                                                    |
+| `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
+| `--format <format>`     | `table` | Output format: json\|table                                                 |
+
+### `kici-admin org-settings global-workflows deny-remove`
+
+Remove a glob pattern from the source-repo deny-list. Use --source to target a source-qualified entry.
+
+Synopsis: `kici-admin org-settings global-workflows deny-remove <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                    |
+| ----------------------- | ------- | ------------------------------------------------------------------------------ |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
+| `--org <id>`            |         | Alias for --customer-id                                                        |
+| `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
+| `--format <format>`     | `table` | Output format: json\|table                                                     |
+
+### `kici-admin org-settings global-workflows elevate-add`
+
+Add a glob pattern to the elevated-access list. Use --source to qualify the entry to one webhook source.
+
+Synopsis: `kici-admin org-settings global-workflows elevate-add <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                |
+| ----------------------- | ------- | -------------------------------------------------------------------------- |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                           |
+| `--org <id>`            |         | Alias for --customer-id                                                    |
+| `--source <routingKey>` |         | Pin the entry to one webhook source (e.g. github:42). Omit for any source. |
+| `--format <format>`     | `table` | Output format: json\|table                                                 |
+
+### `kici-admin org-settings global-workflows elevate-remove`
+
+Remove a glob pattern from the elevated-access list. Use --source to target a source-qualified entry.
+
+Synopsis: `kici-admin org-settings global-workflows elevate-remove <pattern> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `pattern` | yes      | no       |             |
+
+**Options**
+
+| Option                  | Default | Description                                                                    |
+| ----------------------- | ------- | ------------------------------------------------------------------------------ |
+| `--customer-id <id>`    |         | Customer / org id (alias: --org)                                               |
+| `--org <id>`            |         | Alias for --customer-id                                                        |
+| `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
+| `--format <format>`     | `table` | Output format: json\|table                                                     |
+
+### `kici-admin org-settings global-workflows set-enabled`
+
+Toggle the master enable switch (true|false)
+
+Synopsis: `kici-admin org-settings global-workflows set-enabled <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings global-workflows show`
+
+Print current global workflow settings for an org
+
+Synopsis: `kici-admin org-settings global-workflows show [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings user-cache`
+
+Manage per-org user-facing cache quota + entry TTL (null = cluster default)
+
+Synopsis: `kici-admin org-settings user-cache`
+
+### `kici-admin org-settings user-cache reset-quota`
+
+Clear the per-org user-cache quota override (fall back to the cluster default)
+
+Synopsis: `kici-admin org-settings user-cache reset-quota [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings user-cache reset-ttl`
+
+Clear the per-org user-cache ttl override (fall back to the cluster default)
+
+Synopsis: `kici-admin org-settings user-cache reset-ttl [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings user-cache set-quota`
+
+Set the per-org user-cache quota (positive integer bytes)
+
+Synopsis: `kici-admin org-settings user-cache set-quota <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings user-cache set-ttl`
+
+Set the per-org user-cache ttl (positive integer milliseconds)
+
+Synopsis: `kici-admin org-settings user-cache set-ttl <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings user-cache show`
+
+Print the current per-org user-cache quota + TTL settings
+
+Synopsis: `kici-admin org-settings user-cache show [options]`
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin peer`
+
+Manage peer tokens and credentials
+
+Synopsis: `kici-admin peer`
+
+### `kici-admin peer create-token`
+
+Create a join token for a new peer
+
+Synopsis: `kici-admin peer create-token [options]`
+
+**Options**
+
+| Option                   | Default       | Description                                                       |
+| ------------------------ | ------------- | ----------------------------------------------------------------- |
+| `--role <role>`          | `coordinator` | Peer role (worker or coordinator)                                 |
+| `--expiry-hours <hours>` | `1`           | Token expiry in hours                                             |
+| `--org-id <id>`          | `default`     | Organization ID                                                   |
+| `--routing-key <key>`    | `default`     | Routing key                                                       |
+| `--created-by <actor>`   | `cli`         | Attribution written to join_tokens.created_by                     |
+| `--json`                 | `false`       | Emit JSON { token, role, expiresAt, orgId, routingKey } on stdout |
+
+### `kici-admin peer list`
+
+List active peer credentials
+
+Synopsis: `kici-admin peer list`
+
+### `kici-admin peer prune-credentials`
+
+DELETE peer_credentials rows whose instance_id does NOT LIKE <filter> (direct-DB only, destructive). Used by cluster e2e to wipe stale staging peer credentials while leaving e2e-\* peers intact. HTTP mode is intentionally unsupported: the call site is a warm-deploy preflight run while the orchestrator is stopped, mirroring peer reset-raft-state.
+
+Synopsis: `kici-admin peer prune-credentials [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                                   |
+| ---------------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `--filter <pattern>`   |         | SQL LIKE pattern for instance_ids to KEEP (e.g. "e2e-%"). Rows that do NOT match are deleted. |
+| `--database-url <url>` |         | Use direct DB access (offline mode, required)                                                 |
+| `--json`               | `false` | Emit JSON { deleted } on stdout                                                               |
+
+### `kici-admin peer reset-raft-state`
+
+DELETE all rows from raft_state so a freshly-started orchestrator self-elects with a clean term (direct-DB only, destructive)
+
+Synopsis: `kici-admin peer reset-raft-state [options]`
+
+**Options**
+
+| Option                 | Default | Description                                   |
+| ---------------------- | ------- | --------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access (offline mode, required) |
+| `--json`               | `false` | Emit JSON { rowsDeleted } on stdout           |
+
+### `kici-admin peer revoke`
+
+Revoke a peer credential by instance ID
+
+Synopsis: `kici-admin peer revoke [options]`
+
+**Options**
+
+| Option               | Default | Description                       |
+| -------------------- | ------- | --------------------------------- |
+| `--instance-id <id>` |         | Instance ID of the peer to revoke |
+
+### `kici-admin peer revoke-all`
+
+Revoke all active peer credentials
+
+Synopsis: `kici-admin peer revoke-all [options]`
+
+**Options**
+
+| Option      | Default | Description                                |
+| ----------- | ------- | ------------------------------------------ |
+| `--confirm` |         | Confirm revocation of all peer credentials |
+
+### `kici-admin queue`
+
+Dispatch queue maintenance
+
+Synopsis: `kici-admin queue`
+
+### `kici-admin queue clear`
+
+TRUNCATE the dispatch_queue table (destructive)
+
+Synopsis: `kici-admin queue clear [options]`
+
+**Options**
+
+| Option                 | Default | Description                                             |
+| ---------------------- | ------- | ------------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)     |
+| `--confirm`            |         | Explicit confirmation flag                              |
+| `--yes`                |         | Skip interactive confirmation prompt (for scripted use) |
+
+### `kici-admin queue list`
+
+List dispatch_queue entries (read-only)
+
+Synopsis: `kici-admin queue list [options]`
+
+**Options**
+
+| Option                          | Default | Description                                                   |
+| ------------------------------- | ------- | ------------------------------------------------------------- |
+| `--status <s>`                  |         | Filter by exact status (pending\|dispatched\|...)             |
+| `--status-not-in <csv>`         |         | Filter status NOT IN (CSV; e.g. "completed,failed,cancelled") |
+| `--job-name-prefix <p>`         |         | Filter by job_name prefix                                     |
+| `--job-name <name>`             |         | Filter by exact job_name match                                |
+| `--job-name-not-like <pattern>` |         | Exclude job_name LIKE pattern (e.g. "**build**%")             |
+| `--workflow-name <n>`           |         | Filter by exact workflow_name                                 |
+| `--created-after <iso>`         |         | Filter created_at > <ISO timestamp>                           |
+| `--limit <n>`                   |         | Max rows to return (default 100, max 1000)                    |
+| `--database-url <url>`          |         | Use direct DB access instead of HTTP (offline mode)           |
+| `--json`                        |         | Emit JSON output                                              |
+
+### `kici-admin queue show`
+
+Show a single dispatch_queue row by id
+
+Synopsis: `kici-admin queue show <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin registration`
+
+Registered workflow instance read (workflow_registrations table)
+
+Synopsis: `kici-admin registration`
+
+### `kici-admin registration list`
+
+List workflow_registrations rows (also returns registry_version)
+
+Synopsis: `kici-admin registration list [options]`
+
+**Options**
+
+| Option                  | Default | Description                                         |
+| ----------------------- | ------- | --------------------------------------------------- |
+| `--org <id>`            |         | Filter by customer_id                               |
+| `--routing-key <k>`     |         | Filter by routing_key                               |
+| `--repo <ident>`        |         | Filter by repo_identifier                           |
+| `--trigger-type <type>` |         | Filter by trigger type (in trigger_types[])         |
+| `--limit <n>`           |         | Max rows (default 100, max 1000)                    |
+| `--database-url <url>`  |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`                |         | Emit JSON output                                    |
+
+### `kici-admin registration show`
+
+Show a single workflow_registrations row by id
+
+Synopsis: `kici-admin registration show <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                         |
+| ---------------------- | ------- | --------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`               |         | Emit JSON output                                    |
+
+### `kici-admin remote-source`
+
+Inspect the auto-provisioned remote-source org anchor
+
+Synopsis: `kici-admin remote-source`
+
+### `kici-admin remote-source show`
+
+Print the remote_sources anchor row for an org (routing key remote:<orgId>).
+
+Synopsis: `kici-admin remote-source show <orgId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+
+**Options**
+
+| Option                 | Default | Description                                  |
+| ---------------------- | ------- | -------------------------------------------- |
+| `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL) |
+| `--format <format>`    | `table` | Output format: json\|table                   |
+
+### `kici-admin rotate-key`
+
+Rotate the master encryption key (re-encrypts scoped_secrets and config_versions)
+
+Synopsis: `kici-admin rotate-key`
+
+### `kici-admin runs`
+
+Inspect execution runs, jobs, and steps
+
+Synopsis: `kici-admin runs`
+
+### `kici-admin runs ephemeral-key`
+
+Show whether the run-ephemeral key has been scrubbed yet
+
+Synopsis: `kici-admin runs ephemeral-key <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description                         |
+| -------- | ------- | ----------------------------------- |
+| `--json` |         | Emit raw JSON instead of plain text |
+
+### `kici-admin runs jobs`
+
+List jobs for a run (dogfooded via /api/v1/admin/runs/:runId/jobs)
+
+Synopsis: `kici-admin runs jobs <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option            | Default | Description                                     |
+| ----------------- | ------- | ----------------------------------------------- |
+| `--include-steps` |         | Embed step list inside each job (default false) |
+| `--json`          |         | Emit raw JSON instead of a table                |
+
+### `kici-admin runs list`
+
+List execution runs (dogfooded via /api/v1/admin/runs)
+
+Synopsis: `kici-admin runs list [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                                                  |
+| ------------------------ | ------- | -------------------------------------------------------------------------------------------- |
+| `--status <statuses>`    |         | Filter by run status. Accepts a single value or a comma-separated list (e.g. success,failed) |
+| `--workflow-name <name>` |         | Filter by workflow name                                                                      |
+| `--repo <ownerRepo>`     |         | Filter by repo identifier (owner/repo)                                                       |
+| `--since <iso8601>`      |         | Only include runs with created_at strictly later than this ISO-8601 timestamp                |
+| `--count`                |         | Return only the count of matching runs, skipping the row listing                             |
+| `--limit <n>`            | `20`    | Max results (default 20, max 100)                                                            |
+| `--offset <n>`           | `0`     | Skip first N results                                                                         |
+| `--json`                 |         | Emit raw JSON instead of a table                                                             |
+
+### `kici-admin runs secret-outputs`
+
+List per-job secret outputs (masked by default; --reveal decrypts and audits)
+
+Synopsis: `kici-admin runs secret-outputs <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                                                                                                     |
+| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
+| `--output-key <key>` |         | Filter to a single output_key                                                                                   |
+| `--reveal`           |         | Decrypt and print plaintext values. Audited with actor=secret-outputs.reveal; requires secret.reveal permission |
+| `--json`             |         | Emit raw JSON instead of a table                                                                                |
+
+### `kici-admin runs show`
+
+Show run detail with jobs and steps
+
+Synopsis: `kici-admin runs show <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description                               |
+| -------- | ------- | ----------------------------------------- |
+| `--json` |         | Emit raw JSON instead of formatted output |
+
+### `kici-admin runs structured`
+
+Show the provenance-tagged structured run result (agent read path; /structured)
+
+Synopsis: `kici-admin runs structured <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description                                                 |
+| -------- | ------- | ----------------------------------------------------------- |
+| `--json` |         | Emit the raw AgentRunResult (untrusted envelopes preserved) |
+
+### `kici-admin scaler`
+
+Scaler maintenance (local, no orchestrator)
+
+Synopsis: `kici-admin scaler`
+
+### `kici-admin scaler reap-orphans`
+
+Free leaked Firecracker/container resources without a running orchestrator
+
+Synopsis: `kici-admin scaler reap-orphans [options]`
+
+**Options**
+
+| Option            | Default | Description                                                                           |
+| ----------------- | ------- | ------------------------------------------------------------------------------------- |
+| `--config <path>` |         | Path to the orchestrator config (default: KICI_CONFIG or /etc/kici/orchestrator.yaml) |
+| `--force`         | `false` | Reap even if the local orchestrator reports healthy                                   |
+| `--json`          | `false` | Emit machine-readable JSON counts                                                     |
+
+### `kici-admin secret`
+
+Manage scoped secrets
+
+Synopsis: `kici-admin secret`
+
+### `kici-admin secret delete`
+
+Delete a secret
+
+Synopsis: `kici-admin secret delete <orgId> <scope> <key> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+| `scope`  | yes      | no       |             |
+| `key`    | yes      | no       |             |
+
+**Options**
+
+| Option  | Default | Description              |
+| ------- | ------- | ------------------------ |
+| `--yes` |         | Skip confirmation prompt |
+
+### `kici-admin secret list`
+
+List secret key names in a scope (values are never shown)
+
+Synopsis: `kici-admin secret list <orgId> <scope>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+| `scope`  | yes      | no       |             |
+
+### `kici-admin secret purge`
+
+Bulk-delete scoped_secrets. Irreversible — pair with rotate-key for recovery.
+
+Synopsis: `kici-admin secret purge [options]`
+
+**Options**
+
+| Option                 | Default | Description                                             |
+| ---------------------- | ------- | ------------------------------------------------------- |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)     |
+| `--confirm`            |         | Explicit confirmation flag                              |
+| `--org <orgId>`        |         | Restrict to a single org (defaults to ALL orgs)         |
+| `--yes`                |         | Skip interactive confirmation prompt (for scripted use) |
+
+### `kici-admin secret scopes`
+
+List secret scopes for an organization
+
+Synopsis: `kici-admin secret scopes <orgId>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | yes      | no       |             |
+
+### `kici-admin secret set`
+
+Set a secret value. Positional form: "set <orgId> <scope> <key>". Sugar form (context scope): "set --org <id> --context <env> --key <k>". Value comes from one of: --prompt (default on TTY), --from-stdin (default on pipe), --from-file <path>, --from-env <VAR>, --value <plaintext> (discouraged).
+
+Synopsis: `kici-admin secret set [orgId] [scope] [key] [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `orgId`  | no       | no       |             |
+| `scope`  | no       | no       |             |
+| `key`    | no       | no       |             |
+
+**Options**
+
+| Option                              | Default | Description                                                                                         |
+| ----------------------------------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `--value <value>`                   |         | Secret value via argv (visible in shell history; prefer --prompt)                                   |
+| `--org <orgId>`                     |         | Org ID (use with --context + --key; mutually exclusive with positional form)                        |
+| `--context <name>`                  |         | Context scope — sugar for positional <scope>. Requires --org and --key.                             |
+| `--key <key>`                       |         | Secret key name (use with --org + --context)                                                        |
+| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                                           |
+| `--from-stdin`                      |         | Read value from piped stdin until EOF                                                               |
+| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                                                   |
+| `--from-env <var>`                  |         | Read value from a named environment variable                                                        |
+| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once)                            |
+| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string                                   |
+| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write                                |
+| `--database-url <url>`              |         | Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption) |
+
+### `kici-admin source`
+
+Manage webhook sources
+
+Synopsis: `kici-admin source`
+
+### `kici-admin source add`
+
+Add a new webhook source
+
+Synopsis: `kici-admin source add`
+
+### `kici-admin source add generic`
+
+Add a new generic webhook source
+
+Synopsis: `kici-admin source add generic [options]`
+
+**Options**
+
+| Option                                | Default | Description                                                                                                 |
+| ------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `--org <orgId>`                       |         | Organization/customer ID                                                                                    |
+| `--name <name>`                       |         | Human-readable source name                                                                                  |
+| `--verification <method>`             |         | Verification method: hmac_sha256, bearer_token, ip_allowlist, none                                          |
+| `--secret <value>`                    |         | Verification secret (HMAC secret or bearer token, prefix with @ for file)                                   |
+| `--from-env <varName>`                |         | Read verification secret from environment variable                                                          |
+| `--stdin`                             |         | Read verification secret from stdin                                                                         |
+| `--event-type-header <header>`        |         | Header name for event type extraction                                                                       |
+| `--event-type-path <jsonpath>`        |         | JSONPath for event type extraction from body                                                                |
+| `--idempotency-key-header <header>`   |         | Header name for idempotency key                                                                             |
+| `--idempotency-key-path <jsonpath>`   |         | JSONPath for idempotency key from body                                                                      |
+| `--dedup-window <seconds>`            |         | Dedup window in seconds (default: 300)                                                                      |
+| `--max-payload <bytes>`               |         | Maximum payload size in bytes (default: 1048576)                                                            |
+| `--allowed-events <events>`           |         | Comma-separated list of allowed event types                                                                 |
+| `--strip-headers <headers>`           |         | Comma-separated list of headers to strip                                                                    |
+| `--rate-limit <rpm>`                  |         | Rate limit in requests per minute (default: 600)                                                            |
+| `--preset <name>`                     |         | Universal-git preset: forgejo, gitea, gogs, gitlab-repo, github-repo, custom                                |
+| `--git-url-template <url>`            |         | Clone URL template with {owner}/{name}/{repo}                                                               |
+| `--credential-ref <key>`              |         | Secret key name (under **source**/<id> scope)                                                               |
+| `--credential-store <backend>`        |         | Secret backend name (default: pg)                                                                           |
+| `--credential-type <type>`            |         | Credential type: pat, basic, ssh                                                                            |
+| `--credential-user <user>`            |         | Username for PAT/basic auth (default: x-access-token)                                                       |
+| `--ssh-host-key-policy <policy>`      |         | SSH host-key policy: accept-new, pinned                                                                     |
+| `--ssh-known-hosts-pem <pathOrValue>` |         | Pinned SSH known_hosts (prefix with @ for file). Required when --ssh-host-key-policy=pinned                 |
+| `--provider-type <type>`              |         | Provider implementation: generic (default) or local (a git repo on the agent filesystem cloned via file://) |
+| `--json`                              |         | Emit raw JSON (the full source row) instead of formatted text                                               |
+
+### `kici-admin source add github`
+
+Add a new GitHub App source
+
+Synopsis: `kici-admin source add github [options]`
+
+**Options**
+
+| Option                        | Default | Description                                                                                                                                                                        |
+| ----------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--name <name>`               |         | Human-readable source name                                                                                                                                                         |
+| `--app-id <id>`               |         | GitHub App ID (omit when using --manifest)                                                                                                                                         |
+| `--private-key <pathOrValue>` |         | Private key (prefix with @ for file path)                                                                                                                                          |
+| `--webhook-secret <secret>`   |         | Webhook secret                                                                                                                                                                     |
+| `--from-env <varName>`        |         | Read private key from environment variable                                                                                                                                         |
+| `--stdin`                     |         | Read private key from stdin                                                                                                                                                        |
+| `--manifest`                  |         | One-click setup: create and configure a new GitHub App via the App Manifest flow                                                                                                   |
+| `--no-browser`                |         | Headless manifest setup: print a URL and paste the setup code back                                                                                                                 |
+| `--github-org <slug>`         |         | Create the App under a GitHub org instead of your personal account                                                                                                                 |
+| `--webhook-url <url>`         |         | Advanced/self-hosted: bake this https:// URL into the App webhook verbatim and skip platform-mode URL resolution. KiCI adds no ingress at this URL — your own infra owns delivery. |
+| `--json`                      |         | Emit raw JSON (the API response) instead of formatted text                                                                                                                         |
+
+### `kici-admin source add local`
+
+Register a git repo present on the agent filesystem as a file:// source
+
+Synopsis: `kici-admin source add local [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                                                                      |
+| ------------------------ | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--org <orgId>`          |         | Organization/customer ID                                                                                         |
+| `--path <dir>`           |         | Absolute path to the repo (or base dir of repos) on the agent filesystem                                         |
+| `--name <name>`          | `local` | Human-readable source name                                                                                       |
+| `--clone-url-base <url>` |         | Optional git://\|http:// base for remote agents that do not share the orchestrator filesystem (default: file://) |
+| `--json`                 |         | Emit raw JSON (the full source row) instead of formatted text                                                    |
+
+### `kici-admin source disable`
+
+Disable a generic webhook source
+
+Synopsis: `kici-admin source disable <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin source enable`
+
+Enable a generic webhook source
+
+Synopsis: `kici-admin source enable <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin source get`
+
+Get details of a generic webhook source
+
+Synopsis: `kici-admin source get <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option   | Default | Description                                                   |
+| -------- | ------- | ------------------------------------------------------------- |
+| `--json` |         | Emit raw JSON (the full source row) instead of formatted text |
+
+### `kici-admin source get-webhook-secret`
+
+Get the webhook secret for a source (for GitHub webhook configuration)
+
+Synopsis: `kici-admin source get-webhook-secret <routingKey>`
+
+**Arguments**
+
+| Argument     | Required | Variadic | Description |
+| ------------ | -------- | -------- | ----------- |
+| `routingKey` | yes      | no       |             |
+
+### `kici-admin source install-hook`
+
+Install a post-receive hook in the local source repo that triggers runs on push
+
+Synopsis: `kici-admin source install-hook <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option             | Default                 | Description                                  |
+| ------------------ | ----------------------- | -------------------------------------------- |
+| `--repo <path>`    |                         | Repo path (default: the source repoBasePath) |
+| `--base-url <url>` | `http://localhost:8080` | Orchestrator base URL                        |
+
+### `kici-admin source list`
+
+List all configured sources (GitHub and generic)
+
+Synopsis: `kici-admin source list [options]`
+
+**Options**
+
+| Option              | Default | Description                                                               |
+| ------------------- | ------- | ------------------------------------------------------------------------- |
+| `--org <orgId>`     |         | Filter generic sources by organization ID                                 |
+| `--include-deleted` |         | Include soft-deleted generic sources                                      |
+| `--json`            |         | Emit raw JSON ({github: [...], generic: [...]}) instead of formatted text |
+
+### `kici-admin source list-presets`
+
+List built-in universal-git presets (forge shapes supported out of the box)
+
+Synopsis: `kici-admin source list-presets [options]`
+
+**Options**
+
+| Option              | Default | Description                |
+| ------------------- | ------- | -------------------------- |
+| `--format <format>` | `table` | Output format: table\|json |
+
+### `kici-admin source purge-stale`
+
+DELETE sources + scoped secrets whose routing_key differs from the current cluster
+
+Synopsis: `kici-admin source purge-stale [options]`
+
+**Options**
+
+| Option                 | Default | Description                                            |
+| ---------------------- | ------- | ------------------------------------------------------ |
+| `--database-url <url>` |         | Use direct DB access instead of HTTP (offline mode)    |
+| `--routing-key <key>`  |         | Current routing key to preserve                        |
+| `--dry-run`            | `false` | Count stale rows without deleting them                 |
+| `--confirm`            |         | Explicit confirmation flag (required unless --dry-run) |
+
+### `kici-admin source refresh`
+
+Re-sync a GitHub source's name and slug from GitHub (use --all for every source)
+
+Synopsis: `kici-admin source refresh [routingKey] [options]`
+
+**Arguments**
+
+| Argument     | Required | Variadic | Description |
+| ------------ | -------- | -------- | ----------- |
+| `routingKey` | no       | no       |             |
+
+**Options**
+
+| Option   | Default | Description                             |
+| -------- | ------- | --------------------------------------- |
+| `--all`  |         | Refresh every GitHub source             |
+| `--json` |         | Emit raw JSON instead of formatted text |
+
+### `kici-admin source remove`
+
+Remove a source (GitHub, or generic/local with --generic / --local)
+
+Synopsis: `kici-admin source remove <routingKey> [options]`
+
+**Arguments**
+
+| Argument     | Required | Variadic | Description |
+| ------------ | -------- | -------- | ----------- |
+| `routingKey` | yes      | no       |             |
+
+**Options**
+
+| Option      | Default | Description                                                               |
+| ----------- | ------- | ------------------------------------------------------------------------- |
+| `--yes`     |         | Skip confirmation                                                         |
+| `--generic` |         | Remove a generic source (routingKey is treated as source ID)              |
+| `--local`   |         | Remove a local (file://) source (routingKey is treated as source ID)      |
+| `--hard`    |         | Permanently delete a generic/local source (requires --generic or --local) |
+
+### `kici-admin source trigger-local`
+
+Trigger a run against a local source (reads HEAD when --ref/--sha omitted)
+
+Synopsis: `kici-admin source trigger-local <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option                    | Default                 | Description                               |
+| ------------------------- | ----------------------- | ----------------------------------------- |
+| `--event <event>`         | `push`                  | push \| pull_request                      |
+| `--ref <ref>`             |                         | Git ref (default: repo HEAD branch)       |
+| `--sha <sha>`             |                         | Commit SHA (default: repo HEAD)           |
+| `--repo-full-name <name>` | `local/repo`            | owner/name identifier used in the payload |
+| `--base-url <url>`        | `http://localhost:8080` | Orchestrator base URL                     |
+
+### `kici-admin source update`
+
+Update a GitHub source
+
+Synopsis: `kici-admin source update <routingKey> [options]`
+
+**Arguments**
+
+| Argument     | Required | Variadic | Description |
+| ------------ | -------- | -------- | ----------- |
+| `routingKey` | yes      | no       |             |
+
+**Options**
+
+| Option                        | Default | Description                                                        |
+| ----------------------------- | ------- | ------------------------------------------------------------------ |
+| `--name <name>`               |         | New name                                                           |
+| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                           |
+| `--webhook-secret <secret>`   |         | New webhook secret                                                 |
+| `--from-env <varName>`        |         | Read new private key from environment variable                     |
+| `--stdin`                     |         | Read new private key from stdin                                    |
+| `--customer-id <orgId>`       |         | Update the customer/org ID used for secret and environment scoping |
+
+### `kici-admin source update-generic`
+
+Update a generic webhook source
+
+Synopsis: `kici-admin source update-generic <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option                                | Default | Description                                                                                                 |
+| ------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
+| `--name <name>`                       |         | New name                                                                                                    |
+| `--verification <method>`             |         | Verification method: hmac_sha256, bearer_token, ip_allowlist, none                                          |
+| `--secret <value>`                    |         | New verification secret (prefix with @ for file)                                                            |
+| `--from-env <varName>`                |         | Read verification secret from environment variable                                                          |
+| `--stdin`                             |         | Read verification secret from stdin                                                                         |
+| `--event-type-header <header>`        |         | Header name for event type extraction                                                                       |
+| `--event-type-path <jsonpath>`        |         | JSONPath for event type extraction from body                                                                |
+| `--idempotency-key-header <header>`   |         | Header name for idempotency key                                                                             |
+| `--idempotency-key-path <jsonpath>`   |         | JSONPath for idempotency key from body                                                                      |
+| `--dedup-window <seconds>`            |         | Dedup window in seconds                                                                                     |
+| `--max-payload <bytes>`               |         | Maximum payload size in bytes                                                                               |
+| `--allowed-events <events>`           |         | Comma-separated list of allowed event types                                                                 |
+| `--strip-headers <headers>`           |         | Comma-separated list of headers to strip                                                                    |
+| `--rate-limit <rpm>`                  |         | Rate limit in requests per minute                                                                           |
+| `--preset <name>`                     |         | Universal-git preset                                                                                        |
+| `--git-url-template <url>`            |         | Clone URL template                                                                                          |
+| `--credential-ref <key>`              |         | Secret key name                                                                                             |
+| `--credential-store <backend>`        |         | Secret backend name                                                                                         |
+| `--credential-type <type>`            |         | Credential type: pat, basic, ssh                                                                            |
+| `--credential-user <user>`            |         | Username for PAT/basic auth                                                                                 |
+| `--ssh-host-key-policy <policy>`      |         | SSH host-key policy: accept-new, pinned                                                                     |
+| `--ssh-known-hosts-pem <pathOrValue>` |         | Pinned SSH known_hosts (prefix with @ for file)                                                             |
+| `--clear-git-config`                  |         | Revert this source back to a payload-only generic webhook                                                   |
+| `--provider-type <type>`              |         | Provider implementation: generic (default) or local (a git repo on the agent filesystem cloned via file://) |
+| `--json`                              |         | Emit raw JSON (the full source row) instead of formatted text                                               |
+
+### `kici-admin source update-local`
+
+Update a local filesystem (file://) source
+
+Synopsis: `kici-admin source update-local <id> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+**Options**
+
+| Option                   | Default | Description                                                   |
+| ------------------------ | ------- | ------------------------------------------------------------- |
+| `--name <name>`          |         | New name                                                      |
+| `--path <dir>`           |         | New absolute repo base path on the agent filesystem           |
+| `--clone-url-base <url>` |         | New git://\|http:// clone base (default: file://)             |
+| `--json`                 |         | Emit raw JSON (the full source row) instead of formatted text |
+
+### `kici-admin token`
+
+Manage admin API tokens
+
+Synopsis: `kici-admin token`
+
+### `kici-admin token create`
+
+Create a new admin API token
+
+Synopsis: `kici-admin token create <label> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `label`  | yes      | no       |             |
+
+**Options**
+
+| Option                | Default | Description                                                                                                                                                                                |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--role <role>`       |         | Token role (owner, admin, auditor)                                                                                                                                                         |
+| `--routing-key <key>` |         | Restrict the token to a single source routing key (e.g. "github:42"). The token can only act on requests targeting that routing key. Without this, the token has full orchestrator access. |
+
+### `kici-admin token list`
+
+List all admin API tokens
+
+Synopsis: `kici-admin token list`
+
+### `kici-admin token revoke`
+
+Revoke an admin API token
+
+Synopsis: `kici-admin token revoke <id>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `id`     | yes      | no       |             |
+
+### `kici-admin variable`
+
+Manage context variables
+
+Synopsis: `kici-admin variable`
+
+### `kici-admin variable delete`
+
+Delete a context variable
+
+Synopsis: `kici-admin variable delete <orgId> <context> <key> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `orgId`   | yes      | no       |             |
+| `context` | yes      | no       |             |
+| `key`     | yes      | no       |             |
+
+**Options**
+
+| Option  | Default | Description              |
+| ------- | ------- | ------------------------ |
+| `--yes` |         | Skip confirmation prompt |
+
+### `kici-admin variable get`
+
+Print the value of a single variable
+
+Synopsis: `kici-admin variable get <orgId> <context> <key>`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `orgId`   | yes      | no       |             |
+| `context` | yes      | no       |             |
+| `key`     | yes      | no       |             |
+
+### `kici-admin variable list`
+
+List org-level variables in a context
+
+Synopsis: `kici-admin variable list <orgId> <context> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `orgId`   | yes      | no       |             |
+| `context` | yes      | no       |             |
+
+**Options**
+
+| Option     | Default | Description                                                     |
+| ---------- | ------- | --------------------------------------------------------------- |
+| `--values` |         | Print variable values inline (default: keys + locked flag only) |
+
+### `kici-admin variable set`
+
+Set a context variable. Value comes from one of: --prompt (default on TTY), --from-stdin (default on pipe), --from-file <path>, --from-env <VAR>, --value <plaintext> (discouraged).
+
+Synopsis: `kici-admin variable set <orgId> <context> <key> [options]`
+
+**Arguments**
+
+| Argument  | Required | Variadic | Description |
+| --------- | -------- | -------- | ----------- |
+| `orgId`   | yes      | no       |             |
+| `context` | yes      | no       |             |
+| `key`     | yes      | no       |             |
+
+**Options**
+
+| Option                              | Default | Description                                                              |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------ |
+| `--value <value>`                   |         | Variable value via argv (visible in shell history)                       |
+| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                |
+| `--from-stdin`                      |         | Read value from piped stdin until EOF                                    |
+| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                        |
+| `--from-env <var>`                  |         | Read value from a named environment variable                             |
+| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once) |
+| `--locked`                          |         | Mark the variable as locked (source overrides cannot replace it)         |
+| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string        |
+| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write     |
+
+### `kici-admin workflow`
+
+Inspect workflow registrations
+
+Synopsis: `kici-admin workflow`
+
+### `kici-admin workflow list`
+
+List workflow registrations (dogfooded via /api/v1/admin/registrations)
+
+Synopsis: `kici-admin workflow list [options]`
+
+**Options**
+
+| Option                  | Default | Description                                              |
+| ----------------------- | ------- | -------------------------------------------------------- |
+| `--org <orgId>`         |         | Filter by customer/org id (server param: customerId)     |
+| `--routing-key <key>`   |         | Filter by routing key, e.g. github:42                    |
+| `--repo <ownerRepo>`    |         | Filter by repo identifier (owner/repo)                   |
+| `--trigger-type <type>` |         | Filter by trigger type, e.g. webhook, push, schedule     |
+| `--event <eventName>`   |         | Filter by webhook event name (scans lock_entry.triggers) |
+| `--json`                |         | Emit raw JSON instead of a table                         |
+
+### `kici-admin workflow register-manual`
+
+Manually upsert workflow_registrations rows from a lock file + bump registry_versions. Transactional. Used by E2E helpers that seed registrations without a real push event.
+
+Synopsis: `kici-admin workflow register-manual [options]`
+
+**Options**
+
+| Option                      | Default | Description                                              |
+| --------------------------- | ------- | -------------------------------------------------------- |
+| `--lock-file <path>`        |         | Path to a kici.lock.json file                            |
+| `--repo <ident>`            |         | repo_identifier value (e.g. "owner/repo")                |
+| `--routing-key <key>`       |         | Routing key for the source (e.g. "github:42")            |
+| `--customer <id>`           |         | customer_id (org) to attribute rows to                   |
+| `--provider-context <json>` | `{}`    | Provider-specific context as a JSON object (default: {}) |
+| `--commit-sha <sha>`        |         | Optional commit SHA stamped on each row                  |
+| `--database-url <url>`      |         | Use direct DB access instead of HTTP (offline mode)      |
+| `--json`                    |         | Emit JSON output                                         |
+
+<!-- END GENERATED: kici-admin-commands -->
+
+## Command guide
+
+Per-namespace explanations, synopses, and worked examples. For the authoritative argument/option signatures, see the [command reference](#command-reference) above.
+
 ### access-log -- read / admin-mutation attribution log
 
 ```bash
@@ -103,32 +3209,6 @@ kici-admin access-log show <id> [--json]
 ```
 
 Operator-facing read access to the orchestrator's `access_log` table — every read / admin-mutation attributed to an `ActorPrincipal` (user, api_key, service_account, platform_operator, system). Dogfood replacement for raw `psql` when an operator asks "who read this run's payload last Tuesday" or "show me everything a platform_operator actor did".
-
-**access-log list:**
-
-| Option          | Default | Description                                                                                    |
-| --------------- | ------- | ---------------------------------------------------------------------------------------------- |
-| `--org-id`      |         | Filter by org/tenant ID                                                                        |
-| `--actor-type`  |         | Filter by actor type (`user` / `api_key` / `service_account` / `platform_operator` / `system`) |
-| `--actor-id`    |         | Filter by actor id (zsub, keyId, service_account id, ...)                                      |
-| `--action`      |         | Filter by dotted action (e.g. `run.detail.read`, `run.cancel`)                                 |
-| `--source`      |         | Filter by source (`platform_proxy` / `admin_http` / `admin_cli`)                               |
-| `--outcome`     |         | Filter by outcome (`allowed` / `denied` / `error`)                                             |
-| `--target-type` |         | Filter by target type (`run` / `step` / `event_log` / `secret_scope` / ...)                    |
-| `--target-id`   |         | Filter by target id                                                                            |
-| `--from`        |         | ISO timestamp lower bound (inclusive)                                                          |
-| `--to`          |         | ISO timestamp upper bound (exclusive)                                                          |
-| `--q`           |         | Filter by substring of `error_message` (trigram-indexed full-text search)                      |
-| `--limit`       | `50`    | Max results (max 200)                                                                          |
-| `--cursor`      |         | Opaque cursor from a previous `nextCursor`                                                     |
-| `--json`        |         | Emit raw JSON instead of a table                                                               |
-
-**access-log show:**
-
-| Option   | Description                                   |
-| -------- | --------------------------------------------- |
-| `<id>`   | Access-log entry ID (required positional arg) |
-| `--json` | Emit raw JSON instead of formatted output     |
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
@@ -163,58 +3243,6 @@ kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--
 ```
 
 These commands manage the agent as a native system service. The `install --wizard` flow walks through orchestrator URL, agent token, and labels configuration. Lifecycle targeting is folder-anchored — see [Service installation guide](../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
-
-**Install options:**
-
-| Option                     | Default            | Description                                                                           |
-| -------------------------- | ------------------ | ------------------------------------------------------------------------------------- |
-| `--wizard`                 |                    | Interactive wizard for guided setup                                                   |
-| `--platform <type>`        | auto-detected      | Service platform: `systemd`, `launchd`, `windows`, `compose`                          |
-| `--env-file <path>`        |                    | Path to existing env/config file to use                                               |
-| `--binary <path>`          | current executable | Path to agent binary                                                                  |
-| `--name <name>`            | `kici-agent`       | Service name (also the per-instance directory segment under config/log/install roots) |
-| `--instance-dir <path>`    | current directory  | Deploy folder where `.kici-agent.json` is written and resolved from                   |
-| `--force`                  |                    | Overwrite a same-named instance already installed at a different `--instance-dir`     |
-| `--orchestrator-url <url>` |                    | URL of the orchestrator to connect to                                                 |
-| `--token <token>`          |                    | Agent authentication token                                                            |
-| `--labels <labels>`        |                    | Comma-separated agent labels for routing                                              |
-
-**Upgrade options (agent):**
-
-| Option                  | Default       | Description                                                               |
-| ----------------------- | ------------- | ------------------------------------------------------------------------- |
-| `--from <path>`         |               | Path to package archive (`.tar.gz` or `.zip`)                             |
-| `--url <url>`           |               | URL to download package archive from                                      |
-| `--version <version>`   |               | Target version string (e.g., `0.3.0`)                                     |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`              |
-| `--instance-dir <path>` |               | Deploy folder of the instance to upgrade                                  |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest)         |
-| `--yes`                 |               | Skip confirmation prompt                                                  |
-| `--force`               |               | Overwrite existing versioned directory                                    |
-| `--cleanup`             |               | Remove old versions (keeps current and previous)                          |
-| `--rollback`            |               | Roll back to the previous version                                         |
-| `--pick`                |               | Interactively pick an installed version to activate (switch, no download) |
-
-**Status options (agent):**
-
-| Option                  | Default       | Description                                                       |
-| ----------------------- | ------------- | ----------------------------------------------------------------- |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`      |
-| `--instance-dir <path>` |               | Deploy folder of the instance                                     |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest) |
-| `--json`                |               | Output as JSON                                                    |
-
-**Logs options (agent):**
-
-| Option                  | Default       | Description                                                       |
-| ----------------------- | ------------- | ----------------------------------------------------------------- |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`      |
-| `--instance-dir <path>` |               | Deploy folder of the instance                                     |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest) |
-| `--since <duration>`    |               | Show logs since duration (e.g., `1h`, `30m`)                      |
-| `--level <level>`       |               | Filter by log level: `error`, `warn`, `info`                      |
-| `--json`                |               | Output as structured JSON                                         |
-| `--no-follow`           |               | Snapshot mode (do not tail)                                       |
 
 Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `status`, `logs`) resolves its target through the priority chain `--instance-dir` > `--name` > manifest in the current working directory. A bare `kici-admin agent <cmd>` outside any deploy folder with no flags refuses non-zero and prints the candidate list of installed agent instances on the host.
 
@@ -261,6 +3289,24 @@ kici-admin attestations list [--run-id <id>] [--job-id <id>] [--limit <n>] [--js
 - Direct orchestrator DB read — no orchestrator HTTP call. The DB URL comes from
   `--database-url` or `KICI_DATABASE_URL` (else the orchestrator config).
 
+```bash
+kici-admin attestations retry [--run-id <id>] [--all-pending] [--include-rejected]
+```
+
+- `retry` mints deferred attestations now — it drains the pending-attestations
+  outbox (the rows a run left behind when its initial provenance mint could not
+  reach the signer). `--run-id` scopes to a single run; `--all-pending` (the
+  default when `--run-id` is absent) drains every pending row. `--include-rejected`
+  additionally re-arms rows previously marked terminally rejected (it clears the
+  terminal `rejected_at` marker so they mint again).
+- Unlike `list` / `reverify`, this goes through the orchestrator **admin HTTP
+  API**, so it requires an **unscoped** admin token holding the
+  `attestation.retry` permission — granted to the **owner** and **admin** roles
+  only, never to the read-only **auditor** role. Every retry writes an
+  `attestation.retry` `access_log` row (always audited) recording the actor,
+  `include_rejected`, the target run, and the `minted` / `still_pending` /
+  `rejected` counts — so a re-arm of a terminal rejection is never silent.
+
 ### audit -- secrets audit log
 
 ```bash
@@ -291,30 +3337,9 @@ Manages external secret backends (PostgreSQL or Vault/OpenBao) for multi-source 
 
 **Vault options** (for `add` and `test`):
 
-| Option             | Env var                  | Description                               |
-| ------------------ | ------------------------ | ----------------------------------------- |
-| `--vault-url`      | `KICI_BACKEND_VAULT_URL` | Vault/OpenBao URL (required)              |
-| `--auth-method`    |                          | `approle` (default) or `token`            |
-| `--role-id`        | `KICI_BACKEND_ROLE_ID`   | AppRole role ID (required for approle)    |
-| `--secret-id`      | `KICI_BACKEND_SECRET_ID` | AppRole secret ID (required for approle)  |
-| `--secret-id-file` |                          | Read secret ID from file (avoids history) |
-| `--token`          | `KICI_BACKEND_TOKEN`     | Vault token (required for token auth)     |
-| `--namespace`      |                          | Vault namespace                           |
-| `--mount-path`     |                          | Vault mount path (default: `secret`)      |
-| `--base-path`      |                          | Vault base path for secrets               |
-
 **PostgreSQL options** (for `add` and `test`):
 
-| Option                | Env var               | Description                     |
-| --------------------- | --------------------- | ------------------------------- |
-| `--connection-string` | `KICI_BACKEND_PG_URL` | PG connection string (required) |
-
 **Common options** (for `add`):
-
-| Option            | Default  | Description                        |
-| ----------------- | -------- | ---------------------------------- |
-| `--scope-filter`  | `**`     | Scope filter glob pattern          |
-| `--sync-interval` | `300000` | Sync interval in milliseconds (5m) |
 
 ### cluster -- cluster identity recovery (direct DB + S3)
 
@@ -489,14 +3514,14 @@ These rows fold into the command's exit code (0 pass / 1 warn / 2 fail) like eve
 ### environment -- environment management (dual-mode)
 
 ```bash
-kici-admin environment create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--database-url <url>] [--json]
-kici-admin environment bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
-kici-admin environment set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted|null] [--enabled true|false] [--database-url <url>] [--json]
-kici-admin environment list --org <id> [--database-url <url>] [--json]
-kici-admin environment show --org <id> --name <name> [--database-url <url>] [--json]
-kici-admin environment delete --org <id> --name <name> [--database-url <url>] [--json]
-kici-admin environment create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--variables <json>] [--database-url <url>] [--json]
-kici-admin environment purge [--org <id>] [--database-url <url>] [--json]
+kici-admin context create --org <id> --name <name> [--type fixed|glob|template] [--glob-pattern <pattern>] [--enabled true|false] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--database-url <url>] [--json]
+kici-admin context bind --org <id> --env <name> --scope <pattern> [--host <pattern>] [--database-url <url>] [--json]
+kici-admin context set-policy --org <id> --env <name> [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted|null] [--enabled true|false] [--database-url <url>] [--json]
+kici-admin context list --org <id> [--database-url <url>] [--json]
+kici-admin context show --org <id> --name <name> [--database-url <url>] [--json]
+kici-admin context delete --org <id> --name <name> [--database-url <url>] [--json]
+kici-admin context create-template --org <id> --template <name> [--type template] [--branch-restrictions <json>] [--required-reviewers <csv>] [--wait-timer <seconds>] [--hold-expiry <seconds>] [--minimum-trust known|trusted] [--variables <json>] [--database-url <url>] [--json]
+kici-admin context purge [--org <id>] [--database-url <url>] [--json]
 ```
 
 Seeds and mutates environment rows (plus their variables and scope bindings). Defaults to the orchestrator admin API; pass `--database-url` (or set `KICI_DATABASE_URL`) to run the SQL directly — used by E2E `globalSetup` helpers that need to seed envs before the orchestrator is up.
@@ -509,7 +3534,7 @@ Seeds and mutates environment rows (plus their variables and scope bindings). De
 - `create-template` creates/updates a template environment and seeds its variables in one call (`--variables '{"K":"V"}'`).
 - `purge` (direct-DB only) bulk-deletes every environment for an org (cascading bindings, variables, and overrides) and removes the org's held runs for a clean slate. Omit `--org` to clear all orgs. Destructive break-glass / test-reset verb with no orchestrator HTTP wire; requires `--database-url` (or `KICI_DATABASE_URL`). Reports `{ environmentsDeleted, heldRunsDeleted }` with `--json`.
 
-See [Environments](../environments.md) for the broader feature walkthrough.
+See [Contexts](../contexts.md) for the broader feature walkthrough.
 
 ### event -- internal event emission
 
@@ -548,32 +3573,6 @@ kici-admin event-log show <deliveryId> --org <orgId> [--include-payload] [--rout
 
 Operator-facing read access to the orchestrator's `event_log` table — every inbound webhook delivery (relay or direct) the orchestrator has seen, with metadata + a pointer to the gzipped payload in object storage.
 
-**event-log list:**
-
-| Option               | Default | Description                                                                                                     |
-| -------------------- | ------- | --------------------------------------------------------------------------------------------------------------- |
-| `--org`              |         | Filter by org/tenant ID                                                                                         |
-| `--routing-key`      |         | Filter by routing key (e.g. `github:42`)                                                                        |
-| `--event`            |         | Filter by event type (e.g. `push`, `pull_request`)                                                              |
-| `--status`           |         | Filter by outcome (`received` / `processed` / `duplicate` / `lockfile_missing` / `failed`)                      |
-| `--from`             |         | ISO timestamp lower bound (inclusive)                                                                           |
-| `--to`               |         | ISO timestamp upper bound (exclusive)                                                                           |
-| `--delivery-id`      |         | Substring filter on `delivery_id`                                                                               |
-| `--limit`            | `50`    | Max results (max 200)                                                                                           |
-| `--offset`           | `0`     | Skip first N results                                                                                            |
-| `--include-archived` | off     | Merge cold-store archived rows into the result. Requires `--routing-key` so the cold scan can be tenant-scoped. |
-| `--json`             |         | Emit raw JSON instead of a table                                                                                |
-
-**event-log show:**
-
-| Option              | Description                                                                                                             |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `<deliveryId>`      | Delivery ID to inspect (required positional arg)                                                                        |
-| `--org`             | Org/tenant ID for the delivery (required)                                                                               |
-| `--include-payload` | Also fetch the payload body (requires `event_log.read_payload` on the token)                                            |
-| `--routing-key`     | Routing key hint that scopes the cold-store fallback when the delivery is no longer in PG (archived past the warm TTL). |
-| `--json`            | Emit raw JSON instead of formatted text                                                                                 |
-
 Output includes routing key, event/action, source (relay/direct), provider, repo, ref, status, matched workflow count, first run spawned, error message (if failed), received-at, archived-at (when the row has been moved to cold-store), payload size + hash, and (with `--include-payload`) the JSON body.
 
 **Retention model:** rows older than 30 days are archived to S3 instead of being hard-deleted, so the cold tail is effectively forever. Set `--include-archived` on `list` (and pass `--routing-key`) to fold the cold tail into a list query; `show` always tries cold on PG miss when `--routing-key` is supplied. The orch retains the per-row gzipped webhook payload at `event-log/<orgId>/<deliveryId>.json.gz` indefinitely, so `--include-payload` continues to work for archived deliveries.
@@ -605,15 +3604,6 @@ Provisions and verifies the host-side bridge interface + NAT/egress-isolation ru
 - `provision` creates or heals a host bridge with a gateway address, NAT egress, and an nftables table. `--cidr` sets the gateway IP + prefix (e.g. `10.0.0.1/24`); `--host-iface` names the NAT egress interface (auto-detected when omitted). Pass `--persist` to install a systemd oneshot so the bridge survives a reboot.
 - `verify` checks that the named bridge is up with its address and nft table present. Use it after `provision` (or in a health check) to confirm host networking.
 - `teardown` removes the bridge interface and its nft table. It deliberately leaves the NetworkManager unmanaged-interface conf file in place, because that file is host-scoped and protects every `kici-*` interface on the host — removing it would let NetworkManager adopt the other bridges and strip their gateway IPs.
-
-| Option         | Default       | Description                                                                |
-| -------------- | ------------- | -------------------------------------------------------------------------- |
-| `--bridge`     |               | Bridge interface name (e.g. `kici-br0`)                                    |
-| `--cidr`       |               | Gateway IP + prefix (e.g. `10.0.0.1/24`)                                   |
-| `--table`      | `kici`        | nftables table name                                                        |
-| `--host-iface` | auto-detected | NAT egress interface (`provision` only)                                    |
-| `--persist`    |               | Install a systemd oneshot so the bridge survives reboot (`provision` only) |
-| `--sudo`       |               | Wrap privileged commands with `sudo -n` (non-root host)                    |
 
 See [Firecracker host setup](firecracker-host-setup.md) and the [Firecracker scaler backend](auto-scaler/firecracker.md) for the full host-networking walkthrough.
 
@@ -664,57 +3654,7 @@ kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <versio
 
 Manages the orchestrator as a native system service. The `install --wizard` flow handles database setup, encryption key generation, Platform credentials, and optionally adding your first source. Lifecycle targeting is folder-anchored — see [Service installation guide](../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
 
-**Install options:**
-
-| Option                  | Default             | Description                                                                           |
-| ----------------------- | ------------------- | ------------------------------------------------------------------------------------- |
-| `--wizard`              |                     | Interactive wizard for guided setup                                                   |
-| `--platform <type>`     | auto-detected       | Service platform: `systemd`, `launchd`, `windows`, `compose`                          |
-| `--env-file <path>`     |                     | Path to existing env/config file to use                                               |
-| `--binary <path>`       | current executable  | Path to orchestrator binary                                                           |
-| `--dev`                 |                     | Dev mode: spin up PostgreSQL container on port 15432                                  |
-| `--name <name>`         | `kici-orchestrator` | Service name (also the per-instance directory segment under config/log/install roots) |
-| `--instance-dir <path>` | current directory   | Deploy folder where `.kici-orchestrator.json` is written and resolved from            |
-| `--force`               |                     | Overwrite a same-named instance already installed at a different `--instance-dir`     |
-
-**Upgrade options (orchestrator):**
-
-| Option                  | Default       | Description                                                               |
-| ----------------------- | ------------- | ------------------------------------------------------------------------- |
-| `--from <path>`         |               | Path to package archive (`.tar.gz` or `.zip`)                             |
-| `--url <url>`           |               | URL to download package archive from                                      |
-| `--version <version>`   |               | Target version string (e.g., `0.3.0`)                                     |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`              |
-| `--instance-dir <path>` |               | Deploy folder of the instance to upgrade                                  |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest)         |
-| `--yes`                 |               | Skip confirmation prompt                                                  |
-| `--force`               |               | Overwrite existing versioned directory                                    |
-| `--cleanup`             |               | Remove old versions of the resolved instance (keeps current and previous) |
-| `--rollback`            |               | Roll back the resolved instance to its previous version                   |
-| `--pick`                |               | Interactively pick an installed version to activate (switch, no download) |
-
 The `upgrade` command uses a name-scoped versioned directory layout: new versions are extracted under the resolved instance's own `<installBase>/<name>/` tree alongside old ones, and a per-instance symlink is atomically switched. Other installed instances on the host are not touched. Use `--rollback` to revert to the previous version and `--cleanup` to remove old versions (keeping current and previous). Use `--pick` to switch to any already-installed version: it lists every installed version, lets you choose one interactively (the active version is shown but not selectable), prints the change summary, and confirms before switching. Like `--rollback`, `--pick` only switches between versions already extracted under the instance's install base — it never downloads.
-
-**Status options:**
-
-| Option                  | Default       | Description                                                       |
-| ----------------------- | ------------- | ----------------------------------------------------------------- |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`      |
-| `--instance-dir <path>` |               | Deploy folder of the instance                                     |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest) |
-| `--json`                |               | Output as JSON                                                    |
-
-**Logs options:**
-
-| Option                  | Default       | Description                                                       |
-| ----------------------- | ------------- | ----------------------------------------------------------------- |
-| `--platform <type>`     | auto-detected | Service platform: `systemd`, `launchd`, `windows`, `compose`      |
-| `--instance-dir <path>` |               | Deploy folder of the instance                                     |
-| `--name <name>`         |               | Service name (no default — must resolve via flag or CWD manifest) |
-| `--since <duration>`    |               | Show logs since duration (e.g., `1h`, `30m`)                      |
-| `--level <level>`       |               | Filter by log level: `error`, `warn`, `info`                      |
-| `--json`                |               | Output as structured JSON                                         |
-| `--no-follow`           |               | Snapshot mode (do not tail)                                       |
 
 Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `status`, `logs`) resolves its target through the priority chain `--instance-dir` > `--name` > manifest in the current working directory. A bare `kici-admin orchestrator <cmd>` outside any deploy folder with no flags refuses non-zero and prints the candidate list of installed orchestrator instances on the host.
 
@@ -902,64 +3842,13 @@ kici-admin runs secret-outputs <runId> [--output-key <k>] [--reveal] [--json]
 
 Inspects execution runs, jobs, ephemeral keys, and secret outputs. Useful for investigating run status and failures — and, with `secret-outputs --reveal`, for recovering a job's output values during incident response — without direct database access.
 
-**runs list:**
-
-| Option            | Default | Description                                                                                          |
-| ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| `--status`        |         | Filter by run status. Accepts a single value or a comma-separated list (e.g. `success,failed`)       |
-| `--workflow-name` |         | Filter by workflow name                                                                              |
-| `--repo`          |         | Filter by repo identifier (`owner/repo`)                                                             |
-| `--since`         |         | Only include runs with `created_at` strictly later than this ISO-8601 timestamp                      |
-| `--count`         |         | Return only the count of matching runs (skip the row listing; useful for monitoring / health checks) |
-| `--limit`         | `20`    | Max results (max 100)                                                                                |
-| `--offset`        | `0`     | Skip first N results                                                                                 |
-| `--json`          |         | Output raw JSON instead of a table                                                                   |
-
-**runs show:**
-
-| Option    | Description                                 |
-| --------- | ------------------------------------------- |
-| `<runId>` | Run ID to inspect (required positional arg) |
-| `--json`  | Output raw JSON instead of formatted text   |
-
 Shows run header (status, repo, ref, SHA, provider, timing, environment, trust tier), jobs table, and steps per job. Internally composes two admin API calls: `GET /admin/runs/:runId` (run header) + `GET /admin/runs/:runId/jobs?includeSteps=true`.
-
-**runs structured:**
-
-| Option    | Description                                                   |
-| --------- | ------------------------------------------------------------- |
-| `<runId>` | Run ID to inspect (required positional arg)                   |
-| `--json`  | Output the raw provenance-tagged result (envelopes preserved) |
 
 Shows the machine-first, provenance-tagged structured run result — the same shape an automation agent reads over the admin API (`GET /admin/runs/:runId/structured`). Trusted fields (run/job/step ids, enum statuses, exit codes, durations, hashes, the derived failure category) are plain; untrusted fields (workflow / repo / job / step names, refs, error text, job output values) are wrapped in an `{ untrusted: true, value }` envelope so a consumer can keep user-controlled content out of an instruction channel. Secret output **values** are never returned — only their key names. The human view unwraps envelopes for display; `--json` is lossless. See [Agent run-result API](./agent-run-result-api.md) for the full contract.
 
-**runs jobs:**
-
-| Option            | Description                                                      |
-| ----------------- | ---------------------------------------------------------------- |
-| `<runId>`         | Run ID to inspect (required positional arg)                      |
-| `--include-steps` | Embed the step list inside each job row (default: metadata only) |
-| `--json`          | Output raw JSON instead of a table                               |
-
 Lists the execution jobs for a single run. Cheaper than `runs show` when you only need job-level state (e.g., for polling). Each job row carries its resolved upstream dependency edges in `needs` (an array of `{ upstreamName, runOn }`, where `runOn` is the per-edge set of upstream terminal statuses that satisfy the edge, or `null` when the job has no upstreams) — the same dependency structure the dashboard run-detail graph view renders.
 
-**runs ephemeral-key:**
-
-| Option    | Description                                             |
-| --------- | ------------------------------------------------------- |
-| `<runId>` | Run ID to inspect (required positional arg)             |
-| `--json`  | Output raw JSON instead of `exists: bool / created_at:` |
-
 Answers the security-relevant question "did the per-run ephemeral key get scrubbed?" without `psql`. Returns `{ exists, createdAt }`; the key material itself is **never** exposed on the wire, regardless of role.
-
-**runs secret-outputs:**
-
-| Option         | Description                                                                                                                                                                                    |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<runId>`      | Run ID to inspect (required positional arg)                                                                                                                                                    |
-| `--output-key` | Filter to a single `output_key`                                                                                                                                                                |
-| `--reveal`     | Decrypt values inline. Requires the `secret.reveal` RBAC permission. Every reveal call writes a `secret-outputs.reveal` row to `secret_audit_log`. CLI warns on stderr before running the call |
-| `--json`       | Output raw JSON instead of a table                                                                                                                                                             |
 
 Lists the secret outputs produced by a run's jobs. Values are **masked** by default — the row set shows `jobId`, `outputKey`, `createdAt`, and nothing that could reconstruct the secret. `--reveal` is the break-glass path for incident response only: it is always audited, requires the stricter `secret.reveal` permission, and fails with HTTP 503 if the orchestrator was started without a master key (e.g., no `KICI_SECRET_KEY`).
 
@@ -972,12 +3861,6 @@ kici-admin scaler reap-orphans [--config <path>] [--force] [--json]
 ```
 
 Frees leaked Firecracker / container resources (orphaned microVMs, TAP devices, containers) without a running orchestrator. Runs locally against the host using the orchestrator config, so it is the recovery path when the orchestrator crashed and left scaler-managed resources behind.
-
-| Option     | Default                                        | Description                                                        |
-| ---------- | ---------------------------------------------- | ------------------------------------------------------------------ |
-| `--config` | `KICI_CONFIG` or `/etc/kici/orchestrator.yaml` | Path to the orchestrator config                                    |
-| `--force`  | `false`                                        | Reap even if the local orchestrator reports healthy                |
-| `--json`   | `false`                                        | Emit machine-readable JSON counts instead of human-readable output |
 
 By default the command refuses to reap when a local orchestrator reports healthy (so it never races a live process); pass `--force` to override.
 
@@ -1069,36 +3952,7 @@ See the [GitHub provider guide](../../user/providers/github.md) for the full one
 | Environment variable | `--from-env GITHUB_APP_KEY`         |
 | Stdin                | `--stdin`                           |
 
-**Generic source options:**
-
-| Option                              | Description                                                                            |
-| ----------------------------------- | -------------------------------------------------------------------------------------- |
-| `--verification <method>`           | `hmac_sha256`, `bearer_token`, `ip_allowlist`, or `none`                               |
-| `--secret <value>`                  | Verification secret (supports `@file` syntax)                                          |
-| `--event-type-header <header>`      | Header for event type extraction                                                       |
-| `--event-type-path <jsonpath>`      | JSONPath for event type from body                                                      |
-| `--idempotency-key-header <header>` | Header for idempotency key                                                             |
-| `--idempotency-key-path <jsonpath>` | JSONPath for idempotency key from body                                                 |
-| `--dedup-window <seconds>`          | Dedup window (default: 300)                                                            |
-| `--max-payload <bytes>`             | Max payload size (default: 1048576)                                                    |
-| `--allowed-events <events>`         | Comma-separated allowed event types                                                    |
-| `--strip-headers <headers>`         | Comma-separated headers to strip                                                       |
-| `--rate-limit <rpm>`                | Rate limit in requests per minute (default: 600)                                       |
-| `--provider-type <type>`            | `generic` (default) or `local` (file:// filesystem source — prefer `source add local`) |
-
 **Universal-git options** (promote a generic source to clone + trigger-match for Forgejo / Gitea / Gogs / GitLab / plain GitHub — see [Universal-git provider](../../user/providers/universal-git.md)):
-
-| Option                              | Description                                                                           |
-| ----------------------------------- | ------------------------------------------------------------------------------------- |
-| `--preset <name>`                   | `forgejo`, `gitea`, `gogs`, `gitlab-repo`, `github-repo`, or `custom`                 |
-| `--git-url-template <url>`          | Clone URL template with `{owner}` / `{name}` / `{repo}` placeholders                  |
-| `--credential-ref <key>`            | Secret key name under the source-scoped store (`__source__/<sourceId>`)               |
-| `--credential-store <backend>`      | Secret backend name (default: `pg`)                                                   |
-| `--credential-type <type>`          | `pat`, `basic`, or `ssh`                                                              |
-| `--credential-user <user>`          | Username for PAT / basic auth (default: `x-access-token`; ignored for `ssh`)          |
-| `--ssh-host-key-policy <policy>`    | `accept-new` (TOFU, default) or `pinned` (reject unknown host keys)                   |
-| `--ssh-known-hosts-pem <pemOrFile>` | OpenSSH `known_hosts` content (prefix `@` reads from a file). Required when `pinned`. |
-| `--clear-git-config`                | (`source update-generic` only) Revert to a payload-only generic webhook               |
 
 List the canonical presets and their expanded `payloadPaths` + `eventMapping`:
 
@@ -1108,12 +3962,6 @@ kici-admin source list-presets
 
 **Local filesystem (`file://`) source options** (a git repo present on the agent
 filesystem — see the [Local filesystem source guide](../../user/providers/local-file.md)):
-
-| Option                   | Description                                                                                 |
-| ------------------------ | ------------------------------------------------------------------------------------------- |
-| `--path <abs-dir>`       | Absolute base path of the repo on the agent filesystem (`<path>/.kici/kici.lock.json`)      |
-| `--clone-url-base <url>` | Optional `git://` / `http://` base for agents that do not share the orchestrator filesystem |
-| `--name <name>`          | Source name (default: `local`)                                                              |
 
 `source add local` always registers verification `none` — there is no remote
 forge to sign the payload, so only register repos you trust. Drive runs with
@@ -1180,27 +4028,7 @@ kici-admin workflow register-manual --lock-file <path> --repo <ident> --routing-
 
 `list` inspects workflow registrations from the `workflow_registrations` table. All filters are optional and combinable.
 
-| Option           | Description                                                     |
-| ---------------- | --------------------------------------------------------------- |
-| `--org`          | Filter by customer/organization ID (server param: `customerId`) |
-| `--routing-key`  | Filter by routing key (e.g., `github:42`)                       |
-| `--repo`         | Filter by repo identifier (`owner/repo`)                        |
-| `--trigger-type` | Filter by trigger type (e.g., `webhook`, `push`, `schedule`)    |
-| `--event`        | Filter by webhook event name (scans `lock_entry.triggers`)      |
-| `--json`         | Output raw JSON instead of a table                              |
-
 `register-manual` seeds `workflow_registrations` rows straight from a compiled lock file — used by local-only / non-Git deployments and E2E helpers that can't rely on a webhook-driven compile-and-register flow. Dual-mode (HTTP via admin API, or direct DB via `--database-url`).
-
-| Option               | Description                                                |
-| -------------------- | ---------------------------------------------------------- |
-| `--lock-file`        | Path to a compiled `kici.lock.json` file (required)        |
-| `--repo`             | `repo_identifier` value (e.g. `owner/repo`, required)      |
-| `--routing-key`      | Routing key for the source (e.g. `github:42`, required)    |
-| `--customer`         | `customer_id` (org) to attribute rows to (required)        |
-| `--provider-context` | Provider-specific context as a JSON object (default: `{}`) |
-| `--commit-sha`       | Optional commit SHA stamped on each row                    |
-| `--database-url`     | Use direct DB access instead of HTTP (offline mode)        |
-| `--json`             | Emit JSON output                                           |
 
 ## Environment variables summary
 

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
 import { decryptJson } from '@kici-dev/core';
 
-vi.mock('../local-executor/secret-loader.js', () => ({
+vi.mock('./secret-loader.js', () => ({
   loadLocalSecrets: vi.fn(async () => ({
     flat: { TOKEN: 'abc' },
     contexts: { db: { URL: 'postgres://x' } },
@@ -73,7 +73,7 @@ describe('buildEncryptedSecrets', () => {
   });
 
   it('returns null when there are no local secrets, no --env, and no --context', async () => {
-    const { loadLocalSecrets } = await import('../local-executor/secret-loader.js');
+    const { loadLocalSecrets } = await import('./secret-loader.js');
     vi.mocked(loadLocalSecrets).mockResolvedValueOnce({ flat: {}, contexts: {} });
     const r = recipient();
     const result = await buildEncryptedSecrets('/repo/.kici', [], [], r.publicKeyB64);
@@ -81,7 +81,7 @@ describe('buildEncryptedSecrets', () => {
   });
 
   it('returns non-null when ONLY a --context flag is present', async () => {
-    const { loadLocalSecrets } = await import('../local-executor/secret-loader.js');
+    const { loadLocalSecrets } = await import('./secret-loader.js');
     vi.mocked(loadLocalSecrets).mockResolvedValueOnce({ flat: {}, contexts: {} });
     const r = recipient();
     const result = await buildEncryptedSecrets('/repo/.kici', [], ['db.K=v'], r.publicKeyB64);

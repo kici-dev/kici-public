@@ -1,12 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { logger } from '@kici-dev/core';
 import {
-  runLocalCommand,
   runRemoteCommand,
   buildTargetSelector,
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
-  printRunLocalUsage,
   withStdoutOnStderr,
 } from './run.js';
 
@@ -18,14 +16,6 @@ const mockClient = {
   runLogs: vi.fn(),
   cancel: vi.fn(),
 };
-
-// Mock local executor
-const mockExecuteLocal = vi.fn();
-vi.mock('../local-executor/index.js', () => ({
-  get executeLocal() {
-    return mockExecuteLocal;
-  },
-}));
 
 // Mock dependencies
 vi.mock('../remote/config.js', () => ({
@@ -214,22 +204,6 @@ describe('kici run command', () => {
       done: true,
     });
     mockClient.cancel.mockResolvedValue({ cancelled: true });
-
-    mockExecuteLocal.mockResolvedValue(true);
-  });
-
-  describe('runLocalCommand', () => {
-    it('calls executeLocal with correct options', async () => {
-      const options = { event: 'push', workflow: 'ci', kiciDir: '.kici' };
-      const result = await runLocalCommand(options);
-      expect(result).toBe(true);
-      expect(mockExecuteLocal).toHaveBeenCalledWith(options);
-    });
-
-    it('returns false when executeLocal fails', async () => {
-      mockExecuteLocal.mockResolvedValue(false);
-      expect(await runLocalCommand({ event: 'push' })).toBe(false);
-    });
   });
 
   const fixture = {
@@ -797,27 +771,5 @@ describe('withStdoutOnStderr', () => {
     } finally {
       restore();
     }
-  });
-});
-
-describe('printRunLocalUsage', () => {
-  beforeEach(() => {
-    // logger.info is mocked (vi.fn) by the module-level @kici-dev/core mock;
-    // picocolors auto-disables ANSI in a non-TTY test process, so the captured
-    // strings are plain text.
-    vi.mocked(logger.info).mockClear();
-  });
-
-  it('prints a usage synopsis and concrete event examples', () => {
-    printRunLocalUsage();
-    const out = vi
-      .mocked(logger.info)
-      .mock.calls.map((c) => String(c[0]))
-      .join('\n');
-    expect(out).toContain('Usage: kici run local <event> [options]');
-    expect(out).toContain('kici run local push');
-    expect(out).toContain('kici run local pr:open');
-    // Discoverability parity with `kici preview`: interactive escape hatch shown.
-    expect(out).toContain('--pick');
   });
 });

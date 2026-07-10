@@ -10,16 +10,23 @@
  * the two entry points.
  */
 
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import { serve } from '@hono/node-server';
 import {
   createLogger,
   getRequestContext,
+  parseDatabaseUrl,
   requestContext,
   setupGracefulShutdown,
   toErrorMessage,
   validateRequiredTools,
   type ColdStore,
 } from '@kici-dev/shared';
+import {
+  checkCollationDriftAtStartup,
+  shouldFailOnCollationDrift,
+} from '@kici-dev/shared/db-collation';
 import type { AppConfig } from './config.js';
 import { resolveDataDir } from './data-dir.js';
 import { ConfigReloader, type ReloadResult } from './config/reload.js';
@@ -51,6 +58,7 @@ import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
 import { scalerConfigReloadsTotal, pgPoolClientErrorsTotal } from './metrics/prometheus.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
 import { createApp, SourceLocationStore } from './app.js';
+import { LocalDevSigner, KICI_LOCAL_ISSUER, type LocalSigner } from './oidc/local-dev-signer.js';
 import { FleetAgentCollector } from './ws/fleet-agent-collector.js';
 import { FLEET_NODE_TIMEOUT_MS } from './diagnostics/fleet-constants.js';
 import {
@@ -118,7 +126,7 @@ import { ExecutionTracker, type ExecutionTrackerDeps } from './reporting/executi
 import { LogWriter } from './reporting/log-writer.js';
 import { StaleRunDetector } from './stale-detector/stale-run-detector.js';
 import { WorkflowDeadlineDetector } from './stale-detector/workflow-deadline-detector.js';
-import type { HeldRunStore, ReleaseSignal } from './environments/held-runs.js';
+import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import { cancelRunWithReason } from './cancel/cancel-run.js';
 import {
@@ -169,6 +177,7 @@ import { GenericSourcesChangeListener } from './webhook/generic-sources-listener
 import {
   universalGitRegistrationErrorsTotal,
   setDeclaredHostsUnreachable,
+  setDbCollationDrift,
 } from './metrics/prometheus.js';
 import { ConcurrencyGroupTracker, ConcurrencyQueueManager } from './concurrency/index.js';
 import { RegistrationStore } from './registration/registration-store.js';
@@ -370,6 +379,32 @@ export interface OrchestratorHooks {
    * Mode startup log message.
    */
   startupLogMessage: (port: number) => string;
+}
+
+// ── Local dev-signed identity (offline plane only) ──────────────────────────
+
+/**
+ * Load the offline local dev plane's dev-signed ES256 signer from its persisted
+ * private JWK, and write the public JWK next to it (mode 0644 — public material)
+ * so `kici local trust-root` can export a `{ issuer, jwks }` trust root without
+ * a JWKS HTTP endpoint. The private key never leaves this process; only the
+ * public JWK is written out.
+ */
+async function buildLocalDevSigner(
+  keyFile: string,
+  logger: ReturnType<typeof createLogger>,
+): Promise<LocalSigner> {
+  const signer = await LocalDevSigner.fromFile(keyFile);
+  const pubFile = path.join(path.dirname(keyFile), 'identity.pub.jwk');
+  await fs.writeFile(pubFile, JSON.stringify(signer.getPublicJwk(), null, 2) + '\n', {
+    mode: 0o644,
+  });
+  logger.info('local dev-signed identity loaded', {
+    issuer: KICI_LOCAL_ISSUER,
+    kid: signer.getKid(),
+    publicJwkFile: pubFile,
+  });
+  return signer;
 }
 
 // ── Scaler initialization (extracted to reduce bootstrap length) ────────────
@@ -581,7 +616,9 @@ interface CacheInfra {
    * `/api/v1/cache/blob/*` HTTP route to serve / receive blobs. `undefined`
    * for the s3 backend (and when caching is disabled).
    */
-  fsCache: { basePath: string; signingSecret: string; ttlMs: number } | undefined;
+  fsCache:
+    | { basePath: string; signingSecret: string; ttlMs: number; maxUploadBytes: number }
+    | undefined;
 }
 
 function buildCacheLayers(
@@ -705,7 +742,10 @@ function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefine
       signingSecret,
     });
     const layers = buildCacheLayers(cacheStorage, config, 'filesystem', db);
-    return { ...layers, fsCache: { basePath, signingSecret, ttlMs } };
+    return {
+      ...layers,
+      fsCache: { basePath, signingSecret, ttlMs, maxUploadBytes: config.cacheMaxTarballBytes },
+    };
   }
 
   logger.info('Cache storage not configured, caching disabled');
@@ -2171,6 +2211,20 @@ export async function bootstrapOrchestrator(
     logger.info('Auto-migrate disabled (KICI_AUTO_MIGRATE=false)');
   }
 
+  // 2.4. Detect libc collation drift before serving. A stamped-vs-actual
+  // collation-version mismatch silently corrupts text b-tree indexes, so a
+  // present, correctly-scoped row (e.g. a source private key) can read back as
+  // missing. Loud ERROR + `kici_orch_db_collation_drift` gauge on drift; never
+  // crashes by default (opt in with KICI_DB_FAIL_ON_COLLATION_DRIFT=true). Heal
+  // with `kici-admin db reindex` + `db refresh-collation-version`.
+  {
+    const { dbName } = parseDatabaseUrl(config.databaseUrl);
+    const drift = await checkCollationDriftAtStartup(pool, dbName, logger, {
+      failOnDrift: shouldFailOnCollationDrift(process.env),
+    });
+    setDbCollationDrift(dbName, !!drift);
+  }
+
   // 2.5. Validate cluster identity (split-brain prevention)
   const clusterIdentity = new ClusterIdentity({
     db,
@@ -3045,12 +3099,30 @@ export async function bootstrapOrchestrator(
     adminDeps.sharedStore = sharedConfigStore;
   }
 
+  // Local dev-signed identity (offline local dev plane only). Constructed ONLY
+  // in independent mode with KICI_INDEPENDENT_IDENTITY=1 + a freshly-generated
+  // keypair — never on a Platform-connected orchestrator (which mints via the
+  // Platform relay). The public JWK is written next to the private key so
+  // `kici local trust-root` can export it, and it seeds the in-process trust
+  // root so a `kici-local` bundle verifies at ingest without a JWKS endpoint.
+  const localOidcSigner =
+    config.mode === 'independent' && config.independentIdentity && config.devIdentityKeyFile
+      ? await buildLocalDevSigner(config.devIdentityKeyFile, logger)
+      : undefined;
+
   // Build subsystems object for hooks
   // Provenance trust root: the live issuer is wired by the mode-specific hook
   // from the Platform `auth.success`; the config/env value seeds the CLI path.
-  const provenanceTrustRoot = createProvenanceTrustRoot({
-    issuer: config.provenanceIssuer ?? null,
-  });
+  // For the local dev plane, serve the in-process signer's JWKS directly under
+  // the `kici-local` issuer (not a URL, so no discovery/fetch).
+  const provenanceTrustRoot = localOidcSigner
+    ? createProvenanceTrustRoot({
+        issuer: KICI_LOCAL_ISSUER,
+        staticJwks: { keys: [localOidcSigner.getPublicJwk() as Record<string, unknown>] },
+      })
+    : createProvenanceTrustRoot({
+        issuer: config.provenanceIssuer ?? null,
+      });
 
   const subsystems: OrchestratorSubsystems = {
     config,
@@ -3395,6 +3467,7 @@ export async function bootstrapOrchestrator(
     dispatchCacheRefs,
     cacheStorage,
     provenanceTrustRoot,
+    localOidcSigner,
     fsCache,
     pendingBuilds,
     pendingInits,

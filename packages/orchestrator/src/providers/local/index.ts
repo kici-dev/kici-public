@@ -35,6 +35,7 @@ export { LocalRepoUrlBuilder } from './repo-url-builder.js';
 export function createLocalProviderBundle(opts: {
   repoBasePath: string;
   cloneUrlBase?: string;
+  inPlace?: boolean;
 }): ProviderBundle {
   return {
     normalizer: new LocalWebhookNormalizer(),
@@ -44,5 +45,8 @@ export function createLocalProviderBundle(opts: {
     cloneTokenProvider: undefined,
     // Local events don't track changed files -- triggers match on branch/event only
     changedFilesFetcher: undefined,
+    // In-place: the repoBasePath is the operator's real tree — a run against it
+    // skips the source-pack build and runs the tree directly.
+    localInPlace: opts.inPlace === true,
   };
 }

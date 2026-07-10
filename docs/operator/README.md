@@ -48,7 +48,7 @@ How KiCI packages are distributed and deployed. Covers all three distribution ch
 - [Source tarball and dependency caching](dependency-caching.md) -- S3/filesystem cache setup, build flow, cache keys
 - [Cancel behavior](cancel-behavior.md) -- cancel config, grace periods, monitoring
 - [Stale run detection and failure marking](stale-detection.md) -- detection system config, tuning, metrics
-- [Environments](environments.md) -- DB tables, Vault config, held runs, monitoring, troubleshooting
+- [Contexts](contexts.md) -- DB tables, Vault config, held runs, monitoring, troubleshooting
 
 ## Security
 

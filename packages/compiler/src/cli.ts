@@ -22,6 +22,10 @@ export const RETIRED_COMMANDS: Record<string, string> = {
     '`kici runs show <run-id>` to inspect runs, or `kici diagnostics` for ' +
     'orchestrator, scaler, and agent health.',
   cancel: '`kici cancel` is no longer a command. Use `kici runs cancel <run-id>`.',
+  'run local':
+    '`kici run local` is retired. Every run is now a real routed dispatch — ' +
+    'use `kici run <event> --local` (e.g. `kici run push --local`), which runs ' +
+    'this machine as an ephemeral agent through the local dev plane.',
 };
 
 /**
@@ -52,6 +56,12 @@ export function buildProgram(): Command {
   const program = new Command();
 
   program.name('kici').description('KiCI workflow compiler').version(version);
+  // `kici run` is action-bearing AND has a `remote` subcommand whose options
+  // (`--env`, `--quiet`, `--kici-dir`, `--debug`) collide by name with the
+  // parent action's. Positional-options parsing stops the parent from swallowing
+  // an option that appears after the subcommand name, so `kici run remote --json`
+  // reaches the subcommand instead of the parent.
+  program.enablePositionalOptions();
 
   // Print version header before every command, unless the invocation requested
   // structured (`--json`) or quiet output — stdout must stay parseable then.
@@ -117,96 +127,63 @@ export function buildProgram(): Command {
   // --- kici run (local and remote subcommands) ---
 
   const runCommand = program.command('run').description('Execute workflows locally or remotely');
+  // Route options after the `remote` subcommand name to the subcommand (see the
+  // program-level note above) rather than the parent action.
+  runCommand.enablePositionalOptions();
 
+  // `kici run [event]` is action-bearing: a routed run with this machine as the
+  // ephemeral agent, dispatched through the warm local dev plane. It coexists
+  // with the `run remote` subcommand below — Commander dispatches to `remote`
+  // when the first token matches, else runs this parent action. The retired
+  // `run local` subcommand redirects here via the action's retired-command guard.
   runCommand
-    .command('local')
-    .argument('[event]', 'Event type (e.g., push, pr:open, schedule) — optional with --pick')
-    .description('Execute workflows locally without orchestrator infrastructure')
-    .option('-p, --pick', 'Interactively pick a workflow and trigger to simulate', false)
-    .option('--workflow <name>', 'Run only the specified workflow')
-    .option('--job <name>', 'Run only the specified job (and its dependencies)')
-    .option('--branch <name>', 'Override detected git branch')
-    .option('--sha <hash>', 'Override detected git SHA')
-    .option('--payload <path>', 'Path to explicit event payload JSON file')
-    .option('--concurrency <n>', 'Max parallel jobs (default: CPU cores)', parseInt)
-    .option('--keep-going', 'Continue after job failure', false)
-    .option('--container', 'Use Podman container isolation', false)
+    .argument('[event]', 'Event type for a routed local run (e.g. push, pr:open)')
+    .option('--local', 'Route the run with this machine as the ephemeral agent', false)
+    .option('--offline', 'Force the throwaway/independent plane (offline)', false)
+    .option('--connected', 'Force the connected/hybrid plane (requires attachment)', false)
+    .option('--in-place', 'Reuse the working tree directly instead of an isolated clone', false)
+    .option(
+      '--trusted',
+      'Route to the trusted fleet agent profile: steps see the ambient host env (minus the agent identity). Alias: --no-sandbox',
+      false,
+    )
+    .option('--no-sandbox', 'Alias for --trusted (the bwrap sandbox is already off by default)')
     .option(
       '--env <KEY=VALUE>',
-      'Environment variable override (repeatable)',
+      'Per-run secret (repeatable)',
       (val: string, prev: string[]) => [...prev, val],
       [] as string[],
     )
     .option(
-      '--input <KEY=VALUE>',
-      'Typed workflow-dispatch input (repeatable)',
-      (val: string, prev: string[]) => [...prev, val],
-      [] as string[],
+      '--payload <path>',
+      'Dispatch payload JSON { action?, client_payload? } for a routed dispatch run',
     )
-    .option('--quiet', 'Suppress streaming output', false)
-    .option('--json', 'Output structured JSON result', false)
-    .option('--junit <path>', 'Output JUnit XML result')
-    .option(
-      '--files <path>',
-      'Override changed file paths (repeatable, default: git diff)',
-      (val: string, prev: string[]) => [...prev, val],
-      [] as string[],
-    )
-    .option('--debug', 'Verbose internals', false)
     .option('--kici-dir <path>', 'Path to .kici directory', '.kici')
-    .option(
-      '--in-place',
-      'Run against the real working directory instead of an isolated tmp checkout',
-      false,
-    )
-    .option(
-      '--keep',
-      'Always retain the isolated tmp checkout (default: keep only on failure)',
-      false,
-    )
-    .option('--check', 'Run in check mode: report drift, change nothing', false)
-    .option('--fail-on-drift', 'In check mode, exit non-zero if any step reports drift', false)
+    .option('--quiet', 'Suppress the banner + streaming output', false)
+    .option('--debug', 'Verbose internals', false)
     .action(async (event, options) => {
-      if (options.pick && options.workflow) {
-        console.error('Error: --pick is mutually exclusive with --workflow.');
+      // `kici run local` reaches this parent action (event === 'local') now that
+      // the `local` subcommand is retired; redirect to the routed replacement.
+      const retired = retiredCommandHint(event ? `run ${event}` : undefined);
+      if (retired) {
+        process.stderr.write(pc.red(`${retired}\n`));
         process.exit(2);
       }
-      if (!options.pick && !event) {
-        const { printRunLocalUsage } = await import('./commands/index.js');
-        printRunLocalUsage();
-        process.exit(2);
-      }
-      const { runLocalCommand } = await import('./commands/index.js');
-      const { resolveCheckMode } = await import('./commands/check-mode.js');
-      let checkMode;
-      try {
-        checkMode = resolveCheckMode({ check: options.check, failOnDrift: options.failOnDrift });
-      } catch (err) {
-        console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
-        process.exit(2);
-      }
-      const success = await runLocalCommand({
+      const { runRoutedCommand } = await import('./commands/index.js');
+      const success = await runRoutedCommand({
         event,
-        checkMode,
-        pick: options.pick,
-        workflow: options.workflow,
-        job: options.job,
-        branch: options.branch,
-        sha: options.sha,
-        payload: options.payload,
-        concurrency: options.concurrency,
-        keepGoing: options.keepGoing,
-        container: options.container,
-        env: options.env,
-        inputs: options.input,
-        quiet: options.quiet,
-        json: options.json,
-        junit: options.junit,
-        files: options.files,
-        debug: options.debug,
-        kiciDir: options.kiciDir,
+        local: options.local,
+        offline: options.offline,
+        connected: options.connected,
         inPlace: options.inPlace,
-        keep: options.keep,
+        // `--trusted` or its alias `--no-sandbox` (Commander sets options.sandbox
+        // === false when `--no-sandbox` is passed) select the trusted profile.
+        trusted: Boolean(options.trusted) || options.sandbox === false,
+        env: options.env,
+        payload: options.payload,
+        kiciDir: options.kiciDir,
+        quiet: options.quiet,
+        debug: options.debug,
       });
       process.exit(success ? 0 : 1);
     });
@@ -398,6 +375,7 @@ export function buildProgram(): Command {
       'OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another)',
     )
     .option('--routing-key <key>', 'Routing key for webhook source identification')
+    .option('--no-attach', 'Skip the post-login prompt to attach the local dev plane')
     .addHelpText(
       'after',
       `
@@ -417,6 +395,8 @@ Environment variables:
         platformEndpoint: options.platformEndpoint,
         oidcIssuer: options.oidcIssuer,
         routingKey: options.routingKey,
+        // Commander sets options.attach=false for --no-attach (default true).
+        noAttachPrompt: options.attach === false,
       });
       process.exit(success ? 0 : 1);
     });
@@ -483,6 +463,53 @@ Environment variables:
       const { orchestratorsUseCommand } = await import('./commands/index.js');
       const success = await orchestratorsUseCommand(name, { org: options.org });
       process.exit(success ? 0 : 1);
+    });
+
+  const localCommand = program
+    .command('local')
+    .description('Manage the local dev orchestrator plane');
+  localCommand
+    .command('up')
+    .description('Start (or reuse) the local dev plane')
+    .option(
+      '--offline',
+      'Force the independent (offline) plane (does not clear the attachment record)',
+      false,
+    )
+    .option(
+      '--connected',
+      'Force the connected/hybrid plane (requires an attached, reachable Platform)',
+      false,
+    )
+    .action(async (options: { offline?: boolean; connected?: boolean }) => {
+      const { localUpCommand } = await import('./commands/index.js');
+      const ok = await localUpCommand({ offline: options.offline, connected: options.connected });
+      process.exit(ok ? 0 : 1);
+    });
+  for (const [name, desc, fn] of [
+    ['status', 'Show local dev plane status and control commands', 'localStatusCommand'],
+    ['down', 'Stop the local dev plane', 'localDownCommand'],
+    ['logs', 'Print the local dev plane orchestrator log path', 'localLogsCommand'],
+    ['attach', 'Attach the local dev plane to the Platform (hybrid)', 'localAttachCommand'],
+    ['detach', 'Detach the local dev plane from the Platform (offline)', 'localDetachCommand'],
+  ] as const) {
+    localCommand
+      .command(name)
+      .description(desc)
+      .action(async () => {
+        const cmds = await import('./commands/index.js');
+        const ok = await (cmds as unknown as Record<string, () => Promise<boolean>>)[fn]();
+        process.exit(ok ? 0 : 1);
+      });
+  }
+  localCommand
+    .command('trust-root')
+    .description('Export the offline dev-signed identity trust root ({ issuer, jwks }) to a file')
+    .argument('<file>', 'Output path for the { issuer, jwks } trust-root JSON')
+    .action(async (file: string) => {
+      const { localTrustRootCommand } = await import('./commands/index.js');
+      const ok = await localTrustRootCommand(file);
+      process.exit(ok ? 0 : 1);
     });
 
   const secretsCommand = program.command('secrets').description('Manage secrets');

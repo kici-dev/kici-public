@@ -13,7 +13,7 @@ import { InitFailureCategory } from '@kici-dev/engine';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { ProcessingDeps } from './processor.js';
-import type { ReleaseSignal } from '../environments/held-runs.js';
+import type { ReleaseSignal } from '../contexts/held-runs.js';
 import {
   dispatchMatchedWorkflow,
   type WorkflowDispatchContext,

@@ -165,8 +165,8 @@ export * from './env/environment-allowlist.js';
 // --- Secrets management ---
 export * from './secrets/index.js';
 
-// --- Environment model (scoped secrets, env merge, protection gates) ---
-export * from './environment/index.js';
+// --- Context model (scoped secrets, context merge, protection gates) ---
+export * from './context/index.js';
 
 // --- Structured auto-labels (kici:os:, kici:arch:, kici:agent:, kici:scaler:, kici:host:, kici:role:) ---
 export {

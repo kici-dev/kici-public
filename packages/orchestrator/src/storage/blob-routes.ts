@@ -12,6 +12,7 @@
  */
 
 import type { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { promises as fsPromises } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -21,14 +22,31 @@ import { Readable } from 'node:stream';
 import { stream as honoStream } from 'hono/streaming';
 import { verifyToken } from './sign-url.js';
 
+/**
+ * URL prefix for the filesystem-backend blob transfer route. The app-level
+ * webhook body-size cap MUST exempt this prefix: blob PUTs carry internal
+ * artifacts (dependency tarballs up to `cacheMaxTarballBytes`, 500MB by
+ * default), which the S3 backend uploads direct-to-S3 uncapped. Binding them
+ * to the tenant-webhook body limit would 413 legitimate large caches on the
+ * filesystem backend. The PUT route below enforces its own `maxUploadBytes`
+ * bound instead.
+ */
+export const CACHE_BLOB_PATH_PREFIX = '/api/v1/cache/blob/';
+
 export interface FsCacheRouteDeps {
   basePath: string;
   signingSecret: string;
+  /**
+   * Upper bound on a single blob PUT, in bytes. Aligned with the dep-cache's
+   * `cacheMaxTarballBytes` (500MB default) so the filesystem backend accepts
+   * the same artifact sizes the S3 backend does.
+   */
+  maxUploadBytes: number;
 }
 
 /** Mount filesystem-backend cache routes onto an existing Hono app. */
 export function registerBlobRoutes(app: Hono, deps: FsCacheRouteDeps): void {
-  const { basePath, signingSecret } = deps;
+  const { basePath, signingSecret, maxUploadBytes } = deps;
 
   app.get('/api/v1/cache/blob/:key{.+}', async (c) => {
     const key = c.req.param('key');
@@ -60,7 +78,7 @@ export function registerBlobRoutes(app: Hono, deps: FsCacheRouteDeps): void {
     });
   });
 
-  app.put('/api/v1/cache/blob/:key{.+}', async (c) => {
+  app.put('/api/v1/cache/blob/:key{.+}', bodyLimit({ maxSize: maxUploadBytes }), async (c) => {
     const key = c.req.param('key');
     const validationError = validateKey(key);
     if (validationError) return c.json({ error: validationError }, 400);

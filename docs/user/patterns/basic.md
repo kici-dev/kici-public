@@ -191,7 +191,7 @@ Sometimes you want a workflow that does **not** fire on pushes, pull requests, t
 
 There are two ways to "explicitly invoke" a `dispatch()` workflow:
 
-1. **Locally from your laptop**, with `kici run local dispatch` — no orchestrator, no agent, no webhook, nothing deployed. This is the only path while you haven't wired the repo to a deployed KiCI orchestrator.
+1. **Locally from your laptop**, with `kici run dispatch --local` — this machine joins as an ephemeral agent through the warm local dev plane, so no orchestrator deployment is required. This is the path to use while you haven't wired the repo to a deployed KiCI orchestrator.
 2. **Remotely**, if the repo is connected to a KiCI orchestrator via a GitHub App, by calling GitHub's repository-dispatch API: `curl -X POST -H "Authorization: token <PAT>" -H "Accept: application/vnd.github+json" https://api.github.com/repos/<owner>/<repo>/dispatches -d '{"event_type":"hello"}'`. GitHub fans the webhook out to the App, the orchestrator normalizes it into a KiCI `dispatch` event (see `packages/orchestrator/src/providers/github/normalizer.ts`), and the matched workflow runs.
 
 Note that GitHub's `workflow_dispatch` event (the "Run workflow" button / `/actions/workflows/.../dispatches` API) is GitHub-Actions-internal and is **not** delivered to KiCI. The SDK has no `workflowDispatch()` trigger. Only `repository_dispatch` reaches KiCI.
@@ -214,35 +214,17 @@ export default workflow('hello-world', {
 });
 ```
 
-Run it locally, without any orchestrator or agent infrastructure:
+Run it locally, without any orchestrator deployment:
 
 ```bash
 npx kici compile           # regenerate .kici/kici.lock.json
-npx kici run local dispatch
+npx kici run dispatch --local
 ```
 
-`kici run local` compiles the workflow, matches triggers against a simulated `dispatch` event, and executes the matched jobs directly on your machine with DAG-based scheduling. No webhook, no GitHub, no deployed orchestrator involved. See [`kici run local`](../cli-reference.md#kici-run-local) for options like `--job`, `--env`, `--json`, and `--junit`.
-
-### Scoping to a single workflow
-
-Because `kici run local dispatch` matches **every** workflow that listens for a `dispatch` event, running it in a repo with several dispatch-triggered workflows will fire all of them. Narrow execution to one with `--workflow <name>`:
-
-```bash
-npx kici run local dispatch --workflow hello-world
-```
-
-`--workflow` is a post-match filter: the workflow still has to have a trigger that matches the event argument. If `hello-world` does not list a `dispatch()` trigger, the command reports `No workflow named "hello-world" matched the event` and exits successfully without running anything.
-
-If you do not want to memorise event args, use the interactive picker instead:
-
-```bash
-npx kici run local --pick
-```
-
-`--pick` (aliased as `-p`) lists every workflow alongside a compact summary of its triggers, lets you select one, and derives a matching event arg from the chosen trigger — so the execution still flows through the normal trigger-matching pipeline and "cannot produce an inconsistent run". Multi-trigger workflows show a second prompt for which trigger to simulate. `--pick` is mutually exclusive with `--workflow`; in a non-TTY shell it prints the workflow list and exits without running anything.
+`kici run dispatch --local` compiles the workflow, matches triggers against a simulated `dispatch` event, and executes the matched jobs on this machine — which joins as an ephemeral agent through the warm local dev plane — with DAG-based scheduling. No webhook, no GitHub, no deployed orchestrator involved. See [`kici run <event> --local`](../cli-reference.md#kici-run-event---local) for options like `--env`, `--in-place`, and `--offline`.
 
 ### Unfiltered vs typed `dispatch()`
 
-Leave `dispatch()` unfiltered while you drive it from `kici run local`. The CLI currently simulates a dispatch event with no event type (i.e. `action` is undefined), so a trigger defined as `dispatch({ types: ['deploy', 'rollback'] })` will not match `kici run local dispatch` — the typed form is intended for real `repository_dispatch` deliveries from the orchestrator.
+Leave `dispatch()` unfiltered while you drive it from `kici run <event> --local`. The CLI simulates a dispatch event with no event type (i.e. `action` is undefined), so a trigger defined as `dispatch({ types: ['deploy', 'rollback'] })` will not match `kici run dispatch --local` — the typed form is intended for real `repository_dispatch` deliveries from the orchestrator.
 
 ## Conditional execution with rules

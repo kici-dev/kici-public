@@ -1877,7 +1877,7 @@ describe('processWebhook', () => {
     });
   });
 
-  it('tags synthetic rejected-* jobs with environment_rules init_failure', async () => {
+  it('tags synthetic rejected-* jobs with context_rules init_failure', async () => {
     const rejectReason = 'Rejected by protection rules';
     const mockDispatcher = createMockDispatcher();
     // Override dispatch to return a rejection result for the dispatched job.
@@ -1936,7 +1936,7 @@ describe('processWebhook', () => {
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
 
     // The synthetic rejected-* job should be marked failed with the structured
-    // init_failure carrying scope=job, category=environment_rules, the reject
+    // init_failure carrying scope=job, category=context_rules, the reject
     // reason as message, and the job name.
     expect(mockTracker.onJobStatus).toHaveBeenCalled();
     const rejectedCall = mockTracker.onJobStatus.mock.calls.find(
@@ -1951,7 +1951,7 @@ describe('processWebhook', () => {
       error: rejectReason,
       initFailure: {
         scope: 'job',
-        category: InitFailureCategory.enum.environment_rules,
+        category: InitFailureCategory.enum.context_rules,
         message: rejectReason,
         jobName: 'deploy',
       },
@@ -3333,13 +3333,13 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     expect(runIds.size).toBe(1);
   });
 
-  // CS-12 — a static job with dynamic environment fields reached via
+  // CS-12 — a static job with dynamic context fields reached via
   // cross-source delivery queues an __init__ deferred-init job.
   // Regression guard: deferred init dispatch ( two-phase init model)
   // must work through the delegated path. Before the 28.4-06 refactor,
   // this would never fire on cross-source delivery because the
   // static-only loop never reached the deferred-init builder.
-  it('CS-12: static job with dynamic environment queues __init__ job', async () => {
+  it('CS-12: static job with dynamic context queues __init__ job', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs12',
       customerId: '__default__',
@@ -3354,9 +3354,9 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
           runsOn: [{ kind: 'exact', value: 'linux' }],
           needs: [],
           steps: [{ name: 'Run', hasOutputs: false }],
-          // An impure (non-inline) dynamic environment element triggers needsInit
+          // An impure (non-inline) dynamic context element triggers needsInit
           // (the agent resolves it via an init job).
-          environments: [{ value: '', dynamic: true }],
+          contexts: [{ value: '', dynamic: true }],
         },
       ],
     });
@@ -3611,7 +3611,7 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
   });
 });
 
-describe('processWebhook — environment integration', () => {
+describe('processWebhook — context integration', () => {
   function envLockFile(jobOverrides: Record<string, unknown> = {}) {
     return {
       schemaVersion: 9,
@@ -3647,9 +3647,9 @@ describe('processWebhook — environment integration', () => {
     };
   }
 
-  function createMockEnvironmentStore(matchResult: Record<string, unknown> | null = null) {
+  function createMockContextStore(matchResult: Record<string, unknown> | null = null) {
     return {
-      matchEnvironment: vi.fn().mockResolvedValue(matchResult),
+      matchContext: vi.fn().mockResolvedValue(matchResult),
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn().mockResolvedValue(null),
       getByName: vi.fn().mockResolvedValue(null),
@@ -3686,52 +3686,52 @@ describe('processWebhook — environment integration', () => {
     };
   }
 
-  it('dispatches job normally when no environment is declared', async () => {
-    const lockFile = envLockFile(); // No environment on job
+  it('dispatches job normally when no context is declared', async () => {
+    const lockFile = envLockFile(); // No context on job
     const mockDispatcher = createMockDispatcher();
-    const mockEnvStore = createMockEnvironmentStore();
+    const mockEnvStore = createMockContextStore();
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
     });
 
     await processWebhook(basePrInfo(), deps);
 
     // Job dispatched normally
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
-    // Environment store NOT called (no environment declared)
-    expect(mockEnvStore.matchEnvironment).not.toHaveBeenCalled();
+    // Context store NOT called (no context declared)
+    expect(mockEnvStore.matchContext).not.toHaveBeenCalled();
   });
 
-  it('dispatches a job whose referenced environment is not configured (lenient skip)', async () => {
-    const lockFile = envLockFile({ environments: [{ value: 'production', dynamic: false }] });
+  it('dispatches a job whose referenced context is not configured (lenient skip)', async () => {
+    const lockFile = envLockFile({ contexts: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
-    const mockEnvStore = createMockEnvironmentStore(null); // No env config in DB
+    const mockEnvStore = createMockContextStore(null); // No env config in DB
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
     });
 
     await processWebhook(basePrInfo(), deps);
 
-    expect(mockEnvStore.matchEnvironment).toHaveBeenCalledWith('__default__', 'production');
-    // A bound environment with no configured record contributes no protection
+    expect(mockEnvStore.matchContext).toHaveBeenCalledWith('__default__', 'production');
+    // A bound context with no configured record contributes no protection
     // rules / vars but does not block dispatch — the job still runs, with the
-    // declared name recorded as the run environment.
+    // declared name recorded as the run context.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
     const jobConfig = mockDispatcher.dispatch.mock.calls[0][0].jobConfig;
-    expect(jobConfig.environment).toBe('production');
+    expect(jobConfig.context).toBe('production');
   });
 
-  it('evaluates protection rules and rejects job when environment rejects', async () => {
-    const lockFile = envLockFile({ environments: [{ value: 'production', dynamic: false }] });
+  it('evaluates protection rules and rejects job when context rejects', async () => {
+    const lockFile = envLockFile({ contexts: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
-    // Return a disabled environment -> always rejected
-    const mockEnvStore = createMockEnvironmentStore({
+    // Return a disabled context -> always rejected
+    const mockEnvStore = createMockContextStore({
       id: 'env-1',
       org_id: '__default__',
       name: 'production',
@@ -3756,7 +3756,7 @@ describe('processWebhook — environment integration', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
     });
 
     await processWebhook(basePrInfo(), deps);
@@ -3766,11 +3766,11 @@ describe('processWebhook — environment integration', () => {
   });
 
   it('creates held run when protection rules return hold action', async () => {
-    const lockFile = envLockFile({ environments: [{ value: 'staging', dynamic: false }] });
+    const lockFile = envLockFile({ contexts: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const mockHeldRunStore = createMockHeldRunStore();
-    // Environment with required reviewers -> hold action
-    const mockEnvStore = createMockEnvironmentStore({
+    // Context with required reviewers -> hold action
+    const mockEnvStore = createMockContextStore({
       id: 'env-2',
       org_id: '__default__',
       name: 'staging',
@@ -3803,7 +3803,7 @@ describe('processWebhook — environment integration', () => {
       providerRegistry: createMockProviderRegistry(bundle),
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
       heldRunStore: mockHeldRunStore as any,
       accessLogWriter: mockAccessLogWriter as any,
       // db so storePendingJobContext (resume path) can persist the held job.
@@ -3818,9 +3818,9 @@ describe('processWebhook — environment integration', () => {
     expect(mockHeldRunStore.createHold).toHaveBeenCalledTimes(1);
     expect(mockHeldRunStore.createHold.mock.calls[0][0]).toBe('__default__');
     expect(mockHeldRunStore.createHold.mock.calls[0][1]).toMatchObject({
-      environmentId: 'env-2',
+      contextId: 'env-2',
       scope: 'job',
-      triggerSource: 'environment',
+      triggerSource: 'context',
     });
     const requirement = mockHeldRunStore.createHold.mock.calls[0][1].requirement;
     expect(requirement.clauses).toEqual([{ user: 'user1' }]);
@@ -3878,7 +3878,7 @@ describe('processWebhook — environment integration', () => {
     };
     const mockDispatcher = createMockDispatcher();
     const mockHeldRunStore = createMockHeldRunStore();
-    const mockEnvStore = createMockEnvironmentStore({
+    const mockEnvStore = createMockContextStore({
       id: 'env-install',
       org_id: '__default__',
       name: 'prod',
@@ -3916,7 +3916,7 @@ describe('processWebhook — environment integration', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
       secretResolver: mockSecretResolver as any,
       heldRunStore: mockHeldRunStore as any,
       executionTracker: mockTracker as any,
@@ -3935,19 +3935,19 @@ describe('processWebhook — environment integration', () => {
     expect(mockHeldRunStore.createHold.mock.calls[0][1]).toMatchObject({
       jobId: '__install__CI',
       scope: 'workflow',
-      triggerSource: 'environment',
-      environmentId: 'env-install',
+      triggerSource: 'context',
+      contextId: 'env-install',
       holdType: 'reviewer',
     });
   });
 
-  it('includes environment vars from variable store in dispatched job config', async () => {
-    const lockFile = envLockFile({ environments: [{ value: 'dev', dynamic: false }] });
+  it('includes context vars from variable store in dispatched job config', async () => {
+    const lockFile = envLockFile({ contexts: [{ value: 'dev', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const envVars = { DB_HOST: 'localhost', API_KEY: 'test-key' };
     const mockVariableStore = createMockVariableStore(envVars);
-    // Enabled environment with no protection rules
-    const mockEnvStore = createMockEnvironmentStore({
+    // Enabled context with no protection rules
+    const mockEnvStore = createMockContextStore({
       id: 'env-3',
       org_id: '__default__',
       name: 'dev',
@@ -3972,7 +3972,7 @@ describe('processWebhook — environment integration', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
       variableStore: mockVariableStore as any,
     });
 
@@ -3980,8 +3980,8 @@ describe('processWebhook — environment integration', () => {
 
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
     const jobConfig = mockDispatcher.dispatch.mock.calls[0][0].jobConfig;
-    expect(jobConfig.environmentVars).toEqual(envVars);
-    expect(jobConfig.environment).toBe('dev');
+    expect(jobConfig.contextVars).toEqual(envVars);
+    expect(jobConfig.context).toBe('dev');
     // Variable store called with correct args
     expect(mockVariableStore.getResolvedVars).toHaveBeenCalledWith(
       '__default__',
@@ -4006,30 +4006,30 @@ describe('processWebhook — environment integration', () => {
     expect(jobConfig.jobEnv).toEqual({ NODE_ENV: 'production', CI: 'true' });
   });
 
-  it('skips environment evaluation for dynamic environment (flag-only)', async () => {
-    const lockFile = envLockFile({ environments: [{ value: '', dynamic: true }] });
+  it('skips context evaluation for dynamic context (flag-only)', async () => {
+    const lockFile = envLockFile({ contexts: [{ value: '', dynamic: true }] });
     const mockDispatcher = createMockDispatcher();
-    const mockEnvStore = createMockEnvironmentStore();
+    const mockEnvStore = createMockContextStore();
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
     });
 
     await processWebhook(basePrInfo(), deps);
 
     // Job dispatched normally (dynamic env deferred to agent)
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
-    // Environment store NOT called (dynamic)
-    expect(mockEnvStore.matchEnvironment).not.toHaveBeenCalled();
+    // Context store NOT called (dynamic)
+    expect(mockEnvStore.matchContext).not.toHaveBeenCalled();
   });
 
   it('dispatches job with pass result from protection rules', async () => {
-    const lockFile = envLockFile({ environments: [{ value: 'staging', dynamic: false }] });
+    const lockFile = envLockFile({ contexts: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
-    // Enabled environment with no restrictive rules -> pass
-    const mockEnvStore = createMockEnvironmentStore({
+    // Enabled context with no restrictive rules -> pass
+    const mockEnvStore = createMockContextStore({
       id: 'env-4',
       org_id: '__default__',
       name: 'staging',
@@ -4054,7 +4054,7 @@ describe('processWebhook — environment integration', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       dispatcher: mockDispatcher as any,
-      environmentStore: mockEnvStore as any,
+      contextStore: mockEnvStore as any,
     });
 
     await processWebhook(basePrInfo(), deps);
@@ -4344,7 +4344,7 @@ describe('issue_comment /kici approve commitSha lookup', () => {
 
 // -- Init job dispatch tests --
 
-function dynamicEnvironmentLockFile() {
+function dynamicContextLockFile() {
   return {
     schemaVersion: 1,
     source: { file: '.kici/workflows/ci.ts', export: '#default' },
@@ -4365,7 +4365,7 @@ function dynamicEnvironmentLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            environments: [{ value: '', dynamic: true }],
+            contexts: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4396,7 +4396,7 @@ function dynamicEnvOnlyLockFile() {
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
             dynamicEnv: true,
-            environments: [{ value: 'production', dynamic: false }],
+            contexts: [{ value: 'production', dynamic: false }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
           },
         ],
@@ -4426,7 +4426,7 @@ function multipleDynamicJobsLockFile() {
             name: 'deploy-staging',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            environments: [{ value: '', dynamic: true }],
+            contexts: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy staging', hasOutputs: false }],
           },
           {
@@ -4445,9 +4445,7 @@ function multipleDynamicJobsLockFile() {
 
 function createMockPendingInits() {
   return {
-    track: vi
-      .fn()
-      .mockResolvedValue({ environmentNames: ['staging'], env: { NODE_ENV: 'staging' } }),
+    track: vi.fn().mockResolvedValue({ contextNames: ['staging'], env: { NODE_ENV: 'staging' } }),
     resolve: vi.fn(),
     reject: vi.fn(),
     has: vi.fn().mockReturnValue(false),
@@ -4469,12 +4467,12 @@ describe('init job dispatch (dynamic fields)', () => {
     }
   }
 
-  it('dispatches init job with __init__ prefix for dynamicEnvironment job', async () => {
+  it('dispatches init job with __init__ prefix for dynamicContext job', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4495,19 +4493,19 @@ describe('init job dispatch (dynamic fields)', () => {
     ]);
     expect(initCall.jobConfig.initOnly).toBe(true);
     expect(initCall.jobConfig.targetJobName).toBe('deploy-job');
-    expect(initCall.jobConfig.dynamicEnvironment).toBe(true);
+    expect(initCall.jobConfig.dynamicContext).toBe(true);
     expect(initCall.jobConfig.timeoutMs).toBe(60_000);
     expect(initCall.jobConfig.event).toBeDefined();
   });
 
-  it('applies init result environmentName to static resolution pipeline', async () => {
+  it('applies init result contextName to static resolution pipeline', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
-    mockPendingInits.track.mockResolvedValue({ environmentNames: ['production'] });
+    mockPendingInits.track.mockResolvedValue({ contextNames: ['production'] });
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4519,7 +4517,7 @@ describe('init job dispatch (dynamic fields)', () => {
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 
-  it('preserves static environment when only dynamicEnv is set', async () => {
+  it('preserves static context when only dynamicEnv is set', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
     mockPendingInits.track.mockResolvedValue({ env: { DEPLOY_TARGET: 'us-east-1' } });
@@ -4537,21 +4535,21 @@ describe('init job dispatch (dynamic fields)', () => {
     const initCall = mockDispatcher.dispatch.mock.calls[0][0];
     expect(initCall.jobConfig.initOnly).toBe(true);
     expect(initCall.jobConfig.dynamicEnv).toBe(true);
-    expect(initCall.jobConfig.dynamicEnvironment).toBe(false);
+    expect(initCall.jobConfig.dynamicContext).toBe(false);
 
-    // Execution job dispatched after init (static environment 'production' should be preserved)
+    // Execution job dispatched after init (static context 'production' should be preserved)
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
-  it('skips environment resolution when init returns undefined environmentName', async () => {
+  it('skips context resolution when init returns undefined contextName', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
-    // Init returns no environmentName --: proceed without environment resolution
+    // Init returns no contextName --: proceed without context resolution
     mockPendingInits.track.mockResolvedValue({});
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4570,7 +4568,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4601,7 +4599,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
       executionTracker: mockTracker as any,
     });
@@ -4661,7 +4659,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
       executionTracker: mockTracker as any,
     });
@@ -4712,7 +4710,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
 // -- Inline evaluation tests --
 
-function inlineEnvironmentLockFile() {
+function inlineContextLockFile() {
   return {
     schemaVersion: 1,
     source: { file: '.kici/workflows/ci.ts', export: '#default' },
@@ -4733,7 +4731,7 @@ function inlineEnvironmentLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            environments: [
+            contexts: [
               {
                 value: {
                   _type: 'inline' as const,
@@ -4750,7 +4748,7 @@ function inlineEnvironmentLockFile() {
   };
 }
 
-function inlineEnvironmentErrorLockFile() {
+function inlineContextErrorLockFile() {
   return {
     schemaVersion: 1,
     source: { file: '.kici/workflows/ci.ts', export: '#default' },
@@ -4771,7 +4769,7 @@ function inlineEnvironmentErrorLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            environments: [
+            contexts: [
               {
                 value: {
                   _type: 'inline' as const,
@@ -4809,7 +4807,7 @@ function mixedInlineAndDynamicLockFile() {
             name: 'deploy-job',
             runsOn: [{ kind: 'exact', value: 'linux' }],
             needs: [],
-            environments: [
+            contexts: [
               {
                 value: {
                   _type: 'inline' as const,
@@ -4840,12 +4838,12 @@ describe('inline evaluation (pure dynamic functions)', () => {
     }
   }
 
-  it('skips init job dispatch when environment has inline value', async () => {
+  it('skips init job dispatch when context has inline value', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(inlineEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(inlineContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4861,12 +4859,12 @@ describe('inline evaluation (pure dynamic functions)', () => {
     expect(mockPendingInits.track).not.toHaveBeenCalled();
   });
 
-  it('dispatches init job when dynamicEnvironment is true but environment is undefined (impure, )', async () => {
+  it('dispatches init job when dynamicContext is true but context is undefined (impure, )', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(dynamicEnvironmentLockFile()) as any,
+      lockFileCache: createMockLockFileCache(dynamicContextLockFile()) as any,
       pendingInits: mockPendingInits as any,
     });
 
@@ -4885,12 +4883,12 @@ describe('inline evaluation (pure dynamic functions)', () => {
     const mockDispatcher = createMockDispatcher();
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
-      lockFileCache: createMockLockFileCache(inlineEnvironmentErrorLockFile()) as any,
+      lockFileCache: createMockLockFileCache(inlineContextErrorLockFile()) as any,
     });
 
     // processWebhook should throw or the run should fail
     await expect(processWebhook(basePushInfo(), deps)).rejects.toThrow(
-      /Inline environment evaluation failed/,
+      /Inline context evaluation failed/,
     );
   });
 
@@ -4913,7 +4911,7 @@ describe('inline evaluation (pure dynamic functions)', () => {
     expect(initCalls).toHaveLength(1);
     // Init job should indicate dynamicEnv needs resolution
     expect(initCalls[0][0].jobConfig.dynamicEnv).toBe(true);
-    // But dynamicEnvironment should still be flagged (even though resolved inline)
+    // But dynamicContext should still be flagged (even though resolved inline)
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 });

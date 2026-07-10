@@ -21,6 +21,15 @@ export const LocalSourceConfigSchema = z
     /** Optional network clone base (git:// / http://) for remote agents that do
      *  not share the orchestrator's filesystem. When unset, file:// is used. */
     cloneUrlBase: z.string().min(1).optional(),
+    /**
+     * In-place profile: the `repoBasePath` IS the operator's real working tree,
+     * so a dispatched run skips the source-pack `__build__` job and each job runs
+     * the tree directly (the agent, under its `KICI_IN_PLACE` profile, uses the
+     * `file://` path as workDir with no clone). Set only by the local dev plane
+     * for a `kici run --local --in-place` run. Only meaningful for `file://`
+     * (no `cloneUrlBase`) local sources on a host-sharing scaler.
+     */
+    inPlace: z.boolean().optional(),
   })
   .strict();
 

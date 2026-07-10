@@ -67,4 +67,17 @@ describe('ProvenanceTrustRoot', () => {
     await tr.getJwks();
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
+
+  it('serves a static in-process JWKS without fetching (local dev plane)', async () => {
+    const fetchImpl = vi.fn(async () => new Response('should-not-fetch', { status: 500 }));
+    const tr = createProvenanceTrustRoot({
+      issuer: 'kici-local',
+      staticJwks: jwks,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(tr.getIssuer()).toBe('kici-local');
+    expect(await tr.getJwks()).toBe(jwks);
+    expect(await tr.getJwks('any-kid')).toBe(jwks);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });

@@ -23,8 +23,8 @@ function workflow(name: string, options: WorkflowOptions): Workflow;
 | `options.rules`       | `Rule[]`                                                               | no       | Conditions that must pass for execution                                                                                                                     |
 | `options.description` | `string`                                                               | no       | Human-readable description                                                                                                                                  |
 | `options.hashFiles`   | `string[]`                                                             | no       | Extra repo-relative paths or globs mixed into the workflow content hash. Changes invalidate the source cache.                                               |
-| `options.registries`  | `Registry[]`                                                           | no       | Private npm registries the agent authenticates against before `npm install`. Each `tokenSecret` uses qualified `<environment>:<secret>` syntax.             |
-| `options.installEnv`  | `string[]`                                                             | no       | Qualified `<environment>:<secret>` refs projected as env vars onto the install subprocess (used with a customer-committed `.kici/.npmrc`).                  |
+| `options.registries`  | `Registry[]`                                                           | no       | Private npm registries the agent authenticates against before `npm install`. Each `tokenSecret` uses qualified `<context>:<secret>` syntax.                 |
+| `options.installEnv`  | `string[]`                                                             | no       | Qualified `<context>:<secret>` refs projected as env vars onto the install subprocess (used with a customer-committed `.kici/.npmrc`).                      |
 | `options.onCancel`    | `HookInput`                                                            | no       | Runs when the workflow is cancelled                                                                                                                         |
 | `options.cleanup`     | `HookInput`                                                            | no       | Always runs after the workflow (success, failure, or cancel)                                                                                                |
 | `options.onSuccess`   | `HookInput`                                                            | no       | Runs on workflow success                                                                                                                                    |
@@ -575,7 +575,7 @@ step('fetch-token', {
 - **Timeout is per-attempt.** Each attempt gets the step's full `timeout` budget — a timed-out attempt counts as one failed attempt and is retried while attempts remain. The total wall-clock can therefore approach `maxAttempts * (timeout + delay)`, so keep `maxAttempts` and `maxDelayMs` sane (the job-level `timeout` still bounds the whole job).
 - **Retries exhaust before `continueOnError`.** A step with both retries first; only the _final_ failure is then softened to a warning by `continueOnError`.
 
-`retry` works identically under `kici run local` and on a remote agent, and applies to dynamically-generated job steps too. The `retryIf` predicate is an in-memory function: it is honored at execution time but never serialized into the lock file.
+`retry` works identically under `kici run <event> --local` and on a remote agent, and applies to dynamically-generated job steps too. The `retryIf` predicate is an in-memory function: it is honored at execution time but never serialized into the lock file.
 
 > **Retry vs. wait-until-condition.** `retry` re-runs a step that _throws_. To poll until a condition becomes true (a port listening, a `/health` endpoint returning 200, a unit becoming active), use [`waitForStep`](./wait-for.md) instead — it is purpose-built for declarative wait-for-condition with intervals, a timeout, and on-timeout handling.
 
@@ -661,7 +661,7 @@ const deploy = job('deploy', {
 
 **Important:** `needs` must be declared explicitly. Output chaining does not auto-infer dependencies -- you must list job dependencies in `needs` even if you access their outputs via `.result`.
 
-Cross-job output chaining works in both local execution (`kici run local`) and remote pipeline execution. The orchestrator's needs-aware dispatch scheduler guarantees upstream jobs reach a terminal state before downstream jobs dispatch, and upstream outputs are transported to the downstream agent sandbox via the `upstreamJobOutputs` field on `job.dispatch`. See [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the full dispatch semantics.
+Cross-job output chaining works in both local execution (`kici run <event> --local`) and remote pipeline execution. The orchestrator's needs-aware dispatch scheduler guarantees upstream jobs reach a terminal state before downstream jobs dispatch, and upstream outputs are transported to the downstream agent sandbox via the `upstreamJobOutputs` field on `job.dispatch`. See [needs-scheduler](../../architecture/execution/needs-scheduler.md) for the full dispatch semantics.
 
 ### Job dependencies (`needs`)
 

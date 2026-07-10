@@ -153,8 +153,8 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
 
     runPublicKey: dispatch.runPublicKey,
 
-    environment: jobConfig.environment as string | undefined,
-    environmentVars: jobConfig.environmentVars as Record<string, string> | undefined,
+    context: jobConfig.context as string | undefined,
+    contextVars: jobConfig.contextVars as Record<string, string> | undefined,
     jobEnv: jobConfig.jobEnv as Record<string, string> | undefined,
 
     // Global workflow fields

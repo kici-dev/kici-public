@@ -93,21 +93,19 @@ guaranteed side-effect-free.
 
 ## Running in check mode
 
-`--check` and `--fail-on-drift` work on both local and remote runs:
+`--check` and `--fail-on-drift` control drift reporting on `kici run remote`:
 
 ```bash
 # Apply (default): converge the workflow.
-kici run local push
+kici run push --local
 kici run remote my-fixture
 
 # Check: report drift, change nothing. Always exits 0.
-kici run local push --check
 kici run remote my-fixture --check
 
-# Check + fail on drift: exit non-zero (2) locally, or fail the run remotely,
-# when any step reports drift. Use this as a CI gate ("fail the build if prod
-# has drifted").
-kici run local push --check --fail-on-drift
+# Check + fail on drift: fail the run when any step reports drift. Use this as a
+# CI gate ("fail the build if prod has drifted").
+kici run remote my-fixture --check --fail-on-drift
 ```
 
 `--fail-on-drift` only modifies check mode — passing it without `--check` is an

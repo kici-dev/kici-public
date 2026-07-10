@@ -2,7 +2,7 @@
  * Shared approval requirement + clause types.
  *
  * One normalized `ApprovalRequirement` is produced by both approval triggers —
- * a mandatory environment policy and an explicit SDK `approval` config — and is
+ * a mandatory context policy and an explicit SDK `approval` config — and is
  * consumed identically by the orchestrator gate, the resolver, the held-run
  * store, and the agent step round-trip. Pure Zod (no node built-ins), so this
  * module is safe in the browser-facing engine barrel.
@@ -24,8 +24,8 @@ export type ApproverClause = z.infer<typeof approverClauseSchema>;
 export const HoldScope = z.enum(['workflow', 'job', 'step']);
 export type HoldScope = z.infer<typeof HoldScope>;
 
-/** What triggered the hold: an environment policy (mandatory) or SDK code (explicit). */
-export const TriggerSource = z.enum(['environment', 'explicit']);
+/** What triggered the hold: a context policy (mandatory) or SDK code (explicit). */
+export const TriggerSource = z.enum(['context', 'explicit']);
 export type TriggerSource = z.infer<typeof TriggerSource>;
 
 /**

@@ -1,6 +1,6 @@
 import pc from 'picocolors';
 import { DashboardClient, DashboardClientError } from '../remote/dashboard-client.js';
-import type { EnvironmentContext } from '../remote/dashboard-client.js';
+import type { ContextContext } from '../remote/dashboard-client.js';
 import { toErrorMessage } from '@kici-dev/core';
 
 export interface SecretsListOptions {
@@ -11,22 +11,22 @@ export interface SecretsListOptions {
 /**
  * List test-available secret contexts through the Platform.
  *
- * Calls GET /api/v1/orgs/:orgId/environments?includeSecrets=true (relayed to
- * the org's orchestrator), filters to environments with
+ * Calls GET /api/v1/orgs/:orgId/contexts?includeSecrets=true (relayed to
+ * the org's orchestrator), filters to contexts with
  * allowLocalExecution=true, and displays a table of names, key names, and
  * flags. Values are never exposed -- only key names.
  */
 export async function secretsListCommand(_options: SecretsListOptions = {}): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
-    const environments = await client.listEnvironments(true);
-    const contexts = environments.filter((e) => e.allowLocalExecution);
+    const allContexts = await client.listContexts(true);
+    const contexts = allContexts.filter((e) => e.allowLocalExecution);
 
     if (contexts.length === 0) {
       console.log(pc.yellow('No test-available secret contexts found.'));
       console.log(
         pc.gray(
-          'Enable test runs (allowLocalExecution) on an environment to make its secrets available for test runs.',
+          'Enable test runs (allowLocalExecution) on a context to make its secrets available for test runs.',
         ),
       );
       return true;
@@ -45,10 +45,10 @@ export async function secretsListCommand(_options: SecretsListOptions = {}): Pro
 }
 
 /** Render the secret-context table to stdout. */
-function renderContextTable(contexts: EnvironmentContext[]): void {
+function renderContextTable(contexts: ContextContext[]): void {
   console.log(pc.bold('\nTest-available secret contexts:\n'));
 
-  const ctxKeys = (c: EnvironmentContext): string[] => c.secretKeys ?? [];
+  const ctxKeys = (c: ContextContext): string[] => c.secretKeys ?? [];
 
   const nameWidth = Math.max('Context'.length, ...contexts.map((c) => c.name.length));
   const keysWidth = Math.max(

@@ -15,7 +15,7 @@ Workflow authors writing CI/CD in TypeScript.
 | [CLI authentication](user/cli-auth.md)                      | Browser OAuth, device flow, API key paste, org management, PATs                                                                                    |
 | [Lock file and workflow drift](user/lock-file-and-drift.md) | Why the lock file must stay in sync, pre-commit and CI drift detection                                                                             |
 | [Testing guide](user/testing-guide.md)                      | Remote test execution with `kici run remote`, fixture-based testing, overlay mode                                                                  |
-| [Environments](user/environments.md)                        | Deployment environments with variables, scoped secrets, and protection rules                                                                       |
+| [Contexts](user/contexts.md)                        | Deployment environments with variables, scoped secrets, and protection rules                                                                       |
 | [Environment variables](user/env-vars.md)                   | All `KICI_*` environment variables for the CLI                                                                                                     |
 | [Lifecycle hooks](user/hooks.md)                            | Cancel, cleanup, success, failure, and step-level hook callbacks                                                                                   |
 | [Concurrency groups](user/concurrency.md)                   | Control parallel execution with auto-cancel and queue modes                                                                                        |
@@ -50,7 +50,7 @@ Teams deploying the orchestrator and agent in their own infrastructure.
 | [Event routing](operator/event-routing.md)                                   | Internal events, generic webhooks, trust, workflow registrations                 |
 | [Multi-architecture builds](./operator/distribution/multi-arch-builds.md)    | Build images for x64 and ARM64, manifests, cross-arch deploy                     |
 | [Multi-orchestrator clustering](operator/orchestrator/clustering.md)         | HA pair, cross-arch pool, coordinator topologies                                 |
-| [Environments](operator/environments.md)                                     | Deployment environments, secrets integration, protection rules                   |
+| [Contexts](operator/contexts.md)                                     | Deployment environments, secrets integration, protection rules                   |
 | [Cancel behavior](operator/cancel-behavior.md)                               | Grace period, hook timeout, force cancel, monitoring                             |
 | [Agent execution security](./operator/security/agent-security.md)            | Sandbox backends, isolation model, environment sanitization                      |
 | [CI security](./operator/security/security.md)                               | Trust policies, identity linking, approval workflows                             |

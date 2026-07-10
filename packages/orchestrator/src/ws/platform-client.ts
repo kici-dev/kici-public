@@ -1262,27 +1262,27 @@ export class PlatformClient {
       case 'dashboard.event-dlq.count':
       case 'dashboard.event-dlq.retry':
       case 'dashboard.event-dlq.discard':
-      case 'dashboard.environments.list':
-      case 'dashboard.environments.get':
-      case 'dashboard.environments.create':
-      case 'dashboard.environments.update':
-      case 'dashboard.environments.test_access.set':
-      case 'dashboard.environments.delete':
-      case 'dashboard.environments.variables.list':
-      case 'dashboard.environments.variables.set':
-      case 'dashboard.environments.variables.delete':
-      case 'dashboard.environments.source-overrides.list':
-      case 'dashboard.environments.source-overrides.set':
-      case 'dashboard.environments.source-overrides.delete':
-      case 'dashboard.environments.bindings.list':
-      case 'dashboard.environments.bindings.set':
-      case 'dashboard.environments.secrets.list':
-      case 'dashboard.environments.secrets.set':
-      case 'dashboard.environments.secrets.delete':
-      case 'dashboard.environments.secrets.scope.create':
-      case 'dashboard.environments.secrets.scope.rename':
-      case 'dashboard.environments.secrets.scope.delete':
-      case 'dashboard.environments.history':
+      case 'dashboard.contexts.list':
+      case 'dashboard.contexts.get':
+      case 'dashboard.contexts.create':
+      case 'dashboard.contexts.update':
+      case 'dashboard.contexts.test_access.set':
+      case 'dashboard.contexts.delete':
+      case 'dashboard.contexts.variables.list':
+      case 'dashboard.contexts.variables.set':
+      case 'dashboard.contexts.variables.delete':
+      case 'dashboard.contexts.source-overrides.list':
+      case 'dashboard.contexts.source-overrides.set':
+      case 'dashboard.contexts.source-overrides.delete':
+      case 'dashboard.contexts.bindings.list':
+      case 'dashboard.contexts.bindings.set':
+      case 'dashboard.contexts.secrets.list':
+      case 'dashboard.contexts.secrets.set':
+      case 'dashboard.contexts.secrets.delete':
+      case 'dashboard.contexts.secrets.scope.create':
+      case 'dashboard.contexts.secrets.scope.rename':
+      case 'dashboard.contexts.secrets.scope.delete':
+      case 'dashboard.contexts.history':
       case 'dashboard.held-runs.list':
       case 'dashboard.held-runs.approve':
       case 'dashboard.held-runs.reject':

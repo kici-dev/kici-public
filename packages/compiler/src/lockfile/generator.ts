@@ -750,13 +750,13 @@ function validateRunsOn(runsOn: RunsOn, jobName: string): void {
 }
 
 /**
- * Transform one environment reference (static name or function) into a lock
+ * Transform one context reference (static name or function) into a lock
  * `{ value, dynamic }` entry. A function element is analyzed for purity: a pure
  * function becomes an inline expression resolvable at two-phase eval; an impure
  * one carries only the `dynamic` flag (the agent runs an init job to resolve it).
  */
-function transformEnvironmentRef(
-  ref: NonNullable<Job['environments']>[number],
+function transformContextRef(
+  ref: NonNullable<Job['contexts']>[number],
   jobName: string,
 ): { value: string | LockInlineValue; dynamic: boolean } {
   if (typeof ref === 'function') {
@@ -766,7 +766,7 @@ function transformEnvironmentRef(
       return { value: { _type: 'inline', expression: fnSource }, dynamic: true };
     }
     console.warn(
-      `[kici] Job "${jobName}": environment function is not pure (${purity.reason}). ` +
+      `[kici] Job "${jobName}": context function is not pure (${purity.reason}). ` +
         'An init job will be required, adding ~5-10s delay.',
     );
     return { value: '', dynamic: true };
@@ -808,17 +808,16 @@ function transformJob(
   // Validate runsOn for overlap between required and excluded labels
   if (job.runsOn !== undefined) validateRunsOn(job.runsOn, job.name);
 
-  // Resolve environments into an ordered array of { value, dynamic } entries.
-  // Either spelling normalizes here: `environment: 'x'` becomes a one-element
-  // array; `environments: [...]` is emitted in order. Each function element is
-  // analyzed for purity exactly like a dynamic singular environment was.
-  const environmentFields: {
-    environments?: Array<{ value: string | LockInlineValue; dynamic: boolean }>;
+  // Resolve contexts into an ordered array of { value, dynamic } entries.
+  // Either spelling normalizes here: `context: 'x'` becomes a one-element
+  // array; `contexts: [...]` is emitted in order. Each function element is
+  // analyzed for purity exactly like a dynamic singular context was.
+  const contextFields: {
+    contexts?: Array<{ value: string | LockInlineValue; dynamic: boolean }>;
   } = {};
-  const envRefs =
-    job.environments ?? (job.environment !== undefined ? [job.environment] : undefined);
-  if (envRefs !== undefined && envRefs.length > 0) {
-    environmentFields.environments = envRefs.map((ref) => transformEnvironmentRef(ref, job.name));
+  const contextRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
+  if (contextRefs !== undefined && contextRefs.length > 0) {
+    contextFields.contexts = contextRefs.map((ref) => transformContextRef(ref, job.name));
   }
 
   // Resolve env: static object, inline expression (pure function), or dynamic function marker
@@ -904,7 +903,7 @@ function transformJob(
     ...(job.checkout !== undefined && { checkout: job.checkout }),
     ...(job.cache !== undefined && { cache: normalizeCacheSpecs(job.cache) }),
     ...(job.container !== undefined && { container: job.container }),
-    ...environmentFields,
+    ...contextFields,
     ...envFields,
     ...concurrencyFields,
     ...(job.onCancel !== undefined && { hasOnCancel: true }),

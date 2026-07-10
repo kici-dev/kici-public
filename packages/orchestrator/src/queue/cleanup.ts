@@ -3,6 +3,7 @@ import { ExecutionJobStatus } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import { pruneRequestIdempotency } from '../pipeline/request-idempotency.js';
 import { JobQueue } from './job-queue.js';
 
 const logger = createLogger({ prefix: 'cleanup' });
@@ -38,6 +39,17 @@ export async function runCleanup(
   // 2. Mark expired dispatch_queue entries and get details
   const expiredJobs = await queue.markExpired();
   const queueExpired = expiredJobs.length;
+
+  // 2b. Prune stale request idempotency claims (>1h; the request budget is
+  // ~10s, so a claimed requestId is never re-sent after an hour).
+  if (extras) {
+    try {
+      const pruned = await pruneRequestIdempotency(extras.db);
+      if (pruned > 0) logger.info('Pruned stale request idempotency claims', { pruned });
+    } catch (err) {
+      logger.error('Failed to prune request idempotency claims', { error: toErrorMessage(err) });
+    }
+  }
 
   // 3. Forward terminal status to Platform for each expired job
   if (extras && expiredJobs.length > 0) {

@@ -180,6 +180,39 @@ defineObservableGauge(
   (result) => result.observe(_rejectedAttestationsValue),
 );
 
+// ── Database collation drift ────────────────────────────────────
+//
+// 1 when the orchestrator DB's stamped collation version differs from the
+// running libc (text b-tree indexes may silently miss present rows — the
+// failure mode that read a present source private key back as absent); 0 when
+// consistent. Set once at startup by the collation-drift boot guard.
+
+const _dbCollationDrift: Record<string, number> = {};
+
+/** Record the collation-drift flag (1 = drift, 0 = clean) for a database. */
+export function setDbCollationDrift(database: string, drifted: boolean): void {
+  _dbCollationDrift[database] = drifted ? 1 : 0;
+}
+
+/**
+ * Orchestrator DB collation-drift flag (1 = drift, 0 = clean), set once at
+ * startup by the collation-drift boot guard.
+ * Labels:
+ * - database: the orchestrator database name
+ */
+defineObservableGauge(
+  'kici_orch_db_collation_drift',
+  {
+    description:
+      '1 when the orchestrator DB stamped collation version differs from the running libc (text indexes may silently miss present rows); 0 when consistent.',
+  },
+  (result) => {
+    for (const [database, value] of Object.entries(_dbCollationDrift)) {
+      result.observe(value, { database });
+    }
+  },
+);
+
 // ── Scaler resource usage (observable gauges with labels) ────────
 //
 // One CPU and one memory gauge fan out per (scaler, machinePool) combination

@@ -74,18 +74,16 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
 
   validateInit(options.init, name);
 
-  // When a job binds multiple environments and no explicit concurrency group is
-  // set, default the concurrency group to the first (primary) bound environment's
+  // When a job binds multiple contexts and no explicit concurrency group is
+  // set, default the concurrency group to the first (primary) bound context's
   // name. A dynamic first element (function) falls through to dispatch-time
-  // resolution, matching the single-environment behaviour.
-  const firstEnv = options.environments?.[0];
+  // resolution, matching the single-context behaviour.
+  const firstContext = options.contexts?.[0];
   const concurrencyGroup =
-    options.concurrencyGroup ?? (typeof firstEnv === 'string' ? firstEnv : undefined);
+    options.concurrencyGroup ?? (typeof firstContext === 'string' ? firstContext : undefined);
 
-  if (options.environment !== undefined && options.environments !== undefined) {
-    throw new Error(
-      `job('${name}'): environment and environments are mutually exclusive — use one`,
-    );
+  if (options.context !== undefined && options.contexts !== undefined) {
+    throw new Error(`job('${name}'): context and contexts are mutually exclusive — use one`);
   }
 
   if (options.runsOn !== undefined && options.runsOnAll !== undefined) {
@@ -121,8 +119,8 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     exclude: options.exclude,
     checkout: options.checkout,
     container: options.container,
-    environment: options.environment,
-    environments: options.environments,
+    context: options.context,
+    contexts: options.contexts,
     env: options.env,
     concurrencyGroup,
     onCancel: options.onCancel,

@@ -6,15 +6,15 @@ import {
   ensureDatabase,
   maskDatabaseUrl,
   parseDatabaseUrl,
-  seedEnvironmentDirect,
-  deleteEnvironmentDirect,
-  purgeEnvironmentsDirect,
-  seedEnvironmentBindingDirect,
-  setEnvironmentPolicyDirect,
-  listEnvironmentsDirect,
-  showEnvironmentDirect,
-  createEnvironmentTemplateDirect,
-  setEnvironmentSecretDirect,
+  seedContextDirect,
+  deleteContextDirect,
+  purgeContextsDirect,
+  seedContextBindingDirect,
+  setContextPolicyDirect,
+  listContextsDirect,
+  showContextDirect,
+  createContextTemplateDirect,
+  setContextSecretDirect,
   waitForPlatformRegistrationsDirect,
 } from './db-admin.js';
 
@@ -110,7 +110,7 @@ describe('computeMigrationsHash', () => {
   });
 });
 
-// ── environment *Direct helpers ──────────────────────────────────────────
+// ── context *Direct helpers ──────────────────────────────────────────
 //
 // These use a mocked pg.Pool — we assert the SQL text and parameter bindings
 // without hitting a real DB. The integration-level coverage (ON CONFLICT
@@ -179,21 +179,21 @@ function installPoolMock(responses: MockQueryResult[]): {
   };
 }
 
-describe('purgeEnvironmentsDirect', () => {
+describe('purgeContextsDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
-  it('deletes held_runs then environments scoped to an org, in a transaction', async () => {
+  it('deletes held_runs then contexts scoped to an org, in a transaction', async () => {
     pool = installPoolMock([
       { rows: [], rowCount: 1 }, // DELETE FROM held_runs
-      { rows: [], rowCount: 2 }, // DELETE FROM environments
+      { rows: [], rowCount: 2 }, // DELETE FROM contexts
     ]);
-    const result = await purgeEnvironmentsDirect('postgresql://u:p@h:5432/d', 'orgA');
-    expect(result).toEqual({ environmentsDeleted: 2, heldRunsDeleted: 1 });
+    const result = await purgeContextsDirect('postgresql://u:p@h:5432/d', 'orgA');
+    expect(result).toEqual({ contextsDeleted: 2, heldRunsDeleted: 1 });
     expect(pool.calls.map((c) => c.sql)).toEqual([
       'BEGIN',
       'DELETE FROM held_runs WHERE org_id = $1',
-      'DELETE FROM environments WHERE org_id = $1',
+      'DELETE FROM contexts WHERE org_id = $1',
       'COMMIT',
     ]);
     expect(pool.calls[1].params).toEqual(['orgA']);
@@ -204,14 +204,14 @@ describe('purgeEnvironmentsDirect', () => {
   it('purges all orgs (no WHERE clause, empty params) when orgId is omitted', async () => {
     pool = installPoolMock([
       { rows: [], rowCount: 0 }, // DELETE FROM held_runs
-      { rows: [], rowCount: 5 }, // DELETE FROM environments
+      { rows: [], rowCount: 5 }, // DELETE FROM contexts
     ]);
-    const result = await purgeEnvironmentsDirect('postgresql://u:p@h:5432/d');
-    expect(result).toEqual({ environmentsDeleted: 5, heldRunsDeleted: 0 });
+    const result = await purgeContextsDirect('postgresql://u:p@h:5432/d');
+    expect(result).toEqual({ contextsDeleted: 5, heldRunsDeleted: 0 });
     expect(pool.calls.map((c) => c.sql)).toEqual([
       'BEGIN',
       'DELETE FROM held_runs ',
-      'DELETE FROM environments ',
+      'DELETE FROM contexts ',
       'COMMIT',
     ]);
     expect(pool.calls[1].params).toEqual([]);
@@ -338,13 +338,13 @@ describe('ensureDatabase', () => {
   });
 });
 
-describe('seedEnvironmentDirect', () => {
+describe('seedContextDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
   it('upserts and returns the envId + created flag', async () => {
     pool = installPoolMock([{ rows: [{ id: 'env-123', inserted: true }], rowCount: 1 }]);
-    const result = await seedEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    const result = await seedContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'staging',
       type: 'fixed',
@@ -353,7 +353,7 @@ describe('seedEnvironmentDirect', () => {
     });
     expect(result).toEqual({ envId: 'env-123', created: true });
     expect(pool.calls).toHaveLength(1);
-    expect(pool.calls[0].sql).toMatch(/INSERT INTO environments/);
+    expect(pool.calls[0].sql).toMatch(/INSERT INTO contexts/);
     expect(pool.calls[0].params[0]).toBe('org1');
     expect(pool.calls[0].params[1]).toBe('staging');
     expect(pool.calls[0].params[4]).toBe(JSON.stringify(['main']));
@@ -364,7 +364,7 @@ describe('seedEnvironmentDirect', () => {
   it('rejects negative waitTimerSeconds', async () => {
     pool = installPoolMock([]);
     await expect(
-      seedEnvironmentDirect('postgresql://u:p@h:5432/d', {
+      seedContextDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
         name: 'staging',
         waitTimerSeconds: -1,
@@ -375,7 +375,7 @@ describe('seedEnvironmentDirect', () => {
   it('rejects negative holdExpirySeconds', async () => {
     pool = installPoolMock([]);
     await expect(
-      seedEnvironmentDirect('postgresql://u:p@h:5432/d', {
+      seedContextDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
         name: 'staging',
         holdExpirySeconds: -1,
@@ -385,7 +385,7 @@ describe('seedEnvironmentDirect', () => {
 
   it('serialises empty branch restrictions as []', async () => {
     pool = installPoolMock([{ rows: [{ id: 'env-1', inserted: true }], rowCount: 1 }]);
-    await seedEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    await seedContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'prod',
     });
@@ -395,7 +395,7 @@ describe('seedEnvironmentDirect', () => {
 
   it('passes globPattern through to the glob_pattern column', async () => {
     pool = installPoolMock([{ rows: [{ id: 'env-9', inserted: true }], rowCount: 1 }]);
-    await seedEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    await seedContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'review',
       type: 'glob',
@@ -406,7 +406,7 @@ describe('seedEnvironmentDirect', () => {
   });
 });
 
-describe('deleteEnvironmentDirect', () => {
+describe('deleteContextDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
@@ -415,14 +415,14 @@ describe('deleteEnvironmentDirect', () => {
       { rows: [{ count: '0' }], rowCount: 1 },
       { rows: [{ id: 'env-1' }], rowCount: 1 },
     ]);
-    const result = await deleteEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    const result = await deleteContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'staging',
     });
     expect(result).toEqual({ deleted: true });
     expect(pool.calls[0].sql).toMatch(/held_runs/);
     expect(pool.calls[0].params).toEqual(['org1', 'staging']);
-    expect(pool.calls[1].sql).toMatch(/DELETE FROM environments/);
+    expect(pool.calls[1].sql).toMatch(/DELETE FROM contexts/);
     expect(pool.calls[1].params).toEqual(['org1', 'staging']);
     expect(pool.endCalls).toBe(1);
   });
@@ -432,7 +432,7 @@ describe('deleteEnvironmentDirect', () => {
       { rows: [{ count: '0' }], rowCount: 1 },
       { rows: [], rowCount: 0 },
     ]);
-    const result = await deleteEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    const result = await deleteContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'missing',
     });
@@ -443,7 +443,7 @@ describe('deleteEnvironmentDirect', () => {
   it('throws and skips the DELETE when pending held runs exist', async () => {
     pool = installPoolMock([{ rows: [{ count: '3' }], rowCount: 1 }]);
     await expect(
-      deleteEnvironmentDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'staging' }),
+      deleteContextDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'staging' }),
     ).rejects.toThrow(/3 pending held run/);
     // Only the pre-check query ran — the DELETE was never issued.
     expect(pool.calls).toHaveLength(1);
@@ -452,7 +452,7 @@ describe('deleteEnvironmentDirect', () => {
   });
 });
 
-describe('seedEnvironmentBindingDirect', () => {
+describe('seedContextBindingDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
@@ -461,24 +461,24 @@ describe('seedEnvironmentBindingDirect', () => {
       { rows: [{ id: 'env-abc' }], rowCount: 1 },
       { rows: [{ inserted: true }], rowCount: 1 },
     ]);
-    const result = await seedEnvironmentBindingDirect('postgresql://u:p@h:5432/d', {
+    const result = await seedContextBindingDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
-      envName: 'staging',
+      contextName: 'staging',
       scopePattern: 'staging',
     });
     expect(result).toEqual({ created: true });
-    expect(pool.calls[0].sql).toMatch(/SELECT id FROM environments/);
-    expect(pool.calls[1].sql).toMatch(/INSERT INTO environment_bindings/);
+    expect(pool.calls[0].sql).toMatch(/SELECT id FROM contexts/);
+    expect(pool.calls[1].sql).toMatch(/INSERT INTO context_bindings/);
     // host_pattern defaults to '**' (all hosts) when no --host selector is given.
     expect(pool.calls[1].params).toEqual(['org1', 'env-abc', 'staging', '**']);
   });
 
-  it('throws when the environment is missing', async () => {
+  it('throws when the context is missing', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 0 }]);
     await expect(
-      seedEnvironmentBindingDirect('postgresql://u:p@h:5432/d', {
+      seedContextBindingDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        envName: 'missing',
+        contextName: 'missing',
         scopePattern: 'missing',
       }),
     ).rejects.toThrow(/not found/);
@@ -489,29 +489,29 @@ describe('seedEnvironmentBindingDirect', () => {
       { rows: [{ id: 'env-abc' }], rowCount: 1 },
       { rows: [], rowCount: 0 },
     ]);
-    const result = await seedEnvironmentBindingDirect('postgresql://u:p@h:5432/d', {
+    const result = await seedContextBindingDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
-      envName: 'staging',
+      contextName: 'staging',
       scopePattern: 'staging',
     });
     expect(result).toEqual({ created: false });
   });
 });
 
-describe('setEnvironmentPolicyDirect', () => {
+describe('setContextPolicyDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
   it('updates only explicitly-provided fields', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 1 }]);
-    await setEnvironmentPolicyDirect('postgresql://u:p@h:5432/d', {
+    await setContextPolicyDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
-      envName: 'staging',
+      contextName: 'staging',
       waitTimerSeconds: 60,
       minimumTrust: 'verified',
     });
     const call = pool.calls[0];
-    expect(call.sql).toMatch(/UPDATE environments/);
+    expect(call.sql).toMatch(/UPDATE contexts/);
     expect(call.sql).toMatch(/wait_timer_seconds = \$1/);
     expect(call.sql).toMatch(/minimum_trust = \$2/);
     expect(call.sql).not.toMatch(/branch_restrictions/);
@@ -522,9 +522,9 @@ describe('setEnvironmentPolicyDirect', () => {
   it('throws when no policy fields are supplied', async () => {
     pool = installPoolMock([]);
     await expect(
-      setEnvironmentPolicyDirect('postgresql://u:p@h:5432/d', {
+      setContextPolicyDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        envName: 'staging',
+        contextName: 'staging',
       }),
     ).rejects.toThrow(/at least one policy field/);
   });
@@ -532,9 +532,9 @@ describe('setEnvironmentPolicyDirect', () => {
   it('rejects negative waitTimerSeconds', async () => {
     pool = installPoolMock([]);
     await expect(
-      setEnvironmentPolicyDirect('postgresql://u:p@h:5432/d', {
+      setContextPolicyDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        envName: 'staging',
+        contextName: 'staging',
         waitTimerSeconds: -5,
       }),
     ).rejects.toThrow(/waitTimerSeconds must be >= 0/);
@@ -543,20 +543,20 @@ describe('setEnvironmentPolicyDirect', () => {
   it('throws when env not found (rowCount 0)', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 0 }]);
     await expect(
-      setEnvironmentPolicyDirect('postgresql://u:p@h:5432/d', {
+      setContextPolicyDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        envName: 'missing',
+        contextName: 'missing',
         waitTimerSeconds: 10,
       }),
     ).rejects.toThrow(/not found/);
   });
 });
 
-describe('listEnvironmentsDirect', () => {
+describe('listContextsDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
-  it('returns all environments for the given org ordered by name', async () => {
+  it('returns all contexts for the given org ordered by name', async () => {
     pool = installPoolMock([
       {
         rows: [
@@ -566,20 +566,20 @@ describe('listEnvironmentsDirect', () => {
         rowCount: 2,
       },
     ]);
-    const result = await listEnvironmentsDirect('postgresql://u:p@h:5432/d', { orgId: 'org1' });
-    expect(result.environments).toHaveLength(2);
+    const result = await listContextsDirect('postgresql://u:p@h:5432/d', { orgId: 'org1' });
+    expect(result.contexts).toHaveLength(2);
     expect(pool.calls[0].sql).toMatch(
-      /SELECT .* FROM environments\s+WHERE org_id = \$1\s+ORDER BY name/s,
+      /SELECT .* FROM contexts\s+WHERE org_id = \$1\s+ORDER BY name/s,
     );
     expect(pool.calls[0].params).toEqual(['org1']);
   });
 });
 
-describe('showEnvironmentDirect', () => {
+describe('showContextDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
-  it('returns environment + variables + bindings', async () => {
+  it('returns context + variables + bindings', async () => {
     pool = installPoolMock([
       {
         rows: [{ id: 'env-1', org_id: 'org1', name: 'staging', type: 'fixed', enabled: true }],
@@ -588,26 +588,26 @@ describe('showEnvironmentDirect', () => {
       { rows: [{ key: 'API_URL', value: 'https://x', locked: false }], rowCount: 1 },
       { rows: [{ scope_pattern: 'staging' }], rowCount: 1 },
     ]);
-    const result = await showEnvironmentDirect('postgresql://u:p@h:5432/d', {
+    const result = await showContextDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       name: 'staging',
     });
-    expect(result.environment.id).toBe('env-1');
+    expect(result.context.id).toBe('env-1');
     expect(result.variables).toHaveLength(1);
     expect(result.bindings).toHaveLength(1);
     expect(pool.calls[1].params).toEqual(['env-1']);
     expect(pool.calls[2].params).toEqual(['env-1']);
   });
 
-  it('throws when the environment is missing', async () => {
+  it('throws when the context is missing', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 0 }]);
     await expect(
-      showEnvironmentDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'missing' }),
+      showContextDirect('postgresql://u:p@h:5432/d', { orgId: 'org1', name: 'missing' }),
     ).rejects.toThrow(/not found/);
   });
 });
 
-describe('createEnvironmentTemplateDirect', () => {
+describe('createContextTemplateDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
@@ -617,7 +617,7 @@ describe('createEnvironmentTemplateDirect', () => {
       { rows: [], rowCount: 1 },
       { rows: [], rowCount: 1 },
     ]);
-    const result = await createEnvironmentTemplateDirect('postgresql://u:p@h:5432/d', {
+    const result = await createContextTemplateDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
       templateName: 'standard',
       variables: { FOO: 'bar', BAZ: 'qux' },
@@ -626,7 +626,7 @@ describe('createEnvironmentTemplateDirect', () => {
     const sqls = pool.calls.map((c) => c.sql);
     expect(sqls).toContain('BEGIN');
     expect(sqls).toContain('COMMIT');
-    expect(sqls.filter((s) => /INSERT INTO environment_variables/.test(s))).toHaveLength(2);
+    expect(sqls.filter((s) => /INSERT INTO context_variables/.test(s))).toHaveLength(2);
   });
 
   it('rolls back on failure', async () => {
@@ -635,7 +635,7 @@ describe('createEnvironmentTemplateDirect', () => {
     ];
     pool = installPoolMock(failingResponses);
     await expect(
-      createEnvironmentTemplateDirect('postgresql://u:p@h:5432/d', {
+      createContextTemplateDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
         templateName: 'standard',
         variables: { FOO: 'bar' },
@@ -647,15 +647,15 @@ describe('createEnvironmentTemplateDirect', () => {
   });
 });
 
-describe('setEnvironmentSecretDirect', () => {
+describe('setContextSecretDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
 
   it('upserts and returns inserted flag', async () => {
     pool = installPoolMock([{ rows: [{ inserted: true }], rowCount: 1 }]);
-    const result = await setEnvironmentSecretDirect('postgresql://u:p@h:5432/d', {
+    const result = await setContextSecretDirect('postgresql://u:p@h:5432/d', {
       orgId: 'org1',
-      environment: 'staging',
+      context: 'staging',
       key: 'API_KEY',
       encryptedValue: 'e2e-dummy:abc',
     });
@@ -667,33 +667,33 @@ describe('setEnvironmentSecretDirect', () => {
   it('rejects missing orgId', async () => {
     pool = installPoolMock([]);
     await expect(
-      setEnvironmentSecretDirect('postgresql://u:p@h:5432/d', {
+      setContextSecretDirect('postgresql://u:p@h:5432/d', {
         orgId: '',
-        environment: 'staging',
+        context: 'staging',
         key: 'x',
         encryptedValue: 'y',
       }),
     ).rejects.toThrow(/orgId required/);
   });
 
-  it('rejects missing environment', async () => {
+  it('rejects missing context', async () => {
     pool = installPoolMock([]);
     await expect(
-      setEnvironmentSecretDirect('postgresql://u:p@h:5432/d', {
+      setContextSecretDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        environment: '',
+        context: '',
         key: 'x',
         encryptedValue: 'y',
       }),
-    ).rejects.toThrow(/environment name required/);
+    ).rejects.toThrow(/context name required/);
   });
 
   it('rejects missing key', async () => {
     pool = installPoolMock([]);
     await expect(
-      setEnvironmentSecretDirect('postgresql://u:p@h:5432/d', {
+      setContextSecretDirect('postgresql://u:p@h:5432/d', {
         orgId: 'org1',
-        environment: 'staging',
+        context: 'staging',
         key: '',
         encryptedValue: 'y',
       }),

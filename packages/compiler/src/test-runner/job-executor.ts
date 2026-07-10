@@ -13,7 +13,7 @@ import type { CheckStepOutcome } from '@kici-dev/engine';
 import { createStepContext } from './step-context.js';
 import { createRuleContext, evaluateRules } from './rule-evaluator.js';
 import { formatter } from './output-formatter.js';
-import { localRunsOnString } from '../local-executor/runs-on-display.js';
+import { localRunsOnString } from './runs-on-display.js';
 import type { SimulatedEvent } from '@kici-dev/engine';
 import type { EventPayload, RuleResult } from '@kici-dev/sdk';
 import type { ParsedSecrets } from './secrets-file.js';

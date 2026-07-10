@@ -85,7 +85,7 @@ describe('buildSanitizedEnv', () => {
     const env = buildSanitizedEnv(
       { KICI_RUN_ID: 'r1' },
       {
-        environmentVars: { DB_HOST: 'prod-db', API_URL: 'https://api.example.com' },
+        contextVars: { DB_HOST: 'prod-db', API_URL: 'https://api.example.com' },
       },
     );
 
@@ -98,7 +98,7 @@ describe('buildSanitizedEnv', () => {
     const env = buildSanitizedEnv(
       {},
       {
-        environmentVars: { NODE_ENV: 'staging' },
+        contextVars: { NODE_ENV: 'staging' },
         jobEnv: { NODE_ENV: 'production' },
       },
     );
@@ -110,7 +110,7 @@ describe('buildSanitizedEnv', () => {
     const env = buildSanitizedEnv(
       { APP_ENV: 'user' },
       {
-        environmentVars: { APP_ENV: 'org-level' },
+        contextVars: { APP_ENV: 'org-level' },
       },
     );
 
@@ -123,7 +123,7 @@ describe('buildSanitizedEnv', () => {
     const env = buildSanitizedEnv(
       { KICI_RUN_ID: 'r1', SHARED: 'user' },
       {
-        environmentVars: { ORG_VAR: 'org', SHARED: 'org' },
+        contextVars: { ORG_VAR: 'org', SHARED: 'org' },
         jobEnv: { JOB_VAR: 'job', SHARED: 'job' },
       },
     );
@@ -140,6 +140,77 @@ describe('buildSanitizedEnv', () => {
     expect(env.JOB_VAR).toBe('job');
     // SHARED gets job env value (highest non-runtime precedence)
     expect(env.SHARED).toBe('job');
+  });
+});
+
+describe('buildSanitizedEnv trusted-env profile', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('passes the ambient host env through, minus the agent KiCI identity + infra secrets', () => {
+    process.env.PATH = '/usr/bin';
+    process.env.AWS_ACCESS_KEY_ID = 'AKIA';
+    process.env.SOPS_AGE_KEY_FILE = '/keys/age';
+    process.env.SSH_AUTH_SOCK = '/tmp/ssh';
+    process.env.TRUSTED_ENV_PROBE = 'ambient-visible';
+    process.env.KICI_AGENT_TOKEN = 'kat_secret';
+    process.env.KICI_SECRET_KEY = 'deadbeef';
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://orch';
+    process.env.DATABASE_URL = 'postgres://x';
+
+    const env = buildSanitizedEnv({}, { trustedEnv: true });
+
+    // Ambient host env reaches the step.
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.AWS_ACCESS_KEY_ID).toBe('AKIA');
+    expect(env.SOPS_AGE_KEY_FILE).toBe('/keys/age');
+    expect(env.SSH_AUTH_SOCK).toBe('/tmp/ssh');
+    expect(env.TRUSTED_ENV_PROBE).toBe('ambient-visible');
+    // The agent's own identity/operational secrets are still scrubbed.
+    expect(env).not.toHaveProperty('KICI_AGENT_TOKEN');
+    expect(env).not.toHaveProperty('KICI_SECRET_KEY');
+    expect(env).not.toHaveProperty('KICI_ORCHESTRATOR_URL');
+    expect(env).not.toHaveProperty('DATABASE_URL');
+  });
+
+  it('is byte-identical to the allowlist output when trustedEnv is off (default)', () => {
+    process.env.PATH = '/usr/bin';
+    process.env.HOME = '/home/x';
+    process.env.AWS_ACCESS_KEY_ID = 'AKIA'; // ambient, non-allowlisted
+    process.env.TRUSTED_ENV_PROBE = 'ambient';
+
+    const off = buildSanitizedEnv({ FOO: '1' }, { trustedEnv: false });
+    const omitted = buildSanitizedEnv({ FOO: '1' });
+
+    expect(off).toEqual(omitted);
+    // The allowlist-only path never leaks the ambient AWS/probe vars.
+    expect(off).not.toHaveProperty('AWS_ACCESS_KEY_ID');
+    expect(off).not.toHaveProperty('TRUSTED_ENV_PROBE');
+    expect(off.PATH).toBe('/usr/bin');
+    expect(off.HOME).toBe('/home/x');
+    expect(off.FOO).toBe('1');
+  });
+
+  it('a dispatch-supplied KICI_TRUSTED_ENV does NOT elevate to passthrough', () => {
+    process.env.PATH = '/usr/bin';
+    process.env.AWS_ACCESS_KEY_ID = 'AKIA'; // ambient — must stay hidden
+
+    // trustedEnv comes from agent config only; a jobConfig-derived value that
+    // happens to be named KICI_TRUSTED_ENV is just a passed env var and MUST
+    // NOT flip Layer 1 into passthrough.
+    const env = buildSanitizedEnv({ KICI_TRUSTED_ENV: 'true' }, { trustedEnv: false });
+
+    expect(env).not.toHaveProperty('AWS_ACCESS_KEY_ID');
+    // The literal value still merges as a normal Layer-3 env var, but confers
+    // no host-env access.
+    expect(env.KICI_TRUSTED_ENV).toBe('true');
   });
 });
 

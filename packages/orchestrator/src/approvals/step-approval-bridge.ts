@@ -21,7 +21,7 @@
  */
 import { HoldScope, TriggerSource, type ApprovalRequirement } from '@kici-dev/engine';
 
-import type { HeldRunStore } from '../environments/held-runs.js';
+import type { HeldRunStore } from '../contexts/held-runs.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 
 /** Outcome relayed back to the waiting agent. */

@@ -42,7 +42,7 @@ export interface AgentInfo {
 /**
  * Outputs of a matrix job as seen by a downstream `needs:` consumer.
  * A downstream that consumes a matrix upstream receives this envelope instead of
- * a flat outputs object, identically under `kici run local` and the remote path.
+ * a flat outputs object, identically under `kici run --local` and the remote path.
  */
 export interface MatrixJobOutputs<T = Record<string, unknown>> {
   /** Keyed by the combination suffix (the text inside `(...)` of the child name). */
@@ -195,7 +195,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
   /**
    * Raw webhook payload from the git provider.
    * Contains the full, unmodified payload as received from the webhook.
-   * In local preview/run mode (`kici preview` / `kici run local`), contains the simulated payload.
+   * In local preview/run mode (`kici preview` / `kici run --local`), contains the simulated payload.
    * Use this for provider-specific data not covered by normalized fields.
    */
   rawPayload?: Record<string, unknown>;
@@ -224,13 +224,13 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   sourceRepo?: RepoInfo;
   /**
-   * The resolved deployment environment name for this job.
-   * Set when the job declares an `environment` property.
-   * Undefined for jobs without an environment.
+   * The resolved context name for this job.
+   * Set when the job declares a `context` property.
+   * Undefined for jobs without a context.
    */
-  environment?: string;
+  context?: string;
   /**
-   * Secrets resolved for this job's environment.
+   * Secrets resolved for this job's context.
    * Use ctx.secrets.get('KEY') to retrieve a value asynchronously.
    * Use ctx.secrets.expose('KEY') to inject into process.env explicitly.
    * Use ctx.secrets.has('KEY') to check existence synchronously.
@@ -273,7 +273,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    * For a plain upstream this returns the job's collected outputs (step-keyed
    * for multi-step, flat for run shorthand). For a **matrix** upstream it returns
    * a {@link MatrixJobOutputs} envelope `{ byMatrix, merged }` keyed by the
-   * combination suffix — identical under `kici run local` and the remote path.
+   * combination suffix — identical under `kici run --local` and the remote path.
    * Use {@link isMatrixJobOutputs} (or `'byMatrix' in result`) to discriminate.
    *
    * @example

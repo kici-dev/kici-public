@@ -14,7 +14,7 @@ import {
   clearPendingWorkflowContextsMap,
   type SerializableWorkflowDispatchInputs,
 } from './pending-workflow-context.js';
-import type { ReleaseSignal } from '../environments/held-runs.js';
+import type { ReleaseSignal } from '../contexts/held-runs.js';
 import { HoldScope, TriggerSource } from '@kici-dev/engine';
 
 function makeInputs(): SerializableWorkflowDispatchInputs {
@@ -63,7 +63,7 @@ const signal: ReleaseSignal = {
   jobId: '__install__CI',
   scope: HoldScope.enum.workflow,
   stepIndex: null,
-  triggerSource: TriggerSource.enum.environment,
+  triggerSource: TriggerSource.enum.context,
 };
 
 describe('resumeWorkflow', () => {

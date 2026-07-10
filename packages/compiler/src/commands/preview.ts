@@ -115,7 +115,7 @@ export async function previewCommand(
       logger.info(
         pc.gray('For remote fixture execution, use: kici run remote [fixture] [options]'),
       );
-      logger.info(pc.gray('For local workflow execution, use: kici run local <event> [options]\n'));
+      logger.info(pc.gray('For local workflow execution, use: kici run <event> --local\n'));
       return true;
     }
 

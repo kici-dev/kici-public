@@ -2,6 +2,33 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { buildManualJobConfig, handleManualSchedule } from './manual-schedule.js';
 import type { LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 
+// Mock the idempotency claim with an in-memory stateful implementation so the
+// `handleManualSchedule` wiring — a `claimed: false` re-send short-circuits
+// before dispatch — is exercised deterministically without a real DB. Real
+// `INSERT … ON CONFLICT` dedup is covered in `request-idempotency.test.ts`.
+const idempotency = vi.hoisted(() => {
+  const claims = new Map<string, string>();
+  let counter = 0;
+  return {
+    reset: () => {
+      claims.clear();
+      counter = 0;
+    },
+    claim: (requestId: string): { newRunId: string; claimed: boolean } => {
+      const existing = claims.get(requestId);
+      if (existing) return { newRunId: existing, claimed: false };
+      const id = `mock-schedule-run-${++counter}`;
+      claims.set(requestId, id);
+      return { newRunId: id, claimed: true };
+    },
+  };
+});
+
+vi.mock('./request-idempotency.js', () => ({
+  claimRequestId: vi.fn(async (_db: unknown, requestId: string) => idempotency.claim(requestId)),
+  pruneRequestIdempotency: vi.fn(async () => 0),
+}));
+
 function makeRegistration(overrides: Record<string, unknown> = {}) {
   return {
     id: 'reg-abc',
@@ -69,11 +96,18 @@ describe('handleManualSchedule', () => {
   let harness: ReturnType<typeof makeDeps>;
 
   beforeEach(() => {
+    idempotency.reset();
     harness = makeDeps(makeRegistration());
   });
 
   it('dispatches with ref="" so the agent clones the default branch (not --branch HEAD)', async () => {
-    const result = await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps);
+    const result = await handleManualSchedule(
+      'reg-abc',
+      'user@test.com',
+      null,
+      harness.deps,
+      'req-test',
+    );
 
     expect(result.newRunId).toBeDefined();
     expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
@@ -84,8 +118,31 @@ describe('handleManualSchedule', () => {
     expect(input.repoUrl).toBe('https://github.com/owner/repo.git');
   });
 
+  it('is idempotent on requestId: a failover re-send returns the same run without a second dispatch', async () => {
+    const requestId = 'req-schedule-dedupe';
+    const first = await handleManualSchedule(
+      'reg-abc',
+      'user@test.com',
+      null,
+      harness.deps,
+      requestId,
+    );
+    const second = await handleManualSchedule(
+      'reg-abc',
+      'user@test.com',
+      null,
+      harness.deps,
+      requestId,
+    );
+
+    expect(second.newRunId).toBe(first.newRunId);
+    // Only the first hop created + dispatched the run; the re-send short-circuits.
+    expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
+    expect(harness.executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
+  });
+
   it('records execution with ref="" in executionTracker (matches automatic cron path)', async () => {
-    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps);
+    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps, 'req-test');
 
     expect(harness.executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
     const args = harness.executionTracker.onExecutionStarted.mock.calls[0];
@@ -115,7 +172,7 @@ describe('handleManualSchedule', () => {
       }),
     );
 
-    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps);
+    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps, 'req-test');
 
     expect(harness.dispatcher.dispatch).toHaveBeenCalledTimes(2);
     const calls = harness.dispatcher.dispatch.mock.calls.map((c: any[]) => c[0]);
@@ -128,21 +185,21 @@ describe('handleManualSchedule', () => {
 
   it('throws if registration is missing', async () => {
     const h = makeDeps(null);
-    await expect(handleManualSchedule('reg-missing', null, null, h.deps)).rejects.toThrow(
-      'Registration not found',
-    );
+    await expect(
+      handleManualSchedule('reg-missing', null, null, h.deps, 'req-test'),
+    ).rejects.toThrow('Registration not found');
   });
 
   it('throws if registration is disabled', async () => {
     const h = makeDeps(makeRegistration({ disabled: true }));
-    await expect(handleManualSchedule('reg-abc', null, null, h.deps)).rejects.toThrow(
+    await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
       'Workflow is disabled',
     );
   });
 
   it('throws if registration has no commit SHA', async () => {
     const h = makeDeps(makeRegistration({ commitSha: null }));
-    await expect(handleManualSchedule('reg-abc', null, null, h.deps)).rejects.toThrow(
+    await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
       'Registration has no commit SHA',
     );
   });
@@ -158,7 +215,7 @@ describe('handleManualSchedule', () => {
         },
       }),
     );
-    await expect(handleManualSchedule('reg-abc', null, null, h.deps)).rejects.toThrow(
+    await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
       'Workflow has no schedule trigger',
     );
   });
@@ -174,7 +231,7 @@ describe('handleManualSchedule', () => {
     };
     (h.deps as any).coordinator = coordinator;
 
-    await handleManualSchedule('reg-abc', 'user@test.com', null, h.deps);
+    await handleManualSchedule('reg-abc', 'user@test.com', null, h.deps, 'req-test');
 
     expect(coordinator.routeJobs).toHaveBeenCalledOnce();
     const [runCtx, jobs] = coordinator.routeJobs.mock.calls[0];
@@ -218,9 +275,9 @@ describe('handleManualSchedule', () => {
   describe('tenant-isolation invariants under rogue Platform (A10)', () => {
     it('forged registrationId (not in local index) is side-effect-free', async () => {
       const h = makeDeps(null);
-      await expect(handleManualSchedule('forged-reg-id', null, null, h.deps)).rejects.toThrow(
-        'Registration not found',
-      );
+      await expect(
+        handleManualSchedule('forged-reg-id', null, null, h.deps, 'req-test'),
+      ).rejects.toThrow('Registration not found');
       expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
       expect(h.executionTracker.onExecutionStarted).not.toHaveBeenCalled();
       expect(h.executionTracker.addJobsToRun).not.toHaveBeenCalled();
@@ -231,7 +288,7 @@ describe('handleManualSchedule', () => {
 
     it('disabled registration is side-effect-free', async () => {
       const h = makeDeps(makeRegistration({ disabled: true }));
-      await expect(handleManualSchedule('reg-abc', null, null, h.deps)).rejects.toThrow(
+      await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
         'Workflow is disabled',
       );
       expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
@@ -259,7 +316,7 @@ describe('handleManualSchedule', () => {
           },
         }),
       );
-      await expect(handleManualSchedule('reg-abc', null, null, h.deps)).rejects.toThrow(
+      await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
         'Workflow has no schedule trigger',
       );
       expect(h.dispatcher.dispatch).not.toHaveBeenCalled();

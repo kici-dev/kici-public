@@ -76,26 +76,26 @@ export function evaluateInlineFields(
   lockJob: LockJob,
   event: object,
 ): {
-  /** Resolved name per `environments` element, aligned by index; undefined for static or impure-dynamic elements. */
-  inlineEnvironmentNames: Array<string | undefined>;
+  /** Resolved name per `contexts` element, aligned by index; undefined for static or impure-dynamic elements. */
+  inlineContextNames: Array<string | undefined>;
   inlineEnv: Record<string, string> | undefined;
   inlineConcurrencyGroup: string | undefined;
 } {
-  const inlineEnvironmentNames: Array<string | undefined> = [];
+  const inlineContextNames: Array<string | undefined> = [];
   let inlineEnv: Record<string, string> | undefined;
   let inlineConcurrencyGroup: string | undefined;
 
-  for (const element of lockJob.environments ?? []) {
+  for (const element of lockJob.contexts ?? []) {
     if (element.dynamic && isLockInlineValue(element.value)) {
       try {
-        inlineEnvironmentNames.push(evaluateInlineString(element.value.expression, event));
+        inlineContextNames.push(evaluateInlineString(element.value.expression, event));
       } catch (err) {
         throw new Error(
-          `Inline environment evaluation failed for job '${lockJob.name}': ${(err as Error).message}`,
+          `Inline context evaluation failed for job '${lockJob.name}': ${(err as Error).message}`,
         );
       }
     } else {
-      inlineEnvironmentNames.push(undefined);
+      inlineContextNames.push(undefined);
     }
   }
   if (isLockInlineValue(lockJob.env)) {
@@ -116,5 +116,5 @@ export function evaluateInlineFields(
       );
     }
   }
-  return { inlineEnvironmentNames, inlineEnv, inlineConcurrencyGroup };
+  return { inlineContextNames, inlineEnv, inlineConcurrencyGroup };
 }

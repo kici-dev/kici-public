@@ -85,3 +85,44 @@ export const AGENT_REQUIRED_KICI_VARS = [
  *   -> HTTP_PROXY=http://proxy:3128 in the agent process
  */
 export const KICI_AGENT_ENV_PREFIX = 'KICI_AGENT_ENV_' as const;
+
+/**
+ * Non-`KICI_`-prefixed environment variables that are the agent's / orchestrator's
+ * own infrastructure secrets. These are scrubbed from a trusted-env passthrough
+ * in addition to the whole `KICI_*` namespace, so even a trusted fleet agent
+ * never leaks its control-plane credentials into a workflow step.
+ */
+export const TRUSTED_ENV_SCRUB_EXACT = [
+  'DATABASE_URL',
+  'PLATFORM_TOKEN',
+  'WEBHOOK_SECRET',
+  'GITHUB_PRIVATE_KEY',
+] as const;
+
+/**
+ * A variable that must NEVER reach a workflow step even under the trusted-env
+ * profile. The agent's entire `KICI_*` namespace (its orchestrator URL, agent
+ * token, secret key, bootstrap admin token, scaler internals, identity) is
+ * scrubbed, plus the non-`KICI_` infra-secret denylist above. So "trusted"
+ * means "host env yes, the agent's KiCI identity no".
+ */
+export function isTrustedEnvScrubbed(key: string): boolean {
+  return key.startsWith('KICI_') || (TRUSTED_ENV_SCRUB_EXACT as readonly string[]).includes(key);
+}
+
+/**
+ * Build the trusted-env passthrough set: every defined entry of `source` whose
+ * key is not scrubbed by `isTrustedEnvScrubbed`. Used by both env-narrowing
+ * layers (scaler → agent process, agent → step) when the trusted-env profile is
+ * active, so the ambient host env reaches the step minus the agent's own KiCI
+ * identity/operational secrets.
+ */
+export function buildTrustedPassthroughEnv(
+  source: Record<string, string | undefined>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && !isTrustedEnvScrubbed(key)) out[key] = value;
+  }
+  return out;
+}

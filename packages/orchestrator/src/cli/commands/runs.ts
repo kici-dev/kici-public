@@ -396,9 +396,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // envelopes preserved); the human view unwraps for display only.
   runs
     .command('structured <runId>')
-    .description(
-      'Show the provenance-tagged structured run result (agent read path; /structured)',
-    )
+    .description('Show the provenance-tagged structured run result (agent read path; /structured)')
     .option('--json', 'Emit the raw AgentRunResult (untrusted envelopes preserved)')
     .action(async (runId: string, opts) => {
       try {

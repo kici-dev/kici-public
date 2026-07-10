@@ -63,7 +63,7 @@ Categories you may see:
 - **Install-secrets resolution rejected** — the .npmrc / install-secrets resolution rejected the dispatch.
 - **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated, so the orchestrator records the delivery as a failed run instead of silently skipping it. This covers corrupt JSON, a missing schema version, malformed routing labels, and a **schema-version mismatch**: a lock compiled by a different engine version than the one your orchestrator runs is rejected with a clear "recompile with `kici compile`" message rather than dispatched. The orchestrator and the lock move together (no backward compatibility across schema versions), so the fix is always to recompile the lock against your current toolchain and push again — never to force the old lock through. A repository with no lock file at all is not an error and produces no run.
 - **Build coordination failed** — the build job dispatch was rejected or the build coordinator timed out.
-- **Rejected by environment protection rules** — a protection rule (review / wait timer / branch restriction) rejected the job.
+- **Rejected by context protection rules** — a protection rule (review / wait timer / branch restriction) rejected the job.
 - **Dynamic / deferred-init evaluation failed** — a dynamic or deferred-init job dispatch failed.
 - **No agent available to run this job** — no agent matching the job's `runs-on` labels was reachable.
 - **Matrix expansion failed** — a job's dynamic matrix function threw or timed out while resolving its matrix values, so that job is marked failed before any of its steps run.
@@ -159,3 +159,86 @@ All three services (agent, orchestrator, Platform) mirror the same six fields:
 | `engineBundleHash` | sha256 of `packages/engine/dist/index.js` at build time    |
 
 An `unknown` value means the peer's `dist/index.js` didn't exist when the service was bundled (self-build, or a broken workspace build order) — investigate before trusting the service.
+
+## Postgres "row is missing" after an OS or image upgrade (collation drift)
+
+A row that is provably present in the database reads back as **missing** — a
+source's stored credentials, a secret, a run, an org membership — even though a
+direct scan shows it. The orchestrator logs this shape:
+
+```
+error  Source missing private key in secret store   routingKey=github:...
+warn   Failed to refresh GitHub source identity      error="... has no stored credentials ..."
+```
+
+If you also see this in the Postgres logs, it is the tell:
+
+```
+WARNING:  database "..." has no actual collation version, but a version was recorded
+```
+
+### What happened
+
+PostgreSQL text b-tree indexes are ordered by the operating system's collation
+(`glibc` for `libc`-provider collations such as `en_US.utf8`). When the collation's
+sort order changes **under a live data directory** — an OS upgrade, or a Postgres
+container image bumped to a newer base with a different `glibc`, while the data
+volume persists — every text index silently becomes inconsistent with the data.
+Equality lookups served by those indexes then **miss rows that are actually there**,
+while sequential scans (and unique-constraint checks) can disagree. KiCI reads
+secrets and sources by an indexed lookup (`WHERE org_id = … AND scope = … AND
+key = …`), so a corrupted index surfaces as "the credential is missing."
+
+### Diagnose
+
+Confirm it is index corruption and not genuinely-absent data — compare an
+index scan against a sequential scan of the same predicate:
+
+```sql
+-- via index (the corrupted path)
+SELECT count(*) FROM scoped_secrets WHERE org_id = '__system__';
+
+-- force a sequential scan of the identical predicate
+SET enable_indexscan = off;
+SET enable_bitmapscan = off;
+SET enable_indexonlyscan = off;
+SELECT count(*) FROM scoped_secrets WHERE org_id = '__system__';
+```
+
+Different counts for a byte-identical value = a corrupted text index. Check the
+recorded-versus-actual collation version:
+
+```sql
+SELECT datname, datcollate, datcollversion,
+       pg_database_collation_actual_version(oid) AS actual
+FROM pg_database WHERE datname = current_database();
+```
+
+A `datcollversion` that differs from `actual` (or the persistent warning above)
+confirms collation drift.
+
+### Fix
+
+Rebuild the indexes under the current collation ordering, then record the new
+version:
+
+```sql
+REINDEX DATABASE <dbname>;
+ALTER DATABASE <dbname> REFRESH COLLATION VERSION;
+```
+
+`REINDEX` is the actual repair — after it, the indexed lookup returns the correct
+rows and the service reads its data again (restart the service to clear any cached
+"missing" state). `REINDEX DATABASE` takes heavy locks; on a busy system prefer
+per-index `REINDEX INDEX CONCURRENTLY`. `ALTER DATABASE … REFRESH COLLATION
+VERSION` clears the advisory warning; on some `libc` states it errors with
+`invalid collation version change` — that is a cosmetic follow-up, not a blocker,
+and the `REINDEX` has already fixed the data.
+
+### Prevent
+
+Pin the Postgres image (and its base OS) so `glibc` cannot change under a
+persisted data directory across upgrades. When you must move a data directory to a
+host or image with a different `glibc` major, plan a `REINDEX` + `REFRESH COLLATION
+VERSION` as part of the migration rather than discovering it as a phantom
+"missing row."

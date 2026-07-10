@@ -185,11 +185,11 @@ describe('DashboardClient typed methods', () => {
     expect(url).toContain('repoIdentifier=o%2Fr');
   });
 
-  it('listEnvironments requests includeSecrets and returns the contexts', async () => {
+  it('listContexts requests includeSecrets and returns the contexts', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
-          environments: [
+          contexts: [
             { name: 'prod', enabled: true, allowLocalExecution: true, secretKeys: ['API_KEY'] },
           ],
         }),
@@ -197,9 +197,9 @@ describe('DashboardClient typed methods', () => {
       ),
     );
     const client = DashboardClient.fromConfig(baseConfig);
-    const out = await client.listEnvironments(true);
+    const out = await client.listContexts(true);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ name: 'prod', secretKeys: ['API_KEY'] });
-    expect(fetchMock.mock.calls[0][0]).toContain('/orgs/org-1/environments?includeSecrets=true');
+    expect(fetchMock.mock.calls[0][0]).toContain('/orgs/org-1/contexts?includeSecrets=true');
   });
 });

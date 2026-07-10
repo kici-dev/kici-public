@@ -181,8 +181,8 @@ export interface ExecutionTrackerDeps {
      * jobs that never started. Persisted in execution_jobs.init_failure.
      */
     initFailure?: InitFailure,
-    /** Ordered bound deployment-environment names for this job (multi-env jobs). */
-    environments?: string[],
+    /** Ordered bound deployment-context names for this job (multi-env jobs). */
+    contexts?: string[],
   ) => void;
   /**
    * Optional callback to emit run.event messages to Platform.
@@ -248,7 +248,7 @@ interface RunState {
       startedAt?: number;
       agentId?: string;
       runsOnLabels?: string[];
-      environments?: string[];
+      contexts?: string[];
     }
   >;
 }
@@ -265,8 +265,8 @@ interface TrackedJobRow {
   waveGated?: boolean;
   waveMaxParallel?: number;
   waveFailFast?: boolean;
-  environments?: string[];
-  skippedEnvironments?: string[];
+  contexts?: string[];
+  skippedContexts?: string[];
   envWarning?: string;
 }
 
@@ -290,9 +290,9 @@ function trackedJobMutableColumns(
     ...(job.waveMaxParallel !== undefined && { wave_max_parallel: job.waveMaxParallel }),
     ...(job.waveFailFast !== undefined && { wave_fail_fast: job.waveFailFast }),
     ...(runsOnLabelsJson && { runs_on_labels: runsOnLabelsJson }),
-    ...(job.environments?.length && { environments: JSON.stringify(job.environments) }),
-    ...(job.skippedEnvironments?.length && {
-      skipped_environments: JSON.stringify(job.skippedEnvironments),
+    ...(job.contexts?.length && { contexts: JSON.stringify(job.contexts) }),
+    ...(job.skippedContexts?.length && {
+      skipped_contexts: JSON.stringify(job.skippedContexts),
     }),
     ...(job.envWarning && { env_warning: job.envWarning }),
     ...(dispatchedContexts?.length && {
@@ -400,8 +400,8 @@ export class ExecutionTracker {
       waveGated?: boolean;
       waveMaxParallel?: number;
       waveFailFast?: boolean;
-      environments?: string[];
-      skippedEnvironments?: string[];
+      contexts?: string[];
+      skippedContexts?: string[];
       envWarning?: string;
     }>,
     routingKey?: string,
@@ -443,7 +443,7 @@ export class ExecutionTracker {
         startedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
-        environments?: string[];
+        contexts?: string[];
       }
     >();
     for (const job of jobs) {
@@ -451,7 +451,7 @@ export class ExecutionTracker {
         name: job.jobName,
         status: ExecutionJobStatus.enum.pending,
         ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
-        ...(job.environments?.length && { environments: job.environments }),
+        ...(job.contexts?.length && { contexts: job.contexts }),
       });
     }
 
@@ -728,8 +728,8 @@ export class ExecutionTracker {
       baseJobName?: string;
       variantKind?: string;
       variantLabel?: string;
-      environments?: string[];
-      skippedEnvironments?: string[];
+      contexts?: string[];
+      skippedContexts?: string[];
       envWarning?: string;
     }>,
     dispatchedContexts?: string[],
@@ -754,8 +754,8 @@ export class ExecutionTracker {
       baseJobName?: string;
       variantKind?: string;
       variantLabel?: string;
-      environments?: string[];
-      skippedEnvironments?: string[];
+      contexts?: string[];
+      skippedContexts?: string[];
       envWarning?: string;
     }>,
     dispatchedContexts?: string[],
@@ -832,7 +832,7 @@ export class ExecutionTracker {
         ...(preservedStartedAt !== undefined && { startedAt: preservedStartedAt }),
         ...(preservedAgentId !== undefined && { agentId: preservedAgentId }),
         ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
-        ...(job.environments?.length && { environments: job.environments }),
+        ...(job.contexts?.length && { contexts: job.contexts }),
       });
     }
 
@@ -1501,7 +1501,7 @@ export class ExecutionTracker {
       // jobLogBytesTotal is set in the same TERMINAL_JOB_STATES branch above.
       jobLogBytesTotal,
       initFailure,
-      job.environments,
+      job.contexts,
     );
   }
 
@@ -2173,7 +2173,7 @@ export class ExecutionTracker {
     deliveryId: string | null;
     providerContext: Record<string, unknown>;
     routingKey: string;
-    environmentName?: string;
+    contextName?: string;
     reason: string;
     triggerEvent?: string;
     commitMessage?: string;
@@ -2194,7 +2194,7 @@ export class ExecutionTracker {
         provider_context: JSON.stringify(args.providerContext),
         started_at: now,
         status: ExecutionRunStatus.enum.held,
-        ...(args.environmentName && { environment: args.environmentName }),
+        ...(args.contextName && { context: args.contextName }),
       })
       .onConflict((oc) => oc.column('run_id').doNothing())
       .execute();
@@ -2219,7 +2219,7 @@ export class ExecutionTracker {
     logger.info('Recorded held execution run (workflow install gate)', {
       runId: args.runId,
       workflowName: args.workflowName,
-      environment: args.environmentName,
+      context: args.contextName,
       reason: args.reason,
     });
   }
@@ -2539,6 +2539,22 @@ export class ExecutionTracker {
   }
 
   /**
+   * Find the runId of the in-memory run that owns a given dispatched jobId.
+   *
+   * The agent's `event.emit` message is job-scoped (it carries only the
+   * emitting jobId), but run context is keyed by runId. This maps job → run so
+   * `getExecutionContext(runId)` resolves for an agent-emitted custom event.
+   * In-memory only (matches `getExecutionContext`'s semantics); emit happens
+   * mid-execution, so the owning run is always live in `this.runs`.
+   */
+  getRunIdForJob(jobId: string): string | undefined {
+    for (const [runId, run] of this.runs) {
+      if (run.jobs.has(jobId)) return runId;
+    }
+    return undefined;
+  }
+
+  /**
    * Get execution context for a run from in-memory state.
    * Used by commit status reporting to access provider/repo/sha info.
    */
@@ -2707,7 +2723,7 @@ export class ExecutionTracker {
         completedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
-        environments?: string[];
+        contexts?: string[];
       }>;
     }> = [];
 
@@ -2724,7 +2740,7 @@ export class ExecutionTracker {
         completedAt?: number;
         agentId?: string;
         runsOnLabels?: string[];
-        environments?: string[];
+        contexts?: string[];
       }> = [];
 
       for (const [jobId, job] of run.jobs) {
@@ -2735,7 +2751,7 @@ export class ExecutionTracker {
           ...(job.startedAt !== undefined && { startedAt: job.startedAt }),
           ...(job.agentId && { agentId: job.agentId }),
           ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
-          ...(job.environments?.length && { environments: job.environments }),
+          ...(job.contexts?.length && { contexts: job.contexts }),
         });
       }
 
@@ -2948,7 +2964,7 @@ export class ExecutionTracker {
       job?.runsOnLabels,
       undefined,
       undefined,
-      job?.environments,
+      job?.contexts,
     );
   }
 

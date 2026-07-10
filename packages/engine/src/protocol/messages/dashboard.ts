@@ -132,17 +132,17 @@ export const dashboardJobDetailSchema = z.object({
   /** Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). */
   runsOnLabels: z.array(z.string()).nullable().optional(),
   /**
-   * Ordered bound deployment-environment names for this job, in merge order
-   * (later environments override earlier on key collisions). A `(dynamic)`
+   * Ordered bound deployment-context names for this job, in merge order
+   * (later contexts override earlier on key collisions). A `(dynamic)`
    * entry marks an element resolved at runtime. null/absent = no binding.
    */
-  environments: z.array(z.string()).nullable().optional(),
+  contexts: z.array(z.string()).nullable().optional(),
   /**
-   * Bound environments skipped on a test/local run (non-test or unconfigured).
+   * Bound contexts skipped on a test/local run (non-test or unconfigured).
    * null/absent when nothing was skipped.
    */
-  skippedEnvironments: z.array(z.string()).nullable().optional(),
-  /** User-visible warning naming the skipped test-run environments. null/absent when none. */
+  skippedContexts: z.array(z.string()).nullable().optional(),
+  /** User-visible warning naming the skipped test-run contexts. null/absent when none. */
   envWarning: z.string().nullable().optional(),
   /** Aggregated step outputs (step-keyed map). Present when job completed successfully with outputs. */
   outputs: z.record(z.string(), z.record(z.string(), z.unknown())).nullable().optional(),
@@ -444,8 +444,8 @@ export const dashboardRunSummarySchema = z.object({
   triggerEvent: z.string().optional(),
   commitMessage: z.string().optional(),
   jobCount: z.number().optional(),
-  /** Distinct bound deployment-environment names across the run's jobs (first-seen order). */
-  environments: z.array(z.string()).optional(),
+  /** Distinct bound deployment-context names across the run's jobs (first-seen order). */
+  contexts: z.array(z.string()).optional(),
   startedAt: z.string().optional(),
   completedAt: z.string().optional(),
   durationMs: z.number().optional(),
@@ -956,20 +956,20 @@ const dashboardEventDlqDiscardResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-// --- Environment CRUD request/response (REST-over-WS proxy) ---
+// --- Context CRUD request/response (REST-over-WS proxy) ---
 
-const environmentTypeSchema = z.enum(['fixed', 'glob']);
+const contextTypeSchema = z.enum(['fixed', 'glob']);
 const concurrencyStrategySchema = z.enum(['queue', 'cancel-pending']);
 
-// -- Environments --
+// -- Contexts --
 
-/** List all environments for the org. */
-export const envListRequestSchema = z.object({
-  type: z.literal('dashboard.environments.list'),
+/** List all contexts for the org. */
+export const contextListRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.list'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   /**
-   * When true, each returned environment carries its reachable secret key
+   * When true, each returned context carries its reachable secret key
    * names (never values) in `secretKeys`. Used by the developer CLI's
    * `kici secrets list` / `kici types` commands.
    */
@@ -978,7 +978,7 @@ export const envListRequestSchema = z.object({
    * Target org the read must be scoped to, carried per-request by the Platform
    * (the validated `:orgId` path param). The orchestrator honors this over its
    * static connection-level org so a Platform-first `kici run remote` org —
-   * anchored only by `remote_sources` — sees its own environments even when the
+   * anchored only by `remote_sources` — sees its own contexts even when the
    * orchestrator's connection also serves a webhook source for a different org.
    * Absent on the legacy customer-dashboard path, where the connection org is
    * already the request org.
@@ -986,22 +986,22 @@ export const envListRequestSchema = z.object({
   orgId: z.string().optional(),
 });
 
-const envListResponseSchema = z.object({
-  type: z.literal('dashboard.environments.list.response'),
+const contextListResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.list.response'),
   requestId: z.string(),
-  environments: z
+  contexts: z
     .array(
       z.object({
         id: z.string(),
         name: z.string(),
-        type: environmentTypeSchema,
+        type: contextTypeSchema,
         globPattern: z.string().nullable(),
         enabled: z.boolean(),
         allowLocalExecution: z.boolean(),
         createdAt: z.coerce.string(),
         updatedAt: z.coerce.string(),
         /**
-         * Distinct secret key names reachable from this environment's scope
+         * Distinct secret key names reachable from this context's scope
          * bindings (never values). Present only when the request set
          * `includeSecrets: true`.
          */
@@ -1012,22 +1012,22 @@ const envListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Get a single environment by ID. */
-export const envGetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.get'),
+/** Get a single context by ID. */
+export const contextGetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.get'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
 });
 
-const envGetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.get.response'),
+const contextGetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.get.response'),
   requestId: z.string(),
-  environment: z
+  context: z
     .object({
       id: z.string(),
       name: z.string(),
-      type: environmentTypeSchema,
+      type: contextTypeSchema,
       globPattern: z.string().nullable(),
       branchRestrictions: z.array(z.string()).nullable(),
       concurrencyLimit: z.number().nullable(),
@@ -1044,13 +1044,13 @@ const envGetResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Create a new environment. */
-export const envCreateRequestSchema = z.object({
-  type: z.literal('dashboard.environments.create'),
+/** Create a new context. */
+export const contextCreateRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.create'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   name: z.string(),
-  envType: environmentTypeSchema,
+  contextType: contextTypeSchema,
   globPattern: z.string().optional(),
   branchRestrictions: z.array(z.string()).optional(),
   concurrencyLimit: z.number().optional(),
@@ -1061,22 +1061,22 @@ export const envCreateRequestSchema = z.object({
   enabled: z.boolean().optional(),
 });
 
-const envCreateResponseSchema = z.object({
-  type: z.literal('dashboard.environments.create.response'),
+const contextCreateResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.create.response'),
   requestId: z.string(),
-  environmentId: z.string().optional(),
+  contextId: z.string().optional(),
   error: z.string().optional(),
 });
 
-/** Update an existing environment. */
-export const envUpdateRequestSchema = z.object({
-  type: z.literal('dashboard.environments.update'),
+/** Update an existing context. */
+export const contextUpdateRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.update'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   updates: z.object({
     name: z.string().optional(),
-    envType: environmentTypeSchema.optional(),
+    contextType: contextTypeSchema.optional(),
     globPattern: z.string().nullable().optional(),
     branchRestrictions: z.array(z.string()).nullable().optional(),
     concurrencyLimit: z.number().nullable().optional(),
@@ -1088,67 +1088,67 @@ export const envUpdateRequestSchema = z.object({
   }),
 });
 
-const envUpdateResponseSchema = z.object({
-  type: z.literal('dashboard.environments.update.response'),
+const contextUpdateResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.update.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-/** Set an environment's test-run access flag (allowLocalExecution). */
-export const envTestAccessSetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.test_access.set'),
+/** Set an context's test-run access flag (allowLocalExecution). */
+export const contextTestAccessSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.test_access.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   allowLocalExecution: z.boolean(),
 });
 
-const envTestAccessSetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.test_access.set.response'),
+const contextTestAccessSetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.test_access.set.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-/** Delete an environment. */
-export const envDeleteRequestSchema = z.object({
-  type: z.literal('dashboard.environments.delete'),
+/** Delete an context. */
+export const contextDeleteRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.delete'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
 });
 
 /**
- * Machine-readable codes for environment-delete rejections.
+ * Machine-readable codes for context-delete rejections.
  *
  * Three-category response taxonomy on dashboard responses, each mapped to a
  * distinct HTTP status by the Platform proxy: a bare free-text `error` is the
- * human message and maps to 400; a missing result (e.g. environment not found)
+ * human message and maps to 400; a missing result (e.g. context not found)
  * maps to 404; an `errorCode` flags a specific business rejection mapped to a
  * non-400/404 status — here `pending_held_runs` → 409. The sibling precedent is
  * the rerun response's `errorCode` (`runArchivedNotRerunnable` → 410) above.
  */
-export const EnvDeleteErrorCode = z.enum(['pending_held_runs']);
-export type EnvDeleteErrorCode = z.infer<typeof EnvDeleteErrorCode>;
+export const ContextDeleteErrorCode = z.enum(['pending_held_runs']);
+export type ContextDeleteErrorCode = z.infer<typeof ContextDeleteErrorCode>;
 
-const envDeleteResponseSchema = z.object({
-  type: z.literal('dashboard.environments.delete.response'),
+const contextDeleteResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.delete.response'),
   requestId: z.string(),
   error: z.string().optional(),
-  errorCode: EnvDeleteErrorCode.optional(),
+  errorCode: ContextDeleteErrorCode.optional(),
 });
 
-// -- Environment variables --
+// -- Context variables --
 
-/** List variables for an environment. */
-export const envVarsListRequestSchema = z.object({
-  type: z.literal('dashboard.environments.variables.list'),
+/** List variables for an context. */
+export const contextVarsListRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.list'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
 });
 
-const envVarsListResponseSchema = z.object({
-  type: z.literal('dashboard.environments.variables.list.response'),
+const contextVarsListResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.list.response'),
   requestId: z.string(),
   variables: z
     .array(
@@ -1162,51 +1162,51 @@ const envVarsListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Set (create or update) a variable on an environment. */
-export const envVarSetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.variables.set'),
+/** Set (create or update) a variable on an context. */
+export const contextVarSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   key: z.string(),
   value: z.string(),
   locked: z.boolean().optional(),
 });
 
-const envVarSetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.variables.set.response'),
+const contextVarSetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.set.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-/** Delete a variable from an environment. */
-export const envVarDeleteRequestSchema = z.object({
-  type: z.literal('dashboard.environments.variables.delete'),
+/** Delete a variable from an context. */
+export const contextVarDeleteRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.delete'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   key: z.string(),
 });
 
-const envVarDeleteResponseSchema = z.object({
-  type: z.literal('dashboard.environments.variables.delete.response'),
+const contextVarDeleteResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.variables.delete.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
 // -- Source overrides --
 
-/** List source overrides for an environment + routing key. */
-export const envSourceOverridesListRequestSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.list'),
+/** List source overrides for an context + routing key. */
+export const contextSourceOverridesListRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.list'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   routingKey: z.string(),
 });
 
-const envSourceOverridesListResponseSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.list.response'),
+const contextSourceOverridesListResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.list.response'),
   requestId: z.string(),
   overrides: z
     .array(
@@ -1220,77 +1220,77 @@ const envSourceOverridesListResponseSchema = z.object({
 });
 
 /** Set a source override variable. */
-export const envSourceOverrideSetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.set'),
+export const contextSourceOverrideSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   routingKey: z.string(),
   key: z.string(),
   value: z.string(),
 });
 
-const envSourceOverrideSetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.set.response'),
+const contextSourceOverrideSetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.set.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
 /** Delete a source override variable. */
-export const envSourceOverrideDeleteRequestSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.delete'),
+export const contextSourceOverrideDeleteRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.delete'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   routingKey: z.string(),
   key: z.string(),
 });
 
-const envSourceOverrideDeleteResponseSchema = z.object({
-  type: z.literal('dashboard.environments.source-overrides.delete.response'),
+const contextSourceOverrideDeleteResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.source-overrides.delete.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-// -- Environment bindings --
+// -- Context bindings --
 
 /**
- * A scope→environment binding with its host selector. `hostPattern` is the host
+ * A scope→context binding with its host selector. `hostPattern` is the host
  * the binding applies to (`'**'` = all hosts); exact / glob / regex over a
  * fan-out child's agentId / hostname / labels.
  */
-export const envBindingEntrySchema = z.object({
+export const contextBindingEntrySchema = z.object({
   scopePattern: z.string(),
   hostPattern: z.string(),
 });
-export type EnvBindingEntry = z.infer<typeof envBindingEntrySchema>;
+export type ContextBindingEntry = z.infer<typeof contextBindingEntrySchema>;
 
-/** List bindings for an environment. */
-export const envBindingsListRequestSchema = z.object({
-  type: z.literal('dashboard.environments.bindings.list'),
+/** List bindings for an context. */
+export const contextBindingsListRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.bindings.list'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
 });
 
-const envBindingsListResponseSchema = z.object({
-  type: z.literal('dashboard.environments.bindings.list.response'),
+const contextBindingsListResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.bindings.list.response'),
   requestId: z.string(),
-  bindings: z.array(envBindingEntrySchema).optional(),
+  bindings: z.array(contextBindingEntrySchema).optional(),
   error: z.string().optional(),
 });
 
-/** Set bindings (scope + host patterns) for an environment. */
-export const envBindingsSetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.bindings.set'),
+/** Set bindings (scope + host patterns) for an context. */
+export const contextBindingsSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.bindings.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
-  bindings: z.array(envBindingEntrySchema),
+  contextId: z.string(),
+  bindings: z.array(contextBindingEntrySchema),
 });
 
-const envBindingsSetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.bindings.set.response'),
+const contextBindingsSetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.bindings.set.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
@@ -1298,14 +1298,14 @@ const envBindingsSetResponseSchema = z.object({
 // -- Scoped secrets --
 
 /** List all scoped secrets for the org. */
-export const envSecretsListRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.list'),
+export const contextSecretsListRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.list'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
 });
 
-const envSecretsListResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.list.response'),
+const contextSecretsListResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.list.response'),
   requestId: z.string(),
   secrets: z
     .array(
@@ -1321,8 +1321,8 @@ const envSecretsListResponseSchema = z.object({
 });
 
 /** Set (create or update) a scoped secret. */
-export const envSecretSetRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.set'),
+export const contextSecretSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.set'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   scope: z.string(),
@@ -1330,23 +1330,23 @@ export const envSecretSetRequestSchema = z.object({
   value: z.string(),
 });
 
-const envSecretSetResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.set.response'),
+const contextSecretSetResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.set.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
 /** Delete a scoped secret. */
-export const envSecretDeleteRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.delete'),
+export const contextSecretDeleteRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.delete'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   scope: z.string(),
   key: z.string(),
 });
 
-const envSecretDeleteResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.delete.response'),
+const contextSecretDeleteResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.delete.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
@@ -1354,62 +1354,62 @@ const envSecretDeleteResponseSchema = z.object({
 // -- Scope CRUD --
 
 /** Create an empty scope. */
-export const envSecretScopeCreateRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.create'),
+export const contextSecretScopeCreateRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.create'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   scope: z.string(),
 });
 
-const envSecretScopeCreateResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.create.response'),
+const contextSecretScopeCreateResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.create.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-/** Rename a scope -- also updates all environment bindings referencing old scope. */
-export const envSecretScopeRenameRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.rename'),
+/** Rename a scope -- also updates all context bindings referencing old scope. */
+export const contextSecretScopeRenameRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.rename'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   oldScope: z.string(),
   newScope: z.string(),
 });
 
-const envSecretScopeRenameResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.rename.response'),
+const contextSecretScopeRenameResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.rename.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-/** Delete a scope and all its secrets. Also removes environment bindings referencing this scope. */
-export const envSecretScopeDeleteRequestSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.delete'),
+/** Delete a scope and all its secrets. Also removes context bindings referencing this scope. */
+export const contextSecretScopeDeleteRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.delete'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   scope: z.string(),
 });
 
-const envSecretScopeDeleteResponseSchema = z.object({
-  type: z.literal('dashboard.environments.secrets.scope.delete.response'),
+const contextSecretScopeDeleteResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.scope.delete.response'),
   requestId: z.string(),
   error: z.string().optional(),
 });
 
-// -- Environment history --
+// -- Context history --
 
-/** Fetch runs that targeted a specific environment, keyed by environment id. */
-export const envHistoryRequestSchema = z.object({
-  type: z.literal('dashboard.environments.history'),
+/** Fetch runs that targeted a specific context, keyed by context id. */
+export const contextHistoryRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.history'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
-  environmentId: z.string(),
+  contextId: z.string(),
   limit: z.number().optional(),
   offset: z.number().optional(),
 });
 
-const envHistoryResponseSchema = z.object({
-  type: z.literal('dashboard.environments.history.response'),
+const contextHistoryResponseSchema = z.object({
+  type: z.literal('dashboard.contexts.history.response'),
   requestId: z.string(),
   runs: z
     .array(
@@ -1422,7 +1422,7 @@ const envHistoryResponseSchema = z.object({
         commitSha: z.string().nullable(),
         startedAt: z.coerce.string().nullable(),
         completedAt: z.coerce.string().nullable(),
-        environment: z.string().nullable(),
+        context: z.string().nullable(),
       }),
     )
     .optional(),
@@ -1436,7 +1436,7 @@ export const HeldRunStatus = z.enum(['pending', 'approved', 'rejected', 'expired
 export type HeldRunStatus = z.infer<typeof HeldRunStatus>;
 
 /** Queue type for held runs. */
-export const HeldRunQueueType = z.enum(['environment', 'security']);
+export const HeldRunQueueType = z.enum(['context', 'security']);
 export type HeldRunQueueType = z.infer<typeof HeldRunQueueType>;
 
 /** List held runs. */
@@ -1467,10 +1467,10 @@ const heldRunsListResponseSchema = z.object({
       z.object({
         id: z.string(),
         runId: z.string(),
-        // Null once the environment is deleted (held_runs.environment_id is
+        // Null once the context is deleted (held_runs.context_id is
         // FK ON DELETE SET NULL): terminal hold history outlives its env.
-        environmentId: z.string().nullable(),
-        environmentName: z.string().nullable(),
+        contextId: z.string().nullable(),
+        contextName: z.string().nullable(),
         holdType: z.string(),
         queueType: HeldRunQueueType,
         status: HeldRunStatus,
@@ -1482,7 +1482,7 @@ const heldRunsListResponseSchema = z.object({
         contributorUsername: z.string().nullable().optional(),
         trustTier: z.string().nullable().optional(),
         // Per-element approval fields (job/workflow/step holds). Optional so
-        // legacy environment-only holds (which carry no approval requirement)
+        // legacy context-only holds (which carry no approval requirement)
         // still validate.
         jobId: z.string().optional(),
         holdScope: HoldScope.optional(),
@@ -2211,7 +2211,7 @@ export const testRelayTriggerResponseSchema = z.object({
   status: z.enum(['accepted', 'rejected']).optional(),
   reason: z.string().optional(),
   jobIds: z.array(z.string()).optional(),
-  /** User-visible warnings on acceptance (e.g. skipped non-test bound environments). */
+  /** User-visible warnings on acceptance (e.g. skipped non-test bound contexts). */
   warnings: z.array(z.string()).optional(),
   error: z.string().optional(),
 });
@@ -2315,34 +2315,34 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   runCancelRequestSchema,
   dashboardPayloadRequestSchema,
   dashboardOrchLogsRequestSchema,
-  // Environment CRUD
-  envListRequestSchema,
-  envGetRequestSchema,
-  envCreateRequestSchema,
-  envUpdateRequestSchema,
-  envTestAccessSetRequestSchema,
-  envDeleteRequestSchema,
-  // Environment variables
-  envVarsListRequestSchema,
-  envVarSetRequestSchema,
-  envVarDeleteRequestSchema,
+  // Context CRUD
+  contextListRequestSchema,
+  contextGetRequestSchema,
+  contextCreateRequestSchema,
+  contextUpdateRequestSchema,
+  contextTestAccessSetRequestSchema,
+  contextDeleteRequestSchema,
+  // Context variables
+  contextVarsListRequestSchema,
+  contextVarSetRequestSchema,
+  contextVarDeleteRequestSchema,
   // Source overrides
-  envSourceOverridesListRequestSchema,
-  envSourceOverrideSetRequestSchema,
-  envSourceOverrideDeleteRequestSchema,
+  contextSourceOverridesListRequestSchema,
+  contextSourceOverrideSetRequestSchema,
+  contextSourceOverrideDeleteRequestSchema,
   // Bindings
-  envBindingsListRequestSchema,
-  envBindingsSetRequestSchema,
+  contextBindingsListRequestSchema,
+  contextBindingsSetRequestSchema,
   // Scoped secrets
-  envSecretsListRequestSchema,
-  envSecretSetRequestSchema,
-  envSecretDeleteRequestSchema,
+  contextSecretsListRequestSchema,
+  contextSecretSetRequestSchema,
+  contextSecretDeleteRequestSchema,
   // Scope CRUD
-  envSecretScopeCreateRequestSchema,
-  envSecretScopeRenameRequestSchema,
-  envSecretScopeDeleteRequestSchema,
-  // Environment history
-  envHistoryRequestSchema,
+  contextSecretScopeCreateRequestSchema,
+  contextSecretScopeRenameRequestSchema,
+  contextSecretScopeDeleteRequestSchema,
+  // Context history
+  contextHistoryRequestSchema,
   // Held runs
   heldRunsListRequestSchema,
   heldRunApproveRequestSchema,
@@ -2410,34 +2410,34 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   runCancelResponseSchema,
   dashboardPayloadResponseSchema,
   dashboardOrchLogsResponseSchema,
-  // Environment CRUD
-  envListResponseSchema,
-  envGetResponseSchema,
-  envCreateResponseSchema,
-  envUpdateResponseSchema,
-  envTestAccessSetResponseSchema,
-  envDeleteResponseSchema,
-  // Environment variables
-  envVarsListResponseSchema,
-  envVarSetResponseSchema,
-  envVarDeleteResponseSchema,
+  // Context CRUD
+  contextListResponseSchema,
+  contextGetResponseSchema,
+  contextCreateResponseSchema,
+  contextUpdateResponseSchema,
+  contextTestAccessSetResponseSchema,
+  contextDeleteResponseSchema,
+  // Context variables
+  contextVarsListResponseSchema,
+  contextVarSetResponseSchema,
+  contextVarDeleteResponseSchema,
   // Source overrides
-  envSourceOverridesListResponseSchema,
-  envSourceOverrideSetResponseSchema,
-  envSourceOverrideDeleteResponseSchema,
+  contextSourceOverridesListResponseSchema,
+  contextSourceOverrideSetResponseSchema,
+  contextSourceOverrideDeleteResponseSchema,
   // Bindings
-  envBindingsListResponseSchema,
-  envBindingsSetResponseSchema,
+  contextBindingsListResponseSchema,
+  contextBindingsSetResponseSchema,
   // Scoped secrets
-  envSecretsListResponseSchema,
-  envSecretSetResponseSchema,
-  envSecretDeleteResponseSchema,
+  contextSecretsListResponseSchema,
+  contextSecretSetResponseSchema,
+  contextSecretDeleteResponseSchema,
   // Scope CRUD
-  envSecretScopeCreateResponseSchema,
-  envSecretScopeRenameResponseSchema,
-  envSecretScopeDeleteResponseSchema,
-  // Environment history
-  envHistoryResponseSchema,
+  contextSecretScopeCreateResponseSchema,
+  contextSecretScopeRenameResponseSchema,
+  contextSecretScopeDeleteResponseSchema,
+  // Context history
+  contextHistoryResponseSchema,
   // Held runs
   heldRunsListResponseSchema,
   heldRunApproveResponseSchema,
@@ -2523,31 +2523,35 @@ export type DashboardEventDlqDiscardResponse = z.infer<
   typeof dashboardEventDlqDiscardResponseSchema
 >;
 
-// Environment CRUD types
-export type EnvListRequest = z.infer<typeof envListRequestSchema>;
-type EnvListResponse = z.infer<typeof envListResponseSchema>;
-export type EnvGetRequest = z.infer<typeof envGetRequestSchema>;
-type EnvGetResponse = z.infer<typeof envGetResponseSchema>;
-export type EnvCreateRequest = z.infer<typeof envCreateRequestSchema>;
-export type EnvUpdateRequest = z.infer<typeof envUpdateRequestSchema>;
-export type EnvTestAccessSetRequest = z.infer<typeof envTestAccessSetRequestSchema>;
-export type EnvDeleteRequest = z.infer<typeof envDeleteRequestSchema>;
-export type EnvVarsListRequest = z.infer<typeof envVarsListRequestSchema>;
-type EnvVarsListResponse = z.infer<typeof envVarsListResponseSchema>;
-export type EnvVarSetRequest = z.infer<typeof envVarSetRequestSchema>;
-export type EnvVarDeleteRequest = z.infer<typeof envVarDeleteRequestSchema>;
-export type EnvSourceOverridesListRequest = z.infer<typeof envSourceOverridesListRequestSchema>;
-export type EnvSourceOverrideSetRequest = z.infer<typeof envSourceOverrideSetRequestSchema>;
-export type EnvSourceOverrideDeleteRequest = z.infer<typeof envSourceOverrideDeleteRequestSchema>;
-export type EnvBindingsListRequest = z.infer<typeof envBindingsListRequestSchema>;
-export type EnvBindingsSetRequest = z.infer<typeof envBindingsSetRequestSchema>;
-export type EnvSecretsListRequest = z.infer<typeof envSecretsListRequestSchema>;
-export type EnvSecretSetRequest = z.infer<typeof envSecretSetRequestSchema>;
-export type EnvSecretDeleteRequest = z.infer<typeof envSecretDeleteRequestSchema>;
-export type EnvSecretScopeCreateRequest = z.infer<typeof envSecretScopeCreateRequestSchema>;
-export type EnvSecretScopeRenameRequest = z.infer<typeof envSecretScopeRenameRequestSchema>;
-export type EnvSecretScopeDeleteRequest = z.infer<typeof envSecretScopeDeleteRequestSchema>;
-export type EnvHistoryRequest = z.infer<typeof envHistoryRequestSchema>;
+// Context CRUD types
+export type ContextListRequest = z.infer<typeof contextListRequestSchema>;
+type ContextListResponse = z.infer<typeof contextListResponseSchema>;
+export type ContextGetRequest = z.infer<typeof contextGetRequestSchema>;
+type ContextGetResponse = z.infer<typeof contextGetResponseSchema>;
+export type ContextCreateRequest = z.infer<typeof contextCreateRequestSchema>;
+export type ContextUpdateRequest = z.infer<typeof contextUpdateRequestSchema>;
+export type ContextTestAccessSetRequest = z.infer<typeof contextTestAccessSetRequestSchema>;
+export type ContextDeleteRequest = z.infer<typeof contextDeleteRequestSchema>;
+export type ContextVarsListRequest = z.infer<typeof contextVarsListRequestSchema>;
+type ContextVarsListResponse = z.infer<typeof contextVarsListResponseSchema>;
+export type ContextVarSetRequest = z.infer<typeof contextVarSetRequestSchema>;
+export type ContextVarDeleteRequest = z.infer<typeof contextVarDeleteRequestSchema>;
+export type ContextSourceOverridesListRequest = z.infer<
+  typeof contextSourceOverridesListRequestSchema
+>;
+export type ContextSourceOverrideSetRequest = z.infer<typeof contextSourceOverrideSetRequestSchema>;
+export type ContextSourceOverrideDeleteRequest = z.infer<
+  typeof contextSourceOverrideDeleteRequestSchema
+>;
+export type ContextBindingsListRequest = z.infer<typeof contextBindingsListRequestSchema>;
+export type ContextBindingsSetRequest = z.infer<typeof contextBindingsSetRequestSchema>;
+export type ContextSecretsListRequest = z.infer<typeof contextSecretsListRequestSchema>;
+export type ContextSecretSetRequest = z.infer<typeof contextSecretSetRequestSchema>;
+export type ContextSecretDeleteRequest = z.infer<typeof contextSecretDeleteRequestSchema>;
+export type ContextSecretScopeCreateRequest = z.infer<typeof contextSecretScopeCreateRequestSchema>;
+export type ContextSecretScopeRenameRequest = z.infer<typeof contextSecretScopeRenameRequestSchema>;
+export type ContextSecretScopeDeleteRequest = z.infer<typeof contextSecretScopeDeleteRequestSchema>;
+export type ContextHistoryRequest = z.infer<typeof contextHistoryRequestSchema>;
 export type HeldRunsListRequest = z.infer<typeof heldRunsListRequestSchema>;
 type HeldRunsListResponse = z.infer<typeof heldRunsListResponseSchema>;
 export type HeldRunApproveRequest = z.infer<typeof heldRunApproveRequestSchema>;
@@ -2666,11 +2670,11 @@ export const runListItemSchema = z.object({
   hadCompileJob: z.boolean(),
   compileJobId: z.string().nullable(),
   /**
-   * Distinct bound deployment-environment names across the run's jobs
-   * (first-seen order). Drives the run-list environment chips; empty/absent
-   * when no job binds an environment.
+   * Distinct bound deployment-context names across the run's jobs
+   * (first-seen order). Drives the run-list context chips; empty/absent
+   * when no job binds an context.
    */
-  environments: z.array(z.string()).optional(),
+  contexts: z.array(z.string()).optional(),
   /**
    * Run-level repo provider (origin host) — distinct from `source.provider`
    * which is derived from the routing key. Drives provider-aware repo links.
@@ -2828,17 +2832,17 @@ export type DashboardJobDetail = z.infer<typeof dashboardJobDetailSchema>;
 
 // --- Dashboard payload utility types ---
 // Extracted item types for use by dashboard components and orchestrator handlers.
-// These are the "inner" shapes — e.g., a single environment, a single held run —
+// These are the "inner" shapes — e.g., a single context, a single held run —
 // without the WS envelope (type, requestId).
 
-/** Single environment from the list response. */
-export type DashboardEnvironment = NonNullable<EnvListResponse['environments']>[number];
+/** Single context from the list response. */
+export type DashboardContext = NonNullable<ContextListResponse['contexts']>[number];
 
-/** Full environment detail from the get response. */
-export type DashboardEnvironmentDetail = NonNullable<EnvGetResponse['environment']>;
+/** Full context detail from the get response. */
+export type DashboardContextDetail = NonNullable<ContextGetResponse['context']>;
 
-/** Single environment variable from the variables list response. */
-export type DashboardEnvironmentVariable = NonNullable<EnvVarsListResponse['variables']>[number];
+/** Single context variable from the variables list response. */
+export type DashboardContextVariable = NonNullable<ContextVarsListResponse['variables']>[number];
 
 /** Single held run from the held runs list response. */
 export type DashboardHeldRun = NonNullable<HeldRunsListResponse['heldRuns']>[number];

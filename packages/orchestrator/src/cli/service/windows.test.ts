@@ -75,6 +75,17 @@ describe('WindowsServiceManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockExistsSync.mockReturnValue(false);
+    // Fresh-box default: no pre-existing service, so `sc.exe query` throws
+    // (exit non-zero). This makes install()'s serviceExists() guard return
+    // false so the happy-path install tests run unchanged; everything else
+    // succeeds silently. Tests that need a different shape override this with
+    // their own mockReturnValueOnce / mockImplementation.
+    mockExecSync.mockImplementation((cmd: unknown) => {
+      if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
+        throw new Error('service does not exist');
+      }
+      return '';
+    });
   });
 
   describe('install', () => {
@@ -166,6 +177,48 @@ describe('WindowsServiceManager', () => {
           (c[0] as string).includes('restart/'),
       );
       expect(failureCall).toBeDefined();
+    });
+
+    it('removes a pre-existing service before re-installing (idempotent, no 1073)', async () => {
+      // sc.exe query: present on the guard check, then gone during the uninstall poll.
+      let queryCalls = 0;
+      mockExecSync.mockImplementation((cmd: unknown) => {
+        if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
+          queryCalls += 1;
+          if (queryCalls === 1) return ''; // guard check: exit 0 → service EXISTS
+          throw new Error('service does not exist'); // uninstall poll: gone
+        }
+        return ''; // stop/delete/description/config/failure/shawl add all succeed
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await expect(mgr.install(testConfig)).resolves.toBeUndefined();
+
+      const calls = mockExecSync.mock.calls.map((c: unknown[]) => String(c[0]));
+      expect(calls.some((c) => c.includes('sc.exe delete'))).toBe(true); // uninstall ran
+      expect(calls.some((c) => c.includes('shawl') && c.includes('add'))).toBe(true); // reinstall ran
+
+      mockExecSync.mockReset();
+    });
+
+    it('skips uninstall on a fresh box (service absent) and runs shawl add', async () => {
+      mockExecSync.mockImplementation((cmd: unknown) => {
+        if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
+          throw new Error('service does not exist'); // ABSENT
+        }
+        return '';
+      });
+
+      const { WindowsServiceManager } = await import('./windows.js');
+      const mgr = new WindowsServiceManager();
+      await mgr.install(testConfig);
+
+      const calls = mockExecSync.mock.calls.map((c: unknown[]) => String(c[0]));
+      expect(calls.some((c) => c.includes('sc.exe delete'))).toBe(false); // no uninstall
+      expect(calls.some((c) => c.includes('shawl') && c.includes('add'))).toBe(true);
+
+      mockExecSync.mockReset();
     });
   });
 

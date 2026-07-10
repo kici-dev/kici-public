@@ -154,7 +154,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.recordAccess(
         msg.actor,
         'global_workflows.get.read',
-        { type: 'environment', id: this.deps.customerId },
+        { type: 'context', id: this.deps.customerId },
         msg.requestId,
         'allowed',
       );
@@ -167,7 +167,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.recordAccess(
         msg.actor,
         'global_workflows.get.read',
-        { type: 'environment', id: this.deps.customerId },
+        { type: 'context', id: this.deps.customerId },
         msg.requestId,
         'error',
         toErrorMessage(err),
@@ -183,7 +183,7 @@ export class DashboardGlobalWorkflowsHandler {
         'global_workflows.update',
         'dashboard.global-workflows.update.response',
         'global_workflows.update',
-        { type: 'environment', id: this.deps.customerId },
+        { type: 'context', id: this.deps.customerId },
       ))
     ) {
       return;
@@ -196,7 +196,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.recordAccess(
         msg.actor,
         'global_workflows.update',
-        { type: 'environment', id: this.deps.customerId },
+        { type: 'context', id: this.deps.customerId },
         msg.requestId,
         'allowed',
       );
@@ -209,7 +209,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.recordAccess(
         msg.actor,
         'global_workflows.update',
-        { type: 'environment', id: this.deps.customerId },
+        { type: 'context', id: this.deps.customerId },
         msg.requestId,
         'error',
         toErrorMessage(err),

@@ -549,9 +549,9 @@ describe('dashboardOrchToPlatformSchema (discriminated union)', () => {
     expect(() => dashboardOrchToPlatformSchema.parse(msg)).toThrow();
   });
 
-  it('accepts held-runs.list.response rows with a nulled environment reference', () => {
-    // A held run whose environment was deleted carries environmentId AND
-    // environmentName as null (held_runs.environment_id is FK ON DELETE SET
+  it('accepts held-runs.list.response rows with a nulled context reference', () => {
+    // A held run whose environment was deleted carries contextId AND
+    // contextName as null (held_runs.context_id is FK ON DELETE SET
     // NULL). The union must accept the row — a rejection here drops the WS
     // response in the relay and surfaces as a Platform proxy timeout.
     const msg = {
@@ -561,10 +561,10 @@ describe('dashboardOrchToPlatformSchema (discriminated union)', () => {
         {
           id: 'hold-1',
           runId: 'run-1',
-          environmentId: null,
-          environmentName: null,
+          contextId: null,
+          contextName: null,
           holdType: 'reviewer',
-          queueType: 'environment',
+          queueType: 'context',
           status: 'rejected',
           requestedAt: '2026-06-06T00:00:00.000Z',
           resolvedAt: '2026-06-06T00:05:00.000Z',
@@ -931,12 +931,12 @@ describe('dashboardJobDetailSchema with initFailure', () => {
       ...baseJob,
       initFailure: {
         scope: 'job' as const,
-        category: InitFailureCategory.enum.environment_rules,
+        category: InitFailureCategory.enum.context_rules,
         message: 'Rejected by protection rules',
         jobName: 'deploy',
       },
     };
-    expect(dashboardJobDetailSchema.parse(job).initFailure?.category).toBe('environment_rules');
+    expect(dashboardJobDetailSchema.parse(job).initFailure?.category).toBe('context_rules');
   });
 
   it('omits initFailure for normal jobs', () => {
@@ -1157,7 +1157,7 @@ describe('fleetHostDeclareResponseSchema created flag', () => {
 describe('dashboard request-type registry', () => {
   it('derives every request type from the union and includes a known type', () => {
     expect(DASHBOARD_REQUEST_TYPES.length).toBeGreaterThan(20);
-    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.environments.bindings.set')).toBe(true);
+    expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.contexts.bindings.set')).toBe(true);
     expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.totally.made.up')).toBe(false);
   });
 

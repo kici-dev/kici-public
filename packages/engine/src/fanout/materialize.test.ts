@@ -25,7 +25,7 @@ describe('materializeFanout', () => {
     expect(expansionMap.get('test')).toEqual(['test']);
   });
 
-  it('expands a single-dim static matrix (array form) with local-executor naming', () => {
+  it('expands a single-dim static matrix (array form) with deterministic naming', () => {
     const { jobs, expansionMap } = materializeFanout([
       base({ matrix: { _type: 'static', values: ['a', 'b'] } }),
     ]);

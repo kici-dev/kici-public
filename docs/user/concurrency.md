@@ -55,7 +55,7 @@ group: () => 'deploy';
 group: (ctx) => `deploy-${ctx.event.targetBranch ?? 'default'}`;
 ```
 
-The workflow-level group function is always evaluated **agent-side** at runtime -- the lock file records only that a group function exists (`hasGroup: true`), not the function itself. The agent loads the workflow source, calls the group function with `{ branch, event }`, and reports the evaluated key back to the orchestrator before step execution begins. This differs from job-level `concurrencyGroup` (see [Environments](environments.md#concurrency-groups)), where the compiler performs purity analysis and can inline pure functions for orchestrator-side evaluation.
+The workflow-level group function is always evaluated **agent-side** at runtime -- the lock file records only that a group function exists (`hasGroup: true`), not the function itself. The agent loads the workflow source, calls the group function with `{ branch, event }`, and reports the evaluated key back to the orchestrator before step execution begins. This differs from job-level `concurrencyGroup` (see [Contexts](contexts.md#concurrency-groups)), where the compiler performs purity analysis and can inline pure functions for orchestrator-side evaluation.
 
 ## cancelInProgress mode
 
@@ -148,7 +148,7 @@ workflow('deploy', {
   jobs: [
     job('deploy-staging', {
       runsOn: 'linux',
-      environment: 'staging',
+      context: 'staging',
       steps: [
         /* ... */
       ],
@@ -190,11 +190,11 @@ workflow('deploy', {
 });
 ```
 
-## Interaction with environment protection
+## Interaction with context protection
 
-When a workflow has both `concurrency` and `environment` protection rules:
+When a workflow has both `concurrency` and `context` protection rules:
 
-1. Environment protection gates (required reviewers, wait timer) apply first
+1. Context protection gates (required reviewers, wait timer) apply first
 2. Concurrency group check happens after protection gates pass
 3. If the run is queued by concurrency, it keeps its protection approval
 
@@ -206,17 +206,15 @@ Queued runs can be cancelled before they start executing. The cancel request rem
 
 ## Job-level concurrency groups
 
-In addition to workflow-level concurrency, individual jobs can define their own concurrency group via the `concurrencyGroup` property. This controls concurrent execution at the job level rather than the workflow level. See [Environments — concurrency groups](environments.md#concurrency-groups) for details.
+In addition to workflow-level concurrency, individual jobs can define their own concurrency group via the `concurrencyGroup` property. This controls concurrent execution at the job level rather than the workflow level. See [Contexts — concurrency groups](contexts.md#concurrency-groups) for details.
 
 ## Local execution
 
-`kici run local` honors workflow-level `concurrency` per-machine, per-user. The `group` callback is evaluated against the simulated event identically to the remote orchestrator path; `cancelInProgress` carries the same semantics — `true` interrupts the holder via `SIGTERM` (escalating to `SIGKILL` after a grace window) and proceeds with the new run, while `false` queues the new invocation in FIFO order until the holder finishes.
+`kici run <event> --local` honors workflow-level `concurrency` per-machine, per-user. The `group` callback is evaluated against the simulated event identically to the remote orchestrator path; `cancelInProgress` carries the same semantics — `true` interrupts the holder via `SIGTERM` (escalating to `SIGKILL` after a grace window) and proceeds with the new run, while `false` queues the new invocation in FIFO order until the holder finishes.
 
 Coordination is local only. Running the same workflow on two different machines does not serialize across them — that requires the orchestrator. For full cross-host enforcement (queueing across agents, dashboard visibility, `max > 1`), use `kici run remote` against a deployed orchestrator.
 
-Lock files live under `$XDG_RUNTIME_DIR/kici-local-locks/` on Linux, falling back to `os.tmpdir()/kici-local-locks-<uid>/`. A workflow whose `group` callback throws aborts the run with a clear error rather than running unprotected. See [`kici run local` — Concurrency enforcement](cli-reference.md#concurrency-enforcement) for the `KICI_LOCAL_LOCK_KILL_GRACE_MS` override and the diagnostic output emitted while contending on a busy lock.
-
-The `kici run local --concurrency <n>` flag is a separate concept — it caps **job-level** parallelism within a single run (how many jobs from one workflow run at once), not cross-run serialization.
+Lock files live under `$XDG_RUNTIME_DIR/kici-local-locks/` on Linux, falling back to `os.tmpdir()/kici-local-locks-<uid>/`. A workflow whose `group` callback throws aborts the run with a clear error rather than running unprotected. See [`kici run <event> --local` — Concurrency enforcement](cli-reference.md#concurrency-enforcement) for the `KICI_LOCAL_LOCK_KILL_GRACE_MS` override and the diagnostic output emitted while contending on a busy lock.
 
 ---
 

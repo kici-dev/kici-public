@@ -202,7 +202,24 @@ The following categories are **never** passed to the sandbox:
 - `KICI_PLATFORM_TOKEN` -- Platform relay authentication tokens
 - Any variable **not** in the system allowlist above
 
-This is an explicit allowlist approach: adding new environment variables to the host agent will **not** leak them to customer code.
+This is an explicit allowlist approach: adding new environment variables to the host agent will **not** leak them to customer code. The one deliberate exception is the trusted fleet-agent profile below, which an operator opts into per agent — and even then the agent's own KiCI identity secrets are always scrubbed.
+
+### Trusted fleet-agent profile (`KICI_TRUSTED_ENV`)
+
+Some workloads are the operator's **own** host-configuration or fleet jobs — a deploy agent that runs `sops`, `ssh`, `aws`, and `systemctl` against the host — and legitimately need the operator's ambient host environment (their sops age key, SSH agent socket, cloud credentials). For those, an agent can be launched with the **trusted execution profile**:
+
+```bash
+# On the trusted fleet agent (or the scaler label set that spawns it)
+KICI_TRUSTED_ENV=true
+```
+
+When enabled, the step sandbox passes the **ambient host environment through** to workflow steps instead of restricting to the system-variable allowlist — **minus** the agent's own KiCI identity and operational secrets. Specifically, the whole `KICI_*` namespace (orchestrator URL, agent token, secret key, bootstrap admin token, scaler internals) plus a small non-`KICI_` infrastructure denylist (`DATABASE_URL`, `PLATFORM_TOKEN`, `WEBHOOK_SECRET`, `GITHUB_PRIVATE_KEY`) are **always** scrubbed. So "trusted" means _host env yes, the agent's KiCI identity no_ — a trusted step can use the operator's ambient credentials but still cannot impersonate the agent or exfiltrate its join token.
+
+`KICI_TRUSTED_ENV` is **orthogonal** to `KICI_SANDBOX` (bubblewrap namespace isolation): the canonical fleet / host-configuration agent runs with bubblewrap off (full filesystem and network) **and** trusted-env on (full host env), launched as the operator. The two remain independent flags.
+
+**Trust model.** A trusted-env agent runs workflow steps — including any third-party actions they pull — with the operator's full host environment (and, if launched as root, root). This is the Ansible-playbook trust model: you trust the workflows you route to a host-configuration agent. Enable it **per agent**, and route only trusted workflows there.
+
+**The gate is agent-launch-only.** `KICI_TRUSTED_ENV` is read exclusively from the agent's own configuration (or the scaler label set that spawns it). It is **never** derivable from a dispatch payload, a workflow definition, or a trigger — a workflow cannot _request_ trusted-env; it can only be **routed** (by labels) to an agent the operator already configured as trusted. The scaler forwards and validates the trusted decision when it spawns the agent and logs it explicitly. A trigger or workflow can never elevate itself to the trusted profile.
 
 ### KICI_AGENT_ENV\_ prefix forwarding
 

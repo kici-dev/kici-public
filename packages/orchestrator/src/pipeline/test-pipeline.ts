@@ -3,7 +3,7 @@
  *
  * Resolves the lock file, matched decisions, and fixture-specific concerns
  * (inline-vs-provider lock, decision selection, fixture-payload storage, the
- * `allow_local_execution` environment gate, CLI-secret overlay, in-memory
+ * `allow_local_execution` context gate, CLI-secret overlay, in-memory
  * test-run marking), then dispatches each matched workflow through the SAME
  * shared core as webhooks (`dispatchMatchedWorkflow`). The test path is a thin
  * adapter — needs-DAG scheduling, `expansionMap` fan-out edges, `runsOnAll`
@@ -117,7 +117,7 @@ interface TestTriggerResult {
   jobIds: string[];
   /**
    * User-visible warnings on an accepted run — today, one per job whose bound
-   * test-run environment(s) were unavailable (non-test or unconfigured) and
+   * test-run context(s) were unavailable (non-test or unconfigured) and
    * skipped. Printed by the CLI on acceptance.
    */
   warnings?: string[];
@@ -243,7 +243,7 @@ function selectMatchedDecisions(
  * run by evaluating them against the fixture's simulated event (the normalized
  * envelope — the same argument production dispatch passes). Inline evaluation
  * failures reject the run (no fallback), matching production's immediate-failure
- * semantics. Non-test-allowed bound environments are NOT rejected here: the
+ * semantics. Non-test-allowed bound contexts are NOT rejected here: the
  * shared dispatch core skips them for test runs (skip-on-test).
  */
 function validateInlineFieldsForRun(
@@ -310,7 +310,7 @@ function decryptCliSecrets(input: TestTriggerInput): {
 
 /**
  * Resolve the fixture's `secrets` context mapping `{ contextName: envName }`
- * into namespaced secrets, fail-closed on non-test-allowed environments, then
+ * into namespaced secrets, fail-closed on non-test-allowed contexts, then
  * overlay the CLI-uploaded contexts (CLI wins per-context). Keyed by the
  * fixture context name (e.g. `db`), not the env name — the run carries these
  * verbatim on every dispatched job via `extraJobConfig.namespacedSecrets`.
@@ -325,14 +325,14 @@ async function resolveFixtureNamespacedSecrets(
   for (const [ctxName, envName] of Object.entries(input.secrets ?? {})) {
     if (deps.db) {
       const env = await deps.db
-        .selectFrom('environments')
+        .selectFrom('contexts')
         .select(['allow_local_execution'])
         .where('org_id', '=', orgId)
         .where('name', '=', envName)
         .executeTakeFirst();
       if (!env || !env.allow_local_execution) {
         return {
-          rejected: `Fixture secret context '${ctxName}' maps to environment '${envName}' which does not allow test runs`,
+          rejected: `Fixture secret context '${ctxName}' maps to context '${envName}' which does not allow test runs`,
         };
       }
     }
@@ -522,8 +522,8 @@ export async function processTestTrigger(
 
   // Resolve the tenant the SAME way the webhook pipeline does
   // (sources -> generic_webhook_sources -> '__default__'). A wrong org id would
-  // resolve another tenant's environments/secrets, so this MUST match the real
-  // path. Resolved ONCE here and shared by the environment gate, the fixture
+  // resolve another tenant's contexts/secrets, so this MUST match the real
+  // path. Resolved ONCE here and shared by the context gate, the fixture
   // namespaced-secret resolution, and the dispatch core.
   const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
 

@@ -37,7 +37,7 @@ describe('guardedDashboardDispatch', () => {
     const sendRaw = vi.fn();
     await guardedDashboardDispatch(
       { sendRaw, dispatch: async () => true },
-      { type: 'dashboard.environments.list', requestId: 'r3' },
+      { type: 'dashboard.contexts.list', requestId: 'r3' },
     );
     expect(sendRaw).not.toHaveBeenCalled();
   });
@@ -51,10 +51,10 @@ describe('guardedDashboardDispatch', () => {
           throw 'plain string failure';
         },
       },
-      { type: 'dashboard.environments.get', requestId: 'r4' },
+      { type: 'dashboard.contexts.get', requestId: 'r4' },
     );
     expect(sendRaw).toHaveBeenCalledWith({
-      type: 'dashboard.environments.get.response',
+      type: 'dashboard.contexts.get.response',
       requestId: 'r4',
       error: 'plain string failure',
     });

@@ -157,7 +157,7 @@ export function createAdminQueueExecutionRoutes(
           'ref',
           'sha',
           'routing_key',
-          'environment',
+          'context',
           'trust_tier',
           'created_at',
           'started_at',
@@ -189,7 +189,7 @@ export function createAdminQueueExecutionRoutes(
         ref: string;
         sha: string;
         routing_key: string | null;
-        environment: string | null;
+        context: string | null;
         trust_tier: string | null;
         created_at: string;
         started_at: string;
@@ -197,7 +197,7 @@ export function createAdminQueueExecutionRoutes(
         duration_ms: number | null;
       }>`
         SELECT id, run_id, workflow_name, status, provider, repo_identifier,
-               ref, sha, routing_key, environment, trust_tier, created_at,
+               ref, sha, routing_key, context, trust_tier, created_at,
                started_at, completed_at, duration_ms
           FROM execution_runs
          WHERE run_id = ${runId}

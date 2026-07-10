@@ -92,13 +92,13 @@ describe('hasOrchCapability', () => {
 describe('orch capabilities dashboard-request manifest', () => {
   it('advertises the supported dashboard request set', () => {
     expect(ORCH_CAPABILITIES.supportedDashboardRequests).toContain(
-      'dashboard.environments.bindings.set',
+      'dashboard.contexts.bindings.set',
     );
   });
   it('parses a capabilities object carrying the manifest', () => {
     const parsed = orchCapabilitiesSchema.parse({
       orchRole: 'coordinator',
-      supportedDashboardRequests: ['dashboard.environments.bindings.set'],
+      supportedDashboardRequests: ['dashboard.contexts.bindings.set'],
     });
     expect(parsed.supportedDashboardRequests).toHaveLength(1);
   });

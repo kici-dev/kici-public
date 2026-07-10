@@ -43,6 +43,14 @@ export interface ProviderBundle {
   repoUrlBuilder?: RepoUrlBuilder;
   contributorResolver?: ContributorResolver;
   checkStatusPoster?: CheckStatusPoster;
+  /**
+   * Local `file://` in-place profile: this bundle's `repoBasePath` is the
+   * operator's real working tree, so a dispatched run against it skips the
+   * source-pack `__build__` job (the tree is used directly by the agent's
+   * `KICI_IN_PLACE` profile). Set only by `createLocalProviderBundle`. Undefined
+   * for every non-local (or non-in-place local) bundle.
+   */
+  localInPlace?: boolean;
 }
 
 /**

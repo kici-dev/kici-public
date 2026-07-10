@@ -25,6 +25,7 @@ import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { JobToRoute, RunContext } from '../cluster/coordinator.js';
+import { claimRequestId } from './request-idempotency.js';
 
 const logger = createLogger({ prefix: 'manual-schedule' });
 
@@ -57,10 +58,30 @@ export async function handleManualSchedule(
   triggeredBy: string | null,
   triggeredByAgentLabel: string | null,
   deps: ManualScheduleDeps,
+  /**
+   * Platform-minted `requestId`. Stable across an HA relay failover re-send, so
+   * it is the idempotency key: after the read-only validation, the first
+   * coordinator to claim it creates the run and a failover re-send returns that
+   * same run instead of minting a second one.
+   */
+  requestId: string,
 ): Promise<{ newRunId: string }> {
   const { registration, commitSha, provider } = validateScheduleRequest(registrationId, deps);
   const workflow = registration.lockEntry;
-  const newRunId = randomUUID();
+
+  // Claim this request by its Platform `requestId` BEFORE the first write. On a
+  // relay failover re-send a sibling coordinator already owns this requestId, so
+  // return its run id without minting a second run. Validation above is
+  // read-only and identical across hops, so it is never masked by the claim.
+  const { newRunId, claimed } = await claimRequestId(deps.db, requestId);
+  if (!claimed) {
+    logger.info('Manual-schedule requestId already claimed by a sibling; returning existing run', {
+      registrationId,
+      requestId,
+      newRunId,
+    });
+    return { newRunId };
+  }
 
   logger.info('Manually triggering schedule workflow', {
     registrationId,

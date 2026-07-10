@@ -132,7 +132,7 @@ Every variant carries the shared `EventBase` fields — `type`, `action`, `targe
 
 Matrix configurations expand a single job into multiple instances, one per parameter combination. Maximum 256 combinations.
 
-Expansion happens at **dispatch time**: the orchestrator materializes the matrix into N execution jobs — one per combination, each dispatched to its own agent — before any job runs. Each instance receives its combination as `ctx.matrix`. This is identical whether the workflow runs via `kici run local` or remotely through a webhook trigger, and the dashboard groups the N instances under one parent node.
+Expansion happens at **dispatch time**: the orchestrator materializes the matrix into N execution jobs — one per combination, each dispatched to its own agent — before any job runs. Each instance receives its combination as `ctx.matrix`. This is identical whether the workflow runs via `kici run <event> --local` or remotely through a webhook trigger, and the dashboard groups the N instances under one parent node.
 
 ### Static array (single dimension)
 
@@ -278,7 +278,7 @@ step('collect', async ({ jobOutputs }) => {
 });
 ```
 
-The downstream job waits for **all** matrix combinations to terminate before it dispatches. A non-matrix upstream keeps the flat outputs shape. The envelope is identical under `kici run local` and the remote path.
+The downstream job waits for **all** matrix combinations to terminate before it dispatches. A non-matrix upstream keeps the flat outputs shape. The envelope is identical under `kici run <event> --local` and the remote path.
 
 ### Matrix type guards
 

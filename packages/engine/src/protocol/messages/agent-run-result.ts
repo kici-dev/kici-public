@@ -20,7 +20,7 @@ import {
   ExecutionStepStatus,
   InitFailureCategory,
 } from './execution-status.js';
-import { TrustTierSchema } from '../../environment/types.js';
+import { TrustTierSchema } from '../../context/types.js';
 import { CheckStepOutcome } from '../../check-mode.js';
 
 /**

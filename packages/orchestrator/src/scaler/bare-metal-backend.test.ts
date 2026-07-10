@@ -380,6 +380,57 @@ describe('BareMetalScalerBackend', () => {
       expect(env.CUSTOM).toBe('from-yaml');
     });
 
+    it('trusted-env label set forwards ambient host env + KICI_TRUSTED_ENV, scrubs orchestrator secrets', async () => {
+      process.env.SOPS_AGE_KEY_FILE = '/keys/age';
+      process.env.AWS_ACCESS_KEY_ID = 'AKIA';
+      process.env.SSH_AUTH_SOCK = '/tmp/ssh';
+      process.env.TRUSTED_ENV_PROBE = 'ambient-visible';
+      process.env.KICI_SECRET_KEY = 'orchestrator-master-key'; // must NOT leak
+      process.env.KICI_BOOTSTRAP_ADMIN_TOKEN = 'orch-admin'; // must NOT leak
+
+      const backend = createBackend({
+        labelSets: [
+          {
+            labels: ['default', 'self-hosted'],
+            binaryPath: '/opt/kici/kici-agent',
+            env: { KICI_TRUSTED_ENV: 'true', KICI_SANDBOX: 'false' },
+          },
+        ],
+      });
+      await backend.spawn(['default', 'self-hosted'], 'trusted-agent-1', 'ws://orch:8080');
+
+      const env = getSpawnEnv();
+      // Ambient host env forwarded to the trusted agent process.
+      expect(env.SOPS_AGE_KEY_FILE).toBe('/keys/age');
+      expect(env.AWS_ACCESS_KEY_ID).toBe('AKIA');
+      expect(env.SSH_AUTH_SOCK).toBe('/tmp/ssh');
+      expect(env.TRUSTED_ENV_PROBE).toBe('ambient-visible');
+      // Label-set env reaches the agent so it applies the trusted profile.
+      expect(env.KICI_TRUSTED_ENV).toBe('true');
+      // The agent's own identity is set by the scaler (not the orchestrator's).
+      expect(env.KICI_ORCHESTRATOR_URL).toBe('ws://orch:8080');
+      expect(env.KICI_AGENT_ID).toBe('trusted-agent-1');
+      // The orchestrator's OWN control-plane secrets are still scrubbed.
+      expect(env).not.toHaveProperty('KICI_SECRET_KEY');
+      expect(env).not.toHaveProperty('KICI_BOOTSTRAP_ADMIN_TOKEN');
+    });
+
+    it('default (non-trusted) label set does NOT forward ambient host env (byte-identical to today)', async () => {
+      process.env.SOPS_AGE_KEY_FILE = '/keys/age';
+      process.env.AWS_ACCESS_KEY_ID = 'AKIA';
+      process.env.TRUSTED_ENV_PROBE = 'ambient';
+
+      const backend = createBackend();
+      await backend.spawn(['linux', 'bare-metal'], 'agent-1', 'ws://orch:8080');
+
+      const env = getSpawnEnv();
+      // No KICI_TRUSTED_ENV configured → allowlist-only, ambient secrets absent.
+      expect(env).not.toHaveProperty('SOPS_AGE_KEY_FILE');
+      expect(env).not.toHaveProperty('AWS_ACCESS_KEY_ID');
+      expect(env).not.toHaveProperty('TRUSTED_ENV_PROBE');
+      expect(env).not.toHaveProperty('KICI_TRUSTED_ENV');
+    });
+
     it('sets explicit KICI_* agent vars', async () => {
       const backend = createBackend();
       await backend.spawn(['linux', 'bare-metal'], 'test-agent-1', 'ws://orch:8080');

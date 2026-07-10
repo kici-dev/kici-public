@@ -18,7 +18,7 @@ The asymmetry IS the industry-standard pattern for systems with a SaaS control p
 | Configured via                              | Dashboard → Settings → Roles + Members                                                                                                                                                   | `kici-admin api-key create`           |
 | Resources                                   | 17 typed resources (`runs`, `secrets`, `environments`, `workflows`, `members`, `api_keys`, `webhooks`, `org-settings`, `audit`, `event_log`, `ci_trust`, `support`, `teams`, `fleet`, …) | Coarse — admin tokens get every write |
 | Verbs                                       | `none`, `read`, `read_payload`, `write`, `admin`                                                                                                                                         | Fixed per role                        |
-| Per-resource scoping                        | Yes (give `environments:write` without `secrets:write`)                                                                                                                                  | No (admin = every write)              |
+| Per-resource scoping                        | Yes (give `contexts:write` without `secrets:write`)                                                                                                                                      | No (admin = every write)              |
 | Per-path scoping (e.g. "scope `prod` only") | Not today                                                                                                                                                                                | Not today                             |
 
 ## Dashboard RBAC (control plane)
@@ -72,7 +72,7 @@ The mitigation is operational: keep the two surfaces' authority equivalent for a
 
 ### Worked example
 
-Alice is a release engineer. Her dashboard role grants `environments:write` but not `secrets:write`.
+Alice is a release engineer. Her dashboard role grants `contexts:write` but not `secrets:write`.
 
 - **Wrong:** issue Alice an orchestrator `admin` token "so she can use the CLI." The `admin` role on the orchestrator includes every secret write — Alice now has higher authority on the CLI than she does on the dashboard, and the audit trail shows two different identities for the same human.
 - **Right:** if Alice needs CLI access for read-only inspection, issue her an orchestrator `auditor` token. If she needs CLI access for environment writes, ask whether her dashboard role should include `secrets:write` too — the answer is almost always "yes, expand the dashboard role" rather than "issue a more privileged CLI token that bypasses the dashboard role."

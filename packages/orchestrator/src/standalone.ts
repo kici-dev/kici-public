@@ -51,6 +51,9 @@ const otelSdk = initTelemetry({
 const { loadConfig } = await import('./config.js');
 const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
+const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
+const { ContextStore } = await import('./contexts/context-store.js');
+const { VariableStore } = await import('./contexts/variable-store.js');
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
@@ -92,8 +95,16 @@ await guardStartup(logger, async () => {
     // No Platform forwarding in standalone mode
     executionTrackerExtras: undefined,
 
-    // No SecretResolver in standalone mode (secrets subsystem still initializes PgSecretStore for admin deps)
-    onSecretsInitialized: undefined,
+    // Independent mode resolves NO context-scoped secrets at dispatch by
+    // default (the secrets subsystem still initializes PgSecretStore for admin
+    // deps). The local dev plane opts in via KICI_INDEPENDENT_SECRETS=1 so a
+    // workflow's `secrets.yaml` contexts resolve through the real resolver —
+    // gated so a bare independent orchestrator that doesn't want dispatch-time
+    // resolution is unaffected.
+    onSecretsInitialized: config.independentSecrets
+      ? ({ pgSecretStore, backendStores, db, auditLogger }) =>
+          buildContextSecretResolver({ pgSecretStore, backendStores, db, auditLogger, logger })
+      : undefined,
 
     onSubsystemsReady: async (sub) => {
       // One coordinator shared by every sibling peer-client of this
@@ -252,6 +263,17 @@ await guardStartup(logger, async () => {
             }
             return { webhookUrl: null, webhookNote: 'org-not-identified' };
           },
+
+          // Dispatch-time context resolution (variables + scoped secrets) for
+          // independent mode is opt-in via KICI_INDEPENDENT_SECRETS. When on
+          // (the local dev plane), wire the context + variable stores so a job's
+          // bound context is matched and its scoped secrets resolve through the
+          // SecretResolver. Off (a bare independent orchestrator) leaves these
+          // undefined, so context matching is skipped exactly as before.
+          ...(config.independentSecrets && {
+            contextStore: new ContextStore(sub.db),
+            variableStore: new VariableStore(sub.db),
+          }),
         },
 
         configReloaderExtras: {

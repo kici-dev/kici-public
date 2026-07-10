@@ -117,7 +117,7 @@ function isGitDirPath(relPath: string): boolean {
  * clone on the agent — we enumerate the directory explicitly. Including the
  * whole `.git` directory (objects, refs, HEAD, index, config, packed-refs)
  * makes the extracted overlay a real git repository, so workflow steps that
- * shell out to git work exactly as they do under `kici run local`.
+ * shell out to git work exactly as they do under `kici run --local`.
  */
 async function collectGitDirFiles(repoRoot: string): Promise<string[]> {
   const gitRoot = path.join(repoRoot, '.git');
@@ -182,7 +182,7 @@ async function loadKiciIgnore(kiciIgnorePath: string): Promise<((file: string) =
  * When `fullWorkingTree` is set (the `kici run remote` path), the entire
  * `.git` directory is additively included so the extracted overlay is a real
  * git repository on the agent — workflow steps that shell out to git then work
- * exactly as they do under `kici run local`. The `.git` files are added after
+ * exactly as they do under `kici run --local`. The `.git` files are added after
  * `.kiciignore` filtering (git internals are never subject to working-tree
  * ignore globs).
  *

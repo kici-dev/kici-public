@@ -1076,14 +1076,14 @@ describe('PlatformClient', () => {
       const mock = authenticateClient(client);
       mock.sentMessages = [];
 
-      // dashboard.environments.create requires `name`; an empty body fails the
+      // dashboard.contexts.create requires `name`; an empty body fails the
       // primary schema. Without the response guarantee this message is dropped
       // and the Platform hangs until its 10s forward window lapses (504).
-      simulateMessage(mock, { type: 'dashboard.environments.create', requestId: 'req-bad' });
+      simulateMessage(mock, { type: 'dashboard.contexts.create', requestId: 'req-bad' });
 
       const sent = getSentMessages(mock);
       const resp = sent.find(
-        (m) => (m as { type?: string }).type === 'dashboard.environments.create.response',
+        (m) => (m as { type?: string }).type === 'dashboard.contexts.create.response',
       ) as { requestId?: string; error?: string } | undefined;
       expect(resp).toBeDefined();
       expect(resp?.requestId).toBe('req-bad');
@@ -1787,7 +1787,7 @@ describe('classifyDashboardRequestError', () => {
 
   it('flags a known dashboard type with a bad body as invalid_payload', () => {
     const frame = classifyDashboardRequestError(
-      { type: 'dashboard.environments.bindings.set', requestId: 'r2' },
+      { type: 'dashboard.contexts.bindings.set', requestId: 'r2' },
       known,
       '0.1.20',
     );

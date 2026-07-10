@@ -2,6 +2,38 @@
 
 Release notes for the public KiCI packages.
 
+## v0.1.27 — 2026-07-10
+
+### Features
+
+- Rename job environments to contexts (breaking: use context:/contexts:/ctx.context)
+- The orchestrator now detects PostgreSQL collation-version drift at startup and logs a loud, alertable error naming the database, the recorded-vs-actual libc collation versions, and the exact `kici-admin db reindex` remediation — instead of a drifted text index silently reading a present row (such as a source private key) back as missing. A `kici_orch_db_collation_drift` metric exposes the state for alerting, and setting `KICI_DB_FAIL_ON_COLLATION_DRIFT=true` makes the orchestrator refuse to start on drift.
+- kici local: warm local dev orchestrator plane (up/status/down/logs)
+- kici run --local --offline runs a compiled workflow end-to-end on your machine as an ephemeral agent, through a warm local dev orchestrator — no cloud, real execution engine
+- kici run --local --offline: resolve secrets.yaml context-scoped secrets through the real resolver
+- kici run --local --offline now mints a dev-signed identity: ctx.kici.oidc.token() and ctx.attestProvenance() are signed by a local key with issuer kici-local (clearly non-prod). Export the trust root with `kici local trust-root <file>` to verify a dev-signed bundle offline via `kici verify-attestation --trust-root <file>`; against the default (hosted) trust root it correctly rejects.
+- kici run --local: attach the local dev plane to the Platform for real OIDC + attestation, with a `kici login` attach-prompt, `kici local attach`/`detach`, and auto-fallback to offline when the Platform is unreachable
+- Trusted fleet-agent execution profile: an agent launched with `KICI_TRUSTED_ENV=true` passes the ambient host environment through to workflow steps (minus the agent's own KiCI identity secrets), for trusted host-configuration / fleet workloads — composing with the existing `KICI_SANDBOX` isolation toggle. On the local dev plane, `kici run --local --trusted` routes a run to this profile so steps see your ambient credentials (sops/ssh/aws) that a normal sandboxed run cannot. Trusted-env is an agent-launch/scaler-config property only — a workflow or trigger can never elevate itself.
+- The `kici run local` subcommand is retired: every run is now a real routed dispatch. Use `kici run <event> --local` to run a workflow on your own machine (this machine becomes an ephemeral agent through the local dev plane), with `--offline` to force the throwaway/independent plane or `--in-place` to reuse the working tree. `kici run local` now prints a redirect to the new form and exits non-zero.
+
+### Fixes
+
+- kici-admin source refresh no longer fails with '[object Object]' is not valid JSON when refreshing a GitHub source's App identity
+- kici run --local --offline: ctx.emit now delivers custom events instead of failing with 'Unknown job context'
+- `kici local` plane reboots (attach/detach mode switches) now wait for the outgoing orchestrator to fully exit before booting the replacement, so a follow-up `kici local status` no longer intermittently reports the plane as not running
+- Trusted/in-place agent step-log streaming now honors a step's `$({ quiet: true })` intent, so a workflow step that decrypts a credential (for example via `sops -d`) no longer leaks the decrypted value into the captured run log
+- Dynamic context functions on a job (an impure `context()` resolved through an `__init__` job) take effect again. The environment-to-context rename had desynced the orchestrator's dispatch flag and the agent's returned resolved-context field names, so the agent silently skipped evaluating dynamic context functions and the resolved context was dropped
+- Filesystem cache backend no longer rejects dependency-cache uploads larger than 25MB; internal artifact transfers are bounded by the cache max-tarball size instead of the webhook body limit
+- Dashboard metrics, activity, and infrastructure pages now show status-aware error messages (permission/rate-limit/unavailable) instead of a generic connectivity error
+- Windows orchestrator service install is now idempotent — a redeploy onto a peer that already has the service no longer fails with sc create 1073
+- kici local up now honors a durable attachment: an attached plane comes up hybrid (matching kici run --local); --offline forces independent
+- A dashboard re-run now yields exactly one run even when the platform relay fails over between coordinators (requestId idempotency)
+- OAuth connect callbacks use the API base URL in split-origin deployments
+
+### Documentation
+
+- CLI reference command tables are now auto-generated from the CLI command trees
+
 ## v0.1.26 — 2026-07-06
 
 ### Other

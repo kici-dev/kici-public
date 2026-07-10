@@ -111,7 +111,7 @@ into a portable lock file, and executed by self-hosted agents.
 | ------------------------------- | ------------------------------------------- |
 | \`pnpm kici compile --check\`     | Validate workflow source without writing.   |
 | \`pnpm kici preview pr:open --debug\` | Preview which workflows match an event.   |
-| \`pnpm kici run local push\`      | Execute workflows locally with no orchestrator. |
+| \`pnpm kici run push --local\`    | Execute a workflow locally (this machine as an ephemeral agent). |
 | \`pnpm kici docs llm\`            | Print the full LLM documentation bundle.    |
 | \`pnpm kici docs llm --index\`    | Print the curated link index.               |
 
@@ -125,5 +125,5 @@ If \`pnpm kici\` isn't in scripts, fall back to \`npx kici\`.
 3. Edit a workflow under \`.kici/workflows/\`.
 4. Run \`kici compile --check\` (zero exit means valid).
 5. Run \`kici preview <event>\` to preview matching.
-6. Run \`kici run local <event>\` to execute locally before pushing.
+6. Run \`kici run <event> --local\` to execute locally before pushing.
 `;

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -53,13 +53,13 @@
       "import": "./dist/labels/compile.js",
       "types": "./dist/labels/compile.d.ts"
     },
-    "./environment/host-match": {
-      "import": "./dist/environment/host-match.js",
-      "types": "./dist/environment/host-match.d.ts"
+    "./context/host-match": {
+      "import": "./dist/context/host-match.js",
+      "types": "./dist/context/host-match.d.ts"
     },
-    "./environment/scope-template": {
-      "import": "./dist/environment/scope-template.js",
-      "types": "./dist/environment/scope-template.d.ts"
+    "./context/scope-template": {
+      "import": "./dist/context/scope-template.js",
+      "types": "./dist/context/scope-template.d.ts"
     },
     "./protocol/dashboard-global-workflows": {
       "import": "./dist/protocol/dashboard-global-workflows.js",
@@ -68,6 +68,14 @@
     "./protocol/dashboard-write-operations": {
       "import": "./dist/protocol/dashboard-write-operations.js",
       "types": "./dist/protocol/dashboard-write-operations.d.ts"
+    },
+    "./protocol/dashboard-api-errors": {
+      "import": "./dist/protocol/dashboard-api-errors.js",
+      "types": "./dist/protocol/dashboard-api-errors.d.ts"
+    },
+    "./protocol/session-policy": {
+      "import": "./dist/protocol/session-policy.js",
+      "types": "./dist/protocol/session-policy.d.ts"
     },
     "./protocol/analytics-events": {
       "import": "./dist/protocol/analytics-events.js",

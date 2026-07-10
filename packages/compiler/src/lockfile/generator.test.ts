@@ -484,14 +484,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 29', () => {
+  it('schemaVersion is 30', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(29);
-    expect(SCHEMA_VERSION).toBe(29);
+    expect(lockFile.schemaVersion).toBe(30);
+    expect(SCHEMA_VERSION).toBe(30);
   });
 
   it('serializes runsOnPick: deterministic by default and any when set', () => {
@@ -1357,41 +1357,41 @@ describe('generator - auto-IDs and bare function normalization', () => {
   });
 });
 
-describe('generator - environment/env/concurrencyGroup', () => {
-  describe('environment extraction', () => {
-    it('normalizes a static singular environment to environments[]', () => {
+describe('generator - context/env/concurrencyGroup', () => {
+  describe('context extraction', () => {
+    it('normalizes a static singular context to contexts[]', () => {
       const s = step('deploy', async () => {});
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environment: 'production',
+        context: 'production',
       });
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environments).toEqual([{ value: 'production', dynamic: false }]);
-        expect(lockJob).not.toHaveProperty('environment');
-        expect(lockJob).not.toHaveProperty('dynamicEnvironment');
+        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
+        expect(lockJob).not.toHaveProperty('context');
+        expect(lockJob).not.toHaveProperty('dynamicContext');
       }
     });
 
-    it('emits environments[] in order, marking dynamic elements', () => {
+    it('emits contexts[] in order, marking dynamic elements', () => {
       const s = step('deploy', async () => {});
       const envFn = (event: { ref: string }) => event.ref.split('/').pop();
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environments: ['staging', envFn as unknown as () => Promise<string>],
+        contexts: ['staging', envFn as unknown as () => Promise<string>],
       });
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environments?.[0]).toEqual({ value: 'staging', dynamic: false });
-        expect(lockJob.environments?.[1]).toEqual({
+        expect(lockJob.contexts?.[0]).toEqual({ value: 'staging', dynamic: false });
+        expect(lockJob.contexts?.[1]).toEqual({
           value: { _type: 'inline', expression: envFn.toString() },
           dynamic: true,
         });
@@ -1403,24 +1403,24 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environments: [async () => 'staging'],
+        contexts: [async () => 'staging'],
       });
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environments).toEqual([{ value: '', dynamic: true }]);
+        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
       }
     });
 
-    it('warns on impure environment function', () => {
+    it('warns on impure context function', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const s = step('deploy', async () => {});
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environment: async () => 'staging',
+        context: async () => 'staging',
       });
       const w = workflow('ci', { jobs: [j] });
 
@@ -1429,7 +1429,7 @@ describe('generator - environment/env/concurrencyGroup', () => {
       warnSpy.mockRestore();
     });
 
-    it('omits environment fields when not set', () => {
+    it('omits context fields when not set', () => {
       const s = step('build', async () => {});
       const j = job('build', { runsOn: 'linux', steps: [s] });
       const w = workflow('ci', { jobs: [j] });
@@ -1437,8 +1437,8 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('environments');
-        expect(lockJob).not.toHaveProperty('environment');
+        expect(lockJob).not.toHaveProperty('contexts');
+        expect(lockJob).not.toHaveProperty('context');
       }
     });
   });
@@ -1583,7 +1583,7 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const j = job('deploy', {
         runsOn: 'linux',
         steps: [s],
-        environment: 'production',
+        context: 'production',
         env: { DEPLOY_TARGET: 'aws' },
         concurrencyGroup: 'deploy-prod',
       });
@@ -1592,7 +1592,7 @@ describe('generator - environment/env/concurrencyGroup', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
-        expect(lockJob.environments).toEqual([{ value: 'production', dynamic: false }]);
+        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
         expect(lockJob.env).toEqual({ DEPLOY_TARGET: 'aws' });
         expect(lockJob.concurrencyGroup).toBe('deploy-prod');
       }

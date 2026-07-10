@@ -31,7 +31,7 @@ export const AccessLogTargetType = z.enum([
   'event_log',
   'event_log_payload',
   'secret_scope',
-  'environment',
+  'context',
   'registration',
   'backend',
   'diagnostics',
@@ -73,19 +73,19 @@ export const AccessLogAction = z.enum([
   'event_log.list.read',
   'event_log.detail.read',
   'event_log.payload.read',
-  'environment.list.read',
-  'environment.get.read',
-  'environment.create',
-  'environment.update',
-  'environment.delete',
-  'env_var.list.read',
-  'env_var.set',
-  'env_var.delete',
+  'context.list.read',
+  'context.get.read',
+  'context.create',
+  'context.update',
+  'context.delete',
+  'context_var.list.read',
+  'context_var.set',
+  'context_var.delete',
   'source_override.list.read',
   'source_override.set',
   'source_override.delete',
-  'env_binding.list.read',
-  'env_binding.set',
+  'context_binding.list.read',
+  'context_binding.set',
   'secret.list.read',
   'secret.set',
   'secret.delete',
@@ -93,7 +93,7 @@ export const AccessLogAction = z.enum([
   'secret_scope.create',
   'secret_scope.rename',
   'secret_scope.delete',
-  'environment.history.read',
+  'context.history.read',
   'held_run.list.read',
   'held_run.approve',
   'held_run.auto_approve',
@@ -144,6 +144,14 @@ export const AccessLogAction = z.enum([
    * orch-scoped, so `org_id` is null on these rows.
    */
   'cluster_name.update',
+  /**
+   * Deferred-attestation outbox drain / re-arm via the orch admin
+   * `POST /admin/attestations/retry` route (driven by `kici-admin attestations
+   * retry`). `actor_meta` carries `include_rejected`, `run_id`, and the
+   * `minted`/`still_pending`/`rejected` counts. The `include_rejected` re-arm
+   * clears a terminal `rejected_at` marker, so it is always audited.
+   */
+  'attestation.retry',
   'access_log.list.read',
   /** Event DLQ admin actions (Phase 5 — at-least-once event delivery). */
   'event_dlq.list.read',

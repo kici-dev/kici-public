@@ -108,7 +108,7 @@ The working-tree overlay tarball uploads **directly** from the developer machine
 
 The run is dispatched to the developer's active organization (selected with `kici org use`, or overridden per-run). The orchestrator anchors its bound organization with a system-managed **remote source** (routing key `remote:<orgId>`) that it auto-provisions — no manual webhook source is required, so a zero-source org is immediately routable for remote runs. The Platform forces the run's routing key to `remote:<orgId>` server-side; the developer never sets a routing key. When an org has more than one connected orchestrator cluster, the CLI selects the target cluster explicitly (or relies on the per-org default), and a single connected cluster is auto-selected.
 
-Remote runs are offered by the Platform; an orchestrator with no Platform connection cannot serve them. Executing workflow steps on the developer machine with no orchestrator is the separate `kici run local` path.
+Remote runs are offered by the Platform; an orchestrator with no Platform connection cannot serve them. Executing workflow steps on the developer machine with no orchestrator is the separate `kici run <event> --local` path.
 
 ## Source and dependency caching flow
 
@@ -779,7 +779,7 @@ The compiler processes the workflow definition:
 
 ### Execution time (local test runner)
 
-When `kici run local` runs a workflow:
+When `kici run <event> --local` runs a workflow:
 
 1. **SDK module resolution:** The runner resolves `setStepOutputsMap` / `setJobOutputsMap` from the same `@kici-dev/sdk` module instance that the workflow uses (ensures the proxy reads from the same map)
 2. **Map injection:** Fresh `OutputsMap` and `StepRefMap` are created and injected via `setStepOutputsMap()` / `setStepRefMap()` before each job

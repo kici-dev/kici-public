@@ -149,7 +149,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       // Auto-regenerate types when authenticated against the Platform
       // (non-blocking). Requires a token, a Platform endpoint, and an active
       // org — the same context DashboardClient needs to reach the org's
-      // environments through the relay.
+      // contexts through the relay.
       try {
         const { loadGlobalConfig } = await import('../remote/config.js');
         const config = await loadGlobalConfig();

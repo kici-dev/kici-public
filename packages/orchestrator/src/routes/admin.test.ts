@@ -697,5 +697,69 @@ describe('admin routes', () => {
       expect(res.status).toBe(200);
       expect(retryAttestations).toHaveBeenCalledWith({ includeRejected: false });
     });
+
+    it('403s an auditor and never runs the mutation', async () => {
+      const retryAttestations = vi.fn(async () => ({ minted: 0, stillPending: 0, rejected: 0 }));
+      const localDeps = createMockDeps({ retryAttestations });
+      const localApp = createAdminRoutes(localDeps);
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'tok-auditor',
+        role: 'auditor' as Role,
+        routingKey: null,
+        label: 'auditor',
+      });
+
+      const res = await request(localApp, 'POST', '/attestations/retry', {
+        token: 'auditor-token',
+        body: { includeRejected: true },
+      });
+      expect(res.status).toBe(403);
+      expect(retryAttestations).not.toHaveBeenCalled();
+    });
+
+    it('owner succeeds and writes an attestation.retry access-log row', async () => {
+      const retryAttestations = vi.fn(async () => ({ minted: 1, stillPending: 2, rejected: 3 }));
+      const record = vi.fn(async () => undefined);
+      const localDeps = createMockDeps({ retryAttestations, accessLog: { record } as any });
+      const localApp = createAdminRoutes(localDeps);
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'tok-owner',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'owner',
+      });
+
+      const res = await request(localApp, 'POST', '/attestations/retry', {
+        token: 'owner-token',
+        body: { includeRejected: true },
+      });
+      expect(res.status).toBe(200);
+      expect(retryAttestations).toHaveBeenCalledWith({ includeRejected: true });
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record.mock.calls[0][0]).toMatchObject({
+        action: 'attestation.retry',
+        target: { type: 'attestation', id: 'all-pending' },
+        meta: { include_rejected: true, minted: 1, still_pending: 2, rejected: 3 },
+      });
+    });
+
+    it('403s a routing-key-scoped token (unscoped-token required)', async () => {
+      const retryAttestations = vi.fn(async () => ({ minted: 0, stillPending: 0, rejected: 0 }));
+      const localDeps = createMockDeps({ retryAttestations });
+      const localApp = createAdminRoutes(localDeps);
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'tok-scoped',
+        role: 'owner' as Role,
+        routingKey: 'some-key',
+        label: 'scoped',
+      });
+
+      const res = await request(localApp, 'POST', '/attestations/retry', {
+        token: 'scoped-token',
+        body: {},
+      });
+      expect(res.status).toBe(403); // requireUnscopedToken denies scoped tokens
+      expect(retryAttestations).not.toHaveBeenCalled();
+    });
   });
 });

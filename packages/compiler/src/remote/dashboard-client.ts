@@ -82,23 +82,23 @@ export interface RegistrationsListFilters {
 }
 
 /**
- * A secret context (environment) as surfaced to the developer CLI's
+ * A secret context (context) as surfaced to the developer CLI's
  * `secrets list` / `types` commands. The orchestrator returns the per-env
  * secret key names (never values) when `includeSecrets` is requested.
  */
-const environmentContextSchema = z.object({
+const contextContextSchema = z.object({
   name: z.string(),
   enabled: z.boolean(),
   allowLocalExecution: z.boolean(),
   secretKeys: z.array(z.string()).default([]),
 });
 
-const environmentsListSchema = z.object({
-  environments: z.array(environmentContextSchema).default([]),
+const contextsListSchema = z.object({
+  contexts: z.array(contextContextSchema).default([]),
 });
 
-/** A secret context (environment) returned by {@link DashboardClient.listEnvironments}. */
-export type EnvironmentContext = z.infer<typeof environmentContextSchema>;
+/** A secret context (context) returned by {@link DashboardClient.listContexts}. */
+export type ContextContext = z.infer<typeof contextContextSchema>;
 
 const STATUS_ERROR_MAP: Record<number, [DashboardErrorKind, string]> = {
   401: ['unauthorized', 'Authentication failed. Run `kici login` to re-authenticate.'],
@@ -257,14 +257,14 @@ export class DashboardClient {
   }
 
   /**
-   * List the org's environments as secret contexts (GET /environments).
+   * List the org's contexts as secret contexts (GET /contexts).
    *
-   * Pass `includeSecrets` to have the orchestrator attach each environment's
+   * Pass `includeSecrets` to have the orchestrator attach each context's
    * reachable secret key names (never values). Used by `kici secrets list`
    * and `kici types`.
    */
-  async listEnvironments(includeSecrets = false): Promise<EnvironmentContext[]> {
+  async listContexts(includeSecrets = false): Promise<ContextContext[]> {
     const suffix = includeSecrets ? '?includeSecrets=true' : '';
-    return environmentsListSchema.parse(await this.getJson(`/environments${suffix}`)).environments;
+    return contextsListSchema.parse(await this.getJson(`/contexts${suffix}`)).contexts;
   }
 }

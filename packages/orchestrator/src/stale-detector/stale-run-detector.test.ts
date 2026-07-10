@@ -357,7 +357,7 @@ describe('StaleRunDetector', () => {
       jobId: '__install__CI',
       scope: 'workflow',
       stepIndex: null,
-      triggerSource: 'environment',
+      triggerSource: 'context',
     };
     const heldRunStore = {
       releaseDueWaitHolds: vi.fn().mockResolvedValue([waitSignal]),

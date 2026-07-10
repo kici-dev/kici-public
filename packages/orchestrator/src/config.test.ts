@@ -68,6 +68,17 @@ describe('orchestrator loadConfig', () => {
       expect(config.orchestratorHostAgentId).toBe('orch-box');
     });
 
+    it('defaults independentSecrets to false when KICI_INDEPENDENT_SECRETS unset', () => {
+      const config = loadConfig();
+      expect(config.independentSecrets).toBe(false);
+    });
+
+    it('parses KICI_INDEPENDENT_SECRETS=true to independentSecrets=true', () => {
+      process.env.KICI_INDEPENDENT_SECRETS = 'true';
+      const config = loadConfig();
+      expect(config.independentSecrets).toBe(true);
+    });
+
     it('parses KICI_SKIP_S3_SENTINEL_VALIDATION=true to true', () => {
       process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
       const config = loadConfig();
@@ -108,6 +119,32 @@ describe('orchestrator loadConfig', () => {
     it('leaves testMintDeferAudience undefined when unset', () => {
       const config = loadConfig();
       expect(config.testMintDeferAudience).toBeUndefined();
+    });
+
+    it('maps KICI_TEST_MINT_REJECT_AUDIENCE to testMintRejectAudience', () => {
+      process.env.KICI_TEST_MODE = '1';
+      process.env.KICI_TEST_MINT_REJECT_AUDIENCE = 'kici-provenance-reject';
+      const config = loadConfig();
+      expect(config.testMode).toBe(true);
+      expect(config.testMintRejectAudience).toBe('kici-provenance-reject');
+    });
+
+    it('leaves testMintRejectAudience undefined when unset', () => {
+      const config = loadConfig();
+      expect(config.testMintRejectAudience).toBeUndefined();
+    });
+
+    it('maps KICI_TEST_RERUN_DELAY_MS to testRerunDelayMs', () => {
+      process.env.KICI_TEST_MODE = '1';
+      process.env.KICI_TEST_RERUN_DELAY_MS = '4000';
+      const config = loadConfig();
+      expect(config.testMode).toBe(true);
+      expect(config.testRerunDelayMs).toBe(4000);
+    });
+
+    it('leaves testRerunDelayMs undefined when unset', () => {
+      const config = loadConfig();
+      expect(config.testRerunDelayMs).toBeUndefined();
     });
   });
 

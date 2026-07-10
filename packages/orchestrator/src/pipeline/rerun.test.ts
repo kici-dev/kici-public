@@ -2,6 +2,34 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleRerun, type RerunDeps } from './rerun.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
+// The generic mock DB cannot enforce real `INSERT … ON CONFLICT` dedup
+// semantics (that is covered against a real Postgres in
+// `request-idempotency.test.ts`). Here we mock the claim with an in-memory
+// stateful implementation so `handleRerun`'s wiring — a `claimed: false`
+// re-send short-circuits before dispatch — is exercised deterministically.
+const idempotency = vi.hoisted(() => {
+  const claims = new Map<string, string>();
+  let counter = 0;
+  return {
+    reset: () => {
+      claims.clear();
+      counter = 0;
+    },
+    claim: (requestId: string): { newRunId: string; claimed: boolean } => {
+      const existing = claims.get(requestId);
+      if (existing) return { newRunId: existing, claimed: false };
+      const id = `mock-newrun-${++counter}`;
+      claims.set(requestId, id);
+      return { newRunId: id, claimed: true };
+    },
+  };
+});
+
+vi.mock('./request-idempotency.js', () => ({
+  claimRequestId: vi.fn(async (_db: unknown, requestId: string) => idempotency.claim(requestId)),
+  pruneRequestIdempotency: vi.fn(async () => 0),
+}));
+
 // --- Mock helpers ---
 
 function makeMockDb(run?: Record<string, unknown>) {
@@ -167,6 +195,7 @@ describe('handleRerun', () => {
   let eventRouter: { emit: ReturnType<typeof vi.fn> };
 
   beforeEach(() => {
+    idempotency.reset();
     db = makeMockDb(TERMINAL_RUN);
     logStorage = createMockLogStorage(JSON.stringify(PAYLOAD));
     providerBundle = createMockProviderBundle();
@@ -198,7 +227,7 @@ describe('handleRerun', () => {
   });
 
   it('loads original run from DB, reads payload, re-fetches lock file, dispatches jobs with parent_run_id', async () => {
-    const result = await handleRerun('original-run-123', 'user@test.com', null, deps);
+    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     // Should have a newRunId
     expect(result.newRunId).toBeDefined();
@@ -226,6 +255,18 @@ describe('handleRerun', () => {
     expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
   });
 
+  it('is idempotent on requestId: a failover re-send returns the same run without a second dispatch', async () => {
+    const requestId = 'req-dedupe-1';
+    const first = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
+    const second = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
+
+    // Same run id, not a freshly-minted second run.
+    expect(second.newRunId).toBe(first.newRunId);
+    // Only the first hop created + dispatched the run; the re-send short-circuits.
+    expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
+    expect(executionTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
+  });
+
   it('re-materializes a matrix job into N dispatches each carrying matrixValues', async () => {
     providerBundle.lockFileFetcher!.fetchLockFile.mockResolvedValue({
       ...LOCK_FILE,
@@ -249,7 +290,7 @@ describe('handleRerun', () => {
       ],
     });
 
-    await handleRerun('original-run-123', 'user@test.com', null, deps);
+    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     expect(dispatcher.dispatch).toHaveBeenCalledTimes(2);
     const calls = dispatcher.dispatch.mock.calls.map((c: any[]) => c[0]);
@@ -266,7 +307,7 @@ describe('handleRerun', () => {
     db = makeMockDb(runningRun);
     deps.db = db as any;
 
-    await expect(handleRerun('original-run-123', null, null, deps)).rejects.toThrow(
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
       'Run is not in a terminal state (current: running)',
     );
   });
@@ -276,7 +317,7 @@ describe('handleRerun', () => {
     db = makeMockDb(cancellingRun);
     deps.db = db as any;
 
-    await expect(handleRerun('original-run-123', null, null, deps)).rejects.toThrow(
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
       'Run is not in a terminal state (current: cancelling)',
     );
   });
@@ -287,7 +328,7 @@ describe('handleRerun', () => {
     logStorage.read.mockResolvedValue({ data: null, cursor: 0, complete: true });
     deps.logStorage = logStorage as any;
 
-    const result = await handleRerun('original-run-123', null, null, deps);
+    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
 
     // Should succeed
     expect(result.newRunId).toBeDefined();
@@ -307,7 +348,7 @@ describe('handleRerun', () => {
   it('fails with error if lock file not found at original SHA', async () => {
     providerBundle.lockFileFetcher!.fetchLockFile.mockResolvedValue(null);
 
-    await expect(handleRerun('original-run-123', null, null, deps)).rejects.toThrow(
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
       'Lock file not found at original SHA',
     );
   });
@@ -320,7 +361,7 @@ describe('handleRerun', () => {
     db = makeMockDb(null);
     deps.db = db as any;
 
-    await expect(handleRerun('nonexistent', null, null, deps)).rejects.toThrow(
+    await expect(handleRerun('nonexistent', null, null, deps, 'req-test')).rejects.toThrow(
       /archived to cold storage|chunk could not be replayed/,
     );
   });
@@ -329,13 +370,13 @@ describe('handleRerun', () => {
     db = makeMockDb({ ...TERMINAL_RUN, is_test_run: true });
     deps.db = db as any;
 
-    await expect(handleRerun('original-run-123', null, null, deps)).rejects.toThrow(
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
       'Test runs cannot be re-run',
     );
   });
 
   it('passes parentRunId and triggeredBy to executionTracker.onExecutionStarted', async () => {
-    const result = await handleRerun('original-run-123', 'user@test.com', null, deps);
+    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     // executionTracker.onExecutionStarted should have been called with parentRunId and triggeredBy
     // as the last two positional arguments
@@ -349,7 +390,7 @@ describe('handleRerun', () => {
   });
 
   it('passes different triggeredBy values correctly', async () => {
-    await handleRerun('original-run-123', 'admin@company.com', null, deps);
+    await handleRerun('original-run-123', 'admin@company.com', null, deps, 'req-test');
 
     expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
     const call = executionTracker.onExecutionStarted.mock.calls[0];
@@ -358,7 +399,7 @@ describe('handleRerun', () => {
   });
 
   it('emits workflow.rerun system event via EventRouter', async () => {
-    await handleRerun('original-run-123', 'user@test.com', null, deps);
+    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     expect(eventRouter.emit).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -372,7 +413,7 @@ describe('handleRerun', () => {
   });
 
   it('dispatches jobs using the existing Dispatcher infrastructure', async () => {
-    const result = await handleRerun('original-run-123', null, null, deps);
+    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
 
     expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
 
@@ -386,7 +427,7 @@ describe('handleRerun', () => {
   });
 
   it('stores payload for the new run', async () => {
-    const result = await handleRerun('original-run-123', null, null, deps);
+    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
 
     // Should store payload for the new run too
     expect(logStorage.append).toHaveBeenCalledWith(
@@ -409,7 +450,7 @@ describe('handleRerun', () => {
     };
     deps.coordinator = coordinator as any;
 
-    await handleRerun('original-run-123', 'user@test.com', null, deps);
+    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     // Coordinator was asked to route the jobs
     expect(coordinator.routeJobs).toHaveBeenCalledOnce();
@@ -464,7 +505,14 @@ describe('handleRerun', () => {
       deps.coldStore = { replayRow } as unknown as RerunDeps['coldStore'];
 
       await expect(
-        handleRerun('forged-runid-not-in-db', null, null, deps, 'attacker-supplied-routing-key'),
+        handleRerun(
+          'forged-runid-not-in-db',
+          null,
+          null,
+          deps,
+          'req-test',
+          'attacker-supplied-routing-key',
+        ),
       ).rejects.toThrow(/archived to cold storage|chunk could not be replayed/);
 
       // Side-effect-free: nothing got dispatched; nothing got recorded.
@@ -504,7 +552,7 @@ describe('handleRerun', () => {
       db = makeMockDb({ ...TERMINAL_RUN, routing_key: realKey });
       deps.db = db as any;
 
-      await handleRerun('original-run-123', null, null, deps, attackerHint);
+      await handleRerun('original-run-123', null, null, deps, 'req-test', attackerHint);
 
       // The provider bundle resolution MUST have been keyed by the run's
       // own routing_key, not the Platform-supplied hint.

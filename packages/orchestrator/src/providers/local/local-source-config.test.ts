@@ -24,6 +24,14 @@ describe('LocalSourceConfigSchema', () => {
     expect(() => LocalSourceConfigSchema.parse({})).toThrow();
   });
 
+  it('accepts an optional inPlace flag', () => {
+    const parsed = LocalSourceConfigSchema.parse({
+      repoBasePath: '/srv/kici/policy-repo',
+      inPlace: true,
+    });
+    expect(parsed.inPlace).toBe(true);
+  });
+
   it('rejects unknown keys (strict)', () => {
     expect(() =>
       LocalSourceConfigSchema.parse({ repoBasePath: '/srv/kici', bogus: true }),

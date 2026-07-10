@@ -3,12 +3,12 @@ title: Dynamic values
 description: ''
 ---
 
-Dynamic values let you compute `environment`, `env`, and `concurrencyGroup` at runtime based on the incoming event. Instead of hardcoding static strings, you pass a function that receives the normalized event envelope and returns the resolved value.
+Dynamic values let you compute `context`, `env`, and `concurrencyGroup` at runtime based on the incoming event. Instead of hardcoding static strings, you pass a function that receives the normalized event envelope and returns the resolved value.
 
 ```typescript
 job('deploy', {
   runsOn: ['default'],
-  environment: (event) => event.targetBranch,
+  context: (event) => event.targetBranch,
   env: (event) => ({ BRANCH: event.targetBranch }),
   concurrencyGroup: (event) => `deploy-${event.targetBranch}`,
   steps: [
@@ -21,7 +21,7 @@ job('deploy', {
 job('deploy', {
   runsOn: 'default',
   // One shape everywhere: branch on the normalized event type.
-  environment: (event) => (event.type === 'pull_request' ? 'preview' : 'production'),
+  context: (event) => (event.type === 'pull_request' ? 'preview' : 'production'),
   steps: [
     /* ... */
   ],
@@ -49,7 +49,7 @@ When the compiler detects a pure function, it serializes the function source dir
 
 ```typescript
 // Simple branch extraction
-environment: (event) => event.targetBranch;
+context: (event) => event.targetBranch;
 
 // Object literal with string operations
 env: (event) => ({ BRANCH: event.targetBranch });
@@ -61,7 +61,7 @@ concurrencyGroup: (event) => `deploy-${event.targetBranch}`;
 env: (event) => ({ UPPER: String(event.targetBranch).toUpperCase() });
 
 // Local variables are fine
-environment: (event) => {
+context: (event) => {
   const parts = event.targetBranch.split('/');
   return parts[parts.length - 1];
 };
@@ -82,7 +82,7 @@ This adds approximately 5-10 seconds of overhead for cloning and evaluation.
 
 ```typescript
 // Async functions cannot be inlined
-environment: async (event) => await lookupEnv(event.targetBranch);
+context: async (event) => await lookupEnv(event.targetBranch);
 
 // External module references
 env: (event) => {
@@ -91,7 +91,7 @@ env: (event) => {
 };
 
 // Process/global access
-environment: (event) => process.env.DEFAULT_ENV || 'staging';
+context: (event) => process.env.DEFAULT_ENV || 'staging';
 
 // Dynamic imports
 env: async (event) => {
@@ -102,15 +102,15 @@ env: async (event) => {
 
 ## Performance comparison
 
-| Evaluation path                      | Overhead | When used                                                           |
-| ------------------------------------ | -------- | ------------------------------------------------------------------- |
-| Static value (string/object literal) | ~0ms     | `environment: 'staging'`                                            |
-| Inline expression (pure function)    | ~0ms     | `environment: (event) => event.targetBranch`                        |
-| Init job (impure function)           | ~5-10s   | `environment: async (event) => await lookupEnv(event.targetBranch)` |
+| Evaluation path                      | Overhead | When used                                                       |
+| ------------------------------------ | -------- | --------------------------------------------------------------- |
+| Static value (string/object literal) | ~0ms     | `context: 'staging'`                                            |
+| Inline expression (pure function)    | ~0ms     | `context: (event) => event.targetBranch`                        |
+| Init job (impure function)           | ~5-10s   | `context: async (event) => await lookupEnv(event.targetBranch)` |
 
 ## Tips
 
-- **Write pure functions whenever possible** to avoid the init-job delay. Most environment and env computations only need the event payload data.
+- **Write pure functions whenever possible** to avoid the init-job delay. Most context and env computations only need the event payload data.
 - **Check compiler warnings** -- the compiler tells you when a function is classified as impure and explains why.
 - **Runtime errors in inline expressions cause immediate job failure.** There is no fallback to the init-job path. If your pure function throws at runtime (e.g., accessing a property on `undefined`), the job fails immediately.
 - **The event parameter is the normalized event envelope** — the same shape rules receive as `ctx.event`: `{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }` (see the [event payload reference](./sdk/event-payloads.md) for the complete schema). Narrow on `event.type` (`'push'`, `'pull_request'`, `'tag'`, …) to branch per trigger kind. The raw provider webhook body is nested at `event.payload` (for GitHub pushes: `payload.ref`, `payload.after`, `payload.repository`, …).

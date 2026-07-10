@@ -13,7 +13,7 @@ These environment variables are specific to the agent. Variables shared across
 KiCI services (log level, OpenTelemetry endpoint, heartbeat/concurrency timeouts)
 and the rotated-file logger live in the [environment variable reference](../env-reference.md).
 
-<!-- BEGIN GENERATED: agent-env (do not edit; run pnpm docs:env) -->
+<!-- BEGIN GENERATED: agent-env (do not edit; run the doc generator) -->
 
 | Env var                                | Required | Default    | Type                                    | Aliases | Description |
 | -------------------------------------- | -------- | ---------- | --------------------------------------- | ------- | ----------- |
@@ -25,6 +25,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_DOCKER_KEEP_FAILED`              | no       | "false"    | string                                  |         |             |
 | `KICI_EXECUTION_MODE`                  | no       |            | enum:container\|bare-metal\|firecracker |         |             |
 | `KICI_GITHUB_TOKEN`                    | no       |            | string                                  |         |             |
+| `KICI_IN_PLACE`                        | no       | "false"    | string                                  |         |             |
 | `KICI_LABELS`                          | no       |            | string                                  |         |             |
 | `KICI_MAX_LOG_SIZE_BYTES`              | no       | 10485760   | number                                  |         |             |
 | `KICI_ORCHESTRATOR_URL`                | yes      |            | string                                  |         |             |
@@ -36,6 +37,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_SCALER_IDLE_TIMEOUT`             | no       | 5000       | number                                  |         |             |
 | `KICI_SCALER_MANAGED`                  | no       |            | string                                  |         |             |
 | `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` | no       | 60000      | number                                  |         |             |
+| `KICI_TRUSTED_ENV`                     | no       | "false"    | string                                  |         |             |
 
 <!-- END GENERATED: agent-env -->
 

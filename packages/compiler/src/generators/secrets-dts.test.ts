@@ -1,21 +1,21 @@
 import { describe, it, expect } from 'vitest';
 import ts from 'typescript';
 import { generateSecretsDts } from './secrets-dts.js';
-import type { EnvironmentMetadata, GenerateSecretsDtsOptions } from './secrets-dts.js';
+import type { ContextMetadata, GenerateSecretsDtsOptions } from './secrets-dts.js';
 
 function makeOptions(
-  environments: EnvironmentMetadata[],
+  contexts: ContextMetadata[],
   endpoint = 'https://orch.example.com',
 ): GenerateSecretsDtsOptions {
   return {
-    environments,
+    contexts,
     endpoint,
     generatedAt: new Date('2026-01-15T10:00:00Z'),
   };
 }
 
 describe('generateSecretsDts', () => {
-  it('generates valid module augmentation with multiple environments', () => {
+  it('generates valid module augmentation with multiple contexts', () => {
     const output = generateSecretsDts(
       makeOptions([
         { name: 'production', keys: ['DB_HOST', 'DB_PASSWORD', 'API_KEY'] },
@@ -25,7 +25,7 @@ describe('generateSecretsDts', () => {
 
     expect(output).toContain("declare module '@kici-dev/sdk'");
     expect(output).toContain('interface KnownSecretKeys');
-    expect(output).toContain('interface EnvironmentSecrets');
+    expect(output).toContain('interface ContextSecrets');
 
     // KnownSecretKeys: union of all keys
     expect(output).toContain('DB_HOST: string;');
@@ -33,26 +33,26 @@ describe('generateSecretsDts', () => {
     expect(output).toContain('API_KEY: string;');
     expect(output).toContain('SLACK_TOKEN: string;');
 
-    // JSDoc comments showing source environments
-    expect(output).toContain('/** From environment: production, staging */');
-    expect(output).toContain('/** From environment: production */');
-    expect(output).toContain('/** From environment: staging */');
+    // JSDoc comments showing source contexts
+    expect(output).toContain('/** From context: production, staging */');
+    expect(output).toContain('/** From context: production */');
+    expect(output).toContain('/** From context: staging */');
 
-    // EnvironmentSecrets: per-environment key unions
+    // ContextSecrets: per-context key unions
     expect(output).toContain("production: 'DB_HOST' | 'DB_PASSWORD' | 'API_KEY';");
     expect(output).toContain("staging: 'DB_HOST' | 'DB_PASSWORD' | 'SLACK_TOKEN';");
   });
 
-  it('generates empty interfaces when environments array is empty', () => {
+  it('generates empty interfaces when contexts array is empty', () => {
     const output = generateSecretsDts(makeOptions([]));
 
     expect(output).toContain("declare module '@kici-dev/sdk'");
     expect(output).toContain('interface KnownSecretKeys {');
-    expect(output).toContain('interface EnvironmentSecrets {');
+    expect(output).toContain('interface ContextSecrets {');
 
     // Interfaces should be empty (just open/close braces)
     expect(output).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
-    expect(output).toMatch(/interface EnvironmentSecrets \{\n\s*\}/);
+    expect(output).toMatch(/interface ContextSecrets \{\n\s*\}/);
   });
 
   it('uses quoted property syntax for non-identifier key names', () => {
@@ -63,13 +63,13 @@ describe('generateSecretsDts', () => {
     // Non-identifiers should be quoted in KnownSecretKeys
     expect(output).toContain("'my-key': string;");
     expect(output).toContain("'some.dotted': string;");
-    // Environment name with dash should also be quoted
+    // Context name with dash should also be quoted
     expect(output).toContain("'my-env':");
 
     // Valid identifier should not be quoted as a property name in KnownSecretKeys
     expect(output).toContain('VALID_KEY: string;');
 
-    // EnvironmentSecrets uses key unions (all quoted as string literals)
+    // ContextSecrets uses key unions (all quoted as string literals)
     expect(output).toContain("'my-key' | 'some.dotted' | 'VALID_KEY'");
   });
 
@@ -82,7 +82,7 @@ describe('generateSecretsDts', () => {
     expect(output).toContain('// Run `kici types` to refresh');
   });
 
-  it('generates correct output for a single environment with multiple keys', () => {
+  it('generates correct output for a single context with multiple keys', () => {
     const output = generateSecretsDts(
       makeOptions([{ name: 'database', keys: ['HOST', 'PORT', 'USER', 'PASS'] }]),
     );
@@ -93,10 +93,10 @@ describe('generateSecretsDts', () => {
     expect(output).toContain('USER: string;');
     expect(output).toContain('PASS: string;');
 
-    // All keys should reference single environment
-    expect(output).toContain('/** From environment: database */');
+    // All keys should reference single context
+    expect(output).toContain('/** From context: database */');
 
-    // EnvironmentSecrets should have the key union
+    // ContextSecrets should have the key union
     expect(output).toContain("database: 'HOST' | 'PORT' | 'USER' | 'PASS';");
   });
 
@@ -105,7 +105,7 @@ describe('generateSecretsDts', () => {
     expect(output.endsWith('\n')).toBe(true);
   });
 
-  it('deduplicates keys in KnownSecretKeys across environments', () => {
+  it('deduplicates keys in KnownSecretKeys across contexts', () => {
     const output = generateSecretsDts(
       makeOptions([
         { name: 'a', keys: ['SHARED', 'UNIQUE_A'] },
@@ -121,11 +121,11 @@ describe('generateSecretsDts', () => {
     const sharedOccurrences = knownSecretsBlock.match(/SHARED: string;/g);
     expect(sharedOccurrences).toHaveLength(1);
 
-    // But the JSDoc should list all three environments
-    expect(output).toContain('/** From environment: a, b, c */');
+    // But the JSDoc should list all three contexts
+    expect(output).toContain('/** From context: a, b, c */');
   });
 
-  it('uses never type for environments with no bound secrets', () => {
+  it('uses never type for contexts with no bound secrets', () => {
     const output = generateSecretsDts(
       makeOptions([
         { name: 'production', keys: ['DB_PASSWORD'] },
@@ -137,7 +137,7 @@ describe('generateSecretsDts', () => {
     expect(output).toContain('staging: never;');
   });
 
-  it('escapes single quotes and backslashes in key and environment names', () => {
+  it('escapes single quotes and backslashes in key and context names', () => {
     const output = generateSecretsDts(
       makeOptions([{ name: "it's", keys: ["foo'bar", 'back\\slash'] }]),
     );

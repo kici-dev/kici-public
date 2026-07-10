@@ -499,21 +499,21 @@ export async function purgeScopedSecretsDirect(
 }
 
 /**
- * Bulk-delete `environments` (and their FK-dependent rows) for an org, or for
- * every org when `orgId` is omitted. `environment_bindings` /
- * `environment_variables` / `environment_source_overrides` cascade
+ * Bulk-delete `contexts` (and their FK-dependent rows) for an org, or for
+ * every org when `orgId` is omitted. `context_bindings` /
+ * `context_variables` / `context_source_overrides` cascade
  * automatically (ON DELETE CASCADE). `held_runs` and `execution_runs` reference
- * `environments(id)` with ON DELETE SET NULL, so deleting environments alone
- * would leave orphaned `held_runs` rows carrying a null environment reference;
+ * `contexts(id)` with ON DELETE SET NULL, so deleting contexts alone
+ * would leave orphaned `held_runs` rows carrying a null context reference;
  * this helper deletes the org's `held_runs` too so a warm-start reset gets a
  * clean slate. Runs in a transaction so both deletes commit atomically. Used by
- * the E2E warm-start reset (so seeded environments don't leak between
- * categories) and exposed via `kici-admin environment purge`.
+ * the E2E warm-start reset (so seeded contexts don't leak between
+ * categories) and exposed via `kici-admin context purge`.
  */
-export async function purgeEnvironmentsDirect(
+export async function purgeContextsDirect(
   databaseUrl: string,
   orgId?: string,
-): Promise<{ environmentsDeleted: number; heldRunsDeleted: number }> {
+): Promise<{ contextsDeleted: number; heldRunsDeleted: number }> {
   const pool = createPool(databaseUrl);
   const client = await pool.connect();
   try {
@@ -521,10 +521,10 @@ export async function purgeEnvironmentsDirect(
     const where = orgId ? 'WHERE org_id = $1' : '';
     const params = orgId ? [orgId] : [];
     const held = await client.query(`DELETE FROM held_runs ${where}`, params);
-    const envs = await client.query(`DELETE FROM environments ${where}`, params);
+    const envs = await client.query(`DELETE FROM contexts ${where}`, params);
     await client.query('COMMIT');
     return {
-      environmentsDeleted: envs.rowCount ?? 0,
+      contextsDeleted: envs.rowCount ?? 0,
       heldRunsDeleted: held.rowCount ?? 0,
     };
   } catch (err) {
@@ -536,16 +536,16 @@ export async function purgeEnvironmentsDirect(
   }
 }
 
-// ── environment ops ────────────────────────────────────────────────────
+// ── context ops ────────────────────────────────────────────────────
 //
-// Direct-DB helpers backing `kici-admin environment` (Stage 5a #1). These
+// Direct-DB helpers backing `kici-admin context` (Stage 5a #1). These
 // abstract the `ON CONFLICT (org_id, name) DO UPDATE` upsert pattern that
 // the e2e setup helpers previously open-coded against `new pg.Pool`. Every
 // helper owns its own pool (max=1) and awaits `pool.end()` in finally —
 // callers pass a database URL, not a pool.
 
 /**
- * Allowed policy field names for `setEnvironmentPolicyDirect`. Kept as an
+ * Allowed policy field names for `setContextPolicyDirect`. Kept as an
  * explicit allowlist so the column-name interpolation in the UPDATE string
  * can never be driven by unsanitised caller input.
  */
@@ -559,7 +559,7 @@ const ENV_POLICY_COLUMNS = new Set<string>([
   'allow_local_execution',
 ]);
 
-export interface SeedEnvironmentOpts {
+export interface SeedContextOpts {
   orgId: string;
   name: string;
   type?: string;
@@ -572,25 +572,25 @@ export interface SeedEnvironmentOpts {
   globPattern?: string | null;
 }
 
-export interface SeedEnvironmentResult {
+export interface SeedContextResult {
   envId: string;
   created: boolean;
 }
 
 /**
- * Upsert an environment row keyed by (org_id, name). Returns the env id and
+ * Upsert an context row keyed by (org_id, name). Returns the env id and
  * whether the row was newly inserted. `branchRestrictions` / `requiredReviewers`
  * are JSON-serialised server-side; pass them as plain arrays or objects.
  */
-export async function seedEnvironmentDirect(
+export async function seedContextDirect(
   databaseUrl: string,
-  opts: SeedEnvironmentOpts,
-): Promise<SeedEnvironmentResult> {
+  opts: SeedContextOpts,
+): Promise<SeedContextResult> {
   if (opts.waitTimerSeconds != null && opts.waitTimerSeconds < 0) {
-    throw new Error(`environment: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
+    throw new Error(`context: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
   }
   if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 0) {
-    throw new Error(`environment: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
+    throw new Error(`context: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
   }
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
@@ -598,20 +598,20 @@ export async function seedEnvironmentDirect(
     const reviewersJson =
       opts.requiredReviewers === undefined ? null : JSON.stringify(opts.requiredReviewers);
     const result = await pool.query<{ id: string; inserted: boolean }>(
-      `INSERT INTO environments
+      `INSERT INTO contexts
           (org_id, name, type, enabled, branch_restrictions, required_reviewers,
            wait_timer_seconds, hold_expiry_seconds, minimum_trust, glob_pattern)
         VALUES ($1, $2, COALESCE($3, 'fixed'), COALESCE($4, true), $5::jsonb, $6::jsonb,
                 $7, COALESCE($8, 86400), $9, $10)
         ON CONFLICT (org_id, name) DO UPDATE SET
-          type = COALESCE(EXCLUDED.type, environments.type),
+          type = COALESCE(EXCLUDED.type, contexts.type),
           enabled = EXCLUDED.enabled,
           branch_restrictions = EXCLUDED.branch_restrictions,
           required_reviewers = EXCLUDED.required_reviewers,
           wait_timer_seconds = EXCLUDED.wait_timer_seconds,
           hold_expiry_seconds = EXCLUDED.hold_expiry_seconds,
           minimum_trust = EXCLUDED.minimum_trust,
-          glob_pattern = COALESCE(EXCLUDED.glob_pattern, environments.glob_pattern),
+          glob_pattern = COALESCE(EXCLUDED.glob_pattern, contexts.glob_pattern),
           updated_at = now()
         RETURNING id, (xmax = 0) AS inserted`,
       [
@@ -628,54 +628,54 @@ export async function seedEnvironmentDirect(
       ],
     );
     const row = result.rows[0];
-    if (!row) throw new Error(`environment: upsert returned no row for ${opts.name}`);
+    if (!row) throw new Error(`context: upsert returned no row for ${opts.name}`);
     return { envId: row.id, created: row.inserted };
   } finally {
     await pool.end();
   }
 }
 
-export interface DeleteEnvironmentOpts {
+export interface DeleteContextOpts {
   orgId: string;
   name: string;
 }
 
 /**
- * Delete an environment keyed by (org_id, name). Returns whether a row was
- * removed. The `environment_bindings`, `environment_variables`, and
- * `environment_source_overrides` children all carry
- * `FOREIGN KEY (environment_id) REFERENCES environments(id) ON DELETE CASCADE`,
- * so a single DELETE on `environments` cascades to those children. The
+ * Delete an context keyed by (org_id, name). Returns whether a row was
+ * removed. The `context_bindings`, `context_variables`, and
+ * `context_source_overrides` children all carry
+ * `FOREIGN KEY (context_id) REFERENCES contexts(id) ON DELETE CASCADE`,
+ * so a single DELETE on `contexts` cascades to those children. The
  * `held_runs` FK uses `ON DELETE SET NULL`, so terminal held-run history
- * survives the delete with a null environment reference. Pending held runs
- * still reference the environment, so this helper pre-checks their count and
+ * survives the delete with a null context reference. Pending held runs
+ * still reference the context, so this helper pre-checks their count and
  * throws before issuing the DELETE — approve or reject them first.
  */
-export async function deleteEnvironmentDirect(
+export async function deleteContextDirect(
   databaseUrl: string,
-  opts: DeleteEnvironmentOpts,
+  opts: DeleteContextOpts,
 ): Promise<{ deleted: boolean }> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     // The `'pending'` literal mirrors HeldRunStatus.Pending
-    // (orchestrator environments/held-runs.ts) — the source of truth for the
+    // (orchestrator contexts/held-runs.ts) — the source of truth for the
     // value. @kici-dev/shared cannot import the orchestrator enum (dependency
     // direction), so the string is embedded here like other status literals in
     // this module.
     const pending = await pool.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM held_runs hr
-         JOIN environments e ON e.id = hr.environment_id
+         JOIN contexts e ON e.id = hr.context_id
         WHERE e.org_id = $1 AND e.name = $2 AND hr.status = 'pending'`,
       [opts.orgId, opts.name],
     );
     const pendingCount = Number(pending.rows[0]?.count ?? 0);
     if (pendingCount > 0) {
       throw new Error(
-        `environment has ${pendingCount} pending held run(s) — approve or reject them first`,
+        `context has ${pendingCount} pending held run(s) — approve or reject them first`,
       );
     }
     const result = await pool.query<{ id: string }>(
-      `DELETE FROM environments WHERE org_id = $1 AND name = $2 RETURNING id`,
+      `DELETE FROM contexts WHERE org_id = $1 AND name = $2 RETURNING id`,
       [opts.orgId, opts.name],
     );
     return { deleted: result.rows.length > 0 };
@@ -684,35 +684,35 @@ export async function deleteEnvironmentDirect(
   }
 }
 
-export interface SeedEnvironmentBindingOpts {
+export interface SeedContextBindingOpts {
   orgId: string;
-  envName: string;
+  contextName: string;
   scopePattern: string;
   /** Host selector; defaults to `'**'` (all hosts). */
   hostPattern?: string;
 }
 
 /**
- * Upsert an `environment_bindings` row connecting `envName` to `scopePattern`
- * (scoped to `hostPattern`, default `'**'`). Throws if the environment does
+ * Upsert an `context_bindings` row connecting `contextName` to `scopePattern`
+ * (scoped to `hostPattern`, default `'**'`). Throws if the context does
  * not exist.
  */
-export async function seedEnvironmentBindingDirect(
+export async function seedContextBindingDirect(
   databaseUrl: string,
-  opts: SeedEnvironmentBindingOpts,
+  opts: SeedContextBindingOpts,
 ): Promise<{ created: boolean }> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     const envRow = await pool.query<{ id: string }>(
-      `SELECT id FROM environments WHERE org_id = $1 AND name = $2`,
-      [opts.orgId, opts.envName],
+      `SELECT id FROM contexts WHERE org_id = $1 AND name = $2`,
+      [opts.orgId, opts.contextName],
     );
     if (envRow.rows.length === 0) {
-      throw new Error(`environment: not found (org=${opts.orgId}, name=${opts.envName})`);
+      throw new Error(`context: not found (org=${opts.orgId}, name=${opts.contextName})`);
     }
     const envId = envRow.rows[0].id;
     const result = await pool.query<{ inserted: boolean }>(
-      `INSERT INTO environment_bindings (org_id, environment_id, scope_pattern, host_pattern)
+      `INSERT INTO context_bindings (org_id, context_id, scope_pattern, host_pattern)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT DO NOTHING
          RETURNING (xmax = 0) AS inserted`,
@@ -724,9 +724,9 @@ export async function seedEnvironmentBindingDirect(
   }
 }
 
-export interface SetEnvironmentPolicyOpts {
+export interface SetContextPolicyOpts {
   orgId: string;
-  envName: string;
+  contextName: string;
   branchRestrictions?: unknown;
   requiredReviewers?: unknown;
   waitTimerSeconds?: number | null;
@@ -738,17 +738,17 @@ export interface SetEnvironmentPolicyOpts {
 
 /**
  * UPDATE only the policy fields that were explicitly provided. Columns that
- * were NOT in `opts` are left untouched. Throws if the environment is missing.
+ * were NOT in `opts` are left untouched. Throws if the context is missing.
  */
-export async function setEnvironmentPolicyDirect(
+export async function setContextPolicyDirect(
   databaseUrl: string,
-  opts: SetEnvironmentPolicyOpts,
+  opts: SetContextPolicyOpts,
 ): Promise<void> {
   if (opts.waitTimerSeconds != null && opts.waitTimerSeconds < 0) {
-    throw new Error(`environment: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
+    throw new Error(`context: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
   }
   if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 0) {
-    throw new Error(`environment: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
+    throw new Error(`context: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
   }
 
   const setClauses: string[] = [];
@@ -757,7 +757,7 @@ export async function setEnvironmentPolicyDirect(
 
   const addSet = (column: string, value: unknown, cast?: string): void => {
     if (!ENV_POLICY_COLUMNS.has(column)) {
-      throw new Error(`environment: unknown policy column ${column}`);
+      throw new Error(`context: unknown policy column ${column}`);
     }
     setClauses.push(`${column} = $${idx}${cast ? `::${cast}` : ''}`);
     params.push(value);
@@ -782,27 +782,27 @@ export async function setEnvironmentPolicyDirect(
     addSet('allow_local_execution', opts.allowLocalExecution);
 
   if (setClauses.length === 0) {
-    throw new Error('environment: setEnvironmentPolicy requires at least one policy field');
+    throw new Error('context: setContextPolicy requires at least one policy field');
   }
 
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
-    params.push(opts.orgId, opts.envName);
+    params.push(opts.orgId, opts.contextName);
     const orgParam = `$${idx}`;
     const nameParam = `$${idx + 1}`;
-    const sql = `UPDATE environments
+    const sql = `UPDATE contexts
                     SET ${setClauses.join(', ')}, updated_at = now()
                     WHERE org_id = ${orgParam} AND name = ${nameParam}`;
     const result = await pool.query(sql, params);
     if ((result.rowCount ?? 0) === 0) {
-      throw new Error(`environment: not found (org=${opts.orgId}, name=${opts.envName})`);
+      throw new Error(`context: not found (org=${opts.orgId}, name=${opts.contextName})`);
     }
   } finally {
     await pool.end();
   }
 }
 
-export interface EnvironmentRow {
+export interface ContextRow {
   id: string;
   org_id: string;
   name: string;
@@ -818,86 +818,86 @@ export interface EnvironmentRow {
 }
 
 /**
- * SELECT * FROM environments WHERE org_id = $1, ordered by name.
+ * SELECT * FROM contexts WHERE org_id = $1, ordered by name.
  */
-export async function listEnvironmentsDirect(
+export async function listContextsDirect(
   databaseUrl: string,
   opts: { orgId: string },
-): Promise<{ environments: EnvironmentRow[] }> {
+): Promise<{ contexts: ContextRow[] }> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
-    const result = await pool.query<EnvironmentRow>(
+    const result = await pool.query<ContextRow>(
       `SELECT id, org_id, name, type, enabled, branch_restrictions, required_reviewers,
               wait_timer_seconds, hold_expiry_seconds, minimum_trust,
               created_at, updated_at
-         FROM environments
+         FROM contexts
         WHERE org_id = $1
         ORDER BY name`,
       [opts.orgId],
     );
-    return { environments: result.rows };
+    return { contexts: result.rows };
   } finally {
     await pool.end();
   }
 }
 
-export interface EnvironmentVariableRow {
+export interface ContextVariableRow {
   key: string;
   value: string;
   locked: boolean;
   updated_at: string;
 }
 
-export interface EnvironmentBindingRow {
+export interface ContextBindingRow {
   scope_pattern: string;
   host_pattern: string;
   created_at: string;
 }
 
-export interface ShowEnvironmentResult {
-  environment: EnvironmentRow;
-  variables: EnvironmentVariableRow[];
-  bindings: EnvironmentBindingRow[];
+export interface ShowContextResult {
+  context: ContextRow;
+  variables: ContextVariableRow[];
+  bindings: ContextBindingRow[];
 }
 
 /**
- * Fetch a single environment row joined with its variables and bindings.
- * Throws if the environment does not exist.
+ * Fetch a single context row joined with its variables and bindings.
+ * Throws if the context does not exist.
  */
-export async function showEnvironmentDirect(
+export async function showContextDirect(
   databaseUrl: string,
   opts: { orgId: string; name: string },
-): Promise<ShowEnvironmentResult> {
+): Promise<ShowContextResult> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
-    const envResult = await pool.query<EnvironmentRow>(
+    const envResult = await pool.query<ContextRow>(
       `SELECT id, org_id, name, type, enabled, branch_restrictions, required_reviewers,
               wait_timer_seconds, hold_expiry_seconds, minimum_trust,
               created_at, updated_at
-         FROM environments
+         FROM contexts
         WHERE org_id = $1 AND name = $2`,
       [opts.orgId, opts.name],
     );
     if (envResult.rows.length === 0) {
-      throw new Error(`environment: not found (org=${opts.orgId}, name=${opts.name})`);
+      throw new Error(`context: not found (org=${opts.orgId}, name=${opts.name})`);
     }
     const env = envResult.rows[0];
-    const variables = await pool.query<EnvironmentVariableRow>(
+    const variables = await pool.query<ContextVariableRow>(
       `SELECT key, value, locked, updated_at
-         FROM environment_variables
-        WHERE environment_id = $1
+         FROM context_variables
+        WHERE context_id = $1
         ORDER BY key`,
       [env.id],
     );
-    const bindings = await pool.query<EnvironmentBindingRow>(
+    const bindings = await pool.query<ContextBindingRow>(
       `SELECT scope_pattern, host_pattern, created_at
-         FROM environment_bindings
-        WHERE environment_id = $1
+         FROM context_bindings
+        WHERE context_id = $1
         ORDER BY scope_pattern, host_pattern`,
       [env.id],
     );
     return {
-      environment: env,
+      context: env,
       variables: variables.rows,
       bindings: bindings.rows,
     };
@@ -906,7 +906,7 @@ export async function showEnvironmentDirect(
   }
 }
 
-export interface CreateEnvironmentTemplateOpts {
+export interface CreateContextTemplateOpts {
   orgId: string;
   templateName: string;
   type?: string;
@@ -919,25 +919,25 @@ export interface CreateEnvironmentTemplateOpts {
 }
 
 /**
- * Create (or update) an environment template + its seed variables in one
- * transaction. Templates are represented as environments with `type='template'`
+ * Create (or update) an context template + its seed variables in one
+ * transaction. Templates are represented as contexts with `type='template'`
  * by convention. Returns `{ envId, variablesSet }`.
  */
-export async function createEnvironmentTemplateDirect(
+export async function createContextTemplateDirect(
   databaseUrl: string,
-  opts: CreateEnvironmentTemplateOpts,
+  opts: CreateContextTemplateOpts,
 ): Promise<{ envId: string; created: boolean; variablesSet: number }> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const envResult = await client.query<{ id: string; inserted: boolean }>(
-      `INSERT INTO environments
+      `INSERT INTO contexts
           (org_id, name, type, enabled, branch_restrictions, required_reviewers,
            wait_timer_seconds, hold_expiry_seconds, minimum_trust)
         VALUES ($1, $2, COALESCE($3, 'template'), true, $4::jsonb, $5::jsonb, $6, COALESCE($7, 86400), $8)
         ON CONFLICT (org_id, name) DO UPDATE SET
-          type = COALESCE(EXCLUDED.type, environments.type),
+          type = COALESCE(EXCLUDED.type, contexts.type),
           branch_restrictions = EXCLUDED.branch_restrictions,
           required_reviewers = EXCLUDED.required_reviewers,
           wait_timer_seconds = EXCLUDED.wait_timer_seconds,
@@ -957,14 +957,14 @@ export async function createEnvironmentTemplateDirect(
       ],
     );
     const row = envResult.rows[0];
-    if (!row) throw new Error(`environment: template upsert returned no row`);
+    if (!row) throw new Error(`context: template upsert returned no row`);
     let variablesSet = 0;
     if (opts.variables) {
       for (const [key, value] of Object.entries(opts.variables)) {
         await client.query(
-          `INSERT INTO environment_variables (org_id, environment_id, key, value, locked)
+          `INSERT INTO context_variables (org_id, context_id, key, value, locked)
              VALUES ($1, $2, $3, $4, false)
-             ON CONFLICT (org_id, environment_id, key) DO UPDATE SET
+             ON CONFLICT (org_id, context_id, key) DO UPDATE SET
                value = EXCLUDED.value,
                updated_at = now()`,
           [opts.orgId, row.id, key, value],
@@ -983,25 +983,25 @@ export async function createEnvironmentTemplateDirect(
   }
 }
 
-export interface SetEnvironmentSecretOpts {
+export interface SetContextSecretOpts {
   orgId: string;
-  environment: string;
+  context: string;
   key: string;
   encryptedValue: string;
 }
 
 /**
- * UPSERT a scoped_secrets row keyed by (org_id, scope=environment, key).
+ * UPSERT a scoped_secrets row keyed by (org_id, scope=context, key).
  * Writes the value verbatim — the caller is responsible for encryption
  * (matches the stage-4 deferral noted in the plan).
  */
-export async function setEnvironmentSecretDirect(
+export async function setContextSecretDirect(
   databaseUrl: string,
-  opts: SetEnvironmentSecretOpts,
+  opts: SetContextSecretOpts,
 ): Promise<{ inserted: boolean }> {
-  if (!opts.orgId) throw new Error('environment: orgId required');
-  if (!opts.environment) throw new Error('environment: environment name required');
-  if (!opts.key) throw new Error('environment: key required');
+  if (!opts.orgId) throw new Error('context: orgId required');
+  if (!opts.context) throw new Error('context: context name required');
+  if (!opts.key) throw new Error('context: key required');
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
     const result = await pool.query<{ inserted: boolean }>(
@@ -1011,7 +1011,7 @@ export async function setEnvironmentSecretDirect(
            encrypted_value = EXCLUDED.encrypted_value,
            updated_at = now()
          RETURNING (xmax = 0) AS inserted`,
-      [opts.orgId, opts.environment, opts.key, opts.encryptedValue],
+      [opts.orgId, opts.context, opts.key, opts.encryptedValue],
     );
     return { inserted: result.rows[0]?.inserted ?? false };
   } finally {
@@ -1163,7 +1163,7 @@ export interface ExecutionRunRow {
   ref: string;
   sha: string;
   routing_key: string | null;
-  environment: string | null;
+  context: string | null;
   trust_tier: string | null;
   created_at: string;
   started_at: string;
@@ -1183,8 +1183,8 @@ export interface ExecutionJobRow {
   duration_ms: number | null;
   created_at: string;
   error_message: string | null;
-  /** Ordered bound deployment-environment names (JSON-encoded `string[]`), or null. */
-  environments: string | null;
+  /** Ordered bound deployment-context names (JSON-encoded `string[]`), or null. */
+  contexts: string | null;
 }
 
 export interface ListExecutionRunsOpts {
@@ -1226,7 +1226,7 @@ export async function listExecutionRunsDirect(
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const result = await pool.query<ExecutionRunRow>(
       `SELECT id, run_id, workflow_name, status, provider, repo_identifier,
-              ref, sha, routing_key, environment, trust_tier, created_at,
+              ref, sha, routing_key, context, trust_tier, created_at,
               started_at, completed_at, duration_ms
          FROM execution_runs
          ${where}
@@ -1252,7 +1252,7 @@ export async function showExecutionRunDirect(
   try {
     const runResult = await pool.query<ExecutionRunRow>(
       `SELECT id, run_id, workflow_name, status, provider, repo_identifier,
-              ref, sha, routing_key, environment, trust_tier, created_at,
+              ref, sha, routing_key, context, trust_tier, created_at,
               started_at, completed_at, duration_ms
          FROM execution_runs
         WHERE run_id = $1`,
@@ -1264,7 +1264,7 @@ export async function showExecutionRunDirect(
     const run = runResult.rows[0];
     const jobsResult = await pool.query<ExecutionJobRow>(
       `SELECT id, run_id, job_id, job_name, status, agent_id,
-              started_at, completed_at, duration_ms, created_at, error_message, environments
+              started_at, completed_at, duration_ms, created_at, error_message, contexts
          FROM execution_jobs
         WHERE run_id = $1
         ORDER BY created_at ASC`,
@@ -1292,7 +1292,7 @@ export async function listExecutionJobsDirect(
     const result = await pool.query<ExecutionJobRow>(
       `SELECT j.id, j.run_id, j.job_id, j.job_name, j.status, j.agent_id,
               j.started_at, j.completed_at, j.duration_ms, j.created_at, j.error_message,
-              j.environments
+              j.contexts
          FROM execution_jobs j
          INNER JOIN execution_runs r ON r.run_id = j.run_id
         WHERE r.run_id::text = $1 OR r.id::text = $1
@@ -2529,7 +2529,7 @@ export async function seedUniversalGitSourceDirect(
 
 /**
  * Seed the ci-security orchestrator fixtures expected by the security
- * pipeline e2e: sources row for dashboard orgId resolution, environment,
+ * pipeline e2e: sources row for dashboard orgId resolution, context,
  * two execution_runs (unknown + trusted), two execution_jobs, and a
  * security held_run for the unknown contributor.
  *
@@ -2537,7 +2537,7 @@ export async function seedUniversalGitSourceDirect(
  */
 export interface SeedCiSecurityFixturesOpts {
   orgId: string;
-  envName?: string;
+  contextName?: string;
   sourceName?: string;
   sourceRoutingKey?: string;
   runsRoutingKey: string;
@@ -2558,7 +2558,7 @@ export async function seedCiSecurityFixturesDirect(
   databaseUrl: string,
   opts: SeedCiSecurityFixturesOpts,
 ): Promise<SeedCiSecurityFixturesResult> {
-  const envName = opts.envName ?? 'ci-security-env';
+  const contextName = opts.contextName ?? 'ci-security-env';
   const sourceName = opts.sourceName ?? 'ci-security-dashboard-resolver';
   const sourceRoutingKey = opts.sourceRoutingKey ?? `generic:${opts.orgId}:ci-security-dashboard`;
   const pool = createPool(databaseUrl);
@@ -2570,11 +2570,11 @@ export async function seedCiSecurityFixturesDirect(
       [sourceName, sourceRoutingKey, opts.orgId],
     );
     const envResult = await pool.query<{ id: string }>(
-      `INSERT INTO environments (org_id, name, type, enabled)
+      `INSERT INTO contexts (org_id, name, type, enabled)
        VALUES ($1, $2, \'fixed\', true)
        ON CONFLICT (org_id, name) DO UPDATE SET enabled = true
        RETURNING id`,
-      [opts.orgId, envName],
+      [opts.orgId, contextName],
     );
     const envId = envResult.rows[0].id;
     await pool.query(
@@ -2592,7 +2592,7 @@ export async function seedCiSecurityFixturesDirect(
       [opts.unknownJobId, opts.unknownRunId],
     );
     const heldResult = await pool.query<{ id: string }>(
-      `INSERT INTO held_runs (org_id, run_id, job_id, environment_id, hold_type, queue_type, reason, expires_at)
+      `INSERT INTO held_runs (org_id, run_id, job_id, context_id, hold_type, queue_type, reason, expires_at)
        VALUES ($1, $2, $3, $4, \'unknown_contributor\', \'security\',
         \'Unknown contributor requires approval\', NOW() + INTERVAL \'72 hours\')
        RETURNING id`,

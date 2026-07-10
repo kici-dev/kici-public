@@ -217,7 +217,7 @@ The merged map is written to MMDS as a nested object under `meta-data/kici-env/<
 
 ### Agent-tier precedence (sandbox)
 
-The agent's `buildSanitizedEnv()` constructs the sandbox environment using the 7-layer merge documented in [Environments architecture](../environments.md). The simplified view:
+The agent's `buildSanitizedEnv()` constructs the sandbox environment using the 7-layer merge documented in [Contexts architecture](../contexts.md). The simplified view:
 
 1. **System allowlist** (from agent `process.env`) -- lowest precedence
 2. **User env** (from workflow config / orchestrator-provided) -- overrides system

@@ -3,8 +3,11 @@ import { mkdtemp, rm, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Hono } from 'hono';
-import { registerBlobRoutes } from './blob-routes.js';
+import { bodyLimit } from 'hono/body-limit';
+import { registerBlobRoutes, CACHE_BLOB_PATH_PREFIX } from './blob-routes.js';
 import { generateSigningSecret, signToken } from './sign-url.js';
+
+const TEST_MAX_UPLOAD = 10 * 1024 * 1024;
 
 describe('registerBlobRoutes', () => {
   let dir: string;
@@ -15,7 +18,11 @@ describe('registerBlobRoutes', () => {
     dir = await mkdtemp(join(tmpdir(), 'blob-routes-test-'));
     secret = generateSigningSecret();
     app = new Hono();
-    registerBlobRoutes(app, { basePath: dir, signingSecret: secret });
+    registerBlobRoutes(app, {
+      basePath: dir,
+      signingSecret: secret,
+      maxUploadBytes: TEST_MAX_UPLOAD,
+    });
   });
 
   afterEach(async () => {
@@ -129,5 +136,72 @@ describe('registerBlobRoutes', () => {
     expect(getRes.status).toBe(200);
     const got = Buffer.from(await getRes.arrayBuffer());
     expect(got.equals(payload)).toBe(true);
+  });
+
+  it('PUT 413s when the body exceeds maxUploadBytes', async () => {
+    const smallApp = new Hono();
+    registerBlobRoutes(smallApp, { basePath: dir, signingSecret: secret, maxUploadBytes: 1024 });
+    const { token } = signToken(secret, 'PUT', 'dep/big');
+    const url = `http://localhost/api/v1/cache/blob/dep/big?sig=${encodeURIComponent(token)}`;
+    const res = await smallApp.fetch(
+      new Request(url, { method: 'PUT', body: Buffer.alloc(4096, 1) }),
+    );
+    expect(res.status).toBe(413);
+  });
+
+  it('PUT accepts a body at the maxUploadBytes boundary', async () => {
+    const smallApp = new Hono();
+    registerBlobRoutes(smallApp, { basePath: dir, signingSecret: secret, maxUploadBytes: 4096 });
+    const { token } = signToken(secret, 'PUT', 'dep/edge');
+    const url = `http://localhost/api/v1/cache/blob/dep/edge?sig=${encodeURIComponent(token)}`;
+    const res = await smallApp.fetch(
+      new Request(url, { method: 'PUT', body: Buffer.alloc(4096, 1) }),
+    );
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('cache-blob exemption from the tenant webhook body limit', () => {
+  let dir: string;
+  let secret: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'blob-exempt-test-'));
+    secret = generateSigningSecret();
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  // Mirrors the app.ts wiring: a tiny global webhook cap that skips the
+  // cache-blob prefix, plus a generous per-blob-route bound. A blob larger
+  // than the webhook cap must still be accepted; a same-size POST to a
+  // non-exempt route must be rejected.
+  function buildApp(): Hono {
+    const app = new Hono();
+    const webhookBodyLimit = bodyLimit({ maxSize: 100 });
+    app.use('*', (c, next) =>
+      c.req.path.startsWith(CACHE_BLOB_PATH_PREFIX) ? next() : webhookBodyLimit(c, next),
+    );
+    app.post('/webhook/test', (c) => c.json({ ok: true }));
+    registerBlobRoutes(app, { basePath: dir, signingSecret: secret, maxUploadBytes: 10 * 1024 });
+    return app;
+  }
+
+  it('accepts a blob PUT larger than the webhook body cap', async () => {
+    const app = buildApp();
+    const { token } = signToken(secret, 'PUT', 'dep/large');
+    const url = `http://localhost/api/v1/cache/blob/dep/large?sig=${encodeURIComponent(token)}`;
+    const res = await app.fetch(new Request(url, { method: 'PUT', body: Buffer.alloc(5120, 1) }));
+    expect(res.status).toBe(200);
+  });
+
+  it('still enforces the webhook body cap on non-exempt routes', async () => {
+    const app = buildApp();
+    const res = await app.fetch(
+      new Request('http://localhost/webhook/test', { method: 'POST', body: Buffer.alloc(5120, 1) }),
+    );
+    expect(res.status).toBe(413);
   });
 });

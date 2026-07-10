@@ -74,7 +74,33 @@ function parseStateCode(output: string): number | undefined {
 }
 
 export class WindowsServiceManager implements ServiceManager {
+  /**
+   * Check whether a Windows service is currently registered.
+   * `sc.exe query` exits non-zero (execSync throws) when the service does
+   * not exist; exit 0 means it exists (possibly pending-delete).
+   */
+  private serviceExists(name: string): boolean {
+    try {
+      execSync(`sc.exe query ${name}`, { stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async install(config: ServiceConfig): Promise<void> {
+    // Idempotency: if the service is already registered (or pending-delete
+    // from a prior deploy whose stop/delete didn't cleanly finish), remove it
+    // first — reusing uninstall()'s stop → delete → poll-until-gone — so
+    // `shawl add` never hits `sc create` 1073 (ERROR_SERVICE_EXISTS). The
+    // existence guard is required: uninstall() runs `sc.exe delete`, which
+    // throws on a non-existent service, so a fresh box must skip it. Do NOT
+    // wrap uninstall() in try/catch — its clear 30s hung-process error must
+    // propagate instead of surfacing later as a cryptic 1073.
+    if (this.serviceExists(config.name)) {
+      await this.uninstall(config);
+    }
+
     // Download shawl via lazy deps
     const depMeta = getDepMetadata('shawl');
     const cacheDir = getCacheDir();

@@ -84,7 +84,7 @@ A no-scaler orchestrator (agents managed externally and assumed co-located, or n
 
 `kici run remote` uploads the working-tree overlay **directly** from the developer machine to the object store via a pre-signed PUT URL minted with `KICI_STORAGE_UPLOAD_ENDPOINT` (falling back to `KICI_STORAGE_ENDPOINT`). The run is initiated and its logs are retrieved through the Platform relay over a WebSocket connection — the developer machine never talks to the orchestrator's HTTP API directly. This means an orchestrator can sit entirely behind a private network: only the **object store** needs to be reachable from the developer machine for remote runs to work; the orchestrator's HTTP API does not. Point `KICI_STORAGE_UPLOAD_ENDPOINT` at a dev-reachable bucket address whenever the developer machine reaches the object store at a different address than the orchestrator does.
 
-`kici run remote` is offered **by the Platform** — an orchestrator with no Platform connection cannot serve remote runs (there is no air-gapped, orchestrator-direct remote-run path). Executing workflow steps on the developer machine with no orchestrator at all is `kici run local`.
+`kici run remote` is offered **by the Platform** — an orchestrator with no Platform connection cannot serve remote runs (there is no air-gapped, orchestrator-direct remote-run path). Executing workflow steps on the developer machine with no orchestrator at all is `kici run <event> --local`.
 
 ### Filesystem backend specifics
 

@@ -67,7 +67,7 @@ const { DashboardHandler } = await import('./dashboard/handler.js');
 const { payloadFromObject } = await import('./webhook/event-log.js');
 const { loadActiveGenericRoutingKeys } = await import('./webhook/generic-sources.js');
 const { buildPlatformProviderSources } = await import('./sources/build-platform-sources.js');
-const { DashboardEnvHandler } = await import('./ws/dashboard-env-handler.js');
+const { DashboardContextHandler } = await import('./ws/dashboard-context-handler.js');
 const { DashboardRegistrationsHandler } = await import('./ws/dashboard-registrations-handler.js');
 const { DashboardBackendsHandler } = await import('./ws/dashboard-backends-handler.js');
 const { DashboardFleetWriteHandler } = await import('./ws/dashboard-fleet-write-handler.js');
@@ -83,16 +83,16 @@ const {
   handleFleetWorkflowsForHostRequest,
 } = await import('./ws/dashboard-fleet-handler.js');
 const { resolveWorkflowRunsOnAll } = await import('./ws/fleet-runs-on-all.js');
-const { EnvironmentStore } = await import('./environments/environment-store.js');
-const { VariableStore } = await import('./environments/variable-store.js');
-const { BindingStore } = await import('./environments/binding-store.js');
+const { ContextStore } = await import('./contexts/context-store.js');
+const { VariableStore } = await import('./contexts/variable-store.js');
+const { BindingStore } = await import('./contexts/binding-store.js');
 const { handleRerun } = await import('./pipeline/rerun.js');
 const { handleManualSchedule } = await import('./pipeline/manual-schedule.js');
-const { SecretResolver } = await import('./secrets/index.js');
+const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
 const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { TrustResolver } = await import('./security/trust-resolver.js');
 const { ContributorCache } = await import('./security/contributor-cache.js');
-const { HeldRunStore } = await import('./environments/held-runs.js');
+const { HeldRunStore } = await import('./contexts/held-runs.js');
 const { StepApprovalBridge } = await import('./approvals/step-approval-bridge.js');
 const { GlobalWorkflowPolicy } = await import('./security/global-workflow-policy.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
@@ -117,7 +117,7 @@ import type { ProcessingDeps } from './pipeline/processor.js';
 import { provisionRemoteSource } from './pipeline/remote-source-store.js';
 import { readDeploymentIdentity } from './deployment/deployment-identity.js';
 import { dispatchTestRelay } from './ws/test-relay-handlers.js';
-import type { ReleaseSignal } from './environments/held-runs.js';
+import type { ReleaseSignal } from './contexts/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import type { PeerClient as PeerClientT } from './cluster/peer-client.js';
 import { verifyInboundWebhook } from './webhook/verify-inbound.js';
@@ -363,97 +363,8 @@ await guardStartup(logger, async () => {
       },
     }),
 
-    onSecretsInitialized: ({ pgSecretStore, backendStores, db, auditLogger }) => {
-      const envStore = new EnvironmentStore(db);
-
-      // Build SecretStoreLike adapters for each backend store
-      const resolverBackendStores = new Map<
-        string,
-        import('./secrets/secret-resolver.js').SecretStoreLike
-      >();
-
-      for (const [backendName, store] of backendStores) {
-        if (backendName === 'pg') {
-          // PG backend needs special handling for getAllSecrets return type and decrypt
-          resolverBackendStores.set('pg', {
-            getAllSecrets: async (orgId: string) => {
-              const raw = await pgSecretStore.getAllSecrets(orgId);
-              return raw.map((r) => ({
-                id: '',
-                orgId,
-                scope: r.scope,
-                key: r.key,
-                encryptedValue: r.encryptedValue,
-                backendType: 'pg' as const,
-                keyVersion: r.keyVersion,
-                createdAt: '',
-                updatedAt: '',
-              }));
-            },
-            decrypt: (secret) => {
-              return pgSecretStore.decryptValue(
-                secret.orgId,
-                secret.scope,
-                secret.key,
-                secret.encryptedValue,
-                secret.keyVersion,
-              );
-            },
-            getSecrets: (orgId, scope) => pgSecretStore.getSecrets(orgId, scope),
-          });
-        } else {
-          // External backends (Vault): values come back plaintext, decrypt is identity
-          resolverBackendStores.set(backendName, {
-            getAllSecrets: async (orgId: string) => {
-              const raw = await store.getAllSecrets(orgId);
-              return raw.map((r) => ({
-                id: '',
-                orgId,
-                scope: r.scope,
-                key: r.key,
-                encryptedValue: r.encryptedValue, // actually plaintext for Vault
-                backendType: 'vault' as const,
-                keyVersion: 1,
-                createdAt: '',
-                updatedAt: '',
-              }));
-            },
-            decrypt: (secret) => secret.encryptedValue, // Vault values are plaintext
-            getSecrets: (orgId, scope) => store.getSecrets(orgId, scope),
-          });
-        }
-      }
-
-      return new SecretResolver({
-        environmentStore: {
-          getByName: async (orgId, name) => {
-            const row = await envStore.getByName(orgId, name);
-            if (!row) return null;
-            return { id: row.id, name: row.name, orgId: row.org_id };
-          },
-        },
-        bindingStore: {
-          getByEnvironmentId: async (environmentId: string) => {
-            const rows = await db
-              .selectFrom('environment_bindings')
-              .selectAll()
-              .where('environment_id', '=', environmentId)
-              .execute();
-            return rows.map((r) => ({
-              id: r.id,
-              orgId: r.org_id,
-              environmentId: r.environment_id,
-              scopePattern: r.scope_pattern,
-              hostPattern: r.host_pattern,
-              createdAt: r.created_at.toISOString(),
-            }));
-          },
-        },
-        backendStores: resolverBackendStores,
-        auditLogger,
-        logger,
-      });
-    },
+    onSecretsInitialized: ({ pgSecretStore, backendStores, db, auditLogger }) =>
+      buildContextSecretResolver({ pgSecretStore, backendStores, db, auditLogger, logger }),
 
     onSubsystemsReady: async (sub) => {
       // Trust resolution state (updated by Platform push)
@@ -551,7 +462,9 @@ await guardStartup(logger, async () => {
         send: (msg) => dashboardSendFn?.(msg),
         orchestratorId: config.instanceId,
         accessLog: sub.accessLogWriter,
-        onRerun: async (runId, triggeredBy, triggeredByAgentLabel, routingKey) => {
+        testMode: config.testMode,
+        testRerunDelayMs: config.testRerunDelayMs,
+        onRerun: async (runId, triggeredBy, triggeredByAgentLabel, requestId, routingKey) => {
           return handleRerun(
             runId,
             triggeredBy,
@@ -575,30 +488,37 @@ await guardStartup(logger, async () => {
               pendingBuilds: sub.pendingBuilds ?? null,
               coldStore: sub.coldStore,
             },
+            requestId,
             routingKey,
           );
         },
-        onManualSchedule: async (registrationId, triggeredBy, triggeredByAgentLabel) => {
-          return handleManualSchedule(registrationId, triggeredBy, triggeredByAgentLabel, {
-            db: sub.db,
-            logStorage: sub.logStorage,
-            providerRegistry: sub.providerRegistry,
-            executionTracker: sub.executionTracker,
-            dispatcher: sub.dispatcher,
-            jobQueue: sub.queue,
-            platformClient,
-            checkRunReporter: sub.checkRunReporter,
-            coordinator: sub.coordinator,
-            secretResolver: sub.secretResolver,
-            eventRouter: sub.eventRouter,
-            agentRegistry: sub.agentRegistry,
-            sourceCache: sub.sourceCache ?? null,
-            depCache: sub.depCache ?? null,
-            buildCoordinator: sub.buildCoordinator ?? null,
-            pendingBuilds: sub.pendingBuilds ?? null,
-            registrationIndex: sub.registrationIndex,
-            coldStore: sub.coldStore,
-          });
+        onManualSchedule: async (registrationId, triggeredBy, triggeredByAgentLabel, requestId) => {
+          return handleManualSchedule(
+            registrationId,
+            triggeredBy,
+            triggeredByAgentLabel,
+            {
+              db: sub.db,
+              logStorage: sub.logStorage,
+              providerRegistry: sub.providerRegistry,
+              executionTracker: sub.executionTracker,
+              dispatcher: sub.dispatcher,
+              jobQueue: sub.queue,
+              platformClient,
+              checkRunReporter: sub.checkRunReporter,
+              coordinator: sub.coordinator,
+              secretResolver: sub.secretResolver,
+              eventRouter: sub.eventRouter,
+              agentRegistry: sub.agentRegistry,
+              sourceCache: sub.sourceCache ?? null,
+              depCache: sub.depCache ?? null,
+              buildCoordinator: sub.buildCoordinator ?? null,
+              pendingBuilds: sub.pendingBuilds ?? null,
+              registrationIndex: sub.registrationIndex,
+              coldStore: sub.coldStore,
+            },
+            requestId,
+          );
         },
         onCancel: async (runId, cancelledBy, cancelledByAgentLabel, force) => {
           const jobIds = await sub.queue.getDispatchedJobIdsByRunId(runId);
@@ -654,8 +574,8 @@ await guardStartup(logger, async () => {
       // Create global workflow policy for org-level permission enforcement
       const globalWorkflowPolicy = new GlobalWorkflowPolicy(sub.db);
 
-      // Create environment stores and DashboardEnvHandler
-      const environmentStore = new EnvironmentStore(sub.db);
+      // Create environment stores and DashboardContextHandler
+      const contextStore = new ContextStore(sub.db);
       const variableStore = new VariableStore(sub.db);
       const bindingStore = new BindingStore(sub.db);
 
@@ -691,7 +611,7 @@ await guardStartup(logger, async () => {
         orgMemberPermissions,
         teamMembershipLookup,
         heldRunStore,
-        environmentStore,
+        contextStore,
         variableStore,
         globalWorkflowPolicy,
         eventLog: eventLogWriter,
@@ -703,10 +623,10 @@ await guardStartup(logger, async () => {
         maxFanoutHosts: config.maxFanoutHosts,
       });
       let dashboardEnvSendFn: ((msg: unknown) => void) | null = null;
-      const dashboardEnvHandler = new DashboardEnvHandler({
+      const dashboardEnvHandler = new DashboardContextHandler({
         orgId: '__default__',
         send: (msg) => dashboardEnvSendFn?.(msg),
-        environmentStore,
+        contextStore,
         variableStore,
         bindingStore,
         secretStore: sub.pgSecretStore ?? {
@@ -1587,7 +1507,7 @@ await guardStartup(logger, async () => {
       // Bind DashboardHandler send to platformClient.sendRaw
       dashboardSendFn = (msg) => platformClient.sendRaw(msg);
 
-      // Bind DashboardEnvHandler send to platformClient.sendRaw
+      // Bind DashboardContextHandler send to platformClient.sendRaw
       dashboardEnvSendFn = (msg) => platformClient.sendRaw(msg);
 
       // Bind DashboardRegistrationsHandler send to platformClient.sendRaw
@@ -1646,6 +1566,22 @@ await guardStartup(logger, async () => {
         isLeader: () => sub.raft.isLeader(),
         provenanceStorageKey,
         requestMint: async (a) => {
+          // Test-only fault injection: force a TERMINAL rejection for the reject
+          // marker audience so an E2E can exercise the markRejected → gauge-
+          // exclusion → `--include-rejected` re-arm cycle with a REAL deferred
+          // row. Double-gated (testMode AND the marker audience) so production —
+          // which leaves both unset — never reaches it. Permanent for that
+          // audience: `--include-rejected` re-arms then re-rejects.
+          if (
+            config.testMode &&
+            config.testMintRejectAudience &&
+            a.audience === config.testMintRejectAudience
+          ) {
+            return {
+              rejected: true,
+              reason: 'test-only mint-reject fault-injection (KICI_TEST_MINT_REJECT_AUDIENCE)',
+            };
+          }
           try {
             return await requestMint({
               platformClient,
@@ -1868,7 +1804,7 @@ await guardStartup(logger, async () => {
             attestationRetrier
               ? attestationRetrier.runOnce(opts)
               : Promise.resolve({ minted: 0, stillPending: 0, rejected: 0 }),
-          environmentStore,
+          contextStore,
           variableStore,
           heldRunStore,
           stepApprovalBridge,

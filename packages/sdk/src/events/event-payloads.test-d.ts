@@ -49,11 +49,9 @@ describe('EventPayload narrowing', () => {
   });
 
   it('job dynamic functions accept EventPayload-param functions', () => {
-    // The dynamic environment / env / concurrencyGroup fields accept a function
+    // The dynamic context / env / concurrencyGroup fields accept a function
     // whose sole parameter is the EventPayload envelope.
-    expectTypeOf<(event: EventPayload) => string>().toMatchTypeOf<
-      NonNullable<Job['environment']>
-    >();
+    expectTypeOf<(event: EventPayload) => string>().toMatchTypeOf<NonNullable<Job['context']>>();
     expectTypeOf<(event: EventPayload) => Record<string, string>>().toMatchTypeOf<
       NonNullable<Job['env']>
     >();

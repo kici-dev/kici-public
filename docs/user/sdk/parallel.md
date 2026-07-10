@@ -74,7 +74,7 @@ inside a fan-out job nests its concurrency inside each fan-out child.
 ## Local vs remote execution
 
 Run remotely (the orchestrator + agent), parallel children execute concurrently
-and each surfaces as its own dashboard step. `kici run local` executes the same
+and each surfaces as its own dashboard step. `kici run <event> --local` executes the same
 children in array order in its single-process model — the results are identical,
 only the wall-clock and the live fail-fast cancellation differ. Use a remote run
 to observe the concurrent timeline.

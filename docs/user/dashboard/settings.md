@@ -29,6 +29,9 @@ Tab selection syncs with the URL path (`/settings/members`, `/settings/api-keys`
 ## General
 
 
+### Session max age
+
+
 ## Members
 
 
@@ -84,6 +87,7 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 
 
+
 ## CI trust
 
 
@@ -100,10 +104,7 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 ## Notifications
 
-
-
-
-
+Organization-wide notification channels, Slack connections, subscriptions, and the delivery log now live on the dedicated [Notifications](./notifications.md) page (in the org sidebar), on its **Organization** tab.
 
 ## Event log
 

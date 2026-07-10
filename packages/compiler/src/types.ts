@@ -517,11 +517,11 @@ export interface LockJob {
   /** Docker image for job execution. All steps run inside the container. */
   readonly container?: string | { image: string; env?: Record<string, string> };
   /**
-   * Deployment environments in merge order. Each entry is a static name or inline
+   * Bound contexts in merge order. Each entry is a static name or inline
    * expression (pure function); `dynamic` is set when it is a function resolved at
    * two-phase eval. Later entries override earlier ones on name collisions.
    */
-  readonly environments?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
+  readonly contexts?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
   /** Static environment variables or inline expression (pure function). */
   readonly env?: Record<string, string> | LockInlineValue;
   /** When true, env is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
@@ -593,12 +593,12 @@ export type LockJobOrFactory = LockJob | LockDynamicJobFn;
 /**
  * Private npm registry declaration in the lock file.
  * Carries URL/scope/secret-reference but NOT the resolved token — the orchestrator
- * resolves the token at dispatch via the per-environment secretResolver path.
+ * resolves the token at dispatch via the per-context secretResolver path.
  */
 export interface LockRegistry {
   readonly url: string;
   readonly scope?: string;
-  /** Qualified secret reference: `<environment>:<secret-name>`. */
+  /** Qualified secret reference: `<context>:<secret-name>`. */
   readonly tokenSecret: string;
   readonly alwaysAuth?: boolean;
 }
@@ -631,7 +631,7 @@ export interface LockWorkflow {
    */
   readonly registries?: readonly LockRegistry[];
   /**
-   * Extra qualified secret refs (`<environment>:<secret-name>`) to project as env vars
+   * Extra qualified secret refs (`<context>:<secret-name>`) to project as env vars
    * on the install subprocess for use with a customer-committed `.kici/.npmrc`.
    */
   readonly installEnv?: readonly string[];

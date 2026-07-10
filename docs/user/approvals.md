@@ -52,7 +52,7 @@ job('deploy', {
 });
 ```
 
-`approval: true` holds the element until **any** org member who can act on approvals signs off — anyone with the `environments:write` or `ci_trust:write` permission. Use it when you want a manual gate without restricting who may release it.
+`approval: true` holds the element until **any** org member who can act on approvals signs off — anyone with the `contexts:write` or `ci_trust:write` permission. Use it when you want a manual gate without restricting who may release it.
 
 ### Approver list (AND)
 
@@ -173,7 +173,7 @@ A `when: 'drift'` gate on a step without a `check` facet, or at job/workflow sco
 
 ## Mandatory vs. explicit gates
 
-`approval` is the **explicit** gate — a deliberate "pause for a human here" written by the workflow author. It composes with the **mandatory** gate an operator can attach to a protected environment via required reviewers (see [Environments](environments.md#required-reviewers)). When both apply to the same job, all clauses from both sources must be satisfied before the job is released. The two funnel into one held-element mechanism, so the dashboard queue and `kici approve` work the same way regardless of which source held the element.
+`approval` is the **explicit** gate — a deliberate "pause for a human here" written by the workflow author. It composes with the **mandatory** gate an operator can attach to a protected context via required reviewers (see [Contexts](contexts.md#required-reviewers)). When both apply to the same job, all clauses from both sources must be satisfied before the job is released. The two funnel into one held-element mechanism, so the dashboard queue and `kici approve` work the same way regardless of which source held the element.
 
 ## Approving from the CLI
 
@@ -207,11 +207,13 @@ kici run remote deploy-prod --approve-all
 
 `--approve-all` is **run-scoped** — it only auto-approves holds belonging to the run this invocation dispatched; there is no fleet-wide or account-wide auto-approve. Eligibility is still enforced per hold: if you are not eligible for a gate, that gate still blocks. Each auto-approved gate prints its payload before resolving and is recorded distinctly in the audit trail (`held_run.auto_approve`).
 
-You can also approve from the dashboard approval queue. See [Dashboard](dashboard/environments-and-secrets.md#approval-queue).
+`--approve-all` is honored in non-interactive runs too: with `--json` or `--quiet` (no TTY), the flag still auto-approves each eligible gate as it appears instead of hanging or printing out-of-band instructions. Hold notices are routed to stderr so `--json` stdout stays pure machine-readable output.
+
+You can also approve from the dashboard approval queue. See [Dashboard](dashboard/contexts-and-secrets.md#approval-queue).
 
 ## See also
 
 - [Idempotent steps](idempotent-steps.md) — the check/apply step facet that drift gates build on.
-- [Environments](environments.md) — operator-required reviewers on protected environments.
+- [Contexts](contexts.md) — operator-required reviewers on protected contexts.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the approval queue, expiry, and self-approval.
 - [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.

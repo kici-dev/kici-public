@@ -75,10 +75,21 @@ describe('RbacEnforcer', () => {
         'secret.delete',
         'token.manage',
         'key.rotate',
+        'attestation.retry',
       ];
       for (const perm of deniedPerms) {
         expect(enforcer.hasPermission('auditor', perm)).toBe(false);
       }
+    });
+  });
+
+  describe('attestation.retry permission', () => {
+    it('owner and admin hold attestation.retry', () => {
+      expect(enforcer.hasPermission('owner', 'attestation.retry')).toBe(true);
+      expect(enforcer.hasPermission('admin', 'attestation.retry')).toBe(true);
+    });
+    it('auditor does NOT hold attestation.retry', () => {
+      expect(enforcer.hasPermission('auditor', 'attestation.retry')).toBe(false);
     });
   });
 

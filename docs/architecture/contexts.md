@@ -1,0 +1,322 @@
+---
+title: Contexts architecture
+description: Data model, protection pipeline, scope resolution, and state machine for deployment contexts
+---
+
+This document describes the internal architecture of KiCI's deployment context system, including the data model, protection rule pipeline, scope resolution algorithm, and state machine extensions.
+
+## Data model
+
+### Core tables (orchestrator DB)
+
+```
+contexts
+  id             UUID PK
+  org_id         TEXT NOT NULL
+  name           TEXT NOT NULL
+  type           TEXT NOT NULL ('fixed' | 'glob')
+  glob_pattern   TEXT
+  enabled        BOOLEAN DEFAULT true
+  branch_restrictions    JSONB DEFAULT '[]'
+  trigger_type_filters   JSONB DEFAULT '[]'
+  repo_patterns          JSONB DEFAULT '[]'
+  concurrency_limit      INTEGER
+  concurrency_strategy   TEXT DEFAULT 'queue'
+  concurrency_timeout_ms INTEGER DEFAULT 1800000
+  required_reviewers     JSONB
+  wait_timer_seconds     INTEGER
+  hold_expiry_seconds    INTEGER DEFAULT 86400
+  allow_local_execution  BOOLEAN DEFAULT false
+  created_by     TEXT
+  created_at     TIMESTAMPTZ
+  updated_at     TIMESTAMPTZ
+  UNIQUE(org_id, name)
+
+context_variables
+  id              UUID PK
+  org_id          TEXT NOT NULL
+  context_id  UUID FK -> contexts
+  key             TEXT NOT NULL
+  value           TEXT NOT NULL
+  locked          BOOLEAN DEFAULT false
+  UNIQUE(context_id, key)
+
+context_source_overrides
+  id              UUID PK
+  org_id          TEXT NOT NULL
+  context_id  UUID FK -> contexts
+  routing_key     TEXT NOT NULL
+  key             TEXT NOT NULL
+  value           TEXT NOT NULL
+  UNIQUE(context_id, routing_key, key)
+
+held_runs
+  id              UUID PK
+  org_id          TEXT NOT NULL
+  run_id          TEXT NOT NULL
+  job_id          TEXT NOT NULL
+  context_id  UUID FK -> contexts
+  hold_type       TEXT NOT NULL
+  reason          TEXT NOT NULL
+  status          TEXT DEFAULT 'pending'
+  approved_by     TEXT
+  resolved_at     TIMESTAMPTZ
+  expires_at      TIMESTAMPTZ NOT NULL
+  created_at      TIMESTAMPTZ
+```
+
+### Scoped secrets (orchestrator DB)
+
+Secrets use a scope-based organization model:
+
+```
+scoped_secrets
+  id       UUID PK
+  org_id   TEXT NOT NULL
+  scope    TEXT NOT NULL       -- e.g., 'aws/prod', 'databases/postgres'
+  key      TEXT NOT NULL       -- e.g., 'DB_PASSWORD'
+  ...encryption fields...
+  UNIQUE(org_id, scope, key)
+
+context_bindings
+  id              UUID PK
+  org_id          TEXT NOT NULL
+  context_id  UUID FK -> contexts
+  scope_pattern   TEXT NOT NULL  -- glob pattern, e.g., 'aws/prod/**'
+```
+
+## Dispatch flow
+
+The context evaluation is integrated into the orchestrator's webhook processing pipeline:
+
+```
+Webhook arrives
+  |
+  v
+1. Dedup check
+2. Provider normalize
+3. Lock file fetch
+4. Changed files check
+5. Trigger matching (workflows)
+6. Secret resolution (workflow-level, legacy)
+7. Per-job context evaluation:
+   |
+   v
+   7a. Resolve context name (static from lock file, or via init phase for dynamic)
+   7b. Look up context in DB (ContextStore.matchContext)
+       - Fixed: exact name match
+       - Glob: picomatch pattern match
+   7c. Evaluate protection rules (sequential pipeline)
+       - Branch gate -> Trust gate -> Concurrency gate -> Reviewer gate -> Timer gate
+   7d. On reject: mark job as rejected, set error_message
+   7e. On hold/wait/queue: create held_run, skip dispatch
+   7f. On pass: resolve environment variables (VariableStore)
+   7g. Resolve per-context secrets (SecretResolver)
+8. Build job config with context data
+9. Dispatch to agent (or queue)
+```
+
+### Registration-time satisfiability
+
+Before the dispatch flow ever runs, a manual workflow registration is checked for provably-unsatisfiable multi-context bindings. For each job that binds two or more static context names, the orchestrator resolves each name and intersects the statically-decidable gates — context existence, the enabled flag, and the fixed (non-glob) branch / trigger-type / repository restriction sets. When an intersection is provably empty (a missing or disabled context, or two contexts restricted to disjoint fixed branch sets), the registration is rejected with a precise message naming the job, the contexts, and the rule. Bindings whose restrictions use globs are undecidable here and are left to the dispatch-time all-must-pass gate. This is a proactive check layered on top of the dispatch-time catch-all, not a replacement for it.
+
+### Per-job bound-context persistence
+
+Each job's ordered bound-context name list is persisted on its `execution_jobs.contexts` column (a JSON-encoded `string[]`). It is written at dispatch with the statically-resolved names — an impure dynamic element it cannot resolve yet is stored as a `(dynamic)` placeholder — and overwritten with the agent-resolved names when a deferred-init evaluation resolves dynamic elements. The dashboard reads this column to render the bound-context chips on the run detail and run list views.
+
+### Dynamic field resolution
+
+When a lock file job has dynamic fields (`dynamicContext`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. There are two resolution paths:
+
+#### Inline evaluation (schema v11+, `LockInlineValue`)
+
+When a dynamic field's value is a `LockInlineValue` (a pure function serialized as an inline expression), the orchestrator evaluates it directly without dispatching a separate init job. The processor checks `isLockInlineValue()` on `context`, `env`, and `concurrencyGroup` fields and evaluates the inline expression at the orchestrator. This is the preferred path for simple pure functions.
+
+#### Two-phase init model (complex dynamic functions)
+
+When a dynamic field is `true` but its value is not a `LockInlineValue`, the orchestrator uses a two-phase init model:
+
+**Phase 1 -- Init:**
+
+1. Orchestrator dispatches a lightweight `__init__<workflow>__<job>` job to a builder agent
+2. Agent loads the compiled bundle and extracts the workflow/job
+3. Agent calls the dynamic function(s) with the normalized webhook event
+4. Agent reports resolved values via `job.status` with `data.initResult`
+5. Orchestrator receives: `{ contextName?, env?, concurrencyGroup? }`
+
+**Phase 2 -- Resolution + execution:** 6. Orchestrator treats resolved values as static -- full context lookup, protection rules, secret resolution, variable merge all proceed normally 7. A fresh execution job is dispatched with everything resolved
+
+**Key properties (both paths):**
+
+- All dynamic fields resolved before dispatch
+- Mixed static/dynamic fields are supported (e.g., static `context` + dynamic `env`)
+- Hold/wait/queue behavior is identical to static contexts (orchestrator handles after resolution)
+
+**Key properties (two-phase init only):**
+
+- All dynamic fields resolved in a single init call (no separate callbacks per field)
+- Init runner runs in its own agent process -- user code never executes in the orchestrator
+- Dynamic function evaluation has a 60-second timeout (configurable per-job)
+- If a dynamic function throws, the job fails immediately
+- If a dynamic function returns undefined, the job proceeds without that field
+- Init results are NOT cacheable (functions may be non-deterministic)
+
+## Protection rule pipeline
+
+Gates are evaluated sequentially. The first non-pass result stops evaluation:
+
+```
+evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
+  |
+  1. Context disabled? -> reject
+  2. Branch gate:
+     - env.branchRestrictions is empty -> pass
+     - ctx.branch matches any restriction -> pass
+     - else -> reject("Branch 'X' not allowed")
+  3. Trust gate:
+     - env has no trust requirements -> pass
+     - trustTier meets minimum requirement -> pass
+     - else -> reject or hold(holdType: 'trust')
+  4. Concurrency gate:
+     - env.concurrencyLimit is null -> pass
+     - runningCount < limit -> pass
+     - strategy = 'cancel-pending' -> queue (reason: 'cancel-pending', caller handles cancellation)
+     - strategy = 'queue' -> queue
+  5. Reviewer gate:
+     - env.requiredReviewers is null/empty -> pass
+     - else -> hold(holdType: 'reviewer')
+  6. Wait timer gate:
+     - env.waitTimerSeconds is null -> pass
+     - else -> wait(holdUntil: now + timer)
+  |
+  v
+  ProtectionGateResult { action, reason, holdType?, holdUntil? }
+```
+
+### Gate result types
+
+| Action   | Meaning                 | Effect                                 |
+| -------- | ----------------------- | -------------------------------------- |
+| `pass`   | Gate satisfied          | Continue to next gate                  |
+| `reject` | Gate failed permanently | Job rejected, error_message set        |
+| `hold`   | Awaiting human action   | held_run created, job pending          |
+| `wait`   | Time-based delay        | held_run created with expiry           |
+| `queue`  | Concurrency full        | Job queued, dispatched when slot opens |
+
+### Multiple bound contexts
+
+A job can bind an ordered list of contexts (`contexts: [...]` in the lock as `contexts: [{ value, dynamic }]`). On every dispatch:
+
+- **Resolution + merge.** Each context is resolved independently with the per-context logic above, then the per-context secret and variable maps are folded in array order — a later context's key overrides an earlier one (last-wins). The folded set flows into the single `secrets` / `contextVars` dispatch fields, so the agent-side injection is unchanged.
+- **All-must-pass gate aggregation.** Bound names with no configured context are skipped first (they contribute nothing — the established lenient behavior). The hard reject gates (enabled, branch, trigger-type, repo) must then pass for **every** configured bound context; the first failing one produces a rejection naming the offending context and rule. The hold/wait/queue parameters aggregate most-restrictively: minimum trust = max tier, required reviewers = union, wait timer = max, hold expiry = min, concurrency limit = min. The aggregated parameters are evaluated through the same gate pipeline on a synthetic effective context, so adding an context can never loosen access.
+- **Skip-on-test.** For a test/local run, bound contexts whose `allow_local_execution` is false are dropped before gate evaluation and merge; if all are dropped the job runs with no context-scoped variables and a warning.
+- **Concurrency grouping.** The default concurrency group is the first bound context's name; the run's `context` column records that group.
+
+## Scope resolution algorithm
+
+When resolving secrets for an context, the scope resolver uses a longest-path-wins strategy:
+
+```
+Given context bindings:
+  aws/**           -> binds scope 'aws' and all sub-scopes
+  aws/prod/**      -> binds scope 'aws/prod' and sub-scopes
+
+Secrets in DB:
+  aws/shared       : AWS_REGION = us-east-1
+  aws/prod         : AWS_REGION = eu-west-1
+  aws/prod         : DB_PASSWORD = secret123
+
+Resolution for context 'production' (bound to both patterns):
+  AWS_REGION = eu-west-1    (aws/prod wins over aws/shared, longer path)
+  DB_PASSWORD = secret123   (only in aws/prod)
+```
+
+The algorithm:
+
+1. Collect all scope patterns bound to the context
+2. For each pattern, find matching secrets using picomatch glob matching
+3. Sort matched secrets by scope path length (descending)
+4. Build flat map: last-write-wins on key collisions (longest path = highest priority)
+
+## Test-run access (`allow_local_execution`)
+
+Each context carries an `allow_local_execution` flag (default `false`) that gates whether a remote test run (`kici run remote`) may target the context and resolve its secrets.
+
+When the orchestrator resolves secrets for a test run, it combines the developer's CLI-uploaded local secrets (sent encrypted with the run) with test-context secrets resolved from `scoped_secrets`. The test-context side is filtered by `allow_local_execution`:
+
+- The job's own declared `context` and each fixture `secrets: { ctx: envName }` mapping resolve secrets **only** when the target context has `allow_local_execution = true`. Static strings and pure inline `context` expressions both participate — the inline expression is evaluated against the fixture's simulated event and the resolved name goes through the same gate. Impure dynamic contexts (init-job marker) are not evaluated for test runs and contribute no context-resolved secrets.
+- The gate applies to **all** remote test runs: a run whose matched workflow targets an context with the flag off is rejected before dispatch.
+- A fixture mapping that points a context at a missing context, or at one whose flag is off, **rejects the run** (fail-closed).
+- On a key collision, the CLI-uploaded local value wins over the test-context value, giving a per-run override.
+
+Production contexts left at the default `false` are therefore never reachable by a test run. Operators set the flag with `kici-admin context set-policy --allow-local-execution true|false` or through the dashboard's per-context test-runs toggle.
+
+## 7-layer environment variable merge
+
+The agent's `buildSanitizedEnv` function merges variables in this precedence order (last wins):
+
+```
+Layer 1: Allowed system vars       -- PATH, HOME, USER (from agent process)
+Layer 2: Sandbox defaults           -- FORCE_COLOR=1
+Layer 3: KICI_* system vars         -- KICI_RUN_ID, KICI_JOB_NAME, etc.
+Layer 4: Org-level context vars -- from contexts DB table
+Layer 5: Source-level overrides     -- from context_source_overrides (skips locked vars)
+Layer 6: Job env                    -- from SDK env property (static or evaluated)
+Layer 7: setEnv() calls             -- runtime modifications within steps
+```
+
+Layers 4-5 are resolved at the orchestrator and passed in `job.dispatch`. Layer 6 comes from the lock file (static) or from the init phase result (dynamic -- resolved before dispatch via the two-phase init model). Layer 7 is agent-side only. Dynamic env vars land at layer 6 with the same precedence as static env vars.
+
+Secrets are NOT injected as environment variables. They flow through IPC and are accessed via `ctx.secrets.get()` and `ctx.secrets.has()`. Users can explicitly inject a secret into `process.env` by calling `ctx.secrets.expose('KEY')`, but this is opt-in and happens at step execution time.
+
+## State machine extensions
+
+The existing run/job state machine is extended with held states:
+
+```
+                    held
+                   /    \
+                  v      v
+pending -> queued -> running -> success
+                          \-> failed
+                          \-> cancelled
+
+held states:
+  pending (awaiting approval/timer)
+    -> approved (reviewer approves) -> queued -> running
+    -> rejected (reviewer rejects) -> cancelled
+    -> expired (hold_expiry_seconds exceeded) -> cancelled
+```
+
+The `held` and `waiting` states are non-terminal. They resolve to `queued` on success (APPROVE, TIMER_DONE).
+
+## Dashboard CRUD
+
+Context management in the dashboard goes through the same REST-over-WS proxy pattern KiCI uses for the rest of the dashboard surface.
+
+## Lock file schema
+
+The lock file (v6+) includes per-job context fields. Schema v11 added `LockInlineValue` as an alternative to the two-phase init model for pure function evaluation:
+
+```json
+{
+  "jobs": [
+    {
+      "name": "deploy",
+      "context": "production",
+      "dynamicContext": false,
+      "env": { "DEPLOY_TARGET": "us-east-1" },
+      "dynamicEnv": false,
+      "concurrencyGroup": "production-api",
+      "dynamicConcurrencyGroup": false
+    }
+  ]
+}
+```
+
+- `context` -- static context name (`string`) or inline expression (`LockInlineValue`, schema v11+)
+- `dynamicContext` -- `true` when context is a function (resolved via inline evaluation or two-phase init)
+- `env` -- static environment variables (`Record<string, string>`) or inline expression (`LockInlineValue`, schema v11+)
+- `dynamicEnv` -- `true` when env is a function
+- `concurrencyGroup` -- static concurrency group name (`string`) or inline expression (`LockInlineValue`, schema v11+)
+- `dynamicConcurrencyGroup` -- `true` when concurrencyGroup is a function

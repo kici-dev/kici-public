@@ -21,8 +21,8 @@ export const STATE_REPLAY_MAX_RUNS = 500;
 export const MAX_JOBS_PER_RUN = 1000;
 /** Max number of `runsOn` / `secretsAccessed` label entries on a job/step. */
 export const RUNS_ON_LABELS_MAX = 30;
-/** Max number of bound deployment-environment names on a job. */
-export const ENVIRONMENTS_MAX = 30;
+/** Max number of bound context names on a job. */
+export const CONTEXTS_MAX = 30;
 
 // --- Execution status enums (single source of truth via Zod z.enum) ---
 // Access values: ExecutionRunStatus.enum.pending, ExecutionJobStatus.enum.success, etc.
@@ -133,14 +133,14 @@ export type TimeoutReason = z.infer<typeof TimeoutReason>;
  *    (secret_resolution, install_secrets, lock_resolution,
  *    build_coordination).
  *  - `job`-scoped categories fail one job and leave siblings alone
- *    (environment_rules, dynamic_eval, no_agent, matrix_expansion).
+ *    (context_rules, dynamic_eval, no_agent, matrix_expansion).
  */
 export const InitFailureCategory = z.enum([
   'secret_resolution',
   'install_secrets',
   'lock_resolution',
   'build_coordination',
-  'environment_rules',
+  'context_rules',
   'dynamic_eval',
   'no_agent',
   'matrix_expansion',
@@ -304,8 +304,8 @@ export const jobStatusForwardSchema = z.object({
   orchestratorId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** Labels used for agent routing. */
   runsOnLabels: z.array(z.string().max(STATUS_ID_MAX)).max(RUNS_ON_LABELS_MAX).optional(),
-  /** Ordered bound deployment-environment names for this job (multi-env jobs). */
-  environments: z.array(z.string().max(STATUS_ID_MAX)).max(ENVIRONMENTS_MAX).optional(),
+  /** Ordered bound context names for this job (multi-context jobs). */
+  contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
   /**
    * Total raw log bytes accumulated across all steps of this job, summed by
    * the orchestrator from per-step `logBytesStreamed` values reported by the
@@ -359,7 +359,7 @@ export const stateReplaySchema = z.object({
                 .array(z.string().max(STATUS_ID_MAX))
                 .max(RUNS_ON_LABELS_MAX)
                 .optional(),
-              environments: z.array(z.string().max(STATUS_ID_MAX)).max(ENVIRONMENTS_MAX).optional(),
+              contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
             }),
           )
           .max(MAX_JOBS_PER_RUN),

@@ -9,7 +9,6 @@ import {
   type HostTargetSelector,
   type InputsDescriptorMap,
 } from '@kici-dev/engine';
-import type { RunLocalOptions } from '../local-executor/types.js';
 import { resolveKiciDir } from '../execution/index.js';
 import { loadGlobalConfig, type GlobalConfig } from '../remote/config.js';
 import {
@@ -46,27 +45,6 @@ import { handleNewHolds } from './run-hold-watch.js';
 import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
-
-/**
- * Print a usage block for `kici run local` when the event argument is missing.
- *
- * Mirrors the discoverable help `kici preview` prints for a missing event: a
- * bold synopsis line, a one-line description, and a few concrete event
- * examples. The caller exits non-zero after printing — a missing event is a
- * usage error, unlike `kici preview` which treats no-event as help.
- */
-export function printRunLocalUsage(): void {
-  logger.info(pc.bold('\nUsage: kici run local <event> [options]\n'));
-  logger.info(
-    pc.gray('Execute workflows locally for a given event, without orchestrator infrastructure.\n'),
-  );
-  logger.info(pc.gray('Examples:'));
-  logger.info(pc.gray('  kici run local push'));
-  logger.info(pc.gray('  kici run local pr:open'));
-  logger.info(pc.gray('  kici run local schedule'));
-  logger.info(pc.gray('  kici run local lifecycle:workflow_complete\n'));
-  logger.info(pc.gray('Or pick a workflow interactively: kici run local --pick\n'));
-}
 
 /** Terminal run statuses returned by the Platform run-status snapshot. */
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled', 'error']);
@@ -167,11 +145,11 @@ export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Recompile `.kici/workflows` → `kici.lock.json` before a remote run, mirroring
- * `kici run local`. The orchestrator matches triggers and dispatches against the
- * inline lock, so a stale lock would route an edited or newly-added workflow
- * incorrectly. Returns false on a compile/validation error so the caller can
- * abort before any upload or dispatch.
+ * Recompile `.kici/workflows` → `kici.lock.json` before a remote run. The
+ * orchestrator matches triggers and dispatches against the inline lock, so a
+ * stale lock would route an edited or newly-added workflow incorrectly. Returns
+ * false on a compile/validation error so the caller can abort before any upload
+ * or dispatch.
  */
 async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolean> {
   // Keep stdout pure for machine-readable runs: --json (and --quiet) must not
@@ -186,47 +164,6 @@ async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolea
       quiet: pureStdout,
     });
   return pureStdout ? withStdoutOnStderr(compile) : compile();
-}
-
-/**
- * Run a workflow locally using the local executor.
- * Thin wrapper that delegates to executeLocal from local-executor.
- *
- * Exit codes: 0 = success, 1 = job failure, 2 = config/compilation error
- */
-export async function runLocalCommand(options: RunLocalOptions): Promise<boolean> {
-  if (options.debug) {
-    process.env.KICI_DEBUG = 'true';
-    if (!options.quiet) logger.info(pc.gray('Debug mode enabled'));
-  }
-
-  try {
-    // Dynamic import: executeLocal may not be available yet (Plan 03 dependency)
-    const { executeLocal } = await import('../local-executor/index.js');
-    return await executeLocal(options);
-  } catch (error) {
-    if (
-      error instanceof Error &&
-      (error.message.includes('Cannot find module') ||
-        error.message.includes('ERR_MODULE_NOT_FOUND'))
-    ) {
-      logger.error(
-        pc.red(
-          'Local executor not yet available. The local execution engine is under development.',
-        ),
-      );
-      return false;
-    }
-
-    const message = toErrorMessage(error);
-    logger.error(pc.red(`\nError: ${message}\n`));
-
-    if (options.debug && error instanceof Error && error.stack) {
-      logger.error(pc.gray(error.stack));
-    }
-
-    return false;
-  }
 }
 
 /**

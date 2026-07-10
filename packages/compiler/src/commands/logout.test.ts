@@ -19,6 +19,14 @@ vi.mock('node:os', async () => {
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
+// Mock the local dev plane (detach on logout).
+const planeStatusMock = vi.fn().mockResolvedValue({ running: false, mode: 'independent' });
+const detachPlaneMock = vi.fn().mockResolvedValue({ mode: 'independent' });
+vi.mock('../local-plane/plane-manager.js', () => ({
+  planeStatus: (...a: unknown[]) => planeStatusMock(...a),
+  detachPlane: (...a: unknown[]) => detachPlaneMock(...a),
+}));
+
 import { logoutCommand } from './logout.js';
 import { saveGlobalConfig, loadGlobalConfig } from '../remote/config.js';
 
@@ -174,5 +182,22 @@ describe('kici logout', () => {
 
     const output = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(output).toMatch(/logged out/i);
+  });
+
+  it('detaches an attached local dev plane on logout', async () => {
+    await saveGlobalConfig({ pat: 'kici_pat_abc', patId: 'pat-1' });
+    mockFetch.mockResolvedValue({ ok: true });
+    planeStatusMock.mockResolvedValueOnce({ running: true, mode: 'hybrid' });
+    const result = await logoutCommand();
+    expect(result).toBe(true);
+    expect(detachPlaneMock).toHaveBeenCalledWith({ pat: 'kici_pat_abc' });
+  });
+
+  it('does not detach when the plane is independent', async () => {
+    await saveGlobalConfig({ pat: 'kici_pat_abc', patId: 'pat-1' });
+    mockFetch.mockResolvedValue({ ok: true });
+    planeStatusMock.mockResolvedValueOnce({ running: true, mode: 'independent' });
+    await logoutCommand();
+    expect(detachPlaneMock).not.toHaveBeenCalled();
   });
 });

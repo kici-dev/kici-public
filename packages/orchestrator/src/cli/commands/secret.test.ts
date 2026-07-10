@@ -4,13 +4,13 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const mockSetEnvironmentSecretDirect = vi.fn();
+const mockSetContextSecretDirect = vi.fn();
 
 vi.mock('@kici-dev/shared', async (importOriginal) => {
   const original = (await importOriginal()) as Record<string, unknown>;
   return {
     ...original,
-    setEnvironmentSecretDirect: mockSetEnvironmentSecretDirect,
+    setContextSecretDirect: mockSetContextSecretDirect,
   };
 });
 
@@ -98,7 +98,7 @@ describe('kici-admin secret CLI', () => {
     });
 
     it('sets a secret via direct-DB mode', async () => {
-      mockSetEnvironmentSecretDirect.mockResolvedValue({ inserted: true });
+      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
       const { stdout, exitCode } = await runCommand([
         'secret',
         'set',
@@ -111,9 +111,9 @@ describe('kici-admin secret CLI', () => {
         'postgres://x',
       ]);
       expect(exitCode).toBeNull();
-      expect(mockSetEnvironmentSecretDirect).toHaveBeenCalledWith('postgres://x', {
+      expect(mockSetContextSecretDirect).toHaveBeenCalledWith('postgres://x', {
         orgId: 'org-1',
-        environment: 'staging',
+        context: 'staging',
         key: 'DEPLOY_KEY',
         encryptedValue: 'ciphertext',
       });
@@ -122,8 +122,8 @@ describe('kici-admin secret CLI', () => {
   });
 
   // ── sugar form ───────────────────────────────────────────────────────────
-  describe('set (--environment sugar form)', () => {
-    it('sets a secret via HTTP using --org/--environment/--key', async () => {
+  describe('set (--context sugar form)', () => {
+    it('sets a secret via HTTP using --org/--context/--key', async () => {
       const client = makeMockClient();
       client.setSecret.mockResolvedValue(undefined);
       const { stdout, exitCode } = await runCommand(
@@ -132,7 +132,7 @@ describe('kici-admin secret CLI', () => {
           'set',
           '--org',
           'org-1',
-          '--environment',
+          '--context',
           'production',
           '--key',
           'API_KEY',
@@ -146,14 +146,14 @@ describe('kici-admin secret CLI', () => {
       expect(stdout).toContain("Secret 'API_KEY' set in scope 'production'");
     });
 
-    it('sets a secret via direct-DB using --environment sugar', async () => {
-      mockSetEnvironmentSecretDirect.mockResolvedValue({ inserted: false });
+    it('sets a secret via direct-DB using --context sugar', async () => {
+      mockSetContextSecretDirect.mockResolvedValue({ inserted: false });
       const { stdout, exitCode } = await runCommand([
         'secret',
         'set',
         '--org',
         'org-1',
-        '--environment',
+        '--context',
         'staging',
         '--key',
         'DEPLOY_KEY',
@@ -163,20 +163,20 @@ describe('kici-admin secret CLI', () => {
         'postgres://x',
       ]);
       expect(exitCode).toBeNull();
-      expect(mockSetEnvironmentSecretDirect).toHaveBeenCalledWith('postgres://x', {
+      expect(mockSetContextSecretDirect).toHaveBeenCalledWith('postgres://x', {
         orgId: 'org-1',
-        environment: 'staging',
+        context: 'staging',
         key: 'DEPLOY_KEY',
         encryptedValue: 'v1',
       });
       expect(stdout).toContain('(direct)');
     });
 
-    it('errors when --environment missing --org', async () => {
+    it('errors when --context missing --org', async () => {
       const { stderr, exitCode } = await runCommand([
         'secret',
         'set',
-        '--environment',
+        '--context',
         'staging',
         '--key',
         'K',
@@ -187,13 +187,13 @@ describe('kici-admin secret CLI', () => {
       expect(stderr).toContain('--org is required');
     });
 
-    it('errors when --environment missing --key', async () => {
+    it('errors when --context missing --key', async () => {
       const { stderr, exitCode } = await runCommand([
         'secret',
         'set',
         '--org',
         'org-1',
-        '--environment',
+        '--context',
         'staging',
         '--value',
         'v',
@@ -209,7 +209,7 @@ describe('kici-admin secret CLI', () => {
         'org-1',
         'scope-1',
         'KEY-1',
-        '--environment',
+        '--context',
         'staging',
         '--value',
         'v',

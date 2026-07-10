@@ -1,5 +1,5 @@
 import { encryptJson } from '@kici-dev/core';
-import { loadLocalSecrets } from '../local-executor/secret-loader.js';
+import { loadLocalSecrets } from './secret-loader.js';
 
 /**
  * Parse `--context ctx.key=value` flag values into a nested
@@ -27,7 +27,7 @@ export function parseContextFlags(
 }
 
 /**
- * Load the developer's local secrets (same sources as `kici run local`: the
+ * Load the developer's local secrets (same sources as `kici run --local`: the
  * `.kici` secret files plus `--env` flat flags) and `--context` namespaced
  * flags, and encrypt them to the orchestrator's per-upload X25519 public key.
  * `--context` values override `.kici/.secrets` file contexts for the same key.

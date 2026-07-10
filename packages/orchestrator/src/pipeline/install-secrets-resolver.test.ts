@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { initTelemetry } from '@kici-dev/shared';
-import type { Environment as DbEnvironment } from '../db/types.js';
-import type { Environment as EngineEnvironment, ProtectionGateResult } from '@kici-dev/engine';
+import type { Context as DbContext } from '../db/types.js';
+import type { Context as EngineContext, ProtectionGateResult } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
-import type { EnvironmentStore } from '../environments/environment-store.js';
-import type { JobDispatchContext } from '../environments/protection/pipeline.js';
+import type { ContextStore } from '../contexts/context-store.js';
+import type { JobDispatchContext } from '../contexts/protection/pipeline.js';
 import {
   parseQualifiedSecretRef,
   validateRegistryUrlScheme,
@@ -29,7 +29,7 @@ const baseProtectionContext: JobDispatchContext = {
   jobId: '__install__wf',
 };
 
-function makeEnvRow(overrides: Partial<DbEnvironment> = {}): DbEnvironment {
+function makeEnvRow(overrides: Partial<DbContext> = {}): DbContext {
   return {
     id: 'env-1',
     org_id: 'org-1',
@@ -52,13 +52,13 @@ function makeEnvRow(overrides: Partial<DbEnvironment> = {}): DbEnvironment {
     updated_at: new Date(),
     created_by: null,
     ...overrides,
-  } as unknown as DbEnvironment;
+  } as unknown as DbContext;
 }
 
-function makeEnvironmentStore(envs: Map<string, DbEnvironment>): EnvironmentStore {
+function makeContextStore(envs: Map<string, DbContext>): ContextStore {
   return {
-    matchEnvironment: vi.fn(async (_orgId: string, name: string) => envs.get(name) ?? null),
-  } as unknown as EnvironmentStore;
+    matchContext: vi.fn(async (_orgId: string, name: string) => envs.get(name) ?? null),
+  } as unknown as ContextStore;
 }
 
 function makeSecretResolver(perEnv: Map<string, Record<string, string>>): SecretResolver {
@@ -142,7 +142,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: undefined,
-      environmentStore: undefined,
+      contextStore: undefined,
       secretResolver: undefined,
       protectionContext: baseProtectionContext,
     });
@@ -161,7 +161,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: untrusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -180,22 +180,22 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map()),
+      contextStore: makeContextStore(new Map()),
       secretResolver: makeSecretResolver(new Map()),
       protectionContext: baseProtectionContext,
     });
     expect(r.decision).toBe('reject');
-    if (r.decision === 'reject') expect(r.reason).toMatch(/qualified <environment>:<secret-name>/);
+    if (r.decision === 'reject') expect(r.reason).toMatch(/qualified <context>:<secret-name>/);
   });
 
-  it('rejects on missing environment', async () => {
+  it('rejects on missing context', async () => {
     const r = await resolveInstallSecrets({
       registries: [{ url: 'https://npm.example.com/', tokenSecret: 'prod:NPM_TOKEN' }],
       installEnv: undefined,
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map()),
+      contextStore: makeContextStore(new Map()),
       secretResolver: makeSecretResolver(new Map()),
       protectionContext: baseProtectionContext,
     });
@@ -210,7 +210,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 'tok' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -225,7 +225,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', {}]])),
       protectionContext: baseProtectionContext,
     });
@@ -240,7 +240,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow({ enabled: false })]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow({ enabled: false })]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -249,7 +249,7 @@ describe('resolveInstallSecrets', () => {
   });
 
   it('returns a hold decision (not reject) when the env install gate holds for review', async () => {
-    const envs = new Map<string, DbEnvironment>([
+    const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', required_reviewers: JSON.stringify(['alice']) })],
     ]);
     const r = await resolveInstallSecrets({
@@ -258,7 +258,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(envs),
+      contextStore: makeContextStore(envs),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -267,15 +267,15 @@ describe('resolveInstallSecrets', () => {
       expect(r.action).toBe('hold');
       expect(r.holdType).toBe('reviewer');
       expect(r.envName).toBe('prod');
-      expect(r.environmentId).toBe('env-prod');
-      expect(r.queueType).toBe('environment');
+      expect(r.contextId).toBe('env-prod');
+      expect(r.queueType).toBe('context');
       expect(r.requirement.clauses).toEqual([{ user: 'alice' }]);
       expect(typeof r.requirement.expiresAt).toBe('string');
     }
   });
 
   it('returns a hold decision with wait_timer hold type for a wait-timer env', async () => {
-    const envs = new Map<string, DbEnvironment>([
+    const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', wait_timer_seconds: 30 })],
     ]);
     const r = await resolveInstallSecrets({
@@ -284,7 +284,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(envs),
+      contextStore: makeContextStore(envs),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -296,7 +296,7 @@ describe('resolveInstallSecrets', () => {
   });
 
   it('skipProtectionGate bypasses the gate and resolves secrets to pass', async () => {
-    const envs = new Map<string, DbEnvironment>([
+    const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', required_reviewers: JSON.stringify(['alice']) })],
     ]);
     const r = await resolveInstallSecrets({
@@ -305,7 +305,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(envs),
+      contextStore: makeContextStore(envs),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 'secret-value' }]])),
       protectionContext: baseProtectionContext,
       skipProtectionGate: true,
@@ -317,7 +317,7 @@ describe('resolveInstallSecrets', () => {
   });
 
   it('passes and resolves a registry + an installEnv across two envs', async () => {
-    const envs = new Map<string, DbEnvironment>([
+    const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', name: 'prod' })],
       ['stg', makeEnvRow({ id: 'env-stg', name: 'stg' })],
     ]);
@@ -338,7 +338,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(envs),
+      contextStore: makeContextStore(envs),
       secretResolver: makeSecretResolver(secrets),
       protectionContext: baseProtectionContext,
     });
@@ -364,7 +364,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -381,7 +381,7 @@ describe('resolveInstallSecrets', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: undefined,
       protectionContext: baseProtectionContext,
     });
@@ -442,7 +442,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: undefined,
-      environmentStore: undefined,
+      contextStore: undefined,
       secretResolver: undefined,
       protectionContext: baseProtectionContext,
     });
@@ -457,7 +457,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: untrusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -474,7 +474,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map()),
+      contextStore: makeContextStore(new Map()),
       secretResolver: makeSecretResolver(new Map()),
       protectionContext: baseProtectionContext,
     });
@@ -491,7 +491,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 'tok' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -501,14 +501,14 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
     });
   });
 
-  it('records reject with env_not_found reason when an environment is missing', async () => {
+  it('records reject with env_not_found reason when an context is missing', async () => {
     await resolveInstallSecrets({
       registries: [{ url: 'https://npm.example.com/', tokenSecret: 'prod:NPM_TOKEN' }],
       installEnv: undefined,
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map()),
+      contextStore: makeContextStore(new Map()),
       secretResolver: makeSecretResolver(new Map()),
       protectionContext: baseProtectionContext,
     });
@@ -525,7 +525,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow({ enabled: false })]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow({ enabled: false })]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });
@@ -542,7 +542,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', {}]])),
       protectionContext: baseProtectionContext,
     });
@@ -550,11 +550,11 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       value: 1,
       attrs: { decision: 'reject', reason: 'missing_token' },
     });
-    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { environment: 'prod' });
+    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { context: 'prod' });
   });
 
   it('records pass + per-channel/scope rows + per-env duration on a fully-resolved dispatch', async () => {
-    const envs = new Map<string, DbEnvironment>([
+    const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', name: 'prod' })],
       ['stg', makeEnvRow({ id: 'env-stg', name: 'stg' })],
     ]);
@@ -575,7 +575,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(envs),
+      contextStore: makeContextStore(envs),
       secretResolver: makeSecretResolver(secrets),
       protectionContext: baseProtectionContext,
     });
@@ -592,8 +592,8 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       value: 1,
       attrs: { channel: 'install_env', provider: 'static', scope: '-' },
     });
-    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { environment: 'prod' });
-    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { environment: 'stg' });
+    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { context: 'prod' });
+    expect(durationSpy).toHaveBeenCalledWith(expect.any(Number), { context: 'stg' });
   });
 
   it('labels the default registry scope as `default`', async () => {
@@ -603,7 +603,7 @@ describe('resolveInstallSecrets — Prometheus metrics', () => {
       allowHttpNpmRegistries: false,
       resolvedOrgId: 'org-1',
       trustResolution: trusted,
-      environmentStore: makeEnvironmentStore(new Map([['prod', makeEnvRow()]])),
+      contextStore: makeContextStore(new Map([['prod', makeEnvRow()]])),
       secretResolver: makeSecretResolver(new Map([['prod', { NPM_TOKEN: 't' }]])),
       protectionContext: baseProtectionContext,
     });

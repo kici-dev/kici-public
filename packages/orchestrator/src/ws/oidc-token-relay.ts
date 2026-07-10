@@ -106,6 +106,12 @@ export interface OidcTokenHandlerDeps {
    * OIDC audience (config.testMintDeferAudience). Ignored unless `testMode`.
    */
   testMintDeferAudience?: string;
+  /**
+   * Test-only: force the *initial* agent mint to defer for this OIDC audience
+   * (config.testMintRejectAudience) so a pending row is created, which the
+   * retrier then terminally rejects. Ignored unless `testMode`.
+   */
+  testMintRejectAudience?: string;
 }
 
 /**
@@ -124,15 +130,22 @@ export function createOidcTokenHandler(
       throw new MintRejectedError(`job ${jobId} not owned by agent ${agentId}`);
     }
     // Test-only fault injection: force the initial agent mint to defer for a
-    // marker audience so an E2E can exercise the deferred-attestation retry +
-    // per-run serve path with a REAL run. Double-gated (testMode AND marker)
-    // so production deployments — which leave both unset — never reach it. The
-    // deferred result is exactly what the MintUnavailableError catch below
-    // returns; the retrier's re-mint uses requestMint directly and is exempt.
-    if (deps.testMode && deps.testMintDeferAudience && audience === deps.testMintDeferAudience) {
+    // marker audience so an E2E can exercise the deferred-attestation retry
+    // path with a REAL run. Two markers defer here: testMintDeferAudience
+    // (retrier later succeeds → serve path) and testMintRejectAudience (retrier
+    // later terminally rejects → markRejected → --include-rejected re-arm path).
+    // Double-gated (testMode AND a marker) so production — which leaves both
+    // unset — never reaches it. The retrier's re-mint uses requestMint directly
+    // and applies the reject knob at its own call site (server.ts).
+    if (
+      deps.testMode &&
+      ((deps.testMintDeferAudience && audience === deps.testMintDeferAudience) ||
+        (deps.testMintRejectAudience && audience === deps.testMintRejectAudience))
+    ) {
       logger.warn(
         'mint-defer fault-injection ACTIVE — forcing a transient mint failure. ' +
-          'Production deployments must clear KICI_TEST_MODE + KICI_TEST_MINT_DEFER_AUDIENCE.',
+          'Production deployments must clear KICI_TEST_MODE + ' +
+          'KICI_TEST_MINT_DEFER_AUDIENCE / KICI_TEST_MINT_REJECT_AUDIENCE.',
         { jobId, audience },
       );
       return { deferred: true, code: 'unavailable' };

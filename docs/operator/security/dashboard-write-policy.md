@@ -20,13 +20,13 @@ Every mutating dashboard action maps to exactly one `DashboardWriteOperation`. T
 |                   | `secrets.scope.delete`                 | authority   | `kici-admin secret scope delete`                            |
 | **Variables**     | `variables.set`                        | plaintext   | `kici-admin variable set`                                   |
 |                   | `variables.delete`                     | authority   | `kici-admin variable delete`                                |
-| **Environments**  | `environments.create`                  | authority   | `kici-admin environment create`                             |
-|                   | `environments.update`                  | authority   | `kici-admin environment set-policy`                         |
-|                   | `environments.test_access.set`         | authority   | `kici-admin environment set-policy --allow-local-execution` |
-|                   | `environments.delete`                  | authority   | `kici-admin environment delete`                             |
-| **Bindings**      | `environments.bindings.set`            | authority   | `kici-admin environment bind`                               |
-|                   | `environments.source_overrides.set`    | authority   | `kici-admin environment source-override set`                |
-|                   | `environments.source_overrides.delete` | authority   | `kici-admin environment source-override delete`             |
+| **Environments**  | `environments.create`                  | authority   | `kici-admin context create`                             |
+|                   | `environments.update`                  | authority   | `kici-admin context set-policy`                         |
+|                   | `environments.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution` |
+|                   | `environments.delete`                  | authority   | `kici-admin context delete`                             |
+| **Bindings**      | `environments.bindings.set`            | authority   | `kici-admin context bind`                               |
+|                   | `environments.source_overrides.set`    | authority   | `kici-admin context source-override set`                |
+|                   | `environments.source_overrides.delete` | authority   | `kici-admin context source-override delete`             |
 | **Held runs**     | `held_runs.approve`                    | dispatch    | `kici-admin runs approve`                                   |
 |                   | `held_runs.reject`                     | dispatch    | `kici-admin runs reject`                                    |
 | **DLQ**           | `event_dlq.retry`                      | dispatch    | `kici-admin event-dlq retry`                                |

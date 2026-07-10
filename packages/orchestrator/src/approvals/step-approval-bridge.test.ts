@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { HoldScope, TriggerSource } from '@kici-dev/engine';
 
 import { StepApprovalBridge } from './step-approval-bridge.js';
-import type { HeldRunStore } from '../environments/held-runs.js';
+import type { HeldRunStore } from '../contexts/held-runs.js';
 
 function fakeStore(createId = 'hold-1'): {
   store: HeldRunStore;

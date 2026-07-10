@@ -16,6 +16,7 @@ import {
 } from '../remote/prod-defaults.js';
 import { isHeadless } from '../auth/headless-detect.js';
 import { toErrorMessage } from '@kici-dev/core';
+import { planeStatus, attachPlane } from '../local-plane/plane-manager.js';
 
 export interface LoginOptions {
   /** API key for non-interactive authentication */
@@ -28,6 +29,8 @@ export interface LoginOptions {
   routingKey?: string;
   /** Force device authorization flow regardless of environment */
   device?: boolean;
+  /** Skip the post-login "attach the local dev plane?" prompt (scripted logins). */
+  noAttachPrompt?: boolean;
 }
 
 /**
@@ -150,7 +153,64 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   // Check for near-expiry warning
   checkPatExpiry(patResult.expiresAt);
 
+  // Offer to attach the local dev plane so `kici run --local` uses real
+  // Platform identity (design §5). Interactive + opt-out only.
+  await maybePromptAttach(options, {
+    apiBase: platformUrl,
+    pat: patResult.token,
+    orgId: next.activeOrgId,
+  });
+
   return true;
+}
+
+/**
+ * After a successful login, prompt an interactive user to attach their local
+ * dev plane to the Platform. Skipped entirely for non-TTY / piped input, when
+ * `--no-attach` is set, when no org is selected (nothing to attach against), or
+ * when a plane is already attached. Any failure here is non-fatal — login has
+ * already succeeded.
+ */
+async function maybePromptAttach(
+  options: LoginOptions,
+  ctx: { apiBase: string; pat: string; orgId?: string },
+): Promise<void> {
+  try {
+    if (options.noAttachPrompt) return;
+    // Only prompt for a genuinely interactive terminal.
+    if (!process.stdin.isTTY) return;
+    if (!ctx.orgId) {
+      console.log(
+        pc.gray(
+          '\n  Tip: select an org (`kici org use <org>`) then `kici local attach` to use ' +
+            'real Platform identity for `kici run --local`.',
+        ),
+      );
+      return;
+    }
+    const current = await planeStatus();
+    if (current.mode === 'hybrid') return; // already attached
+
+    console.log(
+      "\n  You don't have your local dev plane attached to the Platform.\n" +
+        '  Attach it so `kici run --local` uses real Platform secrets & identity?',
+    );
+    const answer = (await promptInput('  Attach now? [Y/n] ')).toLowerCase();
+    if (answer === 'n' || answer === 'no') {
+      console.log(pc.gray('  Left offline. Re-attach later with `kici local attach`.'));
+      return;
+    }
+    console.log(pc.cyan('\n  Attaching the local dev plane…'));
+    const status = await attachPlane({ apiBase: ctx.apiBase, pat: ctx.pat, orgId: ctx.orgId });
+    console.log(
+      pc.green(
+        `  ✓ Attached (hybrid) at ${status.url ?? ''} — \`kici run --local\` is now connected.`,
+      ),
+    );
+  } catch (err) {
+    console.log(pc.yellow(`  Could not attach the local dev plane: ${toErrorMessage(err)}`));
+    console.log(pc.gray('  Login succeeded; attach later with `kici local attach`.'));
+  }
 }
 
 /**

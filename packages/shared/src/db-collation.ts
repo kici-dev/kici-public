@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { toErrorMessage } from '@kici-dev/core';
 
 /**
  * Collation-drift helpers shared between `kici-admin` (orchestrator DB) and
@@ -99,4 +100,106 @@ export async function refreshDatabaseCollationVersion(
 ): Promise<void> {
   const quoted = pg.escapeIdentifier(dbName);
   await pool.query(`ALTER DATABASE ${quoted} REFRESH COLLATION VERSION`);
+}
+
+/**
+ * The two-step operator remediation for collation drift on `dbName`, as a
+ * single copy-pasteable string. Surfaced in the startup ERROR line and the
+ * hard-fail message so an operator sees exactly what to run.
+ */
+export function collationDriftRemediation(dbName: string): string {
+  const quoted = pg.escapeIdentifier(dbName);
+  return (
+    `REINDEX DATABASE CONCURRENTLY ${quoted}; ` +
+    `ALTER DATABASE ${quoted} REFRESH COLLATION VERSION;`
+  );
+}
+
+/**
+ * Minimal structural logger the startup check needs. `winston.Logger`
+ * satisfies it, so both the orchestrator and Platform pass their own logger
+ * without a shared winston dependency here.
+ */
+export interface CollationDriftStartupLogger {
+  info(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
+  error(message: string, meta?: Record<string, unknown>): void;
+}
+
+/** Env var name that turns a detected drift into a startup refusal. */
+export const FAIL_ON_COLLATION_DRIFT_ENV = 'KICI_DB_FAIL_ON_COLLATION_DRIFT';
+
+/**
+ * Read the opt-in hard-fail toggle from an environment map. When set to
+ * `true`, {@link checkCollationDriftAtStartup} throws on detected drift instead
+ * of logging and continuing. Defaults to off (detect + warn loudly).
+ */
+export function shouldFailOnCollationDrift(env: NodeJS.ProcessEnv): boolean {
+  return env[FAIL_ON_COLLATION_DRIFT_ENV] === 'true';
+}
+
+/**
+ * Boot-time collation-drift guard shared by the orchestrator and Platform.
+ *
+ * Runs {@link getDatabaseCollationDrift} after the DB connection + migrations
+ * are up and before the service starts serving. Behavior:
+ *
+ * - **No drift** → logs one info line and returns `null`.
+ * - **Drift** → logs a single loud, structured ERROR line naming the database,
+ *   the recorded-vs-actual collation versions, the exact remediation command,
+ *   and the risk (text index lookups may silently miss present rows — the
+ *   failure mode that read a present source private key back as absent). Does
+ *   NOT crash by default; a drifted DB still serves most traffic and crashing
+ *   every node is worse than a loud, alertable warning. Returns the drift.
+ * - **`failOnDrift: true`** (opt-in via {@link FAIL_ON_COLLATION_DRIFT_ENV})
+ *   → throws after logging, so strict operators can refuse to boot on drift.
+ * - **Probe failure** (the query itself throws) → logs a WARN and returns
+ *   `null`. A probe bug must never take down every node; unconfirmed drift is
+ *   not a reason to crash, and `failOnDrift` gates confirmed drift only.
+ *
+ * The caller is responsible for reflecting the result into its
+ * `kici_db_collation_drift{database=…}` gauge (1 on drift, 0 clean).
+ */
+export async function checkCollationDriftAtStartup(
+  pool: pg.Pool,
+  dbName: string,
+  logger: CollationDriftStartupLogger,
+  options: { failOnDrift?: boolean } = {},
+): Promise<CollationDrift | null> {
+  let drift: CollationDrift | null;
+  try {
+    drift = await getDatabaseCollationDrift(pool, dbName);
+  } catch (err) {
+    logger.warn('Collation-drift startup probe failed; skipping drift check', {
+      database: dbName,
+      error: toErrorMessage(err),
+    });
+    return null;
+  }
+
+  if (!drift) {
+    logger.info('Database collation version is consistent', { database: dbName });
+    return null;
+  }
+
+  logger.error(
+    'Database collation drift detected — text-column b-tree indexes may silently miss present rows ' +
+      '(e.g. secrets/sources reads reporting present rows as missing). Repair with the remediation below.',
+    {
+      database: dbName,
+      stampedCollationVersion: drift.stamped,
+      actualCollationVersion: drift.actual,
+      remediation: collationDriftRemediation(dbName),
+      risk: 'corrupted-text-btree-index',
+    },
+  );
+
+  if (options.failOnDrift) {
+    throw new Error(
+      `Database "${dbName}" has collation drift (stamped=${drift.stamped}, actual=${drift.actual}) ` +
+        `and ${FAIL_ON_COLLATION_DRIFT_ENV} is set. Remediate: ${collationDriftRemediation(dbName)}`,
+    );
+  }
+
+  return drift;
 }

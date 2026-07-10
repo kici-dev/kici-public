@@ -7,7 +7,9 @@ The **GitHub App** is KiCI's flagship source. A single App:
 
 1. receives `push`, `pull_request`, and related events from every repo it's installed on,
 2. clones repos with a short-lived installation token (no deploy key to manage),
-3. posts workflow / job / step Check runs back to the pull request (see
+3. posts workflow / job / step Check runs back to the commit — visible on
+   the commit view for a plain `push` and on the **Checks** tab of any pull
+   request that contains it (see
    [GitHub checks architecture](../../architecture/webhooks/github-checks.md)).
 
 You don't need an App for every scenario — if you only care about `push`
@@ -343,6 +345,13 @@ Step progress, log tails, and source-location annotations are all
 driven by the orchestrator's reporting module; no workflow
 configuration is required beyond installing the App with the
 `checks: write` permission.
+
+Check runs are keyed to the head commit SHA, so they surface whether or
+not a pull request exists: after a `push` you see the pass/fail directly
+on the commit (a red ✗ / green ✓ next to the SHA in GitHub's commit list
+and on the commit page), and the same checks roll up into the **Checks**
+tab of any pull request that later includes the commit. A failing run is
+therefore visible in GitHub itself without opening the KiCI dashboard.
 
 For architecture details see
 [GitHub checks architecture](../../architecture/webhooks/github-checks.md).

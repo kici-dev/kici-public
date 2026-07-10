@@ -22,6 +22,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { $, $ as zx$ } from 'zx';
 import { initZx, toErrorMessage } from '@kici-dev/shared';
+import { makeStreamingZxLog } from '../streaming-zx-log.js';
 import { ExecutionJobStatus, ExecutionStepStatus, TimeoutReason } from '@kici-dev/engine';
 import type {
   Step,
@@ -1211,10 +1212,16 @@ function createSecretMasker(request: JobExecutionRequest): LogMasker {
  *
  * Intercept zx subprocess output via the log callback: zx does NOT write child
  * stdout/stderr to process.stdout — it pipes to an internal VoidStream and only
- * calls $.log() with { kind: 'stdout'|'stderr' }. With verbose=false the default
- * log function skips stdout entirely, and with quiet=false it writes stderr to
- * process.stderr. We override the log function to capture both kinds directly
- * and send them as masked IPC log.line messages tagged with `stepIndex`.
+ * calls $.log() with { kind: 'stdout'|'stderr', verbose }. We override the log
+ * function (`makeStreamingZxLog`) to capture both kinds and send them as masked
+ * IPC log.line messages tagged with `stepIndex`.
+ *
+ * The shell is built with `verbose: true` so ordinary subprocess output is
+ * flagged `verbose: true` (captured) while a step that opts into
+ * `$({ quiet: true })` — e.g. a `sops -d` credential decrypt — is flagged
+ * `verbose: false` and dropped by `makeStreamingZxLog`. That gate is what keeps
+ * a decrypted secret out of the streamed run log; a `verbose: false` base would
+ * flag ordinary output `verbose: false` too and drop every line.
  *
  * IMPORTANT: The log function must be passed in the zx$() config, not set on the
  * returned function. zx$() returns a plain function (not the proxy $), so setting
@@ -1226,25 +1233,12 @@ function buildSandboxShell(
   stepIndex: number,
   maskedSendFn: (msg: RunnerToAgentMessage) => void,
 ): typeof $ {
-  let zxLineBuf = '';
   return zx$({
     cwd,
     env: { ...process.env } as Record<string, string>,
-    verbose: false,
+    verbose: true,
     quiet: false,
-    log: ((entry: any) => {
-      if (entry.kind === 'stdout' || entry.kind === 'stderr') {
-        const text = typeof entry.data === 'string' ? entry.data : String(entry.data ?? '');
-        zxLineBuf += text;
-        const lines = zxLineBuf.split('\n');
-        zxLineBuf = lines.pop()!;
-        for (const line of lines) {
-          if (line) maskedSendFn({ type: 'log.line', stepIndex, line });
-        }
-        return;
-      }
-      // Suppress cmd/end/cd log kinds — we don't need command echo in logs
-    }) as any,
+    log: makeStreamingZxLog((line) => maskedSendFn({ type: 'log.line', stepIndex, line })) as any,
   }) as unknown as typeof $;
 }
 
@@ -1323,7 +1317,7 @@ export function createSandboxStepContext(
     workflow: { name: request.workflowName },
     job: { name: request.jobName, runsOn: request.runsOn },
     isTestRun: request.isTestRun ?? false,
-    environment: request.environment,
+    context: request.context,
     // User-facing cache bound to the job's work dir. Each restore/save drives
     // the orchestrator over a cache.request IPC -> agent WS -> cache.user.*
     // relay (see buildCacheTransport), mirroring how ctx.emit / ctx.kici relay.

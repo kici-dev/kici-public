@@ -247,7 +247,7 @@ describe('kici-admin variable CLI', () => {
       );
       expect(exitCode).toBeNull();
       expect(client.deleteVariable).toHaveBeenCalledWith('org-1', 'production', 'V');
-      expect(stdout).toContain("deleted from environment 'production'");
+      expect(stdout).toContain("deleted from context 'production'");
     });
   });
 });

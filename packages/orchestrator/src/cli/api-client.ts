@@ -32,12 +32,15 @@ export interface FleetTopologyResponse {
 export type GenericSourceGitConfigPayload = Record<string, unknown>;
 
 /**
- * Wire shape for a local filesystem source's config (`{ repoBasePath, cloneUrlBase? }`).
+ * Wire shape for a local filesystem source's config
+ * (`{ repoBasePath, cloneUrlBase?, inPlace? }`).
  * Matches `LocalSourceConfigSchema` in `providers/local/local-source-config.ts`.
  */
 export interface GenericSourceLocalConfigPayload {
   repoBasePath: string;
   cloneUrlBase?: string;
+  /** In-place profile: the repoBasePath is the operator's real working tree. */
+  inPlace?: boolean;
 }
 
 /**
@@ -216,11 +219,47 @@ export class AdminApiClient {
     );
   }
 
-  // --- Environment variable management ---
+  // --- Context management ---
+
+  /**
+   * Create (or upsert) a deployment context. `allowLocalExecution` lets
+   * CLI-initiated / local runs resolve secrets through this context.
+   */
+  async createContext(data: {
+    orgId: string;
+    name: string;
+    allowLocalExecution?: boolean;
+  }): Promise<{ envId: string; created: boolean }> {
+    return this.request<{ envId: string; created: boolean }>(
+      'POST',
+      `/api/v1/admin/contexts`,
+      data,
+    );
+  }
+
+  /**
+   * Bind a scope pattern to a context so its scoped secrets resolve at dispatch.
+   * `hostPattern` defaults to `**` (every host) server-side.
+   */
+  async bindContext(data: {
+    orgId: string;
+    name: string;
+    scopePattern: string;
+    hostPattern?: string;
+  }): Promise<unknown> {
+    const { name, ...body } = data;
+    return this.request<unknown>(
+      'POST',
+      `/api/v1/admin/contexts/${encodeURIComponent(name)}/bind`,
+      body,
+    );
+  }
+
+  // --- Context variable management ---
 
   async listVariables(
     orgId: string,
-    environment: string,
+    context: string,
   ): Promise<{
     variables: Array<{
       key: string;
@@ -237,12 +276,12 @@ export class AdminApiClient {
         locked: boolean;
         updated_at: string;
       }>;
-    }>('GET', `/api/v1/admin/environments/${encodeURIComponent(environment)}/variables?${params}`);
+    }>('GET', `/api/v1/admin/contexts/${encodeURIComponent(context)}/variables?${params}`);
   }
 
   async setVariable(
     orgId: string,
-    environment: string,
+    context: string,
     key: string,
     value: string,
     locked?: boolean,
@@ -250,16 +289,16 @@ export class AdminApiClient {
     const params = new URLSearchParams({ orgId });
     return this.request<void>(
       'PUT',
-      `/api/v1/admin/environments/${encodeURIComponent(environment)}/variables/${encodeURIComponent(key)}?${params}`,
+      `/api/v1/admin/contexts/${encodeURIComponent(context)}/variables/${encodeURIComponent(key)}?${params}`,
       { value, locked },
     );
   }
 
-  async deleteVariable(orgId: string, environment: string, key: string): Promise<void> {
+  async deleteVariable(orgId: string, context: string, key: string): Promise<void> {
     const params = new URLSearchParams({ orgId });
     return this.request<void>(
       'DELETE',
-      `/api/v1/admin/environments/${encodeURIComponent(environment)}/variables/${encodeURIComponent(key)}?${params}`,
+      `/api/v1/admin/contexts/${encodeURIComponent(context)}/variables/${encodeURIComponent(key)}?${params}`,
     );
   }
 

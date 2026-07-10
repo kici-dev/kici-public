@@ -10,7 +10,7 @@
 npm install -g kici
 kici init
 kici preview pr:open
-kici run local push
+kici run push --local
 ```
 
 Full quickstart with the hosted dashboard and a customer-deployed orchestrator: <https://docs.kici.dev/user/quickstart/>.

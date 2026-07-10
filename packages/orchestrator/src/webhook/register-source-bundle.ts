@@ -192,6 +192,7 @@ function registerLocalBundle(row: GenericWebhookSource, deps: RegisterSourceBund
     createLocalProviderBundle({
       repoBasePath: parsed.data.repoBasePath,
       cloneUrlBase: parsed.data.cloneUrlBase,
+      inPlace: parsed.data.inPlace,
     }),
   );
   logger.info('Registered local provider bundle', {

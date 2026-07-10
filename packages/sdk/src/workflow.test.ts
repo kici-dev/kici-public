@@ -413,22 +413,22 @@ describe('workflow()', () => {
           jobs: [buildJob],
           registries: [{ url: 'https://a.example.com', tokenSecret: 'BARE_TOKEN' }],
         }),
-      ).toThrow(/must use qualified <environment>:<secret-name> syntax/);
+      ).toThrow(/must use qualified <context>:<secret-name> syntax/);
     });
 
-    it('rejects a tokenSecret with empty environment or secret-name halves', () => {
+    it('rejects a tokenSecret with empty context or secret-name halves', () => {
       expect(() =>
         workflow('ci', {
           jobs: [buildJob],
           registries: [{ url: 'https://a.example.com', tokenSecret: ':NAME_ONLY' }],
         }),
-      ).toThrow(/qualified <environment>:<secret-name>/);
+      ).toThrow(/qualified <context>:<secret-name>/);
       expect(() =>
         workflow('ci', {
           jobs: [buildJob],
           registries: [{ url: 'https://a.example.com', tokenSecret: 'env:' }],
         }),
-      ).toThrow(/qualified <environment>:<secret-name>/);
+      ).toThrow(/qualified <context>:<secret-name>/);
     });
 
     it('rejects a tokenSecret with more than one colon', () => {
@@ -437,7 +437,7 @@ describe('workflow()', () => {
           jobs: [buildJob],
           registries: [{ url: 'https://a.example.com', tokenSecret: 'env:NAME:EXTRA' }],
         }),
-      ).toThrow(/qualified <environment>:<secret-name>/);
+      ).toThrow(/qualified <context>:<secret-name>/);
     });
 
     it('accepts an installEnv array of qualified secret refs', () => {
@@ -455,7 +455,7 @@ describe('workflow()', () => {
           jobs: [buildJob],
           installEnv: ['BARE_NAME'],
         }),
-      ).toThrow(/installEnv\[0\] must use qualified <environment>:<secret-name>/);
+      ).toThrow(/installEnv\[0\] must use qualified <context>:<secret-name>/);
     });
 
     it('leaves registries and installEnv undefined by default', () => {

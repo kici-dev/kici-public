@@ -536,7 +536,7 @@ describe('PgSecretStore', () => {
     });
 
     it('renameScope rejects renaming a scope that does not exist', async () => {
-      // Empty select rows → no scoped_secrets and no environment_bindings for
+      // Empty select rows → no scoped_secrets and no context_bindings for
       // the old scope, so the rename must throw rather than silently succeed
       // (which the dashboard would surface as a misleading 200).
       const db = createMockDb({ selectRows: [] });

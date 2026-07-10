@@ -1,8 +1,8 @@
 /**
- * Tests for SecretResolver (environment-binding-based resolution).
+ * Tests for SecretResolver (context-binding-based resolution).
  *
- * The resolver takes an org + environment name, looks up bindings,
- * matches them against scoped secrets via resolveSecretsForEnvironment,
+ * The resolver takes an org + context name, looks up bindings,
+ * matches them against scoped secrets via resolveSecretsForContext,
  * decrypts matching secrets, and returns a flat key-value map.
  *
  * After the multi-backend migration, all scopes and binding patterns are
@@ -12,18 +12,18 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SecretResolver } from './secret-resolver.js';
-import type { EnvironmentBinding, ScopedSecret } from '@kici-dev/engine';
+import type { ContextBinding, ScopedSecret } from '@kici-dev/engine';
 import type { Logger } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
 // ── Mock stores ────────────────────────────────────────────────
 
-interface MockEnvironmentStore {
+interface MockContextStore {
   getByName: ReturnType<typeof vi.fn>;
 }
 
 interface MockBindingStore {
-  getByEnvironmentId: ReturnType<typeof vi.fn>;
+  getByContextId: ReturnType<typeof vi.fn>;
 }
 
 interface MockSecretStore {
@@ -35,11 +35,11 @@ function makeAuditLogger(): AuditLogger {
   return { log: vi.fn(), query: vi.fn() } as unknown as AuditLogger;
 }
 
-function makeBinding(overrides: Partial<EnvironmentBinding> = {}): EnvironmentBinding {
+function makeBinding(overrides: Partial<ContextBinding> = {}): ContextBinding {
   return {
     id: 'bind-1',
     orgId: 'org-1',
-    environmentId: 'env-1',
+    contextId: 'env-1',
     scopePattern: 'pg:aws/prod/**',
     hostPattern: '**',
     createdAt: '2026-01-01T00:00:00Z',
@@ -73,7 +73,7 @@ function makeLogger(): Logger {
 }
 
 describe('SecretResolver', () => {
-  let envStore: MockEnvironmentStore;
+  let envStore: MockContextStore;
   let bindingStore: MockBindingStore;
   let secretStore: MockSecretStore;
   let auditLogger: AuditLogger;
@@ -81,7 +81,7 @@ describe('SecretResolver', () => {
 
   beforeEach(() => {
     envStore = { getByName: vi.fn() };
-    bindingStore = { getByEnvironmentId: vi.fn() };
+    bindingStore = { getByContextId: vi.fn() };
     secretStore = {
       getAllSecrets: vi.fn(),
       decrypt: vi.fn(),
@@ -98,7 +98,7 @@ describe('SecretResolver', () => {
       }
     }
     return new SecretResolver({
-      environmentStore: envStore as any,
+      contextStore: envStore as any,
       bindingStore: bindingStore as any,
       backendStores,
       auditLogger,
@@ -106,9 +106,9 @@ describe('SecretResolver', () => {
     });
   }
 
-  it('resolves secrets for environment with matching bindings', async () => {
+  it('resolves secrets for context with matching bindings', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
     // Secrets are stored WITHOUT prefix; resolver adds 'pg:' prefix
@@ -131,7 +131,7 @@ describe('SecretResolver', () => {
     expect(result).toEqual({ DB_PASSWORD: 'dbpw', API_KEY: 'apikey' });
   });
 
-  it('returns empty secrets when no environment is found', async () => {
+  it('returns empty secrets when no context is found', async () => {
     envStore.getByName.mockResolvedValue(null);
 
     const resolver = createResolver();
@@ -140,9 +140,9 @@ describe('SecretResolver', () => {
     expect(result).toEqual({});
   });
 
-  it('returns empty secrets when environment has no bindings', async () => {
+  it('returns empty secrets when context has no bindings', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'staging', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([]);
+    bindingStore.getByContextId.mockResolvedValue([]);
     secretStore.getAllSecrets.mockResolvedValue([
       makeScopedSecret({ scope: 'aws/prod/db', key: 'DB_PASSWORD' }),
     ]);
@@ -155,7 +155,7 @@ describe('SecretResolver', () => {
 
   it('merges with longest-path-wins when multiple bindings match', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:**' }),
       makeBinding({ id: 'bind-2', scopePattern: 'pg:aws/prod/**' }),
     ]);
@@ -182,7 +182,7 @@ describe('SecretResolver', () => {
 
   it('returns empty when binding patterns do not match any secrets', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'staging', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:gcp/staging/**' }),
     ]);
     secretStore.getAllSecrets.mockResolvedValue([
@@ -197,7 +197,7 @@ describe('SecretResolver', () => {
 
   it('decrypts all matched secrets', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
     secretStore.getAllSecrets.mockResolvedValue([
@@ -228,7 +228,7 @@ describe('SecretResolver', () => {
 
   it('throws when a referenced backend store is unreachable', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
+    bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
     secretStore.getAllSecrets.mockRejectedValue(new Error('Connection refused'));
 
     const resolver = createResolver();
@@ -240,7 +240,7 @@ describe('SecretResolver', () => {
   it('succeeds when unreferenced vault backend is down but PG bindings are satisfied', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding only references pg secrets
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
 
@@ -275,9 +275,7 @@ describe('SecretResolver', () => {
   it('fails when vault backend is down and binding could match it', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding explicitly references vault-prod
-    bindingStore.getByEnvironmentId.mockResolvedValue([
-      makeBinding({ scopePattern: 'vault-prod:**' }),
-    ]);
+    bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'vault-prod:**' })]);
 
     // PG backend has secrets (but doesn't match vault-prod: prefix)
     secretStore.getAllSecrets.mockResolvedValue([
@@ -298,9 +296,7 @@ describe('SecretResolver', () => {
 
   it('resolveForJobWithMeta also applies scoped failure logic', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
-      makeBinding({ scopePattern: 'vault-prod:**' }),
-    ]);
+    bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'vault-prod:**' })]);
 
     secretStore.getAllSecrets.mockResolvedValue([]);
 
@@ -317,7 +313,7 @@ describe('SecretResolver', () => {
 
   it('all backends healthy works as before (regression)', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
     secretStore.getAllSecrets.mockResolvedValue([
@@ -337,7 +333,7 @@ describe('SecretResolver', () => {
 
   it('resolves secrets from multiple backends', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:**' }),
       makeBinding({ id: 'bind-2', scopePattern: 'vault-prod:**' }),
     ]);
@@ -375,7 +371,7 @@ describe('SecretResolver', () => {
   it('audit log only includes backends that contributed resolved secrets', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
     // Binding only matches pg secrets (not vault-prod)
-    bindingStore.getByEnvironmentId.mockResolvedValue([
+    bindingStore.getByContextId.mockResolvedValue([
       makeBinding({ scopePattern: 'pg:aws/prod/**' }),
     ]);
 
@@ -411,7 +407,7 @@ describe('SecretResolver', () => {
 
   it('resolveForJobWithMeta returns backend metadata per ', async () => {
     envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-    bindingStore.getByEnvironmentId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
+    bindingStore.getByContextId.mockResolvedValue([makeBinding({ scopePattern: 'pg:**' })]);
     secretStore.getAllSecrets.mockResolvedValue([
       makeScopedSecret({ scope: 'aws/prod', key: 'DB_PASSWORD', encryptedValue: 'enc:pw' }),
     ]);
@@ -514,7 +510,7 @@ describe('SecretResolver', () => {
   describe('per-host resolution (hostCtx)', () => {
     function seedHostScopedEnv() {
       envStore.getByName.mockResolvedValue({ id: 'env-1', name: 'production', orgId: 'org-1' });
-      bindingStore.getByEnvironmentId.mockResolvedValue([
+      bindingStore.getByContextId.mockResolvedValue([
         makeBinding({ scopePattern: 'pg:prod/shared/**', hostPattern: '**' }),
         makeBinding({
           id: 'bind-2',

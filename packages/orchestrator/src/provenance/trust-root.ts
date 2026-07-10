@@ -22,12 +22,36 @@ export interface ProvenanceTrustRoot {
 }
 
 export function createProvenanceTrustRoot(
-  opts: { issuer?: string | null; fetchImpl?: typeof fetch; ttlMs?: number } = {},
+  opts: {
+    issuer?: string | null;
+    fetchImpl?: typeof fetch;
+    ttlMs?: number;
+    /**
+     * In-process JWKS served directly (no HTTP fetch). Set for the offline local
+     * dev plane, whose `kici-local` issuer is not a URL — the plane's own signer
+     * is the key source, so a `kici-local` bundle verifies at ingest without a
+     * `.well-known/jwks.json` endpoint. When set, discovery/fetch is bypassed.
+     */
+    staticJwks?: JSONWebKeySet;
+  } = {},
 ): ProvenanceTrustRoot {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const ttlMs = opts.ttlMs ?? 5 * 60_000;
   let issuer: string | null = opts.issuer ?? null;
   let cache: { jwks: JSONWebKeySet; at: number } | null = null;
+
+  // Static in-process JWKS (local dev plane): serve it directly, ignore issuer
+  // mutations of the key set (the issuer stays `kici-local`), and never fetch.
+  if (opts.staticJwks) {
+    const staticJwks = opts.staticJwks;
+    return {
+      getIssuer: () => issuer,
+      getJwks: async () => staticJwks,
+      setIssuer: (next) => {
+        issuer = next;
+      },
+    };
+  }
 
   async function fetchJwks(): Promise<JSONWebKeySet | null> {
     if (!issuer) return null;

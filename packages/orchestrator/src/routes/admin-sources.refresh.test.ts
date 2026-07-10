@@ -28,13 +28,11 @@ describe('POST /sources/:routingKey/refresh', () => {
     const updateSource = vi.fn().mockResolvedValue(undefined);
     const sourceStore = createMockSourceStore({
       listSources: vi.fn().mockResolvedValue([ghRow]),
-      getSourceWithSecrets: vi
-        .fn()
-        .mockResolvedValue({
-          ...ghRow,
-          config: JSON.stringify({ appId: '42' }),
-          privateKey: 'pem',
-        }),
+      getSourceWithSecrets: vi.fn().mockResolvedValue({
+        ...ghRow,
+        config: JSON.stringify({ appId: '42' }),
+        privateKey: 'pem',
+      }),
       updateSource,
     });
     const fetchAppIdentity = vi.fn().mockResolvedValue({ name: 'New Name', slug: 'new-slug' });

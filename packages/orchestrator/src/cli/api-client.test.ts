@@ -95,6 +95,51 @@ describe('AdminApiClient', () => {
     expect(opts.method).toBe('DELETE');
   });
 
+  // --- Context management ---
+
+  it('sends POST for createContext with orgId/name/allowLocalExecution body', async () => {
+    const fetchMock = mockFetch(201, { envId: 'env-1', created: true });
+    globalThis.fetch = fetchMock;
+
+    const result = await client.createContext({
+      orgId: 'org-1',
+      name: 'production',
+      allowLocalExecution: true,
+    });
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BASE_URL}/api/v1/admin/contexts`);
+    expect(opts.method).toBe('POST');
+    expect(JSON.parse(opts.body)).toEqual({
+      orgId: 'org-1',
+      name: 'production',
+      allowLocalExecution: true,
+    });
+    expect(result).toEqual({ envId: 'env-1', created: true });
+  });
+
+  it('sends POST for bindContext to /contexts/:name/bind with scope + host body', async () => {
+    const fetchMock = mockFetch(200, { bound: true });
+    globalThis.fetch = fetchMock;
+
+    await client.bindContext({
+      orgId: 'org-1',
+      name: 'production',
+      scopePattern: 'production',
+      hostPattern: '**',
+    });
+
+    const [url, opts] = fetchMock.mock.calls[0];
+    expect(url).toBe(`${BASE_URL}/api/v1/admin/contexts/production/bind`);
+    expect(opts.method).toBe('POST');
+    // The name is a path segment, not part of the body.
+    expect(JSON.parse(opts.body)).toEqual({
+      orgId: 'org-1',
+      scopePattern: 'production',
+      hostPattern: '**',
+    });
+  });
+
   // --- Key rotation ---
 
   it('sends POST for rotateKey', async () => {

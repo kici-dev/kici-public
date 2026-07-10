@@ -43,7 +43,7 @@ import { registerOrgSettingsCommands } from './commands/org-settings.js';
 import { registerClusterNameCommands } from './commands/cluster-name.js';
 import { registerClusterCommands } from './commands/cluster.js';
 import { registerMaintenanceCommands } from './commands/maintenance.js';
-import { registerEnvironmentCommands } from './commands/environment.js';
+import { registerContextCommands } from './commands/context.js';
 import { registerVariableCommands } from './commands/variable.js';
 import { registerQueueCommands } from './commands/queue.js';
 import { registerExecutionCommands } from './commands/execution.js';
@@ -133,7 +133,7 @@ export function buildProgram(): Command {
   // verbs, so must run after registerSecretCommands / registerSourceCommands.
   registerMaintenanceCommands(program, getClient);
   // Environment CLI is a new top-level namespace (not an extension).
-  registerEnvironmentCommands(program, getClient);
+  registerContextCommands(program, getClient);
   // Variable CLI is a sibling namespace to `secret` — both write to the same
   // per-environment trust cone, gated by the dashboard-write policy.
   registerVariableCommands(program, getClient);

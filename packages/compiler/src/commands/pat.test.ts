@@ -47,7 +47,9 @@ describe('patCreateCommand', () => {
   it('mints a user PAT (no agentLabel) when --agent is absent', async () => {
     const fetchImpl = vi
       .fn()
-      .mockResolvedValue(jsonResponse({ id: 'p1', token: 'kici_pat_x', name: 'ci', expiresAt: 's' }));
+      .mockResolvedValue(
+        jsonResponse({ id: 'p1', token: 'kici_pat_x', name: 'ci', expiresAt: 's' }),
+      );
 
     const ok = await patCreateCommand({
       name: 'ci',

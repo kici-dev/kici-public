@@ -83,7 +83,7 @@ describe('createOidcTokenHandler', () => {
   function buildHandler(
     response: unknown,
     calls?: { count: number },
-    extra?: { testMode?: boolean; testMintDeferAudience?: string },
+    extra?: { testMode?: boolean; testMintDeferAudience?: string; testMintRejectAudience?: string },
   ) {
     const platformClient = {
       sendRequestAndAwait: async (_type: string, payload: Record<string, unknown>) => {
@@ -99,6 +99,7 @@ describe('createOidcTokenHandler', () => {
       orchestratorId: 'orch-1',
       testMode: extra?.testMode ?? false,
       testMintDeferAudience: extra?.testMintDeferAudience,
+      testMintRejectAudience: extra?.testMintRejectAudience,
     });
   }
 
@@ -208,6 +209,57 @@ describe('createOidcTokenHandler', () => {
         },
         undefined,
         { testMode: true, testMintDeferAudience: 'kici-provenance' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
+      expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+    });
+  });
+
+  describe('mint-reject fault injection — initial mint defers (test-only)', () => {
+    it('force-defers the initial mint for the reject-marker audience under test-mode', async () => {
+      const calls = { count: 0 };
+      // The initial agent mint must defer for the reject audience too, so a
+      // pending_attestations row is created that the retrier later rejects.
+      // The injection short-circuits BEFORE the Platform relay.
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        calls,
+        { testMode: true, testMintRejectAudience: 'kici-provenance-reject' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance-reject' });
+      expect(res).toEqual({ deferred: true, code: 'unavailable' });
+      expect(calls.count).toBe(0);
+    });
+
+    it('does NOT defer the reject audience when test-mode is off (real mint attempted)', async () => {
+      const calls = { count: 0 };
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        calls,
+        { testMode: false, testMintRejectAudience: 'kici-provenance-reject' },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance-reject' });
+      expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+      expect(calls.count).toBe(1);
+    });
+
+    it('does NOT defer a non-matching audience even with the reject marker set', async () => {
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        undefined,
+        { testMode: true, testMintRejectAudience: 'kici-provenance-reject' },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
       expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });

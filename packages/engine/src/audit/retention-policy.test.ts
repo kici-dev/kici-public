@@ -96,7 +96,7 @@ describe('retention-policy — access_log', () => {
     expect(ACCESS_LOG_WARM_DAYS['run.detail.read']).toBe(30);
     expect(ACCESS_LOG_WARM_DAYS['run.orch_logs.read']).toBe(30);
     expect(ACCESS_LOG_WARM_DAYS['step.logs.read']).toBe(30);
-    expect(ACCESS_LOG_WARM_DAYS['environment.list.read']).toBe(30);
+    expect(ACCESS_LOG_WARM_DAYS['context.list.read']).toBe(30);
   });
 
   it('internal-ops reads land in 30d bucket', () => {
@@ -107,9 +107,9 @@ describe('retention-policy — access_log', () => {
 
   it('sensitive reads + tenant mutations land in 180d bucket', () => {
     expect(ACCESS_LOG_WARM_DAYS['run.payload.read']).toBe(180);
-    expect(ACCESS_LOG_WARM_DAYS['env_var.list.read']).toBe(180);
+    expect(ACCESS_LOG_WARM_DAYS['context_var.list.read']).toBe(180);
     expect(ACCESS_LOG_WARM_DAYS['secret.list.read']).toBe(180);
-    expect(ACCESS_LOG_WARM_DAYS['environment.create']).toBe(180);
+    expect(ACCESS_LOG_WARM_DAYS['context.create']).toBe(180);
     expect(ACCESS_LOG_WARM_DAYS['run.cancel']).toBe(180);
     expect(ACCESS_LOG_WARM_DAYS['backend.sync']).toBe(180);
   });
@@ -153,17 +153,17 @@ describe('retention-policy — audit_log (Platform)', () => {
   });
 
   it('non-compliance actions default to 180d', () => {
-    expect(auditLogWarmDays('environment.create')).toBe(180);
+    expect(auditLogWarmDays('context.create')).toBe(180);
     expect(auditLogWarmDays('run.cancel')).toBe(180);
     expect(auditLogWarmDays('whatever.unknown')).toBe(180);
   });
 
   it('platform_operator actor promotes to 365d regardless of action', () => {
-    expect(
-      getAuditLogWarmDays({ action: 'environment.create', actorType: 'platform_operator' }),
-    ).toBe(365);
+    expect(getAuditLogWarmDays({ action: 'context.create', actorType: 'platform_operator' })).toBe(
+      365,
+    );
     expect(getAuditLogWarmDays({ action: 'plan.change', actorType: 'user' })).toBe(365);
-    expect(getAuditLogWarmDays({ action: 'environment.create', actorType: 'user' })).toBe(180);
+    expect(getAuditLogWarmDays({ action: 'context.create', actorType: 'user' })).toBe(180);
   });
 });
 
@@ -408,7 +408,7 @@ describe('retention-policy — cold retention (Phase 2)', () => {
   });
 
   it('auditLogColdDays returns 730 for tenant-plane mutations / unknown actions', () => {
-    expect(auditLogColdDays('environment.create')).toBe(730);
+    expect(auditLogColdDays('context.create')).toBe(730);
     expect(auditLogColdDays('run.cancel')).toBe(730);
     expect(auditLogColdDays('whatever.unknown')).toBe(730);
   });

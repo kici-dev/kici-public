@@ -55,10 +55,10 @@ import type { EventLogWriter } from '../webhook/event-log.js';
 import { EventLogSource } from '@kici-dev/engine';
 import { ExecutionJobStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { LockJob } from '@kici-dev/engine';
-import type { EnvironmentStore } from '../environments/environment-store.js';
-import type { VariableStore } from '../environments/variable-store.js';
+import type { ContextStore } from '../contexts/context-store.js';
+import type { VariableStore } from '../contexts/variable-store.js';
 import type { TrustResolver, IdentityLink, PermissionLevel } from '../security/trust-resolver.js';
-import type { HeldRunStore } from '../environments/held-runs.js';
+import type { HeldRunStore } from '../contexts/held-runs.js';
 import type { WorkflowDecision } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'pipeline' });
@@ -686,8 +686,8 @@ export function buildSecurityHoldSummary(
     parts.push(
       'Fork PR requires approval. Requires approval from a user with ci_trust:write or higher.',
     );
-  } else if (reason === 'environment_trust') {
-    parts.push('Environment requires a higher trust level than the contributor has.');
+  } else if (reason === 'context_trust') {
+    parts.push('Context requires a higher trust level than the contributor has.');
     parts.push('Requires approval from a user with ci_trust:write or higher.');
   } else {
     parts.push(`Held for security review: ${reason}`);
@@ -776,9 +776,9 @@ export interface ProcessingDeps {
   secretKey?: string;
   /** Log storage backend for persisting webhook payloads. Optional -- if not set, payload storage is skipped. */
   logStorage?: LogStorage;
-  /** Environment store for looking up deployment environments. Optional -- if not set, environment features are inactive. */
-  environmentStore?: EnvironmentStore;
-  /** Variable store for resolving environment variables. Optional -- if not set, environment vars are not merged. */
+  /** Context store for looking up deployment contexts. Optional -- if not set, context features are inactive. */
+  contextStore?: ContextStore;
+  /** Variable store for resolving context variables. Optional -- if not set, context vars are not merged. */
   variableStore?: VariableStore;
   /** Held run store for persisting protection rule holds. Optional -- if not set, holds are not persisted. */
   heldRunStore?: HeldRunStore;

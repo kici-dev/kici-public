@@ -853,12 +853,12 @@ describe('platformToOrchestratorMessageSchema', () => {
     expect(platformToOrchestratorMessageSchema.parse(msg)).toBeDefined();
   });
 
-  it('accepts dashboard.environments.history messages', () => {
+  it('accepts dashboard.contexts.history messages', () => {
     const msg = {
-      type: 'dashboard.environments.history',
+      type: 'dashboard.contexts.history',
       requestId: 'req-env-hist',
       actor: { type: 'user', sub: 'zsub-test' },
-      environmentId: 'env-prod-1',
+      contextId: 'env-prod-1',
       limit: 10,
       offset: 0,
     };
@@ -871,15 +871,15 @@ describe('platformToOrchestratorMessageSchema', () => {
     ).toThrow();
   });
 
-  it('accepts dashboard.environments.test_access.set messages', () => {
+  it('accepts dashboard.contexts.test_access.set messages', () => {
     // The Platform proxies this message verbatim to the orchestrator; if the
     // wire union rejects it, the orchestrator drops the frame and the
     // dashboard's test-access toggle times out with a 504.
     const msg = {
-      type: 'dashboard.environments.test_access.set',
+      type: 'dashboard.contexts.test_access.set',
       requestId: 'req-env-ta',
       actor: { type: 'user', sub: 'zsub-test' },
-      environmentId: 'env-1',
+      contextId: 'env-1',
       allowLocalExecution: true,
     };
     expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);

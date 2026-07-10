@@ -41,13 +41,13 @@ Single-file workflows, runnable with `pnpm kici preview <event> --config <path>`
 | [wait-for-marker.ts](./workflows/wait-for-marker.ts)                 | `waitForStep` polls until a producer job writes a marker file           | `push`       |
 | [parallel-lint-typecheck.ts](./workflows/parallel-lint-typecheck.ts) | `parallel([...])` runs independent checks concurrently within a job     | `push`       |
 
-### Project layout (`dynamic-environment/`)
+### Project layout (`dynamic-context/`)
 
 A repo-shaped example showing the real `.kici/workflows/` directory layout rather than a single file:
 
 | Example                                                                      | Description                                               | Triggers |
 | ---------------------------------------------------------------------------- | --------------------------------------------------------- | -------- |
-| [dynamic-deploy.ts](./dynamic-environment/.kici/workflows/dynamic-deploy.ts) | Per-event `environment` and `env` callbacks select target | `push`   |
+| [dynamic-deploy.ts](./dynamic-context/.kici/workflows/dynamic-deploy.ts) | Per-event `context` and `env` callbacks select target | `push`   |
 
 ## Adding Examples
 

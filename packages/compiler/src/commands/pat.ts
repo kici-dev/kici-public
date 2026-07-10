@@ -76,12 +76,16 @@ export async function patCreateCommand(options: PatCreateOptions = {}): Promise<
       } catch {
         /* ignore non-JSON body */
       }
-      console.error(pc.red(`Failed to create token (${res.status}): ${detail ?? 'request failed'}`));
+      console.error(
+        pc.red(`Failed to create token (${res.status}): ${detail ?? 'request failed'}`),
+      );
       return false;
     }
 
     const created = (await res.json()) as CreatePatResponse;
-    console.log(pc.bold(kind === PatKind.enum.agent ? '\nAgent PAT created.\n' : '\nPAT created.\n'));
+    console.log(
+      pc.bold(kind === PatKind.enum.agent ? '\nAgent PAT created.\n' : '\nPAT created.\n'),
+    );
     console.log(`${pc.gray('Name:   ')}${created.name}`);
     if (kind === PatKind.enum.agent) console.log(`${pc.gray('Agent:  ')}${label}`);
     console.log(`${pc.gray('Expires:')} ${created.expiresAt}`);

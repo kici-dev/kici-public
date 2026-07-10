@@ -167,6 +167,97 @@ kici-admin --url http://localhost:4000 --token $TOKEN config diff
 
 Output shows fields that differ between the local YAML and shared DB config.
 
+## Tuning cache limits
+
+The orchestrator maintains several caches, and their limits live on two planes:
+
+- **Cluster-wide defaults** — every cache limit is a shared-config field, set with
+  `kici-admin config set <field> <value>` (or seeded from the matching `KICI_*`
+  env var). These apply to all orgs on the cluster.
+- **Per-org overrides** — only the user-facing cache (`ctx.cache`) supports
+  per-tenant overrides, stored in `org_settings` and set with
+  `kici-admin org-settings user-cache ...`. When an override is unset (NULL), the
+  cluster-wide default applies.
+
+### Cache-limit fields
+
+| Field                  | Default            | Plane                                   | Controls                                                                     |
+| ---------------------- | ------------------ | --------------------------------------- | ---------------------------------------------------------------------------- |
+| `cacheMaxTarballBytes` | 524288000 (500 MB) | cluster-wide                            | Max size of a source / dependency tarball the blob-storage backend accepts   |
+| `cacheTtlDays`         | 30                 | cluster-wide                            | Retention (days) for the compiled-source, dependency, and attestation caches |
+| `cacheBuildTimeoutMs`  | 600000 (10 min)    | cluster-wide                            | Deadline for a single dependency-cache build operation                       |
+| `lockfileCache.max`    | 500                | cluster-wide                            | Max entries in the in-memory lock-file LRU cache                             |
+| `lockfileCache.ttlMs`  | 3600000 (1 h)      | cluster-wide                            | Per-entry TTL for the lock-file LRU cache                                    |
+| `userCacheQuotaBytes`  | 5368709120 (5 GiB) | cluster-wide default + per-org override | Byte quota for the user-facing cache (`ctx.cache`)                           |
+| `userCacheTtlMs`       | 604800000 (7 d)    | cluster-wide default + per-org override | Per-entry TTL for the user-facing cache                                      |
+
+### List and set the cluster-wide defaults
+
+Every field above is a shared-config field, so `config get` reads the current
+effective value (merged env > YAML > DB > defaults) and `config set` changes it
+for the whole cluster. Follow a set with `config reload` to apply it (these are
+hot-reloadable fields — no restart needed):
+
+```bash
+# Inspect current values
+kici-admin --url http://localhost:4000 --token $TOKEN config get cacheMaxTarballBytes
+kici-admin --url http://localhost:4000 --token $TOKEN config get lockfileCache
+
+# Raise the source/dependency tarball cap to 1 GiB
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  config set cacheMaxTarballBytes 1073741824
+
+# Shorten the dependency-cache retention to 7 days
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  config set cacheTtlDays 7
+
+# Grow the lock-file LRU cache (dotted paths address nested fields)
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  config set lockfileCache.max 1000
+
+# Apply the changes across the cluster
+kici-admin --url http://localhost:4000 --token $TOKEN config reload
+```
+
+To list every config parameter (not just cache limits) with its current value,
+use `config get` with no path, or `config export` for the shared config alone:
+
+```bash
+kici-admin --url http://localhost:4000 --token $TOKEN config get            # full merged config
+kici-admin --url http://localhost:4000 --token $TOKEN config export --format yaml  # shared config only
+```
+
+For the complete field list with types and defaults, see the
+[Configuration reference](configuration.md).
+
+### Override the user cache per org
+
+The user-facing cache (`ctx.cache`, and the declarative job/step `cache:` field)
+is the only cache with a per-tenant override. Use `org-settings user-cache` to
+raise one org's budget or retention without touching the cluster default:
+
+```bash
+# Give one org a 20 GiB quota and 30-day retention
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  org-settings user-cache set-quota 21474836480 --customer-id <org>
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  org-settings user-cache set-ttl 2592000000 --customer-id <org>
+
+# Show the effective per-org values (null = cluster default applies)
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  org-settings user-cache show --customer-id <org>
+
+# Drop an override and fall back to the cluster default
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  org-settings user-cache reset-quota --customer-id <org>
+kici-admin --url http://localhost:4000 --token $TOKEN \
+  org-settings user-cache reset-ttl --customer-id <org>
+```
+
+See the [kici-admin CLI reference](kici-admin-cli.md) for the full
+`org-settings user-cache` surface and [Storage layout: user cache](storage-layout.md#user-cache)
+for the eviction and TTL mechanics.
+
 ## Config history and rollback
 
 ### View version history

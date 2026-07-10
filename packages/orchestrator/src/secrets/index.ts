@@ -24,7 +24,7 @@ export {
   SecretResolver,
   type SecretResolverDeps,
   type ResolvedSecretMeta,
-  type EnvironmentStoreLike,
+  type ContextStoreLike,
   type BindingStoreLike,
   type SecretStoreLike,
 } from './secret-resolver.js';

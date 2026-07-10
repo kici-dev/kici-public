@@ -4,10 +4,10 @@
  * private registries.
  *
  * Each `tokenSecret` / `installEnv[]` entry uses the qualified
- * `<environment>:<secret-name>` syntax. The resolver:
+ * `<context>:<secret-name>` syntax. The resolver:
  *
- *   1. Parses every qualified ref and groups by environment name.
- *   2. Fires the per-environment protection-rule pipeline once per unique env
+ *   1. Parses every qualified ref and groups by context name.
+ *   2. Fires the per-context protection-rule pipeline once per unique env
  *      (branch / trust / concurrency / reviewer / wait-timer). A `reject`
  *      result fails the whole workflow dispatch with a clear reason; a
  *      `hold` / `wait` / `queue` result returns a structured `hold` decision
@@ -15,13 +15,13 @@
  *      run and resume it when the gate clears. On the resume path the caller
  *      sets `skipProtectionGate` so the gate (already satisfied) is bypassed
  *      and secrets are resolved directly.
- *   3. Resolves secrets per environment via `secretResolver.resolveForJob`
+ *   3. Resolves secrets per context via `secretResolver.resolveForJob`
  *      (which writes its own audit log lines).
  *   4. Validates each registry URL scheme: HTTPS always allowed; `http://`
  *      allowed only for loopback / `*.local` hosts OR when the org operator
  *      has flipped `org_settings.allow_http_npm_registries=true`.
  *   5. Strips the resolved auth entirely when the contributor-trust tier is
- *      not `trusted` (defense in depth: even if a misconfigured environment
+ *      not `trusted` (defense in depth: even if a misconfigured context
  *      lets an unknown contributor through the protection-pipeline trust
  *      gate, this strip ensures fork PRs never see registry tokens — the
  *      install fails naturally because the deps are unreachable).
@@ -33,12 +33,12 @@
 import type { ApproverClause, LockRegistry, TrustTier } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
-import type { EnvironmentStore } from '../environments/environment-store.js';
-import { toEnvironment } from '../environments/environment-store.js';
+import type { ContextStore } from '../contexts/context-store.js';
+import { toContext } from '../contexts/context-store.js';
 import {
   evaluateProtectionRules,
   type JobDispatchContext,
-} from '../environments/protection/pipeline.js';
+} from '../contexts/protection/pipeline.js';
 import {
   InstallSecretsChannel,
   InstallSecretsDecisionReason,
@@ -86,7 +86,7 @@ export interface ResolveInstallSecretsArgs {
   allowHttpNpmRegistries: boolean;
   resolvedOrgId: string;
   trustResolution: TrustResolution | undefined;
-  environmentStore: EnvironmentStore | undefined;
+  contextStore: ContextStore | undefined;
   secretResolver: SecretResolverApi | undefined;
   protectionContext: JobDispatchContext;
   /**
@@ -116,17 +116,17 @@ export type ResolveInstallSecretsResult =
       decision: 'hold';
       /** The gate action that paused the dispatch. */
       action: 'hold' | 'wait' | 'queue';
-      /** The environment whose install gate held. */
+      /** The context whose install gate held. */
       envName: string;
-      /** Resolved environment id (for the held row). */
-      environmentId: string;
+      /** Resolved context id (for the held row). */
+      contextId: string;
       /** Discriminates the release trigger: 'reviewer' | 'wait_timer' | 'concurrency' | 'security'. */
       holdType: string;
-      queueType: 'environment' | 'security';
+      queueType: 'context' | 'security';
       requirement: InstallHoldRequirement;
     };
 
-/** Parse `<environment>:<secret-name>`. Returns null on malformed input. */
+/** Parse `<context>:<secret-name>`. Returns null on malformed input. */
 export function parseQualifiedSecretRef(
   ref: string,
 ): { envName: string; secretName: string } | null {
@@ -217,7 +217,7 @@ function collectSecretRefs(
       if (!parsed) {
         return {
           ok: false,
-          reason: `registries[${i}].tokenSecret must use qualified <environment>:<secret-name> syntax (got ${reg.tokenSecret})`,
+          reason: `registries[${i}].tokenSecret must use qualified <context>:<secret-name> syntax (got ${reg.tokenSecret})`,
         };
       }
       registryRefs.push({ index: i, ...parsed });
@@ -233,7 +233,7 @@ function collectSecretRefs(
       if (!parsed) {
         return {
           ok: false,
-          reason: `installEnv[${i}] must use qualified <environment>:<secret-name> syntax (got ${ref})`,
+          reason: `installEnv[${i}] must use qualified <context>:<secret-name> syntax (got ${ref})`,
         };
       }
       installRefs.push(parsed);
@@ -255,7 +255,7 @@ function normalizeHoldType(action: 'hold' | 'wait' | 'queue', raw: string | unde
 }
 
 /**
- * Result of evaluating the per-environment install gates. `held` carries the
+ * Result of evaluating the per-context install gates. `held` carries the
  * structured gate outcome (action, env id, hold type, clauses, hold-expiry) so
  * the caller can pause the workflow dispatch as a workflow-scoped held run.
  */
@@ -267,7 +267,7 @@ type FireProtectionResult =
       reasonKind: 'held';
       action: 'hold' | 'wait' | 'queue';
       envName: string;
-      environmentId: string;
+      contextId: string;
       holdType: string;
       holdUntil: string | undefined;
       clauses: ApproverClause[];
@@ -275,7 +275,7 @@ type FireProtectionResult =
     };
 
 /**
- * Run the protection-rule pipeline once per unique environment. On the first
+ * Run the protection-rule pipeline once per unique context. On the first
  * `reject` env returns a reject result; on the first `hold`/`wait`/`queue` env
  * returns a structured `held` result. When `skipProtectionGate` is set (resume
  * path) the gate is bypassed entirely.
@@ -283,23 +283,23 @@ type FireProtectionResult =
 async function fireProtectionRulesPerEnv(args: {
   envNames: Iterable<string>;
   resolvedOrgId: string;
-  environmentStore: EnvironmentStore;
+  contextStore: ContextStore;
   trustResolution: TrustResolution | undefined;
   protectionContext: JobDispatchContext;
   skipProtectionGate: boolean;
 }): Promise<FireProtectionResult> {
-  const { envNames, resolvedOrgId, environmentStore, trustResolution, protectionContext } = args;
+  const { envNames, resolvedOrgId, contextStore, trustResolution, protectionContext } = args;
   if (args.skipProtectionGate) return { ok: true };
   for (const envName of envNames) {
-    const envRow = await environmentStore.matchEnvironment(resolvedOrgId, envName);
+    const envRow = await contextStore.matchContext(resolvedOrgId, envName);
     if (!envRow) {
       return {
         ok: false,
         reasonKind: 'env_not_found',
-        reason: `registries: refers to environment '${envName}' which does not exist`,
+        reason: `registries: refers to context '${envName}' which does not exist`,
       };
     }
-    const env = toEnvironment(envRow);
+    const env = toContext(envRow);
     // Workflow-level install has no per-job concurrency group — pass the
     // env name itself so the concurrency-gate counts on the env scope only.
     const concurrencyGroup = envName;
@@ -318,7 +318,7 @@ async function fireProtectionRulesPerEnv(args: {
       return {
         ok: false,
         reasonKind: 'protection_rule_block',
-        reason: `environment '${envName}' install gate reject: ${detail}`,
+        reason: `context '${envName}' install gate reject: ${detail}`,
       };
     }
     return {
@@ -326,11 +326,11 @@ async function fireProtectionRulesPerEnv(args: {
       reasonKind: 'held',
       action: result.action,
       envName,
-      environmentId: env.id,
+      contextId: env.id,
       holdType: normalizeHoldType(result.action, result.holdType),
       holdUntil: result.holdUntil,
       clauses: result.clauses ?? [],
-      reason: result.reason ?? `environment '${envName}' install gate ${result.action}`,
+      reason: result.reason ?? `context '${envName}' install gate ${result.action}`,
     };
   }
   return { ok: true };
@@ -384,11 +384,11 @@ export async function resolveInstallSecrets(
     }
   }
 
-  if (!args.environmentStore) {
+  if (!args.contextStore) {
     recordReject(InstallSecretsDecisionReason.MissingEnvStore);
     return {
       decision: 'reject',
-      reason: 'workflow declares registries:/installEnv: but environmentStore is not configured',
+      reason: 'workflow declares registries:/installEnv: but contextStore is not configured',
     };
   }
   if (!args.secretResolver) {
@@ -402,7 +402,7 @@ export async function resolveInstallSecrets(
   const gateResult = await fireProtectionRulesPerEnv({
     envNames: collected.envs.keys(),
     resolvedOrgId: args.resolvedOrgId,
-    environmentStore: args.environmentStore,
+    contextStore: args.contextStore,
     trustResolution: args.trustResolution,
     protectionContext: args.protectionContext,
     skipProtectionGate: args.skipProtectionGate ?? false,
@@ -415,9 +415,9 @@ export async function resolveInstallSecrets(
       decision: 'hold',
       action: gateResult.action,
       envName: gateResult.envName,
-      environmentId: gateResult.environmentId,
+      contextId: gateResult.contextId,
       holdType: gateResult.holdType,
-      queueType: gateResult.holdType === 'security' ? 'security' : 'environment',
+      queueType: gateResult.holdType === 'security' ? 'security' : 'context',
       requirement: {
         clauses: gateResult.clauses,
         expiresAt,
@@ -441,7 +441,7 @@ export async function resolveInstallSecrets(
     const startNs = performance.now();
     const resolved = await args.secretResolver.resolveForJob(args.resolvedOrgId, envName);
     installSecretsTokenResolutionDurationSeconds.record((performance.now() - startNs) / 1000, {
-      environment: envName,
+      context: envName,
     });
     perEnv.set(envName, resolved);
   }

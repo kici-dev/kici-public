@@ -30,7 +30,7 @@ import {
   staleDetectionDurationSeconds,
   setStaleRunsCurrent,
 } from '../metrics/prometheus.js';
-import type { HeldRunStore, ReleaseSignal } from '../environments/held-runs.js';
+import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import type { StepApprovalBridge } from '../approvals/step-approval-bridge.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { DispatchQueueStatus } from '../queue/job-queue.js';

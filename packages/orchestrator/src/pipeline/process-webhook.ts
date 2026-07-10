@@ -1556,7 +1556,10 @@ async function dispatchMatchedSameSourceWorkflows(args: {
       runId,
       trustResolution,
       lockFileSource,
-      localWorkingTree: false,
+      // A local `file://` in-place source runs against the operator's real
+      // working tree — mark the run local-working-tree so the source-pack
+      // `__build__` job is skipped and each job runs the tree directly.
+      localWorkingTree: dispatchBundle.localInPlace === true,
       crossSource: false,
       effectiveRoutingKey: resolvedFallbackRoutingKey ?? undefined,
       effectiveProvider: resolvedFallbackBundle

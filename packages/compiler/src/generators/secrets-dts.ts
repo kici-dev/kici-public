@@ -1,19 +1,19 @@
 /**
- * .d.ts generator for environment secret type augmentation.
+ * .d.ts generator for context secret type augmentation.
  *
  * Produces a TypeScript declaration file that augments @kici-dev/sdk's
- * KnownSecretKeys and EnvironmentSecrets interfaces, enabling compile-time
+ * KnownSecretKeys and ContextSecrets interfaces, enabling compile-time
  * autocomplete and type checking for `ctx.secrets.get()` and `ctx.secrets.expose()`
- * key names per environment.
+ * key names per context.
  */
 
-export interface EnvironmentMetadata {
+export interface ContextMetadata {
   name: string;
   keys: string[];
 }
 
 interface GenerateSecretsDtsOptions {
-  environments: EnvironmentMetadata[];
+  contexts: ContextMetadata[];
   endpoint: string;
   generatedAt: Date;
 }
@@ -34,11 +34,11 @@ function formatProperty(name: string): string {
 }
 
 /**
- * Build a map of key -> list of environment names that provide it.
+ * Build a map of key -> list of context names that provide it.
  */
-function buildKeySourceMap(environments: EnvironmentMetadata[]): Map<string, string[]> {
+function buildKeySourceMap(contexts: ContextMetadata[]): Map<string, string[]> {
   const map = new Map<string, string[]>();
-  for (const env of environments) {
+  for (const env of contexts) {
     for (const key of env.keys) {
       const sources = map.get(key);
       if (sources) {
@@ -52,16 +52,16 @@ function buildKeySourceMap(environments: EnvironmentMetadata[]): Map<string, str
 }
 
 /**
- * Generate a .d.ts string from environment metadata.
+ * Generate a .d.ts string from context metadata.
  *
- * The output augments @kici-dev/sdk's KnownSecretKeys and EnvironmentSecrets
- * interfaces, enabling compile-time autocomplete for secret keys per environment.
+ * The output augments @kici-dev/sdk's KnownSecretKeys and ContextSecrets
+ * interfaces, enabling compile-time autocomplete for secret keys per context.
  *
- * @param options - Environment metadata, endpoint URL, and generation timestamp
+ * @param options - Context metadata, endpoint URL, and generation timestamp
  * @returns The .d.ts file content as a string
  */
 export function generateSecretsDts(options: GenerateSecretsDtsOptions): string {
-  const { environments, endpoint, generatedAt } = options;
+  const { contexts, endpoint, generatedAt } = options;
   const lines: string[] = [];
 
   // Header comment
@@ -73,20 +73,20 @@ export function generateSecretsDts(options: GenerateSecretsDtsOptions): string {
 
   lines.push("declare module '@kici-dev/sdk' {");
 
-  // KnownSecretKeys: union of all keys across all environments
-  const keySourceMap = buildKeySourceMap(environments);
+  // KnownSecretKeys: union of all keys across all contexts
+  const keySourceMap = buildKeySourceMap(contexts);
   lines.push('  interface KnownSecretKeys {');
   for (const [key, sources] of keySourceMap) {
-    lines.push(`    /** From environment: ${sources.join(', ')} */`);
+    lines.push(`    /** From context: ${sources.join(', ')} */`);
     lines.push(`    ${formatProperty(key)}: string;`);
   }
   lines.push('  }');
 
   lines.push('');
 
-  // EnvironmentSecrets: each environment with its specific secret keys as union type
-  lines.push('  interface EnvironmentSecrets {');
-  for (const env of environments) {
+  // ContextSecrets: each context with its specific secret keys as union type
+  lines.push('  interface ContextSecrets {');
+  for (const env of contexts) {
     if (env.keys.length === 0) {
       lines.push(`    ${formatProperty(env.name)}: never;`);
     } else {

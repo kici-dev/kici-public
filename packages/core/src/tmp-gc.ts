@@ -3,7 +3,7 @@
  *
  * Work directories under the temp root normally remove themselves (job
  * runners clean up in `finally`), but two paths legitimately outlive their
- * creator: `kici run local` checkouts retained for inspection after a failed
+ * creator: `kici run --local` checkouts retained for inspection after a failed
  * run, and any workdir whose process died hard (SIGKILL, OOM) before its
  * cleanup ran. Without a collector they accumulate node_modules-sized trees
  * until the temp filesystem runs out of inodes. Callers invoke this at a

@@ -269,7 +269,7 @@ describe('runsOnSelectorsForLockJob', () => {
 /**
  * Chainable Kysely `updateTable(...).set(...).where(...).execute()` stub that
  * records every `.set(...)` payload so a test can assert which run-row UPDATEs
- * fired (environment, trust, test-run).
+ * fired (context, trust, test-run).
  */
 function makeUpdateRecordingDb(): {
   db: unknown;
@@ -300,8 +300,9 @@ function makeSingleJobContext(over: {
   db?: unknown;
   executionTracker?: unknown;
   withBuildInfra?: boolean;
+  localWorkingTree?: boolean;
   runWideFlatSecrets?: Record<string, string>;
-  jobEnvironment?: string;
+  jobContext?: string;
   secretResolver?: unknown;
   checkMode?: string;
 }): { ctx: WorkflowDispatchContext; dispatched: QueuedJobInput[] } {
@@ -319,9 +320,7 @@ function makeSingleJobContext(over: {
         steps: [{ name: 'echo', run: 'echo hi' }],
         needs: [],
         rules: [],
-        ...(over.jobEnvironment
-          ? { environments: [{ value: over.jobEnvironment, dynamic: false }] }
-          : {}),
+        ...(over.jobContext ? { contexts: [{ value: over.jobContext, dynamic: false }] } : {}),
       },
     ],
   } as unknown as LockWorkflow;
@@ -364,13 +363,13 @@ function makeSingleJobContext(over: {
     ...(over.db ? { db: over.db } : {}),
     ...(over.executionTracker ? { executionTracker: over.executionTracker } : {}),
     ...(over.secretResolver ? { secretResolver: over.secretResolver } : {}),
-    // An env-declaring job needs an environment store so the core resolves its
-    // per-job secrets (matchEnvironment returns a no-rules config).
-    ...(over.jobEnvironment
+    // An env-declaring job needs a context store so the core resolves its
+    // per-job secrets (matchContext returns a no-rules config).
+    ...(over.jobContext
       ? {
-          environmentStore: {
-            matchEnvironment: async (_org: string, n: string) =>
-              n === over.jobEnvironment
+          contextStore: {
+            matchContext: async (_org: string, n: string) =>
+              n === over.jobContext
                 ? {
                     id: `env-${n}`,
                     org_id: '__default__',
@@ -424,6 +423,7 @@ function makeSingleJobContext(over: {
     trustResolution: undefined,
     lockFileSource: undefined,
     crossSource: false,
+    localWorkingTree: over.localWorkingTree ?? false,
     extraJobConfig: {
       isTestRun: true,
       fixtureId: 'fx-1',
@@ -579,7 +579,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('layers run-wide CLI flat secrets onto an env-less job', async () => {
-    // `kici run --secret FOO=bar` on a job with no `environment:` must still
+    // `kici run --secret FOO=bar` on a job with no `context:` must still
     // receive the secret — the run-wide flat layer reaches every job.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
@@ -592,7 +592,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('merges run-wide CLI flat under the env-resolved secrets (CLI wins, no clobber)', async () => {
-    // An env-declaring job gets its environment secrets AND the run-wide CLI
+    // An env-declaring job gets its context secrets AND the run-wide CLI
     // flat overlay; on a key collision the CLI value wins (B1-env -> A-CLI-wins).
     const { db } = makeUpdateRecordingDb();
     // The env-rules path queries a running-count; answer 0 and supply db.fn.
@@ -621,7 +621,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
       bundle: undefined,
       fullRepo: true,
       testRun: { fixtureId: 'fx-1' },
-      jobEnvironment: 'staging',
+      jobContext: 'staging',
       db: envDb,
       secretResolver: {
         resolveForJob: async () => ({ DB_URL: 'env-db', SHARED: 'env' }),
@@ -653,6 +653,25 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     expect(names).toEqual(['build']); // the workflow's own static job, not __build__ci
     expect(names.some((n) => n.startsWith('__build__'))).toBe(false);
     // No cached source tarball is attached — the overlay is the source of truth.
+    expect(dispatched[0].sourceTarUrl).toBeUndefined();
+  });
+
+  it('skips the __build__ job for an in-place local run (localWorkingTree) even WITH a bundle', async () => {
+    // A `file://` in-place run has a bundle AND build infra, but the agent runs
+    // the operator's real tree directly — so the source-pack build must be
+    // skipped (packing a dist-less clone would be wrong) and no source tarball
+    // attached.
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      withBuildInfra: true,
+      localWorkingTree: true,
+    });
+    const result = await dispatchMatchedWorkflow(ctx);
+    expect(result.dispatchedJobCount).toBe(1);
+    const names = dispatched.map((d) => d.jobName);
+    expect(names).toEqual(['build']);
+    expect(names.some((n) => n.startsWith('__build__'))).toBe(false);
     expect(dispatched[0].sourceTarUrl).toBeUndefined();
   });
 });
@@ -693,10 +712,10 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     expect(updates.some((u) => 'is_test_run' in u)).toBe(false);
   });
 
-  it('stamps the matched environment_id on the run-level UPDATE for an env-bound job', async () => {
-    // The History tab keys off environment_id, so the run-level write must carry
-    // the configured env's id alongside the declared environment name. The env
-    // store's matchEnvironment returns `id: env-<name>` for the bound name.
+  it('stamps the matched context_id on the run-level UPDATE for an env-bound job', async () => {
+    // The History tab keys off context_id, so the run-level write must carry
+    // the configured env's id alongside the declared context name. The env
+    // store's matchContext returns `id: env-<name>` for the bound name.
     const { db, updates } = makeUpdateRecordingDb();
     const envDb = {
       ...(db as object),
@@ -725,7 +744,7 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     const { ctx } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
-      jobEnvironment: 'staging',
+      jobContext: 'staging',
       db: envDb,
       executionTracker,
       secretResolver: {
@@ -736,9 +755,9 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     });
     await dispatchMatchedWorkflow(ctx);
     await vi.waitFor(() => {
-      expect(
-        updates.some((u) => u.environment === 'staging' && u.environment_id === 'env-staging'),
-      ).toBe(true);
+      expect(updates.some((u) => u.context === 'staging' && u.context_id === 'env-staging')).toBe(
+        true,
+      );
     });
   });
 });

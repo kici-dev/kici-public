@@ -70,8 +70,8 @@ export interface RunDetailJobRow {
   agent_id: string | null;
   error_message: string | null;
   runs_on_labels: unknown;
-  environments: unknown;
-  skipped_environments: unknown;
+  contexts: unknown;
+  skipped_contexts: unknown;
   env_warning: string | null;
   outputs: unknown;
   init_failure: unknown;
@@ -105,15 +105,15 @@ export function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJo
       orchestratorId: null,
       errorMessage: job.error_message ?? null,
       runsOnLabels: (job.runs_on_labels as string[] | null) ?? null,
-      environments: job.environments
-        ? typeof job.environments === 'string'
-          ? (JSON.parse(job.environments) as string[])
-          : (job.environments as string[])
+      contexts: job.contexts
+        ? typeof job.contexts === 'string'
+          ? (JSON.parse(job.contexts) as string[])
+          : (job.contexts as string[])
         : null,
-      skippedEnvironments: job.skipped_environments
-        ? typeof job.skipped_environments === 'string'
-          ? (JSON.parse(job.skipped_environments) as string[])
-          : (job.skipped_environments as string[])
+      skippedContexts: job.skipped_contexts
+        ? typeof job.skipped_contexts === 'string'
+          ? (JSON.parse(job.skipped_contexts) as string[])
+          : (job.skipped_contexts as string[])
         : null,
       envWarning: job.env_warning ?? null,
       outputs: job.outputs
@@ -238,8 +238,8 @@ export async function aggregateRunDetail(
         'duration_ms',
         'error_message',
         'runs_on_labels',
-        'environments',
-        'skipped_environments',
+        'contexts',
+        'skipped_contexts',
         'env_warning',
         'outputs',
         'init_failure',

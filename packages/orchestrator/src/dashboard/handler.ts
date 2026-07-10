@@ -148,6 +148,13 @@ interface DashboardHandlerDeps {
     runId: string,
     triggeredBy: string | null,
     triggeredByAgentLabel: string | null,
+    /**
+     * Platform-minted `requestId` for this rerun. Stable across an HA relay
+     * failover re-send, so the orchestrator uses it as an idempotency key: a
+     * re-sent request returns the first coordinator's run instead of minting a
+     * second one.
+     */
+    requestId: string,
     routingKey?: string,
   ) => Promise<{ newRunId: string }>;
   /**
@@ -169,6 +176,12 @@ interface DashboardHandlerDeps {
     registrationId: string,
     triggeredBy: string | null,
     triggeredByAgentLabel: string | null,
+    /**
+     * Platform-minted `requestId` for this manual schedule. Used as an
+     * idempotency key so an HA relay failover re-send returns the first
+     * coordinator's run instead of minting a second one.
+     */
+    requestId: string,
   ) => Promise<{ newRunId: string }>;
   /**
    * Event store for the per-org DLQ surface. Optional — when absent the
@@ -177,6 +190,17 @@ interface DashboardHandlerDeps {
    * deployments the store is wired by `bootstrapOrchestrator`.
    */
   eventStore?: EventStore | null;
+  /**
+   * **Test-only.** Master switch for fault-injection knobs. When false the
+   * handler ignores every test-only knob below even if it is set.
+   */
+  testMode?: boolean;
+  /**
+   * **Test-only.** When set (and `testMode` is true), `handleRerunRequest`
+   * sleeps this many ms before invoking `onRerun`, so an HA E2E can force a
+   * slow first coordinator and trigger a relay failover. Ignored in production.
+   */
+  testRerunDelayMs?: number;
 }
 
 export class DashboardHandler {
@@ -194,6 +218,8 @@ export class DashboardHandler {
   private readonly coldStore: ColdStore | null;
   private readonly eventStore: EventStore | null;
   private readonly retryAttestations: DashboardHandlerDeps['retryAttestations'];
+  private readonly testMode: boolean;
+  private readonly testRerunDelayMs: number | undefined;
 
   constructor(deps: DashboardHandlerDeps) {
     this.db = deps.db;
@@ -210,6 +236,8 @@ export class DashboardHandler {
     this.coldStore = deps.coldStore ?? null;
     this.eventStore = deps.eventStore ?? null;
     this.retryAttestations = deps.retryAttestations;
+    this.testMode = deps.testMode ?? false;
+    this.testRerunDelayMs = deps.testRerunDelayMs;
   }
 
   /**
@@ -431,8 +459,8 @@ export class DashboardHandler {
           'duration_ms',
           'error_message',
           'runs_on_labels',
-          'environments',
-          'skipped_environments',
+          'contexts',
+          'skipped_contexts',
           'env_warning',
           'outputs',
           'init_failure',
@@ -769,25 +797,23 @@ export class DashboardHandler {
    */
   private async resolveRunJobAggregates(
     runIds: string[],
-  ): Promise<
-    Map<string, { jobCount: number; compileJobId: string | null; environments: string[] }>
-  > {
+  ): Promise<Map<string, { jobCount: number; compileJobId: string | null; contexts: string[] }>> {
     const map = new Map<
       string,
-      { jobCount: number; compileJobId: string | null; environments: string[] }
+      { jobCount: number; compileJobId: string | null; contexts: string[] }
     >();
     if (runIds.length === 0) return map;
 
     const jobRows = await this.db
       .selectFrom('execution_jobs')
-      .select(['run_id', 'job_id', 'job_name', 'environments'])
+      .select(['run_id', 'job_id', 'job_name', 'contexts'])
       .where('run_id', 'in', runIds)
       .execute();
 
     for (const j of jobRows) {
       let agg = map.get(j.run_id);
       if (!agg) {
-        agg = { jobCount: 0, compileJobId: null, environments: [] };
+        agg = { jobCount: 0, compileJobId: null, contexts: [] };
         map.set(j.run_id, agg);
       }
       agg.jobCount += 1;
@@ -797,14 +823,14 @@ export class DashboardHandler {
       if (j.job_name.startsWith('__build__') && !agg.compileJobId) {
         agg.compileJobId = j.job_id;
       }
-      // Distinct bound environments across the run's jobs, in first-seen order.
-      if (j.environments) {
+      // Distinct bound contexts across the run's jobs, in first-seen order.
+      if (j.contexts) {
         const names = (
-          typeof j.environments === 'string'
-            ? (JSON.parse(j.environments) as string[])
-            : (j.environments as string[])
-        ).filter((n) => !agg!.environments.includes(n));
-        agg.environments.push(...names);
+          typeof j.contexts === 'string'
+            ? (JSON.parse(j.contexts) as string[])
+            : (j.contexts as string[])
+        ).filter((n) => !agg!.contexts.includes(n));
+        agg.contexts.push(...names);
       }
     }
 
@@ -938,7 +964,7 @@ export class DashboardHandler {
           : [
               new Map<
                 string,
-                { jobCount: number; compileJobId: string | null; environments: string[] }
+                { jobCount: number; compileJobId: string | null; contexts: string[] }
               >(),
               new Map<string, { name: string | null; subtype: string; provider: string }>(),
             ];
@@ -2101,10 +2127,17 @@ export class DashboardHandler {
     const ctx = this.contextOrFallback(resolved);
 
     try {
+      // Test-only: slow the first coordinator so an HA E2E can force a relay
+      // failover and exercise the requestId idempotency claim.
+      if (this.testMode && this.testRerunDelayMs) {
+        logger.warn('rerun-delay fault-injection ACTIVE', { ms: this.testRerunDelayMs });
+        await new Promise((r) => setTimeout(r, this.testRerunDelayMs));
+      }
       const result = await this.onRerun(
         msg.runId,
         stringifyActor(msg.actor),
         agentLabelOf(msg.actor),
+        msg.requestId,
         msg.routingKey,
       );
 
@@ -2994,6 +3027,7 @@ export class DashboardHandler {
         msg.registrationId,
         stringifyActor(msg.actor),
         agentLabelOf(msg.actor),
+        msg.requestId,
       );
 
       this.recordAccess(
@@ -3191,9 +3225,8 @@ export class DashboardHandler {
       duration_ms: typeof r.duration_ms === 'number' ? r.duration_ms : null,
       error_message: typeof r.error_message === 'string' ? r.error_message : null,
       runs_on_labels: typeof r.runs_on_labels === 'string' ? r.runs_on_labels : null,
-      environments: typeof r.environments === 'string' ? r.environments : null,
-      skipped_environments:
-        typeof r.skipped_environments === 'string' ? r.skipped_environments : null,
+      contexts: typeof r.contexts === 'string' ? r.contexts : null,
+      skipped_contexts: typeof r.skipped_contexts === 'string' ? r.skipped_contexts : null,
       env_warning: typeof r.env_warning === 'string' ? r.env_warning : null,
       outputs: typeof r.outputs === 'string' ? r.outputs : null,
       init_failure: (r.init_failure as InitFailure | null) ?? null,
@@ -3349,10 +3382,7 @@ interface RunSummaryRow {
  */
 function mapRunSummary(
   r: RunSummaryRow,
-  jobAggregates: Map<
-    string,
-    { jobCount: number; compileJobId: string | null; environments: string[] }
-  >,
+  jobAggregates: Map<string, { jobCount: number; compileJobId: string | null; contexts: string[] }>,
   sourceIdentities: Map<string, { name: string | null; subtype: string; provider: string }>,
 ): DashboardRunSummary {
   const agg = jobAggregates.get(r.run_id);
@@ -3381,7 +3411,7 @@ function mapRunSummary(
     ...(r.failure_reason ? { failureReason: r.failure_reason } : {}),
     ...(agg ? { jobCount: agg.jobCount, hadCompileJob: agg.compileJobId !== null } : {}),
     ...(agg?.compileJobId ? { compileJobId: agg.compileJobId } : {}),
-    ...(agg && agg.environments.length > 0 ? { environments: agg.environments } : {}),
+    ...(agg && agg.contexts.length > 0 ? { contexts: agg.contexts } : {}),
     source: {
       routingKey,
       name: identity?.name ?? null,

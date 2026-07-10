@@ -53,7 +53,7 @@ describe('getDashboardWriteOperationDescriptor', () => {
     expect(d.name).toBe('secrets.set');
     expect(d.category).toBe('Secrets');
     expect(d.sensitivity).toBe('plaintext');
-    expect(d.wireMessageType).toBe('dashboard.environments.secrets.set');
+    expect(d.wireMessageType).toBe('dashboard.contexts.secrets.set');
   });
 
   it('throws on an unknown operation', () => {

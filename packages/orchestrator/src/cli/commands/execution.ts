@@ -45,7 +45,7 @@ function printRunsTable(runs: ExecutionRunRow[]): void {
     r.workflow_name,
     r.status,
     r.routing_key ?? '-',
-    r.environment ?? '-',
+    r.context ?? '-',
     String(r.created_at),
   ]);
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((row) => row[i].length)));
@@ -63,7 +63,7 @@ function printRunShow(run: ExecutionRunRow, jobs: ExecutionJobRow[]): void {
   console.log(`ref:        ${run.ref}`);
   console.log(`sha:        ${run.sha}`);
   console.log(`routing:    ${run.routing_key ?? '-'}`);
-  console.log(`env:        ${run.environment ?? '-'}`);
+  console.log(`env:        ${run.context ?? '-'}`);
   console.log(`created_at: ${run.created_at}`);
   if (run.completed_at) console.log(`completed:  ${run.completed_at}`);
   if (run.duration_ms !== null) console.log(`duration:   ${run.duration_ms}ms`);

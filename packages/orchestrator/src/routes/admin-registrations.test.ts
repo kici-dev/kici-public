@@ -378,7 +378,7 @@ describe('admin registration routes', () => {
   // ---- POST /registrations/register-manual (satisfiability) ----
 
   describe('POST /registrations/register-manual', () => {
-    // Returns the DB-row shape `matchEnvironment` resolves; the route converts it
+    // Returns the DB-row shape `matchContext` resolves; the route converts it
     // via `toEnvironment` before the satisfiability check.
     function envRecord(name: string, branchRestrictions: string[]) {
       return {
@@ -417,7 +417,7 @@ describe('admin registration routes', () => {
               jobs: [
                 {
                   name: 'deploy',
-                  environments: envValues.map((v) => ({ value: v, dynamic: false })),
+                  contexts: envValues.map((v) => ({ value: v, dynamic: false })),
                 },
               ],
             },
@@ -427,12 +427,12 @@ describe('admin registration routes', () => {
     }
 
     it('rejects a mutually-exclusive multi-env binding with a precise message', async () => {
-      const matchEnvironment = vi.fn(async (_org: string, name: string) =>
+      const matchContext = vi.fn(async (_org: string, name: string) =>
         name === 'staging' ? envRecord('staging', ['main']) : envRecord('testing', ['develop']),
       );
       deps = createMockDeps({
         registrationStore: { ...(createMockDeps().registrationStore as any), replaceAll: vi.fn() },
-        environmentStore: { matchEnvironment } as any,
+        contextStore: { matchContext } as any,
       });
       app = createAdminRegistrationRoutes(deps);
       (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
@@ -448,16 +448,14 @@ describe('admin registration routes', () => {
     });
 
     it('accepts a satisfiable multi-env binding', async () => {
-      const matchEnvironment = vi.fn(async (_org: string, name: string) =>
-        envRecord(name, ['main']),
-      );
+      const matchContext = vi.fn(async (_org: string, name: string) => envRecord(name, ['main']));
       deps = createMockDeps({
         registrationStore: {
           ...(createMockDeps().registrationStore as any),
           replaceAll: vi.fn(),
           bumpVersion: vi.fn().mockResolvedValue(7),
         },
-        environmentStore: { matchEnvironment } as any,
+        contextStore: { matchContext } as any,
       });
       app = createAdminRegistrationRoutes(deps);
       (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
@@ -472,16 +470,16 @@ describe('admin registration routes', () => {
 
     it('accepts a binding to environments with no configured record (lenient)', async () => {
       // Reproduces the scaler-container cross-source E2E: the lock binds env
-      // names that have no environment record in this orchestrator. matchEnvironment
+      // names that have no environment record in this orchestrator. matchContext
       // returns null → the binding is satisfiable (lenient), so register-manual 200s.
-      const matchEnvironment = vi.fn(async () => null);
+      const matchContext = vi.fn(async () => null);
       deps = createMockDeps({
         registrationStore: {
           ...(createMockDeps().registrationStore as any),
           replaceAll: vi.fn(),
           bumpVersion: vi.fn().mockResolvedValue(9),
         },
-        environmentStore: { matchEnvironment } as any,
+        contextStore: { matchContext } as any,
       });
       app = createAdminRegistrationRoutes(deps);
       (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });

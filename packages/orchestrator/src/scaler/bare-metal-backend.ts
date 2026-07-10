@@ -12,6 +12,7 @@ import { createInterface } from 'node:readline';
 import {
   ALLOWED_SYSTEM_VARS,
   KICI_AGENT_ENV_PREFIX,
+  buildTrustedPassthroughEnv,
   scalerAgentLabels,
   ScalerBackendType,
 } from '@kici-dev/engine';
@@ -232,13 +233,30 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     emit(ScalerEventType.enum['scaler.provisioning'], 'spawning agent process');
 
-    // Build sanitized env for agent process (no ...process.env spread!)
+    // Trusted fleet-agent profile: the matched label set carries
+    // KICI_TRUSTED_ENV=true (or the operator set the global
+    // KICI_AGENT_ENV_KICI_TRUSTED_ENV=true). Agent-launch property ONLY —
+    // never derivable from a dispatch payload.
+    const trustedEnv =
+      matchedLabelSet.env?.KICI_TRUSTED_ENV === 'true' ||
+      process.env.KICI_AGENT_ENV_KICI_TRUSTED_ENV === 'true';
+
+    // Build sanitized env for agent process (no blanket ...process.env spread).
     const env: Record<string, string> = {};
 
-    // 1. Allowlisted system vars from orchestrator process.env
-    for (const key of ALLOWED_SYSTEM_VARS) {
-      const value = process.env[key];
-      if (value !== undefined) env[key] = value;
+    // 1. System vars. Default profile copies only the explicit allowlist; the
+    //    trusted profile forwards the ambient host env minus the scrub-list, so
+    //    a trusted host-configuration agent inherits the operator's ambient
+    //    credentials (sops/ssh/aws) while the orchestrator's own KiCI
+    //    identity/operational secrets are still stripped. The explicit KICI_*
+    //    identity assignments below re-set the agent's own values after this.
+    if (trustedEnv) {
+      Object.assign(env, buildTrustedPassthroughEnv(process.env));
+    } else {
+      for (const key of ALLOWED_SYSTEM_VARS) {
+        const value = process.env[key];
+        if (value !== undefined) env[key] = value;
+      }
     }
 
     // 2. KICI_AGENT_ENV_ forwarded vars (prefix stripped)
@@ -279,6 +297,19 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     // 4. Label-set env from scalers.yaml (highest priority, overrides KICI_AGENT_ENV_)
     Object.assign(env, matchedLabelSet.env ?? {});
+
+    // Log the trusted-env decision explicitly (mirrors the KICI_SANDBOX
+    // validation surface): a trusted agent runs steps with the ambient host env
+    // passed through, so the decision is auditable at spawn time.
+    if (trustedEnv) {
+      const logger = createLogger({ prefix: 'bare-metal-backend' });
+      logger.info(
+        `Spawning TRUSTED-ENV agent "${agentId}" for scaler "${this.name}" ` +
+          `(label set [${labelSet.join(', ')}]). Ambient host env is passed through to ` +
+          `workflow steps (minus the agent's own KiCI identity secrets). ` +
+          `KICI_SANDBOX=${env.KICI_SANDBOX ?? 'false'}.`,
+      );
+    }
 
     // Resolve cgroup wrapping: enforce only on Linux when enforceCgroups is true
     // and effectiveLimits has at least one positive field. Otherwise spawn the

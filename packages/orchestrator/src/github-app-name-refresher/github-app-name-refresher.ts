@@ -25,9 +25,14 @@ export interface RefreshableSourceStore {
   listSources(): Promise<
     Array<{ routing_key: string; provider: string; name: string; slug: string | null }>
   >;
-  getSourceWithSecrets(
-    routingKey: string,
-  ): Promise<{ provider: string; config: string; privateKey: string } | null>;
+  getSourceWithSecrets(routingKey: string): Promise<{
+    provider: string;
+    // The `sources.config` column is jsonb, so the driver hands it back as an
+    // already-parsed object on read; only the write path stringifies it. Type it
+    // as either so the parse below stays honest.
+    config: string | Record<string, unknown>;
+    privateKey: string;
+  } | null>;
   updateSource(
     routingKey: string,
     updates: { name?: string; slug?: string | null },
@@ -76,7 +81,9 @@ export async function refreshGithubSourceIdentity(
   if (!withSecrets) {
     throw new Error(`Source ${routingKey} has no stored credentials to authenticate with GitHub.`);
   }
-  const config = JSON.parse(withSecrets.config) as { appId: string };
+  const config = (
+    typeof withSecrets.config === 'string' ? JSON.parse(withSecrets.config) : withSecrets.config
+  ) as { appId: string };
   const identity = await fetchIdentity({
     appId: config.appId,
     privateKey: withSecrets.privateKey,

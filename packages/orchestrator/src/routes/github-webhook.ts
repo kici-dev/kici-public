@@ -25,8 +25,8 @@ export interface GithubWebhookRoutesDeps {
 
 /**
  * Whether the orchestrator serves the direct GitHub ingress route for a given
- * operating mode. Hybrid + independent run local source config; platform mode
- * is relay-only (no local GitHub source to serve).
+ * operating mode. Hybrid and independent modes serve a local GitHub source
+ * config; platform mode is relay-only (no local GitHub source to serve).
  */
 export function shouldServeGithubIngress(mode: 'platform' | 'hybrid' | 'independent'): boolean {
   return mode === 'hybrid' || mode === 'independent';

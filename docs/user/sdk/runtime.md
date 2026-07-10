@@ -457,14 +457,14 @@ verify → view journey, including how to verify a bundle with `kici verify-atte
 
 Workflows access secrets through `ctx.secrets` on `StepContext`. Use `await ctx.secrets.get('KEY')` to retrieve a value (rejects with `SecretNotFoundError` if the key is missing, fail-fast on typos), `ctx.secrets.has('KEY')` for a synchronous existence check, and `await ctx.secrets.expose('KEY')` when you need the value as a `process.env` entry for a child process.
 
-### Declaring the secret environment
+### Declaring the secret context
 
-Each job picks its secret environment via the `environment` option on `job()`. The orchestrator resolves the environment's scoped-secret store at dispatch time, evaluates access rules, and sends the decrypted secrets to the agent:
+Each job picks its secret context via the `context` option on `job()`. The orchestrator resolves the context's scoped-secret store at dispatch time, evaluates access rules, and sends the decrypted secrets to the agent:
 
 ```typescript
 const deploy = job('deploy', {
   runsOn: 'linux',
-  environment: 'production',
+  context: 'production',
   steps: [
     /* ... */
   ],
@@ -476,11 +476,11 @@ export default workflow('deploy', {
 });
 ```
 
-`environment` accepts either a static string or an async function `(event) => string | Promise<string>` for dynamic resolution at trigger-evaluation time. The resolved environment's secrets are flattened into `ctx.secrets`.
+`context` accepts either a static string or an async function `(event) => string | Promise<string>` for dynamic resolution at trigger-evaluation time. The resolved context's secrets are flattened into `ctx.secrets`.
 
 ### Accessing secrets (ctx.secrets)
 
-`ctx.secrets` provides flat access to the secrets resolved for the job's environment.
+`ctx.secrets` provides flat access to the secrets resolved for the job's context.
 
 ```typescript
 step('deploy', async ({ secrets }) => {

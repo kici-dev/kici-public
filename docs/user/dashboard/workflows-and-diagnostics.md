@@ -33,5 +33,5 @@ The infrastructure page (`/orgs/:customerId/infrastructure`) provides infrastruc
 
 ## Per-cluster views
 
-Click an orchestrator's **Manage →** link in the infrastructure tree to drill into that cluster's per-orch surfaces (security policy, environments, secrets, DLQ, registrations, global workflows), keyed by **cluster name** — the human-friendly name set on the orch via `kici-admin cluster-name set <name>`, or an auto-generated `cluster-<6hex>` if no operator has renamed it. Different clusters in the same org can have different settings, so the tree row is the entry point that lets you pick which cluster you're configuring.
+Click an orchestrator's **Manage →** link in the infrastructure tree to drill into that cluster's per-orch surfaces (security policy, contexts, secrets, DLQ, registrations, global workflows), keyed by **cluster name** — the human-friendly name set on the orch via `kici-admin cluster-name set <name>`, or an auto-generated `cluster-<6hex>` if no operator has renamed it. Different clusters in the same org can have different settings, so the tree row is the entry point that lets you pick which cluster you're configuring.
 

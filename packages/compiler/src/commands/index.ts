@@ -9,7 +9,10 @@ export type { FixtureOptions } from './fixture.js';
 export { previewCommand, previewEvent } from './preview.js';
 export type { PreviewOptions, RemoteRunOptions, RemoteRunResult } from './preview.js';
 
-export { runLocalCommand, runRemoteCommand, printRunLocalUsage } from './run.js';
+export { runRemoteCommand } from './run.js';
+
+export { runRoutedCommand } from './run-routed.js';
+export type { RunRoutedOptions } from './run-routed.js';
 
 export { initCommand } from './init.js';
 export type { InitOptions } from './init.js';
@@ -54,6 +57,16 @@ export { orgListCommand, orgUseCommand, orgCurrentCommand } from './org.js';
 
 export { orchestratorsListCommand, orchestratorsUseCommand } from './orchestrators.js';
 export type { OrchestratorsOptions } from './orchestrators.js';
+
+export {
+  localUpCommand,
+  localStatusCommand,
+  localDownCommand,
+  localLogsCommand,
+  localAttachCommand,
+  localDetachCommand,
+} from './local.js';
+export { localTrustRootCommand } from './local-trust-root.js';
 
 export { logoutCommand } from './logout.js';
 
