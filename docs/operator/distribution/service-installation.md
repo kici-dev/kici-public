@@ -32,7 +32,7 @@ The host's installed instances are tracked at an **instance index**:
 - User-level: `~/.config/kici/instances.json` (Linux), `~/Library/Application Support/kici/instances.json` (macOS), `%LOCALAPPDATA%\kici\instances.json` (Windows).
 - System-level: `/etc/kici/instances.json` (Linux/macOS), `C:\ProgramData\kici\instances.json` (Windows).
 
-The index is a reconciled cache, not the source of truth. `install` also embeds the deploy folder directly in the generated service definition (an `X-KiCI-InstanceDir` directive in the systemd unit, the equivalent plist key / container label / service-description marker on other platforms). Every command rebuilds the index from the init system's native scan: it drops stale entries whose units are gone, and it re-adopts the deploy folder straight from the unit marker when the index entry is missing. So even if the index file is deleted or emptied, `--name` resolution still finds the deploy folder and the index self-heals on the next command. (Units installed before the marker existed have no embedded folder; for those, re-run `install`/`upgrade` once with `--instance-dir` to regenerate the unit with the marker.)
+The index is a reconciled cache, not the source of truth. `install` also embeds the deploy folder directly in the generated service definition (an `X-KiCI-InstanceDir` directive in the systemd unit, the equivalent plist key / container label / service-description marker on other platforms). Every command rebuilds the index from the init system's native scan: it drops stale entries whose units are gone, and it re-adopts the deploy folder straight from the unit marker when the index entry is missing. So even if the index file is deleted or emptied, `--name` resolution still finds the deploy folder and the index self-heals on the next command. (Units installed before the marker existed have no embedded folder; for those, re-run `install` once with `--instance-dir` to regenerate the service definition with the marker. On Unix, `upgrade` only swaps the version symlink and leaves the existing definition in place.)
 
 To point the instance index (and the per-instance config dirs) at a directory other than the platform default, set `KICI_CONFIG_ROOT`. This isolates one host's instances from another tool's — useful when test harnesses install throwaway instances alongside a real one and must not share its index.
 
@@ -59,6 +59,8 @@ Every lifecycle command — `uninstall`, `upgrade`, `start`, `stop`, `restart`, 
 3. A manifest in the current working directory (`./.kici-orchestrator.json` or `./.kici-agent.json`).
 
 If none of those resolve, the command exits non-zero with a candidate list of installed instances on the host. `--name` no longer has a default — a bare `kici-admin orchestrator uninstall` outside any deploy folder will refuse and list the candidates.
+
+`stop` and `uninstall` are **idempotent on a not-found `--name`**: if you pass `--name <n>` and no instance by that name is installed on the host, the command prints `… is not installed — nothing to stop/uninstall.` and exits 0 (there is nothing to remove). This is distinct from the ambiguous-targeting refusal above: supplying an explicit `--name` that simply isn't present is a successful no-op, so cleanup loops that stop/uninstall a set of candidate names across a fleet don't fail on the hosts where a given name was never installed.
 
 ## Prerequisites
 
@@ -159,23 +161,35 @@ digest ships with that build.
 
 ## Installation modes
 
-### Wizard mode (`--wizard`)
+### Wizard mode (default on an interactive terminal)
 
-Interactive guided setup. Asks only essential questions with sensible defaults:
+Interactive guided setup. On an interactive terminal a bare `kici-admin orchestrator install`
+runs the wizard by default; pass `--wizard` to force it, or `--no-wizard` to skip it and write
+a stub env file to edit by hand. The wizard asks only essential questions with sensible defaults:
 
-1. **Operating mode** -- Platform (connects to KiCI Cloud), Hybrid, or Independent
+1. **Operating mode** -- Platform (connects to the hosted KiCI Platform), Hybrid, Observed, or Independent
 2. **Database URL** -- PostgreSQL connection string
 3. **Port** -- HTTP server port (default: 4000)
 4. **Secrets key** -- 32-byte hex encryption key (auto-generated with option to customize)
-5. **Platform connection** (if Platform/Hybrid mode) -- relay URL and API key
+5. **Platform connection** (if Platform/Hybrid/Observed mode) -- Platform URL and API key; Observed mode also asks for the orchestrator's own public webhook base URL
+6. **GitHub App source** (optional, not offered in Observed mode) -- source name, App ID, private-key path, and webhook secret
 
 ```bash
-kici-admin orchestrator install --wizard
+kici-admin orchestrator install
 ```
+
+If you opt into a GitHub App source, the install prints a ready-to-run
+`kici-admin source add github ...` command in its "Next steps". Sources are added at
+runtime against a running orchestrator, so run that command once the orchestrator is
+started -- it is not persisted into the env file.
+
+In a non-interactive shell (CI, a provisioning script) the wizard is skipped automatically and
+`install` writes the stub env file, so scripted installs never block on a prompt.
 
 ### Flags mode
 
-Provide configuration via CLI flags or an existing env file:
+Provide configuration via CLI flags or an existing env file. Passing `--env-file`, `--no-wizard`,
+or `--dev` also skips the wizard:
 
 ```bash
 kici-admin orchestrator install \
@@ -197,7 +211,8 @@ Available flags:
 | `--instance-dir <path>` | Deploy folder where the instance manifest is written and resolved from                | Current working directory |
 | `--force`               | Overwrite a same-named instance already installed at a different `--instance-dir`     | Off                       |
 | `--dev`                 | Dev mode with local PostgreSQL                                                        | Off                       |
-| `--wizard`              | Interactive wizard mode                                                               | Off                       |
+| `--wizard`              | Run the interactive setup wizard                                                      | On (interactive terminal) |
+| `--no-wizard`           | Skip the wizard and write a stub env file to edit by hand                             | Off                       |
 
 ### Dev mode (`--dev`)
 
@@ -396,44 +411,43 @@ Previous versions of the resolved instance are preserved on disk for rollback. O
 
 ### npm-source upgrade (no archive)
 
-For deployments installed from npm, you can upgrade without supplying an archive. First update the global package, then run `upgrade` with no `--from`/`--url`:
+For deployments installed from npm, you can upgrade without supplying an archive. `upgrade` with no `--from`/`--url` is **self-driving** — a single command installs the correct global package under the unit's own runtime, restarts, and verifies:
 
 ```bash
 # Upgrade an npm-installed orchestrator to a published version.
-# The install unit is the `kici-admin` wrapper — it carries both the
-# orchestrator and the agent, and updating it refreshes the copies the
-# service unit's ExecStart points at.
-npm install -g kici-admin@<version>
 kici-admin orchestrator upgrade --version <version> --yes
 
-# The agent flavor uses the same wrapper install
+# The agent flavor works the same way
 kici-admin agent upgrade --version <version> --yes
 ```
 
-With no archive source, the upgrade:
+With no archive source, the self-driving upgrade:
 
-1. Validates that the running package version matches `--version` (guarding against an `npm install` that did not actually replace the global binary). Omit `--version` to default to the installed package version.
-2. Reads the launch command the installed service unit will actually execute (the `ExecStart` of the systemd unit, the `ProgramArguments` of the launchd plist, or the service binary path on Windows) and resolves the version that launch target will run from the package metadata next to it.
-3. Verifies that the resolved launch-target version matches the version of the `kici-admin` you just invoked. Only when they match does it restart the service and record the verified version in the instance manifest.
+1. Reads the launch command the installed service unit will actually execute (the `ExecStart` of the systemd unit, the `ProgramArguments` of the launchd plist, or the service binary path on Windows), and from it recovers **the unit's pinned node runtime** and **the global package its launch target resolves** — `kici-admin` when the component is loaded through kici-admin's nested `node_modules`, or the standalone `@kici-dev/<component>`.
+2. Runs `npm install -g <package>@<version>` using the npm co-located with that pinned node, so the install lands in exactly the global prefix the unit's launch path resolves from — regardless of which node your interactive shell has active.
+3. Restarts the service and verifies the unit now launches `<version>`. If the launched version does not match, the upgrade fails loudly rather than reporting a success it can't stand behind.
 
-No archive is downloaded, no versioned directory is created, and no symlink is flipped — the service unit already points at the global npm package, so a restart is all that is needed. The `--from`/`--url` archive flow (versioned directory, symlink, and rollback) is unchanged and remains the path for offline or air-gapped upgrades.
+No archive is downloaded, no versioned directory is created, and no symlink is flipped. The `--from`/`--url` archive flow (versioned directory, symlink, and rollback) is unchanged and remains a path for offline or air-gapped upgrades.
 
-#### Launch-version verification and the mismatch failure
+#### Why self-driving removes the runtime-mismatch footgun
 
-The upgrade resolves the version the service unit will _actually_ launch before it restarts anything or records a version. This catches the case where `npm install -g` updated a different install than the service is pinned to — for example, when several runtimes are managed side by side (mise, nvm, asdf) and the global install landed under a different runtime than the one the unit's launch path points at.
+Installing the package by hand (`npm install -g`) lands it under whichever node your shell's `PATH` resolves — which, under a version manager (mise, nvm, asdf), is often **not** the pinned node the unit's `ExecStart` points at. When they diverge, the unit keeps launching the old code even though the global package looks updated. The self-driving upgrade makes that impossible by construction: it installs with the unit's _own_ npm, so the copy it updates is exactly the copy the unit runs.
 
-If the version the unit will launch does not match the `kici-admin` you ran, the upgrade aborts **before** stopping the service, leaves the service running, and leaves the instance manifest untouched. The error names both versions and the launch path. Two ways to resolve it:
+#### `--restart-only` for pre-staged installs
 
-- Install the new version under the unit's own runtime — the runtime its launch path (`ExecStart` / `ProgramArguments` / service binary) points at — then re-run the upgrade.
-- Re-run `kici-admin orchestrator install` (or `kici-admin agent install`) to repoint the unit at the runtime where you installed the new version, then re-run the upgrade.
+If you have already installed the package yourself under the unit's runtime — an air-gapped host, a custom registry, or a bespoke provisioning flow — pass `--restart-only` to skip the self-driving install and just restart onto the already-installed package:
 
-This is why a refused npm-source upgrade never leaves a "now running version X" message behind a service that is still running the old code: the version is read from the unit's real launch target, not from the binary you happened to type.
+```bash
+kici-admin orchestrator upgrade --restart-only --yes
+```
+
+In restart-only mode the CLI reads the version the unit will actually launch, verifies it matches the invoking `kici-admin`, and only then restarts. If the versions diverge (your manual install landed under a different runtime than the unit is pinned to), it aborts **before** stopping the service and names both versions and the launch path.
 
 #### `--force` for opaque launch targets
 
-When the service was installed with an explicit `--binary` wrapper (or any launch target whose version can't be read), there is no package metadata to resolve, so the verification can't run. Passing `--force` bypasses the launch-target verification and restarts the service onto the installed package. Because the version could not be verified in that case, the upgrade deliberately leaves the manifest's recorded version unchanged rather than guessing. `--force` does not bypass the running-version check in step 1 — if the invoking `kici-admin`'s own version is itself unresolvable, the upgrade still refuses.
+When the service was installed with an explicit `--binary` wrapper (or any launch target whose version can't be read), there is no package metadata to resolve, so the self-driving install has no global package to update and the restart-only verification can't run. In restart-only mode, passing `--force` bypasses the launch-target verification and restarts onto the installed package, leaving the manifest's recorded version unchanged rather than guessing.
 
-The infrastructure page surfaces the latest published version next to each node's running version and reveals exactly this two-line command when an upgrade is available — see [Monitoring & tracing](../observability/monitoring.md).
+The infrastructure page surfaces the latest published version next to each node's running version and reveals exactly this one-command upgrade when a newer version is available — see [Monitoring & tracing](../observability/monitoring.md).
 
 ### Rollback
 
@@ -474,19 +488,20 @@ kici-admin orchestrator upgrade --instance-dir ~/kici-deploy --cleanup
 
 ### Upgrade CLI flags
 
-| Flag                    | Description                                                                                                                                                                                        |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--from <path>`         | Path to package archive (`.tar.gz` or `.zip`)                                                                                                                                                      |
-| `--url <url>`           | URL to download package archive from                                                                                                                                                               |
-| `--version <ver>`       | Target version string (e.g., `0.3.0`). Required for archive upgrades; for npm-source upgrades it is validated against the installed package and defaults to it when omitted                        |
-| `--rollback`            | Roll back the resolved instance to its previous version                                                                                                                                            |
-| `--pick`                | Interactively pick an already-installed version to activate (switch, no download). Requires an interactive terminal                                                                                |
-| `--cleanup`             | Remove old versions of the resolved instance (keeps current and previous)                                                                                                                          |
-| `--force`               | Archive upgrades: overwrite an existing versioned directory. npm-source upgrades: bypass launch-target version verification (for opaque `--binary` installs); restarts without recording a version |
-| `--yes`                 | Skip confirmation prompt                                                                                                                                                                           |
-| `--platform <type>`     | Force platform (`systemd`, `launchd`, `windows`, `compose`)                                                                                                                                        |
-| `--instance-dir <path>` | Deploy folder of the instance to upgrade                                                                                                                                                           |
-| `--name <name>`         | Service name (no default — must resolve via flag or CWD manifest)                                                                                                                                  |
+| Flag                    | Description                                                                                                                                                                                                |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--from <path>`         | Path to package archive (`.tar.gz` or `.zip`)                                                                                                                                                              |
+| `--url <url>`           | URL to download package archive from                                                                                                                                                                       |
+| `--version <ver>`       | Target version string (e.g., `0.3.0`). Required for archive upgrades and for the self-driving npm-source upgrade (the version to install)                                                                  |
+| `--restart-only`        | npm-source upgrades: skip the self-driving install and just restart onto an already-installed package (pre-staged / air-gapped path)                                                                       |
+| `--rollback`            | Roll back the resolved instance to its previous version                                                                                                                                                    |
+| `--pick`                | Interactively pick an already-installed version to activate (switch, no download). Requires an interactive terminal                                                                                        |
+| `--cleanup`             | Remove old versions of the resolved instance (keeps current and previous)                                                                                                                                  |
+| `--force`               | Archive upgrades: overwrite an existing versioned directory. npm-source `--restart-only`: bypass launch-target version verification (for opaque `--binary` installs); restarts without recording a version |
+| `--yes`                 | Skip confirmation prompt                                                                                                                                                                                   |
+| `--platform <type>`     | Force platform (`systemd`, `launchd`, `windows`, `compose`)                                                                                                                                                |
+| `--instance-dir <path>` | Deploy folder of the instance to upgrade                                                                                                                                                                   |
+| `--name <name>`         | Service name (no default — must resolve via flag or CWD manifest)                                                                                                                                          |
 
 ### Database migrations during upgrade
 
@@ -572,9 +587,31 @@ Services are configured with automatic restart on failure:
 
 This is implemented via:
 
-- systemd: `Restart=on-failure`, `RestartSec`, `StartLimitBurst`, `StartLimitIntervalSec`
+- systemd: `Restart=on-failure` and `RestartSec` in `[Service]`; the `StartLimitBurst` / `StartLimitIntervalSec` rate limit in `[Unit]` (systemd reads the start rate limit from `[Unit]` only)
 - launchd: `KeepAlive` with `SuccessfulExit: false`, `ThrottleInterval`
 - Windows: `sc.exe failure` with restart actions
+
+The rate limit is written into the service definition at install time, so a
+service installed by an older CLI keeps whatever definition it was installed
+with. To apply the current restart policy to an existing instance, re-run
+`install` for it — on Unix, `upgrade` swaps the version symlink and does not
+regenerate the unit or plist:
+
+```bash
+kici-admin orchestrator install --name <service-name> --instance-dir /path/to/deploy-folder --env-file <env>
+```
+
+Pass the same `--name` and `--instance-dir` the instance was installed with — `--name`
+defaults to `kici-orchestrator`, so omitting it on a differently-named instance registers a
+second service instead of refreshing the existing one.
+
+Confirm the window systemd actually applied (drop `--user` for a system-level install):
+
+```bash
+systemctl --user show -p StartLimitIntervalUSec -p StartLimitBurst <service-name>
+# StartLimitIntervalUSec=5min
+# StartLimitBurst=5
+```
 
 The services distinguish clean stops from fatal failures by exit code: an
 intentional shutdown (SIGTERM/SIGINT from a service stop, or an admin-initiated

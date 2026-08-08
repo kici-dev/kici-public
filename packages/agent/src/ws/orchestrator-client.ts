@@ -19,11 +19,16 @@ import {
   type JobDispatch,
   type JobCancel,
   type FleetLogsRequest,
+  ArtifactCompleteAckOutcome,
+  hasOrchAgentCapability,
+  type OrchAgentCapabilities,
 } from '@kici-dev/engine';
 import type {
   CacheRequestIpc,
   CacheResponseIpc,
   ProvenanceRequestIpc,
+  ArtifactRequestIpc,
+  ArtifactResponseIpc,
   ProvenanceResponseIpc,
   StepApprovalRequestIpc,
   StepApprovalResolvedIpc,
@@ -35,12 +40,58 @@ import { LogBuffer } from './log-buffer.js';
 
 const logger = createLogger({ prefix: 'orchestrator-client' });
 
+/**
+ * How long to wait for `artifacts.upload.complete.ack` before failing the step.
+ *
+ * Deliberately shorter than the sandbox's own 30s artifact-request timeout
+ * (`CACHE_RESPONSE_TIMEOUT_MS` in the workflow runner) so a lost ack surfaces
+ * this specific reason rather than the sandbox's generic "artifact request
+ * timed out". The orchestrator's bounded commit retry finishes in well under a
+ * second, so the margin costs nothing.
+ */
+const ARTIFACT_COMPLETE_ACK_TIMEOUT_MS = 25_000;
+
+/**
+ * How many times an in-flight `artifacts.upload.complete` is re-sent across
+ * reconnects before the step is failed.
+ *
+ * Bounded so a flapping connection cannot loop forever. The overall wait is
+ * bounded independently by ARTIFACT_COMPLETE_ACK_TIMEOUT_MS, whose timer is
+ * never restarted across a hold or a resend.
+ */
+export const MAX_COMPLETE_RESEND_ATTEMPTS = 2;
+
+/**
+ * Tail shared by both give-up messages for an unacknowledged commit. The
+ * operator must not be sent hunting for a lost artifact that in fact landed:
+ * the orchestrator may well have committed it and only the ack was lost.
+ */
+const COMMIT_MAY_HAVE_LANDED = 'the artifact may have been committed';
+
+/**
+ * An `artifacts.upload.complete` awaiting its ack, shared by reference between
+ * `pendingUserArtifactRequests`, `resendableCompletes`, `heldCompletes`, and the
+ * ack timer's closure.
+ *
+ * `messageId` is mutated on every resend and is the single source of truth for
+ * which key the pending currently lives under, so the timer always cleans up the
+ * current entry rather than a stale pre-resend key.
+ */
+interface InFlightComplete {
+  /** Current correlation id — re-keyed on every resend. */
+  messageId: string;
+  /** The frame to (re-)send, carrying the current `messageId`. */
+  frame: AgentToOrchestratorMessage;
+  /** How many times this complete has already been re-sent. */
+  attempts: number;
+  pending: {
+    resolve: (response: ArtifactResponseIpc) => void;
+    reject: (err: Error) => void;
+  };
+}
+
 export type ConnectionState =
-  | 'disconnected'
-  | 'connecting'
-  | 'authenticating'
-  | 'registering'
-  | 'registered';
+  'disconnected' | 'connecting' | 'authenticating' | 'registering' | 'registered';
 
 export interface OrchestratorClientOptions {
   /** WebSocket URL of the orchestrator. */
@@ -116,6 +167,14 @@ export class OrchestratorClient {
   private reconnectAttempts = 0;
   private intentionalDisconnect = false;
 
+  /**
+   * Agent-facing capabilities advertised by the orchestrator on `register.ack`.
+   * Undefined until the first ack arrives, and on a pre-capability orchestrator
+   * that never advertises — both cases mean "assume unsupported" for every
+   * optional feature gated on it.
+   */
+  private orchCapabilities: OrchAgentCapabilities | undefined;
+
   // Log batching: accumulate lines and flush every 100ms or 50 lines
   private pendingLogBatch: string[] = [];
   private logFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -157,6 +216,35 @@ export class OrchestratorClient {
       reject: (err: Error) => void;
     }
   >();
+
+  /** Pending user-artifact upload/download requests awaiting orchestrator response. */
+  private readonly pendingUserArtifactRequests = new Map<
+    string,
+    {
+      resolve: (response: ArtifactResponseIpc) => void;
+      reject: (err: Error) => void;
+    }
+  >();
+
+  /**
+   * In-flight `artifacts.upload.complete` frames that are safe to re-send after a
+   * reconnect, keyed by their current `messageId`.
+   *
+   * The commit is idempotent server-side (the storage key is derived server-side,
+   * `initMeta` is a re-writable sidecar, and the DB insert is
+   * `onConflict.doNothing()`), so a dropped ack means "we did not hear the
+   * answer", not "it did not happen". `beginUpload` / `download` are deliberately
+   * absent: `beginUpload` mints a presigned PUT and is not idempotent the same
+   * way, and `download` is read-only and cheap to fail.
+   */
+  private readonly resendableCompletes = new Map<string, InFlightComplete>();
+
+  /**
+   * Completes taken off `pendingUserArtifactRequests` by the disconnect sweep and
+   * parked until the next `register.ack` re-sends them. Their ack timers keep
+   * running — parking does not extend the deadline.
+   */
+  private readonly heldCompletes = new Set<InFlightComplete>();
 
   /**
    * Pending step-approval requests awaiting the orchestrator's resolution.
@@ -282,6 +370,11 @@ export class OrchestratorClient {
     this.intentionalDisconnect = true;
     this.stopHeartbeat();
     this.cancelReconnect();
+
+    // A complete parked by an earlier drop is waiting for a reconnect that is
+    // no longer coming. Fail it closed now instead of leaving it to the ack
+    // deadline, which the process may not outlive.
+    this.rejectHeldCompletes('the agent disconnected');
 
     // Move any pending log batch to LogBuffer (they'll be sent on reconnect)
     this.drainPendingLogBatch();
@@ -639,6 +732,120 @@ export class OrchestratorClient {
   }
 
   /**
+   * Relay a user-facing artifact request from the sandbox to the orchestrator.
+   *
+   * Translates the sandbox `artifacts.request` IPC into the matching
+   * `artifacts.*` WS message and resolves with the orchestrator's response
+   * mapped onto the IPC response shape:
+   *
+   * - `beginUpload` -> `artifacts.upload.request`, awaits `artifacts.upload.response`.
+   * - `completeUpload` -> `artifacts.upload.complete`, awaits
+   *   `artifacts.upload.complete.ack` when the orchestrator advertises the
+   *   `artifactCompleteAck` capability, and rejects when the commit failed so
+   *   the workflow step fails instead of losing the artifact behind a green run.
+   *   Against an orchestrator that never advertises it, the message stays
+   *   fire-and-forget and resolves immediately.
+   * - `download` -> `artifacts.download.request`, awaits `artifacts.download.response`.
+   *
+   * Times out after 30 seconds for the round-trip ops.
+   */
+  async requestUserArtifact(
+    jobId: string,
+    request: ArtifactRequestIpc,
+  ): Promise<ArtifactResponseIpc> {
+    if (request.op === 'completeUpload') {
+      const completeId = randomUUID();
+      const complete = {
+        type: 'artifacts.upload.complete',
+        messageId: completeId,
+        jobId,
+        name: request.name,
+        sizeBytes: request.sizeBytes!,
+        sha256: request.sha256!,
+        storageKey: request.storageKey!,
+      } as AgentToOrchestratorMessage;
+
+      if (!hasOrchAgentCapability(this.orchCapabilities, 'artifactCompleteAck')) {
+        this.sendDirect(complete);
+        return { type: 'artifacts.response', requestId: request.requestId };
+      }
+
+      return new Promise<ArtifactResponseIpc>((resolve, reject) => {
+        // Shared by reference with the maps below, so `record.messageId` always
+        // names the key the pending currently lives under — including after a
+        // reconnect re-key. The timer is created once and is NEVER restarted, so
+        // the hold-plus-resend sequence stays inside the same deadline an
+        // uninterrupted ack wait gets.
+        const record: InFlightComplete = {
+          messageId: completeId,
+          frame: complete,
+          attempts: 0,
+          pending: {
+            resolve: () => {
+              clearTimeout(timer);
+              resolve({ type: 'artifacts.response', requestId: request.requestId });
+            },
+            reject: (err) => {
+              clearTimeout(timer);
+              reject(err);
+            },
+          },
+        };
+
+        const timer = setTimeout(() => {
+          this.forgetComplete(record);
+          reject(
+            new Error(
+              `Artifact upload-complete ack timed out (${ARTIFACT_COMPLETE_ACK_TIMEOUT_MS}ms)`,
+            ),
+          );
+        }, ARTIFACT_COMPLETE_ACK_TIMEOUT_MS);
+
+        this.pendingUserArtifactRequests.set(completeId, record.pending);
+        this.resendableCompletes.set(completeId, record);
+
+        this.sendDirect(complete);
+      });
+    }
+
+    const messageId = randomUUID();
+    return new Promise<ArtifactResponseIpc>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingUserArtifactRequests.delete(messageId);
+        reject(new Error('User-artifact request timed out (30s)'));
+      }, 30_000);
+
+      this.pendingUserArtifactRequests.set(messageId, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve({ ...response, requestId: request.requestId });
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+
+      if (request.op === 'beginUpload') {
+        this.sendDirect({
+          type: 'artifacts.upload.request',
+          messageId,
+          jobId,
+          name: request.name,
+          declaredSizeBytes: request.declaredSizeBytes!,
+        } as AgentToOrchestratorMessage);
+      } else {
+        this.sendDirect({
+          type: 'artifacts.download.request',
+          messageId,
+          jobId,
+          name: request.name,
+        } as AgentToOrchestratorMessage);
+      }
+    });
+  }
+
+  /**
    * Relay a provenance bundle upload operation to the orchestrator. Maps the
    * IPC `provenance.request` onto `requestProvenanceUploadUrl` (returns the
    * presigned URL) or `sendProvenanceUploadComplete` (fire-and-forget) and
@@ -936,6 +1143,33 @@ export class OrchestratorClient {
       }
       this.pendingUserCacheRequests.clear();
 
+      // Pending user-artifact requests on disconnect. An in-flight
+      // `artifacts.upload.complete` is held for resend rather than rejected: the
+      // orchestrator may have committed the artifact and only the ack was lost,
+      // so failing here fails a step whose artifact exists. Everything else
+      // (beginUpload / download) still fails fast — those are not idempotent.
+      //
+      // Holding is only safe when a reconnect is coming. `scheduleReconnect`
+      // runs only for an unintentional disconnect, so on a deliberate shutdown a
+      // held complete would never be re-sent — reject those immediately.
+      for (const [id, pending] of this.pendingUserArtifactRequests) {
+        const record = this.resendableCompletes.get(id);
+        if (record && !this.intentionalDisconnect) {
+          this.heldCompletes.add(record);
+          continue;
+        }
+        pending.reject(new Error('WebSocket disconnected'));
+      }
+      this.pendingUserArtifactRequests.clear();
+      this.resendableCompletes.clear();
+
+      // Same reasoning for completes parked by an *earlier* drop: this close is
+      // deliberate (a shutdown, or a permanently rejected token), so no further
+      // `register.ack` will re-send them.
+      if (this.intentionalDisconnect) {
+        this.rejectHeldCompletes('the agent disconnected');
+      }
+
       // Reject all pending concurrency requests on disconnect
       for (const [_id, pending] of this.pendingConcurrencyRequests) {
         pending.reject(new Error('WebSocket disconnected'));
@@ -962,6 +1196,184 @@ export class OrchestratorClient {
         this.ws.close();
       }
     });
+  }
+
+  /**
+   * Resolve a pending user-artifact request from an `artifacts.upload.response`
+   * / `artifacts.download.response` WS message, mapping the wire fields onto the
+   * IPC response shape. No-op when no request is pending for the requestId.
+   */
+  private resolveArtifactResponse(
+    type: 'artifacts.upload.response' | 'artifacts.download.response',
+    raw: unknown,
+  ): void {
+    const artMsg = raw as {
+      requestId: string;
+      outcome?: string;
+      uploadUrl?: string;
+      storageKey?: string;
+      reason?: string;
+      error?: string;
+      downloadUrl?: string;
+      sizeBytes?: number;
+      sha256?: string;
+    };
+    const pending = this.pendingUserArtifactRequests.get(artMsg.requestId);
+    if (!pending) return;
+    this.pendingUserArtifactRequests.delete(artMsg.requestId);
+    const isUpload = type === 'artifacts.upload.response';
+    pending.resolve({
+      type: 'artifacts.response',
+      requestId: artMsg.requestId,
+      ...(isUpload &&
+        artMsg.outcome !== undefined && {
+          uploadOutcome: artMsg.outcome as 'granted' | 'rejected',
+        }),
+      ...(!isUpload &&
+        artMsg.outcome !== undefined && {
+          downloadOutcome: artMsg.outcome as 'found' | 'not_found',
+        }),
+      ...(artMsg.uploadUrl && { uploadUrl: artMsg.uploadUrl }),
+      ...(artMsg.storageKey && { storageKey: artMsg.storageKey }),
+      ...(artMsg.reason && {
+        reason: artMsg.reason as 'duplicate_name' | 'size_cap' | 'run_cap' | 'org_quota',
+      }),
+      // The orchestrator's internal-failure detail rides a dedicated IPC field:
+      // putting it on `error` would make the sandbox throw a relay failure
+      // instead of rendering the rejection.
+      ...(artMsg.error && { rejectionDetail: artMsg.error }),
+      ...(artMsg.downloadUrl && { downloadUrl: artMsg.downloadUrl }),
+      ...(artMsg.sizeBytes !== undefined && { sizeBytes: artMsg.sizeBytes }),
+      ...(artMsg.sha256 && { sha256: artMsg.sha256 }),
+    });
+  }
+
+  /**
+   * Resolve or reject a pending completeUpload from an
+   * `artifacts.upload.complete.ack`. `committed` resolves the relayed IPC
+   * request; `failed` rejects it (carrying the orchestrator's reason), which
+   * propagates through the relay's `response.error` and fails the workflow step
+   * rather than losing the artifact silently. No-op when nothing is pending for
+   * the requestId (an ack for an already-timed-out complete).
+   */
+  private resolveArtifactCompleteAck(raw: unknown): void {
+    const ack = raw as { requestId: string; outcome: string; reason?: string };
+    const pending = this.pendingUserArtifactRequests.get(ack.requestId);
+    if (!pending) return;
+    this.pendingUserArtifactRequests.delete(ack.requestId);
+    this.resendableCompletes.delete(ack.requestId);
+    if (ack.outcome === ArtifactCompleteAckOutcome.enum.committed) {
+      pending.resolve({ type: 'artifacts.response', requestId: ack.requestId });
+    } else {
+      pending.reject(new Error(ack.reason ?? 'artifact upload-complete failed'));
+    }
+  }
+
+  /**
+   * Drop every trace of an in-flight upload-complete, whichever key it currently
+   * lives under and whether or not it is parked awaiting a resend.
+   *
+   * Called from the ack timer, which fires on the original schedule regardless of
+   * how many times the complete has been re-keyed since.
+   */
+  private forgetComplete(record: InFlightComplete): void {
+    this.pendingUserArtifactRequests.delete(record.messageId);
+    this.resendableCompletes.delete(record.messageId);
+    this.heldCompletes.delete(record);
+  }
+
+  /**
+   * Fail every parked upload-complete closed, for the paths where the reconnect
+   * the park was betting on will never arrive (a deliberate shutdown, a
+   * permanently rejected token). Naming the ambiguity keeps the operator from
+   * hunting for an artifact that in fact landed.
+   */
+  private rejectHeldCompletes(cause: string): void {
+    if (this.heldCompletes.size === 0) return;
+    const held = [...this.heldCompletes];
+    this.heldCompletes.clear();
+    for (const record of held) {
+      record.pending.reject(
+        new Error(
+          `artifact upload-complete could not be acknowledged before ${cause} — ` +
+            COMMIT_MAY_HAVE_LANDED,
+        ),
+      );
+    }
+  }
+
+  /**
+   * Re-send every upload-complete parked by the disconnect sweep.
+   *
+   * Called from `register.ack`, once the new connection's capabilities are known.
+   * Each frame is re-keyed with a fresh `messageId` before it goes out: the id is
+   * the correlation key, so reusing it would let a late ack for the pre-disconnect
+   * send resolve the new pending.
+   *
+   * The ack timer created when the complete was first sent is deliberately left
+   * alone, so the hold plus every resend stays inside the original
+   * ARTIFACT_COMPLETE_ACK_TIMEOUT_MS budget.
+   */
+  private resendHeldCompletes(): void {
+    if (this.heldCompletes.size === 0) return;
+    const held = [...this.heldCompletes];
+    this.heldCompletes.clear();
+
+    // A reconnected orchestrator that no longer acks cannot tell us the commit
+    // landed. Resolving anyway would report success for an artifact we never saw
+    // committed — the fail-open loss the ack exists to prevent — so give up
+    // fail-closed instead, naming the ambiguity.
+    const canAck = hasOrchAgentCapability(this.orchCapabilities, 'artifactCompleteAck');
+
+    for (const record of held) {
+      if (!canAck) {
+        record.pending.reject(
+          new Error(
+            'artifact upload-complete cannot be acknowledged by the reconnected ' +
+              `orchestrator — ${COMMIT_MAY_HAVE_LANDED}`,
+          ),
+        );
+        continue;
+      }
+
+      if (record.attempts >= MAX_COMPLETE_RESEND_ATTEMPTS) {
+        record.pending.reject(
+          new Error(
+            'artifact upload-complete could not be acknowledged after ' +
+              `${MAX_COMPLETE_RESEND_ATTEMPTS} reconnects — ${COMMIT_MAY_HAVE_LANDED}`,
+          ),
+        );
+        continue;
+      }
+
+      record.messageId = randomUUID();
+      record.attempts += 1;
+      record.frame = { ...record.frame, messageId: record.messageId } as AgentToOrchestratorMessage;
+      this.pendingUserArtifactRequests.set(record.messageId, record.pending);
+      this.resendableCompletes.set(record.messageId, record);
+      this.sendDirect(record.frame);
+      logger.info('Re-sent artifact upload-complete after reconnect', {
+        messageId: record.messageId,
+        attempt: record.attempts,
+      });
+    }
+  }
+
+  /**
+   * Route the orchestrator's replies to a relayed user-artifact request, which
+   * are dispatched off the raw frame rather than the parsed protocol union.
+   * Returns true when the message was consumed.
+   */
+  private handleArtifactReply(type: string | undefined, raw: unknown): boolean {
+    if (type === 'artifacts.upload.response' || type === 'artifacts.download.response') {
+      this.resolveArtifactResponse(type, raw);
+      return true;
+    }
+    if (type === 'artifacts.upload.complete.ack') {
+      this.resolveArtifactCompleteAck(raw);
+      return true;
+    }
+    return false;
   }
 
   private handleMessage(data: WebSocket.Data): void {
@@ -1054,6 +1466,10 @@ export class OrchestratorClient {
       return;
     }
 
+    // Handle the orchestrator -> agent replies to a relayed user-artifact
+    // request (upload/download responses and the upload-complete ack).
+    if (this.handleArtifactReply(rawMsg.type, raw)) return;
+
     // Try orchestrator-to-agent protocol messages first
     const parsed = orchestratorToAgentMessageSchema.safeParse(raw);
     if (parsed.success) {
@@ -1094,11 +1510,20 @@ export class OrchestratorClient {
             pendingDispatch: msg.pendingDispatch ?? false,
           });
 
+          // Optional agent-facing features are gated on what this orchestrator
+          // advertises; absent means "stay on the unnegotiated behavior".
+          this.orchCapabilities = msg.capabilities;
+
           // Transition to registered state
           this._state = 'registered';
           this.reconnectAttempts = 0;
           this.startHeartbeat();
           this.flushBuffer();
+
+          // Completes parked by the disconnect sweep go out again now that this
+          // connection's capabilities are known.
+          this.resendHeldCompletes();
+
           this.onRegistered?.({ pendingDispatch: msg.pendingDispatch ?? false });
 
           // Block MMDS access if in Firecracker/scaler-managed mode

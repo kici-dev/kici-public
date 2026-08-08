@@ -17,6 +17,15 @@ import { tmpdir } from 'node:os';
  * uses look much like this: poll a registry for an image tag, poll an
  * external API for a job result, poll a file system for a build
  * output, etc.
+ *
+ * IMPORTANT — both jobs use `runsOn: 'local'` on purpose: the `tmpdir()`
+ * marker is only visible to `consumer` because `local` co-locates both jobs
+ * on this one host. On a distributed fleet each job runs on its own agent
+ * with its own filesystem, so a temp file written by `producer` would NOT
+ * exist for `consumer`. To pass a value between jobs on real agents, return
+ * it as a job output and read it via `needs` + `producer.result` (see
+ * `typed-pipeline.ts`), or publish to a shared store (object storage, a
+ * registry) both agents can reach — never a local temp path.
  */
 
 const MARKER_DIR = join(tmpdir(), 'kici-example-wait-for-marker');

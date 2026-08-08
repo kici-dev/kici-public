@@ -100,13 +100,40 @@ This prevents untrusted contributors from modifying workflow definitions to exfi
 
 When a PR modifies workflows, the orchestrator detects this by directly comparing the base and head lock files (`workflow-diff.ts`). It checks for added, removed, or modified workflows by diffing their triggers, jobs, and rules. If modifications are detected:
 
-1. A GitHub Check is posted: "This PR adds/modifies workflows -- changes will take effect after merge."
-2. For known and unknown contributors, a security hold is created (workflow modifications require ci_trust:write or higher to auto-approve).
-3. Trusted contributors (ci_trust:write+) can modify workflows without triggering a security hold.
+1. A neutral informational GitHub Check is posted on its own check name (`KiCI: Workflow changes`): "This PR adds/modifies workflows -- changes will take effect after merge."
+2. Detection stops there. What happens to the PR's matched runs is decided by the org's **workflow change policy**, which has three outcomes for a contributor below the `trusted` tier:
+   - `hold` (the default) -- the runs are held in the security queue with reason `workflow_modification`, and a pending `KiCI Security` "Held for approval" check is posted. The hold is a real `held_runs` row: `/kici approve` (or the dashboard approval queue) releases it and resolves the check to success, `/kici reject` fails it, and expiry fails it automatically -- the pending check never dangles.
+   - `reject` -- the run fails before any job starts, recorded as a run-scoped `trust_policy` init failure, and a `KiCI Security` failure check is posted.
+   - `allow` -- this arm raises no objection and the next applicable arm decides. The neutral informational check is still posted.
+3. Trusted contributors (ci_trust:write+) can modify workflows without triggering a security hold, whatever the policy says.
+
+`allow` removes the workflow-change objection; it does not dispatch the pull request. Arms are evaluated in a fixed order -- workflow modification, fork PR, unknown contributor -- with any `reject` beating any `hold`, so a PR that trips several arms yields one verdict whose reason comes from the first applicable arm rather than from evaluation accident. A workflow-modifying PR from a same-repo contributor who resolves to `unknown` is therefore still held under `allow`, with the reason moving from `workflow_modification` to `unknown_contributor` -- and the unknown contributor policy has no `allow` value, so no configuration dispatches it. That reason flip is what `e2e/tests/trust-policy-gate.test.ts` asserts.
+
+Two scoping points matter here. The policy is only evaluated for sources with a contributor model (GitHub today); a generic webhook, local source, or plain Git remote has no contributor to resolve and is never gated by it. And this arm is **not fork-only** -- it fires on a same-repo PR from any contributor below `trusted`, which is the default for ordinary org members.
+
+## The verdict is a property of the event
+
+The trust policy is evaluated once per webhook event, before any dispatch path runs, and the resulting verdict is threaded to every path that could start a job. Stating the verdict is mandatory: the dispatch context's field is required, so a path that fails to carry one does not compile rather than silently dispatching. A verdict the build does not recognise denies -- the policy columns are plain text, so a newer Platform can emit a value this orchestrator has never seen, and for a security control the safe reading of "I do not understand this" is to refuse.
+
+### Organization-wide global workflows
+
+Organization-wide global workflows do not run for a pull request that the trust policy holds or rejects, on either dispatch path (with or without a per-repo lock file). A neutral informational check on its own check name (`KiCI: Organization workflows`) records that they were skipped, so it never writes over the `KiCI Security` check the hold or rejection owns; the failure check on a `reject` is posted once, by the pull request's own dispatch path.
+
+When the repository has no lock file of its own there is no such path -- and no run to fail -- so a rejected event there produces only the neutral skipped notice. Nothing is dispatched either way; the difference is only in how much the pull request is told.
+
+A skipped global workflow has no run row and therefore no held run, so approving the event's hold releases the pull request's own workflows only -- it does not retroactively run the organization's global workflows for that event.
+
+This gate exists because a global workflow runs with **organization** credentials against the event's head commit. Running one for an event the policy refused would hand an untrusted contributor exactly the capability the policy was protecting.
+
+### Fork pull requests and the unknown tier
+
+`TrustResolver` returns the `unknown` tier for every fork pull request unconditionally, so the unknown-contributor arm would otherwise fire for every fork -- and because the unknown contributor policy has no `allow` member, no configuration could ever let a fork run. When the fork is what caused the unknown tier and the operator has explicitly set fork PR policy to `allow`, the fork arm wins and the unknown-contributor arm is suppressed.
+
+The suppression is deliberately narrow: a non-fork unknown contributor is unaffected, and the workflow change arm is still evaluated first, so an allowed fork that edits `.kici/` is still governed by the workflow change policy.
 
 ## Security approval queue
 
-Security holds are stored in the `held_runs` table with `queue_type = 'security'`, separate from environment approval holds (`queue_type = 'environment'`). This separation ensures:
+Security holds are stored in the `held_runs` table with `queue_type = 'security'`, separate from context approval holds (`queue_type = 'context'`). This separation ensures:
 
 - Security approvals require ci_trust:write+ permission
 - Environment approvals require contexts:write+ permission
@@ -114,32 +141,37 @@ Security holds are stored in the `held_runs` table with `queue_type = 'security'
 
 ### Hold reasons
 
-| Reason                  | Trigger                                                                  | Required to approve |
-| ----------------------- | ------------------------------------------------------------------------ | ------------------- |
-| `workflow_modification` | Known/unknown contributor modifies `.kici/` files                        | ci_trust:write+     |
-| `environment_trust`     | Environment `minimumTrust` gate blocks contributor with lower trust tier | ci_trust:write+     |
+| Reason                  | Trigger                                                              | Required to approve |
+| ----------------------- | -------------------------------------------------------------------- | ------------------- |
+| `workflow_modification` | Known/unknown contributor modifies `.kici/` files                    | ci_trust:write+     |
+| `fork_pr`               | PR opened from a fork, with fork PR policy set to `hold`             | ci_trust:write+     |
+| `unknown_contributor`   | Contributor could not be resolved to a known identity                | ci_trust:write+     |
+| `context_trust`         | Context `minimumTrust` gate blocks contributor with lower trust tier | ci_trust:write+     |
+
+The first three are raised by the org trust policy; `context_trust` is raised by an environment's `minimumTrust` gate. A PR that trips several policy arms yields exactly one hold: the arms are evaluated in the order above and any `reject` outcome takes precedence over any `hold`. The trust policy is evaluated before the context gate, so a policy-held run never also lands a competing `context_trust` hold.
 
 ### Approval channels
 
 1. **Dashboard** -- security approval queue in org settings CI trust tab
-2. **Comment-based** -- `/kici approve` and `/kici reject` in PR comments (case-insensitive). The commenter's identity is resolved via identity link, and their ci_trust level is verified before processing.
+2. **Comment-based** -- `/kici approve` and `/kici reject` in PR comments (case-insensitive). The commenter's identity is resolved via identity link, and their ci_trust level is verified before processing. A command acts **only on the held runs for the PR (and repo) the comment was posted on** -- a bare `/kici approve` releases every pending security hold for that PR, and never touches holds from other PRs or repos. An explicit `/kici approve <runId>` is narrowed within that PR's holds, so a run id belonging to a different PR or repo matches nothing.
 
 ### Approval expiry
 
-Security holds expire after a configurable duration (default: 72 hours). Expired runs transition to the `expired` status. The GitHub Check is updated with a timeout explanation.
+Security holds expire on a deadline set when the hold is created. A hold raised by the org trust policy — `workflow_modification`, `fork_pr`, or `unknown_contributor`, each covering a whole PR and not attached to any environment — uses the org's approval expiry (default 72 hours). A `context_trust` hold is raised by an environment rather than by the org policy, so it uses that environment's own hold expiry (`hold_expiry_seconds`, default one hour). Expired runs transition to the `expired` status. The GitHub Check is updated with a timeout explanation.
 
 ## GitHub Check status posting
 
 The CheckStatusPoster provider interface posts check statuses for security events:
 
-| Event                  | Check status | Title                     |
-| ---------------------- | ------------ | ------------------------- |
-| Security hold created  | pending      | Held for approval         |
-| Workflow modifications | neutral      | Workflow changes detected |
-| Security hold approved | success      | Approved                  |
-| Security hold rejected | failure      | Rejected                  |
+| Event                        | Check status | Title                          |
+| ---------------------------- | ------------ | ------------------------------ |
+| Security hold created        | pending      | Held for approval              |
+| Workflow modifications       | neutral      | Workflow changes detected      |
+| Organization globals skipped | neutral      | Organization workflows skipped |
+| Security hold approved       | success      | Approved                       |
+| Security hold rejected       | failure      | Rejected                       |
 
-Security holds use a fixed GitHub Check run name `KiCI Security` to enable update-in-place as a hold progresses through its lifecycle (pending -> approved/rejected). Workflow modifications use a separate check name `KiCI: Workflow changes` since they are informational (neutral conclusion) and should not conflict with security hold statuses. The "Title" column shows the check output title.
+Security holds use a fixed GitHub Check run name `KiCI Security` to enable update-in-place as a hold progresses through its lifecycle (pending -> approved/rejected). The two informational (neutral) checks each use their own check name -- `KiCI: Workflow changes` for workflow modifications and `KiCI: Organization workflows` for globals skipped by the trust policy -- so neither can overwrite the security-hold check. That matters concretely: the security check is a single run per commit which the hold posts as pending and approve / reject later complete, so an informational write onto it would resolve a still-held run's check and release whatever branch protection waits on it. The "Title" column shows the check output title.
 
 ## CI trust level resolution
 
@@ -161,6 +193,8 @@ Trust policies are cached locally on the orchestrator and pushed from the Platfo
 - If the trust policy is stale and Platform is unreachable, all contributors are treated as unknown
 - Identity links are pushed alongside trust policy and cached indefinitely on the orchestrator
 - ci_trust RBAC levels are included in the policy push for offline resolution
+
+An organization whose policy row was never created still receives a push carrying the documented defaults. The row is created lazily on a dashboard read, so an organization that has never opened **Settings > CI trust** would otherwise receive no push at all -- and because the push also carries identity links and ci_trust levels, withholding it would leave every contributor in that organization unresolvable, not merely un-policied.
 
 ## Contributor resolution caching
 
@@ -198,10 +232,10 @@ held_runs
   + org_id             VARCHAR(12) NOT NULL
   + run_id             UUID NOT NULL
   + job_id             TEXT NOT NULL
-  + environment_id     UUID NOT NULL (FK to environments.id)
-  + hold_type          TEXT NOT NULL  -- 'reviewer' | 'timer' | 'concurrency' | 'security'
+  + context_id         UUID (FK to contexts.id; null for context-free holds like workflow_modification)
+  + hold_type          TEXT NOT NULL  -- gate types 'reviewer' | 'timer' | 'concurrency' | 'security'
   + status             TEXT NOT NULL DEFAULT 'pending'  -- 'pending' | 'approved' | 'rejected' | 'expired' | 'released'
-  + queue_type         TEXT NOT NULL DEFAULT 'environment'  -- 'environment' | 'security'
+  + queue_type         TEXT NOT NULL DEFAULT 'context'  -- 'context' | 'security'
   + reason             TEXT
   + approved_by        TEXT
   + created_at         TIMESTAMPTZ NOT NULL DEFAULT now()

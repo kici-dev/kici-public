@@ -18,6 +18,7 @@
 
 import { Hono } from 'hono';
 import { createLogger } from '@kici-dev/shared';
+import { AUTH_ERROR } from './admin-auth.js';
 import type { SharedConfigStore } from '../config/shared-store.js';
 import type { ConfigReloader, ReloadResult } from '../config/reload.js';
 import type { LocalConfig } from '../config/types.js';
@@ -73,10 +74,15 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
     }
     const authHeader = c.req.header('Authorization');
     if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
+      return c.json({ error: AUTH_ERROR.missing }, 401);
     }
     const token = authHeader.slice(7);
     if (token !== deps.adminToken) {
+      // The static-token comparator performs no I/O and cannot throw, so this
+      // router does not use the DB-backed auth boundary in routes/admin-auth.ts
+      // and has no 503 outcome. Its 'Invalid token' body is deliberately
+      // distinct from the DB-backed routers' 'Invalid or expired token': the
+      // wording is how an operator tells which credential store rejected them.
       return c.json({ error: 'Invalid token' }, 401);
     }
     await next();

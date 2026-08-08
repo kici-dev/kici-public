@@ -19,7 +19,42 @@ const base = {
   testMode: false,
 };
 
+const orchestratorSigner = {
+  alg: 'ES256',
+  signerKind: 'db',
+  keyRef: null,
+  sign: async () => new Uint8Array(64),
+  getPublicJwk: async () => ({ kty: 'EC' }),
+  getKid: async () => 'orch-kid',
+} as any;
+
 describe('selectOidcMintRegistration — anti-forgery choke point', () => {
+  it('orchestrator signer configured → orchestrator-owned mint (wins over the Platform relay)', () => {
+    const reg = selectOidcMintRegistration({
+      ...base,
+      resolveOrchestratorSigner: async () => orchestratorSigner,
+      provenanceSigningIssuer: 'https://orch.example',
+      platformUrl: 'wss://platform',
+      platformToken: 'tok',
+      platformClient,
+      independentIdentity: false,
+      localOidcSigner: undefined,
+    });
+    expect(reg?.kind).toBe('orchestrator');
+  });
+
+  it('no orchestrator signer, Platform-connected → relay (deprecated path)', () => {
+    const reg = selectOidcMintRegistration({
+      ...base,
+      platformUrl: 'wss://platform',
+      platformToken: 'tok',
+      platformClient,
+      independentIdentity: false,
+      localOidcSigner: undefined,
+    });
+    expect(reg?.kind).toBe('relay');
+  });
+
   it('Platform-connected → relay (local signer NEVER consulted)', () => {
     const reg = selectOidcMintRegistration({
       ...base,

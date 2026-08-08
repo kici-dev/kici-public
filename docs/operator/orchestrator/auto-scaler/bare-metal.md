@@ -80,6 +80,8 @@ scalers:
         binaryPath: C:\kici\agent\kici-agent.exe
 ```
 
+For a non-Linux bare-metal pool, prefer declaring the structured `platform: { os, arch }` field — it is the canonical way to taint a Windows / macOS / ARM pool so unqualified Linux jobs are never routed to it, and it works even when the pool's plain labels use a non-canonical name. See [Automatic platform taint](./common-config.md) in the common config reference.
+
 ### Key notes
 
 - **Warm pool support**: Bare-metal scalers support warm pools just like container scalers. When `warmPool` is configured, idle agent processes are pre-spawned and consumed on demand. Without a warm pool, agents spawn on demand when a job arrives. The `maxAgents` field controls maximum concurrency (how many simultaneous jobs can run).

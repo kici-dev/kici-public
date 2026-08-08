@@ -5,7 +5,7 @@
  * Retrieves changed files for PR and push events via the GitHub API.
  */
 
-import type { ChangedFilesFetcher } from '@kici-dev/engine';
+import type { ChangedFilesFetcher, ChangedFilesResult } from '@kici-dev/engine';
 import { createLogger } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'github:changed-files' });
@@ -20,47 +20,83 @@ const GITHUB_COMPARE_FILE_LIMIT = 300;
 /** Maximum retries for 429 (rate limit) responses */
 const MAX_429_RETRIES = 3;
 
-/** Base delay in ms for exponential backoff on 429 */
+/** Maximum retries for transient 5xx server errors */
+const MAX_5XX_RETRIES = 2;
+
+/** Base delay in ms for exponential backoff */
 const BASE_BACKOFF_MS = 1_000;
+
+/** Prefix on the propagated error so degraded trigger evaluation is greppable. */
+const DEGRADED_FETCH_MESSAGE = 'changed-files fetch failed — trigger evaluation degraded';
+
+/** Read a numeric `status` off an Octokit RequestError, if present. */
+function errorStatus(err: unknown): number | undefined {
+  if (err !== null && typeof err === 'object' && 'status' in err) {
+    const status = (err as { status: unknown }).status;
+    if (typeof status === 'number') return status;
+  }
+  return undefined;
+}
 
 /**
  * Check if an error is a GitHub 429 rate limit response.
  * Octokit throws RequestError with a numeric `status` property.
  */
 export function isRateLimitError(err: unknown): boolean {
-  return (
-    err !== null &&
-    typeof err === 'object' &&
-    'status' in err &&
-    (err as { status: unknown }).status === 429
-  );
+  return errorStatus(err) === 429;
 }
 
 /**
- * Execute a function with retry on 429 rate limit errors.
- * Uses exponential backoff: 1s, 2s, 4s.
- * Non-429 errors are rethrown immediately.
+ * Check if an error is a transient GitHub 5xx server error worth retrying.
+ * A pure network error (no numeric `status`) is deliberately NOT transient
+ * here — it rethrows immediately (loud) rather than masking a persistent
+ * connectivity fault behind silent retries.
+ */
+export function isTransientServerError(err: unknown): boolean {
+  const status = errorStatus(err);
+  return status !== undefined && status >= 500;
+}
+
+/**
+ * Execute a function with bounded retry on 429 rate-limit AND 5xx server
+ * errors, each with its own budget and exponential backoff (1s, 2s, …).
+ * Every other error — a 4xx, or a network error with no `status` — is
+ * rethrown immediately (loud; not retried).
  */
 export async function withRateLimitRetry<T>(fn: () => Promise<T>, context: string): Promise<T> {
-  for (let attempt = 0; attempt <= MAX_429_RETRIES; attempt++) {
+  let rateLimitRetries = 0;
+  let serverErrorRetries = 0;
+  for (;;) {
     try {
       return await fn();
     } catch (err) {
-      if (!isRateLimitError(err) || attempt === MAX_429_RETRIES) {
-        throw err;
+      if (isRateLimitError(err) && rateLimitRetries < MAX_429_RETRIES) {
+        const delayMs = BASE_BACKOFF_MS * 2 ** rateLimitRetries;
+        rateLimitRetries++;
+        logger.warn('GitHub API rate limited (429), retrying with backoff', {
+          context,
+          attempt: rateLimitRetries,
+          maxRetries: MAX_429_RETRIES,
+          delayMs,
+        });
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
       }
-      const delayMs = BASE_BACKOFF_MS * 2 ** attempt;
-      logger.warn('GitHub API rate limited (429), retrying with backoff', {
-        context,
-        attempt: attempt + 1,
-        maxRetries: MAX_429_RETRIES,
-        delayMs,
-      });
-      await new Promise((r) => setTimeout(r, delayMs));
+      if (isTransientServerError(err) && serverErrorRetries < MAX_5XX_RETRIES) {
+        const delayMs = BASE_BACKOFF_MS * 2 ** serverErrorRetries;
+        serverErrorRetries++;
+        logger.warn('GitHub API server error (5xx), retrying with backoff', {
+          context,
+          attempt: serverErrorRetries,
+          maxRetries: MAX_5XX_RETRIES,
+          delayMs,
+        });
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
     }
   }
-  // Unreachable — the loop either returns or throws
-  throw new Error('Unreachable');
 }
 
 /**
@@ -108,23 +144,37 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
     eventType: string,
     payload: unknown,
     credentials: unknown,
-  ): Promise<string[]> {
+  ): Promise<ChangedFilesResult> {
     const { installationId } = credentials as GitHubCredentials;
     const [owner, repo] = repoIdentifier.split('/');
     const p = payload as WebhookPayload;
 
     const octokit = createInstallationOctokit(this.config, installationId);
 
-    if (eventType === 'pull_request') {
-      return this.getPrChangedFiles(octokit, owner, repo, p);
-    }
+    try {
+      if (eventType === 'pull_request') {
+        return await this.getPrChangedFiles(octokit, owner, repo, p);
+      }
 
-    if (eventType === 'push') {
-      return this.getPushChangedFiles(octokit, owner, repo, p);
-    }
+      if (eventType === 'push') {
+        return await this.getPushChangedFiles(octokit, owner, repo, p);
+      }
 
-    logger.debug('Unknown event type for changed files, returning empty', { event: eventType });
-    return [];
+      // Unknown event type: we cannot determine a diff. Report `unavailable`
+      // (not `fetched` + []) so a path-filtered workflow matches conservatively
+      // rather than silently dropping.
+      logger.warn('Unknown event type for changed files, reporting unavailable', {
+        event: eventType,
+      });
+      return { files: [], status: 'unavailable' };
+    } catch (err) {
+      // A real API failure (exhausted 429/5xx retries, or an un-retried 4xx /
+      // network error) propagates loudly with a distinct, greppable prefix so
+      // the event-log `failed` row and operators can see WHY evaluation could
+      // not run — never a silent no-match.
+      const original = err instanceof Error ? err.message : String(err);
+      throw new Error(`${DEGRADED_FETCH_MESSAGE}: ${original}`, { cause: err });
+    }
   }
 
   /**
@@ -135,10 +185,13 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
     owner: string,
     repo: string,
     payload: WebhookPayload,
-  ): Promise<string[]> {
+  ): Promise<ChangedFilesResult> {
     if (!payload.pull_request) {
-      logger.warn('pull_request event missing pull_request data', { owner, repo });
-      return [];
+      logger.warn('pull_request event missing pull_request data, reporting unavailable', {
+        owner,
+        repo,
+      });
+      return { files: [], status: 'unavailable' };
     }
 
     const pullNumber = payload.pull_request.number;
@@ -154,7 +207,7 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
       `pulls.listFiles(${owner}/${repo}#${pullNumber})`,
     );
 
-    return files.map((file) => file.filename);
+    return { files: files.map((file) => file.filename), status: 'fetched' };
   }
 
   /**
@@ -165,33 +218,35 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
     owner: string,
     repo: string,
     payload: WebhookPayload,
-  ): Promise<string[]> {
+  ): Promise<ChangedFilesResult> {
     const before = payload.before;
     const after = payload.after;
 
     if (!before || !after) {
-      logger.warn('push event missing before/after SHAs', { owner, repo });
-      return [];
+      logger.warn('push event missing before/after SHAs, reporting unavailable', { owner, repo });
+      return { files: [], status: 'unavailable' };
     }
 
-    // Initial push (branch creation) has all-zero before SHA
+    // Initial push (branch creation) has all-zero before SHA — there is
+    // genuinely no diff, so this is `fetched` + [] (a deliberate no-match for
+    // path filters), NOT `unavailable`.
     if (before === ZERO_SHA) {
       logger.debug('Initial push detected (zero SHA), returning empty changed files', {
         owner,
         repo,
         after,
       });
-      return [];
+      return { files: [], status: 'fetched' };
     }
 
-    // Branch deletion has all-zero after SHA
+    // Branch deletion has all-zero after SHA — likewise a genuine no-diff.
     if (after === ZERO_SHA) {
       logger.debug('Branch deletion detected (zero after SHA), returning empty changed files', {
         owner,
         repo,
         before,
       });
-      return [];
+      return { files: [], status: 'fetched' };
     }
 
     const response = await withRateLimitRetry(
@@ -214,6 +269,6 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
       );
     }
 
-    return files.map((file) => file.filename);
+    return { files: files.map((file) => file.filename), status: 'fetched' };
   }
 }

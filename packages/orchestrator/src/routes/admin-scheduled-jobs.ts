@@ -28,6 +28,7 @@ import {
   findOrchestratorScheduledJob,
 } from '../queue/scheduled-job.js';
 import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-scheduled-jobs' });
 
@@ -48,21 +49,10 @@ type AdminEnv = {
 export function createAdminScheduledJobsRoutes(deps: AdminScheduledJobsRoutesDeps): Hono<AdminEnv> {
   const app = new Hono<AdminEnv>();
 
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin-scheduled-jobs',
+  });
   app.use('/api/v1/admin/scheduled-jobs/*', authMiddleware);
 
   app.post('/api/v1/admin/scheduled-jobs/:name/trigger', async (c) => {

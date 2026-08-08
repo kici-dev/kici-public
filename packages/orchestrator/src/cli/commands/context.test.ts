@@ -453,6 +453,83 @@ describe('kici-admin context CLI', () => {
       expect(exitCode).toBe(1);
       expect(stderr).toContain('not found');
     });
+
+    it('sends null when --hold-expiry is empty, so the column is cleared', async () => {
+      // `Number('') === 0`, so a plain integer parse turns "clear" into a
+      // 0-second expiry — which cancels every hold on the context.
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      const { exitCode } = await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'staging',
+        '--hold-expiry',
+        '',
+        '--database-url',
+        'postgres://local',
+      ]);
+      expect(exitCode).toBeNull();
+      const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
+      expect(callArgs.holdExpirySeconds).toBeNull();
+    });
+
+    it('sends a positive --hold-expiry unchanged', async () => {
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      const { exitCode } = await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'staging',
+        '--hold-expiry',
+        '900',
+        '--database-url',
+        'postgres://local',
+      ]);
+      expect(exitCode).toBeNull();
+      const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
+      expect(callArgs.holdExpirySeconds).toBe(900);
+    });
+
+    it('omits holdExpirySeconds entirely when --hold-expiry is not passed', async () => {
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      const { exitCode } = await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'staging',
+        '--wait-timer',
+        '60',
+        '--database-url',
+        'postgres://local',
+      ]);
+      expect(exitCode).toBeNull();
+      const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
+      expect('holdExpirySeconds' in callArgs).toBe(false);
+    });
+
+    it('exits non-zero on a non-numeric --hold-expiry', async () => {
+      mockSetContextPolicyDirect.mockResolvedValue(undefined);
+      const { stderr, exitCode } = await runCommand([
+        'context',
+        'set-policy',
+        '--org',
+        'o',
+        '--env',
+        'staging',
+        '--hold-expiry',
+        'abc',
+        '--database-url',
+        'postgres://local',
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('--hold-expiry');
+    });
   });
 
   describe('list', () => {

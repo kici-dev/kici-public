@@ -45,6 +45,12 @@ export const postDeploy = workflow('post-deploy', {
 
 `workflowComplete()` / `jobComplete()` start a **separate** workflow run that reacts to the prior one finishing, gated on its status. They are the right tool when a _different_ workflow should respond. When you instead need to add more jobs to the **same** run based on what a job just produced — fanning out follow-up work from a prior job's outputs — use a result-aware generator (next section), not a completion-event chain.
 
+#### Failure notifier (any source → any destination)
+
+Because the orchestrator auto-emits `workflow_complete` for **every** run, a single workflow with `on: workflowComplete({ status: ['failed'] })` (no `source` filter) becomes an org-wide failure notifier: every failed workflow, whatever repo or provider triggered it, dispatches this one workflow. The runnable example `examples/workflows/failed-workflow-slack-notifier.ts` builds exactly that — it maps the failed run's repo (`ctx.sourceRepo?.identifier`) through an inline `repo → { channel, tag }` table and posts to Slack with `fetch`, guarding the real POST behind `ctx.isTestRun` so a test run never messages a live channel. Swap the `fetch` body for Discord, Teams, PagerDuty, or a plain HTTP endpoint to change the destination — no external package required.
+
+The one failure class this pattern cannot catch is a **dead orchestrator**: a workflow can only run while the orchestrator that would dispatch it is alive, so if the orchestrator itself is gone, nothing dispatches the notifier. Watching for an orchestrator that has stopped reporting is the managed notification plane's job, not a workflow's.
+
 ### Same-run discovery → fan-out
 
 A result-aware [`dynamicJob(group, { needs, generate })`](../sdk/rules-matrix-dynamic.md#dynamicjob--result-aware-generation) is deferred until its declared upstreams complete, then runs with their frozen outputs as `ctx.needs` — so a discovery job can emit a list at runtime and the generator fans out one follow-up job per item, all in the same run:

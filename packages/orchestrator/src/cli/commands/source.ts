@@ -22,14 +22,149 @@
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
+import { sql } from 'kysely';
 import type { Command } from 'commander';
 import type { AdminApiClient, GenericSourceResponse } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import { createPool, createDb } from '../../db/client.js';
+import { GenericSourceManager } from '../../webhook/generic-sources.js';
 import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
 import { LocalSourceConfigSchema } from '../../providers/local/local-source-config.js';
 import { buildLocalTriggerRequest, readRepoHead, sendLocalTrigger } from './local-trigger.js';
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { runGithubManifestSetup } from './source-manifest.js';
+
+/** Mirror of the identical helper in queue.ts / event.ts / etc.: an explicit
+ *  --database-url wins, else KICI_DATABASE_URL, else null (→ HTTP path). */
+function resolveDirectDbUrl(explicit?: string): string | null {
+  return explicit ?? process.env.KICI_DATABASE_URL ?? null;
+}
+
+/** Run `fn` with a GenericSourceManager backed by a one-shot pool built from
+ *  `dbUrl`, always closing the pool. GenericSourceManager's constructor takes
+ *  only a Kysely handle (no secret store), so this is the full offline path for
+ *  generic + local sources. */
+async function withGenericManager<T>(
+  dbUrl: string,
+  fn: (mgr: GenericSourceManager) => Promise<T>,
+): Promise<T> {
+  const pool = createPool(dbUrl);
+  try {
+    return await fn(new GenericSourceManager(createDb(pool)));
+  } finally {
+    await pool.end();
+  }
+}
+
+/** Shape of a GitHub `sources` row as the HTTP `/api/v1/admin/sources` route
+ *  returns it — kept byte-shape-identical so a direct read is a drop-in. */
+interface GithubSourceRow {
+  id: string;
+  routingKey: string;
+  name: string;
+  provider: string;
+  customerId: string;
+  config: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Secret-free direct read of the GitHub `sources` table, shaped to the same
+ *  row the HTTP `/api/v1/admin/sources` route returns. No PgSecretStore needed
+ *  — listing never touches secrets. */
+async function listGithubSourcesDirect(dbUrl: string): Promise<GithubSourceRow[]> {
+  const pool = createPool(dbUrl);
+  try {
+    const db = createDb(pool);
+    const rows = await db.selectFrom('sources').selectAll().execute();
+    return rows.map((r) => ({
+      id: r.id,
+      routingKey: r.routing_key,
+      name: r.name,
+      provider: r.provider,
+      customerId: r.customer_id,
+      config: typeof r.config === 'string' ? JSON.parse(r.config) : (r.config ?? {}),
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }));
+  } finally {
+    await pool.end();
+  }
+}
+
+/** Secret-free direct customer_id update on the GitHub `sources` table.
+ *  SourceStore.updateSource({ customerId }) touches only the row (no secret
+ *  store), so we run the minimal Kysely UPDATE directly and skip building a
+ *  PgSecretStore (which would need master-key material the offline CLI lacks). */
+async function updateGithubCustomerIdDirect(
+  dbUrl: string,
+  routingKey: string,
+  customerId: string,
+): Promise<void> {
+  const pool = createPool(dbUrl);
+  try {
+    const db = createDb(pool);
+    const res = await db
+      .updateTable('sources')
+      .set({ customer_id: customerId, updated_at: sql`now()` })
+      .where('routing_key', '=', routingKey)
+      .executeTakeFirst();
+    if (Number(res.numUpdatedRows ?? 0n) === 0) {
+      throw new Error(`No GitHub source with routing key ${routingKey}`);
+    }
+  } finally {
+    await pool.end();
+  }
+}
+
+/** Structural row a listed generic/local source exposes for text rendering.
+ *  Both the HTTP `GenericSourceResponse` and the DB `GenericWebhookSource`
+ *  satisfy it, so `renderSourceListText` renders either transport's output. */
+interface ListableGenericRow {
+  id: string;
+  name: string;
+  routing_key: string;
+  enabled: boolean;
+  deleted_at?: unknown;
+}
+
+/** Render the human-readable `source list` output shared by the HTTP and the
+ *  direct-DB branches. `hasOrg` mirrors whether `--org` was passed (generic
+ *  sources are only listed for a specific org). */
+function renderSourceListText(
+  githubSources: Array<{ routingKey: string; name: string; provider: string }>,
+  genericSources: ListableGenericRow[],
+  hasOrg: boolean,
+): void {
+  if (githubSources.length > 0) {
+    console.log('GitHub sources:');
+    for (const s of githubSources) {
+      console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})`);
+    }
+  }
+
+  if (hasOrg) {
+    if (genericSources.length > 0) {
+      if (githubSources.length > 0) console.log('');
+      console.log('Generic sources:');
+      for (const s of genericSources) {
+        const status = s.enabled ? 'enabled' : 'disabled';
+        const deleted = s.deleted_at ? ' [deleted]' : '';
+        console.log(
+          `  ${s.id.padEnd(38)} ${s.name.padEnd(25)} ${status.padEnd(10)} ${s.routing_key}${deleted}`,
+        );
+      }
+    } else if (githubSources.length === 0) {
+      console.log('No sources configured.');
+    }
+  } else if (githubSources.length === 0) {
+    console.log('No sources configured.');
+    console.log('Tip: use --org <orgId> to also list generic sources.');
+  } else {
+    console.log('');
+    console.log('Tip: use --org <orgId> to also list generic sources.');
+  }
+}
 
 /** Default orchestrator base URL for the webhook trigger route, matching the
  *  kici-admin global `--url` default. */
@@ -117,6 +252,29 @@ async function readFromStdin(): Promise<string> {
     chunks.push(line);
   }
   return chunks.join('\n');
+}
+
+/** Error shown when both the private key and the webhook secret ask for stdin. */
+export const BOTH_STDIN_ERROR =
+  'cannot read both the private key and the webhook secret from stdin — use @file or --from-env for one of them';
+
+/**
+ * Resolve the `--webhook-secret` value. A literal value passes through; `-`
+ * reads the secret from stdin; absent stays undefined. The private key can also
+ * be piped via `--stdin`, and stdin can only be consumed once — so `-` here
+ * while the private key also reads stdin is a hard error.
+ */
+export async function resolveWebhookSecret(
+  opts: { value?: string; privateKeyFromStdin: boolean },
+  readStdin: () => Promise<string> = readFromStdin,
+): Promise<string | undefined> {
+  if (opts.value === '-') {
+    if (opts.privateKeyFromStdin) {
+      throw new Error(BOTH_STDIN_ERROR);
+    }
+    return (await readStdin()).trim();
+  }
+  return opts.value;
 }
 
 /** Shape of the `source refresh` route response (one source). */
@@ -316,7 +474,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .requiredOption('--name <name>', 'Human-readable source name')
     .option('--app-id <id>', 'GitHub App ID (omit when using --manifest)')
     .option('--private-key <pathOrValue>', 'Private key (prefix with @ for file path)')
-    .option('--webhook-secret <secret>', 'Webhook secret')
+    .option('--webhook-secret <secret>', 'Webhook secret (use "-" to read from stdin)')
     .option('--from-env <varName>', 'Read private key from environment variable')
     .option('--stdin', 'Read private key from stdin')
     .option(
@@ -359,6 +517,10 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           console.error('Error: --app-id is required (or use --manifest for one-click setup)');
           process.exit(1);
         }
+        if (opts.stdin && opts.webhookSecret === '-') {
+          console.error(`Error: ${BOTH_STDIN_ERROR}`);
+          process.exit(1);
+        }
         const privateKey = await resolveSecret({
           value: opts.privateKey,
           stdin: opts.stdin,
@@ -368,6 +530,10 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           console.error('Error: Private key is required (--private-key, --stdin, or --from-env)');
           process.exit(1);
         }
+        const webhookSecret = await resolveWebhookSecret({
+          value: opts.webhookSecret,
+          privateKeyFromStdin: Boolean(opts.stdin),
+        });
 
         const result = await getClient().post<{
           routingKey: string;
@@ -380,7 +546,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           name: opts.name,
           appId: opts.appId,
           privateKey,
-          webhookSecret: opts.webhookSecret,
+          webhookSecret,
         });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -531,6 +697,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       'Optional git://|http:// base for remote agents that do not share the orchestrator filesystem (default: file://)',
     )
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (opts) => {
       try {
         if (!path.isAbsolute(opts.path)) {
@@ -541,6 +708,31 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           repoBasePath: opts.path,
         };
         if (opts.cloneUrlBase) localConfig.cloneUrlBase = opts.cloneUrlBase;
+
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          const s = await withGenericManager(dbUrl, (mgr) =>
+            mgr.create({
+              orgId: opts.org,
+              name: opts.name,
+              providerType: 'local',
+              verificationMethod: 'none',
+              localConfig,
+            }),
+          );
+          if (opts.json) {
+            console.log(JSON.stringify(s, null, 2));
+            return;
+          }
+          console.log(`Local source created:`);
+          console.log(`  ID:           ${s.id}`);
+          console.log(`  Name:         ${s.name}`);
+          console.log(`  Routing key:  ${s.routing_key}`);
+          console.log(`  Org:          ${s.customer_id}`);
+          console.log(`  Repo path:    ${opts.path}`);
+          return;
+        }
+
         const result = await getClient().createGenericSource({
           orgId: opts.org,
           name: opts.name,
@@ -622,8 +814,27 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--org <orgId>', 'Filter generic sources by organization ID')
     .option('--include-deleted', 'Include soft-deleted generic sources')
     .option('--json', 'Emit raw JSON ({github: [...], generic: [...]}) instead of formatted text')
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (opts) => {
       try {
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          const githubSources = await listGithubSourcesDirect(dbUrl);
+          const genericSources = opts.org
+            ? await withGenericManager(dbUrl, (mgr) =>
+                mgr.list(opts.org, Boolean(opts.includeDeleted)),
+              )
+            : [];
+          if (opts.json) {
+            console.log(
+              JSON.stringify({ github: githubSources, generic: genericSources }, null, 2),
+            );
+            return;
+          }
+          renderSourceListText(githubSources, genericSources, Boolean(opts.org));
+          return;
+        }
+
         // List GitHub sources
         const { sources: githubSources } = await getClient().get<{
           sources: Array<{
@@ -658,34 +869,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
 
-        if (githubSources.length > 0) {
-          console.log('GitHub sources:');
-          for (const s of githubSources) {
-            console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})`);
-          }
-        }
-
-        if (opts.org) {
-          if (genericSources.length > 0) {
-            if (githubSources.length > 0) console.log('');
-            console.log('Generic sources:');
-            for (const s of genericSources) {
-              const status = s.enabled ? 'enabled' : 'disabled';
-              const deleted = s.deleted_at ? ' [deleted]' : '';
-              console.log(
-                `  ${s.id.padEnd(38)} ${s.name.padEnd(25)} ${status.padEnd(10)} ${s.routing_key}${deleted}`,
-              );
-            }
-          } else if (githubSources.length === 0) {
-            console.log('No sources configured.');
-          }
-        } else if (githubSources.length === 0) {
-          console.log('No sources configured.');
-          console.log('Tip: use --org <orgId> to also list generic sources.');
-        } else {
-          console.log('');
-          console.log('Tip: use --org <orgId> to also list generic sources.');
-        }
+        renderSourceListText(githubSources, genericSources, Boolean(opts.org));
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
@@ -751,8 +935,31 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       '--customer-id <orgId>',
       'Update the customer/org ID used for secret and environment scoping',
     )
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (routingKey: string, opts) => {
       try {
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          // Direct-DB mode only reassigns customer_id (the secret-free column).
+          // Secret / key / name updates touch the secret store, which the
+          // offline CLI has no master key for — reject them with a clear hint
+          // rather than silently dropping the changes.
+          if (opts.privateKey || opts.webhookSecret || opts.stdin || opts.fromEnv || opts.name) {
+            console.error(
+              'Error: --database-url mode supports only --customer-id updates; ' +
+                'secret/key/name updates require HTTP (drop --database-url)',
+            );
+            process.exit(1);
+          }
+          if (!opts.customerId) {
+            console.error('Error: --database-url mode requires --customer-id');
+            process.exit(1);
+          }
+          await updateGithubCustomerIdDirect(dbUrl, routingKey, opts.customerId);
+          console.log(`Source updated: ${routingKey}`);
+          return;
+        }
+
         const privateKey = await resolveSecret({
           value: opts.privateKey,
           stdin: opts.stdin,
@@ -937,9 +1144,13 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--path <dir>', 'New absolute repo base path on the agent filesystem')
     .option('--clone-url-base <url>', 'New git://|http:// clone base (default: file://)')
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (id: string, opts) => {
       try {
-        const data: Record<string, unknown> = {};
+        const data: {
+          name?: string;
+          localConfig?: { repoBasePath: string; cloneUrlBase?: string };
+        } = {};
         if (opts.name) data.name = opts.name;
         if (opts.path !== undefined) {
           if (!path.isAbsolute(opts.path)) {
@@ -956,6 +1167,22 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           console.error('Error: no fields to update. Provide --path and/or --name.');
           process.exit(1);
         }
+
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          const source = await withGenericManager(dbUrl, (mgr) => mgr.update(id, data));
+          if (!source) {
+            console.error(`Error: no local source with id ${id}`);
+            process.exit(1);
+          }
+          if (opts.json) {
+            console.log(JSON.stringify(source, null, 2));
+          } else {
+            console.log(`Local source updated: ${source.id} (${source.name})`);
+          }
+          return;
+        }
+
         const result = await getClient().updateGenericSource(id, data as any);
         if (opts.json) {
           console.log(JSON.stringify(result.source, null, 2));
@@ -976,6 +1203,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--generic', 'Remove a generic source (routingKey is treated as source ID)')
     .option('--local', 'Remove a local (file://) source (routingKey is treated as source ID)')
     .option('--hard', 'Permanently delete a generic/local source (requires --generic or --local)')
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
     .action(async (routingKey: string, opts) => {
       try {
         if (!opts.yes) {
@@ -988,6 +1216,27 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
             console.log('Cancelled.');
             return;
           }
+        }
+
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          // Direct-DB delete only covers generic/local rows (GenericSourceManager
+          // owns no secret store). GitHub-source removal touches secret material,
+          // so it stays HTTP-only.
+          if (!opts.generic && !opts.local) {
+            console.error(
+              'Error: --database-url mode supports only --generic / --local removal; ' +
+                'GitHub-source removal requires HTTP (drop --database-url)',
+            );
+            process.exit(1);
+          }
+          await withGenericManager(dbUrl, (mgr) =>
+            opts.hard ? mgr.hardDelete(routingKey) : mgr.softDelete(routingKey),
+          );
+          const mode = opts.hard ? 'permanently deleted' : 'soft-deleted';
+          const kind = opts.local ? 'Local' : 'Generic';
+          console.log(`${kind} source ${mode}: ${routingKey}`);
+          return;
         }
 
         // Local sources are generic_webhook_sources rows, so they soft/hard
@@ -1015,9 +1264,15 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
   src
     .command('enable <id>')
     .description('Enable a generic webhook source')
-    .action(async (id: string) => {
+    .option('--database-url <url>', 'Use direct DB access instead of HTTP (offline mode)')
+    .action(async (id: string, opts: { databaseUrl?: string }) => {
       try {
-        await getClient().enableGenericSource(id);
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        if (dbUrl) {
+          await withGenericManager(dbUrl, (mgr) => mgr.enable(id));
+        } else {
+          await getClient().enableGenericSource(id);
+        }
         console.log(`Generic source enabled: ${id}`);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

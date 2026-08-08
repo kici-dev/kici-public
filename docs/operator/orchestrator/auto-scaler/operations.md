@@ -21,7 +21,7 @@ Practical guidance:
 
 - **Container backend in a container** is the standard customer deployment and needs only the socket (or a remote `host`).
 - **Bare-metal backend in a container** is unusual. Because child processes inherit the orchestrator container's filesystem and namespaces, "bare-metal" agents launched from inside a container are really container-local processes, not host processes — which defeats the usual reason to pick bare-metal (host hardware / GPU access). If you need agents on the host, run the orchestrator on the host.
-- **Firecracker backend in a container** is technically possible but operationally fragile: nested KVM access, TAP device management, and jailer chroot all want host-level privileges. The supported and documented path is to run a Firecracker-backed orchestrator **on the bare-metal host** — see the [Firecracker setup guide](../firecracker-setup.md), whose prerequisites assume the orchestrator process has direct `/dev/kvm` and networking access.
+- **Firecracker backend in a container** is technically possible but operationally fragile: nested KVM access, TAP device management, and jailer chroot all want host-level privileges. The supported and documented path is to run a Firecracker-backed orchestrator **on the bare-metal host** — see the [Firecracker host setup](../firecracker/host-setup.md), whose prerequisites assume the orchestrator process has direct `/dev/kvm` and networking access.
 
 The bottom line: the answer is "yes, with the right passthrough," but only the container backend is a natural fit for a containerised orchestrator. For bare-metal and Firecracker, run the orchestrator on the host.
 
@@ -126,7 +126,14 @@ These labels use the reserved `kici:` prefix namespace. You do not need to inclu
 
 ### What happens when no match is found
 
-If a job's labels do not match any scaler's label sets **and** no static agent with matching labels is connected, the job is queued locally as a fallback (with `queued-no-backend` status) while the cluster coordinator attempts peer rerouting. If no peer in the cluster can handle the labels either, the job ultimately fails with a `no-backend` error. In single-orchestrator deployments (no cluster peers), the queued fallback job will remain pending until it times out.
+If a job's labels do not match any scaler's label sets **and** no static agent with matching labels is connected, the job is queued locally as a fallback (with `queued-no-backend` status) while the cluster coordinator attempts peer rerouting. The queued job is registered on the run, so the run cannot finish without it.
+
+If a peer accepts the job, the local fallback entry is cancelled and the peer runs it. Otherwise — no peer can handle the labels, or the deployment has no cluster peers at all — the job stays queued until an agent that satisfies its labels appears (a scaler pool sitting at zero can still scale up and drain it) or the queue window expires.
+
+At expiry the verdict splits:
+
+- A label set that **neither** a connected agent **nor** a scaler backend can serve settles the job [`unroutable`](../../../architecture/execution/state-machine.md). Its error message names the unsatisfied `runsOn` selectors, and the run **fails** — a job that could never be routed does not report success.
+- Anything else — including a job whose agent spawn was attempted and recorded a provisioning error — settles `timed_out_stale`. A failed spawn proves the labels did route, so the provisioning error is the real cause to investigate.
 
 ## Config reload (SIGHUP)
 
@@ -167,13 +174,14 @@ The scaler exposes Prometheus metrics with the `kici_orch_scaler_` prefix, avail
 
 ### Metrics reference
 
-| Metric                                  | Type    | Labels                  | Description                                                                                                                                                                                                |
-| --------------------------------------- | ------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `kici_orch_scaler_config_reloads_total` | Counter | `result`                | Config reload attempts (`attempted`, `success`, `failed`)                                                                                                                                                  |
-| `kici_orch_scaler_cpus_used`            | Gauge   | `scaler`, `machinePool` | Current CPU reservations summed by scaler / pool. `scaler="__global__"` is the orchestrator-wide total; pool rows reflect the ledger                                                                       |
-| `kici_orch_scaler_memory_bytes_used`    | Gauge   | `scaler`, `machinePool` | Current memory reservations (bytes) summed by scaler / pool. Same label semantics as `kici_orch_scaler_cpus_used`                                                                                          |
-| `kici_orch_scaler_spawn_refusals_total` | Gauge   | _(none)_                | Cumulative count of spawn requests refused due to resource caps (`maxAgents`, `resourceCap`, `globalResourceCap`, `machinePool`)                                                                           |
-| `kici_orch_scaler_spawn_failures_total` | Counter | `backend`, `bound`      | Spawn failures where the backend accepted the request but the agent never came up (missing binary, unpullable image, boot failure). `bound` is `true` for a job-bound spawn, `false` for a warm-pool spawn |
+| Metric                                  | Type    | Labels                  | Description                                                                                                                                                                                                                                                                    |
+| --------------------------------------- | ------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `kici_orch_scaler_config_reloads_total` | Counter | `result`                | Config reload attempts (`attempted`, `success`, `failed`)                                                                                                                                                                                                                      |
+| `kici_orch_scaler_cpus_used`            | Gauge   | `scaler`, `machinePool` | Current CPU reservations summed by scaler / pool. `scaler="__global__"` is the orchestrator-wide total; pool rows reflect the ledger                                                                                                                                           |
+| `kici_orch_scaler_memory_bytes_used`    | Gauge   | `scaler`, `machinePool` | Current memory reservations (bytes) summed by scaler / pool. Same label semantics as `kici_orch_scaler_cpus_used`                                                                                                                                                              |
+| `kici_orch_scaler_spawn_refusals_total` | Gauge   | _(none)_                | Cumulative count of spawn requests refused due to resource caps (`maxAgents`, `resourceCap`, `globalResourceCap`, `machinePool`)                                                                                                                                               |
+| `kici_orch_scaler_spawn_failures_total` | Counter | `backend`, `bound`      | Spawn failures where the backend accepted the request but the agent never came up (missing binary, unpullable image, boot failure). `bound` is `true` for a job-bound spawn, `false` for a warm-pool spawn                                                                     |
+| `kici_orch_scaler_redispatch_total`     | Counter | `trigger`               | Pending at-capacity jobs re-offered to the scaler when capacity freed. `trigger` is `hook` (near-zero-latency capacity-freed callback) or `sweep` (leader-gated backstop). See [At-capacity queueing and re-dispatch](./common-config.md#at-capacity-queueing-and-re-dispatch) |
 
 ### Suggested alert rules
 

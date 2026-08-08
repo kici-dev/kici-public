@@ -4,6 +4,12 @@ import {
   OrchRole,
   ORCH_CAPABILITIES,
   hasOrchCapability,
+  platformCapabilitiesSchema,
+  PLATFORM_CAPABILITIES,
+  hasPlatformCapability,
+  orchAgentCapabilitiesSchema,
+  ORCH_AGENT_CAPABILITIES,
+  hasOrchAgentCapability,
 } from './capabilities.js';
 
 describe('OrchRole', () => {
@@ -89,6 +95,61 @@ describe('hasOrchCapability', () => {
   });
 });
 
+describe('platformCapabilitiesSchema', () => {
+  it('accepts empty object (nothing advertised)', () => {
+    expect(platformCapabilitiesSchema.parse({})).toEqual({});
+  });
+
+  it('accepts the known flags', () => {
+    const caps = { orchMetrics: true, oidcMint: false };
+    expect(platformCapabilitiesSchema.parse(caps)).toEqual(caps);
+  });
+
+  it('preserves unknown flags via passthrough', () => {
+    const caps = { orchMetrics: true, futureFlag: true };
+    expect(platformCapabilitiesSchema.parse(caps)).toEqual(caps);
+  });
+
+  it('rejects a non-boolean known flag', () => {
+    expect(() => platformCapabilitiesSchema.parse({ orchMetrics: 'yes' })).toThrow();
+  });
+});
+
+describe('PLATFORM_CAPABILITIES', () => {
+  it('advertises orchMetrics and oidcMint', () => {
+    expect(PLATFORM_CAPABILITIES.orchMetrics).toBe(true);
+    expect(PLATFORM_CAPABILITIES.oidcMint).toBe(true);
+  });
+
+  it('is frozen', () => {
+    expect(Object.isFrozen(PLATFORM_CAPABILITIES)).toBe(true);
+  });
+
+  it('parses through its own schema', () => {
+    expect(platformCapabilitiesSchema.parse(PLATFORM_CAPABILITIES)).toEqual(PLATFORM_CAPABILITIES);
+  });
+});
+
+describe('hasPlatformCapability', () => {
+  it('returns false for undefined capabilities', () => {
+    expect(hasPlatformCapability(undefined, 'orchMetrics')).toBe(false);
+  });
+
+  it('returns false for a missing flag', () => {
+    expect(hasPlatformCapability({}, 'orchMetrics')).toBe(false);
+  });
+
+  it('returns true for a flag set to true', () => {
+    const caps = platformCapabilitiesSchema.parse({ orchMetrics: true });
+    expect(hasPlatformCapability(caps, 'orchMetrics')).toBe(true);
+  });
+
+  it('returns false for a flag set to false', () => {
+    const caps = platformCapabilitiesSchema.parse({ orchMetrics: false });
+    expect(hasPlatformCapability(caps, 'orchMetrics')).toBe(false);
+  });
+});
+
 describe('orch capabilities dashboard-request manifest', () => {
   it('advertises the supported dashboard request set', () => {
     expect(ORCH_CAPABILITIES.supportedDashboardRequests).toContain(
@@ -101,5 +162,31 @@ describe('orch capabilities dashboard-request manifest', () => {
       supportedDashboardRequests: ['dashboard.contexts.bindings.set'],
     });
     expect(parsed.supportedDashboardRequests).toHaveLength(1);
+  });
+});
+
+describe('orchAgentCapabilitiesSchema', () => {
+  it('defaults advertise artifactCompleteAck', () => {
+    expect(ORCH_AGENT_CAPABILITIES.artifactCompleteAck).toBe(true);
+    expect(orchAgentCapabilitiesSchema.parse(ORCH_AGENT_CAPABILITIES)).toEqual(
+      ORCH_AGENT_CAPABILITIES,
+    );
+  });
+
+  it('preserves unknown flags (passthrough)', () => {
+    const parsed = orchAgentCapabilitiesSchema.parse({
+      artifactCompleteAck: true,
+      futureFlag: true,
+    });
+    expect((parsed as Record<string, unknown>).futureFlag).toBe(true);
+  });
+
+  it('hasOrchAgentCapability is false for undefined / missing / false', () => {
+    expect(hasOrchAgentCapability(undefined, 'artifactCompleteAck')).toBe(false);
+    expect(hasOrchAgentCapability({}, 'artifactCompleteAck')).toBe(false);
+    expect(hasOrchAgentCapability({ artifactCompleteAck: false }, 'artifactCompleteAck')).toBe(
+      false,
+    );
+    expect(hasOrchAgentCapability({ artifactCompleteAck: true }, 'artifactCompleteAck')).toBe(true);
   });
 });

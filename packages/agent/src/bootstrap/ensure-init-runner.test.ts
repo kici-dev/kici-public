@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ensureInitRunner } from './ensure-init-runner.js';
 import type { SpawnFn, SshResult } from './ssh-exec.js';
+import type { AgentPayloadSource } from './payload-source.js';
 
 const MATERIAL = {
   broughtUp: true,
@@ -10,7 +11,15 @@ const MATERIAL = {
   targetAgentId: 'box-00007',
   orchestratorUrl: 'ws://10.0.0.1:4000/ws',
   labels: ['kici:init', 'kici:privileged:root', 'kici:host:box-00007'],
+  version: '1.2.3',
 };
+
+const SHA = 'a'.repeat(64);
+
+/** A payload source that resolves a fixed tarball + hash. */
+function payloadSource(): AgentPayloadSource {
+  return { resolve: vi.fn(async () => ({ tarballPath: '/payloads/1.2.3/p.tar.gz', sha256: SHA })) };
+}
 
 function makeSpawn(): {
   spawnFn: SpawnFn;
@@ -43,7 +52,11 @@ describe('ensureInitRunner (agent-side)', () => {
   it('pushes a launcher and starts the init-runner with the bootstrap env', async () => {
     const transport = vi.fn(async () => MATERIAL);
     const { spawnFn, calls } = makeSpawn();
-    const result = await ensureInitRunner(transport, 'box-00007', { spawnFn });
+    // Golden-image path: a fixed agentCommand skips staging.
+    const result = await ensureInitRunner(transport, 'box-00007', {
+      spawnFn,
+      agentCommand: 'kici-agent',
+    });
 
     expect(result).toEqual({ broughtUp: true });
     expect(transport).toHaveBeenCalledWith('kici.ensureInitRunner', { targetAgentId: 'box-00007' });
@@ -56,6 +69,10 @@ describe('ensureInitRunner (agent-side)', () => {
     expect(push?.stdin).toContain('box-00007');
     expect(push?.stdin).toContain('ws://10.0.0.1:4000/ws');
     expect(push?.stdin).toContain('kici:init');
+    // Suppress auto-derived role labels: the bootstrap token authorizes only the
+    // init-runner's bring-up labels, so the launcher must set KICI_ROLES empty or
+    // the register is rejected for exceeding the token-bound label scope.
+    expect(push?.stdin).toContain('KICI_ROLES=');
 
     // A run invocation chmod's + executes the launcher.
     const run = calls.find((c) => c.command === 'ssh' && c.args.some((a) => a.includes('chmod')));
@@ -84,8 +101,49 @@ describe('ensureInitRunner (agent-side)', () => {
       }
       return { exitCode: 0, stdout: '', stderr: '' };
     });
+    await expect(
+      ensureInitRunner(transport, 'box-00007', { spawnFn, agentCommand: 'kici-agent' }),
+    ).rejects.toThrow(/init-runner launch.*failed/s);
+  });
+
+  it('probes + stages a payload, then boots the launcher on the vendored Node', async () => {
+    const transport = vi.fn(async () => MATERIAL);
+    const calls: Array<{ command: string; args: string[]; stdin?: string }> = [];
+    const spawnFn: SpawnFn = vi.fn(async (command, args, opts) => {
+      calls.push({ command, args, stdin: opts.stdin });
+      if (command === 'ssh-agent' && args[0] !== '-k') {
+        return {
+          exitCode: 0,
+          stdout: 'SSH_AUTH_SOCK=/tmp/a.sock;\nSSH_AGENT_PID=1;\n',
+          stderr: '',
+        };
+      }
+      // The platform probe (uname) returns a glibc x86_64 box.
+      if (command === 'ssh' && args.some((a) => a.includes('uname'))) {
+        return { exitCode: 0, stdout: 'Linux x86_64\nldd (GNU libc) 2.36', stderr: '' };
+      }
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    const source = payloadSource();
+    const result = await ensureInitRunner(transport, 'box-00007', {
+      spawnFn,
+      payloadSource: source,
+      hashLocalFile: async () => SHA,
+    });
+    expect(result).toEqual({ broughtUp: true });
+    expect(source.resolve).toHaveBeenCalledWith('linux-x64', '1.2.3');
+    // The payload tarball went over scp (binary-safe).
+    expect(calls.some((c) => c.command === 'scp')).toBe(true);
+    // The launcher the box runs points at the staged vendored-Node launcher.
+    const push = calls.find((c) => c.command === 'ssh' && c.stdin?.includes('KICI_AGENT_TOKEN'));
+    expect(push?.stdin).toContain('/opt/kici-init/kici-agent');
+  });
+
+  it('throws a clear error when neither a payload source nor agentCommand is configured', async () => {
+    const transport = vi.fn(async () => MATERIAL);
+    const { spawnFn } = makeSpawn();
     await expect(ensureInitRunner(transport, 'box-00007', { spawnFn })).rejects.toThrow(
-      /init-runner launch.*failed/s,
+      /no agent payload source configured/,
     );
   });
 });

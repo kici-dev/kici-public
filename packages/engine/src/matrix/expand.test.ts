@@ -5,8 +5,13 @@ import {
   expandMultiDimension,
   expandMatrix,
   applyIncludeExclude,
+  normalizeMatrixInput,
+  matrixCombinationCount,
+  findDuplicateCombination,
+  MatrixShapeError,
   type MatrixValues,
 } from './expand.js';
+import { formatExpandedJobName } from './format.js';
 
 describe('cartesianProduct', () => {
   it('returns a single empty tuple for an empty input', () => {
@@ -126,6 +131,16 @@ describe('expandMultiDimension', () => {
     expect(result).toEqual([{ a: '2', m: '3', z: '1' }]);
   });
 
+  it('keeps a dimension literally named __proto__', () => {
+    // Building each combination by assignment would run the inherited
+    // `__proto__` setter and silently drop the dimension.
+    const matrix = JSON.parse('{"__proto__":["p"],"os":["linux"]}') as Record<string, string[]>;
+    const result = expandMultiDimension(matrix);
+
+    expect(result).toHaveLength(1);
+    expect(Object.keys(result[0])).toEqual(['__proto__', 'os']);
+  });
+
   it('should handle empty object defensively', () => {
     const matrix = {};
     const result = expandMultiDimension(matrix);
@@ -167,6 +182,166 @@ describe('expandMatrix', () => {
         { x: '2', y: 'b' },
       ]),
     );
+  });
+});
+
+describe('normalizeMatrixInput', () => {
+  it('normalizes an array form', () => {
+    expect(normalizeMatrixInput(['a', 'b'])).toEqual({ kind: 'array', values: ['a', 'b'] });
+  });
+
+  it('normalizes an object form with sorted dimensions', () => {
+    expect(normalizeMatrixInput({ y: ['1'], x: ['a'] })).toEqual({
+      kind: 'object',
+      dimensions: [
+        ['x', ['a']],
+        ['y', ['1']],
+      ],
+    });
+  });
+
+  it('coerces numeric and boolean elements to strings', () => {
+    expect(normalizeMatrixInput([18, 20, true])).toEqual({
+      kind: 'array',
+      values: ['18', '20', 'true'],
+    });
+  });
+
+  for (const [label, input] of [
+    ['undefined', undefined],
+    ['null', null],
+    ['a number', 7],
+  ] as const) {
+    it(`rejects ${label}`, () => {
+      expect(() => normalizeMatrixInput(input)).toThrow(MatrixShapeError);
+    });
+  }
+
+  it('names the documented contract in the message', () => {
+    expect(() => normalizeMatrixInput(undefined)).toThrow(
+      /matrix must be a string array or an object of string arrays/,
+    );
+  });
+
+  it('rejects a bare string and explains the per-character trap', () => {
+    expect(() => normalizeMatrixInput('linux')).toThrow(/one dimension per character/);
+  });
+
+  it('rejects a dimension whose value is not an array, naming the dimension', () => {
+    expect(() => normalizeMatrixInput({ os: 'linux' })).toThrow(/dimension "os"/);
+  });
+
+  for (const [label, element] of [
+    ['an object', { a: 1 }],
+    ['an array', []],
+    ['null', null],
+  ] as const) {
+    it(`rejects ${label} as an element`, () => {
+      expect(() => normalizeMatrixInput([element])).toThrow(MatrixShapeError);
+    });
+  }
+});
+
+describe('expandMatrix input-shape regressions', () => {
+  // The two symptoms the guard exists for. They must fail loudly forever.
+  it('does not throw a bare TypeError when the matrix function forgot its return', () => {
+    expect(() => expandMatrix(undefined)).toThrow(MatrixShapeError);
+    expect(() => expandMatrix(undefined)).not.toThrow(TypeError);
+  });
+
+  it('does not read a bare string as one dimension per character', () => {
+    expect(() => expandMatrix('linux')).toThrow(MatrixShapeError);
+  });
+
+  it('does not silently expand a non-string element into an [object Object] job name', () => {
+    expect(() => expandMatrix([{ a: 1 }])).toThrow(MatrixShapeError);
+  });
+
+  it('rejects a hole in a sparse array rather than letting it through', () => {
+    // `.map` skips holes; `Array.from` visits them as undefined, so the element
+    // check actually runs. Without it a hole reaches MatrixValues as undefined.
+    expect(() => expandMatrix([, 'a'])).toThrow(MatrixShapeError);
+  });
+
+  it('names the offending element index', () => {
+    expect(() => expandMatrix(['a', { b: 1 }])).toThrow(/values\[1\]/);
+    expect(() => expandMatrix({ os: ['linux', null] })).toThrow(/dimension "os"\[1\]/);
+  });
+
+  it('collapses an empty dimension without materializing the other dimensions', () => {
+    // 1000^3 x 0. The combination count is 0, so no size guard fires — the
+    // empty-set short-circuit is the only thing standing between this and 1e9
+    // intermediate tuples. Without it this OOMs rather than returning [].
+    const big = Array.from({ length: 1000 }, (_, i) => `v${i}`);
+    expect(expandMatrix({ a: big, b: big, c: big, z: [] })).toEqual([]);
+  });
+});
+
+describe('matrixCombinationCount', () => {
+  it('counts an array form as its length', () => {
+    expect(matrixCombinationCount(['a', 'b', 'c'])).toBe(3);
+  });
+
+  it('counts an object form as the product of its dimensions', () => {
+    expect(matrixCombinationCount({ os: ['a', 'b'], node: ['1', '2', '3'] })).toBe(6);
+  });
+
+  it('counts an empty object as zero combinations', () => {
+    expect(matrixCombinationCount({})).toBe(0);
+  });
+
+  it('validates its own input rather than assuming expandMatrix ran first', () => {
+    expect(() => matrixCombinationCount('linux')).toThrow(MatrixShapeError);
+  });
+
+  it('counts an empty dimension as zero combinations', () => {
+    expect(matrixCombinationCount({ a: ['x', 'y'], z: [] })).toBe(0);
+  });
+
+  it('counts without materializing the product', () => {
+    // 1000^3 = 1e9 combinations. If this materialized, the test would OOM.
+    const big = Array.from({ length: 1000 }, (_, i) => `v${i}`);
+    expect(matrixCombinationCount({ a: big, b: big, c: big })).toBe(1_000_000_000);
+  });
+});
+
+describe('findDuplicateCombination', () => {
+  it('returns null for distinct combinations', () => {
+    expect(findDuplicateCombination([{ value: 'a' }, { value: 'b' }])).toBeNull();
+  });
+
+  it('finds a repeated single-dimension value', () => {
+    expect(findDuplicateCombination([{ value: 'linux' }, { value: 'linux' }])).toEqual({
+      value: 'linux',
+    });
+  });
+
+  it('finds a repeated multi-dimension combination regardless of key order', () => {
+    expect(
+      findDuplicateCombination([
+        { os: 'linux', node: '18' },
+        { node: '18', os: 'linux' },
+      ]),
+    ).toEqual({ node: '18', os: 'linux' });
+  });
+
+  it('does not treat different combinations as duplicates', () => {
+    expect(
+      findDuplicateCombination([
+        { os: 'linux', node: '18' },
+        { os: 'linux', node: '20' },
+      ]),
+    ).toBeNull();
+  });
+
+  it('catches a name collision between structurally different combinations', () => {
+    // Distinct combinations, identical rendered name — the collision that
+    // actually hurts. The structural default misses it; a name key catches it.
+    const combos: MatrixValues[] = [{ value: 'a' }, { other: 'a' }];
+    expect(findDuplicateCombination(combos)).toBeNull();
+    expect(findDuplicateCombination(combos, (c) => formatExpandedJobName('job', c))).toEqual({
+      other: 'a',
+    });
   });
 });
 
@@ -293,6 +468,43 @@ describe('applyIncludeExclude', () => {
     ];
     const result = applyIncludeExclude(expanded, [{}], undefined);
     expect(result).toEqual(expanded);
+  });
+
+  it('sorts an include entry so it renders the same dimension order as its siblings', () => {
+    // `expandMultiDimension` sorts dimension names, but an include entry keeps
+    // the author's key order, and `formatMatrixSuffix` renders insertion order —
+    // so an include child used to print its dimensions back-to-front relative to
+    // every expanded sibling.
+    const expanded = expandMatrix({ os: ['linux'], node: ['18'] });
+    const result = applyIncludeExclude(expanded, [{ os: 'linux', node: '23' }], undefined);
+
+    expect(Object.keys(result.at(-1)!)).toEqual(['node', 'os']);
+    expect(result.map((c) => formatExpandedJobName('test', c))).toEqual([
+      'test (18, linux)',
+      'test (23, linux)',
+    ]);
+  });
+
+  it('copies an include entry rather than aliasing the object it was given', () => {
+    // The pushed combination becomes a child job's `variantValues`; aliasing it
+    // would hand out a live reference to the lock job's own include entry.
+    const incl = { os: 'linux', node: '23' };
+    const result = applyIncludeExclude([], [incl], undefined);
+
+    expect(result[0]).not.toBe(incl);
+    expect(result[0]).toEqual({ node: '23', os: 'linux' });
+  });
+
+  it('keeps a dimension literally named __proto__ on an include entry', () => {
+    // `sorted['__proto__'] = v` runs the inherited setter instead of defining an
+    // own property, so a key-sorted copy built by assignment would drop the
+    // dimension. A lock file is JSON, and `JSON.parse` does create an own
+    // `__proto__` property.
+    const incl = JSON.parse('{"os":"linux","__proto__":"p"}') as Record<string, string>;
+    const result = applyIncludeExclude([], [incl], undefined);
+
+    expect(Object.keys(result[0])).toEqual(['__proto__', 'os']);
+    expect(formatExpandedJobName('test', result[0])).toBe('test (p, linux)');
   });
 
   it('should still apply non-empty excludes when mixed with empty ones', () => {

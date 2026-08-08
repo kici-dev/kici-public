@@ -247,12 +247,14 @@ Any variable not in the allowlist is stripped, including:
 ### Container backend (ContainerSandbox)
 
 - Creates a disposable Docker/Podman container per job via `sleep infinity`
-- Workflow runner bind-mounted read-only at `/opt/kici/workflow-runner.js`
-- Workspace bind-mounted read-write at `/workspace`
-- IPC via dockerode exec API with demultiplexed stdin/stdout streams
+- Workflow runner bind-mounted read-only at `/opt/kici/workflow-runner.js` as a self-contained bundle (runtime dependencies inlined; a pure-JS TypeScript loader-hook bundle is mounted alongside at `/opt/kici/ts-loader-hook.js`)
+- `/workspace` is a container-owned anonymous volume created fresh per job and owned by the container user (not a host bind), so writes work with all capabilities dropped under rootful runtimes
+- IPC via the container runtime's exec API with demultiplexed stdin/stdout streams
 - Container labels (`kici-sandbox`, `kici-job-id`) for orphan cleanup
 - Optional `keepFailed` flag preserves containers for debugging
 - Uses `buildRequest()` from `fork-runner.ts` for consistent dispatch-to-request mapping
+- **Hardened by default:** all Linux capabilities dropped (`CapDrop: ALL`), `no-new-privileges`, pids/memory/CPU cgroup caps (default 512 / 2 GiB / 2 CPUs), and a private tmpfs at `/tmp`. Read-only rootfs and a non-root user are opt-in; the image's configured user is never silently rewritten. The `KICI_SANDBOX_HARDENED=false` rollback affordance reproduces the legacy unhardened posture. Tuned via the `KICI_SANDBOX_*` knobs (see the agent configuration reference and [Agent execution security](../../operator/security/agent-security.md))
+- **Escape hatch is orchestrator-gated, never agent-side:** a job may request extra capabilities or host networking via its `sandbox` block, but the request is resolved at dispatch against a per-org allow-list the operator controls. A request outside the allow-list fails the run at dispatch with a reason naming the offending capability or knob -- never a silent downgrade. Grants are strictly additive, so a job with no `sandbox` request keeps the fully hardened default, and the agent applies only the grant the orchestrator resolved (it never reads the allow-list itself). See [Agent execution security](../../operator/security/agent-security.md)
 
 ### Bare-metal backend (BareMetalSandbox)
 

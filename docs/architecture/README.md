@@ -11,9 +11,9 @@ Deep-dive documentation for KiCI internals. These docs explain how the three-tie
 
 The three-tier relay model (Platform, orchestrator, agent) with a Mermaid flowchart showing all tier connections and a package dependency graph showing how the 11 packages (9 scoped `@kici-dev/*` plus the unscoped `kici` wrapper and `kici-admin` admin CLI) relate to each other. Start here for the big picture of how KiCI is structured and why each tier exists.
 
-### [Execution state machine](./execution/state-machine.md)
+### [Execution status vocabulary](./execution/state-machine.md)
 
-The execution state machine tracks every workflow run, job, and step through 11 states (pending, queued, running, recovering, cancelling, held, waiting, success, failed, cancelled, skipped) using 16 events. This page covers the full transition table, Mermaid stateDiagram-v2 visualization, API reference for the 2 public functions, and how each tier uses the state machine.
+The run, job, and step status vocabularies (`ExecutionRunStatus`, `ExecutionJobStatus`, `ExecutionStepStatus`) that describe a workflow execution at three granularities, the two terminal-state sets (`TERMINAL_RUN_STATES`, `TERMINAL_JOB_STATES`) and why they differ, and the orchestrator's execution tracker that owns lifecycle logic — run-completion detection, job-to-run outcome roll-up, and persistence.
 
 ### [Protocol messages](protocol-messages.md)
 
@@ -45,7 +45,7 @@ Deep-dive into the secrets management subsystem. Covers the AES-256-GCM encrypti
 
 ### [Contexts architecture](contexts.md)
 
-Data model, protection rule pipeline, scope resolution algorithm, and state machine extensions for deployment environments. Covers the orchestrator DB schema (environments, variables, overrides, held_runs), the sequential protection gate pipeline (branch -> concurrency -> reviewer -> timer), the longest-path-wins scope resolution algorithm, the 8-layer environment variable merge, held/waiting state machine extensions, the WS proxy pattern for dashboard CRUD, and lock file v6 schema changes.
+Data model, protection rule pipeline, scope resolution algorithm, and held-run lifecycle for deployment environments. Covers the orchestrator DB schema (environments, variables, overrides, held_runs), the sequential protection gate pipeline (branch -> concurrency -> reviewer -> timer), the longest-path-wins scope resolution algorithm, the 8-layer environment variable merge, the held-run lifecycle, the WS proxy pattern for dashboard CRUD, and lock file v6 schema changes.
 
 ### [Test run architecture](./execution/test-runs.md)
 
@@ -77,7 +77,7 @@ Internal architecture of the event system for non-Git workflow triggers (custom 
 
 ### [Execution lifecycle](./execution/execution-lifecycle.md)
 
-Cancel flow, hook execution order, and concurrency group protocol. Covers the detailed lifecycle of job and step execution beyond the state machine transitions.
+Cancel flow, hook execution order, and concurrency group protocol. Covers the detailed lifecycle of job and step execution beyond the status vocabulary transitions.
 
 ### [Role-based access control (RBAC)](./security/rbac.md)
 
@@ -106,3 +106,15 @@ DB-backed module that gates job dispatch on upstream completion. Covers the `nee
 ### [Webhook pipeline](./webhooks/webhook-pipeline.md)
 
 The orchestrator's webhook processing pipeline that turns inbound provider webhooks into dispatched workflow runs. Covers the provider-agnostic pipeline, `processWebhook()` entry point, normalization, lock-file fetch, and credential minting through the `ProviderRegistry`.
+
+### [Approvals](approvals.md)
+
+The unified one-hold/two-trigger approval model. Covers clause evaluation and resume, held-run state, and the step-level agent round-trip that gates an element mid-run.
+
+### [Build provenance](./security/provenance.md)
+
+How KiCI generates and verifies signed SLSA attestations, and the trust model behind them. Covers the orchestrator-owned signing key, the OIDC discovery and JWKS it publishes, and out-of-band trust-root verification.
+
+### [Scaling ceilings](./clustering/scaling-ceilings.md)
+
+Known cluster-scaling ceilings and the growth conditions that should trigger reworking them.

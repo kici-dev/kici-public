@@ -19,6 +19,7 @@ flowchart LR
     AGENT_B["Agent\n(arm64)"]
 
     GH -- "HTTP\n(webhooks)" --> PLATFORM
+    GH -. "HTTP direct webhook\n(hybrid / observed / independent)" .-> ORCH_A
     PLATFORM <-- "WebSocket\n(relay + telemetry)" --> ORCH_A
     PLATFORM <-- "WebSocket\n(relay + telemetry)" --> ORCH_B
     ORCH_A <-- "WebSocket P2P\n(reroute + progress\n+ Raft)" --> ORCH_B
@@ -31,7 +32,19 @@ flowchart LR
 
 **Why three tiers?** Trust boundaries. The Platform relay never sees customer code -- it only verifies webhook signatures and forwards payloads. The orchestrator matches triggers against the lock file without cloning repositories. Only the agent, running on customer infrastructure, clones code and executes steps.
 
-This model also supports an independent deployment without the hosted Platform: the orchestrator and agent run on customer infrastructure, with the orchestrator receiving webhooks directly from GitHub instead of through the Platform relay.
+This model also supports pointing webhooks **directly** at the orchestrator,
+bypassing the Platform relay. In **hybrid** mode the orchestrator keeps its
+Platform connection for the dashboard and telemetry while GitHub delivers events
+straight to the orchestrator's ingress — so a Platform outage never drops a build
+trigger. **Observed** mode drops the relay leg entirely: webhooks reach only the
+orchestrator's own ingress (no payload ever transits KiCI) while the Platform
+connection stays up for the hosted dashboard, and the orchestrator's sources
+register as observe-only — recorded and dashboard-visible, but excluded from
+every relay-candidate lookup. In a fully **independent** deployment the
+orchestrator and agent run on customer infrastructure with no Platform at all,
+receiving webhooks directly. For
+exactly which capabilities the hosted Platform provides in each case, see
+[What requires the hosted Platform](../operator/orchestrator/platform-capabilities.md).
 
 ## Component responsibilities
 
@@ -46,7 +59,7 @@ The Platform never processes, stores, or executes customer code, and never sees 
 The orchestrator is the execution brain. It decides what to run and dispatches work to agents.
 
 - **Trigger matching** -- Evaluates lock file triggers against webhook payloads to determine which jobs to run. Uses branch, path, and event matching via picomatch.
-- **Lock file caching** -- Fetches `kici.lock.json` from the configured provider's API (GitHub, generic webhook, universal-git, or internal). An LRU cache wraps the per-provider fetcher, keyed by `{provider}:{repo}:{ref}` so cross-provider fallback resolutions stay isolated.
+- **Lock file caching** -- Fetches `kici.lock.json` via the configured source's fetcher (GitHub API, universal-git clone for generic webhook sources backed by a git URL, or the local filesystem for `file://` sources). An LRU cache wraps the per-provider fetcher, keyed by `{provider}:{repo}:{ref}` so cross-provider fallback resolutions stay isolated.
 - **Agent registry** -- Tracks connected agents with label-based routing for job dispatch.
 - **Job queue** -- PostgreSQL-backed FIFO queue for reliable dispatch.
 - **Webhook pipeline** -- Dedup, event mapping, lock file fetch, trigger matching, and job dispatch in a single pipeline.
@@ -61,12 +74,13 @@ The orchestrator is the execution brain. It decides what to run and dispatches w
 The agent is the execution worker. It runs on customer infrastructure and has full access to customer code.
 
 - **Repository cloning** -- Clones the target repo with token-based auth (token in HTTP headers, not URLs, to prevent leakage).
-- **Step execution** -- Runs steps sequentially with full `StepContext` (zx shell, logger, environment, workflow/job metadata).
-- **Docker support** -- Container-based step execution via `docker exec` for isolated environments.
+- **Step execution** -- Runs steps in declaration order with full `StepContext` (zx shell, logger, environment, workflow/job metadata). Steps wrapped in a `parallel()` group run concurrently behind a `maxParallel` window, and each child reports as its own observable step with its own logs, status, timing, and retry.
+- **Execution sandboxes** -- Runs the workflow runner as a separate child process with a sanitized environment, in one of three sandboxes: bare metal (process fork, with optional bubblewrap namespace isolation), a container runtime (the whole job lifecycle runs inside a disposable container), or inside a Firecracker microVM. Agent-internal credentials never reach customer workflow code.
 - **Log streaming** -- Chunked log streaming back to the orchestrator with configurable size limits.
+- **Dependency caching** -- Packs, uploads, and restores installed workflow dependencies so repeat runs skip the install step.
 - **Graceful shutdown** -- SIGTERM with 10s grace period, SIGUSR1 for drain mode.
 
-> Source: `packages/agent/src/execution/job-runner.ts` (job lifecycle), `packages/agent/src/server.ts` (entry point)
+> Source: `packages/agent/src/execution/job-runner.ts` (job lifecycle), `packages/agent/src/execution/sandbox/` (execution sandboxes and the parallel step scheduler), `packages/agent/src/server.ts` (entry point)
 
 ## Supporting packages
 
@@ -77,14 +91,22 @@ Shared business logic used by all three tiers. Single source of truth for cross-
 - Protocol message schemas (Zod-based, direction-specific unions including dashboard REST-over-WS, browser live streaming, the test-relay control plane, log pull, run events, peer-to-peer, cluster join, and source registration)
 - Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, CloneTokenProvider, RepoUrlBuilder, ContributorResolver, CheckStatusPoster)
 - Trigger matching engine (branch, path, event evaluation)
-- Execution state machine (11 states, 16 events, pure functions)
+- Dispatch inputs (input descriptors, extraction from the trigger event, and coercion to typed values)
+- Matrix expansion and fanout (combination expansion with include/exclude, job-name suffix formatting, and materialization of one matrix or multi-host job into N dispatchable children)
+- Execution status vocabulary (run/job/step status enums + terminal-state sets; lifecycle owned by the orchestrator's execution tracker)
+- Check mode (the idempotent run modes `apply` / `check` / `check-fail-on-drift` and the per-step outcome vocabulary)
 - Webhook signature verification (HMAC-SHA256, timing-safe)
 - WebSocket close codes (unified across all tiers)
 - WebSocket rate limiting (WsRateLimiter)
 - Environment allowlist (safe env var filtering)
 - Secrets management (secret context resolution)
-- Environment model (scoped secrets, env merge, protection gates)
+- Context model (scoped secrets, ordered context merge, protection gates)
+- Approval requirements (normalized approver clauses shared by the orchestrator gate, the resolver, the held-run store, and the agent step round-trip)
+- Build provenance (in-toto statement schema, DSSE envelope, attestation bundle, verification)
+- Artifact name contract (the shared filesystem/URL-safe name schema the orchestrator, agent, and SDK all validate against)
+- Developer MCP tool schemas (argument schemas for the AI-agent tool surface)
 - Label utilities (platform label derivation, runsOn normalization, `kici:*` set-only reserved namespace, role labels)
+- Host inventory (the canonical queryable host-roster schema shared by the orchestrator's roster store, the agent-facing inventory API, and the SDK's `ctx.kici.inventory`)
 - Audit policy and retention (per-action access-log sampling, warm-retention windows for cold-store eligibility, federated activity row schema)
 - Scaler backend type enum (`container`, `bare-metal`, `firecracker`, `kubernetes`)
 - Registration trigger type enum (registerable trigger discriminator)
@@ -102,7 +124,9 @@ User-facing SDK for defining workflows in TypeScript. Provides factory functions
 
 CLI tooling for workflow authors. Compiles `.kici/workflows/*.ts` to `.kici/kici.lock.json`, provides watch mode, local test execution, project initialization, and pre-commit hook integration.
 
-> Source: `packages/compiler/src/`
+It also runs the **local dev plane** -- an on-demand, fully local execution stack (embedded PostgreSQL, an orchestrator process, and a bare-metal-scaled agent) that lets an author run a workflow end-to-end on their own machine. That is why the compiler depends on `@kici-dev/orchestrator` and `@kici-dev/agent`: it resolves and spawns their built entry points rather than reimplementing them. See [Local dev plane](../operator/orchestrator/local-dev-plane.md).
+
+> Source: `packages/compiler/src/` (`local-plane/` for the local dev plane)
 
 ### `@kici-dev/core`
 
@@ -128,7 +152,7 @@ Unscoped wrapper package that provides the `kici` CLI command. Re-exports `@kici
 
 ### `kici-admin` (admin CLI wrapper)
 
-Unscoped wrapper package that provides the `kici-admin` CLI command. Re-exports `@kici-dev/orchestrator/cli` for orchestrator administration tasks.
+Unscoped wrapper package that ships two binaries: `kici-admin`, which re-exports `@kici-dev/orchestrator/cli` for orchestrator administration tasks, and `kici-agent`, which re-exports `@kici-dev/agent/server` to run an agent. It therefore depends on both `@kici-dev/orchestrator` and `@kici-dev/agent` (the `KICIADMIN → AGENT` edge in the graph below).
 
 > Source: `packages/kici-admin/`
 
@@ -151,10 +175,13 @@ flowchart TD
     DASH --> ENGINE
     DASH -.->|dev| PLATFORM
     SHARED --> CORE
+    SHARED --> ENGINE
     SDK --> ENGINE
     SDK --> CORE
     COMPILER --> ENGINE
     COMPILER --> CORE
+    COMPILER --> ORCH
+    COMPILER --> AGENT
     COMPILER -.->|peer| SDK
     PLATFORM --> ENGINE
     PLATFORM --> SHARED
@@ -173,9 +200,11 @@ flowchart TD
     KICIADMIN --> AGENT
 ```
 
-**Leaf packages** (no `@kici` dependencies): `@kici-dev/core` and `@kici-dev/engine`. These can be tested and built independently. `@kici-dev/shared` builds on `@kici-dev/core` and re-exports it. The dashboard depends on `@kici-dev/engine` for shared types (protocol schemas, state machine) and imports the Platform's API type definitions as a dev dependency, but communicates with backend services at runtime via HTTP/WebSocket, not at compile time.
+**Leaf packages** (no `@kici` dependencies): `@kici-dev/core` and `@kici-dev/engine`. These can be tested and built independently. `@kici-dev/shared` builds on `@kici-dev/core` (which it re-exports) and on `@kici-dev/engine` for shared vocabularies. The dashboard depends on `@kici-dev/engine` for shared types (protocol schemas, execution status enums) and imports the Platform's API type definitions as a dev dependency, but communicates with backend services at runtime via HTTP/WebSocket, not at compile time.
 
 **Runtime tiers** (Platform, orchestrator, agent) all depend on `@kici-dev/engine` for shared business logic and `@kici-dev/shared` for utilities. Only the agent depends on `@kici-dev/sdk` (it loads workflow definitions at runtime).
+
+The `COMPILER → ORCH` and `COMPILER → AGENT` edges exist solely for the local dev plane: the compiler spawns a local orchestrator and agent so an author can execute a workflow end-to-end without any deployed infrastructure. Nothing in the compile path itself reaches into either tier.
 
 ## Connection overview
 
@@ -204,6 +233,6 @@ KiCI uses application-level tenant isolation. The Platform dashboard API accepts
 ## See also
 
 - [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md) -- P2P clustering, Raft consensus, job rerouting
-- [State Machine](./execution/state-machine.md) -- execution lifecycle tracking across all tiers
+- [Execution lifecycle](./execution/state-machine.md) -- run, job, and step status vocabularies and the tracker that owns lifecycle state
 - [Protocol Messages](protocol-messages.md) -- WebSocket message schemas for all three layers
 - [Webhook Delivery](./webhooks/webhook-delivery.md) -- end-to-end trace of a webhook through all three tiers

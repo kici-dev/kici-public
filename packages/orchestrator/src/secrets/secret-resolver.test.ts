@@ -2,7 +2,7 @@
  * Tests for SecretResolver (context-binding-based resolution).
  *
  * The resolver takes an org + context name, looks up bindings,
- * matches them against scoped secrets via resolveSecretsForContext,
+ * matches them against scoped secrets via resolveSecretsWithProvenance,
  * decrypts matching secrets, and returns a flat key-value map.
  *
  * After the multi-backend migration, all scopes and binding patterns are

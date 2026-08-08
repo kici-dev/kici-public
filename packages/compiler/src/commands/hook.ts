@@ -9,6 +9,7 @@ import path from 'node:path';
 import pc from 'picocolors';
 import { select } from '@inquirer/prompts';
 import { logger, toErrorMessage } from '@kici-dev/core';
+import { isCiEnvironment } from '@kici-dev/core/ci-env';
 import { detectHookTools, installHook, findGitDir } from '../hooks/index.js';
 import type { HookToolName } from '../hooks/index.js';
 
@@ -48,7 +49,7 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
 
       if (tools.length === 0) {
         // No tool detected - use raw git hook or ask
-        if (process.stdout.isTTY && process.env.CI !== 'true') {
+        if (process.stdout.isTTY && !isCiEnvironment()) {
           const choice = await select({
             message: 'No pre-commit tool detected. How would you like to install the hook?',
             choices: [
@@ -72,7 +73,7 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
         logger.info(pc.gray(`Detected ${selectedTool}, installing hook...`));
       } else {
         // Multiple tools - let user choose in interactive mode
-        if (process.stdout.isTTY && process.env.CI !== 'true') {
+        if (process.stdout.isTTY && !isCiEnvironment()) {
           const tool = await select({
             message: 'Multiple pre-commit tools detected. Which would you like to use?',
             choices: tools.map((t) => ({

@@ -104,6 +104,23 @@ function sameIndexSet(a: IndexEntry[], b: IndexEntry[]): boolean {
   return b.every((e) => setA.has(key(e)));
 }
 
+/**
+ * Thrown by resolveInstance when `--name <n>` is given but no installed
+ * instance matches. Lifecycle commands catch this to treat stop/uninstall of
+ * a never-installed instance as an idempotent no-op. Distinct from the
+ * ambiguous-refusal and missing-manifest errors, which stay hard failures.
+ */
+export class InstanceNotFoundError extends Error {
+  readonly component: Component;
+  readonly instanceName: string;
+  constructor(component: Component, instanceName: string, message: string) {
+    super(message);
+    this.name = 'InstanceNotFoundError';
+    this.component = component;
+    this.instanceName = instanceName;
+  }
+}
+
 export interface ResolveArgs {
   component: Component;
   opts: ResolveOptions;
@@ -146,7 +163,11 @@ export async function resolveInstance(args: ResolveArgs): Promise<ResolvedInstan
     });
     const match = candidates.find((c) => c.name === opts.name);
     if (!match) {
-      throw new Error(formatNameNotFound(component, opts.name, candidates));
+      throw new InstanceNotFoundError(
+        component,
+        opts.name,
+        formatNameNotFound(component, opts.name, candidates),
+      );
     }
     if (!match.instanceDir) {
       throw new Error(

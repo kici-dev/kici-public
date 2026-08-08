@@ -36,6 +36,23 @@ describe('normalizeApproval', () => {
   it('object form with no approvers yields an empty clause list', () => {
     expect(normalizeApproval({ when: 'drift' })).toEqual({ clauses: [], when: 'drift' });
   });
+
+  it('throws on a non-positive or non-finite timeout', () => {
+    for (const bad of [0, -1, 1.5, Infinity, NaN]) {
+      expect(() => normalizeApproval({ approvers: [{ team: 'leads' }], timeout: bad })).toThrow(
+        /approval\.timeout must be a positive integer/,
+      );
+    }
+  });
+
+  it('accepts a valid timeout and the absent case', () => {
+    expect(
+      normalizeApproval({ approvers: [{ team: 'leads' }], timeout: 3600 }).timeoutSeconds,
+    ).toBe(3600);
+    expect(normalizeApproval({ approvers: [{ team: 'leads' }] }).timeoutSeconds).toBeUndefined();
+    expect(normalizeApproval(true).timeoutSeconds).toBeUndefined();
+    expect(normalizeApproval([{ team: 'leads' }]).timeoutSeconds).toBeUndefined();
+  });
 });
 
 describe('approval flows through the factories', () => {

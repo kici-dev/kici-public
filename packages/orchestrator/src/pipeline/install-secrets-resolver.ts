@@ -30,6 +30,7 @@
  * `install-secrets-resolver.test.ts`.
  */
 
+import { HoldType } from '@kici-dev/engine';
 import type { ApproverClause, LockRegistry, TrustTier } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
@@ -120,7 +121,7 @@ export type ResolveInstallSecretsResult =
       envName: string;
       /** Resolved context id (for the held row). */
       contextId: string;
-      /** Discriminates the release trigger: 'reviewer' | 'wait_timer' | 'concurrency' | 'security'. */
+      /** Discriminates the release trigger — an engine `HoldType` member. */
       holdType: string;
       queueType: 'context' | 'security';
       requirement: InstallHoldRequirement;
@@ -245,13 +246,24 @@ function collectSecretRefs(
   return { ok: true, envs, registryRefs, installRefs };
 }
 
-/** Engine gate `holdType` ('timer') → held-run `hold_type` ('wait_timer'). */
-function normalizeHoldType(action: 'hold' | 'wait' | 'queue', raw: string | undefined): string {
-  if (raw === 'timer') return 'wait_timer';
+/**
+ * The held-run `hold_type` for a gate outcome — the gate's own `holdType` when
+ * it set one, otherwise the `HoldType` member its action implies. Column and
+ * gate share one vocabulary, so nothing is translated here.
+ *
+ * Distinct from the engine's `normalizePersistedHoldType`, which maps a value
+ * read back OUT of the column onto that same vocabulary.
+ *
+ * Exported for tests.
+ */
+export function resolveHoldType(
+  action: 'hold' | 'wait' | 'queue',
+  raw: string | undefined,
+): string {
   if (raw) return raw;
-  if (action === 'wait') return 'wait_timer';
-  if (action === 'queue') return 'concurrency';
-  return 'reviewer';
+  if (action === 'wait') return HoldType.enum.timer;
+  if (action === 'queue') return HoldType.enum.concurrency;
+  return HoldType.enum.reviewer;
 }
 
 /**
@@ -303,8 +315,10 @@ async function fireProtectionRulesPerEnv(args: {
     // Workflow-level install has no per-job concurrency group — pass the
     // env name itself so the concurrency-gate counts on the env scope only.
     const concurrencyGroup = envName;
-    // running-count of 0: workflow-level install does not yet contribute to
-    // the env's running-job count (a queue hold pauses the workflow instead).
+    // Workflow-install protection does not queue on concurrency: the running
+    // count is always 0 here, so the concurrency gate never holds a workflow
+    // install. Concurrency limits apply at the job scope, enforced by the
+    // concurrency-groups module on dispatch.
     const result = await evaluateProtectionRules(
       env,
       protectionContext,
@@ -327,7 +341,7 @@ async function fireProtectionRulesPerEnv(args: {
       action: result.action,
       envName,
       contextId: env.id,
-      holdType: normalizeHoldType(result.action, result.holdType),
+      holdType: resolveHoldType(result.action, result.holdType),
       holdUntil: result.holdUntil,
       clauses: result.clauses ?? [],
       reason: result.reason ?? `context '${envName}' install gate ${result.action}`,
@@ -417,7 +431,7 @@ export async function resolveInstallSecrets(
       envName: gateResult.envName,
       contextId: gateResult.contextId,
       holdType: gateResult.holdType,
-      queueType: gateResult.holdType === 'security' ? 'security' : 'context',
+      queueType: gateResult.holdType === HoldType.enum.security ? 'security' : 'context',
       requirement: {
         clauses: gateResult.clauses,
         expiresAt,

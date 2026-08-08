@@ -13,20 +13,21 @@ Narrow on the `type` field to branch per trigger kind (`if (event.type === 'push
 
 These fields are present on every envelope (the `EventBase` shape):
 
-| Field             | Type                      | Description                                                                     |
-| ----------------- | ------------------------- | ------------------------------------------------------------------------------- |
-| `type`            | `string`                  | Normalized event type discriminant.                                             |
-| `action?`         | `string`                  | Sub-action (e.g. 'opened', 'created', 'submitted').                             |
-| `targetBranch?`   | `string`                  | Target branch (push target, PR base, or default branch).                        |
-| `sourceBranch?`   | `string`                  | Source branch (PR head branch). Only set for PR-like events.                    |
-| `provider?`       | `string`                  | Provider that originated this event.                                            |
-| `isForkPR?`       | `boolean`                 | Whether this PR comes from a fork. Only set for PR-like events.                 |
-| `baseBranch?`     | `string`                  | Base branch ref for PR events.                                                  |
-| `senderUsername?` | `string`                  | Sender username from the webhook payload.                                       |
-| `sourceRepo?`     | `string`                  | Repository identifier (e.g. "owner/repo").                                      |
-| `changedFiles?`   | `string[]`                | Files changed in this event (for path filtering).                               |
-| `payload?`        | `Record<string, unknown>` | Raw webhook payload from the provider. May be absent in flattened event forms.  |
-| `[key: string]`   | `unknown`                 | Index signature for backward compatibility — untyped fields resolve to unknown. |
+| Field                 | Type                                            | Description                                                                                                                                                                          |
+| --------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `type`                | `string`                                        | Normalized event type discriminant.                                                                                                                                                  |
+| `action?`             | `string`                                        | Sub-action (e.g. 'opened', 'created', 'submitted').                                                                                                                                  |
+| `targetBranch?`       | `string`                                        | Target branch (push target, PR base, or default branch).                                                                                                                             |
+| `sourceBranch?`       | `string`                                        | Source branch (PR head branch). Only set for PR-like events.                                                                                                                         |
+| `provider?`           | `string`                                        | Provider that originated this event.                                                                                                                                                 |
+| `isForkPR?`           | `boolean`                                       | Whether this PR comes from a fork. Only set for PR-like events.                                                                                                                      |
+| `baseBranch?`         | `string`                                        | Base branch ref for PR events.                                                                                                                                                       |
+| `senderUsername?`     | `string`                                        | Sender username from the webhook payload.                                                                                                                                            |
+| `sourceRepo?`         | `string`                                        | Repository identifier (e.g. "owner/repo").                                                                                                                                           |
+| `changedFiles?`       | `string[]`                                      | Files changed in this event (for path filtering).                                                                                                                                    |
+| `changedFilesStatus?` | `import('@kici-dev/engine').ChangedFilesStatus` | Availability of `changedFiles` — `fetched` (real diff), `unavailable` (no diff / could not compute), or `skipped` (orchestrator did not fetch; the agent recomputes from its clone). |
+| `payload?`            | `Record<string, unknown>`                       | Raw webhook payload from the provider. May be absent in flattened event forms.                                                                                                       |
+| `[key: string]`       | `unknown`                                       | Index signature for backward compatibility — untyped fields resolve to unknown.                                                                                                      |
 
 ## Event types
 

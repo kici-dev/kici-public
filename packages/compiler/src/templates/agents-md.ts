@@ -14,7 +14,7 @@ into a portable lock file, and executed by self-hosted agents.
 
 - Public SDK types: \`node_modules/@kici-dev/sdk/dist/index.d.ts\` — read this
   for the canonical signatures of \`workflow\`, \`job\`, \`step\`, \`pr\`,
-  \`push\`, \`schedule\`, \`matrix\`, \`rule\`, \`dynamicJob\`, etc.
+  \`push\`, \`schedule\`, \`rule\`, \`dynamicJob\`, etc.
 - Bundled offline reference for coding agents: \`kici docs llm\` prints the
   full markdown documentation bundle to stdout. \`kici docs llm --index\`
   prints just the curated link index (llms.txt format).
@@ -53,20 +53,19 @@ into a portable lock file, and executed by self-hosted agents.
    versions. The matrix expands at dispatch time.
 
    \`\`\`ts
-   import { workflow, job, step, pr, matrix } from '@kici-dev/sdk';
+   import { workflow, job, step, pr } from '@kici-dev/sdk';
 
    export default workflow('test-matrix', {
      on: pr({ target: 'main' }),
      jobs: [
        job('test', {
          runsOn: 'kici:os:linux',
-         strategy: { matrix: matrix({ node: ['20', '22', '24'] }) },
+         matrix: { node: ['20', '22', '24'] },
          steps: [
            step('test', async ({ $, matrix }) => {
-             await $\`node --version\`;
+             await $\`echo testing on node \${matrix!.node}\`;
              await $\`pnpm install\`;
              await $\`pnpm test\`;
-             return { node: matrix.node };
            }),
          ],
        }),
@@ -81,7 +80,8 @@ into a portable lock file, and executed by self-hosted agents.
 
    \`\`\`ts
    step('deploy', async ({ $, secrets }) => {
-     await $\`./scripts/deploy.sh\`.env({ DEPLOY_TOKEN: secrets.production.DEPLOY_TOKEN });
+     await secrets.expose('DEPLOY_TOKEN');
+     await $\`./scripts/deploy.sh\`;
    });
    \`\`\`
 

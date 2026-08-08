@@ -17,9 +17,8 @@
  * input on stdin and uses a transient host key distinct from the OS sshd key).
  */
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import type { HostReach } from './reach.js';
 
 /** Host-key verification mode for the SSH connection. */
@@ -76,6 +75,14 @@ export const defaultSpawn: SpawnFn = (command, args, opts) =>
     child.on('error', reject);
     child.on('close', (code) => resolve({ exitCode: code ?? -1, stdout, stderr }));
     if (opts.stdin !== undefined) {
+      // The remote can close its read end before we finish writing (a pre-boot
+      // unlock drops the session mid-boot; a connect-timeout exits ssh early),
+      // which emits EPIPE on child.stdin. An unhandled 'error' on the stdin
+      // stream would surface as an uncaught exception and crash the agent —
+      // swallow it here. The real outcome is the process exit code reported via
+      // 'close'; a genuine SSH failure still shows up there (non-zero exit /
+      // stderr), so nothing meaningful is lost by dropping the write error.
+      child.stdin?.on('error', () => {});
       child.stdin?.end(opts.stdin);
     }
   });
@@ -176,6 +183,49 @@ export async function sshPush(
 }
 
 /**
+ * Ship a local FILE to a remote path over `scp` (a binary channel), using the
+ * same ephemeral-key discipline as `sshExec`/`sshPush`.
+ *
+ * Unlike `sshPush` — which pipes a JS string through `ssh 'cat > path'` and so
+ * corrupts binary payloads (a ~50 MB tarball) — `scp` streams the file's raw
+ * bytes untouched. This is the ONLY sanctioned path for a binary payload
+ * transfer; the string `cat >` path is for text (launcher scripts) only. Throws
+ * on a non-zero exit (a payload push must succeed end-to-end).
+ */
+export async function sshPushFile(
+  reach: HostReach,
+  privateKey: string,
+  localFilePath: string,
+  remotePath: string,
+  opts: { port?: number; hostKeyMode?: SshHostKeyMode } = {},
+  deps: SshDeps = {},
+): Promise<void> {
+  const spawnFn = deps.spawnFn ?? defaultSpawn;
+  const hostKeyMode = opts.hostKeyMode ?? 'accept-new';
+  const { dest, port } = resolveTarget(reach, opts.port);
+  const result = await withEphemeralAgent(privateKey, spawnFn, async (env) => {
+    // scp takes an uppercase -P for the port (ssh uses lowercase -p). The
+    // destination is `user@addr:remotePath`; the key comes from the ephemeral
+    // agent via SSH_AUTH_SOCK in env, never a temp key file.
+    const args = [
+      ...baseSshOptions(hostKeyMode),
+      '-P',
+      String(port),
+      localFilePath,
+      `${dest}:${remotePath}`,
+    ];
+    return spawnFn('scp', args, { env });
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `sshPushFile(${reach.agentId}:${remotePath}): exit ${result.exitCode}${
+        result.stderr ? `\n${result.stderr}` : ''
+      }`,
+    );
+  }
+}
+
+/**
  * Start a per-call ephemeral ssh-agent, load the key via stdin (never a file),
  * run `body` with `SSH_AUTH_SOCK` in env, and kill the agent in `finally`.
  *
@@ -195,7 +245,7 @@ async function withEphemeralAgent<T>(
   body: (env: NodeJS.ProcessEnv) => Promise<T>,
 ): Promise<T> {
   const baseEnv = { ...process.env };
-  const agentDir = await mkdtemp(join(tmpdir(), 'kici-bootstrap-ssh-'));
+  const { path: agentDir, cleanup } = await makeTempDir('bootstrap-ssh');
   const sock = join(agentDir, 'agent.sock');
   try {
     const start = await spawnFn('ssh-agent', ['-a', sock, '-s'], { env: baseEnv });
@@ -209,10 +259,19 @@ async function withEphemeralAgent<T>(
     const agentEnv: NodeJS.ProcessEnv = {
       ...baseEnv,
       SSH_AUTH_SOCK: sock,
-      ...(pid ? { SSH_AGENT_PID: pid } : {}),
       SSH_ASKPASS: '/bin/false',
       DISPLAY: '',
     };
+    // Only ever carry the ephemeral agent's own PID. If parseAgentPid could not
+    // extract one, delete any SSH_AGENT_PID inherited from a parent/login agent
+    // so the `finally` teardown's `ssh-agent -k` can never signal the wrong
+    // agent (with no PID it no-ops; the orphaned ephemeral agent is reaped by
+    // kici-leak-sweep via the kici-bootstrap-ssh socket).
+    if (pid) {
+      agentEnv.SSH_AGENT_PID = pid;
+    } else {
+      delete agentEnv.SSH_AGENT_PID;
+    }
     try {
       // Key on stdin, ending with a newline (ssh-add expects a complete PEM).
       const add = await spawnFn('ssh-add', ['-'], {
@@ -230,7 +289,7 @@ async function withEphemeralAgent<T>(
       });
     }
   } finally {
-    await rm(agentDir, { recursive: true, force: true }).catch(() => {
+    await cleanup().catch(() => {
       // Best-effort; a leaked dir is swept by kici-leak-sweep.
     });
   }

@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import type { GenericInitConfig, InitItem, Job, JobOptions } from './types.js';
+import { isKnownCapability } from '@kici-dev/engine';
+import type {
+  GenericInitConfig,
+  InitItem,
+  Job,
+  JobOptions,
+  StepInput,
+  InferJobOutputsFromSteps,
+  StepContextWithNeeds,
+} from './types.js';
+import type { StepContext } from './context.js';
 import { createJobOutputProxy } from './outputs.js';
 
 /** A typed preset is a `'mise'` string or a `{ mise }` object — neither carries `run`. */
@@ -26,35 +36,133 @@ function validateInit(init: JobOptions['init'], jobName: string): void {
 }
 
 /**
- * Create a job with an explicit name.
+ * Validate a job's `sandbox` escape-hatch request. An unknown capability name
+ * is a typo that would never match the operator allow-list, so it is rejected
+ * at author time (security is still enforced deny-by-default at dispatch — this
+ * is a correctness/UX guard). Capability form is normalized by the dispatch
+ * resolver, so both `NET_ADMIN` and `CAP_NET_ADMIN` are accepted here.
+ */
+function validateSandbox(sandbox: JobOptions['sandbox'], jobName: string): void {
+  if (sandbox === undefined) return;
+  for (const cap of sandbox.capabilities ?? []) {
+    if (!isKnownCapability(cap)) {
+      throw new Error(
+        `job('${jobName}'): unknown Linux capability '${cap}' in sandbox.capabilities`,
+      );
+    }
+  }
+}
+
+/**
+ * Create a job with an explicit name; run shorthand with typed `ctx.needs`.
+ *
+ * When the job declares `needs: [jobRef, …]`, the `run:` function's `ctx.needs`
+ * is typed from the tuple — job references thread their inferred outputs, so
+ * `ctx.needs.<job>.result.<field>` is checked (string / `{ name }` entries stay
+ * loose). Outputs are inferred flat from the run function's return type.
+ */
+export function job<
+  TName extends string,
+  const TNeeds extends readonly unknown[],
+  TRun extends (ctx: StepContextWithNeeds<TNeeds>) => Promise<any>,
+>(
+  name: TName,
+  options: Omit<JobOptions, 'needs' | 'run' | 'steps'> & {
+    needs: TNeeds;
+    run: TRun;
+    steps?: undefined;
+  },
+): Job<Awaited<ReturnType<TRun>>, TName>;
+
+/**
+ * Create a job with an explicit name; outputs inferred from the run shorthand.
+ *
+ * The `run:` shorthand infers a **flat** output shape from the run function's
+ * return type (`job.result.<field>`), matching the runtime's single-step
+ * flattening.
+ */
+export function job<TName extends string, TRun extends (ctx: StepContext) => Promise<any>>(
+  name: TName,
+  options: JobOptions & { run: TRun; steps?: undefined },
+): Job<Awaited<ReturnType<TRun>>, TName>;
+
+/**
+ * Create a job with an explicit name; outputs inferred from the steps tuple.
+ *
+ * A `steps:` job infers a **nested** output shape keyed by step name
+ * (`job.result.<step>.<field>`) via {@link InferJobOutputsFromSteps} — name
+ * your steps to get typed cross-job reads (id-less steps contribute nothing).
  *
  * @example
  * const build = job('build', {
- *   runsOn: 'linux',
+ *   runsOn: 'kici:os:linux',
  *   steps: [checkout, install, compile],
  * });
+ */
+export function job<TName extends string, const TSteps extends readonly StepInput[]>(
+  name: TName,
+  options: JobOptions & { steps: TSteps; run?: undefined },
+): Job<InferJobOutputsFromSteps<TSteps>, TName>;
+
+/**
+ * Create a job with an explicit name and an explicit output-type override.
+ *
+ * Pass the output shape as a type argument (`job<MyOutputs>('name', {...})`) for
+ * dynamically-shaped jobs the inference can't reproduce. With no type argument
+ * (and no `run` / `steps` to infer from) it defaults to the loose
+ * `Record<string, unknown>`, so a bare job keeps compiling.
  *
  * @example
- * // With rules and description
  * const build = job('build', {
- *   runsOn: 'linux',
+ *   runsOn: 'kici:os:linux',
  *   steps: [checkout, install, compile],
  *   rules: [rule('env: CI')],
  *   description: 'Build the project',
  * });
  */
-export function job(name: string, options: JobOptions): Job;
+export function job<TOutputs = Record<string, unknown>, TName extends string = string>(
+  name: TName,
+  options: JobOptions,
+): Job<TOutputs, TName>;
 
 /**
- * Create a job with auto-generated ID.
+ * Create a job with auto-generated ID; run shorthand with typed `ctx.needs`.
+ */
+export function job<
+  const TNeeds extends readonly unknown[],
+  TRun extends (ctx: StepContextWithNeeds<TNeeds>) => Promise<any>,
+>(
+  options: Omit<JobOptions, 'needs' | 'run' | 'steps'> & {
+    needs: TNeeds;
+    run: TRun;
+    steps?: undefined;
+  },
+): Job<Awaited<ReturnType<TRun>>>;
+
+/**
+ * Create a job with auto-generated ID; outputs inferred from the run shorthand.
+ */
+export function job<TRun extends (ctx: StepContext) => Promise<any>>(
+  options: JobOptions & { run: TRun; steps?: undefined },
+): Job<Awaited<ReturnType<TRun>>>;
+
+/**
+ * Create a job with auto-generated ID; outputs inferred from the steps tuple.
  *
  * @example
  * const build = job({
- *   runsOn: 'linux',
+ *   runsOn: 'kici:os:linux',
  *   steps: [checkout, install],
  * });
  */
-export function job(options: JobOptions): Job;
+export function job<const TSteps extends readonly StepInput[]>(
+  options: JobOptions & { steps: TSteps; run?: undefined },
+): Job<InferJobOutputsFromSteps<TSteps>>;
+
+/**
+ * Create a job with auto-generated ID and an explicit output-type override.
+ */
+export function job<TOutputs = Record<string, unknown>>(options: JobOptions): Job<TOutputs>;
 
 /**
  * Implementation of job() factory.
@@ -73,6 +181,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
   }
 
   validateInit(options.init, name);
+  validateSandbox(options.sandbox, name);
 
   // When a job binds multiple contexts and no explicit concurrency group is
   // set, default the concurrency group to the first (primary) bound context's
@@ -119,6 +228,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     exclude: options.exclude,
     checkout: options.checkout,
     container: options.container,
+    ...(options.sandbox !== undefined && { sandbox: options.sandbox }),
     context: options.context,
     contexts: options.contexts,
     env: options.env,

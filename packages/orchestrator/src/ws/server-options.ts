@@ -20,10 +20,10 @@ export function configureSecureWsServer(wss: WebSocketServer): void {
   // rationale (matches `WEBHOOK_RELAY_MAX_BODY_BYTES`).
   wss.options.maxPayload = WS_MAX_PAYLOAD_BYTES;
 
-  // @hono/node-ws creates `WebSocketServer({ noServer: true })` without
-  // perMessageDeflate, but the ws library reads this.options.perMessageDeflate
-  // during each handshake, so setting it before any connections arrive enables
-  // compression for all clients.
+  // We construct the WebSocketServer ourselves (`new WebSocketServer({ noServer: true })`)
+  // and set this before any connection arrives; the ws library reads
+  // this.options.perMessageDeflate during each handshake, enabling compression
+  // for all clients.
   wss.options.perMessageDeflate = {
     concurrencyLimit: 10,
     threshold: 128, // Skip compressing tiny messages like heartbeats

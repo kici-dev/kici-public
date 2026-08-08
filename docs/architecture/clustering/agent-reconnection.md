@@ -81,95 +81,36 @@ sequenceDiagram
 
 > See `packages/orchestrator/src/agent/dispatcher.ts` for recovery timer management, `packages/orchestrator/src/ws/agent-handler.ts` for `reconcileInFlightJobs`, and `packages/agent/src/ws/orchestrator-client.ts` for inFlightJobs reporting.
 
-## Execution state machine
+## The `recovering` job status
 
-The execution state machine includes 11 states, with `recovering` being the state relevant to agent reconnection.
+`recovering` is the job status relevant to agent reconnection: a running job whose agent disconnects is held in `recovering` while the orchestrator waits for the agent to come back, rather than being failed immediately. The orchestrator's execution tracker owns these transitions; the status values are the shared job-status enum.
 
-### State diagram
-
-The full 11-state execution state machine (showing the `recovering` state relevant to agent reconnection, plus `cancelling`, `held`, and `waiting` states added by other features):
+### Status flow during recovery
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending
-
-    pending --> queued: ENQUEUE
-    pending --> cancelled: CANCEL
-    pending --> skipped: SKIP
-    pending --> held: HOLD
-    pending --> waiting: WAIT
-
-    queued --> running: START
-    queued --> failed: FAIL
-    queued --> cancelled: CANCEL
-
-    running --> success: SUCCEED
-    running --> failed: FAIL
-    running --> cancelled: CANCEL
-    running --> cancelling: CANCEL_GRACEFUL
-    running --> recovering: RECOVER
-
-    recovering --> running: START
-    recovering --> failed: FAIL
-    recovering --> cancelled: CANCEL
-
-    cancelling --> cancelled: CANCEL_FORCE
-    cancelling --> cancelled: COMPLETE
-    cancelling --> failed: FAIL
-
-    held --> queued: APPROVE
-    held --> cancelled: REJECT
-    held --> cancelled: EXPIRE
-    held --> cancelled: CANCEL
-
-    waiting --> queued: TIMER_DONE
-    waiting --> cancelled: CANCEL
-
-    success --> [*]
-    failed --> [*]
-    cancelled --> [*]
-    skipped --> [*]
+    running --> recovering: agent disconnects
+    recovering --> running: agent reconnects, job reclaimed
+    recovering --> failed: grace period expires (recovery timeout)
+    recovering --> cancelled: job cancelled during recovery
+    running --> success: job completes
+    running --> failed: job fails
 ```
 
-### Transition table
-
-| From State   | Event           | To State     | Trigger                                   |
-| ------------ | --------------- | ------------ | ----------------------------------------- |
-| `pending`    | ENQUEUE         | `queued`     | Job added to dispatch queue               |
-| `pending`    | CANCEL          | `cancelled`  | Cancelled before dispatch                 |
-| `pending`    | SKIP            | `skipped`    | Rule evaluation skips the job             |
-| `pending`    | HOLD            | `held`       | Protection rule: reviewer required        |
-| `pending`    | WAIT            | `waiting`    | Protection rule: wait timer               |
-| `queued`     | START           | `running`    | Agent begins execution                    |
-| `queued`     | FAIL            | `failed`     | Queue error or agent failure              |
-| `queued`     | CANCEL          | `cancelled`  | Cancelled while queued                    |
-| `running`    | SUCCEED         | `success`    | Job completed successfully                |
-| `running`    | FAIL            | `failed`     | Job execution failed                      |
-| `running`    | CANCEL          | `cancelled`  | Job cancelled during execution            |
-| `running`    | CANCEL_GRACEFUL | `cancelling` | Graceful cancellation with cleanup hooks  |
-| `running`    | RECOVER         | `recovering` | Agent disconnected (orchestrator restart) |
-| `recovering` | START           | `running`    | Agent reconnected, job reclaimed          |
-| `recovering` | FAIL            | `failed`     | Grace period expired (recovery timeout)   |
-| `recovering` | CANCEL          | `cancelled`  | Job cancelled during recovery             |
-| `cancelling` | CANCEL_FORCE    | `cancelled`  | Force cancel after grace period           |
-| `cancelling` | COMPLETE        | `cancelled`  | Cleanup hooks completed                   |
-| `cancelling` | FAIL            | `failed`     | Cleanup hook failure                      |
-| `held`       | APPROVE         | `queued`     | Reviewer approved                         |
-| `held`       | REJECT          | `cancelled`  | Reviewer rejected                         |
-| `held`       | EXPIRE          | `cancelled`  | Hold expiry exceeded                      |
-| `held`       | CANCEL          | `cancelled`  | Cancelled while held                      |
-| `waiting`    | TIMER_DONE      | `queued`     | Wait timer completed                      |
-| `waiting`    | CANCEL          | `cancelled`  | Cancelled while waiting                   |
+| From         | To           | Trigger                                                   |
+| ------------ | ------------ | --------------------------------------------------------- |
+| `running`    | `recovering` | Agent disconnected (network drop, orchestrator restart)   |
+| `recovering` | `running`    | Agent reconnected and reclaimed the in-flight job         |
+| `recovering` | `failed`     | Grace period expired without reconnect (recovery timeout) |
+| `recovering` | `cancelled`  | Job cancelled while recovering                            |
 
 ### Key properties
 
-- **`recovering` is non-terminal:** `TERMINAL_STATES` remains `['success', 'failed', 'cancelled', 'skipped']`. Jobs in `recovering` can still transition to `running`, `failed`, or `cancelled`.
-- **RECOVER only from `running`:** Prevents double-recover. A job already in `recovering` cannot receive RECOVER again.
-- **START reused for reconnection:** The `recovering -> running` transition reuses the existing START event rather than introducing a new RECONNECT event.
-- **`cancelling` supports graceful shutdown:** Running jobs can enter `cancelling` via CANCEL_GRACEFUL, allowing cleanup hooks to run before the final `cancelled` state.
-- **`held` and `waiting` are non-terminal:** These states support environment protection rules (reviewer gates and wait timers).
+- **`recovering` is non-terminal:** it is not in `TERMINAL_JOB_STATES`, so a job in `recovering` can still settle on `running`, `failed`, or `cancelled`. A disconnect never prematurely finalizes a job.
+- **Only a `running` job enters `recovering`:** a job that has already reached a terminal status is not moved back to `recovering` by a late disconnect signal.
+- **Reconnection resumes the same job:** the reconnecting agent reclaims its in-flight job and returns it to `running`, rather than the orchestrator re-dispatching a fresh copy.
 
-> See `packages/engine/src/state-machine/types.ts` and `packages/engine/src/state-machine/machine.ts` for the implementation.
+> See `packages/engine/src/protocol/messages/execution-status.ts` for the status enums and terminal-state sets, and `packages/orchestrator/src/reporting/execution-tracker.ts` for the lifecycle logic.
 
 ## Log continuity
 

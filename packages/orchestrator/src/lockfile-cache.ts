@@ -21,13 +21,24 @@ const logger = createLogger({ prefix: 'lockfile-cache' });
 
 export class LockFileCache {
   private readonly cache: LRUCache<string, LockFile>;
+  private readonly inFlight = new Map<string, Promise<LockFile | null>>();
   private hits = 0;
   private misses = 0;
 
-  constructor(options: { max: number; ttl: number }) {
+  constructor(options: { max: number; ttl: number; maxBytes?: number }) {
     this.cache = new LRUCache<string, LockFile>({
       max: options.max,
       ttl: options.ttl,
+      ...(options.maxBytes
+        ? {
+            maxSize: options.maxBytes,
+            // Estimate lock-file bytes once, on the rare cache-miss insert (next
+            // to the validation walks). The hot hit path never stringifies. The
+            // `|| 1` guards a degenerate/empty lock so sizeCalculation stays a
+            // positive integer as lru-cache requires.
+            sizeCalculation: (lf: LockFile): number => Buffer.byteLength(JSON.stringify(lf)) || 1,
+          }
+        : {}),
     });
   }
 
@@ -66,9 +77,31 @@ export class LockFileCache {
       return cached;
     }
 
-    // Cache miss -- fetch from provider
-    this.misses++;
+    // Coalesce concurrent misses for the same key onto one fetch + validation
+    // walk. Without this, N first-webhooks for one repo:ref all stampede the
+    // provider API and all run the three synchronous validation walks.
+    const existing = this.inFlight.get(cacheKey);
+    if (existing) return existing;
 
+    this.misses++;
+    const promise = this.fetchAndValidate(fetcher, repoIdentifier, ref, credentials, cacheKey);
+    // Register before the first await so a synchronously-arriving second caller
+    // observes the in-flight entry. Clear it in `finally` so a rejection is
+    // never retained — a subsequent get re-fetches.
+    const tracked = promise.finally(() => {
+      this.inFlight.delete(cacheKey);
+    });
+    this.inFlight.set(cacheKey, tracked);
+    return tracked;
+  }
+
+  private async fetchAndValidate(
+    fetcher: LockFileFetcher,
+    repoIdentifier: string,
+    ref: string,
+    credentials: unknown,
+    cacheKey: string,
+  ): Promise<LockFile | null> {
     let lockFile: LockFile | null;
     try {
       lockFile = await fetcher.fetchLockFile(repoIdentifier, ref, credentials);
@@ -103,7 +136,7 @@ export class LockFileCache {
     // Ordering matters: matcher-shape rejection runs before the ReDoS check,
     // which assumes well-formed matchers.
     try {
-      assertLockFileSchemaCompatible(lockFile);
+      assertLockFileSchemaCompatible(lockFile, repoIdentifier, ref);
       assertLockFileMatchersValid(lockFile);
       assertLockFileRegexesSafe(lockFile);
     } catch (error: unknown) {
@@ -113,6 +146,10 @@ export class LockFileCache {
         ref,
         error: message,
       });
+      // The schema gate already raises a repo/ref-tagged LockFileParseError with
+      // operator-actionable guidance; rethrow it verbatim. The matcher/regex
+      // asserts throw bare Errors, so wrap those into the corrupt-lock signal.
+      if (error instanceof LockFileParseError) throw error;
       throw new LockFileParseError(repoIdentifier, ref, message);
     }
 
@@ -123,11 +160,12 @@ export class LockFileCache {
   /**
    * Get cache statistics for metrics/monitoring.
    */
-  getStats(): { hits: number; misses: number; size: number } {
+  getStats(): { hits: number; misses: number; size: number; calculatedSize: number } {
     return {
       hits: this.hits,
       misses: this.misses,
       size: this.cache.size,
+      calculatedSize: this.cache.calculatedSize,
     };
   }
 }

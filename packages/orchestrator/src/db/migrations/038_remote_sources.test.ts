@@ -1,14 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './038_remote_sources.js';
 
 /**
  * Real-Postgres test for migration 038.
  *
- * Creates a throwaway database, runs every migration up to latest via the
+ * Creates a throwaway database, applies migrations 001..038 via the
  * production provider, and asserts the remote_sources table + its columns
  * exist with the expected unique constraints. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
@@ -58,8 +57,7 @@ describeDb('migration 038_remote_sources', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

@@ -1,4 +1,5 @@
 export * from '@kici-dev/core';
+export * from './agent-platform.js';
 export {
   encrypt,
   decrypt,
@@ -15,7 +16,14 @@ export {
   FLEET_CHUNK_BYTES,
   type BundleChunkFrame,
 } from './diagnostics/bundle-chunks.js';
-export { createPool, createDb, type CreatePoolOptions, type PgPoolErrorSource } from './db.js';
+export {
+  createPool,
+  createDb,
+  isPoolAcquireTimeout,
+  type CreatePoolOptions,
+  type PgPoolErrorSource,
+  type PoolAcquireOutcome,
+} from './db.js';
 export { isPgUniqueViolation } from './pg-errors.js';
 export {
   parseDatabaseUrl,
@@ -47,6 +55,7 @@ export {
   showQueueEntryDirect,
   listExecutionRunsDirect,
   showExecutionRunDirect,
+  listCheckRunTrackingDirect,
   listExecutionJobsDirect,
   listRegistrationsDirect,
   showRegistrationDirect,
@@ -78,8 +87,9 @@ export {
   waitForPlatformRegistrationsDirect,
   seedUniversalGitSourceDirect,
   seedCiSecurityFixturesDirect,
+  CI_SECURITY_OTHER_REPO,
   // Stage 5c remainder helpers
-  waitForExecutionRunStatusSinceDirect,
+  waitForExecutionRunReachesStatusSinceDirect,
   latestExecutionRunByStatusDirect,
   waitForLatestExecutionJobStatusDirect,
   describeTableColumnsDirect,
@@ -168,6 +178,8 @@ export {
   type ExecutionRunRow,
   type ExecutionJobRow,
   type ListExecutionRunsOpts,
+  type CheckRunTrackingDirectRow,
+  type ListCheckRunTrackingOpts,
   type WorkflowRegistrationRow,
   type ListRegistrationsOpts,
   type ListRegistrationsResult,
@@ -193,6 +205,7 @@ export {
   type GracefulShutdownOptions,
 } from './graceful-shutdown.js';
 export { validateRequiredTools, type ToolRequirement } from './tool-check.js';
+export { kiciTmpBase, kiciMkdtemp } from './tmp-dir.js';
 export { createS3Client, type CreateS3ClientOptions, type SharedS3Config } from './s3-client.js';
 export {
   BaseColdStore,

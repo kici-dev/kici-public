@@ -31,13 +31,14 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, stat, readFile, rm } from 'node:fs/promises';
+import { stat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import type { LockFileFetcher, LockFile } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { makeTempDir } from '@kici-dev/shared/tmp';
 import { resolveSourceCredential } from '../../secrets/source-credentials.js';
 import type { SecretResolver } from '../../secrets/secret-resolver.js';
+import type { ClusterSettingsReader } from '../../cluster/cluster-settings-reader.js';
 import type { UniversalGitConfig } from './config.js';
 import { UniversalGitRepoUrlBuilder } from './repo-url.js';
 import { prepareSshAuthSync } from './ssh-auth.js';
@@ -90,6 +91,10 @@ export class UniversalGitLockFileFetcher implements LockFileFetcher {
       sourceId: string;
       config: UniversalGitConfig;
       secretResolver: SecretResolver;
+      /** Fleet-wide settings reader; overrides the lock-file cap per fetch. */
+      clusterSettings?: ClusterSettingsReader;
+      /** Cluster default cap (bytes) when no cluster_settings override is set. */
+      lockFileMaxBytes?: number;
     },
   ) {
     this.repoUrlBuilder = new UniversalGitRepoUrlBuilder(params.config.gitUrlTemplate);
@@ -135,7 +140,7 @@ export class UniversalGitLockFileFetcher implements LockFileFetcher {
       );
     }
 
-    const tempDir = await mkdtemp(join(tmpdir(), 'kici-ugit-lockfetch-'));
+    const { path: tempDir, cleanup: cleanupTempDir } = await makeTempDir('ugit-lockfetch');
     let sshCleanup: (() => void) | undefined;
     let gitSshCommand: string | undefined;
     const gitConfigArgs: string[] = [];
@@ -225,15 +230,22 @@ export class UniversalGitLockFileFetcher implements LockFileFetcher {
         throw err;
       }
 
-      if (fileInfo.size > LOCK_FILE_MAX_BYTES) {
-        throw new LockFileTooLargeError(repoIdentifier, fileInfo.size);
+      const maxBytes =
+        (await this.params.clusterSettings?.getNumber(
+          'lock_file_max_bytes',
+          this.params.lockFileMaxBytes ?? LOCK_FILE_MAX_BYTES,
+        )) ??
+        this.params.lockFileMaxBytes ??
+        LOCK_FILE_MAX_BYTES;
+      if (fileInfo.size > maxBytes) {
+        throw new LockFileTooLargeError(repoIdentifier, fileInfo.size, maxBytes);
       }
 
       const raw = await readFile(lockPath, 'utf-8');
       return parseLockDocument(raw, repoIdentifier, resolvedRef ?? 'HEAD');
     } finally {
       try {
-        await rm(tempDir, { recursive: true, force: true });
+        await cleanupTempDir();
       } catch (err) {
         logger.warn('Failed to remove universal-git lock-file tempdir', {
           tempDir,

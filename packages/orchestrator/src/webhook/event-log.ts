@@ -29,14 +29,21 @@ import { EventLogStatus, PayloadOmittedReason, EventLogSource } from '@kici-dev/
 import type { Kysely } from 'kysely';
 import type { Database, NewEventLogRow } from '../db/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { WebhookInfo } from './handler.js';
 
 const logger = createLogger({ prefix: 'event-log' });
 
 /** Configuration for the writer. */
 export interface EventLogWriterOptions {
-  /** Soft cap in bytes for payload upload (default 5 MB). */
+  /**
+   * Cluster-wide fallback soft cap in bytes for payload upload (default 5 MB),
+   * used when no live `cluster_settings.event_log_max_payload_bytes` override
+   * is set. Read per-write through {@link ClusterSettingsReader}.
+   */
   maxPayloadBytes: number;
+  /** Optional fleet-wide settings reader; when present overrides maxPayloadBytes per write. */
+  clusterSettings?: ClusterSettingsReader;
 }
 
 /**
@@ -61,7 +68,11 @@ export interface EventLogOutcome {
   ref?: string | null;
   /** First run spawned by this delivery. */
   runId?: string | null;
-  /** Failure reason when status='failed'. */
+  /**
+   * Failure reason when status='failed', or a degraded-evaluation note on a
+   * status='processed' row (e.g. path filters matched conservatively against
+   * an unavailable changed-files diff). Free-text; not tied to a single status.
+   */
   errorMessage?: string | null;
 }
 
@@ -130,18 +141,26 @@ export class EventLogWriter {
     const sizeBytes = payload.raw.byteLength;
     const hash = sha256(payload.raw);
 
+    // Resolve the fleet-wide soft cap per write (a live override applies to new
+    // writes without a restart), falling back to the config default.
+    const maxBytes =
+      (await this.opts.clusterSettings?.getNumber(
+        'event_log_max_payload_bytes',
+        this.opts.maxPayloadBytes,
+      )) ?? this.opts.maxPayloadBytes;
+
     // Decide payload-storage path
     let payloadKey: string | null = null;
     let payloadOmitted = false;
     let payloadOmittedReason: PayloadOmittedReason | null = null;
 
-    if (sizeBytes > this.opts.maxPayloadBytes) {
+    if (sizeBytes > maxBytes) {
       payloadOmitted = true;
       payloadOmittedReason = PayloadOmittedReason.enum.size_exceeded;
       logger.warn('Webhook payload exceeds soft cap; recording metadata only', {
         deliveryId: info.deliveryId,
         sizeBytes,
-        maxBytes: this.opts.maxPayloadBytes,
+        maxBytes,
       });
     } else {
       const key = EventLogWriter.payloadKey(outcome.orgId, info.deliveryId);

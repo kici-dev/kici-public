@@ -316,6 +316,29 @@ describe('PlatformClient', () => {
         dashboardWrites: { 'secrets.delete': false },
       });
     });
+
+    it('omits dashboard request types named in testOmitDashboardRequestTypes when testMode', () => {
+      const client = createClient({
+        testMode: true,
+        testOmitDashboardRequestTypes: 'dashboard.contexts.list',
+      });
+      const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
+      expect(advertised).not.toContain('dashboard.contexts.list');
+      // A sibling type is still advertised (only the named one is removed).
+      expect(advertised).toContain('dashboard.contexts.get');
+    });
+
+    it('advertises all dashboard request types when testMode gates the omit seam off', () => {
+      // The omit seam is double-gated: without testMode the omit list is inert,
+      // so production (which leaves KICI_TEST_MODE unset) always advertises the
+      // full manifest even if the var somehow leaked in.
+      const client = createClient({
+        testMode: false,
+        testOmitDashboardRequestTypes: 'dashboard.contexts.list',
+      });
+      const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
+      expect(advertised).toContain('dashboard.contexts.list');
+    });
   });
 
   describe('send() and buffering', () => {
@@ -472,7 +495,7 @@ describe('PlatformClient', () => {
       exitSpy.mockRestore();
     });
 
-    it('resets reconnect attempts on successful auth', () => {
+    it('resets reconnect attempts once a connection has proven stable', () => {
       const client = createClient();
 
       client.connect();
@@ -500,10 +523,17 @@ describe('PlatformClient', () => {
 
       expect(client.state).toBe('authenticated');
 
+      // Surviving the stability window is what resets the counter — not the
+      // `auth.success` frame itself. Authenticating happens before the state
+      // replay send, so a connection that dies on the reply is one that
+      // authenticated and was never viable; treating auth as proof of health is
+      // what let such a failure reconnect at the floor delay indefinitely.
+      vi.advanceTimersByTime(30_000);
+
       mock.readyState = 3;
       mock.emit('close', 1006, Buffer.from('abnormal'));
 
-      // With reset, base delay ~1000-1500ms
+      // Counter reset, so the next attempt uses the base delay (~1000-1500ms).
       vi.advanceTimersByTime(2000);
 
       expect(mockInstances.length).toBe(attemptsBeforeAuth + 2);
@@ -545,6 +575,164 @@ describe('PlatformClient', () => {
       expect(delays.size).toBeGreaterThan(1);
 
       vi.spyOn(Math, 'random').mockRestore();
+    });
+  });
+
+  describe('reconnect backoff health signal', () => {
+    it('does not reset the backoff counter on auth.success alone', () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      const client = createClient();
+
+      // Two full connect -> authenticate -> 4003 cycles. Authentication
+      // succeeding does NOT mean the connection is viable: the state replay
+      // send is still ahead of it, and a frame the Platform rejects closes the
+      // socket immediately after. Resetting the counter on auth is what let a
+      // post-auth failure reconnect at the 1.0-1.5s floor indefinitely instead
+      // of escalating toward the 60s ceiling.
+      for (let i = 0; i < 2; i++) {
+        const mock = authenticateClient(client);
+        mock.readyState = 3;
+        mock.emit('close', 4003, Buffer.from('Invalid message'));
+      }
+
+      // attempts === 2 -> 1000 * 1.5^2. Were the counter reset on auth it
+      // would read 1500 (attempts === 1) forever, however many times it failed.
+      expect(client.getReconnectDelay()).toBe(2250);
+
+      vi.spyOn(Math, 'random').mockRestore();
+    });
+
+    it('resets the backoff once the connection has proven stable', () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      const client = createClient();
+
+      for (let i = 0; i < 2; i++) {
+        const mock = authenticateClient(client);
+        mock.readyState = 3;
+        mock.emit('close', 4003, Buffer.from('Invalid message'));
+      }
+
+      // Stay up past the stability window: THAT is what proves health.
+      authenticateClient(client);
+      vi.advanceTimersByTime(30_000);
+
+      expect(client.getReconnectDelay()).toBe(1000);
+
+      vi.spyOn(Math, 'random').mockRestore();
+    });
+
+    it('leaves the counter intact when the connection dies before it stabilises', () => {
+      vi.spyOn(Math, 'random').mockReturnValue(0);
+      const client = createClient();
+
+      const first = authenticateClient(client);
+      first.readyState = 3;
+      first.emit('close', 4003, Buffer.from('Invalid message'));
+
+      // Authenticate again but die well before the 30s window elapses.
+      const second = authenticateClient(client);
+      vi.advanceTimersByTime(5_000);
+      second.readyState = 3;
+      second.emit('close', 4003, Buffer.from('Invalid message'));
+
+      // Still escalating (attempts === 2), not back at the floor.
+      expect(client.getReconnectDelay()).toBe(2250);
+
+      vi.spyOn(Math, 'random').mockRestore();
+    });
+  });
+
+  describe('state.replay circuit breaker', () => {
+    function makeReplayRun(runId: string) {
+      return {
+        runId,
+        workflowName: 'wf',
+        status: 'success' as const,
+        jobCount: 0,
+        startedAt: 0,
+        jobs: [],
+      };
+    }
+
+    /** One authenticate -> replay -> 4003 cycle, the shape of the live failure. */
+    async function replayThenReject(client: ReturnType<typeof createClient>) {
+      const mock = authenticateClient(client);
+      await client.sendStateReplay([makeReplayRun('r1')]);
+      mock.readyState = 3;
+      mock.emit('close', 4003, Buffer.from('Invalid message'));
+      return mock;
+    }
+
+    it('opens after three replay-attributed disconnects and then skips the replay', async () => {
+      const client = createClient();
+
+      for (let i = 0; i < 3; i++) await replayThenReject(client);
+
+      const mock = authenticateClient(client);
+      const before = mock.sentMessages.length;
+      const result = await client.sendStateReplay([makeReplayRun('r1')]);
+
+      expect(result.skipped).toBe('breaker');
+      expect(mock.sentMessages.length).toBe(before);
+    });
+
+    it('does not count a close that carried no replay', async () => {
+      const client = createClient();
+
+      // Three closes with no replay sent on the connection must not trip it.
+      for (let i = 0; i < 3; i++) {
+        const mock = authenticateClient(client);
+        mock.readyState = 3;
+        mock.emit('close', 1006, Buffer.from('abnormal'));
+      }
+
+      authenticateClient(client);
+      const result = await client.sendStateReplay([makeReplayRun('r1')]);
+
+      expect(result.skipped).toBeUndefined();
+      expect(result.sent).toBe(1);
+    });
+
+    it('does not count a close on a connection that had proven stable', async () => {
+      const client = createClient();
+
+      for (let i = 0; i < 3; i++) {
+        const mock = authenticateClient(client);
+        await client.sendStateReplay([makeReplayRun('r1')]);
+        // The connection carried the replay AND lived — that is a success, so a
+        // later close is ordinary churn, not a replay rejection.
+        vi.advanceTimersByTime(30_000);
+        mock.readyState = 3;
+        mock.emit('close', 1006, Buffer.from('abnormal'));
+      }
+
+      authenticateClient(client);
+      const result = await client.sendStateReplay([makeReplayRun('r1')]);
+
+      expect(result.skipped).toBeUndefined();
+    });
+
+    it('clears the counter once a connection proves stable', async () => {
+      const client = createClient();
+
+      // Two failures, then a healthy connection, then two more: never reaches 3
+      // consecutively, so the breaker stays shut.
+      await replayThenReject(client);
+      await replayThenReject(client);
+
+      const good = authenticateClient(client);
+      await client.sendStateReplay([makeReplayRun('r1')]);
+      vi.advanceTimersByTime(30_000);
+      good.readyState = 3;
+      good.emit('close', 1006, Buffer.from('abnormal'));
+
+      await replayThenReject(client);
+      await replayThenReject(client);
+
+      authenticateClient(client);
+      const result = await client.sendStateReplay([makeReplayRun('r1')]);
+
+      expect(result.skipped).toBeUndefined();
     });
   });
 
@@ -1387,6 +1575,123 @@ describe('PlatformClient', () => {
       expect(relay.payload).toEqual({ foo: 1 });
     });
 
+    it('sheds before verify: ACKs shed_retry_later and never verifies or runs the pipeline', async () => {
+      const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
+      const onVerifyInbound = vi.fn().mockResolvedValue({ result: 'accepted' as const });
+      const onAdmit = vi.fn().mockResolvedValue({ admitted: false, reason: 'queue_full' });
+      const client = createClient({ onWebhookRelay, onVerifyInbound, onAdmit });
+      const mock = authenticateClient(client);
+
+      const body = '{"foo":1}';
+      simulateMessage(mock, makeStartFrame('m-shed', body, 1));
+      simulateMessage(mock, makeChunk('m-shed', 0, body, true));
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Admission ran on the routing key BEFORE verify; verify never ran.
+      expect(onAdmit).toHaveBeenCalledWith('github:12345');
+      expect(onVerifyInbound).not.toHaveBeenCalled();
+      expect(onWebhookRelay).not.toHaveBeenCalled();
+
+      const acks = getSentMessages(mock).filter(
+        (m) => (m as { type: string }).type === 'webhook.ack',
+      );
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).toMatchObject({ result: 'shed_retry_later', messageId: 'm-shed' });
+    });
+
+    it('captures the shed relay delivery (meta + assembled body) before the shed ack', async () => {
+      const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
+      const onVerifyInbound = vi.fn().mockResolvedValue({ result: 'accepted' as const });
+      const onAdmit = vi.fn().mockResolvedValue({ admitted: false, reason: 'queue_full' });
+      const onShedCapture = vi.fn().mockResolvedValue(undefined);
+      const client = createClient({ onWebhookRelay, onVerifyInbound, onAdmit, onShedCapture });
+      const mock = authenticateClient(client);
+
+      const body = '{"foo":1}';
+      simulateMessage(mock, makeStartFrame('m-cap', body, 1));
+      simulateMessage(mock, makeChunk('m-cap', 0, body, true));
+      await vi.advanceTimersByTimeAsync(100);
+
+      // The capture seam ran with the pre-verify meta + the assembled raw body.
+      expect(onShedCapture).toHaveBeenCalledTimes(1);
+      const [meta, bodyBuf] = onShedCapture.mock.calls[0]!;
+      expect(meta.routingKey).toBe('github:12345');
+      expect(meta.deliveryId).toBe('del-m-cap');
+      expect((bodyBuf as Buffer).toString('utf8')).toBe(body);
+
+      // Capture is additive: the shed ack still returns and verify never ran.
+      expect(onVerifyInbound).not.toHaveBeenCalled();
+      const acks = getSentMessages(mock).filter(
+        (m) => (m as { type: string }).type === 'webhook.ack',
+      );
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).toMatchObject({ result: 'shed_retry_later', messageId: 'm-cap' });
+    });
+
+    it('a capture failure never blocks the shed ack', async () => {
+      const onVerifyInbound = vi.fn().mockResolvedValue({ result: 'accepted' as const });
+      const onAdmit = vi.fn().mockResolvedValue({ admitted: false, reason: 'queue_full' });
+      const onShedCapture = vi.fn().mockRejectedValue(new Error('db down'));
+      const client = createClient({ onVerifyInbound, onAdmit, onShedCapture });
+      const mock = authenticateClient(client);
+
+      const body = '{"foo":1}';
+      simulateMessage(mock, makeStartFrame('m-cap-fail', body, 1));
+      simulateMessage(mock, makeChunk('m-cap-fail', 0, body, true));
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(onShedCapture).toHaveBeenCalledTimes(1);
+      const acks = getSentMessages(mock).filter(
+        (m) => (m as { type: string }).type === 'webhook.ack',
+      );
+      expect(acks).toHaveLength(1);
+      expect(acks[0]).toMatchObject({ result: 'shed_retry_later', messageId: 'm-cap-fail' });
+    });
+
+    it('admits, ACKs accepted, runs the pipeline, and releases the slot after it settles', async () => {
+      const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
+      const onVerifyInbound = vi.fn().mockResolvedValue({ result: 'accepted' as const });
+      const release = vi.fn();
+      const onAdmit = vi.fn().mockResolvedValue({ admitted: true, release });
+      const client = createClient({ onWebhookRelay, onVerifyInbound, onAdmit });
+      const mock = authenticateClient(client);
+
+      const body = '{"foo":1}';
+      simulateMessage(mock, makeStartFrame('m-adm', body, 1));
+      simulateMessage(mock, makeChunk('m-adm', 0, body, true));
+      await vi.advanceTimersByTimeAsync(100);
+
+      const acks = getSentMessages(mock).filter(
+        (m) => (m as { type: string }).type === 'webhook.ack',
+      );
+      expect(acks[0]).toMatchObject({ result: 'accepted', messageId: 'm-adm' });
+      expect(onWebhookRelay).toHaveBeenCalledTimes(1);
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases the admitted slot when verify rejects (no slot leak)', async () => {
+      const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
+      const onVerifyInbound = vi
+        .fn()
+        .mockResolvedValue({ result: 'rejected_signature' as const, reason: 'bad sig' });
+      const release = vi.fn();
+      const onAdmit = vi.fn().mockResolvedValue({ admitted: true, release });
+      const client = createClient({ onWebhookRelay, onVerifyInbound, onAdmit });
+      const mock = authenticateClient(client);
+
+      const body = '{"foo":1}';
+      simulateMessage(mock, makeStartFrame('m-rej', body, 1));
+      simulateMessage(mock, makeChunk('m-rej', 0, body, true));
+      await vi.advanceTimersByTimeAsync(100);
+
+      const acks = getSentMessages(mock).filter(
+        (m) => (m as { type: string }).type === 'webhook.ack',
+      );
+      expect(acks[0]).toMatchObject({ result: 'rejected_signature' });
+      expect(onWebhookRelay).not.toHaveBeenCalled();
+      expect(release).toHaveBeenCalledTimes(1);
+    });
+
     it('reassembles a multi-chunk stream in order', async () => {
       const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
       const onVerifyInbound = vi.fn().mockResolvedValue({ result: 'accepted' as const });
@@ -1803,5 +2108,131 @@ describe('classifyDashboardRequestError', () => {
     );
     expect(frame.orchVersion).toBeUndefined();
     expect(frame.error).toContain('vunknown');
+  });
+});
+
+describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
+  it('replies with a NACK naming the type for an unknown Platform frame (no connection close)', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    mock.sentMessages.length = 0;
+
+    simulateMessage(mock, { type: 'kici.brand.new.thing.v999', messageId: 'req-7' });
+
+    const sent = getSentMessages(mock);
+    const nack = sent.find((m) => (m as { type?: string }).type === 'nack') as {
+      type: string;
+      receivedType: string;
+      messageId?: string;
+      reason: string;
+    };
+    expect(nack).toBeDefined();
+    expect(nack.receivedType).toBe('kici.brand.new.thing.v999');
+    expect(nack.messageId).toBe('req-7');
+    expect(nack.reason).toContain('kici.brand.new.thing.v999');
+    expect(nack.reason).toContain('upgrade the orchestrator');
+    // The connection is NOT torn down for a single skewed frame.
+    expect(mock.closeCode).toBeUndefined();
+  });
+
+  it('does NOT throw on the unknown-message path (it NACKs, never crashes)', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    expect(() => simulateMessage(mock, { type: 'totally.unknown' })).not.toThrow();
+  });
+
+  it('does NOT NACK a known Platform type that failed validation (stays drop-and-warn)', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    mock.sentMessages.length = 0;
+
+    // trust_policy.update is a KNOWN Platform→orch type; a frame that fails its
+    // schema (missing required fields) is malformed, not version skew, so no
+    // spurious skew NACK is emitted.
+    simulateMessage(mock, { type: 'trust_policy.update', messageId: 'bad-1' });
+
+    const sent = getSentMessages(mock);
+    expect(sent.find((m) => (m as { type?: string }).type === 'nack')).toBeUndefined();
+    expect(mock.closeCode).toBeUndefined();
+  });
+
+  it('loop guard: a malformed nack frame does NOT trigger a NACK reply', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    mock.sentMessages.length = 0;
+
+    // A `nack` that fails schema validation (missing reason) must stay
+    // drop-and-warn — never a NACK-of-NACK.
+    simulateMessage(mock, { type: 'nack', messageId: 'x' });
+
+    const sent = getSentMessages(mock);
+    expect(sent.find((m) => (m as { type?: string }).type === 'nack')).toBeUndefined();
+  });
+
+  it('a received (valid) nack is handled without sending a NACK back', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    mock.sentMessages.length = 0;
+
+    simulateMessage(mock, {
+      type: 'nack',
+      receivedType: 'orch.metrics',
+      reason: 'unsupported message type "orch.metrics"',
+    });
+
+    const sent = getSentMessages(mock);
+    expect(sent.find((m) => (m as { type?: string }).type === 'nack')).toBeUndefined();
+  });
+
+  it('caches platform.capabilities and gates a feature-gated send on it', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+
+    // Platform advertises a set WITHOUT orchMetrics → gated send suppressed.
+    simulateMessage(mock, {
+      type: 'platform.capabilities',
+      capabilities: { oidcMint: true },
+    });
+    mock.sentMessages.length = 0;
+
+    const metricsFrame = {
+      type: 'orch.metrics' as const,
+      messageId: 'm1',
+      metrics: [],
+      timestamp: Date.now(),
+    };
+    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
+    expect(
+      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
+    ).toBeUndefined();
+
+    // Now advertise a set WITH orchMetrics → the same gated send goes out.
+    simulateMessage(mock, {
+      type: 'platform.capabilities',
+      capabilities: { orchMetrics: true },
+    });
+    mock.sentMessages.length = 0;
+    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
+    expect(
+      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
+    ).toBeDefined();
+  });
+
+  it('backward-safe: a feature-gated send fires when NO capabilities were advertised', () => {
+    const client = createClient();
+    const mock = authenticateClient(client);
+    mock.sentMessages.length = 0;
+
+    // No platform.capabilities frame was ever received (pre-capability Platform).
+    const metricsFrame = {
+      type: 'orch.metrics' as const,
+      messageId: 'm2',
+      metrics: [],
+      timestamp: Date.now(),
+    };
+    client.sendIfPlatformSupports('orchMetrics', metricsFrame as OrchestratorToPlatformMessage);
+    expect(
+      getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
+    ).toBeDefined();
   });
 });

@@ -77,9 +77,7 @@ step('download-artifacts', {
 ```typescript
 workflow('ci', {
   on: push({ branches: ['main'] }),
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
   onCancel: async (ctx) => {
     // Notify when any job in the workflow is cancelled
     console.log('CI workflow cancelled');
@@ -129,9 +127,7 @@ Each hook has a timeout (default: 5 minutes). You can customize it per-hook:
 ```typescript
 job('deploy', {
   runsOn: 'linux',
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
   cleanup: {
     run: async (ctx) => {
       await ctx.$`./lengthy-cleanup.sh`;
@@ -220,7 +216,7 @@ step('optional-check', {
 
 When a rule returns `false`, the step is reported as `skipped` and subsequent steps continue normally. Skipped steps don't cause the job to fail.
 
-Step rules have access to runtime context via `RuleContext`: `event` (typed discriminated union), `changedFiles`, `env`, and `$`. They evaluate agent-side (unlike job-level rules which evaluate at the orchestrator during trigger matching).
+Step rules have access to runtime context via `RuleContext`: `event` (typed discriminated union), `changedFiles`, `env`, and `$`. Both step-level and job-level rules evaluate agent-side at runtime — not on the orchestrator during trigger matching, because the orchestrator only holds the lock file and never loads the workflow code the rule functions live in. A job-level rule runs inside the execution sandbox after the agent is spawned, the repository source is restored, and the workflow module is loaded, so a job that a rule skips still pays the cost of spawning an agent and restoring the repository source before the skip is decided; only the job's steps are avoided. See [how your workflow code executes](./execution-model.md) for where this sits among the three phases.
 
 ## Hook failure behavior
 

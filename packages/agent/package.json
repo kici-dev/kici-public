@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/agent",
-  "version": "0.1.27",
+  "version": "0.2.0",
   "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
   "keywords": [
     "ci",
@@ -49,28 +49,30 @@
     "entries": {
       "server.js": "src/server.ts",
       "workflow-runner.js": "src/execution/sandbox/workflow-runner.ts",
+      "workflow-runner-bundle.js": "src/execution/sandbox/workflow-runner.ts",
+      "container-ts-loader-hook.js": "src/execution/sandbox/container-ts-loader-hook.ts",
       "index.js": "src/index.ts"
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
-    "typecheck": "tsc --noEmit",
+    "build": "node ../../scripts/build-service.mjs && tsgo --emitDeclarationOnly",
+    "typecheck": "tsgo --noEmit",
     "test": "vitest run",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/agent --name @kici-dev/agent"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.14",
+    "@hono/node-server": "^2.0.10",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
     "@kici-dev/sdk": "workspace:*",
     "@kici-dev/shared": "workspace:*",
     "archiver": "^8.0.0",
-    "dockerode": "^5.0.0",
-    "hono": "^4.12.25",
+    "dockerode": "^5.0.1",
+    "hono": "^4.12.32",
     "jose": "^6.1.0",
-    "tar": "^7.5.16",
+    "tar": "^7.5.20",
     "winston": "^3.19.0",
-    "ws": "^8.21.0",
+    "ws": "^8.21.1",
     "yaml": "^2.9.0",
     "zod": "^4.4.3",
     "zx": "^8.8.5"

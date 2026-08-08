@@ -1,4 +1,4 @@
-import type { CheckMode, CheckStepOutcome } from '@kici-dev/engine';
+import type { CheckMode, CheckStepOutcome, LogStream } from '@kici-dev/engine';
 import type { SandboxStepResult } from './types.js';
 
 /**
@@ -85,6 +85,8 @@ interface LogLineMessage {
   type: 'log.line';
   stepIndex: number;
   line: string;
+  /** Which subprocess stream the line came from. Absent means stdout. */
+  stream?: LogStream;
 }
 
 /**
@@ -258,6 +260,33 @@ export interface ProvenanceRequestIpc {
   publicKey?: unknown;
 }
 
+/** Which artifact operation to relay. */
+export type ArtifactRequestOp = 'beginUpload' | 'completeUpload' | 'download';
+
+/**
+ * Request a user-facing artifact operation (runner -> agent). The agent relays
+ * it over the WS as an `artifacts.upload.request` / `.complete` /
+ * `artifacts.download.request` and pipes the response back as an
+ * {@link ArtifactResponseIpc}. Mirrors the {@link CacheRequestIpc} relay pattern.
+ */
+export interface ArtifactRequestIpc {
+  type: 'artifacts.request';
+  /** UUID for correlating the response. */
+  requestId: string;
+  /** Which artifact operation to perform. */
+  op: ArtifactRequestOp;
+  /** Artifact name (all ops). */
+  name: string;
+  /** Packed tarball size in bytes — drives the enforcement gates. `beginUpload` only. */
+  declaredSizeBytes?: number;
+  /** Confirmed tarball size in bytes. `completeUpload` only. */
+  sizeBytes?: number;
+  /** SHA-256 of the tarball bytes. `completeUpload` only. */
+  sha256?: string;
+  /** Storage key echoed from the grant response. `completeUpload` only. */
+  storageKey?: string;
+}
+
 export type RunnerToAgentMessage =
   | ReadyMessage
   | StepStartMessage
@@ -270,6 +299,7 @@ export type RunnerToAgentMessage =
   | AgentApiRequestIpc
   | CacheRequestIpc
   | ProvenanceRequestIpc
+  | ArtifactRequestIpc
   | StepApprovalRequestIpc;
 
 // --- Agent -> Runner messages (from agent process to workflow runner) ---
@@ -386,6 +416,50 @@ export interface ProvenanceResponseIpc {
   error?: string;
 }
 
+/**
+ * Response to an {@link ArtifactRequestIpc} (agent -> runner). Relayed from the
+ * orchestrator's `artifacts.upload.response` / `artifacts.download.response` WS
+ * message. Carries the union of the upload-grant (`uploadOutcome` / `uploadUrl`
+ * / `storageKey` / `reason`) and download-lookup (`downloadOutcome` /
+ * `downloadUrl` / `sizeBytes` / `sha256`) fields; `completeUpload` resolves with
+ * an empty (no-field) response. `error` is set when the relay itself failed;
+ * `rejectionDetail` carries an orchestrator-side non-enforcement explanation
+ * that the workflow-facing render surfaces without throwing a relay error.
+ */
+export interface ArtifactResponseIpc {
+  type: 'artifacts.response';
+  /** Matches the original request's requestId. */
+  requestId: string;
+  /** beginUpload: `granted` (presigned PUT minted) or `rejected` (named reason). */
+  uploadOutcome?: 'granted' | 'rejected';
+  /** beginUpload: presigned PUT URL (present only on `granted`). */
+  uploadUrl?: string;
+  /** beginUpload: storage key to echo back on complete (present only on `granted`). */
+  storageKey?: string;
+  /** beginUpload: enforcement-gate refusal reason (present only on `rejected`). */
+  reason?: 'duplicate_name' | 'size_cap' | 'run_cap' | 'org_quota';
+  /**
+   * Orchestrator non-enforcement refusal detail — set when a `rejected` upload
+   * or a `not_found` download reflects a name that violates the artifact-name
+   * contract, or an orchestrator problem (artifacts not configured, unresolvable
+   * run, internal error), rather than an enforcement gate or a genuinely missing
+   * artifact. Distinct from `error` below, which is a relay/transport failure
+   * the sandbox turns into a thrown error: this field flows into the normal
+   * rejection render instead.
+   */
+  rejectionDetail?: string;
+  /** download: `found` (presigned GET minted) or `not_found`. */
+  downloadOutcome?: 'found' | 'not_found';
+  /** download: presigned GET URL (present only on `found`). */
+  downloadUrl?: string;
+  /** download: artifact size in bytes (present only on `found`). */
+  sizeBytes?: number;
+  /** download: SHA-256 of the tarball bytes (present only on `found`). */
+  sha256?: string;
+  /** Error description (present when the relay or orchestrator failed). */
+  error?: string;
+}
+
 export type AgentToRunnerMessage =
   | ExecuteMessage
   | AbortMessage
@@ -394,6 +468,7 @@ export type AgentToRunnerMessage =
   | AgentApiResponseIpc
   | CacheResponseIpc
   | ProvenanceResponseIpc
+  | ArtifactResponseIpc
   | StepApprovalResolvedIpc;
 
 // --- Job execution request ---
@@ -582,6 +657,12 @@ export interface JobExecutionRequest {
   hasConcurrencyGroup?: boolean;
   /** Concurrency group evaluation timeout in milliseconds (default: 30000). */
   concurrencyEvaluationTimeoutMs?: number;
+  /**
+   * Orchestrator-resolved concurrency-slot wait timeout (ms), pushed on
+   * `job.dispatch` from the fleet-wide `cluster_settings.concurrency_wait_timeout_ms`.
+   * Absent for older orchestrators — the runner falls back to its own default.
+   */
+  concurrencyWaitTimeoutMs?: number;
   /** Git branch for concurrency group context. */
   branch?: string;
 

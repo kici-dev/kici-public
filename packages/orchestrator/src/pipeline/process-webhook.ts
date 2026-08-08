@@ -32,16 +32,24 @@ import type {
   LockWorkflow,
   SimulatedEvent,
   LockFileParseError,
+  ChangedFilesResult,
 } from '@kici-dev/engine';
 import { EventLogStatus, EventLogSource, InitFailureCategory } from '@kici-dev/engine';
+import type { OrchestratorMode } from '@kici-dev/engine';
 import { isLockStaticJob } from '@kici-dev/engine';
 import { materializeFanout, matrixEnvelopeFields, partitionMatchers } from '@kici-dev/engine';
-import { matchAllWorkflows } from '@kici-dev/engine';
+import { matchAllWorkflows, matchWorkflowsForEvent } from '@kici-dev/engine';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderBundle } from '../provider-registry.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
 import type { TrustResolution } from '../security/trust-resolver.js';
+import {
+  evaluateTrustPolicy,
+  resolveEffectivePolicy,
+  type TrustPolicyOutcome,
+} from '../security/trust-policy-gate.js';
+import type { StoredTrustPolicy } from '../security/trust-policy-store.js';
 import { selectLockFileSource } from '../security/lock-source.js';
 import {
   detectWorkflowModifications,
@@ -57,6 +65,7 @@ import {
   dedupHitsTotal,
   crossSourceFanoutSize,
   crossSourceErrorsTotal,
+  trustPolicyDecisionsTotal,
 } from '../metrics/prometheus.js';
 import { dispatchMatchedWorkflow } from './dispatch-matched-workflow.js';
 import {
@@ -65,7 +74,6 @@ import {
   eventTypeToTriggerType,
   extractInboundRepoIdentifier,
   isDefaultBranchPush,
-  buildSecurityHoldSummary,
   anyTriggerHasPathPatterns,
   summarizeDecision,
   buildTriggerEvent,
@@ -81,8 +89,17 @@ const logger = createLogger({ prefix: 'pipeline' });
  * panel; `skipped` covers unknown provider / unknown event / no-repo paths;
  * `processed` means the pipeline matched and dispatched (or recorded a run).
  */
-export const WebhookIngestOutcome = z.enum(['processed', 'duplicate', 'skipped']);
+export const WebhookIngestOutcome = z.enum(['processed', 'duplicate', 'skipped', 'shed']);
 export type WebhookIngestOutcome = z.infer<typeof WebhookIngestOutcome>;
+
+/**
+ * Annotation written to a `processed` event-log row when path filters were
+ * evaluated against an unavailable changed-files diff (conservative match).
+ * Reuses the existing free-text field so the outcome is never a silent
+ * `processed / matched 0` — no new event-log status enum value is added.
+ */
+const DEGRADED_CHANGED_FILES_REASON =
+  'trigger evaluation degraded: changed files unavailable — path filters matched conservatively';
 
 /** Map a dedup/provider skip reason onto the ingest outcome a route reports. */
 function skipReasonToOutcome(reason: 'duplicate' | 'unknown-provider'): WebhookIngestOutcome {
@@ -134,8 +151,7 @@ interface DedupAndProviderContinue {
 }
 
 type DedupAndProviderResult =
-  | DedupAndProviderContinue
-  | { status: 'skip'; reason: 'duplicate' | 'unknown-provider' };
+  DedupAndProviderContinue | { status: 'skip'; reason: 'duplicate' | 'unknown-provider' };
 
 /**
  * Phase A.1 — Dedup + provider lookup. Resolves org id, drops duplicates, and
@@ -412,6 +428,24 @@ async function dispatchOneCrossSourceCandidate(args: {
     return 0;
   }
 
+  // Cross-source is a dispatch path, so it consults the policy through the same
+  // evaluator as every other path rather than asserting a verdict of its own.
+  // Today an inbound generic webhook normalizes to a non-PR event and the
+  // evaluator short-circuits to `pass`; routing it through the evaluator anyway
+  // is what stops that from silently becoming a bypass if a registration's
+  // normalizer ever yields a PR-shaped event. Trust is unresolved on this path,
+  // which the evaluator reads as `unknown` — fail-closed, never a pass.
+  const crossSourceSecurityDecision = await evaluateSecurityPolicy({
+    deps,
+    bundle: regBundle,
+    isPREvent: isPullRequestEvent(syntheticEvent.type),
+    resolvedOrgId,
+    mode: deps.orchestratorMode ?? 'platform',
+    trustResolution: undefined,
+    isForkPR: syntheticEvent.isForkPR ?? false,
+    hasWorkflowModifications: false,
+  });
+
   let dispatchedCount = 0;
   for (const matched of matchedDecisions) {
     const crossRunId = randomUUID();
@@ -425,9 +459,9 @@ async function dispatchOneCrossSourceCandidate(args: {
     // Synthesize a single-workflow lockfile so the helper's internal lookup
     // (by workflow.name) still resolves. lockfileHash is cleared so the dep
     // cache check becomes a no-op; the bundle cache + build job path is also
-    // disabled inside dispatchMatchedWorkflow via the `crossSource` flag (see
-    // 28.4-VERIFICATION.md Gap 3 — bundles externalize @kici-dev/sdk and an
-    // eval job in a fresh temp dir cannot resolve the package).
+    // disabled inside dispatchMatchedWorkflow via the `crossSource` flag:
+    // bundles externalize @kici-dev/sdk and an eval job in a fresh temp dir
+    // cannot resolve the package.
     // contentHash is preserved so the agent can still perform lock-file drift
     // detection on the compiled bundle.
     const crossSourceLockEntry: LockWorkflow = {
@@ -458,6 +492,7 @@ async function dispatchOneCrossSourceCandidate(args: {
       lockFileSource: undefined,
       localWorkingTree: false,
       crossSource: true,
+      securityDecision: crossSourceSecurityDecision,
       crossSourceDeliveryId: crossDedupKey,
       effectiveRoutingKey: reg.routingKey,
       effectiveProvider: regBundle.normalizer.provider,
@@ -470,8 +505,7 @@ async function dispatchOneCrossSourceCandidate(args: {
         workflowRepoUrl: regBundle.repoUrlBuilder?.buildCloneUrl(reg.repoIdentifier) ?? '',
         // workflowRef is empty so the agent's gitClone() falls through to the
         // default-branch clone path. The registration's commitSha drives the
-        // post-clone SHA verification + fetch-deepen path
-        // (28.4-VERIFICATION.md Gap 2).
+        // post-clone SHA verification + fetch-deepen path.
         workflowRef: '',
         workflowSha: reg.commitSha ?? '',
         workflowRepoIdentifier: reg.repoIdentifier,
@@ -684,6 +718,7 @@ async function handleApprovalCommentIfPresent(args: {
       .where('held_runs.queue_type', '=', 'security')
       .where('held_runs.status', '=', 'pending')
       .where('execution_runs.repo_identifier', '=', repoIdentifier)
+      .where('execution_runs.pr_number', '=', prNumber)
       .orderBy('held_runs.created_at', 'desc')
       .executeTakeFirst();
     commitSha = heldRun?.sha;
@@ -1057,7 +1092,7 @@ function buildGlobalWorkflowJobInputs(args: {
       workflowRef: '',
       workflowSha: reg.commitSha ?? '',
       workflowRepoIdentifier: reg.repoIdentifier,
-      // Cross-provider auth plumbing (Phase 4 Option B): when the
+      // Cross-provider auth plumbing: when the
       // registration's routing key differs from the inbound, the dispatcher
       // resolves the workflow-repo bundle by this key and mints `workflowAuth`
       // independently from `sourceAuth`.
@@ -1090,6 +1125,54 @@ function buildGlobalWorkflowJobInputs(args: {
 }
 
 /**
+ * Post the neutral informational check recording that org global workflows were
+ * skipped because the trust policy did not pass the event.
+ *
+ * Goes through the poster's own dedicated check name, NOT `postCheckStatus`:
+ * that method owns the single "KiCI Security" check run per commit, which the
+ * hold posts as pending and approve / reject later complete — so writing this
+ * notice through it would resolve the still-held run's check to neutral and
+ * unblock a branch protection rule that requires the security check.
+ *
+ * Deliberately neutral in BOTH the hold and reject cases: on `reject` the
+ * same-source path already posts a failure check for the event, and a second
+ * failure would double-report one decision. A skipped global has no run row, so
+ * there is no held run to approve — approving the event's hold releases the
+ * pull request's own workflows only.
+ *
+ * Posted through the INBOUND event's bundle and credentials, since the check
+ * lands on the inbound repo; a cross-provider lock-file fallback swaps the
+ * dispatch bundle for another source's, which must not be used to write here.
+ */
+async function postGlobalsSkippedCheck(args: {
+  bundle: ProviderBundle;
+  repoIdentifier: string;
+  ref: string;
+  credentials: Record<string, unknown>;
+  decision: TrustPolicyOutcome;
+}): Promise<void> {
+  const { bundle, repoIdentifier, ref, credentials, decision } = args;
+  if (decision.action === 'pass') return;
+  try {
+    await bundle.checkStatusPoster?.postGlobalWorkflowsSkippedCheck(
+      repoIdentifier,
+      ref,
+      `The organization trust policy ${decision.action === 'hold' ? 'held' : 'rejected'} this ` +
+        `event (${decision.reason}), so organization-wide global workflows did not run. ` +
+        `Approving the hold releases this pull request's own workflows; it does not ` +
+        `retroactively run the organization's global workflows for this event.`,
+      credentials,
+    );
+  } catch (err) {
+    logger.warn('Failed to post globals-skipped check', {
+      repoIdentifier,
+      reason: decision.reason,
+      error: toErrorMessage(err),
+    });
+  }
+}
+
+/**
  * Phase F — Lock file is missing for this repo — try global workflows in the
  * SAME ORG that target this event type. Even without a per-repo lock file,
  * global workflows in other repos may match. Returns the count of jobs
@@ -1104,6 +1187,10 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /** The inbound event's own bundle, used to post the globals-skipped check. */
+  bundle: ProviderBundle;
+  credentials: Record<string, unknown>;
+  securityDecision: TrustPolicyOutcome;
 }): Promise<number> {
   const {
     info,
@@ -1114,7 +1201,28 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
     ref,
     dispatchBundle,
     dispatchCredentials,
+    bundle,
+    credentials,
+    securityDecision,
   } = args;
+  // Org global workflows run with ORG credentials against the event's head SHA,
+  // so a held or rejected event must not dispatch them.
+  if (securityDecision.action !== 'pass') {
+    logger.info('Global workflows skipped by trust policy (no lock file path)', {
+      deliveryId: info.deliveryId,
+      repoIdentifier,
+      action: securityDecision.action,
+      reason: securityDecision.reason,
+    });
+    await postGlobalsSkippedCheck({
+      bundle,
+      repoIdentifier,
+      ref,
+      credentials,
+      decision: securityDecision,
+    });
+    return 0;
+  }
   if (!deps.registrationIndex) return 0;
 
   // Refresh registration index in case external changes were made.
@@ -1200,20 +1308,25 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
 
 interface SecurityState {
   workflowModifications: WorkflowModification[];
-  securityHold: { reason: string } | undefined;
+  /**
+   * True when this PR changes `.kici/` workflow definitions. A *signal*, not a
+   * decision — the trust-policy gate turns it into an outcome, which the
+   * dispatch gate then enforces as a held run or a rejected run.
+   */
+  hasWorkflowModifications: boolean;
 }
 
 /**
- * Phase G — On non-trusted PR events evaluated against the base lock file,
- * detect workflow modifications by diffing base vs. head, post a neutral
- * informational check status, and (if the contributor is unknown/known) set
- * a security hold so the matched workflows queue for approval.
+ * Phase G — On PR events evaluated against the base lock file, detect workflow
+ * modifications by diffing base vs. head and post a neutral informational check
+ * (on its own dedicated check name).
  *
- * Also posts a pending check status for any security hold reason — the hold
- * itself is later set inside `dispatchMatchedWorkflow` based on environment
- * protection rules; this only handles the workflow_modification reason.
+ * Detection only. Whether a modification gates the run is the org trust policy's
+ * call, evaluated in `evaluateSecurityPolicy` and enforced by the dispatch gate
+ * — which creates the real `held_runs` row and posts the pending
+ * "Held for approval" check, so `/kici approve` / reject / expiry can resolve it.
  */
-function applyWorkflowModificationsAndSecurityHold(args: {
+export function applyWorkflowModificationsAndSecurityHold(args: {
   info: WebhookInfo;
   bundle: ProviderBundle;
   event: SimulatedEvent;
@@ -1240,7 +1353,6 @@ function applyWorkflowModificationsAndSecurityHold(args: {
     credentials,
   } = args;
   let workflowModifications: WorkflowModification[] = [];
-  let securityHold: { reason: string } | undefined;
 
   if (isPREvent && lockFileSource === 'base' && headLockFileForDiff) {
     workflowModifications = detectWorkflowModifications(fullLockFile, headLockFileForDiff);
@@ -1253,31 +1365,13 @@ function applyWorkflowModificationsAndSecurityHold(args: {
         tier,
         modifications: workflowModifications.map((m) => `${m.changeType}:${m.workflowName}`),
       });
-
-      if (tier === 'known' || tier === 'unknown') {
-        securityHold = { reason: 'workflow_modification' };
-      }
     }
 
     if (workflowModifications.length > 0 && bundle.checkStatusPoster) {
-      const modLines = workflowModifications.map(
-        (m) => `- **${m.changeType}**: \`${m.workflowName}\``,
-      );
-      const modSummary = [
-        'This PR adds/modifies workflows -- changes will take effect after merge.',
-        '',
-        '### Detected changes',
-        ...modLines,
-      ].join('\n');
+      // Neutral informational check on its OWN check name so it never overwrites
+      // the security-hold check the dispatch gate posts.
       bundle.checkStatusPoster
-        .postCheckStatus(
-          repoIdentifier,
-          ref,
-          'neutral',
-          'Workflow changes detected',
-          modSummary,
-          credentials,
-        )
+        .postWorkflowModificationCheck(repoIdentifier, ref, workflowModifications, credentials)
         .catch((err) => {
           logger.warn('Failed to post workflow modification check', {
             deliveryId: info.deliveryId,
@@ -1287,30 +1381,63 @@ function applyWorkflowModificationsAndSecurityHold(args: {
     }
   }
 
-  if (securityHold && bundle.checkStatusPoster) {
-    const holdSummary = buildSecurityHoldSummary(
-      securityHold.reason,
-      trustResolution?.tier ?? 'unknown',
-      trustResolution?.contributorUsername,
-    );
-    bundle.checkStatusPoster
-      .postCheckStatus(
-        repoIdentifier,
-        ref,
-        'pending',
-        'Held for approval',
-        holdSummary,
-        credentials,
-      )
-      .catch((err) => {
-        logger.warn('Failed to post security hold check', {
-          deliveryId: info.deliveryId,
-          error: toErrorMessage(err),
-        });
-      });
+  return { workflowModifications, hasWorkflowModifications: workflowModifications.length > 0 };
+}
+
+/**
+ * Evaluate the org trust policy for a PR event.
+ *
+ * Scoped to providers with a contributor model — the same condition trust
+ * resolution uses. A source without a `ContributorResolver` (generic, local,
+ * universal-git) is trusted by construction, so it passes regardless of policy;
+ * in particular, universal-git computes an `isForkPR` signal that must NOT gate
+ * those sources.
+ */
+export async function evaluateSecurityPolicy(args: {
+  deps: ProcessingDeps;
+  bundle: ProviderBundle;
+  isPREvent: boolean;
+  resolvedOrgId: string;
+  mode: OrchestratorMode;
+  trustResolution: TrustResolution | undefined;
+  isForkPR: boolean;
+  hasWorkflowModifications: boolean;
+}): Promise<TrustPolicyOutcome> {
+  const { deps, bundle, isPREvent, resolvedOrgId, mode } = args;
+  if (!isPREvent || !bundle.contributorResolver) return { action: 'pass' };
+
+  let stored: StoredTrustPolicy | null = null;
+  try {
+    stored = (await deps.trustPolicyStore?.get(resolvedOrgId)) ?? null;
+  } catch (err) {
+    // Fall through with `stored = null`, which fails closed on a
+    // Platform-attached orchestrator. Never fail open on a read error.
+    logger.warn('Trust policy read failed; falling back to the mode default', {
+      orgId: resolvedOrgId,
+      error: toErrorMessage(err),
+    });
   }
 
-  return { workflowModifications, securityHold };
+  const outcome = evaluateTrustPolicy(resolveEffectivePolicy(stored, mode), {
+    tier: args.trustResolution?.tier,
+    isForkPR: args.isForkPR,
+    hasWorkflowModifications: args.hasWorkflowModifications,
+  });
+
+  trustPolicyDecisionsTotal.add(1, {
+    arm: outcome.action === 'pass' ? 'none' : outcome.reason,
+    action: outcome.action,
+  });
+
+  if (outcome.action !== 'pass') {
+    logger.info('Trust policy gate decision', {
+      orgId: resolvedOrgId,
+      action: outcome.action,
+      reason: outcome.reason,
+      tier: args.trustResolution?.tier,
+    });
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,7 +1578,12 @@ async function gatherChangedFilesAndMatchTriggers(args: {
     dispatchCredentials,
     repoIdentifier,
   } = args;
-  const changedFiles =
+  // When no trigger uses path patterns the fetch is skipped entirely (the
+  // legitimate fast path); otherwise the fetcher reports whether the diff was
+  // fetched authoritatively or is unavailable (a provider capability gap /
+  // upstream degradation). `unavailable` is threaded so path filters match
+  // conservatively downstream instead of a bare `[]` silently no-matching.
+  const fetched: ChangedFilesResult | { files: string[]; status: 'skipped' } =
     dispatchBundle.changedFilesFetcher &&
     anyTriggerHasPathPatterns(fullLockFile.workflows as LockWorkflow[])
       ? await dispatchBundle.changedFilesFetcher.getChangedFiles(
@@ -1460,7 +1592,7 @@ async function gatherChangedFilesAndMatchTriggers(args: {
           payload,
           dispatchCredentials,
         )
-      : [];
+      : { files: [], status: 'skipped' };
 
   // Populate sourceRepo so same-repo global workflows (those authored in the
   // event's own repo and gated by `repos` patterns) evaluate correctly; the
@@ -1468,12 +1600,18 @@ async function gatherChangedFilesAndMatchTriggers(args: {
   // assumption that per-repo matching already covers them.
   const eventWithFiles: SimulatedEvent = {
     ...event,
-    changedFiles,
+    changedFiles: fetched.files,
+    changedFilesStatus: fetched.status,
     sourceRepo: repoIdentifier,
   };
 
   const matchStart = process.hrtime.bigint();
-  const decisions = matchAllWorkflows(fullLockFile.workflows, eventWithFiles);
+  // Event-type-bucketed candidate scan: only workflows subscribed to
+  // eventWithFiles.type are evaluated. The matched set is identical to
+  // matchAllWorkflows (candidates are a superset of every match); the hot
+  // dispatch path filters `.matched` then looks workflows up by name, never
+  // positionally, so a candidates-only array is safe here.
+  const decisions = matchWorkflowsForEvent(fullLockFile.workflows, eventWithFiles);
   const matchDuration = Number(process.hrtime.bigint() - matchStart) / 1e9;
   triggerMatchDurationSeconds.record(matchDuration);
   return { eventWithFiles, decisions };
@@ -1504,6 +1642,8 @@ async function dispatchMatchedSameSourceWorkflows(args: {
   repoIdentifier: string;
   resolvedFallbackRoutingKey: string | undefined;
   resolvedFallbackBundle: ProviderBundle | undefined;
+  /** PR-wide workflow-modification security-hold signal from phase G. */
+  securityDecision: TrustPolicyOutcome;
 }): Promise<MatchedSummary> {
   const {
     info,
@@ -1522,6 +1662,7 @@ async function dispatchMatchedSameSourceWorkflows(args: {
     repoIdentifier,
     resolvedFallbackRoutingKey,
     resolvedFallbackBundle,
+    securityDecision,
   } = args;
 
   let matchedCount = 0;
@@ -1561,6 +1702,7 @@ async function dispatchMatchedSameSourceWorkflows(args: {
       // `__build__` job is skipped and each job runs the tree directly.
       localWorkingTree: dispatchBundle.localInPlace === true,
       crossSource: false,
+      securityDecision,
       effectiveRoutingKey: resolvedFallbackRoutingKey ?? undefined,
       effectiveProvider: resolvedFallbackBundle
         ? resolvedFallbackBundle.normalizer.provider
@@ -1590,6 +1732,10 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /** The inbound event's own bundle, used to post the globals-skipped check. */
+  bundle: ProviderBundle;
+  credentials: Record<string, unknown>;
+  securityDecision: TrustPolicyOutcome;
 }): Promise<{ matchedCount: number; matchedRunIds: string[] }> {
   const {
     info,
@@ -1600,7 +1746,30 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
     ref,
     dispatchBundle,
     dispatchCredentials,
+    bundle,
+    credentials,
+    securityDecision,
   } = args;
+  // Org global workflows run with ORG credentials against the event's head SHA,
+  // so a held or rejected event must not dispatch them. The same-source path
+  // has already held or failed the PR's own run by this point; this stops the
+  // org's globals from running for that same untrusted event.
+  if (securityDecision.action !== 'pass') {
+    logger.info('Global workflows skipped by trust policy', {
+      deliveryId: info.deliveryId,
+      repoIdentifier,
+      action: securityDecision.action,
+      reason: securityDecision.reason,
+    });
+    await postGlobalsSkippedCheck({
+      bundle,
+      repoIdentifier,
+      ref,
+      credentials,
+      decision: securityDecision,
+    });
+    return { matchedCount: 0, matchedRunIds: [] };
+  }
   if (!deps.registrationIndex) return { matchedCount: 0, matchedRunIds: [] };
 
   let matchedCount = 0;
@@ -1704,6 +1873,7 @@ async function forwardTracesAndRecordEventLog(args: {
   resolvedOrgId: string;
   repoIdentifier: string;
   ref: string;
+  changedFilesStatus: SimulatedEvent['changedFilesStatus'];
 }): Promise<void> {
   const {
     info,
@@ -1715,6 +1885,7 @@ async function forwardTracesAndRecordEventLog(args: {
     resolvedOrgId,
     repoIdentifier,
     ref,
+    changedFilesStatus,
   } = args;
 
   if (deps.platformClient) {
@@ -1758,6 +1929,10 @@ async function forwardTracesAndRecordEventLog(args: {
       repoIdentifier,
       ref,
       runId: firstRunId,
+      // Surface a degraded evaluation (path filters run against an unavailable
+      // diff) so the operator sees it instead of a silent `processed / 0`.
+      errorMessage:
+        changedFilesStatus === 'unavailable' ? DEGRADED_CHANGED_FILES_REASON : undefined,
     });
   }
 
@@ -1767,6 +1942,109 @@ async function forwardTracesAndRecordEventLog(args: {
     matchedWorkflows: matchedCount,
     totalWorkflows: decisions.length,
   });
+}
+
+/**
+ * Phases I–K — Once a lock file resolves, gather changed files, match + dispatch
+ * same-source and cross-repo global workflows, then forward the Platform trace
+ * and record the `processed` event-log row (annotated when path filters ran
+ * against an unavailable diff). Extracted from `processWebhook` to keep the
+ * narrative orchestrator under the function-length budget.
+ */
+async function matchDispatchAndRecordOutcome(args: {
+  info: WebhookInfo;
+  deps: ProcessingDeps;
+  payload: Record<string, unknown>;
+  event: SimulatedEvent;
+  fullLockFile: FullLockFile;
+  lockOutcome: Awaited<ReturnType<typeof fetchLockFileWithFallbackPhase>>;
+  trust: Awaited<ReturnType<typeof resolveTrustForPR>>;
+  resolvedOrgId: string;
+  repoIdentifier: string;
+  ref: string;
+  /** The inbound event's own bundle, used to post the globals-skipped check. */
+  bundle: ProviderBundle;
+  /** Source-repo credentials, used to post the globals-skipped check. */
+  credentials: Record<string, unknown>;
+  /**
+   * The PR-wide org trust-policy verdict for this event. Gates both the
+   * same-source dispatch and the org's global workflows.
+   */
+  securityDecision: TrustPolicyOutcome;
+}): Promise<WebhookIngestOutcome> {
+  const {
+    info,
+    deps,
+    payload,
+    event,
+    bundle,
+    credentials,
+    fullLockFile,
+    lockOutcome,
+    trust,
+    resolvedOrgId,
+    repoIdentifier,
+    ref,
+    securityDecision,
+  } = args;
+
+  const { eventWithFiles, decisions } = await gatherChangedFilesAndMatchTriggers({
+    info,
+    payload,
+    event,
+    fullLockFile,
+    dispatchBundle: lockOutcome.dispatchBundle,
+    dispatchCredentials: lockOutcome.dispatchCredentials,
+    repoIdentifier,
+  });
+
+  const sameSource = await dispatchMatchedSameSourceWorkflows({
+    info,
+    deps,
+    payload,
+    dispatchBundle: lockOutcome.dispatchBundle,
+    dispatchCredentials: lockOutcome.dispatchCredentials,
+    event,
+    eventWithFiles,
+    ref,
+    fullLockFile,
+    resolvedOrgId,
+    decisions,
+    trustResolution: trust.trustResolution,
+    lockFileSource: trust.lockFileSource,
+    repoIdentifier,
+    resolvedFallbackRoutingKey: lockOutcome.resolvedFallbackRoutingKey,
+    resolvedFallbackBundle: lockOutcome.resolvedFallbackBundle,
+    securityDecision,
+  });
+
+  const globals = await dispatchGlobalWorkflowsForOtherRepos({
+    info,
+    deps,
+    eventWithFiles,
+    resolvedOrgId,
+    repoIdentifier,
+    ref,
+    dispatchBundle: lockOutcome.dispatchBundle,
+    dispatchCredentials: lockOutcome.dispatchCredentials,
+    bundle,
+    credentials,
+    securityDecision,
+  });
+
+  await forwardTracesAndRecordEventLog({
+    info,
+    deps,
+    payload,
+    decisions,
+    matchedCount: sameSource.matchedCount + globals.matchedCount,
+    matchedRunIds: [...sameSource.matchedRunIds, ...globals.matchedRunIds],
+    resolvedOrgId,
+    repoIdentifier,
+    ref,
+    changedFilesStatus: eventWithFiles.changedFilesStatus,
+  });
+  return WebhookIngestOutcome.enum.processed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1902,6 +2180,23 @@ export async function processWebhook(
       ref,
       lockFileSource: trust.lockFileSource,
     });
+    // The trust-policy verdict is a property of the EVENT, not of one dispatch
+    // path. This branch used to return before the policy was read at all, so a
+    // fork PR with `forkPolicy: 'reject'` still ran the org's global workflows
+    // against its head SHA with org credentials — the exact false assurance
+    // this feature exists to remove. There is no lock file here, so there is
+    // nothing to diff for workflow modifications.
+    const noLockSecurityDecision = await evaluateSecurityPolicy({
+      deps,
+      bundle,
+      isPREvent,
+      resolvedOrgId,
+      mode: deps.orchestratorMode ?? 'platform',
+      trustResolution: trust.trustResolution,
+      isForkPR: event.isForkPR ?? false,
+      hasWorkflowModifications: false,
+    });
+
     const globalMatched = await tryDispatchGlobalsWithoutLockFile({
       info,
       deps,
@@ -1911,6 +2206,9 @@ export async function processWebhook(
       ref,
       dispatchBundle: lockOutcome.dispatchBundle,
       dispatchCredentials: lockOutcome.dispatchCredentials,
+      bundle,
+      credentials,
+      securityDecision: noLockSecurityDecision,
     });
     webhooksProcessedTotal.add(1, { result: globalMatched > 0 ? 'dispatched' : 'skipped' });
     if (deps.eventLog) {
@@ -1928,7 +2226,7 @@ export async function processWebhook(
 
   const fullLockFile = lockOutcome.lockFile as unknown as FullLockFile;
 
-  applyWorkflowModificationsAndSecurityHold({
+  const security = applyWorkflowModificationsAndSecurityHold({
     info,
     bundle,
     event,
@@ -1955,56 +2253,32 @@ export async function processWebhook(
     fullLockFile,
   });
 
-  const { eventWithFiles, decisions } = await gatherChangedFilesAndMatchTriggers({
-    info,
-    payload,
-    event,
-    fullLockFile,
-    dispatchBundle: lockOutcome.dispatchBundle,
-    dispatchCredentials: lockOutcome.dispatchCredentials,
-    repoIdentifier,
-  });
-
-  const sameSource = await dispatchMatchedSameSourceWorkflows({
-    info,
+  const securityDecision = await evaluateSecurityPolicy({
     deps,
-    payload,
-    dispatchBundle: lockOutcome.dispatchBundle,
-    dispatchCredentials: lockOutcome.dispatchCredentials,
-    event,
-    eventWithFiles,
-    ref,
-    fullLockFile,
+    bundle,
+    isPREvent,
     resolvedOrgId,
-    decisions,
+    // The fail-closed side is the default: a deps object built without an
+    // explicit mode must never open the gate.
+    mode: deps.orchestratorMode ?? 'platform',
     trustResolution: trust.trustResolution,
-    lockFileSource: trust.lockFileSource,
-    repoIdentifier,
-    resolvedFallbackRoutingKey: lockOutcome.resolvedFallbackRoutingKey,
-    resolvedFallbackBundle: lockOutcome.resolvedFallbackBundle,
+    isForkPR: event.isForkPR ?? false,
+    hasWorkflowModifications: security.hasWorkflowModifications,
   });
 
-  const globals = await dispatchGlobalWorkflowsForOtherRepos({
-    info,
-    deps,
-    eventWithFiles,
-    resolvedOrgId,
-    repoIdentifier,
-    ref,
-    dispatchBundle: lockOutcome.dispatchBundle,
-    dispatchCredentials: lockOutcome.dispatchCredentials,
-  });
-
-  await forwardTracesAndRecordEventLog({
+  return matchDispatchAndRecordOutcome({
     info,
     deps,
     payload,
-    decisions,
-    matchedCount: sameSource.matchedCount + globals.matchedCount,
-    matchedRunIds: [...sameSource.matchedRunIds, ...globals.matchedRunIds],
+    event,
+    fullLockFile,
+    lockOutcome,
+    trust,
     resolvedOrgId,
     repoIdentifier,
     ref,
+    bundle,
+    credentials,
+    securityDecision,
   });
-  return WebhookIngestOutcome.enum.processed;
 }

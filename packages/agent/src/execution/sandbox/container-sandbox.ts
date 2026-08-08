@@ -18,6 +18,8 @@
 
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import Docker from 'dockerode';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
@@ -36,10 +38,12 @@ import type {
   AgentApiRequestIpc,
   CacheRequestIpc,
   ProvenanceRequestIpc,
+  ArtifactRequestIpc,
   StepApprovalRequestIpc,
 } from './ipc-protocol.js';
 import { buildRequest } from './fork-runner.js';
 import { encryptSecretOutputs } from './secret-encryption.js';
+import { buildContainerHardening, type SandboxHardeningOptions } from './container-hardening.js';
 
 const logger = createLogger({ prefix: 'container-sandbox' });
 
@@ -52,6 +56,17 @@ const ABORT_GRACE_MS = 10_000;
 /** Stop timeout (seconds) for container stop. */
 const CONTAINER_STOP_TIMEOUT = 10;
 
+/** Fixed mount target for the pure-JS container loader hook bundle. */
+const HOOK_MOUNT_PATH = '/opt/kici/ts-loader-hook.js';
+
+/**
+ * Agent-internal env vars the sandbox always sets on the container + each exec.
+ * They are NOT customer-derived: they point the in-container runner at the
+ * mounted loader hook and route runner-internal logs to stderr (fd2) so they
+ * cannot corrupt the fd1 JSON-lines IPC channel that container/stdio mode uses.
+ */
+const INTERNAL_ENV = [`KICI_TS_LOADER_HOOK_PATH=${HOOK_MOUNT_PATH}`, 'KICI_LOG_STDERR=1'];
+
 // --- Options ---
 
 interface ContainerSandboxOptions {
@@ -63,12 +78,25 @@ interface ContainerSandboxOptions {
   runnerPath: string;
   /** Mount target inside container (default: /opt/kici/workflow-runner.js). */
   runnerMountPath?: string;
+  /**
+   * Path to the pure-JS container loader-hook bundle on the HOST (bind-mounted
+   * read-only). Defaults to `container-ts-loader-hook.js` next to `runnerPath`.
+   */
+  hookPath?: string;
   /** Pre-sanitized environment variables for the container. */
   env: Record<string, string>;
   /** Whether to keep failed containers for debugging. */
   keepFailed?: boolean;
   /** Job ID for container labeling and orphan cleanup. */
   jobId?: string;
+  /**
+   * Resolved hardening posture for the job container (cap-drop, no-new-privileges,
+   * cgroup caps, tmpfs, user, network). When omitted, no hardening is applied —
+   * the production caller (job-runner) always supplies this from agent config so
+   * the secure-by-default posture is in force; leaving it optional keeps the
+   * constructor testable and lets non-production callers opt out explicitly.
+   */
+  hardening?: SandboxHardeningOptions;
 }
 
 // --- Internal helper types ---
@@ -305,6 +333,43 @@ function relayProvenanceRequest(
 }
 
 /**
+ * Relay artifacts.request from the container runner to the orchestrator via
+ * options.onArtifactRequest, then write the response back through `stream`. If
+ * the agent doesn't expose an artifacts relay, write a structured error so the
+ * runner doesn't hang.
+ */
+function relayArtifactRequest(
+  stream: NodeJS.ReadWriteStream,
+  options: JobExecutionOptions,
+  artMsg: ArtifactRequestIpc,
+): void {
+  const writeResponse = (response: Record<string, unknown>): void => {
+    try {
+      stream.write(JSON.stringify(response) + '\n');
+    } catch {
+      // Stream may be closed
+    }
+  };
+  if (!options.onArtifactRequest) {
+    writeResponse({
+      type: 'artifacts.response',
+      requestId: artMsg.requestId,
+      error: 'Artifacts not available in this agent configuration',
+    });
+    return;
+  }
+  options.onArtifactRequest(artMsg).then(
+    (response) => writeResponse(response as unknown as Record<string, unknown>),
+    (err) =>
+      writeResponse({
+        type: 'artifacts.response',
+        requestId: artMsg.requestId,
+        error: toErrorMessage(err),
+      }),
+  );
+}
+
+/**
  * Relay approval.request from the container runner to the orchestrator via
  * options.onApprovalRequest, then write the resolution back through `stream`.
  * If the agent doesn't expose an approval relay (or it throws), write a
@@ -389,9 +454,14 @@ export class ContainerSandbox implements ExecutionSandbox {
   private readonly image: string;
   private readonly runnerPath: string;
   private readonly runnerMountPath: string;
+  /** Host path to the pure-JS container loader-hook bundle (bind-mounted :ro). */
+  private readonly hookHostPath: string;
   private readonly env: Record<string, string>;
   private readonly keepFailed: boolean;
   private readonly jobId: string;
+  private readonly hardening?: SandboxHardeningOptions;
+  /** Resolved container user (image-user override / grant), applied to createContainer + each exec. */
+  private resolvedUser?: string;
 
   /** The running container instance (set during setup). */
   private container: Docker.Container | null = null;
@@ -407,19 +477,53 @@ export class ContainerSandbox implements ExecutionSandbox {
     this.image = options.image;
     this.runnerPath = options.runnerPath;
     this.runnerMountPath = options.runnerMountPath ?? '/opt/kici/workflow-runner.js';
+    this.hookHostPath =
+      options.hookPath ?? join(dirname(options.runnerPath), 'container-ts-loader-hook.js');
     this.env = options.env;
     this.keepFailed = options.keepFailed ?? false;
     this.jobId = options.jobId ?? `unknown-${Date.now()}`;
+    this.hardening = options.hardening;
   }
 
   // --- Lifecycle: setup ---
+
+  /**
+   * Ensure the job's container image is present locally, pulling it on demand
+   * when it is not.
+   *
+   * dockerode's `createContainer` — unlike `docker run` / `podman run` — never
+   * auto-pulls a missing image; it fails with `(HTTP code 404) ... No such
+   * image`. A bare-metal executor that aggressively prunes unused images under
+   * disk pressure can leave a container job with nothing to run, so the agent
+   * pulls the image itself. Already-present images (the common case, and how
+   * private images pre-pulled with registry auth stay working) skip the pull.
+   */
+  private async ensureImagePresent(): Promise<void> {
+    try {
+      await this.docker.getImage(this.image).inspect();
+      return;
+    } catch {
+      // Not present locally — pull it below.
+    }
+
+    logger.info('Pulling sandbox image (not present locally)', { image: this.image });
+    const stream = await this.docker.pull(this.image);
+    await new Promise<void>((resolve, reject) => {
+      this.docker.modem.followProgress(stream, (err: Error | null) =>
+        err ? reject(err) : resolve(),
+      );
+    });
+    logger.info('Sandbox image pulled', { image: this.image });
+  }
 
   async setup(options: SandboxSetupOptions): Promise<void> {
     this.containerName = `kici-sandbox-${this.jobId}-${Date.now()}`;
 
     // Build env array (key=value format) from sanitized env.
     // This env has already been processed by buildSanitizedEnv() -- NO agent credentials.
-    const envArray = Object.entries(this.env).map(([k, v]) => `${k}=${v}`);
+    // The two INTERNAL_ENV entries (loader-hook path + stderr routing) are
+    // agent-owned, never customer-derived.
+    const envArray = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
 
     logger.info('Creating sandbox container', {
       name: this.containerName,
@@ -427,22 +531,50 @@ export class ContainerSandbox implements ExecutionSandbox {
       workDir: options.workDir,
     });
 
+    // Resolve the hardening posture (cap-drop, no-new-privileges, cgroup caps,
+    // tmpfs, user, network). Merged into the HostConfig below; the resolved
+    // user (if any) is applied top-level and re-applied on each exec.
+    const hardened = this.hardening
+      ? buildContainerHardening(this.hardening)
+      : { hostConfig: {} as Partial<Docker.HostConfig>, user: undefined };
+    this.resolvedUser = hardened.user;
+
+    const binds = this.buildBinds(options, hardened.hostConfig);
+
+    // Ensure the image is present before createContainer — dockerode does NOT
+    // auto-pull a missing image (the `docker`/`podman run` CLI does), so a job
+    // whose image was never pulled, or was reaped by a disk-pressure image
+    // prune, fails with a 404 "No such image" instead of running.
+    await this.ensureImagePresent();
+
     // Create container:
     // - sleep infinity keeps it alive for the entire job
-    // - Work directory bind-mounted read-write at /workspace
+    // - /workspace is a container-owned anonymous volume (`Volumes`), created
+    //   fresh and owned by the container user — NOT a host bind. This dissolves
+    //   the host-uid ↔ container-uid ownership conflict that made a read-write
+    //   host bind unwritable under rootful docker once `CapDrop: ['ALL']` removes
+    //   CAP_DAC_OVERRIDE. The clone/install/execute all run inside the container,
+    //   so the host workDir is never read back — a private volume is sufficient.
     // - Workflow runner bind-mounted read-only
+    // - file:// clone-source dir(s) and (under host networking) the host's
+    //   name-resolution files bind-mounted read-only — see buildBinds
+    // - Hardening posture (cap-drop ALL, no-new-privileges, cgroup caps, tmpfs
+    //   /tmp) merged from buildContainerHardening
     this.container = await this.docker.createContainer({
       Image: this.image,
       name: this.containerName,
       Cmd: ['sleep', 'infinity'],
       Env: envArray,
       WorkingDir: '/workspace',
+      Volumes: { '/workspace': {} },
+      ...(hardened.user ? { User: hardened.user } : {}),
       Labels: {
         'kici-sandbox': 'true',
         'kici-job-id': this.jobId,
       },
       HostConfig: {
-        Binds: [`${options.workDir}:/workspace`, `${this.runnerPath}:${this.runnerMountPath}:ro`],
+        Binds: binds,
+        ...hardened.hostConfig,
       },
     });
 
@@ -452,6 +584,50 @@ export class ContainerSandbox implements ExecutionSandbox {
       name: this.containerName,
       containerId: this.container.id.slice(0, 12),
     });
+  }
+
+  /**
+   * Build the container's read-only bind list.
+   *
+   * The workspace is NOT bound here — it is a container-owned anonymous volume
+   * (`Volumes: { '/workspace': {} }` on the container config), so the container
+   * user can write it on every runtime with `CapDrop: ['ALL']` intact. This
+   * method binds the workflow runner (read-only) plus two parity affordances
+   * that mirror the bare-metal bwrap sandbox — both strictly additive and gated,
+   * so the default posture for a production (https-source, bridge-network) job is
+   * unchanged:
+   *
+   * - **`file://` clone-source dir(s)** (`options.extraReadOnlyBinds`): the
+   *   workflow runner clones the repo from inside the container, so a local
+   *   `file://` source dir must be exposed read-only or `git clone` fails.
+   *   Empty for https/ssh remotes — mirrors fork-runner's `extraReadOnlyBinds`.
+   * - **Host name-resolution files under host networking**: when the effective
+   *   network posture is `host` (`KICI_SANDBOX_NETWORK=host`, or a per-job host
+   *   grant), bind the host's `/etc/hosts` (+ `/etc/nsswitch.conf`) read-only so
+   *   an `/etc/hosts`-only name the host resolves — e.g. a private registry —
+   *   resolves inside the container too. Mirrors fork-runner's
+   *   `--ro-bind /etc/hosts` for the bwrap host-network mode.
+   */
+  private buildBinds(
+    options: SandboxSetupOptions,
+    hostConfig: Partial<Docker.HostConfig>,
+  ): string[] {
+    const binds = [
+      `${this.runnerPath}:${this.runnerMountPath}:ro`,
+      `${this.hookHostPath}:${HOOK_MOUNT_PATH}:ro`,
+    ];
+
+    for (const dir of options.extraReadOnlyBinds ?? []) {
+      if (dir) binds.push(`${dir}:${dir}:ro`);
+    }
+
+    if (hostConfig.NetworkMode === 'host') {
+      for (const nssFile of ['/etc/hosts', '/etc/nsswitch.conf']) {
+        if (existsSync(nssFile)) binds.push(`${nssFile}:${nssFile}:ro`);
+      }
+    }
+
+    return binds;
   }
 
   // --- Lifecycle: executeJob ---
@@ -501,9 +677,18 @@ export class ContainerSandbox implements ExecutionSandbox {
    */
   private async attachExecStream(options: JobExecutionOptions): Promise<ExecStreamContext> {
     // Build the exec environment -- same sanitized env, no agent credentials.
-    const execEnv = Object.entries(this.env).map(([k, v]) => `${k}=${v}`);
+    // Plus the agent-owned INTERNAL_ENV (loader-hook path + stderr routing).
+    const execEnv = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
 
-    // Create exec inside the running container.
+    // Create exec inside the running container. The runner process (and every
+    // workflow step it spawns) inherits the container's hardened posture —
+    // CapDrop ALL, no-new-privileges, and the cgroup caps — because the runtime
+    // copies the container's process spec into each exec; the dockerode exec API
+    // exposes no per-exec capability/no-new-privileges fields to re-assert them.
+    // The scaler-container `sandbox-hardening-defaults` E2E probes /proc/self/status
+    // from inside this exec, so a runtime that ever stopped inheriting the posture
+    // would fail that test loudly. Re-apply the resolved user explicitly since some
+    // runtimes do not inherit the container's configured user into exec.
     const exec = await this.container!.exec({
       Cmd: ['node', this.runnerMountPath],
       AttachStdin: true,
@@ -511,6 +696,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       AttachStderr: true,
       Env: execEnv,
       WorkingDir: '/workspace',
+      ...(this.resolvedUser ? { User: this.resolvedUser } : {}),
     });
 
     // Start exec with hijack mode for bidirectional stdin/stdout.
@@ -684,7 +870,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       }
 
       case 'log.line':
-        options.onLogLine(msg.stepIndex, msg.line);
+        options.onLogLine(msg.stepIndex, msg.line, msg.stream);
         return false;
 
       case 'step.secret_mount':
@@ -711,6 +897,10 @@ export class ContainerSandbox implements ExecutionSandbox {
 
       case 'cache.request':
         relayCacheRequest(stream, options, msg as CacheRequestIpc);
+        return false;
+
+      case 'artifacts.request':
+        relayArtifactRequest(stream, options, msg as ArtifactRequestIpc);
         return false;
 
       case 'provenance.request':
@@ -794,7 +984,9 @@ export class ContainerSandbox implements ExecutionSandbox {
     }
 
     try {
-      await this.container.remove({ force: true });
+      // `v: true` removes the container-owned anonymous /workspace volume along
+      // with the container (the keepFailed early-return above keeps both).
+      await this.container.remove({ force: true, v: true });
     } catch {
       // Container may already be removed.
     }
@@ -814,7 +1006,8 @@ export class ContainerSandbox implements ExecutionSandbox {
    * mapping from JobDispatch to JobExecutionRequest.
    */
   private sendExecuteRequest(stream: NodeJS.ReadWriteStream, options: JobExecutionOptions): void {
-    // workDir is /workspace inside the container (bind-mounted from host).
+    // workDir is /workspace inside the container — a container-owned anonymous
+    // volume the runner clones into (not a host bind).
     const request = buildRequest(options.dispatch, '/workspace');
     const msg: AgentToRunnerMessage = { type: 'execute', request };
     stream.write(JSON.stringify(msg) + '\n');

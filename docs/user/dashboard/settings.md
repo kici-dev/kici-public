@@ -19,17 +19,15 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 10. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
 11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
 12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
-13. **Security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
-14. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
+13. **Security** -- dashboard-level session and account security controls for this org (today, the session max age; viewing needs `org_settings:read`, changing needs `org_settings:write`)
+14. **Orchestrator security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
+15. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
 
 Audit-log-style entries are not a settings tab; they live on the dedicated **Activity** page accessible from the sidebar.
 
 Tab selection syncs with the URL path (`/settings/members`, `/settings/api-keys`, etc.), making tabs bookmarkable.
 
 ## General
-
-
-### Session max age
 
 
 ## Members
@@ -104,7 +102,7 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 ## Notifications
 
-Organization-wide notification channels, Slack connections, subscriptions, and the delivery log now live on the dedicated [Notifications](./notifications.md) page (in the org sidebar), on its **Organization** tab.
+Organization-wide notification channels, Slack connections, subscriptions, and the delivery log live on the dedicated [Notifications](./notifications.md) page (in the org sidebar), on its **Organization** tab. The `/settings/notifications` URL redirects there.
 
 ## Event log
 
@@ -128,6 +126,13 @@ The list view supports filters for routing key, event type, status, and free-tex
 Retention is 30 days.
 
 ## Security
+
+Dashboard-level security controls for this organization.
+
+### Session max age
+
+
+## Orchestrator security
 
 
 ## Support access

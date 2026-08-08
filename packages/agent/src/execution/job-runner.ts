@@ -1,15 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import os, { tmpdir } from 'node:os';
+import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs/promises';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import Docker from 'dockerode';
 import type {
   AgentToOrchestratorMessage,
   JobDispatch,
   JobStatus,
   AgentStepStatus,
+  ResolvedSandboxGrant,
 } from '@kici-dev/engine';
 import {
   ExecutionJobStatus,
@@ -26,6 +28,14 @@ import { restoreSource } from './source-restore.js';
 import { evaluateDynamicFields } from './init-runner.js';
 import { withBootstrapInterception } from '../bootstrap/api-intercept.js';
 import { ensureInitRunner } from '../bootstrap/ensure-init-runner.js';
+import { LocalDirPayloadSource } from '../bootstrap/payload-source.js';
+import {
+  S3PayloadSource,
+  fetchUrlToFile,
+  defaultPayloadCacheDir,
+  payloadFileExists,
+  type PresignedPayload,
+} from '../bootstrap/s3-payload-source.js';
 import { withTimeout } from './timeout-util.js';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 import { serializeJobsToLock, MatrixExpansionError } from './dynamic-job-serializer.js';
@@ -46,6 +56,8 @@ import type {
   CacheResponseIpc,
   ProvenanceRequestIpc,
   ProvenanceResponseIpc,
+  ArtifactRequestIpc,
+  ArtifactResponseIpc,
   StepApprovalRequestIpc,
   StepApprovalResolvedIpc,
 } from './sandbox/index.js';
@@ -54,6 +66,7 @@ import {
   ContainerSandbox,
   FirecrackerSandbox,
   buildSanitizedEnv,
+  fileCloneSourceBinds,
 } from './sandbox/index.js';
 import { stepsTotal, stepDurationSeconds, cloneDurationSeconds } from '../metrics/prometheus.js';
 
@@ -75,10 +88,8 @@ async function fileExists(p: string): Promise<boolean> {
  * Dependencies injected into JobRunner.
  */
 export interface JobRunnerDeps {
-  /** Send function for WS messages (buffered) */
+  /** Send function for WS messages (buffered; replayed on reconnect) */
   send: (msg: AgentToOrchestratorMessage) => void;
-  /** Send direct function (bypasses buffer, for protocol messages) */
-  sendDirect: (msg: AgentToOrchestratorMessage) => void;
   /** Agent config */
   config: AppConfig;
   /** Request a pre-signed S3 upload URL from the orchestrator via WS request-response. */
@@ -180,6 +191,17 @@ export interface JobRunnerDeps {
     request: ProvenanceRequestIpc,
   ) => Promise<ProvenanceResponseIpc>;
   /**
+   * Relay a user-facing artifact request to the orchestrator and await the
+   * response. Translates the sandbox `artifacts.request` IPC into the matching
+   * `artifacts.upload.request` / `.complete` / `artifacts.download.request` WS
+   * message and returns the orchestrator's response mapped back onto the IPC
+   * response shape. Optional for backward compatibility.
+   */
+  requestUserArtifact?: (
+    jobId: string,
+    request: ArtifactRequestIpc,
+  ) => Promise<ArtifactResponseIpc>;
+  /**
    * Relay a step-level approval request to the orchestrator and await the
    * resolution. Translates the sandbox `approval.request` IPC into a
    * `step.approval-request` WS message and returns the orchestrator's
@@ -250,6 +272,20 @@ function resolveRunnerPath(): string {
   if (existsSync(chunkedPath)) return chunkedPath;
   // Fallback: return bundle path and let the caller handle the error
   return bundlePath;
+}
+
+/**
+ * Derive the self-contained runner bundle path from the resolved runner path.
+ *
+ * The container backend mounts the runner as a single file into the customer
+ * job container, so it must run `workflow-runner-bundle.js` (zx + `@kici-dev/*`
+ * inlined) rather than the external `workflow-runner.js`, which cannot resolve
+ * its bare imports without the agent's node_modules / pnpm workspace. The
+ * bundle is a flat sibling emitted alongside the runner by build-service.mjs.
+ * bwrap / firecracker keep the external runner (they bind the workspace).
+ */
+export function resolveRunnerBundlePath(runnerPath: string): string {
+  return join(dirname(runnerPath), 'workflow-runner-bundle.js');
 }
 
 /**
@@ -325,11 +361,11 @@ export async function resolveJobWorkDir(
       inPlace: true,
     };
   }
-  const workDir = await fs.mkdtemp(join(tmpdir(), 'kici-'));
+  const { path: workDir, cleanup } = await makeTempDir('workdir');
   return {
     workDir,
     cleanup: async () => {
-      await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      await cleanup().catch(() => {});
     },
     inPlace: false,
   };
@@ -351,7 +387,6 @@ export async function resolveJobWorkDir(
  */
 export class JobRunner {
   private readonly send: (msg: AgentToOrchestratorMessage) => void;
-  private readonly sendDirect: (msg: AgentToOrchestratorMessage) => void;
   private readonly config: AppConfig;
   private readonly requestUploadUrl: JobRunnerDeps['requestUploadUrl'];
   private readonly sendUploadComplete: JobRunnerDeps['sendUploadComplete'];
@@ -364,6 +399,7 @@ export class JobRunner {
   private readonly _sendApiRequest?: JobRunnerDeps['sendApiRequest'];
   private readonly _requestUserCache?: JobRunnerDeps['requestUserCache'];
   private readonly _relayProvenance?: JobRunnerDeps['relayProvenance'];
+  private readonly _requestUserArtifact?: JobRunnerDeps['requestUserArtifact'];
   private readonly _sendStepApproval?: JobRunnerDeps['sendStepApproval'];
 
   /** Tracks running jobs for concurrency and cancellation */
@@ -374,7 +410,6 @@ export class JobRunner {
 
   constructor(deps: JobRunnerDeps) {
     this.send = deps.send;
-    this.sendDirect = deps.sendDirect;
     this.config = deps.config;
     this.requestUploadUrl = deps.requestUploadUrl;
     this.sendUploadComplete = deps.sendUploadComplete;
@@ -387,6 +422,7 @@ export class JobRunner {
     this._sendApiRequest = deps.sendApiRequest;
     this._requestUserCache = deps.requestUserCache;
     this._relayProvenance = deps.relayProvenance;
+    this._requestUserArtifact = deps.requestUserArtifact;
     this._sendStepApproval = deps.sendStepApproval;
   }
 
@@ -554,6 +590,12 @@ export class JobRunner {
     // Create sandbox for this job
     let sandbox: ExecutionSandbox | undefined;
 
+    // Owned here (not inside runSandboxExecution) so an execution that throws
+    // still flushes whatever the failing step had already streamed. Without it
+    // the buffered tail — which is exactly where the failure diagnostics sit —
+    // dies with the streamer and the run log ends mid-step.
+    const logStreamers = new Map<number, LogStreamer>();
+
     try {
       const setupResult = await this.setupSandboxForExecution(dispatch, workDir, abortController);
       if (!setupResult) {
@@ -562,14 +604,21 @@ export class JobRunner {
       }
       sandbox = setupResult.sandbox;
 
-      const { result, logStreamers } = await this.runSandboxExecution(
+      const result = await this.runSandboxExecution(
         dispatch,
         sandbox,
         abortController,
+        logStreamers,
       );
 
       this.reportExecutionResult(dispatch, result, logStreamers);
     } catch (error) {
+      // Flush before the terminal status so the in-flight step output reaches
+      // the orchestrator. destroy() is idempotent — a job that already went
+      // through reportExecutionResult re-enters here with empty buffers.
+      for (const streamer of logStreamers.values()) {
+        streamer.destroy();
+      }
       // Unexpected error in job execution
       const errorMsg = toErrorMessage(error);
       this.sendJobStatus(dispatch, ExecutionJobStatus.enum.failed, {
@@ -636,8 +685,15 @@ export class JobRunner {
 
     this.activeSandbox = sandbox;
 
-    // Step 2: Setup sandbox (container: create + start; bare-metal: validate)
-    await sandbox.setup({ workDir, env: sanitizedEnv });
+    // Step 2: Setup sandbox (container: create + start; bare-metal: validate).
+    // Thread the file:// clone-source dir(s) so a container-backend job can
+    // read a local source (the bare-metal backend derives its own equivalent
+    // internally and ignores this field). Empty for https/ssh remotes.
+    await sandbox.setup({
+      workDir,
+      env: sanitizedEnv,
+      extraReadOnlyBinds: fileCloneSourceBinds(dispatch.repoUrl),
+    });
 
     if (abortController.signal.aborted) {
       this.sendJobStatus(dispatch, ExecutionJobStatus.enum.cancelled);
@@ -663,7 +719,8 @@ export class JobRunner {
   /**
    * Drive `sandbox.executeJob` with IPC callbacks wired to the WS pipeline.
    *
-   * Lazily creates per-step LogStreamers, forwards step + log + event-emit +
+   * Lazily populates `logStreamers` (owned by the caller so a throw still
+   * leaves the buffered output flushable), forwards step + log + event-emit +
    * concurrency-report + api-request messages, and emits the
    * `agent.execution.start` / `agent.execution.end` lifecycle events.
    */
@@ -671,11 +728,11 @@ export class JobRunner {
     dispatch: JobDispatch,
     sandbox: ExecutionSandbox,
     abortController: AbortController,
-  ): Promise<{ result: JobExecutionResult; logStreamers: Map<number, LogStreamer> }> {
+    logStreamers: Map<number, LogStreamer>,
+  ): Promise<JobExecutionResult> {
     const { runId, jobId } = dispatch;
 
     // Step 3: Manage LogStreamers lazily per step
-    const logStreamers = new Map<number, LogStreamer>();
     const maxLogSizeBytes = dispatch.maxLogSizeBytes ?? this.config.maxLogSizeBytes;
 
     const getOrCreateLogStreamer = (stepIndex: number): LogStreamer => {
@@ -731,9 +788,9 @@ export class JobRunner {
         this.maybeEmitCacheRunEvent(runId, jobId, stepIndex, state, data);
         this.sendStepStatus(dispatch, stepIndex, stepName, state, data, logBytesStreamed);
       },
-      onLogLine: (stepIndex, line) => {
+      onLogLine: (stepIndex, line, stream) => {
         const streamer = getOrCreateLogStreamer(stepIndex);
-        streamer.addLine(line);
+        streamer.addLine(line, stream);
       },
       signal: abortController.signal,
       // Wire event.emit relay: sandbox runner -> agent WS -> orchestrator
@@ -771,6 +828,10 @@ export class JobRunner {
       onProvenanceRequest: this._relayProvenance
         ? async (request) => this._relayProvenance!(jobId, request)
         : undefined,
+      // Wire user-artifacts relay: sandbox runner -> agent WS -> orchestrator
+      onArtifactRequest: this._requestUserArtifact
+        ? async (request) => this._requestUserArtifact!(jobId, request)
+        : undefined,
       // Wire step-approval relay: sandbox runner -> agent WS -> orchestrator
       onApprovalRequest: this._sendStepApproval
         ? async (request) => this._sendStepApproval!(dispatch.runId, dispatch.jobId, request)
@@ -799,7 +860,7 @@ export class JobRunner {
       metadata: { status: result.status },
     });
 
-    return { result, logStreamers };
+    return result;
   }
 
   /**
@@ -898,10 +959,30 @@ export class JobRunner {
       // the agent-side helper directly with the raw orchestrator transport — do
       // NOT route through `withBootstrapInterception`, which exists to catch the
       // method coming FROM a workflow sandbox.
-      const result = await ensureInitRunner(
-        async (method, params) => this._sendApiRequest!(method, params),
-        targetAgentId,
-      );
+      // Stage a self-contained agent+Node payload onto the (possibly Node-less)
+      // target so a stock rescue box boots on its vendored Node. The PRIMARY
+      // source is the orchestrator's own cache bucket (pulled via a presigned
+      // URL over `kici.presignAgentPackage`); KICI_AGENT_PAYLOAD_DIR selects the
+      // air-gap local-dir fallback; KICI_AGENT_COMMAND (golden image) skips
+      // staging entirely.
+      const transport = async (method: string, params: Record<string, unknown>) =>
+        this._sendApiRequest!(method, params);
+      const payloadSource = this.config.agentPayloadDir
+        ? new LocalDirPayloadSource(this.config.agentPayloadDir)
+        : new S3PayloadSource({
+            presign: async (platform) =>
+              (await transport('kici.presignAgentPackage', {
+                targetAgentId,
+                platform,
+              })) as PresignedPayload | null,
+            fetchToFile: fetchUrlToFile,
+            cacheDir: defaultPayloadCacheDir(),
+            exists: payloadFileExists,
+          });
+      const result = await ensureInitRunner(transport, targetAgentId, {
+        payloadSource,
+        agentCommand: this.config.agentCommand,
+      });
       streamer.addLine(
         result.broughtUp
           ? `Init-runner brought up on ${targetAgentId}.`
@@ -1079,8 +1160,7 @@ export class JobRunner {
     const tarballUrl = (jobConfig as Record<string, unknown>).tarballUrl as string | undefined;
     const cliPublicKey = (jobConfig as Record<string, unknown>).cliPublicKey as string | undefined;
     const orchestratorPrivateKey = (jobConfig as Record<string, unknown>).orchestratorPrivateKey as
-      | string
-      | undefined;
+      string | undefined;
 
     if (tarballUrl && cliPublicKey && orchestratorPrivateKey) {
       logger.info('Applying overlay tarball for test run', { jobId });
@@ -1540,9 +1620,9 @@ export class JobRunner {
         env: { ...process.env } as Record<string, string>,
         verbose: true,
         quiet: false,
-        log: makeStreamingZxLog((line) => evalStreamer.addLine(line)) as unknown as (
-          entry: unknown,
-        ) => void,
+        log: makeStreamingZxLog((line, stream) =>
+          evalStreamer.addLine(line, stream),
+        ) as unknown as (entry: unknown) => void,
       }) as unknown as typeof zx$;
 
       const evalSink: CaptureSink = { addLine: (line) => evalStreamer.addLine(line) };
@@ -1700,10 +1780,32 @@ export class JobRunner {
         return new ContainerSandbox({
           docker: new Docker(),
           image,
-          runnerPath: opts.runnerPath,
+          // The container backend runs the self-contained bundle (zx +
+          // @kici-dev/* inlined) so the single-file runner mount loads inside a
+          // bare job container. bwrap / firecracker keep the external runner.
+          runnerPath: resolveRunnerBundlePath(opts.runnerPath),
           env: opts.env,
           keepFailed: this.config.dockerKeepFailed,
           jobId: opts.jobId,
+          // Secure-by-default job-container posture from agent config. The
+          // network posture honors KICI_SANDBOX_NETWORK: `host` shares the host
+          // network namespace (parity with the bwrap host-network mode — needed
+          // when a workflow must reach a host-resolved registry), anything else
+          // keeps the runtime default (bridge). The container backend's default
+          // therefore stays bridge unless the operator opts into host. The
+          // `grant` is the dispatch-resolved per-job escape hatch (allow-listed
+          // orchestrator-side); the agent applies only what dispatch authorized
+          // and never reads the allow-list itself (single enforcement point).
+          hardening: {
+            hardened: this.config.sandboxHardened,
+            readonlyRootfs: this.config.sandboxReadonlyRootfs,
+            user: this.config.sandboxUser,
+            pidsLimit: this.config.sandboxPidsLimit,
+            memoryBytes: this.config.sandboxMemoryBytes,
+            nanoCpus: this.config.sandboxNanoCpus,
+            networkMode: this.config.sandboxNetwork === 'host' ? 'host' : 'default',
+            grant: opts.jobConfig.sandboxGrant as ResolvedSandboxGrant | undefined,
+          },
         });
       }
 
@@ -1837,7 +1939,11 @@ export class JobRunner {
     data?: Record<string, unknown>,
     secretOutputs?: Record<string, { agentPublicKey: string; encrypted: string }>,
   ): void {
-    this.sendDirect({
+    // Buffered send: a terminal transition dropped by an at-completion disconnect
+    // is the most costly frame to lose (the run would sit "running" until stale
+    // detection). Routing through send() enqueues it in the reconnect-replay
+    // buffer instead of the silent-drop unbuffered path.
+    this.send({
       type: 'job.status',
       messageId: randomUUID(),
       runId: dispatch.runId,
@@ -1874,7 +1980,10 @@ export class JobRunner {
     const { secretsAccessed: _s, concurrencyKind: _c, groupId: _g, ...restData } = data ?? {};
     const hasRestData = Object.keys(restData).length > 0;
 
-    this.sendDirect({
+    // Buffered send (same rationale as sendJobStatus): step-status frames ride
+    // the reconnect-replay buffer so a disconnect at a step transition cannot
+    // silently drop it.
+    this.send({
       type: 'step.status',
       messageId: randomUUID(),
       runId: dispatch.runId,

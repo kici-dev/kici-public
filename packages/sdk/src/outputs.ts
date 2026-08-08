@@ -1,4 +1,4 @@
-import type { OutputProxy } from './types.js';
+import type { OutputProxy, SourceLocation } from './types.js';
 
 /**
  * Well-known string property names that should delegate to Reflect rather than throwing.
@@ -92,13 +92,38 @@ export function getStepRefMap(): StepRefMap {
 }
 
 /**
+ * Minimal shape the step output proxy needs from a step: a name that may be
+ * assigned after the proxy is created (id-less steps are named `step-N` when the
+ * job's steps are enumerated at execution start), plus the optional source
+ * location for a helpful error when the name is still unresolved.
+ */
+export interface StepNameRef {
+  readonly name: string;
+  readonly _sourceLocation?: SourceLocation;
+}
+
+/**
  * Create a Proxy over step outputs that resolves property access lazily
  * against the module-global step outputs map.
  *
- * @param stepName - The name of the step whose outputs to proxy
+ * The proxy reads `stepRef.name` at ACCESS time rather than capturing the name
+ * string at creation. Id-less steps have `name === ''` when the proxy is built;
+ * the runner assigns `step-N` onto the same step object before any run function
+ * executes, so `.result` resolves under the final name by the time it is used.
+ *
+ * @param stepRef - The step whose (possibly later-assigned) name identifies its outputs
  * @returns A Proxy that resolves property access at runtime
  */
-export function createStepOutputProxy<T>(stepName: string): OutputProxy<T> {
+export function createStepOutputProxy<T>(stepRef: StepNameRef): OutputProxy<T> {
+  const unresolvedError = (): Error => {
+    const loc = stepRef._sourceLocation;
+    const at = loc ? ` (step defined at ${loc.file}:${loc.line})` : '';
+    return new Error(
+      `This step has no name yet; .result is only available inside another step's run ` +
+        `function${at}. Name the step to reference its outputs before execution.`,
+    );
+  };
+
   return new Proxy({} as OutputProxy<T>, {
     get(_target, prop, receiver) {
       // Symbol properties: delegate to Reflect (JSON.stringify, iteration, etc.)
@@ -111,27 +136,31 @@ export function createStepOutputProxy<T>(stepName: string): OutputProxy<T> {
         return Reflect.get(_target, prop, receiver);
       }
 
-      const outputs = _stepOutputsMap.get(stepName);
+      if (!stepRef.name) throw unresolvedError();
+      const outputs = _stepOutputsMap.get(stepRef.name);
       if (!outputs) {
-        throw new Error(`Step '${stepName}' has not produced outputs yet`);
+        throw new Error(`Step '${stepRef.name}' has not produced outputs yet`);
       }
       return outputs[prop];
     },
 
     ownKeys() {
-      const outputs = _stepOutputsMap.get(stepName);
+      if (!stepRef.name) return [];
+      const outputs = _stepOutputsMap.get(stepRef.name);
       if (!outputs) return [];
       return Reflect.ownKeys(outputs);
     },
 
     has(_target, prop) {
-      const outputs = _stepOutputsMap.get(stepName);
+      if (!stepRef.name) return false;
+      const outputs = _stepOutputsMap.get(stepRef.name);
       if (!outputs) return false;
       return prop in outputs;
     },
 
     getOwnPropertyDescriptor(_target, prop) {
-      const outputs = _stepOutputsMap.get(stepName);
+      if (!stepRef.name) return undefined;
+      const outputs = _stepOutputsMap.get(stepRef.name);
       if (!outputs) return undefined;
       if (prop in outputs) {
         return {
@@ -155,8 +184,8 @@ export function createStepOutputProxy<T>(stepName: string): OutputProxy<T> {
  * @param jobName - The name of the job whose outputs to proxy
  * @returns A Proxy that resolves property access at runtime
  */
-export function createJobOutputProxy(jobName: string): OutputProxy<any> {
-  return new Proxy({} as OutputProxy<any>, {
+export function createJobOutputProxy<TOutputs = any>(jobName: string): OutputProxy<TOutputs> {
+  return new Proxy({} as OutputProxy<TOutputs>, {
     get(_target, prop, receiver) {
       // Symbol properties: delegate to Reflect
       if (typeof prop === 'symbol') {

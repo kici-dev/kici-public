@@ -14,10 +14,10 @@ import {
 
 describe('findLocalProtocolDeps', () => {
   it('flags a workspace:* dependency', () => {
-    const pkg = { dependencies: { '@kici-dev/action-github': 'workspace:*' } };
+    const pkg = { dependencies: { '@kici-dev/sdk': 'workspace:*' } };
     expect(findLocalProtocolDeps(pkg)).toEqual<LocalProtocolDep[]>([
       {
-        name: '@kici-dev/action-github',
+        name: '@kici-dev/sdk',
         spec: 'workspace:*',
         protocol: LocalDepProtocol.Workspace,
       },
@@ -76,7 +76,7 @@ describe('formatUnresolvableDepError', () => {
     const msg = formatUnresolvableDepError(
       [
         {
-          name: '@kici-dev/action-github',
+          name: '@kici-dev/sdk',
           spec: 'workspace:*',
           protocol: LocalDepProtocol.Workspace,
         },
@@ -84,7 +84,7 @@ describe('formatUnresolvableDepError', () => {
       PackageManager.Npm,
       YarnFlavor.Classic,
     );
-    expect(msg).toContain('@kici-dev/action-github: workspace:*');
+    expect(msg).toContain('@kici-dev/sdk: workspace:*');
     expect(msg).toMatch(/npm/);
     expect(msg).toMatch(/pnpm/);
   });
@@ -136,17 +136,17 @@ describe('assertResolvableDeps', () => {
   });
 
   it('rejects workspace:* for npm', async () => {
-    await writeKiciPkg({ '@kici-dev/action-github': 'workspace:*' });
+    await writeKiciPkg({ '@kici-dev/sdk': 'workspace:*' });
     await expect(
       assertResolvableDeps({ kiciDir, repoRoot, packageManager: PackageManager.Npm }),
-    ).rejects.toThrow(/@kici-dev\/action-github: workspace:\*/);
+    ).rejects.toThrow(/@kici-dev\/sdk: workspace:\*/);
     await expect(
       assertResolvableDeps({ kiciDir, repoRoot, packageManager: PackageManager.Npm }),
     ).rejects.not.toThrow(/EUNSUPPORTEDPROTOCOL/);
   });
 
   it('allows workspace:* for pnpm when a pnpm-workspace.yaml is present', async () => {
-    await writeKiciPkg({ '@kici-dev/action-github': 'workspace:*' });
+    await writeKiciPkg({ '@kici-dev/sdk': 'workspace:*' });
     await fs.writeFile(
       path.join(repoRoot, 'pnpm-workspace.yaml'),
       'packages:\n  - .kici\n',
@@ -158,7 +158,7 @@ describe('assertResolvableDeps', () => {
   });
 
   it('rejects workspace:* for pnpm when there is no pnpm-workspace.yaml', async () => {
-    await writeKiciPkg({ '@kici-dev/action-github': 'workspace:*' });
+    await writeKiciPkg({ '@kici-dev/sdk': 'workspace:*' });
     await expect(
       assertResolvableDeps({ kiciDir, repoRoot, packageManager: PackageManager.Pnpm }),
     ).rejects.toThrow(/pnpm-workspace\.yaml/);
@@ -336,7 +336,7 @@ describe('kiciHasLocalProtocolDeps', () => {
   it('is true when a workspace: dep is present', async () => {
     await fs.writeFile(
       path.join(kiciDir, 'package.json'),
-      JSON.stringify({ dependencies: { '@kici-dev/action-github': 'workspace:*' } }),
+      JSON.stringify({ dependencies: { '@kici-dev/sdk': 'workspace:*' } }),
       'utf-8',
     );
     expect(await kiciHasLocalProtocolDeps(kiciDir)).toBe(true);

@@ -12,7 +12,7 @@
  * Trust model (must hold):
  *   The orchestrator's HTTP/WS surface MUST NOT return plaintext
  *   `value` fields from the `scoped_secrets` table. The negative
- *   invariant for §4.5 (no-http-secret-value-readback): list endpoints
+ *   invariant (no HTTP secret-value readback): list endpoints
  *   return key/scope NAMES only; set/rotate endpoints take a value as
  *   input but do not echo it; no GET endpoint exists that decrypts
  *   `scoped_secrets.encrypted_value` and returns it to the caller via
@@ -26,22 +26,22 @@
  *   context_variables (non-secret config per docs/user/contexts.md
  *   §31: "Variables — non-secret key-value configuration") are
  *   intentionally plaintext-readable via
- *   `GET /api/v1/admin/contexts/:name`; that's outside the §4.5
- *   scope.
+ *   `GET /api/v1/admin/contexts/:name`; that's outside the
+ *   no-readback scope.
  */
 import { describe, it, expectTypeOf } from 'vitest';
 import type { DashboardContextHandlerDeps } from './dashboard-context-handler.js';
 
 type SecretStoreForDashboard = DashboardContextHandlerDeps['secretStore'];
 
-describe('§4.5 dashboard secret-store interface excludes value-returning methods', () => {
+describe('dashboard secret-store interface excludes value-returning methods', () => {
   it('SecretStoreForDashboard exposes name/key listing but not plaintext value reads', () => {
     // Compile-time invariant: the interface key set must be exactly
     // these eight members. Adding `getSecrets` (or any other
     // value-returning shape) to the dashboard-facing secret store
     // would let the WS handler at runtime fetch decrypted values and
     // either fan them out to every connected dashboard session or
-    // return them via the WS reply path — both are §4.5 violations.
+    // return them via the WS reply path — both are readback violations.
     type RequiredKeys = 'listScopes' | 'listKeys' | 'setSecret' | 'deleteSecret';
     type OptionalKeys = 'createScope' | 'renameScope' | 'deleteScope';
 

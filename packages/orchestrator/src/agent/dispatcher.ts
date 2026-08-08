@@ -6,12 +6,20 @@ import {
   type QueuedJob,
   type QueuedJobInput,
 } from '../queue/job-queue.js';
-import type { ScaleResult } from '../scaler/types.js';
+import type { ScaleResult, ScalerRedispatchTrigger } from '../scaler/types.js';
 import type { ResourceRequest, RunsOnPick } from '@kici-dev/engine';
 import type { AgentEntry } from './registry.js';
 import { requestContext, createLogger, toErrorMessage } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'dispatcher' });
+
+/**
+ * Default per-pass cap on how many pending jobs a capacity-freed re-drive
+ * re-offers to the scaler. Bounds the burst so a single free event cannot storm
+ * the scaler; the per-backend spawn semaphore bounds actual provisioning, and a
+ * job that gets `at-capacity` again simply stays pending for the next tick.
+ */
+export const DEFAULT_REDRIVE_BATCH = 10;
 
 /**
  * Pick the single agent to run a label-routed job from the matching candidates.
@@ -40,6 +48,8 @@ export interface DispatchMetrics {
   incJobsDispatched(status: 'dispatched' | 'queued' | 'rejected'): void;
   /** Set the queue depth gauge. */
   setQueueDepth(depth: number): void;
+  /** Record `count` pending jobs re-driven through the scaler by `trigger`. */
+  incScalerRedispatch(trigger: ScalerRedispatchTrigger, count: number): void;
 }
 
 /**
@@ -57,11 +67,18 @@ export interface HostRosterRebootStore {
 
 /**
  * Result of a dispatch attempt.
+ *
+ * `duplicate` = the dispatch_queue row for a preassigned (rerouted) jobId
+ * already existed, so nothing was dispatched here (the claimed agent slot is
+ * released and onDispatch is NOT called). The reroute caller should treat the
+ * job as already handled. Only reachable on a reroute re-dispatch — first-
+ * dispatch paths use a fresh UUID that can never collide.
  */
 type DispatchResult =
   | { status: 'dispatched'; agentId: string; jobId: string }
   | { status: 'queued'; jobId: string }
   | { status: 'queued-no-backend'; jobId: string }
+  | { status: 'duplicate'; jobId: string }
   | { status: 'rejected'; reason: string };
 
 /**
@@ -88,8 +105,17 @@ export class Dispatcher {
         runId: string,
         excludeLabels: string[],
         resources?: ResourceRequest,
+        orgId?: string,
       ) => Promise<ScaleResult>)
     | undefined;
+
+  /**
+   * Single-flight guard for `retryPendingScaleRequests`. The capacity-freed
+   * hook and the leader-gated sweep can both fire concurrently; this prevents
+   * two re-drives from double-offering the same pending jobs to the scaler in
+   * the same tick.
+   */
+  private redriveInFlight = false;
 
   /**
    * Tracks which jobs are dispatched to which agents.
@@ -137,8 +163,7 @@ export class Dispatcher {
    * the execution-tracker job failed with the given reason.
    */
   private readonly onJobFailedPermanently?:
-    | ((agentId: string, jobId: string, runId: string, reason: string) => void)
-    | undefined;
+    ((agentId: string, jobId: string, runId: string, reason: string) => void) | undefined;
 
   /** Callback when a job enters recovery (starts timer). */
   private readonly onRecoveryStarted?: ((agentId: string, jobId: string) => void) | undefined;
@@ -169,8 +194,7 @@ export class Dispatcher {
 
   /** Cancel + disconnect an agent whose dispatch ack deadline expired. */
   private readonly onAckTimeout?:
-    | ((agentId: string, jobId: string, runId: string) => void)
-    | undefined;
+    ((agentId: string, jobId: string, runId: string) => void) | undefined;
 
   /**
    * Jobs that have reached agent-side execution (a `job.status: running`
@@ -202,6 +226,10 @@ export class Dispatcher {
   /** Host roster store for the reboot-pending gate; undefined ⇒ flow inert. */
   private readonly rosterStore?: HostRosterRebootStore;
 
+  /** Coordinator drain predicate; when true, new jobs queue Pending instead of
+   *  dispatching. Defaults to never-draining. */
+  private readonly isDraining: () => boolean;
+
   constructor(deps: {
     registry: AgentRegistry;
     queue: JobQueue;
@@ -216,6 +244,7 @@ export class Dispatcher {
       runId: string,
       excludeLabels: string[],
       resources?: ResourceRequest,
+      orgId?: string,
     ) => Promise<ScaleResult>;
     /** Max reconnection delay from agent config (default 60s). Used to derive grace period. */
     maxReconnectDelayMs?: number;
@@ -240,12 +269,17 @@ export class Dispatcher {
      * reboot-pending behavior is inert (every host reads not-pending).
      */
     rosterStore?: HostRosterRebootStore;
+    /** Coordinator drain predicate. When true, dispatch() enqueues new jobs as
+     *  Pending and onAgentAvailable() claims nothing — jobs already on agents
+     *  finish. Defaults to never-draining. */
+    isDraining?: () => boolean;
   }) {
     this.registry = deps.registry;
     this.queue = deps.queue;
     this.metrics = deps.metrics;
     this.onDispatch = deps.onDispatch;
     this.onNoMatchingAgent = deps.onNoMatchingAgent;
+    this.isDraining = deps.isDraining ?? (() => false);
     this.maxReconnectDelayMs = deps.maxReconnectDelayMs ?? 60_000;
     this.onJobFailedPermanently = deps.onJobFailedPermanently;
     this.onRecoveryStarted = deps.onRecoveryStarted;
@@ -269,6 +303,28 @@ export class Dispatcher {
     if (job.pinnedAgentId) {
       return this.dispatchPinned(job);
     }
+
+    // Coordinator draining: never send a new job to an agent or spawn capacity.
+    // Enqueue as Pending so the fresh coordinator drains it after the upgrade
+    // restart (Model A / job-level drain). Every new job — new-run first job or
+    // in-flight-run downstream ready job — becomes Pending; only jobs already
+    // executing on agents finish.
+    if (this.isDraining()) {
+      let jobId: string;
+      try {
+        jobId = await this.queue.enqueue(job);
+        this.metrics.incJobsDispatched('queued');
+        await this.updateQueueDepthMetric();
+      } catch (err: unknown) {
+        if (toErrorMessage(err) === 'queue full') {
+          this.metrics.incJobsDispatched('rejected');
+          return { status: 'rejected', reason: 'queue full' };
+        }
+        throw err;
+      }
+      return { status: 'queued', jobId };
+    }
+
     const availableRaw = this.registry.findAvailable(
       job.runsOnLabels,
       job.runsOnPatterns ?? [],
@@ -291,17 +347,33 @@ export class Dispatcher {
 
       // Claim the slot before the async insert (same race as onAgentAvailable).
       this.registry.incrementActiveJobs(agent.agentId);
-      let jobId: string;
+      let insertResult: { id: string; inserted: boolean };
       try {
         // Persist the job in dispatch_queue with status='dispatched' for:
         // - Audit trail of all dispatched jobs
         // - Ability to mark as failed on agent disconnect
         // - State recovery after orchestrator restart
-        jobId = await this.queue.insertDispatched(job);
+        // Idempotent on the primary key: a rerouted jobId already written by a
+        // sibling coordinator (or an earlier reroute) makes this a no-op instead
+        // of a pkey error.
+        insertResult = await this.queue.insertDispatched(job, agent.agentId);
       } catch (err) {
         this.registry.decrementActiveJobs(agent.agentId);
         throw err;
       }
+      if (!insertResult.inserted) {
+        // The row already exists — the job is tracked elsewhere. Release the slot
+        // we just claimed and report the benign duplicate; do NOT double-dispatch
+        // it to this agent. Only reachable on a preassigned (rerouted) jobId.
+        this.registry.decrementActiveJobs(agent.agentId);
+        logger.info('Reroute re-dispatch no-op — job already present in dispatch_queue', {
+          runId: job.runId,
+          jobId: insertResult.id,
+          jobName: job.jobName,
+        });
+        return { status: 'duplicate', jobId: insertResult.id };
+      }
+      const jobId = insertResult.id;
 
       const queuedJob: QueuedJob = {
         id: jobId,
@@ -368,6 +440,7 @@ export class Dispatcher {
         job.runId,
         job.excludeLabels ?? [],
         job.resources,
+        typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
       );
 
       if (
@@ -405,6 +478,60 @@ export class Dispatcher {
   }
 
   /**
+   * Re-drive the scaler for jobs still pending after an `at-capacity` verdict.
+   *
+   * Called by the capacity-freed hook (`ScalerManager.onCapacityFreed`) and the
+   * leader-gated `PendingScaleSweeper`. Lists the oldest pending jobs (FIFO
+   * fairness — the longest-waiting burst victim gets the freed slot first) and
+   * re-runs the SAME `onNoMatchingAgent` → `requestScale` path used at dispatch
+   * time, so the re-drive inherits the per-backend spawn semaphore and cap
+   * accounting. A job that returns `at-capacity` again just stays pending for
+   * the next free/sweep tick — no retry state, no backoff bookkeeping.
+   *
+   * Single-flight: a second call while one is in flight returns 0, so an
+   * overlapping hook+sweep cannot double-offer the same jobs. Bounded by
+   * `maxJobs` so one free event cannot storm the scaler.
+   *
+   * @returns the number of jobs that entered `spawning`.
+   */
+  async retryPendingScaleRequests(
+    maxJobs: number = DEFAULT_REDRIVE_BATCH,
+    trigger: ScalerRedispatchTrigger = 'hook',
+  ): Promise<number> {
+    if (!this.onNoMatchingAgent || this.redriveInFlight) return 0;
+    this.redriveInFlight = true;
+    try {
+      const pending = await this.queue.listPending(maxJobs);
+      let redriven = 0;
+      for (const job of pending) {
+        const result = await this.onNoMatchingAgent(
+          job.runsOnLabels,
+          job.id,
+          job.runId,
+          job.excludeLabels ?? [],
+          job.resources,
+          typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
+        );
+        if (result.action === 'spawning') redriven++;
+      }
+      if (redriven > 0) {
+        this.metrics.incScalerRedispatch(trigger, redriven);
+        logger.info('Re-drove pending jobs after capacity freed', {
+          trigger,
+          redriven,
+          scanned: pending.length,
+        });
+      }
+      return redriven;
+    } catch (err) {
+      logger.warn('Pending-scale re-drive failed', { trigger, error: toErrorMessage(err) });
+      return 0;
+    } finally {
+      this.redriveInFlight = false;
+    }
+  }
+
+  /**
    * Dispatch a host-fanout pinned child. The job targets exactly
    * `job.pinnedAgentId`: if that agent is locally connected, satisfies the
    * runsOn/exclude/mandatory gate, and has capacity, dispatch immediately;
@@ -423,6 +550,10 @@ export class Dispatcher {
     // `needs` are satisfied by the restart job completing.)
     const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
     const dispatchable =
+      // Coordinator draining: never send even a pinned job to an agent — fall
+      // through to the queue-with-pin path so the pin is preserved and the
+      // fresh coordinator delivers it after the upgrade restart.
+      !this.isDraining() &&
       !rebootPending &&
       agent &&
       this.registry.agentSatisfies(
@@ -436,13 +567,24 @@ export class Dispatcher {
 
     if (dispatchable) {
       this.registry.incrementActiveJobs(agentId);
-      let jobId: string;
+      let insertResult: { id: string; inserted: boolean };
       try {
-        jobId = await this.queue.insertDispatched(job);
+        insertResult = await this.queue.insertDispatched(job, agentId);
       } catch (err) {
         this.registry.decrementActiveJobs(agentId);
         throw err;
       }
+      if (!insertResult.inserted) {
+        this.registry.decrementActiveJobs(agentId);
+        logger.info('Reroute re-dispatch no-op — pinned job already present in dispatch_queue', {
+          runId: job.runId,
+          jobId: insertResult.id,
+          jobName: job.jobName,
+          pinnedAgentId: agentId,
+        });
+        return { status: 'duplicate', jobId: insertResult.id };
+      }
+      const jobId = insertResult.id;
       const queuedJob: QueuedJob = {
         id: jobId,
         runId: job.runId,
@@ -532,6 +674,11 @@ export class Dispatcher {
     if (!agent) return false;
     if (agent.activeJobs >= agent.maxConcurrency) return false;
 
+    // Coordinator draining: do not claim a scaler-bound job onto a freshly
+    // registered agent. The job stays Pending and the fresh coordinator
+    // re-dispatches it after the upgrade restart.
+    if (this.isDraining()) return false;
+
     // Claim the slot before the async dequeue (same race as onAgentAvailable).
     this.registry.incrementActiveJobs(agentId);
     let job: QueuedJob | null = null;
@@ -601,6 +748,9 @@ export class Dispatcher {
   async onAgentAvailable(agentId: string): Promise<void> {
     const agent = this.registry.get(agentId);
     if (!agent) return;
+
+    // Coordinator draining: do not claim new queued work onto a freed agent.
+    if (this.isDraining()) return;
 
     const agentLabels = [...agent.labels];
     const agentMandatoryLabels = [...agent.mandatoryLabels];
@@ -882,6 +1032,7 @@ export class Dispatcher {
         job.runId,
         job.excludeLabels ?? [],
         job.resources,
+        typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
       );
     }
   }
@@ -1180,7 +1331,7 @@ export class Dispatcher {
     const runId = this.recoveringJobs.get(jobId)?.runId;
     const claimed = this.claimRecovery(jobId, agentId);
     if (!claimed) return false;
-    await this.queue.markDispatchedIfRecovering(jobId);
+    await this.queue.markDispatchedIfRecovering(jobId, agentId);
     this.restoreJobForAgent(agentId, jobId, runId);
     return true;
   }

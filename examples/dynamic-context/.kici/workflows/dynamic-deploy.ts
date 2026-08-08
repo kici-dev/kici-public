@@ -20,7 +20,7 @@ export default workflow('dynamic-deploy', {
       env: (event) => ({
         DEPLOY_TARGET: event.targetBranch === 'main' ? 'prod' : 'stg',
       }),
-      runsOn: ['self-hosted'],
+      runsOn: 'kici:os:linux',
       steps: [
         step('deploy', async ({ $, env }) => {
           // DEPLOY_TARGET came from the job-level `env` callback above.

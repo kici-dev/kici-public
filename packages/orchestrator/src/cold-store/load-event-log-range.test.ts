@@ -50,7 +50,11 @@ const SAMPLE_HOT_1: EventLogColdStoreRow = {
   received_at: new Date(),
 } as EventLogColdStoreRow;
 
-function makeColdStoreMock(opts: { rows?: EventLogColdStoreRow[]; throwOnFetch?: Error }): {
+function makeColdStoreMock(opts: {
+  rows?: EventLogColdStoreRow[];
+  throwOnFetch?: Error;
+  warmCutoff?: Date;
+}): {
   coldStore: ColdStore;
   fetchRange: ReturnType<typeof vi.fn>;
 } {
@@ -69,7 +73,8 @@ function makeColdStoreMock(opts: { rows?: EventLogColdStoreRow[]; throwOnFetch?:
     }
     return gen();
   });
-  return { coldStore: { fetchRange } as unknown as ColdStore, fetchRange };
+  const warmCutoff = vi.fn(() => opts.warmCutoff ?? new Date(Date.now() - 30 * 86_400_000));
+  return { coldStore: { fetchRange, warmCutoff } as unknown as ColdStore, fetchRange };
 }
 
 /**
@@ -154,6 +159,49 @@ describe('loadEventLogRange cold-store error propagation', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('cold-1');
+    expect(fetchRange).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips cold entirely when the requested window starts after the store warm cutoff', async () => {
+    // Cutoff 100 days back, caller asks for the last 10 days — nothing can
+    // have been archived in that window, so cold must not be consulted.
+    const { coldStore, fetchRange } = makeColdStoreMock({
+      rows: [SAMPLE_COLD_1],
+      warmCutoff: new Date(Date.now() - 100 * 86_400_000),
+    });
+
+    await loadEventLogRange({
+      db: makeMockDb([]),
+      coldStore,
+      routingKey: 'github:1',
+      limit: 50,
+      offset: 0,
+      includeArchived: true,
+      fromTs: new Date(Date.now() - 10 * 86_400_000),
+    });
+
+    expect(fetchRange).not.toHaveBeenCalled();
+  });
+
+  it('consults cold when the store warm cutoff is lowered below the requested window', async () => {
+    // The mirror case, and the regression: a 2-day cutoff means rows older
+    // than 2 days are archived, so a 10-day window MUST reach cold. A reader
+    // holding a 30-day literal would have skipped the read entirely.
+    const { coldStore, fetchRange } = makeColdStoreMock({
+      rows: [SAMPLE_COLD_1],
+      warmCutoff: new Date(Date.now() - 2 * 86_400_000),
+    });
+
+    await loadEventLogRange({
+      db: makeMockDb([]),
+      coldStore,
+      routingKey: 'github:1',
+      limit: 50,
+      offset: 0,
+      includeArchived: true,
+      fromTs: new Date(Date.now() - 10 * 86_400_000),
+    });
+
     expect(fetchRange).toHaveBeenCalledTimes(1);
   });
 });

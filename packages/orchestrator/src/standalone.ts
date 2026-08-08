@@ -95,6 +95,10 @@ await guardStartup(logger, async () => {
     // No Platform forwarding in standalone mode
     executionTrackerExtras: undefined,
 
+    // Independent mode has no Platform connection, so step logs are persisted
+    // locally and not relayed for browser fan-out.
+    forwardLogChunk: undefined,
+
     // Independent mode resolves NO context-scoped secrets at dispatch by
     // default (the secrets subsystem still initializes PgSecretStore for admin
     // deps). The local dev plane opts in via KICI_INDEPENDENT_SECRETS=1 so a
@@ -173,7 +177,8 @@ await guardStartup(logger, async () => {
               reason: result.reason,
             });
           },
-          onJobProgress: (msg, reply) => sub.coordinator.onPeerJobProgress(msg, reply),
+          onJobProgress: (msg, fromPeerId, reply) =>
+            sub.coordinator.onPeerJobProgress(msg, fromPeerId, reply),
           onJobCancel: (msg) => {
             if (!msg.jobId) return;
             const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);

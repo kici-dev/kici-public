@@ -50,6 +50,12 @@ vi.mock('../remote/platform-client.js', () => {
     AuthenticationError: class extends Error {},
     AccessDeniedError: class extends Error {},
     ConnectionError: class extends Error {},
+    NotFoundError: class extends Error {
+      constructor(m = 'Resource not found') {
+        super(m);
+        this.name = 'NotFoundError';
+      }
+    },
   };
 });
 
@@ -174,7 +180,7 @@ describe('kici run command', () => {
     // Default: authenticated, org-targeted config
     loadGlobalConfig.mockResolvedValue({
       pat: 'test-pat',
-      platformEndpoint: 'https://api.kici.dev',
+      platformEndpoint: 'https://platform.invalid',
       activeOrgId: 'org_a',
     });
 
@@ -247,7 +253,7 @@ describe('kici run command', () => {
       );
       // PlatformRunClient built against the configured Platform endpoint + PAT.
       expect(platformClientConfigs[0]).toEqual({
-        platformEndpoint: 'https://api.kici.dev',
+        platformEndpoint: 'https://platform.invalid',
         token: 'test-pat',
       });
     });
@@ -292,7 +298,7 @@ describe('kici run command', () => {
     it('uses config.defaultClusters[orgId] when --orchestrator is omitted', async () => {
       loadGlobalConfig.mockResolvedValue({
         pat: 'test-pat',
-        platformEndpoint: 'https://api.kici.dev',
+        platformEndpoint: 'https://platform.invalid',
         activeOrgId: 'org_a',
         defaultClusters: { org_a: 'cluster-default' },
       });
@@ -311,7 +317,7 @@ describe('kici run command', () => {
     it('errors when no org can be resolved', async () => {
       loadGlobalConfig.mockResolvedValue({
         pat: 'test-pat',
-        platformEndpoint: 'https://api.kici.dev',
+        platformEndpoint: 'https://platform.invalid',
       });
       compileFixtures.mockResolvedValue([fixture]);
       filterFixtures.mockReturnValue([fixture]);
@@ -565,6 +571,56 @@ describe('kici run command', () => {
         1,
         expect.anything(),
       );
+    });
+
+    it('retries while a freshly triggered run is not yet readable on the Platform', async () => {
+      const { NotFoundError } = await import('../remote/platform-client.js');
+      // The trigger returns the run id before the Platform's view of the run
+      // lands, so the first poll 404s. The poll must retry, not fail the run.
+      mockClient.runLogs
+        .mockRejectedValueOnce(new NotFoundError('Run not found'))
+        .mockResolvedValueOnce({ lines: ['a'], nextCursor: 1, done: true });
+      mockClient.runStatus.mockResolvedValueOnce({
+        runId: 'run-123',
+        status: 'success',
+        jobs: [{ jobId: 'j1', jobName: 'build', status: 'success' }],
+        done: true,
+      });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+
+      expect(result).toBe(true);
+      expect(mockClient.runLogs).toHaveBeenCalledTimes(2);
+      // The retry re-reads from the same cursor — no log lines were consumed.
+      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
+        2,
+        'org_a',
+        'run-123',
+        0,
+        expect.anything(),
+      );
+    });
+
+    it('surfaces a 404 once the run has already been read', async () => {
+      const { NotFoundError } = await import('../remote/platform-client.js');
+      mockClient.runLogs
+        .mockResolvedValueOnce({ lines: ['a'], nextCursor: 1, done: false })
+        .mockRejectedValueOnce(new NotFoundError('Run not found'));
+      mockClient.runStatus.mockResolvedValueOnce({
+        runId: 'run-123',
+        status: 'running',
+        jobs: [],
+        done: false,
+      });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+
+      expect(result).toBe(false);
+      expect(mockClient.runLogs).toHaveBeenCalledTimes(2);
     });
 
     it('reports a failed run as failure', async () => {

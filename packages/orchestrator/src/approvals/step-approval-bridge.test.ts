@@ -208,3 +208,53 @@ describe('StepApprovalBridge', () => {
     expect(bridge.resolve('hold-4', 'approved')).toBe(false);
   });
 });
+
+describe('StepApprovalBridge.request timeout guard', () => {
+  it('rejects an invalid timeout without creating a hold', async () => {
+    const { store, createHold } = fakeStore();
+    const bridge = new StepApprovalBridge({
+      store,
+      resolveOrgId: () => 'org-1',
+      resolveExpirySeconds: async () => 86400,
+    });
+
+    const res = await bridge.request({
+      agentId: 'agent-1',
+      runId: 'run-1',
+      jobId: 'deploy',
+      stepIndex: 0,
+      stepName: 'apply',
+      clauses: [],
+      reason: 'gate',
+      timeoutSeconds: 0,
+    });
+
+    expect(res.outcome).toBe('rejected');
+    expect(createHold).not.toHaveBeenCalled();
+    expect(bridge.size()).toBe(0);
+  });
+
+  it('creates a hold for a valid timeout', async () => {
+    const { store, createHold } = fakeStore();
+    const bridge = new StepApprovalBridge({
+      store,
+      resolveOrgId: () => 'org-1',
+      resolveExpirySeconds: async () => 86400,
+    });
+
+    bridge.request({
+      agentId: 'agent-1',
+      runId: 'run-1',
+      jobId: 'deploy',
+      stepIndex: 0,
+      stepName: 'apply',
+      clauses: [],
+      reason: 'gate',
+      timeoutSeconds: 120,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(createHold).toHaveBeenCalledTimes(1);
+  });
+});

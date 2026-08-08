@@ -1,205 +1,108 @@
 ---
-title: Execution state machine
-description: 11 states, 16 events, transition rules, and terminal state handling
+title: Execution status vocabulary
+description: Run, job, and step status vocabulary, terminal-state rules, and the tracker that owns lifecycle state
 ---
 
 ## Overview
 
-The state machine tracks workflow runs, jobs, and steps through a consistent lifecycle. It is a pure-function implementation with no internal state -- given a current state and an event, it deterministically returns the next state or rejects the transition.
+Every workflow run moves through a lifecycle: it is created, its jobs are dispatched to agents, the agents execute steps and report status back, and the run settles on a final outcome. Three status vocabularies describe that lifecycle at three granularities — the run, its jobs, and each job's steps.
 
-The same state machine is used across all tiers: the orchestrator tracks run and job states during dispatch, while the agent transitions job and step states during execution. Both import from `@kici-dev/engine`.
+The status vocabularies are the wire contract. They are shared enums defined once in `packages/engine/src/protocol/messages/execution-status.ts` and carried on the `execution.status`, `job.status`, and `step.status` protocol messages, so the orchestrator and agent always agree on the set of legal values.
 
-> Source: `packages/engine/src/state-machine/`
+Lifecycle _logic_ — deciding when a run is complete, rolling job outcomes up into a run outcome, and persisting the result — lives in the orchestrator's execution tracker (`packages/orchestrator/src/reporting/execution-tracker.ts`). The tracker is the single authority for run state; there is no separate transition engine.
 
-## States
+## Status vocabularies
 
-The state machine defines 11 states. Seven are transient (the entity is still in progress) and four are terminal (the entity has reached a final outcome).
+### Run status (`ExecutionRunStatus`)
 
-| State        | Description                                                    | Terminal |
-| ------------ | -------------------------------------------------------------- | -------- |
-| `pending`    | Initial state. Waiting for processing.                         | No       |
-| `queued`     | Enqueued for execution. Waiting for an agent.                  | No       |
-| `running`    | Actively executing.                                            | No       |
-| `recovering` | Temporarily disconnected. Waiting for reconnection or timeout. | No       |
-| `cancelling` | Graceful cancellation in progress. Running cancel hooks.       | No       |
-| `held`       | Held for approval (protection rule: required reviewers).       | No       |
-| `waiting`    | Waiting for timer expiry (protection rule: wait timer).        | No       |
-| `success`    | Completed successfully.                                        | Yes      |
-| `failed`     | Completed with failure.                                        | Yes      |
-| `cancelled`  | Cancelled before or during execution.                          | Yes      |
-| `skipped`    | Skipped due to rule evaluation or dependency.                  | Yes      |
+A run is the top-level unit of work. Its status is one of:
 
-> Source: `packages/engine/src/state-machine/types.ts` -- `ExecutionState` type and `TERMINAL_STATES` constant.
+| Status       | Description                                                                                     | Terminal |
+| ------------ | ----------------------------------------------------------------------------------------------- | -------- |
+| `pending`    | Created, not yet dispatched.                                                                    | No       |
+| `running`    | One or more jobs are executing.                                                                 | No       |
+| `cancelling` | Graceful cancellation in progress (cancel hooks running).                                       | No       |
+| `held`       | Paused at a workflow install-gate protection rule (awaiting reviewer approval or a wait timer). | No       |
+| `success`    | All jobs succeeded.                                                                             | Yes      |
+| `failed`     | At least one job failed.                                                                        | Yes      |
+| `cancelled`  | Cancelled before or during execution (no job failed).                                           | Yes      |
 
-## Events
+### Job status (`ExecutionJobStatus`)
 
-The state machine responds to 16 events. Each event represents an action that moves the entity from one state to another.
+A job is one dispatchable unit within a run, executed by a single agent. Its status carries more outcomes than a run because jobs surface agent-level and scheduling verdicts that a run only ever reports as an aggregate:
 
-| Event             | Description                                                     |
-| ----------------- | --------------------------------------------------------------- |
-| `ENQUEUE`         | Move from pending to queued.                                    |
-| `START`           | Begin execution (or resume from recovering).                    |
-| `SUCCEED`         | Mark as successfully completed.                                 |
-| `FAIL`            | Mark as failed.                                                 |
-| `CANCEL`          | Cancel the execution (immediate, no hooks).                     |
-| `CANCEL_GRACEFUL` | Begin graceful cancellation (run cancel hooks before stopping). |
-| `CANCEL_FORCE`    | Force cancellation of a gracefully-cancelling execution.        |
-| `COMPLETE`        | Cancel hooks finished; complete the cancellation.               |
-| `SKIP`            | Skip the execution (rule or dependency).                        |
-| `RECOVER`         | Enter recovery mode (e.g., agent disconnect).                   |
-| `HOLD`            | Hold for approval (protection rule enforcement).                |
-| `APPROVE`         | Approve a held run (reviewer action).                           |
-| `REJECT`          | Reject a held run (reviewer action).                            |
-| `EXPIRE`          | Hold period expired without approval.                           |
-| `WAIT`            | Enter wait timer (protection rule enforcement).                 |
-| `TIMER_DONE`      | Wait timer expired, proceed to queued.                          |
+| Status            | Description                                                                | Terminal |
+| ----------------- | -------------------------------------------------------------------------- | -------- |
+| `pending`         | Queued behind dependencies or parallelism limits.                          | No       |
+| `queued`          | Ready to dispatch, waiting for an agent.                                   | No       |
+| `running`         | Executing on an agent.                                                     | No       |
+| `recovering`      | Agent temporarily disconnected; awaiting reconnect or timeout.             | No       |
+| `cancelling`      | Graceful cancellation in progress.                                         | No       |
+| `success`         | Completed successfully.                                                    | Yes      |
+| `failed`          | Completed with a failure.                                                  | Yes      |
+| `cancelled`       | Cancelled before or during execution.                                      | Yes      |
+| `skipped`         | Not run because its `if` condition or a dependency excluded it.            | Yes      |
+| `timed_out_stale` | Reaped after its agent went silent past the stale threshold.               | Yes      |
+| `drift_dropped`   | Dropped because the workflow definition changed under the run.             | Yes      |
+| `unroutable`      | Its `runsOn` matched no agent for the whole queue window, so it never ran. | Yes      |
 
-> Source: `packages/engine/src/state-machine/types.ts` -- `ExecutionEvent` type.
+### Step status (`ExecutionStepStatus`)
 
-## State diagram
+A step is one command within a job. Steps report independently so the run timeline can render per-step progress.
 
-```mermaid
-stateDiagram-v2
-    [*] --> pending
-    pending --> queued : ENQUEUE
-    pending --> cancelled : CANCEL
-    pending --> skipped : SKIP
-    pending --> held : HOLD
-    pending --> waiting : WAIT
-    held --> queued : APPROVE
-    held --> cancelled : REJECT
-    held --> cancelled : EXPIRE
-    held --> cancelled : CANCEL
-    waiting --> queued : TIMER_DONE
-    waiting --> cancelled : CANCEL
-    queued --> running : START
-    queued --> failed : FAIL
-    queued --> cancelled : CANCEL
-    running --> success : SUCCEED
-    running --> failed : FAIL
-    running --> cancelled : CANCEL
-    running --> cancelling : CANCEL_GRACEFUL
-    running --> recovering : RECOVER
-    cancelling --> cancelled : CANCEL_FORCE
-    cancelling --> cancelled : COMPLETE
-    cancelling --> failed : FAIL
-    recovering --> running : START
-    recovering --> failed : FAIL
-    recovering --> cancelled : CANCEL
-    success --> [*]
-    failed --> [*]
-    cancelled --> [*]
-    skipped --> [*]
-```
+| Status      | Description                                                                             |
+| ----------- | --------------------------------------------------------------------------------------- |
+| `running`   | Executing.                                                                              |
+| `success`   | Completed successfully.                                                                 |
+| `failed`    | Completed with a failure.                                                               |
+| `skipped`   | Not run because its condition excluded it.                                              |
+| `pending`   | A parallel-group child queued behind the group's `maxParallel` limit, not yet launched. |
+| `cancelled` | A parallel-group sibling aborted by fail-fast. This is **not** a failure.               |
 
-## Transition table
+There is no terminal-state constant for steps: a step's outcome is read directly from its status, and only runs and jobs carry the terminal sets described below.
 
-All 25 valid transitions. Any transition not listed here will throw an `InvalidTransitionError`.
+Each step also carries a concurrency role (`StepConcurrencyKind`) that explains which of those values it can take: `sequential` for an ordinary step in the flat step sequence, `parallel-child` for a member of a `parallel()` group running concurrently with its siblings, and `parallel-group` for the structural group wrapper the dashboard renders as an aggregate band. The `pending` and `cancelled` statuses only ever appear on parallel-group children.
 
-| Current State | Event             | Next State   |
-| ------------- | ----------------- | ------------ |
-| `pending`     | `ENQUEUE`         | `queued`     |
-| `pending`     | `CANCEL`          | `cancelled`  |
-| `pending`     | `SKIP`            | `skipped`    |
-| `pending`     | `HOLD`            | `held`       |
-| `pending`     | `WAIT`            | `waiting`    |
-| `held`        | `APPROVE`         | `queued`     |
-| `held`        | `REJECT`          | `cancelled`  |
-| `held`        | `EXPIRE`          | `cancelled`  |
-| `held`        | `CANCEL`          | `cancelled`  |
-| `waiting`     | `TIMER_DONE`      | `queued`     |
-| `waiting`     | `CANCEL`          | `cancelled`  |
-| `queued`      | `START`           | `running`    |
-| `queued`      | `FAIL`            | `failed`     |
-| `queued`      | `CANCEL`          | `cancelled`  |
-| `running`     | `SUCCEED`         | `success`    |
-| `running`     | `FAIL`            | `failed`     |
-| `running`     | `CANCEL`          | `cancelled`  |
-| `running`     | `CANCEL_GRACEFUL` | `cancelling` |
-| `running`     | `RECOVER`         | `recovering` |
-| `cancelling`  | `CANCEL_FORCE`    | `cancelled`  |
-| `cancelling`  | `COMPLETE`        | `cancelled`  |
-| `cancelling`  | `FAIL`            | `failed`     |
-| `recovering`  | `START`           | `running`    |
-| `recovering`  | `FAIL`            | `failed`     |
-| `recovering`  | `CANCEL`          | `cancelled`  |
+## Terminal states
 
-**Key patterns:**
+A status is **terminal** when the entity has reached a final outcome and will not change again. The terminal sets live alongside the enums in `execution-status.ts` as two constants, and they deliberately differ:
 
-- `CANCEL` is valid from six transient states (pending, queued, running, recovering, held, waiting). The `cancelling` state uses `CANCEL_FORCE` instead.
-- `CANCEL_GRACEFUL` is only valid from running — it enters the `cancelling` state where cancel hooks run before the entity reaches `cancelled`.
-- From `cancelling`, `CANCEL_FORCE` or `COMPLETE` resolve to `cancelled`, and `FAIL` resolves to `failed` (hook failure).
-- `FAIL` is valid from queued (e.g., agent crash before execution starts), running, cancelling (hook failure), and recovering (e.g., recovery timeout).
-- `SKIP` is only valid from pending (before any processing begins).
-- `SUCCEED` is only valid from running (must have started execution).
-- `RECOVER` is only valid from running (agent disconnect during execution). From recovering, `START` resumes execution.
-- `HOLD` and `WAIT` are only valid from pending (protection rules are evaluated before dispatch).
-- `APPROVE`, `REJECT`, and `EXPIRE` are only valid from held. `TIMER_DONE` is only valid from waiting.
-- Both held and waiting resolve to queued on success (APPROVE/TIMER_DONE), re-entering the normal execution flow.
+- **`TERMINAL_RUN_STATES`** = `success`, `failed`, `cancelled`.
+- **`TERMINAL_JOB_STATES`** = `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`.
 
-## Terminal States
+The four extra job-terminal values — `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` — are **job-level verdicts**. They describe how an individual job settled, and they roll up into the run's aggregate outcome rather than appearing on the run directly. A run whose only unfinished job is skipped still settles on `success` or `failed` based on its other jobs; it never carries a `skipped` status of its own. Keeping the two sets separate is what makes a run-level terminal check use the 3-value set and a job-level check use the 7-value set.
 
-Four states are terminal: `success`, `failed`, `cancelled`, and `skipped`. Once a state machine entity reaches a terminal state, it is immutable -- no further transitions are possible.
+## Run outcome roll-up
 
-Terminal states have no entries in the transition table (empty objects). Attempting to apply any event to a terminal state throws an `InvalidTransitionError`.
+The tracker folds job outcomes into the run outcome with a fixed rule, applied in order:
 
-The `TERMINAL_STATES` constant is exported from `packages/engine/src/state-machine/types.ts` for runtime checks.
+- The run is `failed` if **any** job ended `failed`, `timed_out_stale`, `drift_dropped`, or `unroutable` — the three infra-class job verdicts fail the run exactly like an ordinary job failure. `unroutable` in particular is what stops a run whose job could not be routed from reporting success on its siblings alone.
+- Otherwise the run is `cancelled` if **any** job was cancelled.
+- Otherwise the run is `success`. Jobs that were `skipped` do not hold a run back from succeeding.
 
-## API Reference
+One case bypasses the roll-up entirely: a run executing in `check-fail-on-drift` mode that saw at least one step report drift is `failed`, even when every job succeeded. That is the mode's whole point — previewing changes without applying them, and failing the run when the preview is non-empty. See [Idempotent steps](../../user/idempotent-steps.md) for the check modes.
 
-The state machine exports 2 public functions via `packages/engine/src/state-machine/index.ts`. Both are pure -- they take inputs and return outputs with no side effects or internal state.
+A run reaches a terminal status when all of its jobs are terminal. At that point the tracker stamps the run's `completed_at` and `duration_ms` and records the failure class (`RunFailureClass`) for a failed or cancelled run, so downstream reads and notification subscriptions can match on why it ended.
 
-> Source: `packages/engine/src/state-machine/machine.ts`
+That rollup is only as correct as the set of jobs the run knows about, so the tracker holds a run open while jobs are still to be registered. It has two mechanisms for that, and neither introduces a second notion of completeness — both keep the same all-jobs-terminal check from passing early:
 
-### `transition(state, event)`
+- **Jobs gated behind another job** (a `needs` dependency, a rolling-wave hold) are registered up front as non-terminal placeholder rows and swapped for the real job when it is dispatched.
+- **Jobs whose registration is still pending.** Several windows leave a run registered with fewer jobs than it will end up with, and the tracker holds the run open across each one. A workflow whose source must be packed first runs its build job alone while the run's real jobs wait. A job whose environment or matrix is resolved by an init step, and a dynamic job function that generates its jobs at run time, both register their jobs from work that continues after the dispatch call returns. Without a hold, the jobs registered so far reaching a terminal state would read as the run finishing — posting a green check to the provider and forwarding a terminal status to the Platform before the jobs it was still registering had run. The hold counts the outstanding registrations rather than flagging one window, so overlapping windows each keep the run open until their own jobs land, and it is a property of the in-memory run rather than a placeholder job, so it never appears as a phantom job or inflates the run's reported job count.
 
-```typescript
-function transition(state: ExecutionState, event: ExecutionEvent): ExecutionState;
-```
+A run paused at a workflow install gate is likewise never rolled up complete: it tracks no jobs and resumes into a fresh dispatch, so the jobs registered before the gate held it cannot satisfy the completion check.
 
-Applies an event to a state and returns the new state. Throws `InvalidTransitionError` if the transition is not valid.
+## Ordering tolerance
 
-### `isTerminal(state)`
+Status updates arrive over the network and can race. The most common race is a dispatch path re-touching a job row while a fast agent has already reported that same job terminal. The tracker guards against this by never overwriting an already-terminal status: before resetting a job back to `pending`, it checks both its in-memory entry and the persisted row, and preserves any terminal status it finds. Job rows are upserted idempotently, so a repeated or reordered update settles on the same final state rather than corrupting it. This tolerance is a property of the tracker's write path, not of a separate validation layer.
 
-```typescript
-function isTerminal(state: ExecutionState): boolean;
-```
+Runs carry the same guard, and the status the orchestrator forwards to the Platform follows it. The writes that can arrive after a run has already settled — the stale detector recomputing a finished run, the crash-recovery fallback whose run-state read raced a normal completion, an init failure landing on a run that finished anyway — are each conditional on the run still being non-terminal, and their forward fires only when that write actually changed the row. So the Platform is never told an outcome the orchestrator declined to record. This matters because the Platform mirrors what it is told and its run-mirror reconciler only revisits mirrors that are still non-terminal: a suppressed forward leaves a mirror the reconciler can heal, while a wrong one would stand forever.
 
-Returns `true` if the state is terminal (`success`, `failed`, `cancelled`, or `skipped`). Returns `false` for transient states (`pending`, `queued`, `running`, `recovering`, `cancelling`, `held`, `waiting`).
+## Persistence
 
-### Internal functions (not exported)
-
-The following are defined in `machine.ts` but not re-exported from the module index:
-
-- `canTransition(state, event)` -- checks whether a transition is valid without throwing
-- `validEvents(state)` -- returns valid events for a given state
-- `InvalidTransitionError` -- thrown when an invalid transition is attempted
-
-### `InvalidTransitionError` (internal)
-
-```typescript
-class InvalidTransitionError extends Error {
-  readonly state: ExecutionState;
-  readonly event: ExecutionEvent;
-}
-```
-
-Thrown by `transition()` when an invalid transition is attempted. Carries the `state` and `event` that caused the error for programmatic error handling. This class is not re-exported from the public module index — callers should catch generic `Error` instances instead.
-
-## Usage Across Tiers
-
-### Orchestrator
-
-The orchestrator uses the state machine to track run and job states during the dispatch pipeline. When a webhook arrives, the orchestrator creates a run in `pending` state, transitions matched jobs through `queued`, and tracks status updates from agents.
-
-### Agent
-
-The agent uses the state machine to transition job and step states during execution. A job starts as `pending`, moves to `running` when execution begins, and reaches a terminal state (`success`, `failed`, `cancelled`) based on the outcome. Steps follow the same lifecycle independently.
-
-Both tiers import the state machine from `@kici-dev/engine`, ensuring consistent transition logic across the system.
+The tracker keeps in-memory run state for fast lookups (job-name resolution, run-completion detection) and write-through to the orchestrator's `execution_runs`, `execution_jobs`, and `execution_steps` tables. Completed runs are pruned from memory after a short delay; the database rows are the durable record that the run timeline and history views read from.
 
 ## See also
 
-- [Architecture Overview](../overview.md) -- three-tier model and package relationships
-- [Protocol Messages](../protocol-messages.md) -- job.status and step.status messages carry state values
-- [Job Execution](job-execution.md) -- how the agent transitions states during job lifecycle
+- [Architecture overview](../overview.md) — three-tier model and package relationships
+- [Protocol messages](../protocol-messages.md) — the `job.status` and `step.status` messages that carry status values
+- [Job execution](job-execution.md) — how the agent runs a job and reports step status

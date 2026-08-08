@@ -6,6 +6,9 @@
  */
 import { z } from 'zod';
 import type { ApproverClause } from '../approval/types.js';
+import type { HoldType } from './hold-type.js';
+import type { HeldRunStatus } from './held-run-status.js';
+import type { ConcurrencyStrategy } from './concurrency-strategy.js';
 
 /** Context entity — org-level deployment target with protection rules. */
 export interface Context {
@@ -18,7 +21,7 @@ export interface Context {
   triggerTypeFilters: string[];
   repoPatterns: string[];
   concurrencyLimit: number | null;
-  concurrencyStrategy: 'queue' | 'cancel-pending';
+  concurrencyStrategy: ConcurrencyStrategy;
   concurrencyTimeoutMs: number;
   requiredReviewers: string[] | null;
   waitTimerSeconds: number | null;
@@ -97,8 +100,8 @@ export interface HeldRun {
   runId: string;
   jobId: string;
   contextId: string;
-  holdType: 'reviewer' | 'timer' | 'concurrency' | 'security';
-  status: 'pending' | 'approved' | 'rejected' | 'expired';
+  holdType: HoldType;
+  status: HeldRunStatus;
   reason: string | null;
   approvedBy: string | null;
   createdAt: string;
@@ -111,7 +114,7 @@ export interface ProtectionGateResult {
   action: 'pass' | 'reject' | 'hold' | 'queue' | 'wait';
   reason?: string;
   holdUntil?: string;
-  holdType?: 'reviewer' | 'timer' | 'concurrency' | 'security';
+  holdType?: HoldType;
   /**
    * Approver clauses for a reviewer hold, mapped from the context's
    * `requiredReviewers`. Each reviewer string maps to a `{ user }` clause

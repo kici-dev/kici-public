@@ -292,6 +292,32 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
     expect(out.result).toBe('rejected_misconfigured');
   });
 
+  it('returns rejected_misconfigured (never throws) for an out-of-union verification_method', async () => {
+    const deps: VerifyInboundDeps = {
+      db: fakeDb(null),
+      secretStore: fakeSecretStore({}),
+      genericSourceManager: fakeGenericSourceManager({
+        routing_key: ROUTING,
+        // A verification_method outside the VerificationMethod union — models a
+        // hand-repaired DB row or a schema that grew a method ahead of this parser.
+        verification_method: 'future_method',
+        verification_config: '{}',
+      }),
+    };
+
+    // Must RESOLVE (not reject) — verifyInboundWebhook is documented never-throws.
+    const out = await verifyInboundWebhook(deps, {
+      routingKey: ROUTING,
+      body: Buffer.from(BODY),
+      headers: {},
+      signatureHeaderName: null,
+      signatureHeader: null,
+      clientIp: null,
+    });
+
+    expect(out.result).toBe('rejected_misconfigured');
+  });
+
   it('returns rejected_unknown_source when no row exists', async () => {
     const deps: VerifyInboundDeps = {
       db: fakeDb(null),

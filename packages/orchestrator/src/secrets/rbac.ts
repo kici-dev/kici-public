@@ -35,14 +35,25 @@ export type Permission =
   | 'scheduled_job.trigger'
   | 'attestation.retry'
   | 'event_dlq.read'
-  | 'event_dlq.manage';
+  | 'event_dlq.manage'
+  | 'orchestrator.drain'
+  /** Read the org-wide CI trust policy that gates fork / unknown / workflow-change PRs. */
+  | 'ci_trust.read'
+  /** Modify org-wide trust policies (independent mode only — Platform-attached PATCH refuses). */
+  | 'ci_trust.admin';
 
 /**
  * Role-to-permission mapping.
- * owner gets everything, admin gets context/secret/audit + attestation.retry,
- * auditor gets context.read + audit.read + run.read (read-only — no
- * attestation.retry, so a read-only role can never drain / re-arm the
- * deferred-attestation outbox).
+ * owner gets everything, admin gets context/secret/audit + attestation.retry +
+ * orchestrator.drain, auditor gets context.read + audit.read + run.read
+ * (read-only — no attestation.retry and no orchestrator.drain, so a read-only
+ * role can never drain the coordinator or re-arm the deferred-attestation
+ * outbox).
+ *
+ * `ci_trust.read` / `ci_trust.admin` are held by owner + admin only. The trust
+ * policy decides whether a fork PR runs at all, so it is not a read-only-role
+ * surface; the auditor sees trust-policy changes through `access_log.read`
+ * instead, which records every `trust_policy.updated` mutation.
  */
 const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
   owner: new Set<Permission>([
@@ -66,6 +77,9 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'attestation.retry',
     'event_dlq.read',
     'event_dlq.manage',
+    'orchestrator.drain',
+    'ci_trust.read',
+    'ci_trust.admin',
   ]),
   admin: new Set<Permission>([
     'context.create',
@@ -86,6 +100,9 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
     'attestation.retry',
     'event_dlq.read',
     'event_dlq.manage',
+    'orchestrator.drain',
+    'ci_trust.read',
+    'ci_trust.admin',
   ]),
   auditor: new Set<Permission>([
     'context.read',

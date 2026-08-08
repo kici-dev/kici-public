@@ -1,9 +1,9 @@
 ---
 title: Contexts architecture
-description: Data model, protection pipeline, scope resolution, and state machine for deployment contexts
+description: Data model, protection pipeline, scope resolution, and held-run lifecycle for deployment contexts
 ---
 
-This document describes the internal architecture of KiCI's deployment context system, including the data model, protection rule pipeline, scope resolution algorithm, and state machine extensions.
+This document describes the internal architecture of KiCI's deployment context system, including the data model, protection rule pipeline, scope resolution algorithm, and the held-run lifecycle.
 
 ## Data model
 
@@ -25,7 +25,7 @@ contexts
   concurrency_timeout_ms INTEGER DEFAULT 1800000
   required_reviewers     JSONB
   wait_timer_seconds     INTEGER
-  hold_expiry_seconds    INTEGER DEFAULT 86400
+  hold_expiry_seconds    INTEGER
   allow_local_execution  BOOLEAN DEFAULT false
   created_by     TEXT
   created_at     TIMESTAMPTZ
@@ -176,18 +176,18 @@ evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
   3. Trust gate:
      - env has no trust requirements -> pass
      - trustTier meets minimum requirement -> pass
-     - else -> reject or hold(holdType: 'trust')
+     - else -> reject or hold(holdType: 'security')
   4. Concurrency gate:
-     - env.concurrencyLimit is null -> pass
+     - env.concurrencyLimit is null or non-positive -> pass (unlimited)
      - runningCount < limit -> pass
-     - strategy = 'cancel-pending' -> queue (reason: 'cancel-pending', caller handles cancellation)
-     - strategy = 'queue' -> queue
+     - strategy = 'cancel-pending' -> queue(holdType: 'concurrency', reason: 'cancel-pending', caller handles cancellation)
+     - strategy = 'queue' -> queue(holdType: 'concurrency')
   5. Reviewer gate:
      - env.requiredReviewers is null/empty -> pass
      - else -> hold(holdType: 'reviewer')
   6. Wait timer gate:
      - env.waitTimerSeconds is null -> pass
-     - else -> wait(holdUntil: now + timer)
+     - else -> wait(holdType: 'timer', holdUntil: now + timer)
   |
   v
   ProtectionGateResult { action, reason, holdType?, holdUntil? }
@@ -258,7 +258,7 @@ The agent's `buildSanitizedEnv` function merges variables in this precedence ord
 ```
 Layer 1: Allowed system vars       -- PATH, HOME, USER (from agent process)
 Layer 2: Sandbox defaults           -- FORCE_COLOR=1
-Layer 3: KICI_* system vars         -- KICI_RUN_ID, KICI_JOB_NAME, etc.
+Layer 3: Orchestrator-supplied env  -- the dispatch's `env` field
 Layer 4: Org-level context vars -- from contexts DB table
 Layer 5: Source-level overrides     -- from context_source_overrides (skips locked vars)
 Layer 6: Job env                    -- from SDK env property (static or evaluated)
@@ -269,9 +269,9 @@ Layers 4-5 are resolved at the orchestrator and passed in `job.dispatch`. Layer 
 
 Secrets are NOT injected as environment variables. They flow through IPC and are accessed via `ctx.secrets.get()` and `ctx.secrets.has()`. Users can explicitly inject a secret into `process.env` by calling `ctx.secrets.expose('KEY')`, but this is opt-in and happens at step execution time.
 
-## State machine extensions
+## Held-run lifecycle
 
-The existing run/job state machine is extended with held states:
+A protection gate holds a run or job at the `held` status — a non-terminal member of both `ExecutionRunStatus` and `ExecutionJobStatus`. The orchestrator's execution tracker owns these status transitions:
 
 ```
                     held
@@ -281,14 +281,14 @@ pending -> queued -> running -> success
                           \-> failed
                           \-> cancelled
 
-held states:
-  pending (awaiting approval/timer)
-    -> approved (reviewer approves) -> queued -> running
-    -> rejected (reviewer rejects) -> cancelled
-    -> expired (hold_expiry_seconds exceeded) -> cancelled
+held status:
+  awaiting approval / timer
+    -> approval satisfied  -> queued -> running
+    -> rejection           -> cancelled
+    -> expiry (hold_expiry_seconds exceeded) -> cancelled
 ```
 
-The `held` and `waiting` states are non-terminal. They resolve to `queued` on success (APPROVE, TIMER_DONE).
+The `held` status is non-terminal. It resolves to `queued` once the gate is satisfied (a reviewer approves, or a timer elapses).
 
 ## Dashboard CRUD
 

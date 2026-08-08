@@ -201,6 +201,10 @@ Logs flow from the sandbox child process via IPC to the agent, where the `LogStr
 2. **Direct console output from step TS/JS code** — `installOutputCapture()` monkey-patches `process.stdout.write` and `process.stderr.write` while a step is active (`captureStepIndex >= 0`). Calls to `console.log`, `console.error`, `console.warn`, or any library that writes directly to `process.stdout`/`stderr` are split into lines and forwarded as `log.line`. The patch is also active during the pre-step `prepare` phase (module load, concurrency-group evaluation, rule evaluation) under `capturePrepareActive = true`, routing output to the workflow-level log bucket (`stepIndex: -1`).
 3. **Structured logger** — the step context's `log` object (`log.info` / `log.warn` / `log.error` / `log.debug`) sends `log.line` directly over IPC, bypassing the stdio hooks.
 
+Every captured line carries the stream it came from (`stdout` or `stderr`) from the zx callback through the IPC message and the chunk batcher, out on the `log.chunk` message, and into the persisted log record's level. The batcher closes the pending chunk whenever the stream flips, so stdout/stderr interleaving survives batching. A peer that does not send the field is read as `stdout`.
+
+**A failing step's error lands in its own log.** When a step body throws, the error message is emitted into that step's log stream — tagged `stderr` and ordered ahead of the terminal status — instead of only riding `step.complete`. This matters because subprocess wrappers pack the real diagnosis (captured stderr, exit code, kill signal) into the thrown error's message. The logged copy is bounded to 100 lines / 8192 characters and states what it dropped; the full untruncated message still travels on `step.complete`. It goes through the same send path as every other log line, so secret masking applies unchanged.
+
 All three paths converge in the agent's per-step `LogStreamer`. Hooks (`beforeStep`, `afterStep`, `onSuccess`, `onFailure`, `onCancel`, `cleanup`) also run under `captureStepIndex` — per-step hooks reuse the step index and land in the step's log; post-loop and cancel-path hooks allocate their own indices above `steps.length` and appear as dedicated step rows in the dashboard.
 
 **What gets captured inside an in-process agent job (`__init__` / `__build__` / `__dynamic__`):** these jobs don't use the sandbox child process; they run in the agent itself. A second capture primitive — `AsyncLocalStorage`-scoped `console.*` patching in `packages/agent/src/execution/console-capture.ts` — routes user-supplied output to a per-job synthetic step-0 `LogStreamer`.
@@ -208,7 +212,7 @@ All three paths converge in the agent's per-step `LogStreamer`. Hooks (`beforeSt
 The captured surfaces are:
 
 - `console.log` / `console.error` / `console.warn` / `console.info` / `console.debug` from module top-level code.
-- Dynamic `environment` / `env` / `concurrencyGroup` functions.
+- Dynamic `context` / `env` / `concurrencyGroup` functions.
 - The `DynamicJobFn` body and generated-job `env` / matrix functions.
 - Subprocess output from the per-invocation zx `$` callback installed on the `DynamicJobFn` path:
 
@@ -240,7 +244,8 @@ The patch targets only `console.*` methods (not `process.stdout.write`) because 
 log.chunk {
   messageId, runId, jobId, stepIndex,
   lines: string[],
-  timestamp
+  timestamp,
+  stream?: 'stdout' | 'stderr'   // absent is read as stdout
 }
 ```
 
@@ -278,15 +283,15 @@ The execution mode is determined at the **job level** (not per-step) by the `Job
 3. `KICI_SCALER_MANAGED=1` with Firecracker detection → `firecracker`
 4. Default → `bare-metal`
 
-When running in container mode, the agent uses the `ContainerSandbox`. The workflow runner is bind-mounted read-only into the container, and IPC uses stdin/stdout JSON-lines via dockerode's exec API.
+When running in container mode, the agent uses the `ContainerSandbox`. The workflow runner is bind-mounted read-only into the container as a **self-contained bundle** (its runtime dependencies inlined, plus a pure-JS TypeScript loader-hook bundle mounted alongside it) so the single-file runner loads inside a bare job container with no access to the agent's `node_modules`. IPC uses stdin/stdout JSON-lines over the container runtime's exec API.
 
 > See `packages/agent/src/execution/sandbox/container-sandbox.ts` for the implementation.
 
 **Container lifecycle:**
 
-1. **Create container** -- `docker create` with workflow runner bind-mounted at `/opt/kici/workflow-runner.js`, pre-sanitized environment variables, and `sleep infinity` as the entrypoint to keep the container alive
+1. **Create container** -- `docker create` with the self-contained workflow-runner bundle bind-mounted read-only at `/opt/kici/workflow-runner.js` (and the loader-hook bundle at `/opt/kici/ts-loader-hook.js`), pre-sanitized environment variables, and `sleep infinity` as the entrypoint to keep the container alive. `/workspace` is a container-owned anonymous volume created fresh per job and owned by the container user -- not a host bind -- so clone/install/execute writes work even with all capabilities dropped under rootful container runtimes
 2. **Start container** -- `docker start`
-3. **Execute job** -- `docker exec` runs the workflow runner inside the container; the runner handles clone, deps, compile, and step execution within the container
+3. **Execute job** -- `docker exec` runs the workflow runner inside the container; the runner handles clone, deps, workflow loading, and step execution within the container
 4. **Cleanup** -- `docker rm -f` after job completes
 
 **Important:** With the sandbox model, the entire workflow runner process (including step TypeScript code and shell commands via `$`) runs inside the container. Agent-internal credentials (`KICI_*`, `KICI_DATABASE_URL`, etc.) never enter the container -- only pre-sanitized environment variables are passed through.
@@ -336,6 +341,6 @@ The agent supports a drain mode for graceful scaling down. When `SIGUSR1` is rec
 
 - [Reconnection and event buffering](../clustering/reconnection.md) -- WebSocket reconnection behavior during agent disconnection
 - [Protocol messages](../protocol-messages.md) -- message schemas for job.dispatch, job.status, log.chunk
-- [State machine](state-machine.md) -- execution state transitions (pending, running, success, failed)
+- [Execution lifecycle](state-machine.md) -- run, job, and step status vocabularies and terminal states
 - [Agent configuration](../../operator/agent/configuration.md) -- environment variables for the agent
 - [Agent getting started](../../operator/agent/getting-started.md) -- deployment guide

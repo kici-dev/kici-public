@@ -8,13 +8,14 @@
  * `commits[].{added,modified,removed}` arrays in the push payload, so we
  * extract them via JSONPath from the already-delivered webhook body.
  *
- * For PR events we return an empty list: the upstream trigger matcher treats
- * empty changed-files as "match any path", which is the safest default when
- * we don't have per-PR diff data. A follow-up can add an optional REST
- * fetcher if source authors want PR path filtering.
+ * For PR events we report `unavailable`: no per-commit diff is present in the
+ * webhook body, so the upstream trigger matcher matches path filters
+ * conservatively (the workflow runs) instead of silently never matching. A
+ * follow-up can add an optional REST fetcher if source authors want exact PR
+ * path filtering.
  */
 
-import type { ChangedFilesFetcher } from '@kici-dev/engine';
+import type { ChangedFilesFetcher, ChangedFilesResult } from '@kici-dev/engine';
 import { JSONPath } from 'jsonpath-plus';
 import {
   expandUniversalGitConfig,
@@ -63,13 +64,13 @@ export class UniversalGitChangedFilesFetcher implements ChangedFilesFetcher {
     eventType: string,
     payload: unknown,
     _credentials: unknown,
-  ): Promise<string[]> {
+  ): Promise<ChangedFilesResult> {
     const kind = this.classifyEvent(eventType);
     if (kind !== 'push') {
-      // PR events: no per-commit diff available in the webhook body; upstream
-      // trigger logic treats empty changed-files as "match any path", which
-      // is the intended semantics for universal-git v1.
-      return [];
+      // PR events: no per-commit diff is available in the webhook body — report
+      // `unavailable` so path filters match conservatively (the workflow runs)
+      // instead of silently never matching.
+      return { files: [], status: 'unavailable' };
     }
 
     const p = (payload as Record<string, unknown>) ?? {};
@@ -85,7 +86,7 @@ export class UniversalGitChangedFilesFetcher implements ChangedFilesFetcher {
       wrap: true,
     }) as unknown[];
 
-    return collectStrings([...added, ...modified, ...removed]);
+    return { files: collectStrings([...added, ...modified, ...removed]), status: 'fetched' };
   }
 
   private classifyEvent(eventType: string): 'push' | 'pull_request' | null {

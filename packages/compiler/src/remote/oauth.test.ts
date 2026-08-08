@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from 'vitest';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -28,6 +28,99 @@ function discoveryDoc(origin: string): string {
 
 function isDiscoveryReq(url: string | undefined): boolean {
   return url === '/.well-known/openid-configuration';
+}
+
+/**
+ * How long a console wait may run before it gives up and reports what it saw.
+ * It must stay well under the package-wide 15s vitest timeout so the helper's
+ * diagnosis — not a bare "Test timed out" — is what a developer reads.
+ */
+const CALLBACK_WAIT_MS = 5_000;
+
+/**
+ * The authorize URL as it appears on stdout. The character class excludes ESC
+ * so a colorized line cannot capture a trailing style reset into the URL.
+ */
+const AUTHORIZE_URL = /(http:\/\/127\.0\.0\.1:\d+\/oauth\/v2\/authorize\?[^\s\u001B]+)/;
+
+function consoleText(spy: MockInstance): string {
+  return spy.mock.calls.map((c) => c.join(' ')).join('\n');
+}
+
+/**
+ * Wait for `pattern` to appear on the spied console, bounded by a deadline and
+ * raced against the flow that is supposed to print it. Exactly three exits, and
+ * none of them hang: the pattern matches, the flow rejects, or the deadline
+ * fires with a diagnosis naming what was awaited and what the console held.
+ */
+async function waitForConsole(
+  spy: MockInstance,
+  pattern: RegExp,
+  opts: { flow: Promise<unknown>; label: string; timeoutMs?: number },
+): Promise<RegExpMatchArray> {
+  const timeoutMs = opts.timeoutMs ?? CALLBACK_WAIT_MS;
+  const startedAt = Date.now();
+  let interval: ReturnType<typeof setInterval> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  // A flow cannot resolve before its callback is driven, so the resolve branch
+  // parks forever; only a rejection is allowed to win this race.
+  const flowRejected = opts.flow.then(
+    () => new Promise<never>(() => {}),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`while waiting for ${opts.label}, the flow rejected: ${message}`, {
+        cause: err,
+      });
+    },
+  );
+  // Swallow the loser of the race so a late flow rejection is not reported as
+  // an unhandled rejection inside whichever test runs next.
+  flowRejected.catch(() => {});
+
+  const polled = new Promise<RegExpMatchArray>((resolve, reject) => {
+    interval = setInterval(() => {
+      const match = consoleText(spy).match(pattern);
+      if (match) resolve(match);
+    }, 10);
+    timer = setTimeout(() => {
+      const text = consoleText(spy);
+      reject(
+        new Error(
+          `timed out after ${Date.now() - startedAt}ms waiting for ${opts.label} ` +
+            `(/${pattern.source}/). Console held: ${text || '(console produced no output)'}`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([polled, flowRejected]);
+  } finally {
+    clearInterval(interval);
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Wait for the authorize URL the flow prints, then drive the OIDC callback the
+ * browser would normally deliver. The callback fetch is awaited, so a callback
+ * that fails to land surfaces here instead of being dropped.
+ */
+async function driveCallback(
+  spy: MockInstance,
+  flow: Promise<unknown>,
+  opts?: { pattern?: RegExp; timeoutMs?: number },
+): Promise<void> {
+  const match = await waitForConsole(spy, opts?.pattern ?? AUTHORIZE_URL, {
+    flow,
+    label: 'the authorize URL',
+    timeoutMs: opts?.timeoutMs,
+  });
+  const authUrl = new URL(match[1]);
+  const redirectUri = authUrl.searchParams.get('redirect_uri')!;
+  const state = authUrl.searchParams.get('state')!;
+  await fetch(`${redirectUri}?code=test-code&state=${state}`);
 }
 
 beforeEach(() => {
@@ -205,27 +298,69 @@ describe('pkceFlow', () => {
     ).rejects.toThrow(/KICI_CALLBACK_PORT/);
   });
 
+  it('throws on out-of-range KICI_CALLBACK_PORT', async () => {
+    // Above 65535 `server.listen()` throws a synchronous RangeError that never
+    // reaches the 'error' listener, so the range has to be rejected up front.
+    process.env.KICI_CALLBACK_PORT = '70000';
+
+    await expect(
+      pkceFlow({
+        issuer: 'http://127.0.0.1:1234',
+        clientId: 'test-client-id',
+      }),
+    ).rejects.toThrow(/KICI_CALLBACK_PORT/);
+  });
+
+  it('rejects with an actionable error when KICI_CALLBACK_PORT is busy', async () => {
+    // The OIDC discovery fetch runs before the callback server binds, so the
+    // issuer must point at a real discovery endpoint — not at the squatter,
+    // which speaks no OIDC.
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    const squatter = createServer(() => {});
+    await new Promise<void>((resolve) => {
+      squatter.listen(0, '127.0.0.1', () => resolve());
+    });
+    const busyPort = (squatter.address() as AddressInfo).port;
+
+    try {
+      process.env.KICI_CALLBACK_PORT = String(busyPort);
+
+      const err = await pkceFlow({
+        issuer: `http://127.0.0.1:${mockPort}`,
+        clientId: 'test-client-id',
+      }).then(
+        () => null,
+        (e) => e as Error,
+      );
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toContain(String(busyPort));
+      expect(err!.message).toContain('KICI_CALLBACK_PORT');
+      expect(err!.message).toContain('--device');
+    } finally {
+      squatter.close();
+    }
+  });
+
   it('prints URL to stdout when KICI_BROWSER_CMD=none', async () => {
     process.env.KICI_BROWSER_CMD = 'none';
     vi.mocked(open).mockClear();
 
     const consoleSpy = vi.spyOn(console, 'log');
-
-    // We need to simulate the callback happening after the URL is printed
-    // Use a small delay to allow the server to start and URL to be printed
-    const callbackPromise = new Promise<void>((resolve) => {
-      const interval = setInterval(() => {
-        const calls = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-        const match = calls.match(/KICI_AUTH_URL=(\S+)/);
-        if (match) {
-          clearInterval(interval);
-          const authUrl = new URL(match[1]);
-          const redirectUri = authUrl.searchParams.get('redirect_uri')!;
-          const state = authUrl.searchParams.get('state')!;
-          fetch(`${redirectUri}?code=test-code&state=${state}`).then(() => resolve());
-        }
-      }, 10);
-    });
 
     mockAuthServer = createServer((req, res) => {
       if (isDiscoveryReq(req.url)) {
@@ -252,7 +387,9 @@ describe('pkceFlow', () => {
       clientId: 'test-client-id',
     });
 
-    await callbackPromise;
+    // This test exists to prove the machine-readable form is printed, so wait
+    // on that exact marker rather than the generic authorize-URL pattern.
+    await driveCallback(consoleSpy, tokenPromise, { pattern: /KICI_AUTH_URL=(\S+)/ });
     const token = await tokenPromise;
 
     expect(token).toBe('browser-cmd-none-token');
@@ -261,6 +398,51 @@ describe('pkceFlow', () => {
     // Should have printed the auth URL
     const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(allOutput).toContain('KICI_AUTH_URL=');
+  });
+
+  it('prints the authorize URL on the default open path', async () => {
+    delete process.env.KICI_BROWSER_CMD;
+    vi.mocked(open).mockClear();
+    vi.mocked(open).mockResolvedValue(undefined as never);
+
+    const consoleSpy = vi.spyOn(console, 'log');
+
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+      } else if (req.url?.startsWith('/oauth/v2/token')) {
+        let body = '';
+        req.on('data', (chunk: Buffer) => (body += chunk.toString()));
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ access_token: 'default-open-token' }));
+        });
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    const tokenPromise = pkceFlow({
+      issuer: `http://127.0.0.1:${mockPort}`,
+      clientId: 'test-client-id',
+    });
+
+    await driveCallback(consoleSpy, tokenPromise);
+    const token = await tokenPromise;
+
+    expect(token).toBe('default-open-token');
+    // The default path does attempt the launch...
+    expect(open).toHaveBeenCalledTimes(1);
+    // ...and prints the URL regardless, so a launch that silently fails to
+    // display a browser still leaves the user something to click.
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(allOutput).toContain('If it does not open, visit:');
+    expect(allOutput).toContain('/oauth/v2/authorize?');
   });
 
   it('serves HTML success page on callback', async () => {
@@ -304,6 +486,217 @@ describe('pkceFlow', () => {
     const html = await callbackResponse!.text();
     expect(html).toContain('KiCI');
     expect(html).toContain('success');
+  });
+
+  it('names the device flow in the callback timeout error', async () => {
+    delete process.env.KICI_BROWSER_CMD;
+    vi.mocked(open).mockClear();
+    vi.mocked(open).mockResolvedValue(undefined as never);
+
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    // The callback is never driven, so the flow must reject on its own timer.
+    // nudgeAfterMs is pinned high so this case exercises only the timeout.
+    await expect(
+      pkceFlow({
+        issuer: `http://127.0.0.1:${mockPort}`,
+        clientId: 'test-client-id',
+        timeoutMs: 100,
+        nudgeAfterMs: 60_000,
+      }),
+    ).rejects.toThrow(/kici login --device/);
+  });
+
+  it('nudges toward the device flow while still waiting for the callback', async () => {
+    delete process.env.KICI_BROWSER_CMD;
+    vi.mocked(open).mockClear();
+    vi.mocked(open).mockResolvedValue(undefined as never);
+
+    const consoleSpy = vi.spyOn(console, 'log');
+
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+      } else if (req.url?.startsWith('/oauth/v2/token')) {
+        req.on('data', () => {});
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ access_token: 'nudge-token' }));
+        });
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    const tokenPromise = pkceFlow({
+      issuer: `http://127.0.0.1:${mockPort}`,
+      clientId: 'test-client-id',
+      nudgeAfterMs: 50,
+    });
+
+    // Wait for the nudge to appear, and only then drive the callback: the flow
+    // runs with a 50ms nudge delay, so driving it first would mean the asserted
+    // nudge never fires. Waiting for the nudge rather than sleeping a fixed
+    // duration is what keeps this deterministic.
+    await waitForConsole(consoleSpy, /Still waiting for the browser callback/, {
+      flow: tokenPromise,
+      label: 'the nudge',
+    });
+    await driveCallback(consoleSpy, tokenPromise);
+    const token = await tokenPromise;
+
+    expect(token).toBe('nudge-token');
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(allOutput).toContain('Still waiting for the browser callback');
+    expect(allOutput).toContain('kici login --device');
+  });
+
+  it('does not nudge when the callback arrives promptly', async () => {
+    delete process.env.KICI_BROWSER_CMD;
+    vi.mocked(open).mockClear();
+    vi.mocked(open).mockResolvedValue(undefined as never);
+
+    const consoleSpy = vi.spyOn(console, 'log');
+
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+      } else if (req.url?.startsWith('/oauth/v2/token')) {
+        req.on('data', () => {});
+        req.on('end', () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ access_token: 'quiet-token' }));
+        });
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    const tokenPromise = pkceFlow({
+      issuer: `http://127.0.0.1:${mockPort}`,
+      clientId: 'test-client-id',
+      nudgeAfterMs: 30_000,
+    });
+    await driveCallback(consoleSpy, tokenPromise);
+    const token = await tokenPromise;
+
+    expect(token).toBe('quiet-token');
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(allOutput).not.toContain('Still waiting for the browser callback');
+  });
+
+  it('does not nudge once the callback landed, even if the token exchange is slow', async () => {
+    delete process.env.KICI_BROWSER_CMD;
+    vi.mocked(open).mockClear();
+    vi.mocked(open).mockResolvedValue(undefined as never);
+
+    const consoleSpy = vi.spyOn(console, 'log');
+
+    // The nudge delay is deliberately far longer than a loopback callback
+    // round-trip, and the token exchange is held past it. So the nudge window
+    // opens strictly *after* the callback landed and strictly *before* the
+    // token arrives — the exact window in which the nudge's "press Ctrl-C"
+    // advice would abort a login that is succeeding.
+    const NUDGE_AFTER_MS = 1_000;
+    const TOKEN_HOLD_MS = 1_400;
+
+    let tokenRequestAt: number | undefined;
+
+    mockAuthServer = createServer((req, res) => {
+      if (isDiscoveryReq(req.url)) {
+        const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(discoveryDoc(origin));
+      } else if (req.url?.startsWith('/oauth/v2/token')) {
+        tokenRequestAt = Date.now();
+        req.on('data', () => {});
+        req.on('end', () => {
+          setTimeout(() => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ access_token: 'slow-exchange-token' }));
+          }, TOKEN_HOLD_MS);
+        });
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      mockAuthServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    mockPort = (mockAuthServer.address() as AddressInfo).port;
+
+    const startedAt = Date.now();
+    const tokenPromise = pkceFlow({
+      issuer: `http://127.0.0.1:${mockPort}`,
+      clientId: 'test-client-id',
+      nudgeAfterMs: NUDGE_AFTER_MS,
+    });
+
+    await driveCallback(consoleSpy, tokenPromise);
+    const token = await tokenPromise;
+
+    // Guard the premise: if the loopback callback somehow took longer than the
+    // nudge delay, the nudge fired legitimately and the assertion below would
+    // be meaningless. Fail loudly rather than pass vacuously.
+    expect(tokenRequestAt).toBeDefined();
+    expect(tokenRequestAt! - startedAt).toBeLessThan(NUDGE_AFTER_MS);
+
+    expect(token).toBe('slow-exchange-token');
+    const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(allOutput).not.toContain('Still waiting for the browser callback');
+  });
+
+  it('waitForConsole reports a deadline with a diagnosis instead of hanging', async () => {
+    const consoleSpy = vi.spyOn(console, 'log');
+    const neverSettles = new Promise<never>(() => {});
+
+    await expect(
+      waitForConsole(consoleSpy, /a line nothing ever prints/, {
+        flow: neverSettles,
+        label: 'a line nothing prints',
+        timeoutMs: 50,
+      }),
+    ).rejects.toThrow(/waiting for a line nothing prints/);
+  });
+
+  it('driveCallback surfaces a flow rejection instead of timing out', async () => {
+    const consoleSpy = vi.spyOn(console, 'log');
+
+    // Bind+close a probe server to get a port nothing listens on. Discovery
+    // then rejects before any authorize URL is printed — the exact shape that
+    // leaves an unbounded poller waiting for a line that will never arrive.
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', () => resolve()));
+    const deadPort = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+
+    const tokenPromise = pkceFlow({
+      issuer: `http://127.0.0.1:${deadPort}`,
+      clientId: 'test-client-id',
+    });
+
+    await expect(driveCallback(consoleSpy, tokenPromise)).rejects.toThrow(/the flow rejected/);
+    await expect(tokenPromise).rejects.toThrow();
   });
 });
 

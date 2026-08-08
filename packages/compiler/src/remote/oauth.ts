@@ -33,6 +33,19 @@ interface PkceFlowOptions {
   issuer: string;
   /** OAuth client ID for the CLI application */
   clientId: string;
+  /**
+   * Delay before the "still waiting" nudge is printed. A testing seam, not a
+   * user-facing knob — no CLI flag or env var sets it.
+   */
+  nudgeAfterMs?: number;
+  /**
+   * How long to wait for the browser callback before giving up. A testing seam,
+   * not a user-facing knob — no CLI flag or env var sets it. The timeout message
+   * states five minutes literally, so a non-default value produces a message
+   * whose duration does not match; that is acceptable only because no user can
+   * set this. Promoting it to a real option means deriving the duration from it.
+   */
+  timeoutMs?: number;
 }
 
 /** Options for the RFC 8628 device authorization flow. */
@@ -121,6 +134,31 @@ const SUCCESS_HTML = `<!DOCTYPE html>
 </html>`;
 
 /**
+ * Turn a callback-server `listen` failure into an actionable message.
+ *
+ * The wording differs by cause on purpose: naming `KICI_CALLBACK_PORT` when the
+ * port was ephemeral misdirects the user, and reporting "already in use" for a
+ * permission error is a false diagnosis.
+ */
+function describeListenFailure(err: NodeJS.ErrnoException, listenPort: number): string {
+  const escapes =
+    'Retry with `kici login --device` (no local callback needed), or set KICI_CALLBACK_PORT to a free port your firewall allows.';
+
+  if (err.code === 'EADDRINUSE') {
+    if (listenPort === 0) {
+      return `No local port was available for the login callback server. ${escapes}`;
+    }
+    return `Port ${listenPort} (KICI_CALLBACK_PORT) is already in use, so the login callback server could not start. ${escapes}`;
+  }
+
+  if (err.code === 'EACCES') {
+    return `Permission denied binding port ${listenPort} (KICI_CALLBACK_PORT) for the login callback server — ports below 1024 need elevated privileges. ${escapes}`;
+  }
+
+  return `Could not start the local callback server on port ${listenPort}: ${err.message}. ${escapes}`;
+}
+
+/**
  * PKCE authorization code flow with localhost callback.
  *
  * Spins up a temporary HTTP server on a random port, opens the browser
@@ -133,7 +171,7 @@ const SUCCESS_HTML = `<!DOCTYPE html>
  * @returns OIDC access token
  */
 export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
-  const { issuer, clientId } = opts;
+  const { issuer, clientId, nudgeAfterMs = 90_000, timeoutMs = 5 * 60 * 1000 } = opts;
 
   // Validate KICI_CALLBACK_PORT before the discovery round-trip — a bad
   // env var should fail fast with a clear message, not get masked by a
@@ -142,9 +180,12 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
   const callbackPortEnv = process.env.KICI_CALLBACK_PORT;
   if (callbackPortEnv) {
     const parsed = parseInt(callbackPortEnv, 10);
-    if (isNaN(parsed) || parsed < 0) {
+    // The upper bound matters as much as the lower one: `server.listen()`
+    // rejects a port above 65535 with a synchronous RangeError, which escapes
+    // as a raw stack trace instead of reaching describeListenFailure().
+    if (isNaN(parsed) || parsed < 0 || parsed > 65535) {
       throw new Error(
-        `KICI_CALLBACK_PORT must be a valid non-negative integer, got: "${callbackPortEnv}"`,
+        `KICI_CALLBACK_PORT must be a port number between 0 and 65535, got: "${callbackPortEnv}"`,
       );
     }
     listenPort = parsed;
@@ -154,10 +195,9 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
   const { verifier, challenge } = generatePkceChallenge();
   const state = randomBytes(16).toString('hex');
 
-  const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
-
   return new Promise<string>((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let nudgeTimer: ReturnType<typeof setTimeout> | undefined;
 
     const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       const url = new URL(req.url!, `http://127.0.0.1`);
@@ -166,6 +206,13 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
         res.end('Not found');
         return;
       }
+
+      // The callback landed, so the "your browser cannot reach the callback"
+      // nudge no longer applies. Cancel it here rather than in cleanup(): the
+      // token exchange below can itself outlast the nudge delay, and telling a
+      // user mid-exchange to press Ctrl-C would abort a login that is
+      // succeeding.
+      if (nudgeTimer) clearTimeout(nudgeTimer);
 
       const code = url.searchParams.get('code');
       const returnedState = url.searchParams.get('state');
@@ -238,8 +285,19 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
 
     function cleanup() {
       if (timer) clearTimeout(timer);
+      if (nudgeTimer) clearTimeout(nudgeTimer);
       if (server.listening) server.close();
     }
+
+    // Without an 'error' listener a failed bind emits 'error' with nobody
+    // attached, so Node raises an uncaught exception and this promise never
+    // settles. cleanup() is safe here: it guards server.close() behind
+    // server.listening (false after a failed bind) and the timers it clears
+    // are not set yet.
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      cleanup();
+      reject(new Error(describeListenFailure(err, listenPort)));
+    });
 
     server.listen(listenPort, '127.0.0.1', () => {
       const actualPort = (server.address() as AddressInfo).port;
@@ -273,8 +331,11 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
           }
         });
       } else {
-        // Default: use open package
+        // Default: use open package. `open` resolves as soon as it spawns the
+        // launcher, so a launch that never displays a browser does not reject —
+        // print the URL up front so that case is still recoverable.
         console.log(pc.cyan('  Opening browser for authentication...'));
+        console.log(pc.dim(`  If it does not open, visit:\n  ${authUrl.toString()}`));
         open(authUrl.toString()).catch(() => {
           console.log(
             pc.yellow(
@@ -285,12 +346,31 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
       }
     });
 
+    // A blocked callback otherwise means five silent minutes before the timeout
+    // says anything, so nudge once mid-wait. The delay has to clear a healthy
+    // interactive sign-in — typing credentials, an MFA prompt, and a cold IdP
+    // login page together run well past half a minute — because a nudge that
+    // fires during a login that is succeeding reads as advice to abort it.
+    nudgeTimer = setTimeout(() => {
+      console.log(
+        pc.yellow(
+          '  Still waiting for the browser callback...\n' +
+            '  If you are still signing in, ignore this. If your browser cannot reach the\n' +
+            '  callback, press Ctrl+C and retry with `kici login --device`.',
+        ),
+      );
+    }, nudgeAfterMs);
+
     timer = setTimeout(() => {
       cleanup();
       reject(
-        new Error('Authentication timed out after 5 minutes. Please try again with `kici login`.'),
+        new Error(
+          'Authentication timed out after 5 minutes. ' +
+            'If your browser cannot reach the local callback, retry with `kici login --device` ' +
+            'to authenticate without one.',
+        ),
       );
-    }, TIMEOUT_MS);
+    }, timeoutMs);
   });
 }
 

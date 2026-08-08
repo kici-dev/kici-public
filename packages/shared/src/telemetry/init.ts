@@ -54,16 +54,21 @@ export function getPrometheusExporter(): PrometheusExporter | undefined {
   return _prometheusExporter;
 }
 
+/** One instrument's identity plus the descriptor facts that decide its wire kind. */
+export interface RuntimeMetricDescriptor {
+  name: string;
+  dataPointType: number;
+  isMonotonic?: boolean;
+}
+
 /**
  * Boot `RuntimeNodeInstrumentation` standalone, exercise the event loop and
- * garbage collector, collect once, and return the set of dotted instrument
- * names it emitted. This is the ground truth for the curated runtime-metrics
- * catalog drift guard (`scripts/generate-prometheus.ts`). It deliberately
- * does NOT touch the singleton `_prometheusExporter` — it spins up an
- * isolated SDK so it can be called from tooling without affecting a running
- * service's telemetry.
+ * garbage collector, collect once, and return one descriptor per instrument it
+ * emitted. It deliberately does NOT touch the singleton `_prometheusExporter` —
+ * it spins up an isolated SDK so it can be called from tooling without
+ * affecting a running service's telemetry.
  */
-export async function collectRuntimeMetricNames(): Promise<string[]> {
+async function probeRuntimeInstruments(): Promise<RuntimeMetricDescriptor[]> {
   const exporter = new PrometheusExporter({ preventServerStart: true });
   const sdk = new NodeSDK({
     resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: 'runtime-metrics-drift-guard' }),
@@ -83,13 +88,45 @@ export async function collectRuntimeMetricNames(): Promise<string[]> {
   if (typeof global.gc === 'function') global.gc();
   await new Promise((r) => setTimeout(r, 500));
 
-  const names = new Set<string>();
+  const descriptors: RuntimeMetricDescriptor[] = [];
   const { resourceMetrics } = await exporter.collect();
   for (const scopeMetrics of resourceMetrics.scopeMetrics) {
     for (const metric of scopeMetrics.metrics) {
-      names.add((metric as { descriptor: { name: string } }).descriptor.name);
+      const m = metric as {
+        descriptor: { name: string };
+        dataPointType: number;
+        isMonotonic?: boolean;
+      };
+      descriptors.push({
+        name: m.descriptor.name,
+        dataPointType: m.dataPointType,
+        ...(m.isMonotonic === undefined ? {} : { isMonotonic: m.isMonotonic }),
+      });
     }
   }
   await sdk.shutdown();
-  return [...names].sort();
+  return descriptors;
+}
+
+/**
+ * The sorted set of dotted instrument names `RuntimeNodeInstrumentation`
+ * emits. This is the ground truth for the curated runtime-metrics catalog
+ * drift guard (`scripts/generate-prometheus.ts`).
+ */
+export async function collectRuntimeMetricNames(): Promise<string[]> {
+  const descriptors = await probeRuntimeInstruments();
+  return [...new Set(descriptors.map((d) => d.name))].sort();
+}
+
+/**
+ * Like `collectRuntimeMetricNames`, but also returns each instrument's
+ * descriptor type and monotonicity — the facts that decide the wire kind the
+ * Platform admits it as. Ground truth for the drift guard's kind check.
+ *
+ * Deliberately not exported from the package barrel: it is tooling ground truth,
+ * and `@kici-dev/shared` is a published surface.
+ */
+export async function collectRuntimeMetricDescriptors(): Promise<RuntimeMetricDescriptor[]> {
+  const descriptors = await probeRuntimeInstruments();
+  return descriptors.sort((a, b) => a.name.localeCompare(b.name));
 }

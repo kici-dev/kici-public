@@ -40,7 +40,7 @@ vi.mock('../../service/index.js', async () => {
 });
 
 import { registerAgentStop } from './stop.js';
-import { writeIndex, writeManifest } from '../../service/index.js';
+import { InstanceNotFoundError, writeIndex, writeManifest } from '../../service/index.js';
 import type { InstanceManifest } from '../../service/index.js';
 
 function mkTmp(prefix: string): string {
@@ -116,6 +116,25 @@ describe('agent stop — folder-anchored', () => {
       process.chdir(savedCwd);
       exitSpy.mockRestore();
       fs.rmSync(emptyCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('exits 0 as a no-op when --name matches no installed instance', async () => {
+    // Empty scan → resolveInstance throws InstanceNotFoundError for the name.
+    mockListResult = [];
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+
+    try {
+      await program.parseAsync(['node', 'agent', 'stop', '--name', 'kici-absent']);
+      expect(mockStop).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+      const logs = consoleLogSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(logs).toContain('not installed');
+      expect(new InstanceNotFoundError('agent', 'x', 'm')).toBeInstanceOf(Error);
+    } finally {
+      exitSpy.mockRestore();
     }
   });
 

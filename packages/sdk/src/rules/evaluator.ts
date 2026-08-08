@@ -1,5 +1,6 @@
 import type { Rule, RuleContext, RuleResult } from './types.js';
 import { toErrorMessage } from '@kici-dev/core';
+import { ChangedFilesUnavailableError } from './context.js';
 
 /**
  * Result of evaluating rules for a job or workflow.
@@ -8,6 +9,13 @@ import { toErrorMessage } from '@kici-dev/core';
 export interface RuleEvaluationResult {
   allPassed: boolean;
   results: RuleResult[];
+  /**
+   * Set iff a rule's check() threw — an evaluation failure, NOT a clean
+   * `return false`. Consumers fail-hard on this (surface the error + fail the
+   * job/step) instead of treating a crashed gate as a silent skip, which would
+   * be a false green. A clean false leaves this undefined.
+   */
+  evaluationError?: { label: string; message: string };
 }
 
 /**
@@ -31,6 +39,7 @@ export async function evaluateRules(
 ): Promise<RuleEvaluationResult> {
   const results: RuleResult[] = [];
   let allPassed = true;
+  let evaluationError: { label: string; message: string } | undefined;
 
   for (const rule of rules) {
     const startTime = Date.now();
@@ -40,8 +49,10 @@ export async function evaluateRules(
     try {
       passed = await rule.check(context);
     } catch (e) {
+      if (e instanceof ChangedFilesUnavailableError) throw e; // fatal — never a silent skip
       passed = false;
       error = toErrorMessage(e);
+      evaluationError = { label: rule.label, message: error };
     }
 
     const durationMs = Date.now() - startTime;
@@ -63,5 +74,5 @@ export async function evaluateRules(
     }
   }
 
-  return { allPassed, results };
+  return { allPassed, results, evaluationError };
 }

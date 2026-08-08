@@ -8,6 +8,11 @@
  * paths (matching routing key, unscoped token) are already covered
  * by the per-file tests next to each route file — this sweep
  * deliberately focuses on the deny case to prevent silent regressions.
+ *
+ * The secret routes are the exception: they have no matching-routing-key
+ * happy path at all, because secret scope names and routing keys are
+ * disjoint namespaces. A scoped token is refused on every secret route,
+ * including one named after its own routing key.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
@@ -123,6 +128,84 @@ describe('routing-key scope sweep — admin.ts', () => {
       { token: VALID_TOKEN, body: { value: 'v' } },
     );
     expect(res.status).toBe(403);
+  });
+
+  // Secrets have no per-routing-key slice: routing keys and secret scope
+  // paths are disjoint namespaces. A scoped token is refused on every
+  // secret route, including one named after its own routing key.
+  it('refuses scoped token on PUT /secrets/:orgId/:scope/:key for its OWN routing key', async () => {
+    const res = await request(
+      app,
+      'PUT',
+      `http://localhost/api/v1/admin/secrets/o1/${encodeURIComponent(TOKEN_ROUTING_KEY)}/k1`,
+      { token: VALID_TOKEN, body: { value: 'v' } },
+    );
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+  });
+
+  it('refuses scoped token on GET /secrets/keys for its OWN routing key', async () => {
+    const res = await request(
+      app,
+      'GET',
+      `http://localhost/api/v1/admin/secrets/keys?orgId=o1&scope=${encodeURIComponent(TOKEN_ROUTING_KEY)}`,
+      { token: VALID_TOKEN },
+    );
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.listKeys).not.toHaveBeenCalled();
+  });
+
+  it('refuses scoped token on POST /secrets/scopes (create)', async () => {
+    const res = await request(app, 'POST', 'http://localhost/api/v1/admin/secrets/scopes', {
+      token: VALID_TOKEN,
+      body: { orgId: 'o1', scope: TOKEN_ROUTING_KEY },
+    });
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.createScope).not.toHaveBeenCalled();
+  });
+
+  // Both sides name the token's own routing key on purpose: that is the only
+  // scope a routing-key match could ever have admitted, so it is the case that
+  // proves the route refuses the scoped token outright rather than refusing
+  // whichever side happens to differ.
+  it('refuses scoped token on PUT /secrets/scopes/rename for its OWN routing key', async () => {
+    const res = await request(app, 'PUT', 'http://localhost/api/v1/admin/secrets/scopes/rename', {
+      token: VALID_TOKEN,
+      body: { orgId: 'o1', oldScope: TOKEN_ROUTING_KEY, newScope: TOKEN_ROUTING_KEY },
+    });
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+  });
+
+  it('refuses scoped token on PUT /secrets/scopes/rename for a foreign routing key', async () => {
+    const res = await request(app, 'PUT', 'http://localhost/api/v1/admin/secrets/scopes/rename', {
+      token: VALID_TOKEN,
+      body: { orgId: 'o1', oldScope: TOKEN_ROUTING_KEY, newScope: 'aws/prod' },
+    });
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+  });
+
+  it('refuses scoped token on DELETE /secrets/scopes/:orgId/:scope', async () => {
+    const res = await request(
+      app,
+      'DELETE',
+      `http://localhost/api/v1/admin/secrets/scopes/o1/${encodeURIComponent(TOKEN_ROUTING_KEY)}`,
+      { token: VALID_TOKEN },
+    );
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.deleteScope).not.toHaveBeenCalled();
+  });
+
+  it('refuses scoped token on DELETE /secrets/:orgId/:scope/:key', async () => {
+    const res = await request(
+      app,
+      'DELETE',
+      `http://localhost/api/v1/admin/secrets/o1/${encodeURIComponent(TOKEN_ROUTING_KEY)}/k1`,
+      { token: VALID_TOKEN },
+    );
+    expect(res.status).toBe(403);
+    expect(deps.secretStore.deleteSecret).not.toHaveBeenCalled();
   });
 
   it('refuses scoped token on POST /rotate-key (orchestrator-wide)', async () => {

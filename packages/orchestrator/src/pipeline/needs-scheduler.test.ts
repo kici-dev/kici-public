@@ -248,6 +248,53 @@ describe('needs-scheduler', () => {
       expect(result).toEqual([{ jobName: 'deploy', action: 'dispatch' }]);
     });
 
+    it('dispatches a fan-in job once when several upstreams finish concurrently', async () => {
+      // Two upstreams of the same job reach terminal at nearly the same moment.
+      // Each terminal runs its own evaluateDownstreams, and both observe every
+      // upstream satisfied — only the one that wins the needs_satisfied claim
+      // may dispatch, or the job executes twice.
+      const db = createMockDb(
+        [
+          {
+            run_id: RUN_ID,
+            job_name: 'lint',
+            status: 'success',
+            needs_satisfied: true,
+            ready_at: null,
+            group_name: null,
+          },
+          {
+            run_id: RUN_ID,
+            job_name: 'test',
+            status: 'success',
+            needs_satisfied: true,
+            ready_at: null,
+            group_name: null,
+          },
+          {
+            run_id: RUN_ID,
+            job_name: 'deploy',
+            status: 'pending',
+            needs_satisfied: false,
+            ready_at: null,
+            group_name: null,
+          },
+        ],
+        [
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
+          { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS },
+        ],
+      );
+
+      const [fromLint, fromTest] = await Promise.all([
+        evaluateDownstreams(db, RUN_ID, 'lint', ExecutionJobStatus.enum.success),
+        evaluateDownstreams(db, RUN_ID, 'test', ExecutionJobStatus.enum.success),
+      ]);
+
+      const dispatches = [...fromLint, ...fromTest].filter((r) => r.action === 'dispatch');
+      expect(dispatches).toEqual([{ jobName: 'deploy', action: 'dispatch' }]);
+    });
+
     it('does NOT return downstream when another upstream is still pending', async () => {
       const db = createMockDb(
         [

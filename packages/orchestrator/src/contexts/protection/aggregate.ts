@@ -9,7 +9,13 @@
  * single most-restrictive effective set.
  */
 import picomatch from 'picomatch';
-import { ContextGateRejectReason, type Context } from '@kici-dev/engine';
+import {
+  ContextGateRejectReason,
+  DEFAULT_CONCURRENCY_STRATEGY,
+  DEFAULT_HOLD_EXPIRY_SECONDS,
+  type ConcurrencyStrategy,
+  type Context,
+} from '@kici-dev/engine';
 import type { JobDispatchContext } from './pipeline.js';
 
 /** A single context's rejection under all-must-pass aggregation. */
@@ -26,7 +32,7 @@ export interface EffectiveProtection {
   waitTimerSeconds: number | null;
   holdExpirySeconds: number;
   concurrencyLimit: number | null;
-  concurrencyStrategy: 'queue' | 'cancel-pending';
+  concurrencyStrategy: ConcurrencyStrategy;
 }
 
 const TRUST_RANK: Record<'known' | 'trusted', number> = { known: 1, trusted: 2 };
@@ -136,9 +142,11 @@ export function aggregateProtectionParams(envs: ReadonlyArray<Context>): Effecti
     minimumTrust,
     requiredReviewers: [...reviewers].sort(),
     waitTimerSeconds,
-    holdExpirySeconds: Number.isFinite(holdExpirySeconds) ? holdExpirySeconds : 3600,
+    holdExpirySeconds: Number.isFinite(holdExpirySeconds)
+      ? holdExpirySeconds
+      : DEFAULT_HOLD_EXPIRY_SECONDS,
     concurrencyLimit,
-    concurrencyStrategy: envs[0]?.concurrencyStrategy ?? 'queue',
+    concurrencyStrategy: envs[0]?.concurrencyStrategy ?? DEFAULT_CONCURRENCY_STRATEGY,
   };
 }
 

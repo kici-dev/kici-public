@@ -36,6 +36,7 @@ import type { AccessLogWriter } from '../audit/access-log.js';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
 import type { PeerRegistry } from '../cluster/peer-registry.js';
 import { shouldDeferReroutedJob } from '../cluster/rerouted-job-guard.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 const logger = createLogger({ prefix: 'stale-detector' });
 
@@ -52,6 +53,10 @@ export interface StaleRunDetectorDeps {
    * still be replayed from the worker's durable outbox.
    */
   peerRegistry: PeerRegistry;
+  /** Reader for fleet-wide cluster tunables (reroute flap-grace override). */
+  clusterSettings: ClusterSettingsReader;
+  /** Cluster default for the reroute flap-grace window (config.rerouteFlapGraceMs). */
+  rerouteFlapGraceFallbackMs: number;
   /** Threshold in ms after which a job is considered stale. Default: heartbeatIntervalMs * multiplier */
   staleThresholdMs: number;
   /** How often to scan for stale jobs in ms. Default: 60_000 */
@@ -80,6 +85,8 @@ export class StaleRunDetector {
   private readonly dispatcher: Dispatcher;
   private readonly registry: AgentRegistry;
   private readonly peerRegistry: PeerRegistry;
+  private readonly clusterSettings: ClusterSettingsReader;
+  private readonly rerouteFlapGraceFallbackMs: number;
   private readonly staleThresholdMs: number;
   private readonly scanIntervalMs: number;
   private readonly heldRunStore?: HeldRunStore;
@@ -97,6 +104,8 @@ export class StaleRunDetector {
     this.dispatcher = deps.dispatcher;
     this.registry = deps.registry;
     this.peerRegistry = deps.peerRegistry;
+    this.clusterSettings = deps.clusterSettings;
+    this.rerouteFlapGraceFallbackMs = deps.rerouteFlapGraceFallbackMs;
     this.staleThresholdMs = deps.staleThresholdMs;
     this.scanIntervalMs = deps.scanIntervalMs;
     this.heldRunStore = deps.heldRunStore;
@@ -642,7 +651,11 @@ export class StaleRunDetector {
     // the worker's terminal status may still be replayed from its durable
     // outbox. A rerouted job whose worker has been gone past the grace window
     // is NOT deferred, so a dead worker's job is still timed out.
-    if (shouldDeferReroutedJob(job, this.peerRegistry)) {
+    const flapGraceMs = await this.clusterSettings.getNumber(
+      'reroute_flap_grace_ms',
+      this.rerouteFlapGraceFallbackMs,
+    );
+    if (shouldDeferReroutedJob(job, this.peerRegistry, { flapGraceMs })) {
       logger.info('Deferring stale-fail for rerouted job; worker peer connected or recently seen', {
         runId: job.run_id,
         jobId: job.job_id,

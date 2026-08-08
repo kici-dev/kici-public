@@ -10,7 +10,11 @@
  * - deleteSecret calls delete with correct filters
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
-import { PgSecretStore, SecretScopeNotFoundError } from './pg-secret-store.js';
+import {
+  PgSecretStore,
+  SecretScopeExistsError,
+  SecretScopeNotFoundError,
+} from './pg-secret-store.js';
 import { encrypt, decrypt, deriveKey, type EncryptedValue } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
@@ -550,6 +554,43 @@ describe('PgSecretStore', () => {
       await expect(store.renameScope('org-001', 'missing', 'missing-2')).rejects.toBeInstanceOf(
         SecretScopeNotFoundError,
       );
+    });
+
+    it('renameScope refuses a target scope that already exists', async () => {
+      // Renaming onto an occupied scope silently MERGES two scopes: rows whose
+      // key does not collide land under the target name and the operator is
+      // told the rename succeeded. Refuse instead — a merge is never what a
+      // rename means, and the losing rows are unrecoverable once re-encrypted.
+      const orgId = 'org-001';
+      const oldScope = 'aws/old';
+      const enc = encrypt('value-a', testKey, testKeyVersion, `${orgId}:${oldScope}:KEY_A`);
+      const db = createMockDb({
+        selectRows: [
+          {
+            id: 'sec-0',
+            org_id: orgId,
+            scope: oldScope,
+            key: 'KEY_A',
+            encrypted_value: enc.data,
+            key_version: testKeyVersion,
+          },
+          {
+            id: 'sec-1',
+            org_id: orgId,
+            scope: 'aws/new',
+            key: 'KEY_B',
+            encrypted_value: enc.data,
+            key_version: testKeyVersion,
+          },
+        ],
+      });
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+
+      await expect(store.renameScope(orgId, oldScope, 'aws/new')).rejects.toBeInstanceOf(
+        SecretScopeExistsError,
+      );
+      // Nothing may be re-encrypted or moved once the conflict is detected.
+      expect(db.updateTable).not.toHaveBeenCalled();
     });
 
     it('deleteScope uses a transaction', async () => {

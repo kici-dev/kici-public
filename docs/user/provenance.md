@@ -23,13 +23,20 @@ An attestation is a self-contained bundle holding three things:
   commit, ref, workflow, run/job identifiers, timestamps).
 - A **[DSSE](https://github.com/secure-systems-lab/dsse) signature** over that
   statement, made with an ephemeral signing key generated for the run.
-- A short-lived **OIDC identity token** issued by the KiCI platform that binds
-  the signature to the build identity. The token's identity claims
-  (`repository`, `ref`, `sha`, run/job ids) are derived by the platform from the
-  run itself — a step cannot forge them.
+- A short-lived **OIDC identity token** issued by your **orchestrator** that
+  binds the signature to the build identity. The token's identity claims
+  (`repository`, `ref`, `sha`, run/job ids) are derived by the orchestrator from
+  the run itself — a step cannot forge them.
+
+The orchestrator owns the provenance root of trust: it holds its own long-lived
+ES256 signing key, mints and signs the identity token **locally** from its own
+run records, and publishes its own OIDC discovery + public key set (JWKS). Builds
+therefore produce verifiable provenance with **no dependency on the hosted KiCI
+platform** — the availability, sovereignty, and air-gap story all follow from
+this.
 
 Because the bundle carries the identity token and the public signing key, it is
-**offline-verifiable**: a verifier checks it against the platform's published
+**offline-verifiable**: a verifier checks it against the orchestrator's published
 signing keys with no per-attestation online lookup.
 
 ## Attesting an artifact in a workflow
@@ -78,8 +85,11 @@ The identity token is fetched and masked in logs automatically — you never
 handle it. The call returns `{ storageKey, subjectDigest, bundleMediaType }`
 identifying the stored bundle.
 
-`ctx.attestProvenance` is only available inside a running job step. Calling it
-during local execution rejects with a clear error.
+`ctx.attestProvenance` is only available inside a running job step; calling it
+outside one rejects with a clear error. `kici run --local` runs are supported:
+the offline local dev plane signs with a dev identity under the
+clearly-non-production issuer `kici-local`, and those bundles verify against a
+trust root exported with `kici local trust-root`.
 
 ### Requesting a raw identity token
 
@@ -96,11 +106,11 @@ step('mint', async (ctx) => {
 
 The token is a short-lived (about 10 minutes) signed JWT scoped to the current
 run and job. Its identity claims (`repository`, `ref`, `sha`, `kici_run_id`,
-`kici_job_id`) are derived by the platform from the run context, so a step cannot
-spoof them. The returned token value is automatically masked in step logs, and
-the step never holds platform credentials — the request is relayed through the
-orchestrator, which mints the token on the step's behalf. Like
-`attestProvenance`, it is only available inside a running job step.
+`kici_job_id`) are derived by the orchestrator from the run context, so a step
+cannot spoof them. The returned token value is automatically masked in step logs,
+and the step never holds signing credentials — the orchestrator mints and signs
+the token on the step's behalf from its own run records. Like `attestProvenance`,
+it is only available inside a running job step.
 
 ## Verifying an attestation
 
@@ -116,14 +126,27 @@ kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-
 
 ### Which trust root do I use?
 
-The trust root is the **KiCI platform's provenance issuer** — the same hosted
-KiCI platform you `kici login` against. KiCI attestations are issued by, and
-verified against, that one issuer; there are no competing "roots" to choose
-between. So the answer to "shouldn't I just use KiCI as the trust root?" is yes
-— and that's the **default**: omit `--trust-root` and the verifier checks the
-bundle against the hosted KiCI platform automatically. You only pass
-`--trust-root` to verify against a different environment or, more commonly, an
-offline `{ issuer, jwks }` file for air-gapped checks.
+The trust root is **your orchestrator's provenance issuer** — the orchestrator
+you `kici login` against, which owns the provenance signing key and publishes its
+own JWKS. That is the **default**: omit `--trust-root` and the verifier checks the
+bundle against your configured orchestrator automatically. There are three ways to
+verify, and offline is always the primary one:
+
+1. **Offline against a JWKS / trust-root file (air-gap)** — export the
+   `{ issuer, jwks }` file once with `kici-admin signing-key export --public` and
+   verify against it with `--trust-root <file>`. No network needed at verify time.
+2. **Directly online against your orchestrator** — the default: the verifier
+   resolves your orchestrator's discovery → JWKS. You can also POST a bundle to
+   the orchestrator's native `POST /v1/verify-attestation` endpoint for a verdict
+   against its live keys (fresh rotations / revocations included).
+3. **Against the hosted KiCI platform** — bundles produced before your
+   orchestrator owned signing were signed by the hosted platform; those keep
+   verifying forever. When no orchestrator is configured, the default falls back
+   to the hosted platform's issuer so those historical bundles still verify with
+   no flag.
+
+You pass `--trust-root` to verify against a different environment or, most
+commonly, an offline `{ issuer, jwks }` file for air-gapped checks.
 
 ### Why you supply it out-of-band
 
@@ -166,7 +189,7 @@ when it does not (or on an error such as a missing flag or unreachable trust
 root).
 
 ```bash
-# Default: verify against the hosted KiCI platform (no --trust-root needed):
+# Default: verify against your configured orchestrator (no --trust-root needed):
 kici verify-attestation ./dist/app.tgz --bundle ./app.tgz.kici.json
 
 # Override the trust root to verify against a specific issuer:
@@ -180,7 +203,7 @@ kici verify-attestation ./dist/app.tgz \
   --trust-root ./kici-trust-root.json
 ```
 
-The full flag reference is in the [CLI reference](./cli-reference.md#kici-verify-attestation).
+The full flag reference is in the [CLI reference](./cli/notifications-and-diagnostics.md#kici-verify-attestation).
 
 ## Viewing attestations in the dashboard
 
@@ -201,6 +224,19 @@ the bundle did not pass; `unverifiable` means no verdict could be computed (no
 provenance issuer configured, or its keys could not be read — not a forgery
 signal); `pending` means the verdict has not been computed yet.
 
+A `pending` row is one still waiting to be minted — the attestation was signed
+at build time, but attaching its identity token has not completed yet. Those
+rows carry a **Retry** button that asks your orchestrator to mint that run's
+outstanding attestations immediately, and the page header offers **Retry
+pending** to do the same across every pending run. Only one retry runs at a
+time — the other retry buttons are unavailable until it finishes.
+
+Retrying is safe to repeat while the mint is only temporarily unavailable: the
+row stays pending and the next retry tries again. A mint that is definitively
+rejected — for example the run's records are no longer there to bind the
+attestation to — is terminal: the row stops being retried, and re-arming it is
+an operator action (`kici-admin attestations retry --include-rejected`).
+
 Opening a row leads to the **attestation detail page**:
 
 
@@ -208,5 +244,5 @@ Opening a row leads to the **attestation detail page**:
 
 - [SDK runtime reference](./sdk/runtime.md) — the `ctx.attestProvenance` and
   `ctx.kici.oidc.token` step APIs in full.
-- [CLI reference](./cli-reference.md#kici-verify-attestation) — every
+- [CLI reference](./cli/notifications-and-diagnostics.md#kici-verify-attestation) — every
   `kici verify-attestation` flag and exit code.

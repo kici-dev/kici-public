@@ -6,7 +6,7 @@ import {
   type RunCoordinatorDeps,
 } from './coordinator.js';
 import type { PeerInfo } from './peer-registry.js';
-import { ScalerEventType, type LabelMatcher } from '@kici-dev/engine';
+import { ExecutionJobStatus, ScalerEventType, type LabelMatcher } from '@kici-dev/engine';
 import { AgentRegistry } from '../agent/registry.js';
 
 // --- Mock factories ---
@@ -40,6 +40,7 @@ function createMockDispatcher() {
     dispatch: vi
       .fn()
       .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' }),
+    cancelQueuedJob: vi.fn().mockResolvedValue(undefined),
     onAgentAvailable: vi.fn(),
     onAgentDisconnect: vi.fn(),
     onJobComplete: vi.fn(),
@@ -728,17 +729,20 @@ describe('RunCoordinator', () => {
     it('forwards step progress (kind="step") to ExecutionTracker.onStepStatus', () => {
       const { coordinator, deps } = createCoordinator();
 
-      coordinator.onPeerJobProgress({
-        type: 'job.progress',
-        kind: 'step',
-        runId: 'run-1',
-        jobId: 'job-1',
-        jobName: 'build',
-        stepIndex: 0,
-        stepName: 'Install deps',
-        state: 'running',
-        timestamp: Date.now(),
-      });
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'step',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: 'Install deps',
+          state: 'running',
+          timestamp: Date.now(),
+        },
+        'peer-1',
+      );
 
       expect(deps.executionTracker.onStepStatus).toHaveBeenCalledWith(
         'run-1',
@@ -755,17 +759,20 @@ describe('RunCoordinator', () => {
     it('forwards job-level progress (kind="job") to ExecutionTracker.onJobStatus', () => {
       const { coordinator, deps } = createCoordinator();
 
-      coordinator.onPeerJobProgress({
-        type: 'job.progress',
-        kind: 'job',
-        runId: 'run-1',
-        jobId: 'job-1',
-        jobName: 'build',
-        stepIndex: 0,
-        stepName: '',
-        state: 'success',
-        timestamp: Date.now(),
-      });
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: '',
+          state: 'success',
+          timestamp: Date.now(),
+        },
+        'peer-1',
+      );
 
       expect(deps.executionTracker.onJobStatus).toHaveBeenCalledWith(
         'run-1',
@@ -794,6 +801,7 @@ describe('RunCoordinator', () => {
           state: 'success',
           timestamp: 1,
         },
+        'peer-1',
         reply,
       );
 
@@ -826,6 +834,7 @@ describe('RunCoordinator', () => {
           state: 'running',
           timestamp: 1,
         },
+        'peer-1',
         reply,
       );
 
@@ -849,6 +858,7 @@ describe('RunCoordinator', () => {
           state: 'running',
           timestamp: 1,
         },
+        'peer-1',
         reply,
       );
 
@@ -881,17 +891,20 @@ describe('RunCoordinator', () => {
     it('re-asserts the rerouted_to_peer marker when the worker first status creates the row', async () => {
       const { coordinator, deps, jobId } = await rerouteOne();
 
-      coordinator.onPeerJobProgress({
-        type: 'job.progress',
-        kind: 'job',
-        runId: 'run-7',
-        jobId,
-        jobName: 'gpu-job',
-        stepIndex: 0,
-        stepName: '',
-        state: 'running',
-        timestamp: 1,
-      });
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-7',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        'peer-1',
+      );
 
       // The marker write lands AFTER the tracker apply resolves (the row now
       // exists), so the defer guard can see the job belongs to peer-1.
@@ -907,17 +920,20 @@ describe('RunCoordinator', () => {
     it('does not re-assert the marker on a terminal peer status', async () => {
       const { coordinator, deps, jobId } = await rerouteOne();
 
-      coordinator.onPeerJobProgress({
-        type: 'job.progress',
-        kind: 'job',
-        runId: 'run-7',
-        jobId,
-        jobName: 'gpu-job',
-        stepIndex: 0,
-        stepName: '',
-        state: 'success',
-        timestamp: 1,
-      });
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-7',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: 'success',
+          timestamp: 1,
+        },
+        'peer-1',
+      );
 
       await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
       expect(deps.executionTracker.markJobReroutedToPeer).not.toHaveBeenCalled();
@@ -926,20 +942,169 @@ describe('RunCoordinator', () => {
     it('does not re-assert the marker for a job that was not rerouted', async () => {
       const { coordinator, deps } = createCoordinator();
 
-      coordinator.onPeerJobProgress({
-        type: 'job.progress',
-        kind: 'job',
-        runId: 'run-1',
-        jobId: 'job-1',
-        jobName: 'build',
-        stepIndex: 0,
-        stepName: '',
-        state: 'running',
-        timestamp: 1,
-      });
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-1',
+          jobId: 'job-1',
+          jobName: 'build',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        'peer-1',
+      );
 
       await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
       expect(deps.executionTracker.markJobReroutedToPeer).not.toHaveBeenCalled();
+    });
+
+    describe('terminal source-peer provenance', () => {
+      it('ignores a terminal job update relayed by a superseded peer (no apply, entry kept)', async () => {
+        const { coordinator, deps, jobId } = await rerouteOne(); // tracked against peer-1
+        deps.executionTracker.onJobStatus.mockClear();
+
+        // Stray terminal from a DIFFERENT peer than the one this job is tracked against.
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-7',
+            jobId,
+            jobName: 'gpu-job',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.failed,
+            timestamp: 1,
+          },
+          'peer-SUPERSEDED',
+        );
+
+        // The terminal was not applied to the run.
+        expect(deps.executionTracker.onJobStatus).not.toHaveBeenCalled();
+
+        // The tracking entry survived: a subsequent NON-terminal progress from the
+        // tracked peer still re-asserts the rerouted_to_peer marker, which only
+        // happens when reroutedJobs still holds the entry.
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-7',
+            jobId,
+            jobName: 'gpu-job',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.running,
+            timestamp: 2,
+          },
+          'peer-1',
+        );
+        await vi.waitFor(() =>
+          expect(deps.executionTracker.markJobReroutedToPeer).toHaveBeenCalledWith(
+            'run-7',
+            jobId,
+            'peer-1',
+          ),
+        );
+      });
+
+      it('still acks a superseded-peer terminal so the peer prunes its outbox', async () => {
+        const { coordinator, jobId } = await rerouteOne();
+        const reply = vi.fn();
+
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-7',
+            jobId,
+            jobName: 'gpu-job',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.failed,
+            timestamp: 1,
+          },
+          'peer-SUPERSEDED',
+          reply,
+        );
+
+        // Ack is synchronous (not gated on a tracker apply, which we skipped).
+        expect(reply).toHaveBeenCalledWith({
+          type: 'job.progress.ack',
+          runId: 'run-7',
+          jobId,
+          state: ExecutionJobStatus.enum.failed,
+        });
+      });
+
+      it('applies AND cleans up a terminal from the currently-tracked peer', async () => {
+        const { coordinator, deps, jobId } = await rerouteOne(); // tracked against peer-1
+        deps.executionTracker.onJobStatus.mockClear();
+        deps.executionTracker.markJobReroutedToPeer.mockClear();
+
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-7',
+            jobId,
+            jobName: 'gpu-job',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.success,
+            timestamp: 1,
+          },
+          'peer-1',
+        );
+
+        // Terminal from the tracked peer IS applied.
+        await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+
+        // Cleanup happened: a later progress finds no tracked entry, so it does NOT
+        // re-assert the marker.
+        deps.executionTracker.markJobReroutedToPeer.mockClear();
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-7',
+            jobId,
+            jobName: 'gpu-job',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.running,
+            timestamp: 2,
+          },
+          'peer-1',
+        );
+        await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+        expect(deps.executionTracker.markJobReroutedToPeer).not.toHaveBeenCalled();
+      });
+
+      it('applies a terminal for a job that is not rerouted (no tracked entry)', async () => {
+        const { coordinator, deps } = createCoordinator();
+
+        coordinator.onPeerJobProgress(
+          {
+            type: 'job.progress',
+            kind: 'job',
+            runId: 'run-1',
+            jobId: 'job-1',
+            jobName: 'build',
+            stepIndex: 0,
+            stepName: '',
+            state: ExecutionJobStatus.enum.failed,
+            timestamp: 1,
+          },
+          'peer-any',
+        );
+
+        // No tracked entry → today's unconditional apply is preserved.
+        await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
+      });
     });
   });
 
@@ -947,15 +1112,18 @@ describe('RunCoordinator', () => {
     it('forwards a worker-relayed scaler event to ExecutionTracker.emitScalerEvent', () => {
       const { coordinator, deps } = createCoordinator();
 
-      coordinator.onPeerScalerEvent({
-        type: 'scaler.event',
-        runId: 'run-1',
-        jobId: 'job-1',
-        agentId: 'scaler-container-abc',
-        eventType: ScalerEventType.enum['scaler.failed'],
-        detail: 'image pull failed: not found',
-        timestampMs: 1700,
-      });
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-1',
+          jobId: 'job-1',
+          agentId: 'scaler-container-abc',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'image pull failed: not found',
+          timestampMs: 1700,
+        },
+        'peer-1',
+      );
 
       expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalledWith('run-1', 'job-1', {
         agentId: 'scaler-container-abc',
@@ -1018,6 +1186,408 @@ describe('RunCoordinator', () => {
       coordinator.cancelRun('nonexistent-run', 'test reason');
 
       expect(peerClient.send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('reroute spawn-window backstop (Layer A)', () => {
+    /**
+     * Reroute one gpu-job to peer-1 (accepts) under a short spawn window so the
+     * post-ACK re-dispatch timer is deterministic. Returns the coordinator +
+     * deps + the peer client + the tracked jobId.
+     */
+    async function setupReroute(windowMs = 1000) {
+      const peer1 = makePeerInfo({ instanceId: 'peer-1' });
+      const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
+      const { coordinator, deps } = createCoordinator({
+        getRerouteSpawnWindowMs: async () => windowMs,
+      } as Partial<RunCoordinatorDeps>);
+      // Initial local dispatch rejects → the job reroutes to peer-1.
+      deps.dispatcher.dispatch.mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer1]);
+      deps.getPeerClient.mockReturnValue(peerClient);
+
+      const result = await coordinator.routeJobs(makeRunContext({ runId: 'run-9' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+      const jobId = result.reroutedJobs[0].jobId;
+      return { coordinator, deps, peerClient, jobId };
+    }
+
+    it('re-dispatches locally when the spawn window elapses with no progress', async () => {
+      const { deps, peerClient, jobId } = await setupReroute();
+      // After the window, the local dispatcher accepts the re-dispatch.
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      // Double-execution guard: the original peer got a cancel.
+      expect(peerClient.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
+      );
+      // Local re-dispatch reused the SAME jobId (execution row is keyed by it).
+      expect(deps.dispatcher.dispatch).toHaveBeenLastCalledWith(
+        expect.objectContaining({ jobId, jobName: 'gpu-job' }),
+      );
+    });
+
+    it('does not re-dispatch when progress arrives within the window', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupReroute();
+
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-9',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        'peer-1',
+      );
+      deps.dispatcher.dispatch.mockClear();
+
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+    });
+
+    it('re-dispatches to another peer, skipping the failed one', async () => {
+      const peer1 = makePeerInfo({ instanceId: 'peer-1' });
+      const peer2 = makePeerInfo({ instanceId: 'peer-2' });
+      const client1 = createMockPeerClient({ sendAndWaitAckResult: true });
+      const client2 = createMockPeerClient({ sendAndWaitAckResult: true });
+      const { coordinator, deps } = createCoordinator({
+        getRerouteSpawnWindowMs: async () => 1000,
+      } as Partial<RunCoordinatorDeps>);
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer1, peer2]);
+      deps.getPeerClient.mockImplementation((id: string) =>
+        id === 'peer-1' ? client1 : id === 'peer-2' ? client2 : undefined,
+      );
+
+      const result = await coordinator.routeJobs(makeRunContext({ runId: 'run-10' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+      const jobId = result.reroutedJobs[0].jobId;
+      expect(result.reroutedJobs[0].peerId).toBe('peer-1');
+      client2.sendAndWaitAck.mockClear();
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      // Re-dispatch went to peer-2 (peer-1 is in triedConnections → skipped).
+      expect(client2.sendAndWaitAck).toHaveBeenCalled();
+      expect(client1.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel', jobId }),
+      );
+    });
+
+    it('marks the job failed when unroutable after the window (no stale-detector wait)', async () => {
+      const { deps, jobId } = await setupReroute();
+      // Re-dispatch: no peers accept, local dispatch also rejects.
+      deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(deps.executionTracker.onJobStatus).toHaveBeenCalledWith(
+        'run-9',
+        jobId,
+        'failed',
+        expect.any(Number),
+        undefined,
+        expect.objectContaining({ reason: expect.stringContaining('reroute') }),
+      );
+    });
+  });
+
+  describe('reroute NAK-after-accept fast path (Layer B)', () => {
+    async function setupReroute(windowMs = 100_000) {
+      const peer1 = makePeerInfo({ instanceId: 'peer-1' });
+      const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
+      const { coordinator, deps } = createCoordinator({
+        getRerouteSpawnWindowMs: async () => windowMs,
+      } as Partial<RunCoordinatorDeps>);
+      deps.dispatcher.dispatch.mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' });
+      deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer1]);
+      deps.getPeerClient.mockReturnValue(peerClient);
+      const result = await coordinator.routeJobs(makeRunContext({ runId: 'run-9' }), [
+        makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
+      ]);
+      return { coordinator, deps, peerClient, jobId: result.reroutedJobs[0].jobId };
+    }
+
+    it('re-dispatches immediately on a worker-relayed scaler.failed for a tracked reroute', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupReroute();
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-x',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'spawn EINVAL',
+          timestampMs: 1,
+        },
+        'peer-1',
+      );
+
+      // Still forwarded to the tracker.
+      expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(peerClient.send).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
+        ),
+      );
+      await vi.waitFor(() =>
+        expect(deps.dispatcher.dispatch).toHaveBeenLastCalledWith(
+          expect.objectContaining({ jobId }),
+        ),
+      );
+    });
+
+    it('ignores scaler.failed once the job has reported progress (window disarmed)', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupReroute();
+      // Healthy spawn: first progress disarms the spawn-window timer.
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-9',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        'peer-1',
+      );
+      deps.dispatcher.dispatch.mockClear();
+      peerClient.send.mockClear();
+
+      // A late scaler.failed (e.g. from a superseded peer for the same jobId)
+      // must NOT cancel/bounce the now-healthy running job.
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-x',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'spawn EINVAL',
+          timestampMs: 2,
+        },
+        'peer-1',
+      );
+
+      // Still forwarded to the tracker, but no re-dispatch / cancel.
+      expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+    });
+
+    it('ignores scaler.failed for a non-tracked job (still forwards to tracker)', async () => {
+      const { coordinator, deps } = createCoordinator();
+
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-x',
+          jobId: 'job-x',
+          agentId: 'a',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'x',
+          timestampMs: 1,
+        },
+        'peer-1',
+      );
+
+      expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+    });
+
+    it('is idempotent: the window timer no-ops after a NAK re-dispatch', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupReroute(1000);
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-x',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'spawn EINVAL',
+          timestampMs: 1,
+        },
+        'peer-1',
+      );
+      // Wait for the NAK re-dispatch to fully settle (local dispatch happened).
+      await vi.waitFor(() =>
+        expect(deps.dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ jobId })),
+      );
+      const dispatchCallsAfterNak = deps.dispatcher.dispatch.mock.calls.length;
+
+      // The Layer A window timer fires next — but the tracking entry is gone, so
+      // it must no-op (no second re-dispatch).
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(deps.dispatcher.dispatch.mock.calls.length).toBe(dispatchCallsAfterNak);
+    });
+
+    it('does not re-dispatch when scaler.failed comes from a superseded (non-tracked) peer', async () => {
+      const { coordinator, deps, jobId } = await setupReroute();
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+      deps.dispatcher.dispatch.mockClear();
+
+      // A stale scaler.failed relayed by a peer that is NOT the tracked reroute
+      // target (the job was rerouted to peer-1) must be ignored — the tracked
+      // job is healthy and must not be bounced by a superseded peer's signal.
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-stale',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'stale failure from superseded peer',
+          timestampMs: 2000,
+        },
+        'peer-SUPERSEDED',
+      );
+
+      // Still forwarded to the tracker (persistence is provenance-independent),
+      // but no re-dispatch happens.
+      expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+
+      // The SAME scaler.failed from the tracked peer DOES re-dispatch — proof the
+      // job is still tracked with an armed window; only the source gate blocked it.
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-x',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'spawn EINVAL',
+          timestampMs: 2001,
+        },
+        'peer-1',
+      );
+      await vi.waitFor(() =>
+        expect(deps.dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ jobId })),
+      );
+    });
+
+    it('does not disarm the spawn window when progress comes from a superseded (non-tracked) peer', async () => {
+      const { coordinator, deps, jobId } = await setupReroute();
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+
+      // A stray progress relayed by a peer that is NOT the tracked reroute target
+      // (e.g. a slow, best-effort-cancelled original peer) must NOT disarm the
+      // replacement peer's spawn-window timer.
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-9',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: 'running',
+          timestamp: 1,
+        },
+        'peer-SUPERSEDED',
+      );
+
+      // The window is still armed, so a subsequent scaler.failed FROM THE TRACKED
+      // PEER still triggers the NAK re-dispatch — proof the timer was not cleared.
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-bare-metal-x',
+          eventType: ScalerEventType.enum['scaler.failed'],
+          detail: 'spawn EINVAL',
+          timestampMs: 2,
+        },
+        'peer-1',
+      );
+      await vi.waitFor(() =>
+        expect(deps.dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ jobId })),
+      );
+    });
+
+    it('still persists tracker updates regardless of the source peer', async () => {
+      const { coordinator, deps, jobId } = await setupReroute();
+
+      // A non-matching source: emitScalerEvent must still fire for a non-failed
+      // event, and a NON-terminal job.progress must still drive onJobStatus
+      // (both unconditional). Only a TERMINAL progress from a superseded peer is
+      // gated — that case is covered by the onPeerJobProgress
+      // "terminal source-peer provenance" tests.
+      coordinator.onPeerScalerEvent(
+        {
+          type: 'scaler.event',
+          runId: 'run-9',
+          jobId,
+          agentId: 'scaler-x',
+          eventType: ScalerEventType.enum['scaler.provisioning'],
+          detail: 'provisioning',
+          timestampMs: 10,
+        },
+        'peer-OTHER',
+      );
+      expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
+
+      coordinator.onPeerJobProgress(
+        {
+          type: 'job.progress',
+          kind: 'job',
+          runId: 'run-9',
+          jobId,
+          jobName: 'gpu-job',
+          stepIndex: 0,
+          stepName: '',
+          state: ExecutionJobStatus.enum.running,
+          timestamp: 20,
+        },
+        'peer-OTHER',
+      );
+      await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
     });
   });
 

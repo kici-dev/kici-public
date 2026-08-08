@@ -13,7 +13,10 @@
  * v17 widens per-job init to typed presets ('mise' / { mise }) and 'auto' detection.
  */
 
-import { SCHEMA_VERSION as _SCHEMA_VERSION } from '@kici-dev/engine';
+import {
+  SCHEMA_VERSION as _SCHEMA_VERSION,
+  BREAKING_FLOOR as _BREAKING_FLOOR,
+} from '@kici-dev/engine';
 import type {
   ResourceRequest,
   ApproverClause,
@@ -41,6 +44,9 @@ export interface LockApproval {
 
 /** Schema version - re-exported from engine as single source of truth */
 export const SCHEMA_VERSION = _SCHEMA_VERSION;
+
+/** Lock compatibility-window floor - re-exported from engine as single source of truth */
+export const BREAKING_FLOOR = _BREAKING_FLOOR;
 
 /**
  * Source file reference with meaningful path.
@@ -265,6 +271,18 @@ export interface LockWorkflowCompleteTrigger {
 }
 
 /**
+ * Workflows-failed-batch trigger in lock file.
+ * Accumulates failed workflow completions over a window and fires the
+ * subscribing workflow once per window with the batched run list.
+ */
+export interface LockWorkflowsFailedBatchTrigger {
+  readonly _type: 'workflows_failed_batch';
+  readonly accumulateFor: number;
+  readonly name?: string;
+  readonly source?: string;
+}
+
+/**
  * Job completion trigger in lock file.
  * Matches when a specific job within a workflow finishes execution.
  */
@@ -348,6 +366,7 @@ export type LockTrigger =
   | LockWebhookTrigger
   | LockKiciEventTrigger
   | LockWorkflowCompleteTrigger
+  | LockWorkflowsFailedBatchTrigger
   | LockJobCompleteTrigger
   | LockGenericWebhookTrigger
   | LockScheduleTrigger
@@ -670,6 +689,12 @@ export interface LockWorkflow {
  */
 export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;
+  /**
+   * Newest breaking schema version at emit time (`BREAKING_FLOOR`). Readers
+   * whose own SCHEMA_VERSION is below this must reject the lock. Mirrors the
+   * engine `LockFile.minReaderVersion` field.
+   */
+  readonly minReaderVersion?: number;
   readonly source: LockSource;
   /** SHA-256 hash of the serialized lock file content (excluding this field). Changes only when workflows, triggers, jobs, or bundle hashes change. */
   readonly contentHash: string;

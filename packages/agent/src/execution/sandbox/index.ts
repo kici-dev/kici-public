@@ -22,6 +22,8 @@ export type {
   CacheResponseIpc,
   ProvenanceRequestIpc,
   ProvenanceResponseIpc,
+  ArtifactRequestIpc,
+  ArtifactResponseIpc,
   StepApprovalRequestIpc,
   StepApprovalResolvedIpc,
   JobExecutionRequest,
@@ -40,3 +42,4 @@ export {
 export { BareMetalSandbox } from './bare-metal-sandbox.js';
 export { FirecrackerSandbox } from './firecracker-sandbox.js';
 export { ContainerSandbox } from './container-sandbox.js';
+export { fileCloneSourceBinds } from './fork-runner.js';

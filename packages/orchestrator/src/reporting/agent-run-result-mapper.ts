@@ -105,7 +105,17 @@ export function mapToAgentRunResult(d: CanonicalRunDetail): AgentRunResult {
   const anyStepNonZeroExit = d.jobs.some((j) =>
     j.steps.some((s) => typeof s.exitCode === 'number' && s.exitCode !== 0),
   );
-  const timedOut = d.jobs.some((j) => j.status === ExecutionJobStatus.enum.timed_out_stale);
+  // The three infra-class terminal statuses: the job never ran, so there is no
+  // step exit code to classify it by. All three belong here so `failureCategory`
+  // agrees with the `execution_runs.failure_class` the tracker writes for the
+  // same run (see `ExecutionTracker.computeFailureClass`); without them the
+  // category falls through to `unknown`.
+  const timedOut = d.jobs.some(
+    (j) =>
+      j.status === ExecutionJobStatus.enum.timed_out_stale ||
+      j.status === ExecutionJobStatus.enum.drift_dropped ||
+      j.status === ExecutionJobStatus.enum.unroutable,
+  );
   const jobInitFailure = d.jobs.find((j) => j.initFailure)?.initFailure ?? null;
   const initFailure = d.initFailure ?? jobInitFailure;
 

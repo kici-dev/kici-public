@@ -120,6 +120,36 @@ Workflows with `repos` patterns are classified as **global workflows** and store
 
 ## Security model
 
+### Trust-policy precondition
+
+Before any global-workflow policy decision is consulted, the event must clear the
+org's trust policy (`packages/orchestrator/src/security/trust-policy-gate.ts`).
+Both org-global dispatch paths — the fallback that runs globals when the source
+repo has no lock file, and the pass that dispatches globals authored in other
+repos — return without dispatching unless the verdict is `pass`. So a `hold` or
+`reject` verdict (a workflow modification, a fork pull request, or an unresolved
+contributor) stops the organization's global workflows too, not only the pull
+request's own workflows. This matters because globals run with **org**
+credentials against the **event's** head SHA: dispatching them for an event the
+policy refused would hand an untrusted head SHA the org's credentials.
+
+A skipped global creates no run row, so there is nothing to approve — approving
+the event's security hold releases the pull request's own workflows and does not
+retroactively run the organization's globals for that event.
+
+The skip is recorded as a **neutral** informational check named
+`KiCI: Organization workflows`, posted through the inbound event's own bundle and
+credentials (a cross-provider lock-file fallback swaps the dispatch bundle for
+another source's, which must not write this check). It is deliberately a
+different check from `KiCI Security`: that name owns the single security check
+run per commit, which the hold posts as pending and approve / reject later
+complete, so writing the notice through it would resolve a still-held run's check
+and could unblock a branch-protection rule that requires it. The notice stays
+neutral in the `reject` case as well, because the same-source path already posts
+the failure for that event and a second failure would double-report one decision.
+
+See [Approvals](./approvals.md) for the trust policy's hold / reject vocabulary.
+
 ### Org-level permissions
 
 Global workflows require explicit opt-in via the `org_settings` table. The
@@ -264,7 +294,7 @@ WHERE customer_id = 'kiciStg00001';
 The org settings page exposes all three knobs through the **Global workflows** tab (`/orgs/:customerId/settings/global-workflows`), visible to any user with `org_settings:read`. Editing requires `org_settings:write`. The tab surfaces:
 
 - A master enable toggle bound to `global_workflows_enabled`.
-- A **Workflow authors** section with its own enable toggle and editable list bound to `global_workflow_allowed_repos` (the authoring axis). When the toggle is off, any repo in the org may author global workflows.
+- An **Allowed author repos** section with its own enable toggle and editable list bound to `global_workflow_allowed_repos` (the authoring axis). When the toggle is off, any repo in the org may author global workflows.
 - A **Blocked source repos** section with its own enable toggle and editable list bound to `global_workflow_denied_repos` (the source axis). Use this to protect forks and public-contrib repos from silently triggering org-wide automation.
 - An independent **Elevated access** list bound to `global_workflow_elevated_repos` with an inline security warning.
 

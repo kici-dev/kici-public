@@ -116,11 +116,12 @@ export class RelayBufferRegistry {
     }
 
     const ttl = setTimeout(() => {
+      const receivedChunks = this.buffers.get(messageId)?.expectedSequence ?? 0;
       this.buffers.delete(messageId);
       logger.warn('Reassembly buffer TTL expired before final chunk', {
         messageId,
         deliveryId: meta.deliveryId,
-        receivedChunks: this.buffers.get(messageId)?.expectedSequence ?? 0,
+        receivedChunks,
       });
     }, this.bufferTtlMs);
 

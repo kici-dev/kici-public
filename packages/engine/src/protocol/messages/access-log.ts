@@ -43,6 +43,7 @@ export const AccessLogTargetType = z.enum([
   'org_settings',
   'cluster_meta',
   'attestation',
+  'database',
 ]);
 export type AccessLogTargetType = z.infer<typeof AccessLogTargetType>;
 
@@ -60,6 +61,7 @@ export const AccessLogAction = z.enum([
   'run.orch_logs.read',
   'step.logs.read',
   'attestations.read',
+  'artifacts.read',
   'run.cancel',
   'run.rerun',
   'run.manual_schedule',
@@ -138,6 +140,23 @@ export const AccessLogAction = z.enum([
    */
   'org_settings.dashboard_write_policy.update',
   /**
+   * Org trust-policy write via the orch admin `PATCH /admin/trust-policy`
+   * route (driven by `kici-admin trust-policy set`). Only reachable on an
+   * independent orchestrator — a Platform-attached one refuses the PATCH,
+   * because the Platform owns the policy there. `actor_meta` carries the
+   * requested `patch` plus the resulting `policy`, so an operator loosening
+   * `forkPolicy` to `allow` is attributable. Written inside the same
+   * transaction as the policy row.
+   *
+   * Past tense, unlike every sibling here (`…update` / `…set` / `…delete`),
+   * and deliberately so: `trust_policy.update` is already taken by the
+   * Platform→orchestrator WebSocket push that delivers the policy
+   * (`platform-orchestrator.ts`). Two different things named identically —
+   * one a wire frame, one an audited local mutation — would be far more
+   * confusing than the tense break. Do NOT "fix" this to `.update`.
+   */
+  'trust_policy.updated',
+  /**
    * Cluster-name rename via the orch admin `PUT /admin/cluster-name`
    * route (driven by `kici-admin cluster-name set`). The `actor_meta`
    * columns carry `prior_value` and `new_value`. Cluster-name is
@@ -161,6 +180,19 @@ export const AccessLogAction = z.enum([
   'archive_chunk',
   /** Cold-store purge deleted an expired chunk from S3 + PG bookkeeping. */
   'purge_chunk',
+  /**
+   * Direct-DB kici-admin mutations (source 'admin_cli'). Emitted by the
+   * mutating db subcommands so an operator's provisioning + maintenance DDL is
+   * audited identically to the HTTP/WS admin path. Non-transactional DDL means
+   * the row is recorded best-effort after the operation succeeds (or with
+   * outcome 'error' on failure).
+   */
+  'db.fresh',
+  'db.ensure',
+  'db.create_role',
+  'db.create_readonly_user',
+  'db.reindex',
+  'db.refresh_collation_version',
 ]);
 export type AccessLogAction = z.infer<typeof AccessLogAction>;
 

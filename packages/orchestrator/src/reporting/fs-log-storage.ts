@@ -1,15 +1,17 @@
 /**
  * Filesystem-backed log storage.
  *
- * Stores execution logs as files on disk. No TTL -- logs persist indefinitely.
- * Supports append-only writes (JSONL accumulation) and cursor-based pagination.
+ * Stores execution logs as files on disk. Lifecycle is operator-managed (the
+ * cleanup retention sweep runs on the S3 backend only). Supports append-only
+ * writes (JSONL accumulation) and cursor-based pagination.
  *
  * File layout:
  *   {basePath}/executions/{runId}/job-{name}/step-{index}.log
  */
 
-import { appendFile, mkdir, readFile, readdir, stat } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { appendFile, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import { assertSafeLogPath } from './log-storage.js';
 import type { LogReadOptions, LogReadResult, LogStorage } from './log-storage.js';
 
 interface FilesystemLogStorageOptions {
@@ -25,8 +27,35 @@ export class FilesystemLogStorage implements LogStorage {
 
   // -- Paths --
 
+  /**
+   * Resolve a logical log path to an absolute filesystem path, refusing
+   * anything that would address a file outside the storage root.
+   *
+   * Two checks, deliberately both. `assertSafeLogPath` is the effective gate on
+   * POSIX: once a path is relative and carries no `..` segment, `resolve()`
+   * cannot produce anything outside the root, so the comparison below is
+   * unreachable there. It is kept as a second, independent statement of the
+   * same invariant — it is what catches a resolver with extra escape hatches
+   * (win32 resolves a drive-relative `C:foo` against that drive's own cwd, not
+   * against the root), and it means relaxing the logical check cannot silently
+   * reopen an escape.
+   *
+   * Both checks are lexical — neither resolves symlinks. A symlink planted
+   * inside the log root still redirects a logically-clean path outside it;
+   * containing that would need a `realpath` on every call, and the log root is
+   * the orchestrator user's own directory.
+   *
+   * Every verb on this class funnels through here, so a new caller is
+   * contained on arrival.
+   */
   private fullPath(path: string): string {
-    return resolve(this.basePath, path);
+    assertSafeLogPath(path);
+    const full = resolve(this.basePath, path);
+    // The equality arm lets an empty / `.` prefix address the root itself.
+    if (full !== this.basePath && !full.startsWith(this.basePath + sep)) {
+      throw new Error(`log path escapes the storage root: ${path}`);
+    }
+    return full;
   }
 
   // -- Helpers --
@@ -98,6 +127,16 @@ export class FilesystemLogStorage implements LogStorage {
     await appendFile(filePath, data, 'utf-8');
   }
 
+  async appendStreaming(path: string, data: string): Promise<void> {
+    // appendFile is already atomic + durable, so a step log needs no buffering
+    // on the filesystem backend.
+    await this.append(path, data);
+  }
+
+  async finalize(_path: string): Promise<void> {
+    // No-op: appendFile writes are already durable.
+  }
+
   async read(path: string, options?: LogReadOptions): Promise<LogReadResult> {
     const filePath = this.fullPath(path);
     const cursor = options?.cursor ?? 0;
@@ -135,5 +174,33 @@ export class FilesystemLogStorage implements LogStorage {
   async list(prefix: string): Promise<string[]> {
     const dirPath = this.fullPath(prefix);
     return this.listRecursive(dirPath);
+  }
+
+  async listWithMetadata(prefix: string): Promise<Array<{ path: string; lastModified: Date }>> {
+    const paths = await this.list(prefix); // relative paths, one per file
+    const out: Array<{ path: string; lastModified: Date }> = [];
+    for (const p of paths) {
+      try {
+        const s = await stat(this.fullPath(p));
+        out.push({ path: p, lastModified: s.mtime });
+      } catch (err: unknown) {
+        // A file that vanished between listing and stat is simply not returned.
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+    return out;
+  }
+
+  async deleteMany(paths: string[]): Promise<number> {
+    let deleted = 0;
+    for (const p of paths) {
+      try {
+        await unlink(this.fullPath(p));
+        deleted += 1;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+    return deleted;
   }
 }

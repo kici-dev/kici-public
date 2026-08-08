@@ -71,8 +71,15 @@ export interface DefineEnvOptions<TShape extends z.ZodRawShape> {
 }
 
 export interface DefineEnvResult<T> {
-  /** Parse `env` (defaults to `process.env`) into a typed config. */
-  parse(env?: NodeJS.ProcessEnv): T;
+  /**
+   * Parse `env` (defaults to `process.env`) into a typed config.
+   *
+   * `parserOverride` is an optional per-call parser (e.g. a scope-narrowed
+   * `.superRefine`) that replaces the default parser for this parse only —
+   * used to validate the same env map under a looser/stricter cross-field
+   * rule set without duplicating the envMap.
+   */
+  parse(env?: NodeJS.ProcessEnv, parserOverride?: z.ZodType): T;
   /** Machine-readable field specs for docs generation. */
   describe(): EnvFieldSpec[];
   /** Flat list of every env var the schema reads (for the unknown-var scanner). */
@@ -318,9 +325,11 @@ function describeFieldRecursive(
 export function defineEnv<TShape extends z.ZodRawShape>(
   opts: DefineEnvOptions<TShape>,
 ): DefineEnvResult<z.infer<z.ZodObject<TShape>>> {
-  const parserSchema: z.ZodType = opts.parser ?? opts.schema;
-
-  function parse(env: NodeJS.ProcessEnv = process.env): z.infer<z.ZodObject<TShape>> {
+  function parse(
+    env: NodeJS.ProcessEnv = process.env,
+    parserOverride?: z.ZodType,
+  ): z.infer<z.ZodObject<TShape>> {
+    const parserSchema: z.ZodType = parserOverride ?? opts.parser ?? opts.schema;
     const raw = readEnv(opts.envMap, env) as Record<string, unknown>;
     const result = parserSchema.safeParse(raw);
     if (!result.success) {
@@ -395,12 +404,27 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
  *   (on POSIX it's a shell-local var that doesn't leak).
  * - `KICI_DEV`: the dev-mode toggle itself — read by the scanner to flip
  *   to warn-only, so it must not trip the scanner.
+ * - `KICI_BUILD_COUNTER_NO_COMMIT`: a build-tooling flag read only by
+ *   `hack/lib/commit-build-counter.mjs` (skip the per-build `.build-counter`
+ *   commit on a force-synced checkout, e.g. a remote E2E executor). Set in the
+ *   ambient shell for `pnpm build`; the native orchestrator spawn inherits it.
+ * - `KICI_TEST_ISOLATION`: the test-isolation marker set at config-eval time
+ *   by every vitest config in this repository (`hack/lib/vitest-isolation.ts`,
+ *   enforced by `hack/check-vitest-isolation.ts`). It makes the CLI's
+ *   `getConfigDir` refuse the developer machine's ambient `~/.kici` config, and
+ *   it is inherited by every service a test spawns — same leak-by-inheritance
+ *   shape as the `KICI_E2E_` prefix below.
  *
  * Keep this list small and well-justified. Every addition is a typo we can
  * no longer catch, so only list things that are (a) actually set in the
  * wild by our own tooling and (b) could never be a config typo.
  */
-export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = ['KICI_CACHE', 'KICI_DEV'];
+export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
+  'KICI_CACHE',
+  'KICI_DEV',
+  'KICI_BUILD_COUNTER_NO_COMMIT',
+  'KICI_TEST_ISOLATION',
+];
 
 /**
  * `KICI_*` prefixes that are entirely outside the service-config namespace —

@@ -1,4 +1,4 @@
-import type { AgentLogChunk } from '@kici-dev/engine';
+import { LogStream, type AgentLogChunk } from '@kici-dev/engine';
 import {
   logBackpressureActive,
   logBackpressureEventsTotal,
@@ -67,6 +67,9 @@ export class LogStreamer {
   private totalBytes = 0;
   private truncated = false;
 
+  /** Which stream the currently-buffered lines came from. */
+  private bufferStream: LogStream = LogStream.enum.stdout;
+
   /** Number of lines dropped due to backpressure (drop mode). */
   private droppedCount = 0;
   /** Whether we are currently in a backpressured state (pause mode). */
@@ -113,10 +116,30 @@ export class LogStreamer {
   /**
    * Add a line to the buffer. Triggers flush if threshold reached,
    * otherwise schedules a timer-based flush.
+   *
+   * A chunk carries a single stream, so a kind flip closes the pending chunk
+   * before the new line is buffered. Chunks are delivered in order, so the
+   * stdout/stderr interleaving is preserved across that boundary.
+   *
+   * `bufferStream` is only advanced once the buffer is actually empty. Under
+   * pause-mode backpressure `flush()` deliberately leaves the buffer intact
+   * until the socket drains, so the flip cannot close the pending chunk;
+   * advancing the tag there would relabel the already-buffered lines as the
+   * newly-arrived stream. The buffer keeps the tag of its first lines instead,
+   * which means a chunk assembled while backpressured reports one stream for
+   * lines that came from both — stderr in such a chunk is under-reported as
+   * stdout. Separating them needs a queue of pending per-stream chunks.
    */
-  addLine(line: string): void {
+  addLine(line: string, stream: LogStream = LogStream.enum.stdout): void {
     if (this.truncated) {
       return;
+    }
+
+    if (this.buffer.length > 0 && stream !== this.bufferStream) {
+      this.flush();
+    }
+    if (this.buffer.length === 0) {
+      this.bufferStream = stream;
     }
 
     if (this.totalBytes >= this.maxLogSizeBytes) {
@@ -191,6 +214,7 @@ export class LogStreamer {
       stepIndex: this.stepIndex,
       lines,
       timestamp: Date.now(),
+      stream: this.bufferStream,
     });
   }
 
@@ -268,6 +292,7 @@ export class LogStreamer {
       stepIndex: this.stepIndex,
       lines,
       timestamp: Date.now(),
+      stream: this.bufferStream,
     });
   }
 

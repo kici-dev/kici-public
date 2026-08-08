@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Replace the shared logger with a stable spy so the eviction tests can assert
 // the structured `logger.info('user-cache eviction ...')` line is emitted (the
@@ -24,6 +27,9 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
 
 import { UserCache } from './user-cache.js';
 import type { CacheStorage } from '../storage/types.js';
+import { keyDiscriminator } from '../storage/key-discriminator.js';
+import { FilesystemCacheStorage } from '../storage/filesystem.js';
+import { generateSigningSecret } from '../storage/sign-url.js';
 
 /**
  * In-memory CacheStorage stub implementing the full interface (incl. list/copy).
@@ -170,6 +176,109 @@ class FakeStorage implements CacheStorage {
       createdAt: new Date(this.createdSeq.get(key) ?? 0).toISOString(),
       lastAccessedAt: new Date(this.lastAccessSeq.get(key) ?? 0).toISOString(),
     };
+  }
+
+  /**
+   * Pure stat: byte size of the stored blob, null when the key is absent. No
+   * TTL eviction and no access-recency bump — matches the real backends.
+   */
+  async getObjectSize(key: string): Promise<number | null> {
+    return this.data.get(key)?.length ?? null;
+  }
+}
+
+/**
+ * A storage backend whose namespace is CASE-INSENSITIVE but case-PRESERVING —
+ * macOS APFS/HFS+ and Windows NTFS, which is what the filesystem cache backend
+ * runs on when an operator hosts the orchestrator on either.
+ *
+ * Two names differing only by case resolve to one object, and the object keeps
+ * the name it was first created with. `list()` therefore reports the REAL
+ * (created) name, not the name a later caller asked for — that asymmetry is
+ * what makes a byte-exact listing check a usable safety gate.
+ */
+class CaseFoldingStorage implements CacheStorage {
+  /** folded name -> the real name the object was created with. */
+  private readonly real = new Map<string, string>();
+
+  constructor(private readonly inner: FakeStorage) {}
+
+  /** Resolve a read to whatever real name already claimed this folded slot. */
+  private phys(key: string): string {
+    return this.real.get(key.toLowerCase()) ?? key;
+  }
+
+  /** Resolve a write, claiming the folded slot for this name if it is free. */
+  private physForWrite(key: string): string {
+    const folded = key.toLowerCase();
+    const existing = this.real.get(folded);
+    if (existing !== undefined) return existing;
+    this.real.set(folded, key);
+    return key;
+  }
+
+  advance(ms: number): void {
+    this.inner.advance(ms);
+  }
+
+  simulateUpload(key: string, body: Buffer): void {
+    this.inner.simulateUpload(this.physForWrite(key), body);
+  }
+
+  async put(key: string, data: Buffer | string): Promise<void> {
+    return this.inner.put(this.physForWrite(key), data);
+  }
+
+  async get(key: string): Promise<Buffer | null> {
+    return this.inner.get(this.phys(key));
+  }
+
+  async has(key: string): Promise<boolean> {
+    return this.inner.has(this.phys(key));
+  }
+
+  async delete(key: string): Promise<boolean> {
+    const folded = key.toLowerCase();
+    const existed = await this.inner.delete(this.phys(key));
+    this.real.delete(folded);
+    return existed;
+  }
+
+  async touch(key: string): Promise<void> {
+    return this.inner.touch(this.phys(key));
+  }
+
+  async getUrl(key: string, ttlMs?: number): Promise<string | null> {
+    return this.inner.getUrl(this.phys(key), ttlMs);
+  }
+
+  async getUploadUrl(key: string): Promise<string> {
+    return this.inner.getUploadUrl(this.physForWrite(key));
+  }
+
+  async getInternalUploadUrl(key: string): Promise<string> {
+    return this.inner.getInternalUploadUrl(this.physForWrite(key));
+  }
+
+  async initMeta(key: string): Promise<void> {
+    return this.inner.initMeta(this.physForWrite(key));
+  }
+
+  /** A directory listing is case-PRESERVING: it reports real names verbatim. */
+  async list(subPrefix: string): Promise<string[]> {
+    return this.inner.list(subPrefix);
+  }
+
+  async copy(srcKey: string, destKey: string): Promise<void> {
+    return this.inner.copy(this.phys(srcKey), this.physForWrite(destKey));
+  }
+
+  async getMetadata(key: string): Promise<import('../storage/types.js').CacheMetadata | null> {
+    return this.inner.getMetadata(this.phys(key));
+  }
+
+  async getObjectSize(key: string): Promise<number | null> {
+    return this.inner.getObjectSize(this.phys(key));
   }
 }
 
@@ -417,9 +526,177 @@ describe('UserCache', () => {
     storage.advance(5000);
     // Lazy TTL eviction: restore misses...
     expect((await cache.restore({ org, repo, scope: 'shared', key: 'k1' })).hit).toBe(false);
-    // ...and the underlying object was deleted on access.
+    // ...and the underlying object was deleted on access. Name the discriminated
+    // key: asserting the bare `k1.tar.gz` would pass vacuously, since no object
+    // is ever stored under that name.
     const prefix = 'cache/org-1/owner_repo/shared/';
-    expect(await storage.has(`${prefix}k1.tar.gz`)).toBe(false);
+    expect(await storage.has(`${prefix}k1-${keyDiscriminator('k1')}.tar.gz`)).toBe(false);
+  });
+
+  describe('case-insensitive storage backend', () => {
+    let folding: CaseFoldingStorage;
+
+    beforeEach(() => {
+      folding = new CaseFoldingStorage(new FakeStorage());
+      cache = new UserCache({ storage: folding, quotaBytes: 1_000_000, ttlMs: 86_400_000 });
+    });
+
+    // The wrong-cache-hit this whole change exists to prevent: a restore for one
+    // key must never be served the tarball saved under a case variant of it.
+    it('does not serve a different key that folds onto the same name', async () => {
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'build',
+        tarHash: 'h',
+        sizeBytes: 10,
+      });
+      const r = await cache.restore({ org, repo, scope: 'shared', key: 'Build' });
+      expect(r.hit).toBe(false);
+    });
+
+    it('keeps two case-variant keys as two independent entries', async () => {
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'build',
+        tarHash: 'lower',
+        sizeBytes: 10,
+      });
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'Build',
+        tarHash: 'upper',
+        sizeBytes: 10,
+      });
+      expect((await cache.restore({ org, repo, scope: 'shared', key: 'build' })).tarHash).toBe(
+        'lower',
+      );
+      expect((await cache.restore({ org, repo, scope: 'shared', key: 'Build' })).tarHash).toBe(
+        'upper',
+      );
+    });
+
+    it('commits the object under the discriminated key', async () => {
+      const begin = await cache.beginSave({ org, repo, scope: 'shared', key: 'build' });
+      folding.simulateUpload(begin.tempKey!, Buffer.from('TARDATA'));
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'build',
+        tarHash: 'h',
+        sizeBytes: 7,
+      });
+      const listed = await folding.list('cache/org-1/owner_repo/shared/');
+      expect(listed).toContain(
+        `cache/org-1/owner_repo/shared/build-${keyDiscriminator('build')}.tar.gz`,
+      );
+    });
+
+    it('does not skip a save because a case variant already exists', async () => {
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'build',
+        tarHash: 'h',
+        sizeBytes: 10,
+      });
+      const begin = await cache.beginSave({ org, repo, scope: 'shared', key: 'Build' });
+      expect(begin.skip).toBe(false);
+      expect(begin.uploadUrl).toBeDefined();
+    });
+  });
+
+  describe('transitional read of the un-discriminated key format', () => {
+    const sharedPrefix = 'cache/org-1/owner_repo/shared/';
+
+    /** Write an entry in the pre-discriminator format, sidecars included. */
+    async function seedLegacyEntry(
+      store: FakeStorage | CaseFoldingStorage,
+      key: string,
+      tarHash: string,
+    ): Promise<void> {
+      await store.put(`${sharedPrefix}${key}${'.tar.gz'}`, Buffer.from('LEGACY'));
+      await store.put(`${sharedPrefix}${key}.tar.gz.hash`, tarHash);
+      await store.put(`${sharedPrefix}${key}.tar.gz.size`, '6');
+    }
+
+    it('restores an entry written before the discriminator existed', async () => {
+      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
+      const r = await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' });
+      expect(r.hit).toBe(true);
+      expect(r.matchedKey).toBe('node-deps-v1');
+      expect(r.tarHash).toBe('legacy-hash');
+    });
+
+    // Uppercase means the old format could have folded this onto a case variant,
+    // so the fallback must decline rather than risk serving the wrong tarball.
+    it('declines a key that is not lowercase', async () => {
+      await seedLegacyEntry(storage, 'Build', 'legacy-hash');
+      expect((await cache.restore({ org, repo, scope: 'shared', key: 'Build' })).hit).toBe(false);
+    });
+
+    // `seg()` rewrites the space to `_`, so `node deps` and `node_deps` are two
+    // keys that sanitize to one legacy object — exactly the many-to-one case.
+    it('declines a key that sanitization would rewrite', async () => {
+      await seedLegacyEntry(storage, 'node_deps', 'legacy-hash');
+      expect((await cache.restore({ org, repo, scope: 'shared', key: 'node deps' })).hit).toBe(
+        false,
+      );
+    });
+
+    // The second gate on its own: the key passes the static predicate, but the
+    // object really on disk was created as `Build`, and a case-insensitive
+    // backend would happily resolve `build` to it.
+    it('declines when the stored object has a different real name', async () => {
+      const folding = new CaseFoldingStorage(new FakeStorage());
+      const foldingCache = new UserCache({
+        storage: folding,
+        quotaBytes: 1_000_000,
+        ttlMs: 86_400_000,
+      });
+      await seedLegacyEntry(folding, 'Build', 'wrong-entry');
+      expect((await foldingCache.restore({ org, repo, scope: 'shared', key: 'build' })).hit).toBe(
+        false,
+      );
+    });
+
+    it('commits under the discriminated key after a legacy restore', async () => {
+      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
+      await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' });
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'node-deps-v1',
+        tarHash: 'fresh',
+        sizeBytes: 10,
+      });
+      expect(
+        await storage.has(`${sharedPrefix}node-deps-v1-${keyDiscriminator('node-deps-v1')}.tar.gz`),
+      ).toBe(true);
+    });
+
+    it('prefers a discriminated entry over a legacy one', async () => {
+      await seedLegacyEntry(storage, 'node-deps-v1', 'legacy-hash');
+      await cache.commitSave({
+        org,
+        repo,
+        scope: 'shared',
+        key: 'node-deps-v1',
+        tarHash: 'current',
+        sizeBytes: 10,
+      });
+      expect(
+        (await cache.restore({ org, repo, scope: 'shared', key: 'node-deps-v1' })).tarHash,
+      ).toBe('current');
+    });
   });
 
   describe('per-org limits override (org_settings)', () => {
@@ -520,5 +797,59 @@ describe('UserCache', () => {
       await cache.commitSave({ org, repo, scope: 'shared', key: 'a', tarHash: 'h', sizeBytes: 10 });
       expect((await cache.restore({ org, repo, scope: 'shared', key: 'a' })).hit).toBe(true);
     });
+  });
+});
+
+// The FakeStorage above prefix-matches in `list()`, which is what let a real
+// FilesystemCacheStorage bug (it read the prefix as a directory) survive every
+// restoreKeys unit test. Drive the real backend over a temp dir instead.
+describe('UserCache restoreKeys against a real FilesystemCacheStorage', () => {
+  let dir: string;
+  let cache: UserCache;
+  let storage: FilesystemCacheStorage;
+  const org = 'org-1';
+  const repo = 'owner/repo';
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'user-cache-fs-'));
+    storage = new FilesystemCacheStorage({
+      basePath: dir,
+      ttlMs: 60_000,
+      baseUrl: 'http://orch.local:10143',
+      signingSecret: generateSigningSecret(),
+    });
+    cache = new UserCache({ storage, quotaBytes: 1_000_000, ttlMs: 86_400_000 });
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('falls back to a restoreKeys prefix match', async () => {
+    // Full save flow: commitSave alone writes only the sidecars — the tarball
+    // itself is the temp object the presigned upload lands, which commitSave
+    // then copies to the final key.
+    const begin = await cache.beginSave({ org, repo, scope: 'shared', key: 'node-v1-aaa' });
+    await storage.put(begin.tempKey!, Buffer.from('TARDATA'));
+    await cache.commitSave({
+      org,
+      repo,
+      scope: 'shared',
+      key: 'node-v1-aaa',
+      tarHash: 'h',
+      sizeBytes: 7,
+      tempKey: begin.tempKey,
+    });
+
+    const r = await cache.restore({
+      org,
+      repo,
+      scope: 'shared',
+      key: 'node-v1-miss',
+      restoreKeys: ['node-v1'],
+    });
+
+    expect(r.hit).toBe(true);
+    expect(r.matchedKey).toBe('node-v1-aaa');
   });
 });

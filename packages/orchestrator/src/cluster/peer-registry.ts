@@ -96,6 +96,8 @@ export interface PeerInfo {
   configVersion: number;
   /** Registry version reported by this peer (0 = unknown/legacy). */
   registryVersion: number;
+  /** Cluster-settings version reported by this peer (0 = unknown/legacy). */
+  clusterSettingsVersion: number;
   /** Cluster role of the peer. */
   role: 'coordinator' | 'worker';
   // --- OS metadata (from heartbeats) ---
@@ -119,6 +121,8 @@ export interface PeerRegistryOptions {
   onConfigVersionBehind?: (peerVersion: number) => void;
   /** Called when a peer's registryVersion is higher than the local version. */
   onRegistryVersionBehind?: (peerVersion: number) => void;
+  /** Called when a peer's clusterSettingsVersion is higher than the local version. */
+  onClusterSettingsVersionBehind?: (peerVersion: number) => void;
   /** Called when a peer transitions to disconnected state. */
   onPeerDisconnected?: (instanceId: string) => void;
 }
@@ -127,13 +131,16 @@ export class PeerRegistry {
   private readonly peers = new Map<string, PeerInfo>();
   private localConfigVersion = 0;
   private localRegistryVersion = 0;
+  private localClusterSettingsVersion = 0;
   private readonly onConfigVersionBehind?: (peerVersion: number) => void;
   private readonly onRegistryVersionBehind?: (peerVersion: number) => void;
+  private readonly onClusterSettingsVersionBehind?: (peerVersion: number) => void;
   private readonly onPeerDisconnected?: (instanceId: string) => void;
 
   constructor(options?: PeerRegistryOptions) {
     this.onConfigVersionBehind = options?.onConfigVersionBehind;
     this.onRegistryVersionBehind = options?.onRegistryVersionBehind;
+    this.onClusterSettingsVersionBehind = options?.onClusterSettingsVersionBehind;
     this.onPeerDisconnected = options?.onPeerDisconnected;
   }
 
@@ -149,6 +156,15 @@ export class PeerRegistry {
    */
   setLocalRegistryVersion(version: number): void {
     this.localRegistryVersion = version;
+  }
+
+  /**
+   * Update the local cluster-settings version for comparison with peer
+   * heartbeats. A worker sets this after pulling a snapshot so it stops
+   * re-firing the version-behind hook on every subsequent heartbeat.
+   */
+  setLocalClusterSettingsVersion(version: number): void {
+    this.localClusterSettingsVersion = version;
   }
 
   /**
@@ -191,6 +207,7 @@ export class PeerRegistry {
       scalerCapacity: undefined, // Always start empty
       configVersion: 0,
       registryVersion: 0,
+      clusterSettingsVersion: 0,
       role: info.role ?? 'coordinator',
     });
   }
@@ -234,6 +251,7 @@ export class PeerRegistry {
     peer.leaderId = heartbeat.leaderId;
     peer.configVersion = heartbeat.configVersion ?? 0;
     peer.registryVersion = heartbeat.registryVersion ?? 0;
+    peer.clusterSettingsVersion = heartbeat.clusterSettingsVersion ?? 0;
     peer.lastHeartbeatAt = heartbeat.timestamp;
     // OS metadata (optional fields, only update if present)
     if (heartbeat.hostname !== undefined) peer.hostname = heartbeat.hostname;
@@ -267,6 +285,18 @@ export class PeerRegistry {
       this.onRegistryVersionBehind
     ) {
       this.onRegistryVersionBehind(peer.registryVersion);
+    }
+
+    // Auto-remediation: if a peer (the leader) advertises a newer cluster-settings
+    // version, pull the worker-settings snapshot. Unlike config/registry, there is
+    // NO `localClusterSettingsVersion > 0` gate: a worker legitimately starts at 0
+    // and must pull the first time the leader is ahead.
+    if (
+      peer.clusterSettingsVersion > 0 &&
+      peer.clusterSettingsVersion > this.localClusterSettingsVersion &&
+      this.onClusterSettingsVersionBehind
+    ) {
+      this.onClusterSettingsVersionBehind(peer.clusterSettingsVersion);
     }
   }
 

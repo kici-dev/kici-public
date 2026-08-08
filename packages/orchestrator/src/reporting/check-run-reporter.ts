@@ -49,7 +49,12 @@ const logger = createLogger({ prefix: 'check-run-reporter' });
 /** Debounce interval for in_progress check run updates (ms). */
 const PROGRESS_DEBOUNCE_MS = 5_000;
 
-import { ExecutionJobStatus, ExecutionStepStatus, CheckRunConclusion } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  ExecutionStepStatus,
+  CheckRunConclusion,
+  type TerminalJobStatus,
+} from '@kici-dev/engine';
 
 /**
  * Dependencies for the CheckRunReporter.
@@ -148,7 +153,7 @@ interface SetBuildCompleteOptions {
   repo: string;
   sha: string;
   workflowName: string;
-  status: Extract<ExecutionJobStatus, 'success' | 'failed' | 'cancelled' | 'timed_out_stale'>;
+  status: TerminalJobStatus;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
   routingKey?: string;
@@ -169,7 +174,7 @@ interface UpdateJobStatusOptions {
   sha: string;
   workflowName: string;
   jobName: string;
-  state: Extract<ExecutionJobStatus, 'success' | 'failed' | 'cancelled' | 'timed_out_stale'>;
+  state: TerminalJobStatus;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
   routingKey?: string;
@@ -195,10 +200,7 @@ interface UpdateWorkflowStatusOptions {
   repo: string;
   sha: string;
   workflowName: string;
-  overallStatus: Extract<
-    ExecutionJobStatus,
-    'success' | 'failed' | 'cancelled' | 'timed_out_stale'
-  >;
+  overallStatus: TerminalJobStatus;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
   routingKey?: string;
@@ -270,6 +272,19 @@ export class CheckRunReporter {
   private readonly progressTimers = new Map<string, NodeJS.Timeout>();
   /** L1 cache: first in-progress sent flag (synced to `check_run_tracking.in_progress_sent_at`). */
   private readonly inProgressSent = new Map<string, boolean>();
+  /**
+   * Keys whose job check run has already been completed.
+   *
+   * Makes the check run's status monotonic: once a `completed` update is
+   * issued, no later step-progress update may push it back to `in_progress`.
+   * Cancelling the pending debounce timer at completion time is not sufficient
+   * on its own — a step status that arrives after the completion schedules a
+   * FRESH timer, which then fires and leaves the check run showing
+   * `status: in_progress` with a terminal `conclusion` already attached. That
+   * is the permanently-unresolved state check-run completion exists to prevent,
+   * so the guard is on the write itself rather than on the timer.
+   */
+  private readonly terminalSent = new Set<string>();
   /**
    * L1 cache: runId → set of check-run composite keys. Synced to the
    * indexed `check_run_tracking.run_id` column so a replacement coord can
@@ -473,13 +488,14 @@ export class CheckRunReporter {
   }
 
   /**
-   * Clean up step-progress entries, debounce timers, and DB rows for a
-   * completed run. Called when the execution tracker prunes the run.
+   * Clean up step-progress entries and debounce timers for a completed run.
+   * Called when the execution tracker prunes the run.
    *
-   * In-memory cleanup is synchronous; the DB cleanup is fire-and-forget
-   * because the caller (run-pruning hook) is on the response-shaping path
-   * and shouldn't block on a network round-trip. Failure logs but does
-   * not propagate.
+   * In-memory only. Database rows are owned by the retention sweep in
+   * `queue/cleanup.ts`, which deletes on inactivity age rather than on run
+   * completion. Deleting here would strand a late terminal update: a check-run
+   * status PATCH that arrives after the prune resolves its check-run ID by
+   * loading through to this row, and a deleted row makes that lookup fail.
    */
   cleanupRun(runId: string): void {
     const keysToClean = this.runIdToKeys.get(runId);
@@ -492,33 +508,28 @@ export class CheckRunReporter {
         }
         this.stepProgress.delete(key);
         this.inProgressSent.delete(key);
+        this.terminalSent.delete(key);
         this.checkRunIds.delete(key);
       }
       this.runIdToKeys.delete(runId);
     }
-    if (this.deps.trackingStore) {
-      this.deps.trackingStore.deleteByRunId(runId).catch((err) => {
-        logger.warn('Failed to delete check-run-tracking rows for run, leaving for GC', {
-          runId,
-          error: toErrorMessage(err),
-        });
-      });
-    }
   }
 
   /**
-   * Hydrate the L1 caches from the DB after a leader switch (or any
-   * boot-time recovery). Called once on coord become-leader so the
-   * runIdToKeys reverse map is populated for any future cleanupRun calls
-   * without requiring a DB round-trip per cleanup. If no store is wired,
+   * Mark the reporter as DB-backed after a leader switch (or any boot-time
+   * recovery). Called once on coord become-leader. If no store is wired,
    * this is a no-op.
+   *
+   * Nothing is hydrated up front — the table can be large across many shas —
+   * so check-run IDs load through on demand inside `resolveCheckRunId`. The
+   * `runIdToKeys` reverse map is rebuilt only from this coord's own writes,
+   * so a run whose keys all predate the switch leaves `cleanupRun` nothing to
+   * evict. That is harmless: the L1 caches it clears are equally empty on a
+   * fresh coord, and the DB rows belong to the retention sweep rather than to
+   * run prune.
    */
   async recoverState(): Promise<void> {
     if (!this.deps.trackingStore) return;
-    // We don't bulk-hydrate every L1 cache (the table could be large
-    // across many shas). On-demand load-through inside resolveCheckRunId
-    // handles ID lookups; the reverse-map cache is built lazily as the
-    // store reports keys during cleanup.
     logger.info('CheckRunReporter recovered (DB-backed state lookups enabled)');
   }
 
@@ -561,7 +572,7 @@ export class CheckRunReporter {
     this.checkRunIds.set(key, checkRunId);
     if (!this.deps.trackingStore) return;
     try {
-      await this.deps.trackingStore.setCheckRunId(this.parseKey(key), checkRunId);
+      await this.deps.trackingStore.setCheckRunId(this.parseKey(key), checkRunId, runId);
       if (runId) {
         await this.deps.trackingStore.markBuildCreationComplete(this.parseKey(key));
       }
@@ -819,10 +830,13 @@ export class CheckRunReporter {
       this.progressTimers.delete(key);
     }
 
-    // Clear step progress for this key in the L1 cache. The DB row is
-    // deleted later in cleanupRun once the run completes.
+    // Clear step progress for this key in the L1 cache. The DB row stays —
+    // it is reaped by the inactivity-age retention sweep, not by run cleanup.
     this.stepProgress.delete(key);
     this.inProgressSent.delete(key);
+    // Latch the key terminal BEFORE the PATCH: a step status arriving while the
+    // completion is in flight must not schedule a progress update behind it.
+    this.terminalSent.add(key);
 
     const octokit = createInstallationOctokit(githubConfig, opts.installationId);
     const traceIds = this.resolveTraceIds(opts);
@@ -899,20 +913,25 @@ export class CheckRunReporter {
     const { conclusion } = this.mapJobConclusion(opts.state, opts.description);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
-    await this.updateCheckRun(octokit, {
-      owner: opts.owner,
-      repo: opts.repo,
-      check_run_id: checkRunId,
-      status: 'completed',
-      conclusion,
-      completed_at: new Date().toISOString(),
-      output: {
-        title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
-        summary,
-        annotations,
+    await this.updateCheckRun(
+      octokit,
+      {
+        owner: opts.owner,
+        repo: opts.repo,
+        check_run_id: checkRunId,
+        status: 'completed',
+        conclusion,
+        completed_at: new Date().toISOString(),
+        output: {
+          title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+          summary,
+          annotations,
+        },
+        ...(detailsUrl && { details_url: detailsUrl }),
       },
-      ...(detailsUrl && { details_url: detailsUrl }),
-    });
+      key,
+      opts.runId,
+    );
   }
 
   private async doUpdateWorkflowStatus(opts: UpdateWorkflowStatusOptions): Promise<void> {
@@ -944,19 +963,24 @@ export class CheckRunReporter {
     const traceIds = this.resolveTraceIds(opts);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
-    await this.updateCheckRun(octokit, {
-      owner: opts.owner,
-      repo: opts.repo,
-      check_run_id: checkRunId,
-      status: 'completed',
-      conclusion,
-      completed_at: new Date().toISOString(),
-      output: {
-        title: `KiCI: ${opts.workflowName}`,
-        summary: this.appendTraceIds(description, traceIds),
+    await this.updateCheckRun(
+      octokit,
+      {
+        owner: opts.owner,
+        repo: opts.repo,
+        check_run_id: checkRunId,
+        status: 'completed',
+        conclusion,
+        completed_at: new Date().toISOString(),
+        output: {
+          title: `KiCI: ${opts.workflowName}`,
+          summary: this.appendTraceIds(description, traceIds),
+        },
+        ...(detailsUrl && { details_url: detailsUrl }),
       },
-      ...(detailsUrl && { details_url: detailsUrl }),
-    });
+      key,
+      opts.runId,
+    );
   }
 
   private async doCleanupStaleCheckRuns(opts: {
@@ -1083,6 +1107,9 @@ export class CheckRunReporter {
 
     const checkName = `kici/${opts.workflowName}/job/${opts.jobName}`;
     const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, checkName);
+    // The job is already reported. Publishing progress now would reopen a
+    // resolved check run — see `terminalSent`.
+    if (this.terminalSent.has(key)) return;
     const checkRunId = await this.resolveCheckRunId(key);
     if (!checkRunId) return;
 
@@ -1129,17 +1156,22 @@ export class CheckRunReporter {
       const progressText = buildProgressText({ steps, traceIds });
       const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
-      await this.updateCheckRun(octokit, {
-        owner: opts.owner,
-        repo: opts.repo,
-        check_run_id: checkRunId,
-        status: 'in_progress',
-        output: {
-          title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
-          summary: progressText,
+      await this.updateCheckRun(
+        octokit,
+        {
+          owner: opts.owner,
+          repo: opts.repo,
+          check_run_id: checkRunId,
+          status: 'in_progress',
+          output: {
+            title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+            summary: progressText,
+          },
+          ...(detailsUrl && { details_url: detailsUrl }),
         },
-        ...(detailsUrl && { details_url: detailsUrl }),
-      });
+        key,
+        opts.runId,
+      );
       return;
     }
 
@@ -1178,6 +1210,9 @@ export class CheckRunReporter {
       runId?: string;
     },
   ): Promise<void> {
+    // A timer that outlived the job's completion — see `terminalSent`. Firing it
+    // would PATCH `status: in_progress` over a resolved check run.
+    if (this.terminalSent.has(key)) return;
     const checkRunId = await this.resolveCheckRunId(key);
     const githubConfig = this.resolveGithubConfig(opts.routingKey);
     if (!checkRunId || !githubConfig || !opts.installationId) return;
@@ -1190,17 +1225,22 @@ export class CheckRunReporter {
     const progressText = buildProgressText({ steps, traceIds });
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
-    await this.updateCheckRun(octokit, {
-      owner: opts.owner,
-      repo: opts.repo,
-      check_run_id: checkRunId,
-      status: 'in_progress',
-      output: {
-        title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
-        summary: progressText,
+    await this.updateCheckRun(
+      octokit,
+      {
+        owner: opts.owner,
+        repo: opts.repo,
+        check_run_id: checkRunId,
+        status: 'in_progress',
+        output: {
+          title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+          summary: progressText,
+        },
+        ...(detailsUrl && { details_url: detailsUrl }),
       },
-      ...(detailsUrl && { details_url: detailsUrl }),
-    });
+      key,
+      opts.runId,
+    );
   }
 
   private async doSetBuildPending(opts: SetBuildPendingOptions): Promise<void> {
@@ -1278,26 +1318,31 @@ export class CheckRunReporter {
     const traceIds = this.resolveTraceIds(opts);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
-    await this.updateCheckRun(octokit, {
-      owner: opts.owner,
-      repo: opts.repo,
-      check_run_id: checkRunId,
-      status: 'completed',
-      conclusion,
-      completed_at: new Date().toISOString(),
-      output: {
-        title: `KiCI: ${opts.workflowName}/setup`,
-        summary: this.appendTraceIds(description, traceIds),
+    await this.updateCheckRun(
+      octokit,
+      {
+        owner: opts.owner,
+        repo: opts.repo,
+        check_run_id: checkRunId,
+        status: 'completed',
+        conclusion,
+        completed_at: new Date().toISOString(),
+        output: {
+          title: `KiCI: ${opts.workflowName}/setup`,
+          summary: this.appendTraceIds(description, traceIds),
+        },
+        ...(detailsUrl && { details_url: detailsUrl }),
       },
-      ...(detailsUrl && { details_url: detailsUrl }),
-    });
+      key,
+      opts.runId,
+    );
   }
 
   /**
    * Map internal build status to GitHub Checks conclusion and description.
    */
   private mapBuildConclusion(
-    status: Extract<ExecutionJobStatus, 'success' | 'failed' | 'cancelled' | 'timed_out_stale'>,
+    status: TerminalJobStatus,
     customDescription?: string,
   ): { conclusion: CheckRunConclusion; description: string } {
     switch (status) {
@@ -1322,6 +1367,45 @@ export class CheckRunReporter {
           description:
             customDescription ?? 'Build became stale -- no heartbeat received from agent.',
         };
+      case ExecutionJobStatus.enum.skipped:
+        // `CheckRunConclusion` has no `skipped` member, and adding one is a
+        // change to a provider vocabulary with its own consumers. `cancelled`
+        // is the closest available "did not run" outcome and, like GitHub's
+        // own skipped conclusion, does not block a branch. Reporting a skipped
+        // build as `success` would be a lie.
+        return {
+          conclusion: CheckRunConclusion.enum.cancelled,
+          description: customDescription ?? 'Build skipped',
+        };
+      case ExecutionJobStatus.enum.drift_dropped:
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ??
+            'Build dropped -- determinism drift detected during re-evaluation on the agent.',
+        };
+      case ExecutionJobStatus.enum.unroutable:
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ?? 'Build could not be routed -- its runsOn matched no agent.',
+        };
+      default: {
+        // Unreachable while `status` is a `TerminalJobStatus`. That type is an
+        // `Exclude<>` of the non-terminal statuses, so a status added to the
+        // engine enum widens it and makes this switch non-exhaustive — the
+        // `never` assignment below is then a compile error. The runtime arm
+        // exists because an untyped caller must degrade the check run rather
+        // than crash it.
+        const unexpected: never = status;
+        logger.warn('Unexpected terminal job status mapping a build conclusion', {
+          status: unexpected as unknown as string,
+        });
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description: customDescription ?? 'Build finished with an unrecognised status',
+        };
+      }
     }
   }
 
@@ -1329,7 +1413,7 @@ export class CheckRunReporter {
    * Map internal job state to GitHub Checks conclusion and description.
    */
   private mapJobConclusion(
-    state: Extract<ExecutionJobStatus, 'success' | 'failed' | 'cancelled' | 'timed_out_stale'>,
+    state: TerminalJobStatus,
     customDescription?: string,
   ): { conclusion: CheckRunConclusion; description: string } {
     switch (state) {
@@ -1355,6 +1439,44 @@ export class CheckRunReporter {
             customDescription ??
             'Run became stale -- no heartbeat received. Agent may have died or become unresponsive.',
         };
+      case ExecutionJobStatus.enum.skipped:
+        // `CheckRunConclusion` has no `skipped` member; `cancelled` is the
+        // closest available "did not run" outcome and does not block a branch.
+        return {
+          conclusion: CheckRunConclusion.enum.cancelled,
+          description: customDescription ?? 'Job skipped',
+        };
+      case ExecutionJobStatus.enum.drift_dropped:
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ??
+            'Job dropped -- determinism drift detected during re-evaluation on the agent.',
+        };
+      case ExecutionJobStatus.enum.unroutable:
+        // A job that could not run must not satisfy a required check, so this
+        // is a `failure` rather than the `cancelled` used for `skipped`.
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ?? 'Job could not be routed -- its runsOn matched no agent.',
+        };
+      default: {
+        // Unreachable while `state` is a `TerminalJobStatus`. That type is an
+        // `Exclude<>` of the non-terminal statuses, so a status added to the
+        // engine enum widens it and makes this switch non-exhaustive — the
+        // `never` assignment below is then a compile error. The runtime arm
+        // exists because an untyped caller must degrade the check run rather
+        // than crash it.
+        const unexpected: never = state;
+        logger.warn('Unexpected terminal job status mapping a job conclusion', {
+          status: unexpected as unknown as string,
+        });
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description: customDescription ?? 'Job finished with an unrecognised status',
+        };
+      }
     }
   }
 
@@ -1362,7 +1484,7 @@ export class CheckRunReporter {
    * Map internal workflow state to GitHub Checks conclusion and description.
    */
   private mapWorkflowConclusion(
-    status: Extract<ExecutionJobStatus, 'success' | 'failed' | 'cancelled' | 'timed_out_stale'>,
+    status: TerminalJobStatus,
     customDescription?: string,
   ): { conclusion: CheckRunConclusion; description: string } {
     switch (status) {
@@ -1388,6 +1510,43 @@ export class CheckRunReporter {
             customDescription ??
             'One or more jobs became stale -- no heartbeat received from agent.',
         };
+      case ExecutionJobStatus.enum.skipped:
+        // `CheckRunConclusion` has no `skipped` member; `cancelled` is the
+        // closest available "did not run" outcome and does not block a branch.
+        return {
+          conclusion: CheckRunConclusion.enum.cancelled,
+          description: customDescription ?? 'Workflow skipped',
+        };
+      case ExecutionJobStatus.enum.drift_dropped:
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ??
+            'One or more jobs were dropped -- determinism drift detected during re-evaluation.',
+        };
+      case ExecutionJobStatus.enum.unroutable:
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description:
+            customDescription ??
+            'One or more jobs could not be routed -- their runsOn matched no agent.',
+        };
+      default: {
+        // Unreachable while `status` is a `TerminalJobStatus`. That type is an
+        // `Exclude<>` of the non-terminal statuses, so a status added to the
+        // engine enum widens it and makes this switch non-exhaustive — the
+        // `never` assignment below is then a compile error. The runtime arm
+        // exists because an untyped caller must degrade the check run rather
+        // than crash it.
+        const unexpected: never = status;
+        logger.warn('Unexpected terminal job status mapping a workflow conclusion', {
+          status: unexpected as unknown as string,
+        });
+        return {
+          conclusion: CheckRunConclusion.enum.failure,
+          description: customDescription ?? 'Workflow finished with an unrecognised status',
+        };
+      }
     }
   }
 
@@ -1470,7 +1629,32 @@ export class CheckRunReporter {
        */
       details_url?: string;
     },
+    /**
+     * Tracking key whose row is stamped `terminal_sent_at` once the provider
+     * has accepted a `completed` update. Optional so a caller without a key
+     * still compiles; every call site of this method passes it, so a terminal
+     * update routed through here cannot skip the marker without also skipping
+     * the PATCH.
+     *
+     * `doCleanupStaleCheckRuns` deliberately does NOT route through here: it
+     * PATCHes `conclusion: 'timed_out'` straight through Octokit for check runs
+     * a dead orchestrator abandoned, and those are not terminal updates this
+     * pipeline sent. They stay unstamped so the column keeps meaning "the
+     * pipeline reported a result", not "something closed the check run".
+     */
+    trackingKey?: string,
+    /**
+     * The KiCI run the stamped row belongs to, threaded exactly as
+     * `markInProgressSent` / `markBuildCreationPending` / `setStepProgress`
+     * thread theirs. The stamp is an upsert, so on the cache-only fallback path
+     * (`persistCheckRunId` swallowed a DB error but L1 still holds the id) it
+     * can INSERT the row rather than update one — without `run_id` that row is
+     * invisible to `listKeysByRunId`, so nothing can tell an operator which run
+     * posted it.
+     */
+    trackingRunId?: string,
   ): Promise<void> {
+    let patchAccepted = false;
     try {
       const updateParams: Record<string, unknown> = {
         owner: params.owner,
@@ -1498,6 +1682,7 @@ export class CheckRunReporter {
       }
 
       await octokit.checks.update(updateParams as any);
+      patchAccepted = true;
 
       githubCheckRunTotal.add(1, { operation: 'update' });
     } catch (err: unknown) {
@@ -1514,6 +1699,22 @@ export class CheckRunReporter {
         logger.error('GitHub API error updating check run', {
           checkRunId: params.check_run_id,
           status: error.status,
+          error: toErrorMessage(err),
+        });
+      }
+    }
+
+    // Stamp only a terminal update the provider actually accepted. A stamp on
+    // a thrown or `in_progress` update would make the column lie, and not
+    // lying is the column's only value. Best-effort like every other write on
+    // this table: a tracking failure must not turn an accepted check-run
+    // update into an error.
+    if (patchAccepted && params.status === 'completed' && trackingKey && this.deps.trackingStore) {
+      try {
+        await this.deps.trackingStore.markTerminalSent(this.parseKey(trackingKey), trackingRunId);
+      } catch (err) {
+        logger.warn('Failed to stamp terminal_sent_at; continuing', {
+          key: trackingKey,
           error: toErrorMessage(err),
         });
       }

@@ -35,6 +35,8 @@ import {
   type PeerCacheUploadResponse,
   type PeerConfigReload,
   type PeerConfigReloadResponse,
+  type PeerClusterSettingsRequest,
+  type PeerClusterSettingsResponse,
   type PeerLogsCollectRequest,
   type PeerLeaving,
   type PeerAgentTokenRevoke,
@@ -60,11 +62,7 @@ declare const KICI_PKG_VERSION: string;
 const SOFTWARE_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.0';
 
 type PeerConnectionState =
-  | 'disconnected'
-  | 'connecting'
-  | 'handshaking'
-  | 'authenticating'
-  | 'connected';
+  'disconnected' | 'connecting' | 'handshaking' | 'authenticating' | 'connected';
 
 export interface PeerClientOptions {
   /** WebSocket URL of the remote peer orchestrator. */
@@ -88,7 +86,7 @@ export interface PeerClientOptions {
   /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
   /** Callback when a job progress update is received from peer. */
-  onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
+  onJobProgress: (msg: JobProgress, fromPeerId: string, reply: (m: JobProgressAck) => void) => void;
   /**
    * Callback invoked once this client reaches the `connected` state (initial
    * connect AND every reconnect). Carries this client's peer URL.
@@ -184,6 +182,14 @@ interface ConfigReloadWaiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/**
+ * Tracks pending cluster-settings pull responses.
+ */
+interface ClusterSettingsWaiter {
+  resolve: (response: PeerClusterSettingsResponse | null) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class PeerClient {
   private ws: WebSocket | null = null;
   private _state: PeerConnectionState = 'disconnected';
@@ -196,6 +202,7 @@ export class PeerClient {
   private readonly ackWaiters = new Map<string, AckWaiter>();
   private readonly cacheWaiters = new Map<string, CacheWaiter>();
   private readonly configReloadWaiters = new Map<string, ConfigReloadWaiter>();
+  private readonly clusterSettingsWaiters = new Map<string, ClusterSettingsWaiter>();
   /** Correlates peer.logs.collect.request with the peer's chunked subtree response. */
   private readonly logsCollectWaiters = new ChunkRequestWaiter();
 
@@ -214,7 +221,11 @@ export class PeerClient {
   private readonly heartbeatIntervalMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly onJobReroute: (msg: JobReroute) => Promise<void>;
-  private readonly onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
+  private readonly onJobProgress: (
+    msg: JobProgress,
+    fromPeerId: string,
+    reply: (m: JobProgressAck) => void,
+  ) => void;
   private readonly onConnected?: (url: string) => void;
   private readonly onJobProgressAck?: (msg: JobProgressAck) => void;
   private readonly onJobCancel: (msg: PeerJobCancel) => void;
@@ -296,6 +307,7 @@ export class PeerClient {
     this.clearAckWaiters();
     this.clearCacheWaiters();
     this.clearConfigReloadWaiters();
+    this.clearClusterSettingsWaiters();
     this.logsCollectWaiters.rejectAll('peer disconnected');
 
     if (this.ws) {
@@ -382,6 +394,29 @@ export class PeerClient {
       }, timeoutMs);
 
       this.configReloadWaiters.set(msg.messageId, { resolve, timer });
+    });
+  }
+
+  /**
+   * Send a peer.clusterSettings.request to the connected leader and wait for the
+   * matching peer.clusterSettings.response carrying the worker-settings snapshot.
+   *
+   * @returns The response, or null if not connected or the leader doesn't reply
+   *   within the timeout — the caller keeps its current (config-default) settings.
+   */
+  async sendClusterSettingsRequestAndWait(
+    msg: PeerClusterSettingsRequest,
+    timeoutMs: number = 10_000,
+  ): Promise<PeerClusterSettingsResponse | null> {
+    if (!this.send(msg as PeerToPeerMessage)) return null;
+
+    return new Promise<PeerClusterSettingsResponse | null>((resolve) => {
+      const timer = setTimeout(() => {
+        this.clusterSettingsWaiters.delete(msg.messageId);
+        resolve(null);
+      }, timeoutMs);
+
+      this.clusterSettingsWaiters.set(msg.messageId, { resolve, timer });
     });
   }
 
@@ -856,7 +891,14 @@ export class PeerClient {
       }
 
       case 'job.progress': {
-        this.onJobProgress(msg, (out) => this.send(out));
+        // job.progress only arrives on an authenticated connection, so the
+        // remote peer's instanceId is set here; it is what the coordinator uses
+        // to verify signal provenance against the tracked reroute target.
+        if (this._targetInstanceId === null) {
+          logger.warn('Dropping job.progress received before peer authentication completed');
+          break;
+        }
+        this.onJobProgress(msg, this._targetInstanceId, (out) => this.send(out));
         break;
       }
 
@@ -981,6 +1023,16 @@ export class PeerClient {
         break;
       }
 
+      case 'peer.clusterSettings.response': {
+        const waiter = this.clusterSettingsWaiters.get(msg.messageId);
+        if (waiter) {
+          clearTimeout(waiter.timer);
+          this.clusterSettingsWaiters.delete(msg.messageId);
+          waiter.resolve(msg);
+        }
+        break;
+      }
+
       case 'peer.logs.collect.request': {
         void this.onLogsCollectRequest?.(msg, (out) => this.send(out));
         break;
@@ -1080,5 +1132,14 @@ export class PeerClient {
       });
     }
     this.configReloadWaiters.clear();
+  }
+
+  private clearClusterSettingsWaiters(): void {
+    for (const [, waiter] of this.clusterSettingsWaiters) {
+      clearTimeout(waiter.timer);
+      // Null result → the worker keeps its current (config-default) settings.
+      waiter.resolve(null);
+    }
+    this.clusterSettingsWaiters.clear();
   }
 }

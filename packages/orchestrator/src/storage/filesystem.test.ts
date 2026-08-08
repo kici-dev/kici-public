@@ -97,6 +97,12 @@ describe('FilesystemCacheStorage', () => {
     expect(await storage.getMetadata('dep/nope')).toBeNull();
   });
 
+  it('getObjectSize returns the stored byte size and null for a missing key', async () => {
+    await storage.put('sized/obj', Buffer.from('hello world')); // 11 bytes
+    expect(await storage.getObjectSize('sized/obj')).toBe(11);
+    expect(await storage.getObjectSize('sized/missing')).toBeNull();
+  });
+
   it('getUrl() returns null when missing', async () => {
     expect(await storage.getUrl('dep/missing')).toBeNull();
   });
@@ -112,6 +118,13 @@ describe('FilesystemCacheStorage', () => {
     expect(token).toBeTruthy();
     const result = verifyToken(secret, 'GET', 'dep/abc', token!);
     expect(result.ok).toBe(true);
+  });
+
+  it('presignedGetTtlSeconds() reports the signature TTL, decoupled from the retention ttlMs', () => {
+    // The store's retention ttlMs is 60_000 (60 s), but signed GET URLs are
+    // minted with DEFAULT_SIGN_URL_TTL_MS (1 h) — the dashboard needs the
+    // signature expiry, not the retention window.
+    expect(storage.presignedGetTtlSeconds()).toBe(3600);
   });
 
   it('getUploadUrl() returns a signed PUT URL', async () => {
@@ -168,6 +181,50 @@ describe('FilesystemCacheStorage', () => {
 
   it('list() returns an empty array for a missing sub-prefix', async () => {
     expect(await storage.list('nope/')).toEqual([]);
+  });
+
+  // UserCache.restoreByPrefix lists on `${prefix}${seg(restoreKey)}` — a PARTIAL
+  // object name, not a directory. Treating that as a directory to readdir made
+  // the restoreKeys fallback silently never hit on this backend (ENOENT -> []),
+  // or throw outright (ENOTDIR) when a real file happened to carry that exact
+  // name. The S3 backend prefix-matches, so only the filesystem backend was
+  // affected and no FakeStorage-based unit test could see it.
+  describe('list() with a partial-name prefix (restoreKeys)', () => {
+    it('matches objects whose key starts with the prefix', async () => {
+      await storage.put('a/node-v1-aaa', 'x');
+      await storage.put('a/node-v1-bbb', 'y');
+      await storage.put('a/other-v1', 'z');
+
+      const listed = await storage.list('a/node-v1');
+
+      expect(listed.sort()).toEqual(['a/node-v1-aaa', 'a/node-v1-bbb']);
+    });
+
+    it('returns [] rather than throwing when the prefix names an existing file', async () => {
+      // The ENOTDIR path: `a/node-v1` is itself an object, so readdir-ing it
+      // raised ENOTDIR, which the old not-found check did not treat as a miss.
+      await storage.put('a/node-v1', 'x');
+
+      const listed = await storage.list('a/node-v1');
+
+      expect(listed).toEqual(['a/node-v1']);
+    });
+
+    it('returns [] for a partial prefix that matches nothing', async () => {
+      await storage.put('a/other', 'z');
+      expect(await storage.list('a/node-v1')).toEqual([]);
+    });
+
+    it('does not match a sibling directory that merely shares the stem', async () => {
+      await storage.put('a/node-v1-aaa', 'x');
+      await storage.put('a/node-v10/nested', 'y');
+
+      const listed = await storage.list('a/node-v1');
+
+      // `a/node-v10/nested` DOES start with `a/node-v1`, so it is a legitimate
+      // prefix match — the same answer S3 gives.
+      expect(listed.sort()).toEqual(['a/node-v1-aaa', 'a/node-v10/nested']);
+    });
   });
 
   it('copy() server-side copies bytes to a new key with fresh metadata', async () => {

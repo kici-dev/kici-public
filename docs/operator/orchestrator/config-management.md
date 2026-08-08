@@ -44,7 +44,7 @@ providers:
       appId: '12345'
 
 platform:
-  url: 'wss://relay.kici.dev'
+  url: 'wss://api.kici.dev/ws'
 
 storage:
   type: 's3'

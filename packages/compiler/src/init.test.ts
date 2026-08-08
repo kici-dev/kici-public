@@ -482,4 +482,106 @@ describe('kici init', () => {
       expect(body).toContain('Do NOT write `.yml` / `.yaml`');
     });
   });
+
+  describe('workspace integrate mode', () => {
+    // A .git marker bounds detectWorkspaceRoot's upward walk to tempDir, so the
+    // real myci26 workspace above the compiler package is never picked up.
+    async function makePnpmWorkspace(): Promise<void> {
+      await fs.writeFile(
+        path.join(tempDir, 'pnpm-workspace.yaml'),
+        "packages:\n  - 'packages/*'\n",
+      );
+      await fs.writeFile(
+        path.join(tempDir, 'package.json'),
+        JSON.stringify({ name: 'root', private: true }, null, 2) + '\n',
+      );
+      await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
+    }
+
+    it('omits .kici/package.json and adds @kici-dev/sdk to the root manifest', async () => {
+      await makePnpmWorkspace();
+      const ok = await initCommand({ workspace: true, skipInstall: true });
+      expect(ok).toBe(true);
+
+      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(false);
+      expect(await exists(path.join(tempDir, '.kici', 'tsconfig.json'))).toBe(true);
+
+      const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
+      expect(root.devDependencies['@kici-dev/sdk']).toBeDefined();
+    });
+
+    it('dev mode writes the root .npmrc, not .kici/.npmrc', async () => {
+      process.env.KICI_DEV = 'true';
+      try {
+        await makePnpmWorkspace();
+        await initCommand({ workspace: true, skipInstall: true });
+        expect(await exists(path.join(tempDir, '.npmrc'))).toBe(true);
+        expect(await exists(path.join(tempDir, '.kici', '.npmrc'))).toBe(false);
+        const npmrc = await fs.readFile(path.join(tempDir, '.npmrc'), 'utf-8');
+        expect(npmrc).toContain('@kici-dev:registry=');
+      } finally {
+        delete process.env.KICI_DEV;
+      }
+    });
+
+    it('does not clobber an existing root @kici-dev/sdk', async () => {
+      await makePnpmWorkspace();
+      await fs.writeFile(
+        path.join(tempDir, 'package.json'),
+        JSON.stringify(
+          { name: 'root', private: true, devDependencies: { '@kici-dev/sdk': '1.2.3' } },
+          null,
+          2,
+        ) + '\n',
+      );
+      await initCommand({ workspace: true, skipInstall: true });
+      const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
+      expect(root.devDependencies['@kici-dev/sdk']).toBe('1.2.3');
+    });
+
+    it('--workspace with no workspace fails', async () => {
+      // A .git marker but no workspace manifest → detection returns null.
+      await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
+      const ok = await initCommand({ workspace: true, skipInstall: true });
+      expect(ok).toBe(false);
+    });
+
+    it('--workspace and --standalone together fails', async () => {
+      await makePnpmWorkspace();
+      const ok = await initCommand({ workspace: true, standalone: true, skipInstall: true });
+      expect(ok).toBe(false);
+    });
+
+    it('--standalone inside a workspace writes the standalone layout', async () => {
+      await makePnpmWorkspace();
+      await initCommand({ standalone: true, skipInstall: true });
+      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(true);
+    });
+
+    it('CI/non-TTY inside a workspace defaults to standalone (no flag)', async () => {
+      // CI=true is set by the suite's beforeEach.
+      await makePnpmWorkspace();
+      await initCommand({ skipInstall: true });
+      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(true);
+    });
+  });
+
+  describe('host-OS runsOn rewrite', () => {
+    it('scaffolds runsOn matching the host OS', async () => {
+      const nodeOs = await import('node:os');
+      const { primaryHostOsLabel } = await import('./commands/init-host-os.js');
+      const expectedLabel = primaryHostOsLabel(nodeOs.platform(), nodeOs.arch());
+
+      const success = await initCommand({ skipInstall: true });
+      expect(success).toBe(true);
+
+      const hello = await fs.readFile('.kici/workflows/hello-world.ts', 'utf-8');
+      expect(hello).toContain(`runsOn: '${expectedLabel}'`);
+      // On a non-Linux host the stale kici:os:linux must be gone; on a Linux
+      // host expectedLabel IS kici:os:linux so this guard is inert.
+      if (expectedLabel !== 'kici:os:linux') {
+        expect(hello).not.toContain('kici:os:linux');
+      }
+    });
+  });
 });

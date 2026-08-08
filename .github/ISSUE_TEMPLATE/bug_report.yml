@@ -1,6 +1,6 @@
 name: Bug report
 description: Report a defect in a published KiCI package or container image
-labels: ["bug"]
+labels: ['bug']
 body:
   - type: markdown
     attributes:
@@ -12,7 +12,7 @@ body:
     attributes:
       label: KiCI version
       description: Output of `kici --version`.
-      placeholder: "0.1.16"
+      placeholder: '0.1.16'
     validations:
       required: true
   - type: input
@@ -20,7 +20,7 @@ body:
     attributes:
       label: Environment
       description: Node version, package manager + version, and OS.
-      placeholder: "Node 24.13.0, pnpm 11.3.0, Ubuntu 24.04"
+      placeholder: 'Node 24.13.0, pnpm 11.3.0, Ubuntu 24.04'
     validations:
       required: true
   - type: textarea

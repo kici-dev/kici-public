@@ -76,6 +76,8 @@ Orchestrators need to reach each other via WebSocket for direct peer connections
 
 In Platform/hybrid modes, orchestrators that cannot reach each other directly fall back to relay through the Platform tier.
 
+For the full outbound allowlist and inbound surface across all deployment modes, see [Network requirements](../network-requirements.md).
+
 ## Configuration reference
 
 Cluster configuration uses the `KICI_CLUSTER_*` environment variable prefix.
@@ -539,10 +541,19 @@ The Raft leader runs periodic orphan recovery (every 60 seconds). It detects run
 
 Rerouted jobs carry a hop counter to prevent infinite routing loops. If a job exceeds the maximum hop count, it fails instead of being rerouted again.
 
-| Limit        | Value | Description                                                         |
-| ------------ | ----- | ------------------------------------------------------------------- |
-| Maximum hops | 3     | Jobs rerouted more than 3 times are failed to prevent routing loops |
-| ACK timeout  | 15s   | Time for a peer to acknowledge receipt of a rerouted job            |
+| Limit        | Default | `kici-admin org-settings reroute` flag | Description                                                            |
+| ------------ | ------- | -------------------------------------- | ---------------------------------------------------------------------- |
+| Maximum hops | 3       | `--max-hops`                           | Jobs rerouted more than this many times are failed to prevent loops    |
+| ACK timeout  | 15s     | `--ack-timeout`                        | Time for a peer to acknowledge receipt of a rerouted job               |
+| Spawn window | 90s     | `--window`                             | After a peer ACKs, how long to wait for progress before re-dispatching |
+
+Each default is cluster-wide; set a per-org override with `kici-admin org-settings reroute set --org <id> --window <ms> --ack-timeout <ms> --max-hops <n>`, and clear it with `kici-admin org-settings reroute reset --org <id>`.
+
+### Rerouted job stalls (spawn failure)
+
+**Symptom:** a job rerouted to a peer never starts and the run sits `pending`.
+
+A peer that accepts a reroute but then fails to spawn the agent (transient scaler error, image-pull failure, peer crash) does not strand the run. The coordinator arms a **spawn window** on every accepted reroute: if no progress arrives within the window, it cancels the original peer's job and re-dispatches the job to another peer or a local backend, failing the job only if no backend can run it. A worker that detects the spawn failure directly reports it back, so recovery usually happens well before the window elapses. Raise `--window` for peers with legitimately slow agent startup; lower it to recover faster on flaky backends.
 
 ### Jobs not rerouting
 

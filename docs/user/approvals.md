@@ -46,13 +46,13 @@ When the run reaches this job, it is held instead of dispatched. The held run ap
 job('deploy', {
   runsOn: 'default',
   approval: true,
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 ```
 
-`approval: true` holds the element until **any** org member who can act on approvals signs off — anyone with the `contexts:write` or `ci_trust:write` permission. Use it when you want a manual gate without restricting who may release it.
+`approval: true` holds the element until **any** org member who can act on approvals signs off — anyone with `contexts:write`, since an `approval` gate always raises a reviewer hold. Use it when you want a manual gate without restricting who may release it.
+
+A **security** hold is different: it is raised by the CI trust pipeline (an unknown contributor, a fork PR, a workflow-modifying PR), never by `approval`, and releasing one requires `ci_trust:write`. See [Approval gates (operator guide)](../operator/approvals.md#who-may-approve).
 
 ### Approver list (AND)
 
@@ -80,14 +80,16 @@ approval: {
 },
 ```
 
-| Field       | Type                  | Description                                                                                                                                                                 |
-| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `when`      | `'always' \| 'drift'` | When the gate fires. `'always'` (default) gates before the element; `'drift'` gates a check/apply step only when it finds drift. See [Drift gates](#drift-gates-whendrift). |
-| `approvers` | `ApproverClause[]`    | The AND list of `{ team }` / `{ user }` clauses. An empty list means "any approval-capable member".                                                                         |
-| `reason`    | `string`              | A human-readable label shown in the dashboard queue and the held-for-approval status check.                                                                                 |
-| `timeout`   | `number`              | Per-gate expiry in **seconds**, overriding the org default. On expiry the element is rejected.                                                                              |
+| Field       | Type                  | Description                                                                                                                                                                                                      |
+| ----------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `when`      | `'always' \| 'drift'` | When the gate fires. `'always'` (default) gates before the element; `'drift'` gates a check/apply step only when it finds drift. See [Drift gates](#drift-gates-whendrift).                                      |
+| `approvers` | `ApproverClause[]`    | The AND list of `{ team }` / `{ user }` clauses. An empty list means "any approval-capable member".                                                                                                              |
+| `reason`    | `string`              | A human-readable label shown in the dashboard queue and the held-for-approval status check.                                                                                                                      |
+| `timeout`   | `number`              | Per-gate expiry in **seconds**, overriding the org default. Must be a **positive integer** number of seconds; a non-positive or non-finite value is rejected at compile time. On expiry the element is rejected. |
 
 When `timeout` is omitted, the gate uses the org's default approval expiry (set by the operator). On expiry, the held element is rejected and the run fails — see [expiry](../operator/approvals.md#expiry).
+
+A `timeout` that is zero, negative, or non-finite (for example a computed `minutes * 60` where `minutes` is `0`) fails `kici compile` with a clear author-facing error, so a misconfigured gate can never silently expire the moment it is created. If an orchestrator ever receives such a value from a hand-edited lock file, the run fails fast with an **Approval gate misconfigured** init-failure rather than dispatching ungated.
 
 ## Granularity
 
@@ -113,9 +115,7 @@ A job-level gate holds just that job; other jobs in the run proceed normally:
 job('publish', {
   runsOn: 'default',
   approval: [{ team: 'leads' }],
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 ```
 
@@ -186,14 +186,14 @@ kici approve <run-id>
 # Approve a held job
 kici approve <run-id> --job deploy-production
 
-# Approve a held step
-kici approve <run-id> --job migrate-and-deploy --step apply-migration
+# Approve a held step (--step takes the step's zero-based index within the job)
+kici approve <run-id> --job migrate-and-deploy --step 1
 
 # Reject (a reason is required)
 kici reject <run-id> --job deploy-production --reason "Wrong release branch"
 ```
 
-You must be eligible for at least one unsatisfied clause — being a member of a named team or being a named user. The orchestrator verifies eligibility against the operator-defined teams, so naming a team in your workflow can never let an ineligible person release the gate. The command reports whether the element was released, how many clauses remain, or that it was rejected. See [`kici approve`](cli-reference.md#kici-approve) for the full command reference.
+You must be eligible for at least one unsatisfied clause — being a member of a named team or being a named user. The orchestrator verifies eligibility against the operator-defined teams, so naming a team in your workflow can never let an ineligible person release the gate. The command reports whether the element was released, how many clauses remain, or that it was rejected. See [`kici approve`](./cli/runs-and-approvals.md#kici-approve) for the full command reference.
 
 ### Inline approval and `--approve-all` in `kici run remote`
 

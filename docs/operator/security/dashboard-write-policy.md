@@ -7,36 +7,49 @@ The orchestrator decides, per operation, whether a mutating dashboard action sta
 
 The default at first boot is **permissive**: every operation is enabled. Small teams onboard with the dashboard doing everything they expect a CI control plane to do. Customers preparing for SOC2 or running regulated workloads ratchet specific operations off as their compliance posture demands. There is no "all-or-nothing" switch — every operation flips independently.
 
+## Three postures per operation
+
+Each operation carries one of three postures:
+
+- **`permissive`** — the write is accepted through the web UI and its value transits the hosted control plane in the clear (today's default; the shape most SaaS CI vendors have).
+- **`encrypted`** — for the two `plaintext`-sensitivity operations (`secrets.set`, `variables.set`) only: the web UI keeps the value-entry form, but the **browser encrypts the value to the orchestrator before it leaves the page**, so the control plane relays only opaque ciphertext and never sees the plaintext. See [Encrypted dashboard writes](./encrypted-dashboard-writes.md).
+- **`disabled`** — the write is refused on the web UI; the operator must use `kici-admin`.
+
+`encrypted` is only valid for the plaintext operations — an operation with no plaintext payload has nothing to seal, so the CLI rejects `encrypted` for any other operation. Existing operators keep the familiar permissive/disabled behavior unchanged; `encrypted` is opt-in.
+
 ## The operation registry
 
-Every mutating dashboard action maps to exactly one `DashboardWriteOperation`. The orchestrator ships with **24 operations** today, grouped into eight categories and three sensitivity buckets:
+Every mutating dashboard action maps to exactly one `DashboardWriteOperation`. The orchestrator ships with **27 operations** today, grouped into ten categories and three sensitivity buckets:
 
-| Category          | Operation                              | Sensitivity | `kici-admin` equivalent                                     |
-| ----------------- | -------------------------------------- | ----------- | ----------------------------------------------------------- |
-| **Secrets**       | `secrets.set`                          | plaintext   | `kici-admin secret set`                                     |
-|                   | `secrets.delete`                       | authority   | `kici-admin secret delete`                                  |
-|                   | `secrets.scope.create`                 | authority   | `kici-admin secret scope create`                            |
-|                   | `secrets.scope.rename`                 | authority   | `kici-admin secret scope rename`                            |
-|                   | `secrets.scope.delete`                 | authority   | `kici-admin secret scope delete`                            |
-| **Variables**     | `variables.set`                        | plaintext   | `kici-admin variable set`                                   |
-|                   | `variables.delete`                     | authority   | `kici-admin variable delete`                                |
-| **Environments**  | `environments.create`                  | authority   | `kici-admin context create`                             |
-|                   | `environments.update`                  | authority   | `kici-admin context set-policy`                         |
-|                   | `environments.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution` |
-|                   | `environments.delete`                  | authority   | `kici-admin context delete`                             |
-| **Bindings**      | `environments.bindings.set`            | authority   | `kici-admin context bind`                               |
-|                   | `environments.source_overrides.set`    | authority   | `kici-admin context source-override set`                |
-|                   | `environments.source_overrides.delete` | authority   | `kici-admin context source-override delete`             |
-| **Held runs**     | `held_runs.approve`                    | dispatch    | `kici-admin runs approve`                                   |
-|                   | `held_runs.reject`                     | dispatch    | `kici-admin runs reject`                                    |
-| **DLQ**           | `event_dlq.retry`                      | dispatch    | `kici-admin event-dlq retry`                                |
-|                   | `event_dlq.discard`                    | dispatch    | `kici-admin event-dlq discard`                              |
-| **Registrations** | `registration.disable`                 | dispatch    | `kici-admin registration disable`                           |
-|                   | `registration.delete`                  | dispatch    | `kici-admin registration delete`                            |
-| **Topology**      | `global_workflows.update`              | dispatch    | `kici-admin org-settings global-workflows set`              |
-|                   | `backends.sync`                        | dispatch    | `kici-admin backend sync`                                   |
-|                   | `backends.sync_one`                    | dispatch    | `kici-admin backend sync --one`                             |
-|                   | `backends.test`                        | dispatch    | `kici-admin backend test`                                   |
+| Category          | Operation                          | Sensitivity | `kici-admin` equivalent                                 |
+| ----------------- | ---------------------------------- | ----------- | ------------------------------------------------------- |
+| **Secrets**       | `secrets.set`                      | plaintext   | `kici-admin secret set`                                 |
+|                   | `secrets.delete`                   | authority   | `kici-admin secret delete`                              |
+|                   | `secrets.scope.create`             | authority   | `kici-admin secret scope create`                        |
+|                   | `secrets.scope.rename`             | authority   | `kici-admin secret scope rename`                        |
+|                   | `secrets.scope.delete`             | authority   | `kici-admin secret scope delete`                        |
+| **Variables**     | `variables.set`                    | plaintext   | `kici-admin variable set`                               |
+|                   | `variables.delete`                 | authority   | `kici-admin variable delete`                            |
+| **Contexts**      | `contexts.create`                  | authority   | `kici-admin context create`                             |
+|                   | `contexts.update`                  | authority   | `kici-admin context set-policy`                         |
+|                   | `contexts.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution` |
+|                   | `contexts.delete`                  | authority   | `kici-admin context delete`                             |
+| **Bindings**      | `contexts.bindings.set`            | authority   | `kici-admin context bind`                               |
+|                   | `contexts.source_overrides.set`    | authority   | `kici-admin context source-override set`                |
+|                   | `contexts.source_overrides.delete` | authority   | `kici-admin context source-override delete`             |
+| **Held runs**     | `held_runs.approve`                | dispatch    | `kici-admin runs approve`                               |
+|                   | `held_runs.reject`                 | dispatch    | `kici-admin runs reject`                                |
+| **DLQ**           | `event_dlq.retry`                  | dispatch    | `kici-admin event-dlq retry`                            |
+|                   | `event_dlq.discard`                | dispatch    | `kici-admin event-dlq discard`                          |
+| **Attestations**  | `attestations.retry`               | dispatch    | `kici-admin attestations retry`                         |
+| **Registrations** | `registration.disable`             | dispatch    | `kici-admin registration disable`                       |
+|                   | `registration.delete`              | dispatch    | `kici-admin registration delete`                        |
+| **Topology**      | `global_workflows.update`          | dispatch    | `kici-admin org-settings global-workflows set`          |
+|                   | `backends.sync`                    | dispatch    | `kici-admin backend sync`                               |
+|                   | `backends.sync_one`                | dispatch    | `kici-admin backend sync --one`                         |
+|                   | `backends.test`                    | dispatch    | `kici-admin backend test`                               |
+| **Fleet**         | `fleet.host.declare`               | dispatch    | `kici-admin host declare`                               |
+|                   | `fleet.host.remove`                | dispatch    | `kici-admin host remove`                                |
 
 The **sensitivity** bucket describes the threat each operation participates in when routed through the dashboard:
 
@@ -65,14 +78,15 @@ kici-admin org-settings dashboard-writes show --category=Secrets
 kici-admin org-settings dashboard-writes show --sensitivity=plaintext
 ```
 
-### Disable individual operations
+### Set individual operations
 
 ```bash
-kici-admin org-settings dashboard-writes set --op secrets.set=false
-kici-admin org-settings dashboard-writes set --op secrets.set=false --op variables.set=false
+kici-admin org-settings dashboard-writes set --op secrets.set=disabled
+kici-admin org-settings dashboard-writes set --op secrets.set=disabled --op variables.set=disabled
+kici-admin org-settings dashboard-writes set --op secrets.set=encrypted   # plaintext ops only
 ```
 
-Multiple `--op <name>=<bool>` flags are accepted in one call. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
+Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled` (the legacy `true`/`false` are still accepted and mean `permissive`/`disabled`). Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
 
 ### Disable a whole category or sensitivity bucket
 
@@ -145,9 +159,9 @@ The dashboard reads the current policy from a `GET /api/v1/orgs/:customerId/capa
 
 For each disabled operation:
 
-- **The control is rendered with a lock-icon prefix**, grayed out, and inert. Hovering it reveals a tooltip with the operation name, a one-line explanation, and the exact `kici-admin` invocation needed to perform the action. A copy-to-clipboard button puts the command on the clipboard.
+- **The control is rendered with a lock-icon prefix**, grayed out, and inert — it leaves the tab order entirely, so no pointer, keyboard, or screen-reader interaction can activate it. Hovering **or keyboard-focusing** the lock reveals a tooltip with the operation name, a one-line explanation, and the exact `kici-admin` invocation needed to perform the action. A copy-to-clipboard button puts the command on the clipboard. The lock itself stays focusable and is announced as an unavailable control, so the CLI equivalent is reachable without a mouse.
 - **The page banner** at the top of any page containing at least one disabled operation lists every disabled op on that page plus the CLI equivalent. If every operation on the page is disabled, the banner escalates to "this page is read-only".
-- **The Security policy page** (Settings → Security → Dashboard policy) renders the full 24-row matrix, grouped by category, with the live state and the `kici-admin` command for each row.
+- **The Security policy page** (Settings → Security → Dashboard policy) renders the full 27-row matrix, grouped by category, with the live state and the `kici-admin` command for each row.
 
 A control disabled by policy is visually distinct from a control disabled by RBAC: the policy lock icon is universal across the org and points at `kici-admin`; the RBAC disable points at the org's role configuration. Both can apply at once — RBAC wins (the user simply can't see the data).
 
@@ -157,7 +171,7 @@ The policy is enforced at three independent layers. Any one of them blocking is 
 
 ### Layer 1 — dashboard render
 
-The web UI reads `useCapabilities()`, swaps disabled controls for their lock-icon counterpart, and never issues a mutating request for a disabled operation. The user doesn't get a half-successful click that produces a confusing error.
+The web UI reads the per-orchestrator capabilities endpoint, swaps disabled controls for their lock-icon counterpart, and never issues a mutating request for a disabled operation. The user doesn't get a half-successful click that produces a confusing error.
 
 ### Layer 2 — control-plane HTTP gate
 

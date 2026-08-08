@@ -44,7 +44,8 @@ Each entry in the `scalers` array configures one backend:
 scalers:
   - name: container-linux # Required. Unique human-readable name.
     type: container # Required. Backend type: "container", "bare-metal", or "firecracker".
-    maxAgents: 20 # Required. Per-backend max concurrent agents.
+    maxAgents: 20 # Required. Per-backend population cap: max concurrent agents.
+    maxConcurrentSpawns: 8 # Optional. Provisioning-rate throttle. Default: 8.
     labelSets: # Required. At least one label-set mapping.
       - ...
     orchestratorUrl: 'ws://...' # Optional. URL for spawned agents to connect back to.
@@ -150,6 +151,46 @@ When a job arrives, the scaler resolves the **request** (cpus, memBytes) by walk
 
 If every cap has room, the scaler reserves the request, records it in each affected counter (and writes a row to the on-disk ledger when a pool is involved), then spawns the agent. On agent destroy / failure / scaler shutdown the reservations are released. A reaper sweeps the on-disk ledger every 30 s, releasing rows whose owning process is gone (cross-boot rows are unconditionally stale).
 
+## Spawn concurrency (`maxConcurrentSpawns`)
+
+`maxAgents` is a **population cap** — the number of agents that may exist at once. `maxConcurrentSpawns` is a distinct, orthogonal **provisioning-rate throttle**: the number of `spawn` operations (image pull + container create + start) a backend may run at the same time. Default: `8`.
+
+The two do not conflate. With `maxAgents: 100` and a burst of 100 queued jobs, the population cap admits all 100 — you do want 100 agents. But without a rate throttle all 100 would provision in the same instant, firing 100 near-simultaneous image pulls and container creates at one container socket and hammering the registry — connection storms, registry rate limits, and serialized cold-start latency. `maxConcurrentSpawns: 8` still spawns all 100 agents (their capacity is already reserved); it just drains the provisioning 8 at a time, so the socket and registry are never stormed.
+
+Raise it on a fast local registry or a beefy host; lower it if you see registry rate-limiting or socket saturation during large bursts. The throttle is per-backend, since each backend has its own container socket.
+
+## Spawn timeout
+
+Each `spawn` (image pull + container create + start) runs under a deadline. If the container runtime or registry wedges — a hung pull against an unreachable registry, a stuck create against a saturated daemon — the spawn would otherwise hold its `maxConcurrentSpawns` slot forever and head-of-line block every spawn queued behind it on that backend. On the deadline, the orchestrator aborts the provision (best-effort removing any container it already created), releases the slot, and frees the reservation so the next queued spawn proceeds.
+
+The cluster-wide default is **300000 ms (5 minutes)** — generous, so a legitimate cold-cache pull of a large agent image never trips it. Set it with the `KICI_SCALER_SPAWN_TIMEOUT_MS` environment variable.
+
+Operators can override the deadline per tenant at runtime (no redeploy) via `kici-admin org-settings scaler-spawn-timeout`:
+
+```bash
+# Show the effective value for an org (null = cluster default)
+kici-admin org-settings scaler-spawn-timeout show --org <customerId>
+
+# Set a per-org deadline (integer milliseconds, >= 1000)
+kici-admin org-settings scaler-spawn-timeout set 120000 --org <customerId>
+
+# Clear the override and fall back to the cluster default
+kici-admin org-settings scaler-spawn-timeout reset --org <customerId>
+```
+
+Lower it for a tenant whose registry is fast and local (so a genuine hang is caught sooner); leave it at the default when large cold pulls are expected.
+
+## At-capacity queueing and re-dispatch
+
+When a job arrives and the scaler is already at a cap (`maxAgents`, `globalMaxAgents`, a `resourceCap`, or a machine pool), the job does not fail — it queues. As soon as capacity frees (an ephemeral agent finishes its job and is destroyed, a spawn fails and releases its reservation, or a machine-pool slot opens), the orchestrator **re-offers the oldest queued jobs to the scaler** so they spawn immediately instead of waiting for their queue TTL to expire.
+
+Two mechanisms drive this, and both route through the same spawn path (so the `maxConcurrentSpawns` throttle still bounds the burst):
+
+- **Capacity-freed hook** — near-zero latency. The moment a slot opens, the oldest pending jobs are re-offered (oldest-first, so the longest-waiting job in a burst gets the freed slot first). A short debounce coalesces a burst of simultaneous releases into one re-dispatch pass.
+- **Leader-gated sweep** — a periodic backstop that re-runs the same re-offer on a timer, catching any edge case the hook could miss (a silently failed spawn, a reservation freed on a non-leader coordinator). The interval is `KICI_SCALER_PENDING_SWEEP_INTERVAL_MS` (default `10000`). The sweep runs only on the cluster leader, so multiple coordinators don't each drive the queue.
+
+A job re-offered while the scaler is still at capacity simply stays queued for the next release or sweep tick — there is no per-job retry state to tune. The `kici_orch_scaler_redispatch_total` counter (labeled `trigger="hook"` / `"sweep"`) reports how many jobs each mechanism has re-dispatched.
+
 ### Machine-pool ledger
 
 ```yaml
@@ -210,7 +251,7 @@ maxAgents = 20, warmPool.size = 5
 => 15 slots available for on-demand spawns
 ```
 
-If the global cap is reached due to warm pool agents, on-demand jobs will be queued until capacity frees up.
+If the global cap is reached due to warm pool agents, on-demand jobs are queued and re-dispatched as soon as capacity frees (see [At-capacity queueing and re-dispatch](#at-capacity-queueing-and-re-dispatch)).
 
 ## Agent roles
 
@@ -278,7 +319,27 @@ A workflow with `runsOn: ['linux']` cannot land on `gpu-pool` — the gate requi
 - Labels with the `kici:` prefix are reserved for auto-injected system labels (`kici:role:*`, `kici:os:*`, `kici:arch:*`, `kici:agent:*`, `kici:scaler:*`) and cannot be used in `mandatoryLabels` — same rule as `labelSets[].labels`.
 - The default is `[]` (no gate).
 
-**Cross-peer routing:** `mandatoryLabels` is advertised over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same gate. A coordinator will not reroute a job to a peer whose only matching scaler is gated by a label the job does not declare.
+**Structured `platform` field (canonical):** a scaler entry may declare its platform explicitly:
+
+    scalers:
+      - name: windows-builders
+        type: bare-metal
+        platform:
+          os: windows        # linux | macos | windows
+          arch: x64          # x64 | arm64
+        labelSets:
+          - labels: [windows-builders, bare-metal]
+            binaryPath: C:\kici\kici-agent.cmd
+
+When `platform` is set, BOTH the auto-injected `kici:os:*` / `kici:arch:*` labels AND the mandatory taint derive from this one field. A non-default `os` (`macos`, `windows`) or `arch` (`arm64`) taints the pool, and the plain taint token (`macos` / `windows` / `arm64`) is injected as a matchable label — so a job whose `runsOn` requests that platform is routed to the pool without you also declaring the platform in `labels`, even when the pool's plain labels use a non-canonical name (`windows-builders`, `osx`) that the label-based detection below would miss. When `platform` is omitted, a bare-metal pool derives its platform from the host OS/arch, and container / firecracker pools default to Linux.
+
+Declaring the structured field is preferred; the orchestrator logs a warning when a plain platform label is used without it.
+
+**Automatic platform taint (fallback):** a bare-metal (or any) scaler pool whose declared `labels` include a non-default OS or architecture — `windows`, `win32`, `macos`, `darwin`, `arm64`, `aarch64`, or `arm` — is **also** automatically treated as if that platform label were in its `mandatoryLabels`, with no extra configuration. This label-based detection is the fallback for pools that have not yet declared the structured `platform` field. Only jobs whose `runsOn` requests that platform are routed to such a pool, locally or via cross-peer reroute. Linux and x64/amd64 are the defaults and carry no taint, so an unqualified `runsOn: 'bare-metal'` (Linux-x64) job still routes to a Linux-x64 pool and is never dispatched to a Windows, macOS, or ARM pool it cannot run. The derived taint stacks with any explicit `mandatoryLabels` you configure.
+
+For example, a Windows pool declared with `labels: [windows, bare-metal]` only accepts a job whose `runsOn` includes `windows` (e.g. `runsOn: ['windows', 'bare-metal']`); a plain `runsOn: 'bare-metal'` job is rejected there and lands on a Linux pool instead.
+
+**Cross-peer routing:** `mandatoryLabels` (including the automatic platform taint above) is advertised over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same gate. A coordinator will not reroute a job to a peer whose only matching scaler is gated by a label the job does not declare.
 
 `mandatoryLabels` and `excludeLabels` are two orthogonal mechanisms that control which scaler a job lands on. Both filter at the scaler-matcher level; the dispatcher applies them together.
 

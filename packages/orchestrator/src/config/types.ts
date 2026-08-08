@@ -7,6 +7,8 @@
  * - AppConfig: merged result type used throughout the codebase
  */
 
+import type { OrchestratorMode } from '@kici-dev/engine';
+
 /**
  * Per-orchestrator settings loaded from YAML file.
  * These are instance-specific and never shared across orchestrators.
@@ -17,7 +19,7 @@ export interface LocalConfig {
   };
   instance?: {
     id?: string;
-    mode?: 'platform' | 'hybrid' | 'independent';
+    mode?: OrchestratorMode;
   };
   server?: {
     port?: number;
@@ -110,7 +112,7 @@ export interface AppConfig {
   /** Unique identifier for this orchestrator instance */
   instanceId: string;
   /** Operating mode */
-  mode: 'platform' | 'hybrid' | 'independent';
+  mode: OrchestratorMode;
 
   // --- From LocalConfig ---
   /** PostgreSQL connection URL */

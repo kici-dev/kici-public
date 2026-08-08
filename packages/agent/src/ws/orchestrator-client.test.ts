@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { WS_MAX_PAYLOAD_BYTES, type AgentToOrchestratorMessage } from '@kici-dev/engine';
-import { OrchestratorClient, type OrchestratorClientOptions } from './orchestrator-client.js';
+import {
+  MAX_COMPLETE_RESEND_ATTEMPTS,
+  OrchestratorClient,
+  type OrchestratorClientOptions,
+} from './orchestrator-client.js';
 import { readAgentVersion } from '../version.js';
 
 // ── Hoisted mock state ──────────────────────────────────────────────
@@ -97,6 +101,8 @@ function simulateRegisterAck(
     agentId: string;
     labels: string[];
     scalerManaged: boolean;
+    /** Agent-facing capabilities; omit to model a pre-capability orchestrator. */
+    capabilities: Record<string, unknown>;
   }> = {},
 ): void {
   simulateMessage(mock, {
@@ -104,6 +110,7 @@ function simulateRegisterAck(
     agentId: overrides.agentId ?? 'agent-test-1',
     labels: overrides.labels ?? ['linux', 'docker'],
     scalerManaged: overrides.scalerManaged ?? false,
+    ...(overrides.capabilities ? { capabilities: overrides.capabilities } : {}),
   });
 }
 
@@ -126,11 +133,14 @@ function createClient(overrides: Partial<OrchestratorClientOptions> = {}) {
  * Connect and register the client. Simulates the full handshake:
  * connect -> open -> send agent.register -> receive register.ack -> registered.
  */
-function registerClient(client: OrchestratorClient): MockWsInstance {
+function registerClient(
+  client: OrchestratorClient,
+  ackOverrides: Parameters<typeof simulateRegisterAck>[1] = {},
+): MockWsInstance {
   client.connect();
   const mock = getLatestMock();
   simulateOpen(mock);
-  simulateRegisterAck(mock);
+  simulateRegisterAck(mock, ackOverrides);
   return mock;
 }
 
@@ -201,7 +211,7 @@ describe('OrchestratorClient', () => {
       expect(msg.maxConcurrency).toBeUndefined();
       // Should have a messageId
       expect(msg.messageId).toBeDefined();
-      // Reports its own package version so the diagnostics page can show it.
+      // Reports its own package version so the Infrastructure page can show it.
       expect(msg.version).toBe(readAgentVersion());
     });
 
@@ -534,6 +544,37 @@ describe('OrchestratorClient', () => {
         expect.objectContaining({ type: 'job.status', messageId: 'msg-2' }),
       );
     });
+
+    it('does not replay heartbeats sent via sendDirect while disconnected', () => {
+      const client = createClient();
+      const mock1 = registerClient(client);
+
+      // Disconnect unexpectedly
+      mock1.readyState = 3;
+      mock1.emit('close', 1006, Buffer.from('abnormal'));
+
+      // A heartbeat via sendDirect while the socket is down is silently dropped
+      // (never buffered) — the liveness contract that lets status frames move to
+      // the buffered path without co-buffering ephemeral heartbeats.
+      client.sendDirect({
+        type: 'agent.heartbeat',
+        agentId: 'test-agent',
+        timestamp: 1234,
+      } as never);
+      expect(client.getBufferedCount()).toBe(0);
+
+      // Reconnect + re-register
+      vi.advanceTimersByTime(2000);
+      const mock2 = getLatestMock();
+      simulateOpen(mock2);
+      simulateRegisterAck(mock2);
+
+      // The dropped heartbeat must NOT reappear on the new connection.
+      const sent = getSentMessages(mock2);
+      expect(sent).not.toContainEqual(
+        expect.objectContaining({ type: 'agent.heartbeat', timestamp: 1234 }),
+      );
+    });
   });
 
   describe('exponential backoff calculation', () => {
@@ -820,8 +861,7 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock);
       const configAck = sent.find((m) => (m as Record<string, unknown>).type === 'config.ack') as
-        | Record<string, unknown>
-        | undefined;
+        Record<string, unknown> | undefined;
 
       expect(configAck).toBeDefined();
       expect(configAck!.agentId).toBe('agent-ack-test');
@@ -1413,6 +1453,446 @@ describe('OrchestratorClient', () => {
         sizeBytes: 4096,
       });
       expect(response).toEqual({ type: 'cache.response', requestId: 'ipc-3' });
+    });
+  });
+
+  describe('user-facing artifact relay (requestUserArtifact completeUpload)', () => {
+    const ACK_CAPS = { artifactCompleteAck: true };
+
+    /** The IPC completeUpload request the sandbox relays. */
+    function completeRequest(requestId: string) {
+      return {
+        type: 'artifacts.request' as const,
+        requestId,
+        op: 'completeUpload' as const,
+        name: 'bundle',
+        sizeBytes: 4096,
+        sha256: 'deadbeef',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      };
+    }
+
+    /** The `artifacts.upload.complete` frame the client sent. */
+    function sentComplete(mock: MockWsInstance): { messageId: string } {
+      return getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'artifacts.upload.complete',
+      ) as { messageId: string };
+    }
+
+    it('awaits the ack and resolves on committed', async () => {
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const promise = client.requestUserArtifact('job-1', completeRequest('ipc-1'));
+      const sent = sentComplete(mock);
+      expect(sent).toMatchObject({ name: 'bundle', sha256: 'deadbeef' });
+
+      simulateMessage(mock, {
+        type: 'artifacts.upload.complete.ack',
+        requestId: sent.messageId,
+        outcome: 'committed',
+      });
+
+      await expect(promise).resolves.toEqual({
+        type: 'artifacts.response',
+        requestId: 'ipc-1',
+      });
+    });
+
+    it('rejects on a failed ack so the workflow step fails', async () => {
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const promise = client.requestUserArtifact('job-1', completeRequest('ipc-2'));
+      const sent = sentComplete(mock);
+
+      // Any reason relays verbatim: the agent is content-agnostic here, and the
+      // orchestrator only ever sends a fixed, classified string (never raw
+      // exception text), so this placeholder stands in for whichever literal it
+      // picked. Deliberately NOT a copy of one of the orchestrator's literals —
+      // they live in an orchestrator-internal module this package cannot import,
+      // so a verbatim copy here would be a silent-drift duplicate.
+      const reason = 'a fixed classified commit-failure reason';
+      simulateMessage(mock, {
+        type: 'artifacts.upload.complete.ack',
+        requestId: sent.messageId,
+        outcome: 'failed',
+        reason,
+      });
+
+      await expect(promise).rejects.toThrow(reason);
+    });
+
+    it('rejects when the ack never arrives, before the sandbox request timeout', async () => {
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      // Capture the rejection before advancing the clock: the timer fires
+      // inside advanceTimersByTimeAsync, so a handler attached afterwards
+      // would surface as an unhandled rejection first.
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-3'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      // Strictly inside the sandbox's own 30s artifact-request timeout, so the
+      // specific ack reason is what reaches the failing step.
+      await vi.advanceTimersByTimeAsync(29_000);
+
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('upload-complete ack timed out'),
+      });
+    });
+
+    it('stays fire-and-forget when the orchestrator does not advertise the capability', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      // Resolves with no ack at all — the pre-capability orchestrator behavior.
+      await expect(client.requestUserArtifact('job-1', completeRequest('ipc-4'))).resolves.toEqual({
+        type: 'artifacts.response',
+        requestId: 'ipc-4',
+      });
+      expect(sentComplete(mock)).toBeDefined();
+    });
+
+    /**
+     * Drop the socket unintentionally, let the backoff fire, and re-register.
+     * Returns the mock for the new connection.
+     */
+    function reconnect(
+      mock: MockWsInstance,
+      /** `null` models an orchestrator that no longer advertises the capability. */
+      capabilities: Record<string, unknown> | null = ACK_CAPS,
+    ): MockWsInstance {
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      vi.advanceTimersByTime(2_000);
+      const next = getLatestMock();
+      simulateOpen(next);
+      simulateRegisterAck(next, capabilities ? { capabilities } : {});
+      return next;
+    }
+
+    it('holds an in-flight complete across an unintentional disconnect', async () => {
+      // The commit is idempotent, so a dropped ack means "we did not hear the
+      // answer" — failing here would fail a step whose artifact exists.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = vi.fn();
+      void client.requestUserArtifact('job-1', completeRequest('ipc-hold')).then(settled, settled);
+      expect(sentComplete(mock)).toBeDefined();
+
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).not.toHaveBeenCalled();
+    });
+
+    it('still rejects an in-flight beginUpload on disconnect', async () => {
+      // beginUpload mints a presigned PUT and is deliberately NOT resendable.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const promise = client.requestUserArtifact('job-1', {
+        type: 'artifacts.request' as const,
+        requestId: 'ipc-begin',
+        op: 'beginUpload' as const,
+        name: 'bundle',
+        declaredSizeBytes: 4096,
+      });
+
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+
+      await expect(promise).rejects.toThrow('WebSocket disconnected');
+    });
+
+    it('rejects a held complete when the disconnect was intentional', async () => {
+      // No reconnect is scheduled on a deliberate shutdown, so holding would
+      // strand the step until the ack timer fired.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-intent'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      client.disconnect();
+      // The mock defers its close event to setImmediate, which is faked here.
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await settled).toMatchObject({ message: 'WebSocket disconnected' });
+    });
+
+    it('rejects a complete parked by an earlier drop once the agent shuts down', async () => {
+      // The park is only a bet on a reconnect that is coming. A deliberate
+      // shutdown after the park cancels it, so the step must fail closed then
+      // rather than wait out the ack deadline (or die unsettled with the
+      // process).
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-park-shutdown'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      client.disconnect();
+
+      // Asserted without draining the mock's deferred close event on purpose:
+      // the rejection has to come from `disconnect()` itself. A real socket that
+      // is already CLOSED emits no second close, so a fix that only lived in the
+      // close handler would strand this step.
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('may have been committed'),
+      });
+    });
+
+    it('rejects a parked complete when the token is rejected and no reconnect is coming', async () => {
+      // A permanent auth failure never reaches another register.ack, so the
+      // parked complete would otherwise sit until its deadline.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-park-auth'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('abnormal'));
+      await vi.advanceTimersByTimeAsync(0);
+
+      vi.advanceTimersByTime(2_000);
+      const next = getLatestMock();
+      simulateOpen(next);
+      simulateMessage(next, { type: 'auth.failure', reason: 'token revoked' });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('may have been committed'),
+      });
+    });
+
+    it('re-sends a held complete after re-registering and resolves on the ack', async () => {
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const promise = client.requestUserArtifact('job-1', completeRequest('ipc-resend'));
+      const first = sentComplete(mock);
+
+      const next = reconnect(mock);
+      const resent = sentComplete(next);
+
+      // A fresh correlation id and an otherwise byte-identical frame: a late ack
+      // for the pre-disconnect send must not resolve the re-keyed pending.
+      expect(resent.messageId).not.toBe(first.messageId);
+      expect({ ...(resent as Record<string, unknown>), messageId: first.messageId }).toEqual(first);
+      const settled = vi.fn();
+      void promise.then(settled, settled);
+      simulateMessage(next, {
+        type: 'artifacts.upload.complete.ack',
+        requestId: first.messageId,
+        outcome: 'committed',
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).not.toHaveBeenCalled();
+
+      simulateMessage(next, {
+        type: 'artifacts.upload.complete.ack',
+        requestId: resent.messageId,
+        outcome: 'committed',
+      });
+
+      await expect(promise).resolves.toEqual({
+        type: 'artifacts.response',
+        requestId: 'ipc-resend',
+      });
+    });
+
+    it('gives up after the resend budget and says the artifact may have committed', async () => {
+      const client = createClient();
+      let mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-budget'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      // One reconnect per resend, plus the one that exhausts the budget.
+      for (let i = 0; i <= MAX_COMPLETE_RESEND_ATTEMPTS; i++) {
+        mock = reconnect(mock);
+      }
+
+      // The wording matters: an operator must not be sent hunting for an
+      // artifact that is in fact committed.
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('may have been committed'),
+      });
+    });
+
+    it('fails closed when the reconnected orchestrator can no longer ack', async () => {
+      // Resolving here would report success for a commit whose outcome we never
+      // learned — the fail-open loss the ack exists to prevent.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-downgrade'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      reconnect(mock, null);
+
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('may have been committed'),
+      });
+    });
+
+    it('does not restart the ack deadline across a resend', async () => {
+      // Load-bearing: a restarted timer would let a flapping connection keep the
+      // step alive indefinitely instead of failing on the original schedule.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-deadline'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      expect(sentComplete(mock)).toBeDefined();
+
+      // 20s of waiting, then a reconnect (+2s of backoff), then 4s more — past
+      // the 25s deadline, which the resend must not have pushed out.
+      await vi.advanceTimersByTimeAsync(20_000);
+      const next = reconnect(mock);
+      expect(sentComplete(next)).toBeDefined();
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('upload-complete ack timed out'),
+      });
+    });
+
+    /** The `artifacts.<kind>.request` frame the client sent. */
+    function sentRequest(mock: MockWsInstance, kind: 'upload' | 'download'): { messageId: string } {
+      return getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === `artifacts.${kind}.request`,
+      ) as { messageId: string };
+    }
+
+    it('maps a rejected upload response error onto rejectionDetail, not the relay error', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      const promise = client.requestUserArtifact('job-1', {
+        type: 'artifacts.request',
+        requestId: 'ipc-6',
+        op: 'beginUpload',
+        name: 'bundle',
+        declaredSizeBytes: 100,
+      });
+
+      simulateMessage(mock, {
+        type: 'artifacts.upload.response',
+        requestId: sentRequest(mock, 'upload').messageId,
+        outcome: 'rejected',
+        error: 'the orchestrator hit an internal error while starting the upload',
+      });
+
+      const resolved = await promise;
+      expect(resolved.uploadOutcome).toBe('rejected');
+      expect(resolved.reason).toBeUndefined();
+      expect(resolved.rejectionDetail).toBe(
+        'the orchestrator hit an internal error while starting the upload',
+      );
+      // Must NOT populate the relay-failure field — that would make the sandbox
+      // throw a transport error instead of rendering the rejection.
+      expect(resolved.error).toBeUndefined();
+    });
+
+    it('maps a not_found download response error onto rejectionDetail', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      const promise = client.requestUserArtifact('job-1', {
+        type: 'artifacts.request',
+        requestId: 'ipc-7',
+        op: 'download',
+        name: 'bundle',
+      });
+
+      simulateMessage(mock, {
+        type: 'artifacts.download.response',
+        requestId: sentRequest(mock, 'download').messageId,
+        outcome: 'not_found',
+        error: 'artifact downloads are not configured on this orchestrator',
+      });
+
+      const resolved = await promise;
+      expect(resolved.downloadOutcome).toBe('not_found');
+      expect(resolved.rejectionDetail).toBe(
+        'artifact downloads are not configured on this orchestrator',
+      );
+      expect(resolved.error).toBeUndefined();
+    });
+
+    it('leaves rejectionDetail unset on an enforcement rejection', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      const promise = client.requestUserArtifact('job-1', {
+        type: 'artifacts.request',
+        requestId: 'ipc-8',
+        op: 'beginUpload',
+        name: 'bundle',
+        declaredSizeBytes: 100,
+      });
+
+      simulateMessage(mock, {
+        type: 'artifacts.upload.response',
+        requestId: sentRequest(mock, 'upload').messageId,
+        outcome: 'rejected',
+        reason: 'org_quota',
+      });
+
+      const resolved = await promise;
+      expect(resolved.reason).toBe('org_quota');
+      expect(resolved.rejectionDetail).toBeUndefined();
+    });
+
+    it('fails the step on the ack deadline when the orchestrator never comes back', async () => {
+      // A held complete is not a hang: the original ack timer still owns the
+      // deadline, so a genuinely unreachable orchestrator fails the step on
+      // schedule instead of parking it forever.
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: ACK_CAPS });
+
+      const settled = client
+        .requestUserArtifact('job-1', completeRequest('ipc-5'))
+        .then(() => null)
+        .catch((err: Error) => err);
+      mock.readyState = 3;
+      mock.emit('close', 1006, Buffer.from('gone'));
+
+      await vi.advanceTimersByTimeAsync(26_000);
+
+      expect(await settled).toMatchObject({
+        message: expect.stringContaining('upload-complete ack timed out'),
+      });
     });
   });
 });

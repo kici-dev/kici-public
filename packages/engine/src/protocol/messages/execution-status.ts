@@ -49,7 +49,15 @@ export const ExecutionRunStatus = z.enum([
 ]);
 export type ExecutionRunStatus = z.infer<typeof ExecutionRunStatus>;
 
-/** Status values for execution jobs (execution_jobs table + job.status protocol messages). */
+/**
+ * Status values for execution jobs (execution_jobs table + job.status protocol messages).
+ *
+ * `unroutable` = the job's `runsOn` matched no agent for the whole queue
+ * window, so it never ran. Distinct from `failed` (a failed job ran and has
+ * logs to read; an unroutable one has a fleet/label problem to fix), from
+ * `skipped` (a condition deliberately excluded it) and from `timed_out_stale`
+ * (capacity existed but never freed up).
+ */
 export const ExecutionJobStatus = z.enum([
   'pending',
   'queued',
@@ -62,6 +70,7 @@ export const ExecutionJobStatus = z.enum([
   'skipped',
   'timed_out_stale',
   'drift_dropped',
+  'unroutable',
 ]);
 export type ExecutionJobStatus = z.infer<typeof ExecutionJobStatus>;
 
@@ -131,7 +140,7 @@ export type TimeoutReason = z.infer<typeof TimeoutReason>;
  * Scope is carried separately on `initFailureSchema.scope`:
  *  - `run`-scoped categories fail the whole run before any job runs
  *    (secret_resolution, install_secrets, lock_resolution,
- *    build_coordination).
+ *    build_coordination, approval_misconfig, sandbox_denied, trust_policy).
  *  - `job`-scoped categories fail one job and leave siblings alone
  *    (context_rules, dynamic_eval, no_agent, matrix_expansion).
  */
@@ -144,8 +153,33 @@ export const InitFailureCategory = z.enum([
   'dynamic_eval',
   'no_agent',
   'matrix_expansion',
+  'approval_misconfig',
+  'sandbox_denied',
+  'trust_policy',
 ]);
 export type InitFailureCategory = z.infer<typeof InitFailureCategory>;
+
+/**
+ * Why a terminal run failed (only meaningful for failed/cancelled runs):
+ *  - never_started     — init failure (no_agent/secret/lock/build); no step ran.
+ *  - timed_out         — a job timed out (never dispatched, or agent went silent).
+ *  - dead_orchestrator — the Platform failed the run because its orchestrator died.
+ *  - step_failure      — a job actually ran and failed.
+ *  - cancelled         — the run was cancelled.
+ *
+ * Derived at run completion from the terminal job statuses, because
+ * `timed_out`/`step_failure` both collapse to run-status `failed` — the status
+ * alone can't carry it. `never_started` is stamped by the init-failure paths and
+ * `dead_orchestrator` is stamped Platform-side by the dead-orchestrator detector.
+ */
+export const RunFailureClass = z.enum([
+  'never_started',
+  'timed_out',
+  'dead_orchestrator',
+  'step_failure',
+  'cancelled',
+]);
+export type RunFailureClass = z.infer<typeof RunFailureClass>;
 
 /**
  * `step_type` values for the user-facing cache pseudo-steps that appear in the
@@ -173,6 +207,15 @@ export type CacheRunEventType = z.infer<typeof CacheRunEventType>;
 export const CacheOutcome = z.enum(['hit', 'miss', 'saved', 'skipped', 'error']);
 export type CacheOutcome = z.infer<typeof CacheOutcome>;
 
+/**
+ * Failure reason the Platform records on a run it fails because that run's
+ * orchestrator disconnected and did not reconnect within the stale threshold.
+ * Written by the Platform stale-detector into `execution_runs.failure_reason`
+ * and matched by the dashboard to render the "stale / offline" run badge. A
+ * shared constant so the writer (Platform) and reader (dashboard) never drift.
+ */
+export const DEAD_ORCH_FAILURE_REASON = 'Orchestrator disconnected and did not recover';
+
 /** Structured init-failure signal. Presence on a run/job means "never started". */
 export const initFailureSchema = z.object({
   scope: z.enum(['run', 'job']),
@@ -199,6 +242,31 @@ export const TERMINAL_JOB_STATES: ReadonlySet<string> = new Set<ExecutionJobStat
   ExecutionJobStatus.enum.skipped,
   ExecutionJobStatus.enum.timed_out_stale,
   ExecutionJobStatus.enum.drift_dropped,
+  ExecutionJobStatus.enum.unroutable,
+]);
+
+/**
+ * The type-level counterpart of `TERMINAL_JOB_STATES`.
+ *
+ * Written as `Exclude<>` of the non-terminal statuses, never `Extract<>` of the
+ * terminal ones. That direction is load-bearing: `Extract<ExecutionJobStatus,
+ * 'success' | …>` does not widen when a value is added to the enum, so an
+ * exhaustive switch over it keeps compiling and its `never` default arm is
+ * inert. `Exclude<>` does widen, so a new status becomes a compile error at
+ * every switch that claims to be total over the terminal set — which is the
+ * only reason to write such a switch.
+ */
+export type TerminalJobStatus = Exclude<
+  ExecutionJobStatus,
+  'pending' | 'queued' | 'running' | 'recovering' | 'cancelling'
+>;
+
+/** Terminal step states that indicate the step is no longer running. */
+export const TERMINAL_STEP_STATES: ReadonlySet<string> = new Set<ExecutionStepStatus>([
+  ExecutionStepStatus.enum.success,
+  ExecutionStepStatus.enum.failed,
+  ExecutionStepStatus.enum.skipped,
+  ExecutionStepStatus.enum.cancelled,
 ]);
 
 // --- Orchestrator -> Platform: Execution status messages ---
@@ -210,6 +278,13 @@ export const executionStatusSchema = z.object({
   runId: z.string().max(STATUS_ID_MAX),
   workflowName: z.string().max(STATUS_ID_MAX),
   status: ExecutionRunStatus,
+  /**
+   * Routing key of the run's own source. Optional for backward compatibility
+   * with older orchestrators (absent → the Platform falls back to the WS
+   * connection's first routing key). Lets the Platform mirror attribute each
+   * run to its real source even when one orchestrator serves multiple sources.
+   */
+  routingKey: z.string().max(STATUS_ID_MAX).optional(),
   repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
    * Run-level repo provider (origin host: `github` / `gitlab` / `bitbucket` /
@@ -265,6 +340,8 @@ export const executionStatusSchema = z.object({
    * on both orchestrator and Platform sides. Only present when status === 'failed'.
    */
   initFailure: initFailureSchema.optional(),
+  /** Why a terminal run failed (only present for failed/cancelled runs). */
+  failureClass: RunFailureClass.optional(),
 });
 
 /** Per-step status forwarded from agent to Platform (real-time). */
@@ -319,53 +396,59 @@ export const jobStatusForwardSchema = z.object({
 });
 
 /** State replay sent on orchestrator reconnection -- full snapshot of active runs and jobs. */
+/**
+ * A single run's full mirror-projection shape, as carried in `state.replay`.
+ *
+ * Carried by the orchestrator-reconnect `state.replay` push and consumed by the
+ * Platform's shared `upsertRunMirror` mirror-projection helper. Extracting it as
+ * a named schema keeps a single source of truth for any future reconciliation
+ * path that projects the same per-run shape.
+ */
+export const stateReplayRunSchema = z.object({
+  runId: z.string().max(STATUS_ID_MAX),
+  workflowName: z.string().max(STATUS_ID_MAX),
+  status: ExecutionRunStatus,
+  routingKey: z.string().max(STATUS_ID_MAX).optional(),
+  repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
+  sha: z.string().max(STATUS_ID_MAX).optional(),
+  ref: z.string().max(STATUS_ID_MAX).optional(),
+  triggerEvent: z.string().max(STATUS_ID_MAX).optional(),
+  commitMessage: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  jobCount: z.number(),
+  startedAt: z.number(),
+  completedAt: z.number().optional(),
+  durationMs: z.number().optional(),
+  parentRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
+  originalRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
+  triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
+  triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
+  /** Human-readable reason why the run failed (only present for failed runs). */
+  failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  /** Why the run failed (`RunFailureClass`); only present for failed/cancelled runs. */
+  failureClass: RunFailureClass.optional(),
+  jobs: z
+    .array(
+      z.object({
+        jobId: z.string().max(STATUS_ID_MAX),
+        jobName: z.string().max(STATUS_ID_MAX),
+        status: z.string().max(STATUS_ID_MAX),
+        startedAt: z.number().optional(),
+        completedAt: z.number().optional(),
+        durationMs: z.number().optional(),
+        errorMessage: z.string().max(STATUS_FREE_TEXT_MAX).nullable().optional(),
+        agentId: z.string().max(STATUS_ID_MAX).nullable().optional(),
+        runsOnLabels: z.array(z.string().max(STATUS_ID_MAX)).max(RUNS_ON_LABELS_MAX).optional(),
+        contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
+      }),
+    )
+    .max(MAX_JOBS_PER_RUN),
+});
+export type StateReplayRun = z.infer<typeof stateReplayRunSchema>;
+
 export const stateReplaySchema = z.object({
   type: z.literal('state.replay'),
   messageId: z.string().max(STATUS_ID_MAX),
-  runs: z
-    .array(
-      z.object({
-        runId: z.string().max(STATUS_ID_MAX),
-        workflowName: z.string().max(STATUS_ID_MAX),
-        status: ExecutionRunStatus,
-        routingKey: z.string().max(STATUS_ID_MAX).optional(),
-        repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
-        sha: z.string().max(STATUS_ID_MAX).optional(),
-        ref: z.string().max(STATUS_ID_MAX).optional(),
-        triggerEvent: z.string().max(STATUS_ID_MAX).optional(),
-        commitMessage: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
-        jobCount: z.number(),
-        startedAt: z.number(),
-        completedAt: z.number().optional(),
-        durationMs: z.number().optional(),
-        parentRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
-        originalRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
-        triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
-        triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
-        /** Human-readable reason why the run failed (only present for failed runs). */
-        failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
-        jobs: z
-          .array(
-            z.object({
-              jobId: z.string().max(STATUS_ID_MAX),
-              jobName: z.string().max(STATUS_ID_MAX),
-              status: z.string().max(STATUS_ID_MAX),
-              startedAt: z.number().optional(),
-              completedAt: z.number().optional(),
-              durationMs: z.number().optional(),
-              errorMessage: z.string().max(STATUS_FREE_TEXT_MAX).nullable().optional(),
-              agentId: z.string().max(STATUS_ID_MAX).nullable().optional(),
-              runsOnLabels: z
-                .array(z.string().max(STATUS_ID_MAX))
-                .max(RUNS_ON_LABELS_MAX)
-                .optional(),
-              contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
-            }),
-          )
-          .max(MAX_JOBS_PER_RUN),
-      }),
-    )
-    .max(STATE_REPLAY_MAX_RUNS),
+  runs: z.array(stateReplayRunSchema).max(STATE_REPLAY_MAX_RUNS),
   timestamp: z.number(),
 });
 

@@ -12,9 +12,10 @@
  * directory per line for path. Blank lines and lines without `=` are ignored.
  */
 
-import { mkdtemp, writeFile, readFile } from 'node:fs/promises';
+import { writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import type { EnvDelta } from './env-delta.js';
 
 /** The pair of temp files the step's shell appends to. */
@@ -58,7 +59,7 @@ export function parsePathFileContent(content: string): string[] {
 
 /** Create fresh, empty env + path files inside a private temp dir under `baseDir`. */
 export async function createEnvFiles(baseDir: string): Promise<EnvFiles> {
-  const dir = await mkdtemp(join(baseDir, 'kici-env-'));
+  const { path: dir } = await makeTempDir('env', { base: baseDir });
   const envFile = join(dir, 'env');
   const pathFile = join(dir, 'path');
   await writeFile(envFile, '');

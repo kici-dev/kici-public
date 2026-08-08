@@ -1,26 +1,34 @@
 /**
  * Lock file types for the trigger matching engine.
  * Single source of truth -- replaces local copies in @kici-dev/compiler and @kici-dev/orchestrator.
- * Schema version 4: adds 4 internal event routing trigger types (kici_event, workflow_complete,
+ *
+ * Bump-history convention: every entry is annotated `additive` (older readers
+ * tolerate the new lock because unknown fields are ignored) or `BREAKING` (an
+ * older reader would mis-parse the lock). Every `BREAKING` bump moves
+ * `BREAKING_FLOOR` (below) to that version in the SAME commit.
+ *
+ * Schema version 4 (additive): adds 4 internal event routing trigger types (kici_event, workflow_complete,
  * job_complete, generic_webhook).
- * Schema version 6: replaces job-level contexts with environment/env/concurrencyGroup.
- * Schema version 8: adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
- * Schema version 9: adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
- * Schema version 10: removes notRepos/notPaths fields, negative patterns use ! prefix in repos/paths arrays.
- * Schema version 11: adds LockInlineValue type for pure function inline evaluation.
- * Schema version 14: adds declarative cache specs to LockJob and LockStep.
- * Schema version 15: adds per-job init config(s) to LockJob.
- * Schema version 16: adds normalized approval config to LockWorkflow/LockJob/LockStep.
- * Schema version 17: widens LockJob.init to typed presets ('mise' / { mise }) and 'auto' detection.
- * Schema version 18: adds LockJob.runsOnAll host fan-out predicate + onUnreachable policy.
- * Schema version 19: adds LockJob.maxParallel/failFast fan-out concurrency (rolling waves).
- * Schema version 20: runsOn/runsOnAll/excludeLabels carry LabelMatcher (exact|regex) for glob+regex selectors.
- * Schema version 23: adds LockDispatchTrigger.inputs (typed dispatch inputs descriptors).
- * Schema version 24: adds LockJob.runsOnPick (deterministic single-host selection).
- * Schema version 25: adds LockStep.retry (step retry policy data subset; retryIf is execution-only).
- * Schema version 26: adds LockJob.includeUninitialized (runsOnAll fans out to declared-but-un-agented hosts, bringing up a temporary init-runner per fresh box).
- * Schema version 27: adds LockScheduleTrigger.inputs (defaults-only schedule dispatch inputs).
- * Schema version 30: renames job-level `environments` to `contexts`.
+ * Schema version 6 (BREAKING): replaces job-level contexts with environment/env/concurrencyGroup.
+ * Schema version 8 (additive): adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
+ * Schema version 9 (additive): adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
+ * Schema version 10 (BREAKING): removes notRepos/notPaths fields, negative patterns use ! prefix in repos/paths arrays.
+ * Schema version 11 (additive): adds LockInlineValue type for pure function inline evaluation.
+ * Schema version 14 (additive): adds declarative cache specs to LockJob and LockStep.
+ * Schema version 15 (additive): adds per-job init config(s) to LockJob.
+ * Schema version 16 (additive): adds normalized approval config to LockWorkflow/LockJob/LockStep.
+ * Schema version 17 (additive): widens LockJob.init to typed presets ('mise' / { mise }) and 'auto' detection.
+ * Schema version 18 (additive): adds LockJob.runsOnAll host fan-out predicate + onUnreachable policy.
+ * Schema version 19 (additive): adds LockJob.maxParallel/failFast fan-out concurrency (rolling waves).
+ * Schema version 20 (BREAKING): runsOn/runsOnAll/excludeLabels carry LabelMatcher (exact|regex) for glob+regex selectors.
+ * Schema version 23 (additive): adds LockDispatchTrigger.inputs (typed dispatch inputs descriptors).
+ * Schema version 24 (additive): adds LockJob.runsOnPick (deterministic single-host selection).
+ * Schema version 25 (additive): adds LockStep.retry (step retry policy data subset; retryIf is execution-only).
+ * Schema version 26 (additive): adds LockJob.includeUninitialized (runsOnAll fans out to declared-but-un-agented hosts, bringing up a temporary init-runner per fresh box).
+ * Schema version 27 (additive): adds LockScheduleTrigger.inputs (defaults-only schedule dispatch inputs).
+ * Schema version 30 (BREAKING): renames job-level `environments` to `contexts`.
+ * Schema version 31 (additive): adds the workflows_failed_batch lock trigger.
+ * Schema version 32 (additive): adds LockJob.sandbox (per-job escape-hatch request).
  */
 
 import { z } from 'zod';
@@ -29,9 +37,31 @@ import type { ApproverClause } from '../approval/types.js';
 import type { InputsDescriptorMap } from '../inputs/descriptor.js';
 import { LabelMatcher } from '../labels-match.js';
 import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
+import { isFailureStatus } from '../status/presentation.js';
 
-/** Schema version - increment on breaking changes */
-export const SCHEMA_VERSION = 30 as const;
+/**
+ * Schema version the compiler emits into every lock file. Incremented on ANY
+ * schema change (additive or breaking); the bump-history comment above records
+ * which. See `BREAKING_FLOOR` for the compatibility-window semantics.
+ */
+export const SCHEMA_VERSION = 32 as const;
+
+/**
+ * Oldest lock schema version this codebase can still read correctly — the lower
+ * bound of the acceptance window.
+ *
+ * A lock at `schemaVersion >= BREAKING_FLOOR` parses correctly here even if it
+ * is newer than `SCHEMA_VERSION` (additive bumps add fields this reader ignores).
+ * A lock below the floor was produced by an SDK whose breaking change this
+ * reader predates and must be rejected (it would mis-parse silently otherwise).
+ *
+ * Bump rule: move this to the current `SCHEMA_VERSION` ONLY in the commit that
+ * lands a `BREAKING` schema change (see the bump-history convention above). It
+ * currently sits at 30 because v30 (`environments`→`contexts`) was the most
+ * recent breaking bump; v31 and v32 were additive, so a v30 lock still reads
+ * correctly.
+ */
+export const BREAKING_FLOOR = 30 as const;
 
 /**
  * Normalized approval config carried in the lock file. Produced by the compiler
@@ -273,6 +303,22 @@ export interface LockWorkflowCompleteTrigger {
 }
 
 /**
+ * Workflows-failed-batch trigger in lock file.
+ *
+ * Accumulates failed workflow completions over `accumulateFor` ms and fires the
+ * subscribing workflow once per window with the batched run list. The matcher
+ * treats a failed `workflow_complete` event as an accumulation input and a
+ * synthetic `workflows_failed_batch` event as the dispatch trigger.
+ */
+export interface LockWorkflowsFailedBatchTrigger {
+  readonly _type: 'workflows_failed_batch';
+  /** Accumulation window in milliseconds; the window opens on the first failure. */
+  readonly accumulateFor: number;
+  readonly name?: string;
+  readonly source?: string;
+}
+
+/**
  * Job completion trigger in lock file.
  * Matches when a specific job within a workflow finishes execution.
  */
@@ -356,6 +402,7 @@ export type LockTrigger =
   | LockWebhookTrigger
   | LockKiciEventTrigger
   | LockWorkflowCompleteTrigger
+  | LockWorkflowsFailedBatchTrigger
   | LockJobCompleteTrigger
   | LockGenericWebhookTrigger
   | LockScheduleTrigger
@@ -479,24 +526,35 @@ export type NeedsWhen = z.infer<typeof NeedsWhen>;
 export const NeedsRunOn = z.array(ExecutionJobStatus).nonempty();
 export type NeedsRunOn = z.infer<typeof NeedsRunOn>;
 
-const WHEN_TO_RUN_ON: Record<NeedsWhen, ExecutionJobStatus[]> = {
+const WHEN_TO_RUN_ON: Readonly<Record<NeedsWhen, readonly ExecutionJobStatus[]>> = {
   'on-success': [ExecutionJobStatus.enum.success],
   always: [...TERMINAL_JOB_STATES] as ExecutionJobStatus[],
   'on-skip': [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped],
-  'on-failure': [ExecutionJobStatus.enum.failed, ExecutionJobStatus.enum.timed_out_stale],
+  // Derived, not listed: the terminal statuses that mean the workflow did not
+  // do what it declared. Reading the same classification the run roll-up reads
+  // is what stops the two from disagreeing — a drift-dropped job already makes
+  // its run fail, so a downstream error handler must run for it too.
+  // `cancelled` stays out (deliberately stopped, its own outcome) and so does
+  // `skipped` (never ran).
+  'on-failure': ([...TERMINAL_JOB_STATES] as ExecutionJobStatus[]).filter(isFailureStatus),
 };
 
 /**
  * Resolve the author-facing `when` (keyword sugar | raw status-set | unset) to
  * the normalized status-set. An unset `when` defaults to success-only — the
  * downstream runs only when the upstream succeeded.
+ *
+ * Always a fresh array. The keyword arm used to hand back the shared
+ * `WHEN_TO_RUN_ON` entry itself, so every lock-file edge compiled from the same
+ * keyword aliased one array and any caller that sorted or mutated its result
+ * silently reordered the keyword's expansion for every other edge.
  */
 export function resolveWhenToRunOn(
   when: NeedsWhen | ExecutionJobStatus[] | undefined,
 ): ExecutionJobStatus[] {
   if (when === undefined) return [ExecutionJobStatus.enum.success];
-  if (Array.isArray(when)) return when;
-  return WHEN_TO_RUN_ON[when];
+  if (Array.isArray(when)) return [...when];
+  return [...WHEN_TO_RUN_ON[when]];
 }
 
 /**
@@ -566,6 +624,28 @@ export type OnUnreachableMode = z.infer<typeof OnUnreachableMode>;
 export const RunsOnPick = z.enum(['deterministic', 'any']);
 export type RunsOnPick = z.infer<typeof RunsOnPick>;
 
+/** Container network posture: 'default' (bridge), 'none' (loopback-only), 'host' (host netns; gated). */
+export const SANDBOX_NETWORK_MODES = ['default', 'none', 'host'] as const;
+export type SandboxNetworkMode = (typeof SANDBOX_NETWORK_MODES)[number];
+
+/**
+ * The dispatch-resolved, allow-listed per-job sandbox escape hatch. Produced
+ * orchestrator-side at dispatch (the agent never resolves it) and applied
+ * additively over the hardened container baseline by the agent. The lock carries
+ * the workflow-declared request (`LockJob.sandbox`); this is the resolved grant
+ * the orchestrator authorized against the operator's `org_settings` allow-list.
+ */
+export interface ResolvedSandboxGrant {
+  /** Extra Linux capabilities added back over CapDrop:['ALL'] (bare form, e.g. 'NET_ADMIN'). */
+  capabilities?: string[];
+  /** Network override; when set it wins over the config network mode. */
+  network?: SandboxNetworkMode;
+  /** Force a read-only rootfs (operator-config path only in Phase 2). */
+  readonlyRootfs?: boolean;
+  /** Run the container as this user (operator-config path only in Phase 2). */
+  user?: string;
+}
+
 export interface LockJob {
   readonly _type: 'static';
   readonly name: string;
@@ -632,6 +712,26 @@ export interface LockJob {
    * (`requests`) and kernel-side enforcement (`limits`) on the spawned agent.
    */
   readonly resources?: import('../scaler/resource-types.js').ResourceRequest;
+  /**
+   * Container image selecting the container execution backend on the agent. A
+   * bare image string or an object with `image` + optional `env`. When set, the
+   * agent's `determineExecutionMode` routes the job to the container sandbox
+   * (top priority), so the orchestrator threads it through dispatch as
+   * `jobConfig.container`. (Shape mirrors the SDK `string | ContainerConfig`;
+   * the engine cannot import the SDK, so it is inlined here.)
+   */
+  readonly container?: string | { readonly image: string; readonly env?: Record<string, string> };
+  /**
+   * Workflow-declared per-job sandbox escape-hatch request (container jobs
+   * only). The orchestrator resolves it at dispatch against the operator's
+   * `org_settings` allow-list into a `ResolvedSandboxGrant` (a non-allow-listed
+   * request fails the run); the agent never reads this field. Additive — an
+   * older orchestrator that does not understand it ignores it.
+   */
+  readonly sandbox?: {
+    readonly capabilities?: string[];
+    readonly network?: SandboxNetworkMode;
+  };
   /** Normalized approval gate; when set the job is held before dispatch. */
   readonly approval?: LockApproval;
 }
@@ -739,6 +839,14 @@ export interface LockWorkflow {
  */
 export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;
+  /**
+   * The newest breaking schema version at emit time (the compiler stamps
+   * `BREAKING_FLOOR`). A reader whose own `SCHEMA_VERSION` is below this value
+   * predates a breaking change the lock relies on and must reject it. Absent on
+   * pre-window locks, in which case the reader falls back to exact-match
+   * strictness (see `assertLockFileSchemaCompatible`).
+   */
+  readonly minReaderVersion?: number;
   readonly source: LockSource;
   /** SHA-256 hash of the serialized lock file content (excluding this field). Changes only when workflows, triggers, jobs, or bundle hashes change. */
   readonly contentHash: string;
@@ -758,6 +866,21 @@ export function isLockDynamicJobFn(job: LockJobOrFactory): job is LockDynamicJob
 }
 
 /**
+ * Availability of the changed-files list for path-filter evaluation.
+ *
+ * Distinguishes three states that a bare `string[]` collapses into one:
+ * - `skipped` — no trigger has path patterns, so the fetch never ran. Path
+ *   filters are not evaluated (today's no-fetch fast path).
+ * - `fetched` — the fetch succeeded and the list is authoritative; an empty
+ *   list genuinely means "no files changed" and does NOT match a path filter.
+ * - `unavailable` — the diff could not be determined (a provider capability
+ *   gap such as universal-git PR events, or upstream degradation). Path
+ *   filters match conservatively so a real change is never silently dropped.
+ */
+export const changedFilesStatusSchema = z.enum(['fetched', 'unavailable', 'skipped']);
+export type ChangedFilesStatus = z.infer<typeof changedFilesStatusSchema>;
+
+/**
  * Simulated event payload structure for trigger matching.
  *
  * Known event types: push, pull_request, tag, comment, review, review_comment,
@@ -772,8 +895,18 @@ export interface SimulatedEvent {
   targetBranch: string;
   /** PR source branch (only for PRs) */
   sourceBranch?: string;
+  /** Pull-request number for PR-family events (pull_request / review / review_comment); undefined otherwise. */
+  prNumber?: number;
   /** Changed files (for path filtering) */
   changedFiles?: string[];
+  /**
+   * Availability of {@link changedFiles} for path-filter evaluation. When
+   * `unavailable`, path filters match conservatively instead of inferring a
+   * no-match from an empty list. Optional for backward compatibility with the
+   * compiler/test CLI, which never fetches a diff (treated as legacy `fetched`
+   * exact-match semantics).
+   */
+  changedFilesStatus?: ChangedFilesStatus;
   /** Which provider originated this event. Optional for backward compatibility with compiler/test CLI. */
   provider?: ProviderType;
   /** Whether this PR comes from a fork (head repo != base repo). Only set for PR events. */

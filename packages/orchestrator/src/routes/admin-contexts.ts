@@ -60,7 +60,7 @@ const createContextSchema = z.object({
   branchRestrictions: z.array(z.string()).optional(),
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
-  holdExpirySeconds: z.number().int().min(0).nullable().optional(),
+  holdExpirySeconds: z.number().int().positive().nullable().optional(),
   minimumTrust: z.string().nullable().optional(),
   /** Gate that lets CLI-initiated test runs resolve secrets through this env. */
   allowLocalExecution: z.boolean().optional(),
@@ -80,7 +80,7 @@ const setPolicySchema = z.object({
   branchRestrictions: z.array(z.string()).optional(),
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
-  holdExpirySeconds: z.number().int().min(0).nullable().optional(),
+  holdExpirySeconds: z.number().int().positive().nullable().optional(),
   minimumTrust: z.string().nullable().optional(),
   enabled: z.boolean().optional(),
   allowLocalExecution: z.boolean().optional(),
@@ -93,7 +93,7 @@ const createTemplateSchema = z.object({
   branchRestrictions: z.array(z.string()).optional(),
   requiredReviewers: z.array(z.string()).nullable().optional(),
   waitTimerSeconds: z.number().int().min(0).nullable().optional(),
-  holdExpirySeconds: z.number().int().min(0).nullable().optional(),
+  holdExpirySeconds: z.number().int().positive().nullable().optional(),
   minimumTrust: z.string().nullable().optional(),
   variables: z.record(z.string(), z.string()).optional(),
 });
@@ -231,8 +231,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
         updates.branchRestrictions = body.branchRestrictions;
       if (body.requiredReviewers !== undefined) updates.requiredReviewers = body.requiredReviewers;
       if (body.waitTimerSeconds !== undefined) updates.waitTimerSeconds = body.waitTimerSeconds;
-      if (body.holdExpirySeconds !== undefined)
-        updates.holdExpirySeconds = body.holdExpirySeconds ?? undefined;
+      if (body.holdExpirySeconds !== undefined) updates.holdExpirySeconds = body.holdExpirySeconds;
       if (body.minimumTrust !== undefined)
         updates.minimumTrust = body.minimumTrust as 'known' | 'trusted' | null;
       if (body.enabled !== undefined) updates.enabled = body.enabled;
@@ -463,7 +462,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       const body = setVariableSchema.parse(await c.req.json());
       const orgId = c.req.query('orgId');
       const name = c.req.param('name');
-      const key = decodeURIComponent(c.req.param('key'));
+      const key = c.req.param('key');
       if (!orgId) return c.json({ error: 'orgId required' }, 400);
       const env = await envStore.getByName(orgId, name);
       if (!env) {
@@ -483,7 +482,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       deps.rbac.requirePermission(c.get('role'), 'secret.delete');
       const orgId = c.req.query('orgId');
       const name = c.req.param('name');
-      const key = decodeURIComponent(c.req.param('key'));
+      const key = c.req.param('key');
       if (!orgId) return c.json({ error: 'orgId required' }, 400);
       const env = await envStore.getByName(orgId, name);
       if (!env) {

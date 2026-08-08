@@ -20,6 +20,7 @@ import {
   webhook,
   kiciEvent,
   workflowComplete,
+  workflowsFailedBatch,
   jobComplete,
   genericWebhook,
   schedule,
@@ -30,10 +31,13 @@ import * as sdk from '@kici-dev/sdk';
 
 // delete is a reserved word -- access via namespace
 const del = sdk['delete'];
-import { generateLockFile, transformTriggers } from './generator.js';
+import { parallel } from '@kici-dev/sdk';
+import type { Job } from '@kici-dev/sdk';
+import { generateLockFile, schemaWindowWarning, transformTriggers } from './generator.js';
+import { isCompilerError, type CompilerError } from '../errors/index.js';
 import type { LockDispatchTrigger } from '@kici-dev/engine';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
-import { SCHEMA_VERSION, type WorkflowWithSource } from '../types.js';
+import { SCHEMA_VERSION, BREAKING_FLOOR, type WorkflowWithSource } from '../types.js';
 
 // Mock child_process to avoid git dependency in tests
 vi.mock('node:child_process', () => ({
@@ -62,6 +66,28 @@ function makeWorkflowWithSource(
     bundleSource,
   };
 }
+
+describe('generator - schema compatibility window', () => {
+  it('stamps minReaderVersion = BREAKING_FLOOR into the emitted lock', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('ci', { jobs: [j] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    expect(lockFile.minReaderVersion).toBe(BREAKING_FLOOR);
+    expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+});
+
+describe('schemaWindowWarning', () => {
+  it('returns null when the floor is below the current version (additive era)', () => {
+    expect(schemaWindowWarning(30, 31)).toBeNull();
+  });
+
+  it('warns and names the required version when the current version is itself breaking', () => {
+    const warning = schemaWindowWarning(31, 31);
+    expect(warning).not.toBeNull();
+    expect(warning).toContain('v31');
+  });
+});
 
 describe('generator - approval config', () => {
   it('maps step approval into LockStep.approval (when defaults to always)', () => {
@@ -282,6 +308,37 @@ describe('generator - agent execution fields', () => {
       }
     });
 
+    it('serializes the sandbox escape-hatch request to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: 'node:20',
+        sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
+      }
+    });
+
+    it('omits the sandbox key when not requested (additive — no floor bump)', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], container: 'node:20' });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob).not.toHaveProperty('sandbox');
+      }
+      // Additive field: the breaking floor must stay strictly below the version.
+      expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
+    });
+
     it('omits checkout and container when not set', () => {
       const s = step('build', async () => {});
       const j = job('build', { runsOn: 'linux', steps: [s] });
@@ -484,14 +541,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 30', () => {
+  it('schemaVersion is 32', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(30);
-    expect(SCHEMA_VERSION).toBe(30);
+    expect(lockFile.schemaVersion).toBe(32);
+    expect(SCHEMA_VERSION).toBe(32);
   });
 
   it('serializes runsOnPick: deterministic by default and any when set', () => {
@@ -1102,6 +1159,34 @@ describe('generator - new trigger types', () => {
     }
   });
 
+  it('transforms WorkflowsFailedBatchTrigger to its lock trigger', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([
+        workflowsFailedBatch({ accumulateFor: 5000, name: 'CI', source: 'org/repo' }),
+      ]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflows_failed_batch');
+    if (t._type === 'workflows_failed_batch') {
+      expect(t.accumulateFor).toBe(5000);
+      expect(t.name).toBe('CI');
+      expect(t.source).toBe('org/repo');
+    }
+  });
+
+  it('transforms WorkflowsFailedBatchTrigger omitting undefined optional fields', () => {
+    const lockFile = generateLockFile([
+      makeTriggerWorkflow([workflowsFailedBatch({ accumulateFor: 3000 })]),
+    ]);
+    const t = lockFile.workflows[0].triggers[0];
+    expect(t._type).toBe('workflows_failed_batch');
+    if (t._type === 'workflows_failed_batch') {
+      expect(t.accumulateFor).toBe(3000);
+      expect(t).not.toHaveProperty('name');
+      expect(t).not.toHaveProperty('source');
+    }
+  });
+
   it('transforms JobCompleteTrigger to LockJobCompleteTrigger', () => {
     const lockFile = generateLockFile([
       makeTriggerWorkflow([jobComplete({ workflow: 'CI', job: 'build' })]),
@@ -1414,7 +1499,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       }
     });
 
-    it('warns on impure context function', () => {
+    it('falls back to the dynamic marker for an impure context without console.warn', () => {
+      // The impurity warning is surfaced as a W101 compile diagnostic (see
+      // purity-diagnostics + compile.ts), not a bare console.warn from the generator.
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const s = step('deploy', async () => {});
       const j = job('deploy', {
@@ -1424,8 +1511,12 @@ describe('generator - context/env/concurrencyGroup', () => {
       });
       const w = workflow('ci', { jobs: [j] });
 
-      generateLockFile([makeWorkflowWithSource(w)]);
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('init job will be required'));
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
+      }
+      expect(warnSpy).not.toHaveBeenCalled();
       warnSpy.mockRestore();
     });
 
@@ -2375,7 +2466,12 @@ describe('generator - result-aware dynamicJob', () => {
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
     const entry = lockFile.workflows[0].jobs.find((j) => j.name === 'report');
     if (!entry || entry._type !== 'static') throw new Error('expected static report job');
-    expect(entry.needs).toEqual([{ name: 'build', runOn: ['failed', 'timed_out_stale'] }]);
+    // `'on-failure'` expands to every terminal status classified as a failure,
+    // which includes a job dropped by determinism drift and a job whose
+    // `runsOn` matched no agent.
+    expect(entry.needs).toEqual([
+      { name: 'build', runOn: ['failed', 'timed_out_stale', 'drift_dropped', 'unroutable'] },
+    ]);
   });
 
   it('normalizes a raw status-set when to a runOn set', () => {
@@ -2489,5 +2585,62 @@ describe('schedule inputs in lock file', () => {
     expect(() => generateLockFile([makeWorkflowWithSource(w)])).toThrow(
       /schedule input "name" must declare a \.default\(\) or be \.optional\(\)/,
     );
+  });
+});
+
+describe('generator invariant throws are coded, located CompilerErrors', () => {
+  function catchThrown(fn: () => unknown): unknown {
+    try {
+      fn();
+    } catch (e) {
+      return e;
+    }
+    return undefined;
+  }
+
+  it('E110: maxParallel < 1 throws a located CompilerError anchored to the job step', () => {
+    const w = workflow('ci', {
+      jobs: [
+        job('bad', { runsOn: 'kici:os:linux', maxParallel: 0, steps: [step('x', async () => {})] }),
+      ],
+    });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E110');
+    // Anchored to the first step's real captured location (this test file), not line 1.
+    expect(err.location?.file).toContain('generator.test.ts');
+    expect(err.location?.line).toBeGreaterThan(1);
+  });
+
+  it('E115: empty parallel group throws a located CompilerError', () => {
+    const w = workflow('ci', {
+      jobs: [
+        job('bad', {
+          runsOn: 'kici:os:linux',
+          steps: [step('real', async () => {}), parallel([])],
+        }),
+      ],
+    });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E115');
+    // Falls back to the enclosing job's first step location (the "real" step).
+    expect(err.location?.file).toContain('generator.test.ts');
+    expect(err.location?.line).toBeGreaterThan(1);
+  });
+
+  it('E108: a manually-constructed job with both runsOn and runsOnAll is a located CompilerError', () => {
+    // The SDK job() factory guards this, so build the invalid job by hand to
+    // exercise the generator's defense-in-depth invariant.
+    const base = job('bad', { runsOn: 'kici:os:linux', steps: [step('x', async () => {})] });
+    const both = { ...base, runsOnAll: 'kici:os:linux' } as Job;
+    const w = workflow('ci', { jobs: [both] });
+    const thrown = catchThrown(() => generateLockFile([makeWorkflowWithSource(w)]));
+    expect(isCompilerError(thrown)).toBe(true);
+    const err = thrown as CompilerError;
+    expect(err.code).toBe('E108');
+    expect(err.location?.line).toBeGreaterThan(1);
   });
 });

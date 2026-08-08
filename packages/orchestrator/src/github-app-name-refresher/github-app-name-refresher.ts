@@ -20,11 +20,17 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'github-app-name-refresher' });
 
+/** A source row as returned by listSources() — the slice this module needs. */
+export type SourceIdentityRow = {
+  routing_key: string;
+  provider: string;
+  name: string;
+  slug: string | null;
+};
+
 /** The slice of {@link SourceStore} this module needs. */
 export interface RefreshableSourceStore {
-  listSources(): Promise<
-    Array<{ routing_key: string; provider: string; name: string; slug: string | null }>
-  >;
+  listSources(): Promise<SourceIdentityRow[]>;
   getSourceWithSecrets(routingKey: string): Promise<{
     provider: string;
     // The `sources.config` column is jsonb, so the driver hands it back as an
@@ -56,30 +62,28 @@ export interface RefreshResult {
 }
 
 /**
- * Re-fetch one GitHub source's identity from GitHub and persist it when the
- * name or slug drifted. Shared by the daily task and `kici-admin source
- * refresh`. Throws for a missing or non-GitHub routing key.
+ * Refresh one already-resolved GitHub source's identity from GitHub and persist
+ * it when the name or slug drifted. The caller supplies the row it already holds,
+ * so this never lists the sources table. Throws for a non-GitHub row or missing
+ * credentials.
  */
-export async function refreshGithubSourceIdentity(
-  sourceStore: RefreshableSourceStore,
-  routingKey: string,
+export async function refreshResolvedGithubSource(
+  sourceStore: Pick<RefreshableSourceStore, 'getSourceWithSecrets' | 'updateSource'>,
+  row: SourceIdentityRow,
   fetchIdentity: FetchGithubAppIdentity,
 ): Promise<RefreshResult> {
-  const all = await sourceStore.listSources();
-  const row = all.find((s) => s.routing_key === routingKey);
-  if (!row) {
-    throw new Error(`Source not found: ${routingKey}`);
-  }
   if (row.provider !== 'github') {
     throw new Error(
-      `Source ${routingKey} is not a GitHub source (provider=${row.provider}); ` +
+      `Source ${row.routing_key} is not a GitHub source (provider=${row.provider}); ` +
         'name/slug sync only applies to GitHub App sources.',
     );
   }
 
-  const withSecrets = await sourceStore.getSourceWithSecrets(routingKey);
+  const withSecrets = await sourceStore.getSourceWithSecrets(row.routing_key);
   if (!withSecrets) {
-    throw new Error(`Source ${routingKey} has no stored credentials to authenticate with GitHub.`);
+    throw new Error(
+      `Source ${row.routing_key} has no stored credentials to authenticate with GitHub.`,
+    );
   }
   const config = (
     typeof withSecrets.config === 'string' ? JSON.parse(withSecrets.config) : withSecrets.config
@@ -91,17 +95,36 @@ export async function refreshGithubSourceIdentity(
 
   const changed = identity.name !== row.name || identity.slug !== row.slug;
   if (changed) {
-    await sourceStore.updateSource(routingKey, { name: identity.name, slug: identity.slug });
+    await sourceStore.updateSource(row.routing_key, { name: identity.name, slug: identity.slug });
   }
 
   return {
-    routingKey,
+    routingKey: row.routing_key,
     changed,
     oldName: row.name,
     newName: identity.name,
     oldSlug: row.slug,
     newSlug: identity.slug,
   };
+}
+
+/**
+ * Re-fetch one GitHub source's identity from GitHub and persist it when the
+ * name or slug drifted. Resolves the row by routing key (one sources read) then
+ * delegates. Shared by `kici-admin source refresh`. Throws for a missing or
+ * non-GitHub routing key.
+ */
+export async function refreshGithubSourceIdentity(
+  sourceStore: RefreshableSourceStore,
+  routingKey: string,
+  fetchIdentity: FetchGithubAppIdentity,
+): Promise<RefreshResult> {
+  const all = await sourceStore.listSources();
+  const row = all.find((s) => s.routing_key === routingKey);
+  if (!row) {
+    throw new Error(`Source not found: ${routingKey}`);
+  }
+  return refreshResolvedGithubSource(sourceStore, row, fetchIdentity);
 }
 
 export interface GithubAppNameRefresherDeps {
@@ -147,9 +170,9 @@ export class GithubAppNameRefresher {
     let updated = 0;
     for (const source of githubSources) {
       try {
-        const result = await refreshGithubSourceIdentity(
+        const result = await refreshResolvedGithubSource(
           this.sourceStore,
-          source.routing_key,
+          source,
           this.fetchIdentity,
         );
         if (result.changed) {

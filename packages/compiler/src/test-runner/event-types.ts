@@ -24,6 +24,7 @@ export type EventType =
   | { type: 'watch'; action: string }
   | { type: 'kici_event'; eventName: string }
   | { type: 'workflow_complete'; workflowName: string; status: string }
+  | { type: 'workflows_failed_batch' }
   | { type: 'job_complete'; workflowName: string; jobName: string; status: string }
   | { type: 'generic_webhook'; source?: string }
   | { type: 'schedule'; cronExpression?: string; timezone?: string }
@@ -165,6 +166,10 @@ export function parseEventArg(arg: string): EventType {
       return { type: 'workflow_complete', workflowName: 'test', status: 'failed' };
     case 'workflow_complete:cancelled':
       return { type: 'workflow_complete', workflowName: 'test', status: 'cancelled' };
+
+    // --- Workflows failed batch (synthetic internal event) ---
+    case 'workflows_failed_batch':
+      return { type: 'workflows_failed_batch' };
 
     // --- Job complete ---
     case 'job_complete':
@@ -311,6 +316,8 @@ export function triggerToEventArg(trigger: LockTrigger): string {
       const status = trigger.status?.[0];
       return status ? `workflow_complete:${status}` : 'workflow_complete';
     }
+    case 'workflows_failed_batch':
+      return 'workflows_failed_batch';
     case 'job_complete': {
       const status = trigger.status?.[0];
       return status ? `job_complete:${status}` : 'job_complete';
@@ -402,6 +409,10 @@ export function triggerSummary(trigger: LockTrigger): string {
       const name = trigger.name ? `${trigger.name}` : '*';
       const status = trigger.status?.length ? `, ${joinList(trigger.status)}` : '';
       return `workflow_complete(${name}${status})`;
+    }
+    case 'workflows_failed_batch': {
+      const name = trigger.name ? `${trigger.name}` : '*';
+      return `workflows_failed_batch(${name}, ${trigger.accumulateFor}ms)`;
     }
     case 'job_complete': {
       const workflow = trigger.workflow ?? '*';

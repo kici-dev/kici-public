@@ -1,7 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { Step, StepContext, HookContext, OutputsMap } from '@kici-dev/sdk';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
-import { executeStepLoop, type JobHooks } from './step-loop.js';
+import { LogStream } from '@kici-dev/engine';
+import {
+  executeStepLoop,
+  STEP_FAILURE_LOG_MAX_CHARS,
+  STEP_FAILURE_LOG_MAX_LINES,
+  type JobHooks,
+} from './step-loop.js';
 
 // --- Helpers ---
 
@@ -670,8 +676,7 @@ describe('executeStepLoop parallel groups', () => {
     const result = await executeStepLoop(opts);
     expect(result.status).toBe('failed');
     const slowComplete = messages.find((m) => m.type === 'step.complete' && m.stepIndex === 1) as
-      | { status?: string }
-      | undefined;
+      { status?: string } | undefined;
     expect(slowComplete?.status).toBe('cancelled');
   });
 });
@@ -1298,5 +1303,129 @@ describe('step retry', () => {
     });
     expect(n).toBe(2);
     expect(result.stepResults[0].status).toBe('success');
+  });
+});
+
+describe('failing-step diagnostics reach the run log', () => {
+  async function runFailingStep(message: string): Promise<RunnerToAgentMessage[]> {
+    const { messages, sendIpc } = collectMessages();
+    await executeStepLoop({
+      steps: [
+        makeStep('boom', async () => {
+          throw new Error(message);
+        }),
+      ],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    return messages;
+  }
+
+  function logLines(
+    messages: RunnerToAgentMessage[],
+  ): Extract<RunnerToAgentMessage, { type: 'log.line' }>[] {
+    return messages.filter(
+      (m): m is Extract<RunnerToAgentMessage, { type: 'log.line' }> => m.type === 'log.line',
+    );
+  }
+
+  // A step whose body throws must put its error in the step's own log, not only
+  // on `step.complete` — otherwise the persisted run log shows a red step with
+  // nothing explaining it. Subprocess wrappers pack the captured stderr into
+  // that message, so dropping it from the log drops the diagnosis.
+  it('emits the thrown error message as a stderr log line', async () => {
+    const messages = await runFailingStep('ssh failed: nft: Could not process rule');
+    const lines = logLines(messages);
+
+    expect(lines.length).toBeGreaterThan(0);
+    const failure = lines.find((m) => m.line.includes('nft: Could not process rule'));
+    expect(failure).toBeDefined();
+    expect(failure!.line).toContain("Step 'boom' failed");
+    expect(failure!.stream).toBe(LogStream.enum.stderr);
+  });
+
+  it('orders the failure log line before the terminal step.complete', async () => {
+    const messages = await runFailingStep('kaboom');
+    const failureIdx = messages.findIndex(
+      (m) => m.type === 'log.line' && m.line.includes('kaboom'),
+    );
+    const completeIdx = messages.findIndex((m) => m.type === 'step.complete');
+
+    expect(failureIdx).toBeGreaterThanOrEqual(0);
+    expect(completeIdx).toBeGreaterThanOrEqual(0);
+    expect(failureIdx).toBeLessThan(completeIdx);
+  });
+
+  it('bounds a huge error message and says what it dropped', async () => {
+    const huge = Array.from({ length: 5000 }, (_, i) => `noisy line ${i}`).join('\n');
+    const messages = await runFailingStep(huge);
+    const lines = logLines(messages);
+
+    // Never dump the whole thing: the cap is the line cap plus the marker.
+    expect(lines.length).toBeLessThanOrEqual(STEP_FAILURE_LOG_MAX_LINES + 1);
+    expect(lines.at(-1)!.line).toContain('truncated');
+    // The full text still travels on the terminal message.
+    const complete = messages.find(
+      (m): m is Extract<RunnerToAgentMessage, { type: 'step.complete' }> =>
+        m.type === 'step.complete',
+    );
+    expect(complete!.error!.message).toBe(huge);
+  });
+
+  /** Pull the two counts out of the truncation marker line. */
+  function parseTruncationCounts(marker: string): { lines: number; chars: number } {
+    const m = /\((\d+) more line\(s\), (\d+) more character\(s\)\)/.exec(marker);
+    expect(m, `marker did not carry both counts: ${marker}`).not.toBeNull();
+    return { lines: Number(m![1]), chars: Number(m![2]) };
+  }
+
+  // The marker is the only record of what the log dropped, so both of its
+  // numbers have to be real. Each cap drops lines AND characters — reporting
+  // one of them as 0 reads as "nothing else was lost" and sends the operator
+  // looking in the wrong place.
+  it('reports both counts when only the line cap fires', async () => {
+    // 200 one-character lines: 399 chars total, so the char cap never trips —
+    // only the line cap does, and it still drops characters along with lines.
+    const body = Array.from({ length: 2 * STEP_FAILURE_LOG_MAX_LINES }, () => 'e').join('\n');
+    expect(body.length).toBeLessThan(STEP_FAILURE_LOG_MAX_CHARS);
+
+    const counts = parseTruncationCounts(logLines(await runFailingStep(body)).at(-1)!.line);
+    expect(counts.lines).toBe(STEP_FAILURE_LOG_MAX_LINES);
+    expect(counts.chars).toBe(2 * STEP_FAILURE_LOG_MAX_LINES);
+  });
+
+  it('reports both counts when only the character cap fires', async () => {
+    // Five enormous lines: the char cap cuts inside line 2 and takes lines 3-5
+    // with it, even though the line cap never trips.
+    const body = Array.from({ length: 5 }, () => 'x'.repeat(5000)).join('\n');
+    const counts = parseTruncationCounts(logLines(await runFailingStep(body)).at(-1)!.line);
+
+    expect(counts.chars).toBe(body.length - STEP_FAILURE_LOG_MAX_CHARS);
+    expect(counts.lines).toBe(3);
+  });
+
+  it('emits no truncation marker when nothing was dropped', async () => {
+    const lines = logLines(await runFailingStep('a single short failure'));
+    expect(lines.some((m) => m.line.includes('truncated'))).toBe(false);
+  });
+
+  it('leaves a successful step log stream untouched', async () => {
+    const { messages, sendIpc } = collectMessages();
+    await executeStepLoop({
+      steps: [makeStep('ok', async () => {})],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+    expect(logLines(messages).filter((m) => m.line.includes('failed'))).toHaveLength(0);
   });
 });

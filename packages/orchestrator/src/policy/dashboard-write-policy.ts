@@ -26,7 +26,9 @@ import {
   DashboardWriteOperation,
   dashboardWritePolicyMapSchema,
   type DashboardWritePolicyMap,
+  type DashboardWritePolicyState,
   isDashboardWriteOperationEnabled,
+  resolvePolicyState,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import type { Database } from '../db/types.js';
 import type { ActorPrincipal } from '@kici-dev/engine';
@@ -176,6 +178,19 @@ export async function isDashboardWriteEnabled(
 }
 
 /**
+ * Resolve the tri-state posture (`permissive` | `encrypted` | `disabled`) for
+ * an operation. Reads through the same 30 s cache as the enabled check.
+ */
+export async function getDashboardWritePolicyState(
+  db: Kysely<Database>,
+  customerId: string,
+  op: DashboardWriteOperation,
+): Promise<DashboardWritePolicyState> {
+  const policy = await getDashboardWritePolicy(db, customerId);
+  return resolvePolicyState(policy, op);
+}
+
+/**
  * Defense-in-depth gate for orch-side dashboard.* handlers. Throws
  * `DashboardWritePolicyDisabledError` when the operation is disabled.
  * Callers translate the error into the structured error envelope they
@@ -230,15 +245,16 @@ export async function setDashboardWritePolicy(
     const next: DashboardWritePolicyMap = { ...current };
     const changed: Array<{
       op: DashboardWriteOperation;
-      prior: boolean;
-      next: boolean;
+      prior: DashboardWritePolicyState;
+      next: DashboardWritePolicyState;
     }> = [];
-    for (const [op, value] of Object.entries(parsed) as Array<[DashboardWriteOperation, boolean]>) {
-      const priorExplicit = current[op];
-      const priorEffective = priorExplicit === undefined ? true : priorExplicit;
-      if (value === true) {
-        // Normalize: permissive is the default — drop the key.
-        if (priorExplicit !== undefined) delete next[op];
+    for (const [op, value] of Object.entries(parsed) as Array<
+      [DashboardWriteOperation, DashboardWritePolicyState]
+    >) {
+      const priorEffective = resolvePolicyState(current, op);
+      if (value === 'permissive') {
+        // Normalize: permissive is the absent-key default — drop the key.
+        delete next[op];
       } else {
         next[op] = value;
       }
@@ -296,8 +312,8 @@ export interface PolicyChangeEvent {
   actor: ActorPrincipal;
   customerId: string;
   op: DashboardWriteOperation;
-  prior: boolean;
-  next: boolean;
+  prior: DashboardWritePolicyState;
+  next: DashboardWritePolicyState;
 }
 
 /**
@@ -312,12 +328,12 @@ export async function resetDashboardWritePolicy(
     onChange?: (event: PolicyChangeEvent) => Promise<void>;
   },
 ): Promise<DashboardWritePolicyMap> {
-  // Reset = explicit `true` for every key currently disabled. The
+  // Reset = explicit `permissive` for every key currently set. The
   // updates are normalized to "remove keys" so the JSONB ends up empty.
   const current = await getDashboardWritePolicy(db, customerId);
   const updates: DashboardWritePolicyMap = {};
   for (const op of Object.keys(current) as DashboardWriteOperation[]) {
-    updates[op] = true;
+    updates[op] = 'permissive';
   }
   if (Object.keys(updates).length === 0) {
     return current;

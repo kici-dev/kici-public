@@ -243,3 +243,63 @@ function fileExistsSync(target: string): boolean {
     return false;
   }
 }
+
+/** The workspace flavor a repo root uses, for prompt/output wording. */
+export enum WorkspaceKind {
+  Pnpm = 'pnpm',
+  Npm = 'npm',
+  Yarn = 'yarn',
+}
+
+/** A detected workspace root and its flavor. */
+export interface WorkspaceRoot {
+  root: string;
+  kind: WorkspaceKind;
+}
+
+/** True when a package.json's `workspaces` field declares at least one glob. */
+function manifestDeclaresWorkspaces(raw: string): boolean {
+  try {
+    const pkg = JSON.parse(raw) as { workspaces?: unknown };
+    const w = pkg.workspaces;
+    if (Array.isArray(w)) return w.length > 0;
+    if (w && typeof w === 'object') {
+      const packages = (w as { packages?: unknown }).packages;
+      return Array.isArray(packages) && packages.length > 0;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/** The workspace flavor rooted exactly at `dir`, or null when `dir` is not a root. */
+async function workspaceKindAt(dir: string): Promise<WorkspaceKind | null> {
+  if (await fileExists(path.join(dir, 'pnpm-workspace.yaml'))) return WorkspaceKind.Pnpm;
+  const raw = await readPackageJson(dir);
+  if (raw && manifestDeclaresWorkspaces(raw)) {
+    const pm = await detectPackageManagerFromManifests(dir);
+    return pm === PackageManager.Yarn ? WorkspaceKind.Yarn : WorkspaceKind.Npm;
+  }
+  return null;
+}
+
+/**
+ * Walk up from `startDir` to the git-repo root (inclusive) and return the
+ * nearest ancestor directory that is a workspace root, or null. pnpm roots are
+ * identified by `pnpm-workspace.yaml`; npm/yarn roots by a non-empty
+ * `workspaces` field in `package.json`. The walk stops at the first `.git`
+ * marker so it never escapes the repository.
+ */
+export async function detectWorkspaceRoot(startDir: string): Promise<WorkspaceRoot | null> {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const kind = await workspaceKindAt(dir);
+    if (kind) return { root: dir, kind };
+    // Stop once we've inspected the repo root — do not climb past `.git`.
+    if (await fileExists(path.join(dir, '.git'))) return null;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}

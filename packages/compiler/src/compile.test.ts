@@ -45,18 +45,14 @@ describe('compiler integration', () => {
     );
 
     // Execute config
-    const { workflows: workflowsWithSource, configPath: absolutePath } =
-      await executeConfig(configPath);
+    const { workflows: workflowsWithSource } = await executeConfig(configPath);
 
     expect(workflowsWithSource).toHaveLength(1);
     expect(workflowsWithSource[0].workflow.name).toBe('ci');
     expect(workflowsWithSource[0].workflow.jobs).toHaveLength(1);
 
-    // Extract workflows for validation
-    const workflows = workflowsWithSource.map((w) => w.workflow);
-
     // Validate
-    const validation = validateConfig(workflows, absolutePath);
+    const validation = validateConfig(workflowsWithSource);
     expect(validation.valid).toBe(true);
 
     // Generate lock file with source tracking
@@ -104,10 +100,8 @@ describe('compiler integration', () => {
       'utf-8',
     );
 
-    const { workflows: workflowsWithSource, configPath: absolutePath } =
-      await executeConfig(configPath);
-    const workflows = workflowsWithSource.map((w) => w.workflow);
-    const validation = validateConfig(workflows, absolutePath);
+    const { workflows: workflowsWithSource } = await executeConfig(configPath);
+    const validation = validateConfig(workflowsWithSource);
 
     expect(validation.valid).toBe(false);
     if (!validation.valid) {
@@ -138,10 +132,8 @@ describe('compiler integration', () => {
       'utf-8',
     );
 
-    const { workflows: workflowsWithSource, configPath: absolutePath } =
-      await executeConfig(configPath);
-    const workflows = workflowsWithSource.map((w) => w.workflow);
-    const validation = validateConfig(workflows, absolutePath);
+    const { workflows: workflowsWithSource } = await executeConfig(configPath);
+    const validation = validateConfig(workflowsWithSource);
     expect(validation.valid).toBe(true);
 
     const lockFile = generateLockFile(workflowsWithSource);
@@ -173,8 +165,7 @@ describe('compiler integration', () => {
       'utf-8',
     );
 
-    const { workflows: workflowsWithSource, configPath: absolutePath } =
-      await executeConfig(configPath);
+    const { workflows: workflowsWithSource } = await executeConfig(configPath);
     const lockFile = generateLockFile(workflowsWithSource);
     const job = lockFile.workflows[0].jobs[0];
 

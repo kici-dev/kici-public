@@ -37,7 +37,9 @@ const loggerMock = vi.hoisted(() => ({
 
 // --- Mocks ---
 
-// Mock @kici-dev/shared (createLogger + getRequestContext + createMeter)
+// Mock @kici-dev/shared (createLogger + getRequestContext + createMeter +
+// kiciTmpBase — the bring-up handler resolves the agent-payload cache dir via
+// defaultPayloadCacheDir() → kiciTmpBase()).
 vi.mock('@kici-dev/shared', () => {
   const noopInstrument = { add: vi.fn(), record: vi.fn() };
   return {
@@ -49,16 +51,27 @@ vi.mock('@kici-dev/shared', () => {
       createHistogram: vi.fn().mockReturnValue(noopInstrument),
     }),
     toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
+    kiciTmpBase: vi.fn().mockReturnValue('/tmp'),
   };
 });
 
-// Mock fs for mkdtemp and rm
+// Mock fs for mkdtemp and rm. The workdir now flows through the
+// @kici-dev/core/tmp allocator, which imports the *named* mkdtemp/rm/writeFile
+// from node:fs/promises, while job-runner still uses the default import — so
+// named and default exports share the same vi.fn instances (assertions read
+// the default export).
+const { mkdtempFn, rmFn, accessFn, writeFileFn } = vi.hoisted(() => ({
+  mkdtempFn: vi.fn().mockResolvedValue('/tmp/kici-test123'),
+  rmFn: vi.fn().mockResolvedValue(undefined),
+  accessFn: vi.fn().mockResolvedValue(undefined),
+  writeFileFn: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock('node:fs/promises', () => ({
-  default: {
-    mkdtemp: vi.fn().mockResolvedValue('/tmp/kici-test123'),
-    rm: vi.fn().mockResolvedValue(undefined),
-    access: vi.fn().mockResolvedValue(undefined),
-  },
+  default: { mkdtemp: mkdtempFn, rm: rmFn, access: accessFn, writeFile: writeFileFn },
+  mkdtemp: mkdtempFn,
+  rm: rmFn,
+  access: accessFn,
+  writeFile: writeFileFn,
 }));
 
 // Mock dockerode to prevent real Docker connections
@@ -79,6 +92,7 @@ vi.mock('./sandbox/index.js', () => ({
     return mockSandboxInstance;
   }),
   buildSanitizedEnv: vi.fn().mockReturnValue({ PATH: '/usr/bin', HOME: '/home/user' }),
+  fileCloneSourceBinds: vi.fn(() => [] as string[]),
 }));
 
 // Mock git clone (used by build jobs)
@@ -213,13 +227,10 @@ function makeDispatch(overrides: Partial<JobDispatch> = {}): JobDispatch {
 
 function makeDeps(): JobRunnerDeps & {
   messages: AgentToOrchestratorMessage[];
-  directMessages: AgentToOrchestratorMessage[];
 } {
   const messages: AgentToOrchestratorMessage[] = [];
-  const directMessages: AgentToOrchestratorMessage[] = [];
   return {
     send: (msg) => messages.push(msg),
-    sendDirect: (msg) => directMessages.push(msg),
     config: makeConfig(),
     requestUploadUrl: vi.fn().mockResolvedValue('https://s3.example.com/upload?presigned=1'),
     sendUploadComplete: vi.fn(),
@@ -228,7 +239,6 @@ function makeDeps(): JobRunnerDeps & {
     sendRunEvent: vi.fn(),
     sendConcurrencyReport: vi.fn().mockResolvedValue({ action: 'proceed' }),
     messages,
-    directMessages,
   };
 }
 
@@ -267,7 +277,7 @@ describe('JobRunner', () => {
     expect(gitClone).not.toHaveBeenCalled();
 
     // Verify status messages: running -> success
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     expect(jobStatuses).toHaveLength(2);
     expect((jobStatuses[0] as { state: string }).state).toBe('running');
     expect((jobStatuses[1] as { state: string }).state).toBe('success');
@@ -294,7 +304,7 @@ describe('JobRunner', () => {
     await runner.execute(makeDispatch());
 
     // Job reports failed
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     expect((jobStatuses[jobStatuses.length - 1] as { state: string }).state).toBe('failed');
   });
 
@@ -320,7 +330,7 @@ describe('JobRunner', () => {
     await runner.execute(makeDispatch());
 
     // Job reports failed with 2 stepResults
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const failedStatus = jobStatuses.find((m) => (m as { state: string }).state === 'failed') as {
       data?: { stepResults?: unknown[] };
     };
@@ -389,7 +399,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const failedStatus = jobStatuses.find((m) => (m as { state: string }).state === 'failed') as {
       data?: Record<string, unknown>;
     };
@@ -447,6 +457,49 @@ describe('JobRunner', () => {
     );
   });
 
+  it('container mode: threads the dispatched sandbox grant into hardening.grant', async () => {
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'node:20',
+        // The dispatch-resolved (allow-listed) escape-hatch grant.
+        sandboxGrant: { capabilities: ['NET_ADMIN'], network: 'host' },
+      },
+    });
+
+    const runner = new JobRunner(makeDeps());
+    await runner.execute(dispatch);
+
+    expect(ContainerSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hardening: expect.objectContaining({
+          grant: { capabilities: ['NET_ADMIN'], network: 'host' },
+        }),
+      }),
+    );
+  });
+
+  it('container mode: no grant threaded when jobConfig carries none (default posture)', async () => {
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'node:20',
+      },
+    });
+
+    const runner = new JobRunner(makeDeps());
+    await runner.execute(dispatch);
+
+    const call = (ContainerSandbox as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+    expect(call?.[0].hardening.grant).toBeUndefined();
+  });
+
   it('cancel: abort() called on active sandbox', async () => {
     // Make sandbox.executeJob block until manually resolved
     let resolveExecution!: (value: JobExecutionResult) => void;
@@ -486,7 +539,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
 
     expect(states[0]).toBe('running');
@@ -517,7 +570,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    const stepStatuses = deps.directMessages.filter((m) => m.type === 'step.status');
+    const stepStatuses = deps.messages.filter((m) => m.type === 'step.status');
     expect(stepStatuses).toHaveLength(4);
 
     // Verify step status message content
@@ -608,7 +661,7 @@ describe('JobRunner', () => {
     const runner = new JobRunner(deps);
     await runner.execute(makeDispatch());
 
-    const stepStatuses = deps.directMessages.filter((m) => m.type === 'step.status') as Array<{
+    const stepStatuses = deps.messages.filter((m) => m.type === 'step.status') as Array<{
       stepIndex: number;
       state: string;
       logBytesStreamed?: number;
@@ -633,7 +686,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const successStatus = jobStatuses.find((m) => (m as { state: string }).state === 'success') as {
       data?: Record<string, unknown>;
     };
@@ -649,7 +702,7 @@ describe('JobRunner', () => {
 
     // Make sandbox.executeJob check activeJobs mid-execution
     mockSandboxInstance.executeJob.mockReset().mockImplementation(async () => {
-      // runner is captured via closure below -- use deps.directMessages as proxy
+      // runner is captured via closure below -- use deps.messages as proxy
       // Instead, we check from outside after a tick
       return defaultSuccessResult;
     });
@@ -855,6 +908,31 @@ describe('JobRunner', () => {
     }
   });
 
+  it('log streamers are destroyed when execution throws, before the failed status', async () => {
+    // The step's buffered output — where the failure diagnostics sit — must
+    // reach the orchestrator even when the sandbox blows up mid-execution.
+    mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
+      const options = opts as {
+        onLogLine: (stepIndex: number, line: string) => void;
+      };
+      options.onLogLine(0, 'nft: Could not process rule');
+      throw new Error('sandbox exploded');
+    });
+
+    const deps = makeDeps();
+    const runner = new JobRunner(deps);
+
+    await runner.execute(makeDispatch());
+
+    expect(logStreamerInstances).toHaveLength(1);
+    expect(logStreamerInstances[0]!.destroy).toHaveBeenCalledOnce();
+
+    const failed = deps.messages.filter(
+      (m) => m.type === 'job.status' && (m as { state?: string }).state === 'failed',
+    );
+    expect(failed).toHaveLength(1);
+  });
+
   // --- E. Build job tests (in-process, no sandbox) ---
 
   it('build job: gitClone and loadWorkflowSource called in-process', async () => {
@@ -883,7 +961,7 @@ describe('JobRunner', () => {
     expect(ContainerSandbox).not.toHaveBeenCalled();
 
     // Status: running -> success
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
     expect(states[0]).toBe('running');
     expect(states[states.length - 1]).toBe('success');
@@ -922,7 +1000,7 @@ describe('JobRunner', () => {
     expect(sendApiRequest).toHaveBeenCalledWith('kici.ensureInitRunner', {
       targetAgentId: 'fresh-01',
     });
-    const statuses = deps.directMessages
+    const statuses = deps.messages
       .filter((m) => m.type === 'job.status')
       .map((m) => (m as { state: string }).state);
     expect(statuses).toContain('success');
@@ -945,7 +1023,7 @@ describe('JobRunner', () => {
 
     await runner.execute(dispatch);
 
-    const statuses = deps.directMessages
+    const statuses = deps.messages
       .filter((m) => m.type === 'job.status')
       .map((m) => (m as { state: string }).state);
     expect(statuses).toContain('failed');
@@ -999,7 +1077,7 @@ describe('JobRunner', () => {
     );
 
     // Init job ends in success when the drift gate is happy
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
     expect(states[states.length - 1]).toBe('success');
   });
@@ -1019,7 +1097,7 @@ describe('JobRunner', () => {
       ['asset.txt'],
     );
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status');
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
     expect(states[states.length - 1]).toBe('success');
   });
@@ -1084,7 +1162,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeInitDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status') as Array<{
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status') as Array<{
       state: string;
       data?: Record<string, unknown>;
     }>;
@@ -1107,7 +1185,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDynamicDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status') as Array<{
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status') as Array<{
       state: string;
       data?: Record<string, unknown>;
     }>;
@@ -1131,7 +1209,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDynamicDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status') as Array<{
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status') as Array<{
       state: string;
       data?: Record<string, unknown>;
     }>;
@@ -1156,7 +1234,7 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDynamicDispatch());
 
-    const jobStatuses = deps.directMessages.filter((m) => m.type === 'job.status') as Array<{
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status') as Array<{
       state: string;
       data?: Record<string, unknown>;
     }>;

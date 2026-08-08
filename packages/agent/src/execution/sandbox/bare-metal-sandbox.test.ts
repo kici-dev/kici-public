@@ -270,7 +270,7 @@ describe('BareMetalSandbox', () => {
         line: 'npm install done',
       } satisfies RunnerToAgentMessage);
 
-      expect(onLogLine).toHaveBeenCalledWith(0, 'npm install done');
+      expect(onLogLine).toHaveBeenCalledWith(0, 'npm install done', undefined);
 
       // step.complete
       fakeChild.emit('message', {

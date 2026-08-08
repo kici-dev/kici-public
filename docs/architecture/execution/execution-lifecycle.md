@@ -5,9 +5,9 @@ description: Cancel flow, hook execution order, and concurrency group protocol
 
 ## Overview
 
-This document describes the runtime lifecycle of a KiCI workflow execution, focusing on cancellation, lifecycle hooks, and concurrency groups. For the underlying state machine, see [state-machine.md](./state-machine.md). For job execution details, see [job-execution.md](./job-execution.md).
+This document describes the runtime lifecycle of a KiCI workflow execution, focusing on cancellation, lifecycle hooks, and concurrency groups. For the run, job, and step status vocabulary and terminal-state rules, see [state-machine.md](./state-machine.md). For job execution details, see [job-execution.md](./job-execution.md).
 
-## State machine: cancelling state
+## The cancelling state
 
 The `cancelling` state is a transient state between `running` and `cancelled`. It represents the grace period during which the agent terminates the active step and runs lifecycle hooks.
 
@@ -19,15 +19,17 @@ pending -> queued -> running -> cancelling -> cancelled
 
 ### Transitions involving cancelling
 
-| From         | Event             | To           | Description                        |
-| ------------ | ----------------- | ------------ | ---------------------------------- |
-| `running`    | `CANCEL`          | `cancelled`  | Force cancel (immediate, no hooks) |
-| `running`    | `CANCEL_GRACEFUL` | `cancelling` | Graceful cancel (hooks will run)   |
-| `cancelling` | `CANCEL_FORCE`    | `cancelled`  | Force cancel escalation            |
-| `cancelling` | `COMPLETE`        | `cancelled`  | Hooks finished normally            |
-| `cancelling` | `FAIL`            | `failed`     | A hook failed during cancellation  |
+The execution tracker moves a run between these statuses in response to the following triggers:
 
-The `cancelling` state is NOT terminal -- `isTerminal('cancelling')` returns `false`.
+| From         | Trigger                     | To           | Description                        |
+| ------------ | --------------------------- | ------------ | ---------------------------------- |
+| `running`    | Force cancel request        | `cancelled`  | Force cancel (immediate, no hooks) |
+| `running`    | Graceful cancel request     | `cancelling` | Graceful cancel (hooks will run)   |
+| `cancelling` | Force-cancel escalation     | `cancelled`  | Force cancel escalation            |
+| `cancelling` | Cancellation hooks finished | `cancelled`  | Hooks finished normally            |
+| `cancelling` | Cancellation hook failed    | `failed`     | A hook failed during cancellation  |
+
+The `cancelling` status is transient, not terminal -- it is deliberately absent from `TERMINAL_RUN_STATES`.
 
 ## Cancel chain
 
@@ -234,4 +236,4 @@ When a run is cancelled, pending/queued dependent jobs (jobs with `needs`) are m
 
 ---
 
-_Source: `packages/engine/src/state-machine/`, `packages/engine/src/protocol/messages/orchestrator-agent.ts`_
+_Source: `packages/orchestrator/src/reporting/execution-tracker.ts`, `packages/engine/src/protocol/messages/orchestrator-agent.ts`_

@@ -1,9 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import {
-  buildLocalTriggerRequest,
-  triggerRun,
-  type RunDiscoveryClient,
-} from './plane-trigger.js';
+import { buildLocalTriggerRequest, triggerRun, type RunDiscoveryClient } from './plane-trigger.js';
 
 describe('buildLocalTriggerRequest', () => {
   it('builds a GitHub-shaped push body + generic webhook path', () => {
@@ -63,7 +59,13 @@ describe('buildLocalTriggerRequest', () => {
 
 describe('triggerRun', () => {
   beforeEach(() => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 202 }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        status: 202,
+        json: async () => ({ accepted: true, deliveryId: 'rk:del-1' }),
+      }),
+    );
   });
   afterEach(() => vi.unstubAllGlobals());
 
@@ -82,7 +84,7 @@ describe('triggerRun', () => {
     const get = vi
       .fn()
       .mockResolvedValueOnce({ runs: [] })
-      .mockResolvedValueOnce({ runs: [{ runId: 'run-9', createdAt: 'now' }] });
+      .mockResolvedValueOnce({ runs: [{ runId: 'run-9' }] });
     const client: RunDiscoveryClient = { get };
     const runId = await triggerRun('http://127.0.0.1:4319', 'tok', input, {
       client,
@@ -105,5 +107,49 @@ describe('triggerRun', () => {
         timeoutMs: 30,
       }),
     ).rejects.toThrow(/no run appeared/);
+  });
+
+  it('polls by the delivery id of THIS webhook, never "newest since"', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        status: 202,
+        json: async () => ({ accepted: true, deliveryId: 'rk:mine' }),
+      }),
+    );
+    // The discovery poll MUST carry the captured, url-encoded delivery id.
+    // A decoy run from another invocation is never returned because the
+    // filtered query only matches this delivery.
+    const get = vi.fn(async (path: string) => {
+      expect(path).toContain('deliveryId=rk%3Amine');
+      return { runs: [{ runId: 'run-mine' }] };
+    });
+    const runId = await triggerRun('http://127.0.0.1:4319', 'tok', input, {
+      client: { get },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+    });
+    expect(runId).toBe('run-mine');
+  });
+
+  it('captures the delivery id from a resend when the first send has none', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ status: 404, json: async () => ({ rejected: true }) })
+      .mockResolvedValue({
+        status: 202,
+        json: async () => ({ accepted: true, deliveryId: 'rk:late' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    const get = vi.fn(async (path: string) =>
+      path.includes('deliveryId=rk%3Alate') ? { runs: [{ runId: 'run-late' }] } : { runs: [] },
+    );
+    const runId = await triggerRun('http://127.0.0.1:4319', 'tok', input, {
+      client: { get },
+      pollIntervalMs: 1,
+      resendAfterMs: 1,
+      timeoutMs: 5_000,
+    });
+    expect(runId).toBe('run-late');
   });
 });

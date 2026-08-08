@@ -96,7 +96,7 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   // If KICI_BROWSER_CMD is set (even to 'none'), the user explicitly configured browser handling,
   // so skip headless auto-detection and use PKCE. The --device flag still forces device flow.
   const browserCmdSet = !!process.env.KICI_BROWSER_CMD;
-  const useDeviceFlow = options.device || (!browserCmdSet && isHeadless());
+  const useDeviceFlow = options.device || (!browserCmdSet && (await isHeadless()));
   const flowName = useDeviceFlow ? 'device authorization' : 'PKCE (browser)';
   console.log(pc.gray(`  Using ${flowName} flow`));
 

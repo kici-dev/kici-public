@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './043_rerouted_to_peer.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -40,10 +39,7 @@ describeDb('migration 043_rerouted_to_peer', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

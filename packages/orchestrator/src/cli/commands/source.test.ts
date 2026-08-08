@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { Command } from 'commander';
-import { registerSourceCommands } from './source.js';
+import { registerSourceCommands, resolveWebhookSecret } from './source.js';
 import type { AdminApiClient } from '../api-client.js';
 import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
 
@@ -101,6 +101,66 @@ describe('kici-admin source list-presets', () => {
     const client = {} as Partial<AdminApiClient>;
     const { exitCode } = await runCommand(['source', 'list-presets'], client);
     expect(exitCode).toBeNull();
+  });
+});
+
+describe('resolveWebhookSecret', () => {
+  it('passes a literal value through unchanged', async () => {
+    const out = await resolveWebhookSecret(
+      { value: 's3cr3t', privateKeyFromStdin: false },
+      async () => 'X',
+    );
+    expect(out).toBe('s3cr3t');
+  });
+
+  it('returns undefined when no value is given', async () => {
+    expect(
+      await resolveWebhookSecret({ privateKeyFromStdin: false }, async () => 'X'),
+    ).toBeUndefined();
+  });
+
+  it('reads from stdin (trimmed) when the value is "-"', async () => {
+    const out = await resolveWebhookSecret(
+      { value: '-', privateKeyFromStdin: false },
+      async () => 'piped-secret\n',
+    );
+    expect(out).toBe('piped-secret');
+  });
+
+  it('throws when both the private key and the webhook secret want stdin', async () => {
+    await expect(
+      resolveWebhookSecret({ value: '-', privateKeyFromStdin: true }, async () => 'x'),
+    ).rejects.toThrow(/both the private key and the webhook secret from stdin/);
+  });
+});
+
+describe('kici-admin source add github', () => {
+  it('rejects reading both the private key and webhook secret from stdin', async () => {
+    let httpUsed = false;
+    const client: Partial<AdminApiClient> = {
+      post: (async () => {
+        httpUsed = true;
+        return {};
+      }) as AdminApiClient['post'],
+    };
+    const { exitCode, stderr } = await runCommand(
+      [
+        'source',
+        'add',
+        'github',
+        '--name',
+        'n',
+        '--app-id',
+        '1',
+        '--stdin',
+        '--webhook-secret',
+        '-',
+      ],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(httpUsed).toBe(false);
+    expect(stderr).toMatch(/both the private key and the webhook secret from stdin/);
   });
 });
 
@@ -441,5 +501,106 @@ describe('kici-admin source remove --local', () => {
     );
     expect(exitCode).toBeNull();
     expect(received).toEqual([{ id: 'g-local', hard: undefined }]);
+  });
+});
+
+describe('kici-admin source direct-DB (--database-url) surface', () => {
+  function optLongsFor(segments: string[]): string[] {
+    const program = new Command();
+    registerSourceCommands(program, () => ({}) as AdminApiClient);
+    let cmd = program.commands.find((c) => c.name() === 'source');
+    for (const seg of segments) cmd = cmd?.commands.find((c) => c.name() === seg);
+    if (!cmd) throw new Error(`command not found: source ${segments.join(' ')}`);
+    return cmd.options.map((o) => o.long ?? '');
+  }
+
+  it('exposes --database-url on list / add local / update-local / enable / remove / update', () => {
+    expect(optLongsFor(['list'])).toContain('--database-url');
+    expect(optLongsFor(['add', 'local'])).toContain('--database-url');
+    expect(optLongsFor(['update-local'])).toContain('--database-url');
+    expect(optLongsFor(['enable'])).toContain('--database-url');
+    expect(optLongsFor(['remove'])).toContain('--database-url');
+    expect(optLongsFor(['update'])).toContain('--database-url');
+  });
+});
+
+describe('kici-admin source --database-url dispatch (bypasses HTTP client)', () => {
+  /** Run a `--database-url` command against an unreachable DB. The direct
+   *  branch fails at connect (never touching getClient), which the action
+   *  catches and turns into process.exit(1) — proving the HTTP path was
+   *  skipped. Returns whether the HTTP client factory was ever called. */
+  async function runDirect(
+    args: string[],
+  ): Promise<{ httpUsed: boolean; exitCode: number | null }> {
+    let httpUsed = false;
+    const program = new Command();
+    program.exitOverride();
+    registerSourceCommands(program, () => {
+      httpUsed = true;
+      throw new Error('HTTP client must not be used in --database-url mode');
+    });
+
+    const origExit = process.exit;
+    const origError = console.error;
+    let exitCode: number | null = null;
+    process.exit = ((code?: number) => {
+      exitCode = code ?? 0;
+      throw new Error(`EXIT:${code}`);
+    }) as never;
+    console.error = () => {};
+    try {
+      await program.parseAsync(args, { from: 'user' });
+    } catch {
+      // EXIT:<n> from the caught DB-connect failure, or a commander error.
+    } finally {
+      process.exit = origExit;
+      console.error = origError;
+    }
+    return { httpUsed, exitCode };
+  }
+
+  it('add local --database-url hits the DB path, never the HTTP client', async () => {
+    const { httpUsed, exitCode } = await runDirect([
+      'source',
+      'add',
+      'local',
+      '--org',
+      'o',
+      '--path',
+      '/tmp/x',
+      '--database-url',
+      'postgresql://127.0.0.1:1/none',
+      '--json',
+    ]);
+    expect(httpUsed).toBe(false);
+    expect(exitCode).toBe(1);
+  });
+
+  it('update --customer-id --database-url hits the DB path, never the HTTP client', async () => {
+    const { httpUsed, exitCode } = await runDirect([
+      'source',
+      'update',
+      'github:1',
+      '--customer-id',
+      'o',
+      '--database-url',
+      'postgresql://127.0.0.1:1/none',
+    ]);
+    expect(httpUsed).toBe(false);
+    expect(exitCode).toBe(1);
+  });
+
+  it('rejects a secret update in --database-url mode before touching the DB', async () => {
+    const { httpUsed, exitCode } = await runDirect([
+      'source',
+      'update',
+      'github:1',
+      '--webhook-secret',
+      's',
+      '--database-url',
+      'postgresql://127.0.0.1:1/none',
+    ]);
+    expect(httpUsed).toBe(false);
+    expect(exitCode).toBe(1);
   });
 });

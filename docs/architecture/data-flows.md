@@ -5,7 +5,7 @@ description: End-to-end data flows through the KiCI three-tier architecture
 
 This document describes the key data flows through the KiCI architecture: webhook delivery, job execution, developer-initiated remote runs, dependency caching, re-run and cancel, trace ID propagation, internal event routing, and generic webhook ingestion.
 
-> **Lock file schema version:** The lock file uses schema version 29. The orchestrator rejects any fetched lock whose `schemaVersion` does not exactly match the engine version it was built against, so a stale lock must be recompiled with `kici compile` and pushed again after any SDK upgrade that bumps the schema.
+> **Lock file schema version:** The orchestrator accepts a compatibility window of lock schema versions rather than an exact match. A lock is accepted when its `schemaVersion` is at or above the orchestrator's oldest supported version (additive bumps add fields older readers ignore) and the orchestrator's own schema is at or above the lock's `minReaderVersion` (the newest breaking version at compile time). A lock below the floor must be recompiled with `kici compile` and pushed; a lock requiring a newer reader means the orchestrator must be upgraded. Both out-of-window cases are rejected with an actionable error rather than a silent mis-route. See [lock file and drift](../user/lock-file-and-drift.md#schema-compatibility-window).
 
 ## Webhook delivery flow
 
@@ -211,7 +211,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 29.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 31.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -299,7 +299,7 @@ Agents receive pre-signed S3 GET URLs (15-minute expiry) directly in `job.dispat
 
 The source/dep cache above is internal: the orchestrator owns its keys and decides when to hit or build. The **user-facing cache** is driven by the workflow author — the declarative `cache: { key, paths, restoreKeys? }` on a job/step, or the imperative `ctx.cache.restore()` / `ctx.cache.save()` API (see [SDK caching reference](../user/sdk/caching.md)). It reuses the same object-storage backend and the same direct-to-storage presigned-URL transport, but the agent — not the orchestrator — initiates each restore and save over WebSocket.
 
-The agent's cache module archives `paths` into a gzipped tarball (computing a SHA-256 over the bytes) and streams downloads back through a checksum-verified extract pipeline. The orchestrator's `UserCache` owns the `cache/<orgId>/<repoId>/<scope>/<key>` namespacing, the immutable first-save check, the `restoreKeys` prefix scan, the two-phase atomic save, and per-org quota/TTL eviction.
+The agent's cache module archives `paths` into a gzipped tarball (computing a SHA-256 over the bytes) and streams downloads back through a checksum-verified extract pipeline. The orchestrator's `UserCache` owns the `cache/<orgId>/<repoId>/<scope>/<key>-<discriminator>` namespacing (the discriminator is a hash of the exact cache key, so two keys differing only by case stay two objects on a case-insensitive store), the immutable first-save check, the `restoreKeys` prefix scan, the two-phase atomic save, and per-org quota/TTL eviction.
 
 ### Restore flow
 
@@ -580,7 +580,7 @@ POST /webhook/:orgId/generic/:sourceId
 
 ## Database topology
 
-The orchestrator owns its own PostgreSQL database, with the authoritative `execution_runs`, `execution_jobs`, `execution_steps`, `dispatch_queue`, `dedup_cache`, `workflow_registrations`, `environments` / `scoped_secrets` / `environment_bindings`, `agent_tokens`, `cluster_meta`, and related tables. Each orchestrator deployment uses its own `KICI_DATABASE_URL`; database users are scoped per service.
+The orchestrator owns its own PostgreSQL database, with the authoritative `execution_runs`, `execution_jobs`, `execution_steps`, `dispatch_queue`, `dedup_cache`, `workflow_registrations`, `contexts` / `scoped_secrets` / `context_bindings`, `agent_tokens`, `cluster_meta`, and related tables. Each orchestrator deployment uses its own `KICI_DATABASE_URL`; database users are scoped per service.
 
 ## Execution reporting flow
 
@@ -764,7 +764,7 @@ Output chaining allows steps to consume outputs from preceding steps (within a j
 When workflow code runs at definition time (`step()`, `job()` calls):
 
 - `step()` creates an `OutputProxy<T>` via `createStepOutputProxy(stepName)` and attaches it as `.result`
-- `job()` creates an `OutputProxy<any>` via `createJobOutputProxy(jobName)` and attaches it as `.result`
+- `job()` creates an `OutputProxy<TOutputs>` (the job's inferred output shape — nested by step name for a multi-step job, flat for the `run:` shorthand) via `createJobOutputProxy(jobName)` and attaches it as `.result`, so cross-job reads type-check
 - The proxy is an ES6 `Proxy` object that defers all property access to a module-global `OutputsMap`
 - No outputs exist yet -- accessing `.result.field` before execution throws "has not produced outputs yet"
 
@@ -848,7 +848,7 @@ The Platform tier exposes a `/ws/browser` WebSocket endpoint for dashboard clien
 - [Architecture overview](overview.md) -- three-tier model and component responsibilities
 - [Protocol messages](protocol-messages.md) -- WebSocket message schemas
 - [Event system internals](./webhooks/event-system.md) -- event router, registration model, cron scheduler
-- [State machine](./execution/state-machine.md) -- job execution state transitions
+- [Execution lifecycle](./execution/state-machine.md) -- run, job, and step status vocabularies and terminal states
 - [Webhook delivery](./webhooks/webhook-delivery.md) -- detailed webhook processing pipeline
 - [Operator: dependency caching](../operator/dependency-caching.md) -- configuration guide
 - [Operator: monitoring & tracing](../operator/observability/monitoring.md) -- trace fields and Loki queries

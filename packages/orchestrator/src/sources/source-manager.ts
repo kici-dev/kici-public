@@ -13,7 +13,7 @@ import { ProviderRegistry } from '../provider-registry.js';
 import type { ProviderBundle } from '../provider-registry.js';
 import type { ProviderSource } from '../entry-helpers.js';
 import { diffProviderSources } from '../entry-helpers.js';
-import { type SourceProvider, SourceSubtype } from '@kici-dev/engine';
+import { type SourceProvider, SourceSubtype, OrchestratorMode } from '@kici-dev/engine';
 import {
   GitHubWebhookNormalizer,
   GitHubLockFileFetcher,
@@ -30,6 +30,23 @@ import { createLogger } from '@kici-dev/shared';
 const logger = createLogger({ prefix: 'sources' });
 
 /**
+ * Operator-facing error for a GitHub-App source under `observed` mode. Shared
+ * by the startup assertion and the admin source-create route so both paths give
+ * the same remediation.
+ */
+export const OBSERVED_GITHUB_APP_SOURCE_ERROR =
+  'observed mode does not support GitHub-App sources (they are Platform-relayed); ' +
+  'remove them or set KICI_MODE=hybrid';
+
+/** Thrown at startup when an observed-mode orchestrator holds GitHub-App sources. */
+export class ObservedGithubAppSourcesError extends Error {
+  constructor(readonly count: number) {
+    super(`${OBSERVED_GITHUB_APP_SOURCE_ERROR} — found ${count}`);
+    this.name = 'ObservedGithubAppSourcesError';
+  }
+}
+
+/**
  * Options for creating a SourceManager.
  */
 export interface SourceManagerOptions {
@@ -41,6 +58,13 @@ export interface SourceManagerOptions {
   onSourcesChanged: (diff: { added: ProviderSource[]; removed: ProviderSource[] }) => void;
   /** Debounce interval in ms for coalescing rapid changes. Default: 200. */
   debounceMs?: number;
+  /**
+   * Orchestrator operating mode. In `observed` mode the manager refuses to
+   * start when the `sources` table holds any GitHub-App row — those are
+   * Platform-relayed by construction and an observed orchestrator never
+   * accepts a relay. Omitted (undefined) imposes no mode constraint.
+   */
+  mode?: OrchestratorMode;
 }
 
 /**
@@ -92,6 +116,7 @@ export class SourceManager {
 
   /** Initial load + subscribe to changes. */
   async start(): Promise<ProviderRegistry> {
+    await this.assertNoGithubAppSourcesInObservedMode();
     await this.reload();
 
     this.client = await this.opts.pool.connect();
@@ -121,6 +146,18 @@ export class SourceManager {
       }
       this.client.release();
       this.client = null;
+    }
+  }
+
+  /**
+   * Fail fast when an observed-mode orchestrator holds GitHub-App sources. The
+   * `sources` table is GitHub-App-only, so any row is a relay-type source.
+   */
+  private async assertNoGithubAppSourcesInObservedMode(): Promise<void> {
+    if (this.opts.mode !== OrchestratorMode.enum.observed) return;
+    const sources = await this.opts.sourceStore.listSources();
+    if (sources.length > 0) {
+      throw new ObservedGithubAppSourcesError(sources.length);
     }
   }
 

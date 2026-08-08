@@ -12,6 +12,7 @@ import type { Command } from 'commander';
 import {
   createServiceManager,
   detectPlatform,
+  InstanceNotFoundError,
   kiciConfigRoot,
   resolveInstance,
   resolveUserLevel,
@@ -68,6 +69,10 @@ export function registerAgentStop(agent: Command): void {
         await manager.stop(config);
         console.log(`Agent service "${config.name}" stopped.`);
       } catch (err) {
+        if (err instanceof InstanceNotFoundError) {
+          console.log(`Agent service "${err.instanceName}" is not installed — nothing to stop.`);
+          return;
+        }
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }

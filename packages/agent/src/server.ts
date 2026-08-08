@@ -4,7 +4,7 @@
  * Startup sequence:
  * 1. Load config
  * 2. Create logger
- * 3. Create JobRunner with send/sendDirect callbacks
+ * 3. Create JobRunner with send callbacks
  * 4. Create OrchestratorClient with dispatch and cancel handlers
  * 5. Add WS log transport (if not scaler-managed)
  * 6. Connect OrchestratorClient
@@ -183,10 +183,9 @@ await guardStartup(logger, async () => {
   // We need a forward reference for the client since JobRunner and client reference each other.
   let client: OrchestratorClient;
 
-  // 4. Create JobRunner with send/sendDirect/upload callbacks wired to OrchestratorClient
+  // 4. Create JobRunner with send/upload callbacks wired to OrchestratorClient
   const jobRunner = new JobRunner({
     send: (msg) => client.send(msg),
-    sendDirect: (msg) => client.sendDirect(msg),
     config,
     requestUploadUrl: (jobId, cacheType, key) => client.requestUploadUrl(jobId, cacheType, key),
     sendUploadComplete: (jobId, cacheType, key) => client.sendUploadComplete(jobId, cacheType, key),
@@ -220,6 +219,8 @@ await guardStartup(logger, async () => {
     requestUserCache: (jobId, request) => client.requestUserCache(jobId, request),
     // Provenance: relay ctx.attestProvenance bundle uploads to orchestrator via WS
     relayProvenance: (jobId, request) => client.relayProvenance(jobId, request),
+    // User-facing artifacts: relay ctx.artifacts upload/download to orchestrator via WS
+    requestUserArtifact: (jobId, request) => client.requestUserArtifact(jobId, request),
     // Step-level approvals: relay an approval step's hold to the
     // orchestrator and await its resolution via WS.
     sendStepApproval: (runId, jobId, request) => client.sendStepApproval(runId, jobId, request),

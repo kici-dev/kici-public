@@ -136,9 +136,9 @@ async function runOneInit(
     }
     // Allocate fresh KICI_ENV/KICI_PATH files and point the shell env at them so
     // the command can export env + PATH additions to subsequent steps (P1).
-    // This MUST precede building the shell: buildSandboxShell snapshots
-    // process.env at construction time, so KICI_ENV/KICI_PATH have to be set
-    // before the snapshot or the command sees them as unbound (set -u).
+    // The shell reads live process.env at spawn, so KICI_ENV/KICI_PATH must be
+    // set before the command runs or it sees them as unbound (set -u); setting
+    // them here, before opts.shellFor, keeps that ordering explicit.
     await opts.env?.beginCapture();
     const $ = opts.shellFor(spec, index);
     // Run the user's command through the job's sandbox shell. The shell's cwd is

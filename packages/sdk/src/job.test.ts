@@ -710,3 +710,39 @@ describe('runsOn accepts RegExp and glob strings', () => {
     expect(j2.runsOn).toBe('kici:host:box-*');
   });
 });
+
+describe('job() sandbox escape hatch', () => {
+  it('stores a two-lever sandbox request on the job', () => {
+    const j = job('build', {
+      runsOn: 'linux',
+      container: 'node:20',
+      sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
+      run: async () => {},
+    });
+    expect(j.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
+  });
+
+  it('accepts a capability in either CAP_-prefixed or bare form', () => {
+    const j = job('build', {
+      runsOn: 'linux',
+      sandbox: { capabilities: ['CAP_NET_ADMIN'] },
+      run: async () => {},
+    });
+    expect(j.sandbox?.capabilities).toEqual(['CAP_NET_ADMIN']);
+  });
+
+  it('rejects an unknown capability at author time', () => {
+    expect(() =>
+      job('build', {
+        runsOn: 'linux',
+        sandbox: { capabilities: ['NOT_A_CAP'] },
+        run: async () => {},
+      }),
+    ).toThrow(/unknown Linux capability/i);
+  });
+
+  it('omits the sandbox key entirely when not requested', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    expect('sandbox' in j).toBe(false);
+  });
+});

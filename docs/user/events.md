@@ -330,11 +330,11 @@ export const deployComplete = defineEvent(
 );
 ```
 
-Then emit using the definition's name:
+Then emit using the definition — the payload is checked against the schema:
 
 ```typescript
 step('emit', async (ctx) => {
-  await ctx.emit(deployComplete.name, {
+  await ctx.emit(deployComplete, {
     env: 'prod',
     version: '1.2.3',
     services: ['api', 'web'],

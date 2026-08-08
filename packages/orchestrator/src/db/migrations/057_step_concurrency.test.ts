@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { randomUUID } from 'node:crypto';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './057_step_concurrency.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -39,10 +39,7 @@ describeDb('migration 057_step_concurrency', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -71,10 +68,12 @@ describeDb('migration 057_step_concurrency', () => {
   });
 
   it('inserts a parallel-child row through the typed columns', async () => {
-    const runId = `run-${Date.now()}`;
-    const jobId = `job-${Date.now()}`;
-    await sql`INSERT INTO public.execution_runs (run_id, workflow_name, provider, repo_identifier, status)
-      VALUES (${runId}, 'wf', 'github', 'org/repo', 'pending')`.execute(db);
+    const runId = randomUUID();
+    const jobId = randomUUID();
+    await sql`INSERT INTO public.execution_runs (run_id, workflow_name, provider, repo_identifier, ref, sha, status)
+      VALUES (${runId}, 'wf', 'github', 'org/repo', 'refs/heads/main', 'deadbeef', 'pending')`.execute(
+      db,
+    );
     await sql`INSERT INTO public.execution_steps
       (run_id, job_id, step_index, step_name, status, concurrency_kind, group_id)
       VALUES (${runId}, ${jobId}, 1, 'lint', 'cancelled', 'parallel-child', 'g0')`.execute(db);

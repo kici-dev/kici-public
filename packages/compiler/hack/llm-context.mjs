@@ -24,10 +24,17 @@ function docsUrl(slugPath, siteBaseUrl) {
 // repo-relative directory. docs/user/dashboard/ is dashboard UI-usage
 // documentation and docs/user/quickstart/ is install/deploy guidance — both
 // are user-facing but neither is workflow-authoring content, the audience of
-// these bundles. The deepened coverage check in hack/llm-context.test.ts
-// fails the build if a new docs/user path is neither bundled nor excluded
-// here, forcing an explicit decision about whether it belongs in a bundle.
-export const EXCLUDED_FROM_LLM_BUNDLE = new Set(['docs/user/dashboard/', 'docs/user/quickstart/']);
+// these bundles. docs/user/deprecations.md is the customer-facing deprecation
+// ledger (backward-compatibility policy), reference material rather than
+// workflow-authoring content, so it is excluded on the same grounds. The
+// deepened coverage check in hack/llm-context.test.ts fails the build if a new
+// docs/user path is neither bundled nor excluded here, forcing an explicit
+// decision about whether it belongs in a bundle.
+export const EXCLUDED_FROM_LLM_BUNDLE = new Set([
+  'docs/user/dashboard/',
+  'docs/user/quickstart/',
+  'docs/user/deprecations.md',
+]);
 
 // Per-task bundle size budget. A task bundle over this is a signal to split
 // the group — keeping each bundle small enough to drop into an LLM context
@@ -38,10 +45,19 @@ export const SCOPE_GROUPS = [
   {
     id: 'getting-started',
     label: 'Getting started',
-    purpose: 'Install the SDK, write your first workflow, compile and test locally',
+    purpose:
+      'Adopt KiCI: why it exists, how workflows execute, migrating from GitHub Actions, installing the SDK, and writing/compiling/testing your first workflow',
     dir: 'docs/user',
     recurse: false,
-    only: ['quickstart.md', 'getting-started.md', 'README.md', 'README-public.md'],
+    only: [
+      'quickstart.md',
+      'getting-started.md',
+      'migrating-from-github-actions.md',
+      'why-kici.md',
+      'execution-model.md',
+      'README.md',
+      'README-public.md',
+    ],
   },
   {
     id: 'patterns',
@@ -53,12 +69,37 @@ export const SCOPE_GROUPS = [
   },
   {
     id: 'sdk',
-    label: 'SDK reference',
+    label: 'SDK reference: core',
     purpose:
-      'Authoring API: workflow/job/step factories, triggers, rules, matrix, runtime, caching',
+      'Core authoring API: workflow/job/step factories, triggers, rules, matrix, dynamic jobs, cross-job outputs',
     dir: 'docs/user/sdk',
-    recurse: true,
+    recurse: false,
+    only: [
+      'core.md',
+      'triggers.md',
+      'rules-matrix-dynamic.md',
+      'validation-events.md',
+      'parallel.md',
+    ],
     extras: [{ dir: 'docs/user', only: ['sdk-reference.md'] }],
+  },
+  {
+    id: 'sdk-runtime',
+    label: 'SDK reference: runtime and advanced',
+    purpose:
+      'Runtime and advanced authoring: step runtime context, event payloads, host fan-out, idempotent steps, caching, artifacts, waiting',
+    dir: 'docs/user/sdk',
+    recurse: false,
+    only: [
+      'runtime.md',
+      'event-payloads.md',
+      'runs-on-all.md',
+      'idempotent.md',
+      'caching.md',
+      'artifacts.md',
+      'temp-directories.md',
+      'wait-for.md',
+    ],
   },
   {
     id: 'cli',
@@ -71,10 +112,16 @@ export const SCOPE_GROUPS = [
       'cli-auth.md',
       'ai-agents.md',
       'testing-guide.md',
+      'common-failures.md',
       'hooks.md',
       'lock-file-and-drift.md',
       'workflow-patterns.md',
     ],
+    // The full kici command reference lives in the co-located child pages under
+    // docs/user/cli/ (cli-reference.md is their thin index). Bundle every child
+    // so the CLI task bundle carries the command reference an authoring agent
+    // needs, and so the docs/user coverage check stays satisfied.
+    extras: [{ dir: 'docs/user/cli' }],
   },
   {
     id: 'features',

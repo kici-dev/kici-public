@@ -57,26 +57,41 @@ export const TRUSTED_ROUTING_LABEL = 'self-hosted';
 export const IN_PLACE_ROUTING_LABEL = 'in-place';
 
 /**
- * Write the plane's bare-metal scaler YAML and return its path. One scaler with
- * two coexisting label sets spawning the agent wrapper against the plane
- * orchestrator's localhost WS endpoint:
+ * Write the plane's bare-metal scaler YAML and return its path. TWO coexisting
+ * bare-metal scalers spawn the agent wrapper against the plane orchestrator's
+ * localhost WS endpoint — a **sandboxed** pool and a `self-hosted`-**tainted**
+ * TRUSTED pool:
  *
- * - `default` — the sandboxed / credential-isolated profile a normal
- *   `kici run --local` dispatch (jobs with `runsOn: ['default']` or none) lands
- *   on. Smallest-set-wins routing keeps default runs here.
- * - `default` + `self-hosted` — the TRUSTED fleet profile (`KICI_TRUSTED_ENV=true`,
- *   bwrap off) a `kici run --local --trusted` run (or a `runsOn: self-hosted`
- *   workflow) lands on: steps run with the ambient host env passed through,
- *   minus the agent's own KiCI identity secrets.
- * - `default` + `self-hosted` + `in-place` — the TRUSTED **in-place** profile
- *   (adds `KICI_IN_PLACE=true`) a `kici run --local --trusted --in-place` run
- *   lands on: same trusted env, but the agent uses the operator's real working
- *   tree directly (no clone) — the profile KiCI's own routed `deploy:stg` uses.
+ * - `kici-local-bare-metal` (sandboxed) — one `default` label set, no taint. The
+ *   credential-isolated profile a normal `kici run --local` dispatch (jobs with
+ *   `runsOn: ['default']` or none) lands on. Its agents inherit no
+ *   `mandatoryLabels`, so a bare `default` job routes here.
+ * - `kici-local-bare-metal-trusted` (TRUSTED) — carries `mandatoryLabels:
+ *   ['self-hosted']`, so ONLY a job that explicitly requests `self-hosted`
+ *   (i.e. a `kici run --local --trusted` run, whose lock patch appends the
+ *   `self-hosted` routing label, or a `runsOn: self-hosted` workflow) is ever
+ *   routed to it — at BOTH the scaler spawn matcher AND the orchestrator's
+ *   agent-registry dispatch gate. Two label sets:
+ *     - `default` + `self-hosted` — the trusted fleet profile
+ *       (`KICI_TRUSTED_ENV=true`, bwrap off): steps run with the ambient host
+ *       env passed through, minus the agent's own KiCI identity secrets.
+ *     - `default` + `self-hosted` + `in-place` — the trusted **in-place**
+ *       profile (adds `KICI_IN_PLACE=true`) a `kici run --local --trusted
+ *       --in-place` run lands on: same trusted env, but the agent uses the
+ *       operator's real working tree directly (no clone) — the profile KiCI's
+ *       own routed `deploy:stg` uses.
+ *
+ * The `self-hosted` taint is the isolation guarantee: without it, an idle
+ * trusted agent (spawned for an earlier `--trusted` run and lingering for
+ * follow-up jobs) would satisfy the agent-registry's subset match for a plain
+ * `default` job and leak the ambient host env into a sandboxed run. The taint
+ * closes that at the dispatch layer, not just the spawn heuristic.
  */
 export function writeScalerConfig(orchestratorPort: number): string {
   const { scalerConfigFile, root } = planePaths();
   fs.mkdirSync(root, { recursive: true });
   const binaryPath = writeAgentWrapper();
+  const orchestratorUrl = `ws://127.0.0.1:${orchestratorPort}/ws`;
   const yaml = stringifyYaml({
     version: 1,
     scalers: [
@@ -84,9 +99,19 @@ export function writeScalerConfig(orchestratorPort: number): string {
         name: 'kici-local-bare-metal',
         type: 'bare-metal',
         maxAgents: 10,
-        orchestratorUrl: `ws://127.0.0.1:${orchestratorPort}/ws`,
+        orchestratorUrl,
+        labelSets: [{ labels: ['default'], binaryPath }],
+      },
+      {
+        name: 'kici-local-bare-metal-trusted',
+        type: 'bare-metal',
+        maxAgents: 10,
+        orchestratorUrl,
+        // Taint: only jobs whose runsOn includes `self-hosted` may spawn on or
+        // dispatch to this pool. Keeps a bare `default` run off every trusted
+        // agent (default-off host-env passthrough is enforced by routing).
+        mandatoryLabels: [TRUSTED_ROUTING_LABEL],
         labelSets: [
-          { labels: ['default'], binaryPath },
           {
             labels: ['default', TRUSTED_ROUTING_LABEL],
             binaryPath,

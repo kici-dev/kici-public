@@ -1,14 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m026 from './026_event_log_lockfile_corrupt.js';
 
 /**
  * Real-Postgres test for migration 026.
  *
- * Creates a uniquely-named throwaway database, runs every migration up to 026
+ * Creates a uniquely-named throwaway database, applies migrations 001..026
  * via the production migration provider, and asserts that the event_log status
  * CHECK constraint accepts 'lockfile_corrupt' (and still rejects garbage). The
  * throwaway database is dropped in teardown.
@@ -71,8 +70,7 @@ describeDb('migration 026_event_log_lockfile_corrupt', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

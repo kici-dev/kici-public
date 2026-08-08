@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   materializeFanout,
+  materializeResolvedMatrix,
   materializeResolvedHosts,
   hostEnvelopeFields,
   matrixEnvelopeFields,
@@ -126,6 +127,58 @@ describe('materializeFanout', () => {
     const { jobs } = materializeFanout([job]);
     expect(jobs[0].lockJob).toBe(job);
     expect(jobs[1].lockJob).toBe(job);
+  });
+});
+
+describe('matrix input guards (static path)', () => {
+  it('rejects an oversized product before materializing it', () => {
+    const big = Array.from({ length: 1000 }, (_, i) => `v${i}`);
+    const lockJob = base({ matrix: { _type: 'static', values: { a: big, b: big, c: big } } });
+    // If the guard were missing this would allocate 1e9 tuples, not throw.
+    expect(() => materializeFanout([lockJob])).toThrow(FanoutError);
+    expect(() => materializeFanout([lockJob])).toThrow(/too large to expand/);
+  });
+
+  it('still allows a product above the fan-out cap that excludes back under it', () => {
+    // 300 raw combinations, excluded down to 200 — succeeds today and must keep
+    // succeeding. This is the regression guard for the two-threshold split.
+    const twenty = Array.from({ length: 20 }, (_, i) => `a${i}`);
+    const fifteen = Array.from({ length: 15 }, (_, i) => `b${i}`);
+    const lockJob = base({
+      matrix: { _type: 'static', values: { a: twenty, b: fifteen } },
+      exclude: fifteen.slice(0, 5).map((b) => ({ b })),
+    });
+    const result = materializeFanout([lockJob]);
+    expect(result.jobs).toHaveLength(200);
+  });
+
+  it('rewraps a malformed matrix as a FanoutError naming the job', () => {
+    const lockJob = base({ matrix: { _type: 'static', values: 'linux' as never } });
+    expect(() => materializeFanout([lockJob])).toThrow(FanoutError);
+    expect(() => materializeFanout([lockJob])).toThrow(/one dimension per character/);
+    expect(() => materializeFanout([lockJob])).toThrow(/job 'test'/);
+  });
+
+  it('rejects a duplicate combination', () => {
+    const lockJob = base({ matrix: { _type: 'static', values: ['a', 'a'] } });
+    expect(() => materializeFanout([lockJob])).toThrow(FanoutError);
+    expect(() => materializeFanout([lockJob])).toThrow(/duplicate combination/);
+    expect(() => materializeFanout([lockJob])).toThrow(/test \(a\)/);
+  });
+});
+
+describe('matrix input guards (resolved dynamic path)', () => {
+  it('rejects duplicate resolved combinations', () => {
+    const lockJob = base({});
+    expect(() =>
+      materializeResolvedMatrix(lockJob, [{ value: 'linux' }, { value: 'linux' }]),
+    ).toThrow(/duplicate combination/);
+  });
+
+  it('accepts distinct resolved combinations', () => {
+    const lockJob = base({});
+    const result = materializeResolvedMatrix(lockJob, [{ value: 'a' }, { value: 'b' }]);
+    expect(result.jobs).toHaveLength(2);
   });
 });
 

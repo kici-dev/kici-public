@@ -15,17 +15,24 @@ Install the `kici-admin` CLI first — it drives orchestrator install and lifecy
 npm install -g kici-admin
 ```
 
-Then run the wizard and start the orchestrator:
+Then install and start the orchestrator. On an interactive terminal, `install` runs
+the setup wizard by default:
 
 ```bash
-# 1. Run the interactive wizard (collects mode, DB, Platform credentials + optional source)
-kici-admin orchestrator install --wizard
+# 1. Install (runs the interactive wizard on a TTY; collects mode, DB, Platform
+#    credentials + optional source). Pass --wizard to force it, or --no-wizard to
+#    skip it and write a stub env file you edit by hand.
+kici-admin orchestrator install
 
 # 2. Start the orchestrator
 kici-admin orchestrator start
 ```
 
-The wizard handles everything: database connection, encryption key generation, Platform credentials, and optionally adding your first GitHub App source.
+The wizard handles everything: database connection, encryption key generation, Platform credentials, and optionally collecting your first GitHub App source. Sources are added at runtime against a running orchestrator, so if you configure one, the wizard prints a ready-to-run `kici-admin source add github ...` command in its "Next steps" to run once the orchestrator is started -- it does not write the source into the env file.
+
+In a non-interactive shell (CI, a provisioning script), `install` writes a stub env
+file enumerating the required keys with generation commands, then you edit it and run
+`start`. Pass `--env-file <path>` to install from an existing config file.
 
 ## Manual setup
 
@@ -109,6 +116,15 @@ All secret parameters support multiple input methods:
 
 The `@file` syntax reads the file contents at the given path. This is the recommended approach for private keys.
 
+The webhook secret has its own stdin form: pass `--webhook-secret -` to read it from standard input, keeping it out of shell history:
+
+```bash
+printf %s "$WEBHOOK_SECRET" | kici-admin source add github \
+  --name main-org --app-id 12345 --private-key @/path/to/app.pem --webhook-secret -
+```
+
+`--webhook-secret -` cannot be combined with `--stdin` (which reads the private key from stdin) -- only one value can come from standard input. Use `@file` or `--from-env` for the other.
+
 ### Adding a generic webhook source
 
 Generic sources accept HTTP webhooks from any external service. They support multiple verification methods and configurable event extraction.
@@ -177,7 +193,7 @@ Adding, updating, or removing a source via `kici-admin source` triggers a Postgr
 
 | Variable                     | Description                                                        | Default                      |
 | ---------------------------- | ------------------------------------------------------------------ | ---------------------------- |
-| `KICI_MODE`                  | Operating mode: `platform`, `hybrid`, `independent`                | `platform`                   |
+| `KICI_MODE`                  | Operating mode: `platform`, `hybrid`, `observed`, `independent`    | `platform`                   |
 | `KICI_DATABASE_URL`          | PostgreSQL connection string                                       | Required                     |
 | `KICI_SECRET_KEY`            | 32-byte encryption key for secrets (64-char hex or base64-encoded) | Required                     |
 | `KICI_AUTO_MIGRATE`          | Auto-run DB migrations on startup                                  | `true`                       |
@@ -186,6 +202,10 @@ Adding, updating, or removing a source via `kici-admin source` triggers a Postgr
 | `KICI_PLATFORM_TOKEN`        | Platform authentication token (API key)                            | Required for platform/hybrid |
 | `KICI_PORT`                  | HTTP listen port                                                   | `4000`                       |
 
-### Provenance ID-token relay
+### Provenance ID-token minting
 
-When a workflow step requests a build-provenance ID token (`ctx.kici.oidc.token()`), the agent relays the request to the orchestrator, which mints the token by calling the Platform using its own `KICI_PLATFORM_TOKEN`. The orchestrator only mints a token for a job the requesting agent is actually running, and the agent never holds Platform credentials. This relay is active in `platform` and `hybrid` modes; in `independent` mode (no `KICI_PLATFORM_URL` / `KICI_PLATFORM_TOKEN`) the token request returns an error because there is no Platform to mint against.
+When a workflow step requests a build-provenance ID token (`ctx.kici.oidc.token()`), the agent relays the request to the orchestrator, which mints the token for it. The orchestrator only mints a token for a job the requesting agent is actually running, derives every identity claim from its own run records (a step cannot forge them), and the agent never holds signing credentials. Which minter serves the request:
+
+- **Orchestrator-owned signing (recommended, all modes including `independent`):** with `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` and a provisioned signing key (see [signing keys](signing-keys.md)), the orchestrator mints and signs the token locally under its own issuer — no Platform involvement. This always wins when configured, even in `platform`/`hybrid` modes.
+- **Platform relay (deprecated fallback, `platform`/`hybrid` only):** with no signing key configured, the orchestrator relays the mint to the hosted Platform using its `KICI_PLATFORM_TOKEN`. Existing Platform-signed bundles keep verifying forever.
+- **No minter:** an `independent` orchestrator with no signing key configured returns an error for token requests (outside the [local dev plane](local-dev-plane.md), which dev-signs under the `kici-local` issuer).

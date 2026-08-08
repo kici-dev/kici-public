@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminRoutes, type AdminRouteDeps } from './admin.js';
 import type { Role } from '../secrets/rbac.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
-import { SecretScopeNotFoundError } from '../secrets/pg-secret-store.js';
+import { SecretScopeExistsError, SecretScopeNotFoundError } from '../secrets/pg-secret-store.js';
 
 /**
  * Create mock admin route dependencies.
@@ -238,6 +238,21 @@ describe('admin routes', () => {
       expect(await res.json()).toEqual({ error: "Secret scope 'does-not-exist' not found" });
     });
 
+    it('returns 409 (not 500) when the destination scope is already occupied', async () => {
+      // The store refuses the merge; the route must surface it as a conflict
+      // the operator can fix by choosing a free name, not a server fault.
+      (deps.secretStore.renameScope as any).mockRejectedValue(
+        new SecretScopeExistsError('aws/staging'),
+      );
+
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'aws/prod', newScope: 'aws/staging' },
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: "Secret scope 'aws/staging' already exists" });
+    });
+
     it('returns 400 when the request body is malformed (missing newScope)', async () => {
       const res = await request(app, 'PUT', '/secrets/scopes/rename', {
         token: validToken,
@@ -245,6 +260,295 @@ describe('admin routes', () => {
       });
       expect(res.status).toBe(400);
       expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Scope-name validation ─────────────────────────────────────
+  describe('scope-name validation', () => {
+    it('POST /secrets/scopes rejects an empty-path-segment scope with 400', async () => {
+      const res = await request(app, 'POST', '/secrets/scopes', {
+        token: validToken,
+        body: { orgId: 'org-1', scope: 'a//b' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.createScope).not.toHaveBeenCalled();
+    });
+
+    it('POST /secrets/scopes rejects a percent-containing scope with 400', async () => {
+      const res = await request(app, 'POST', '/secrets/scopes', {
+        token: validToken,
+        body: { orgId: 'org-1', scope: 'a%b' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.createScope).not.toHaveBeenCalled();
+    });
+
+    it('PUT /secrets/scopes/rename rejects a malformed newScope with 400', async () => {
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'good', newScope: 'bad%name' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+    });
+
+    it('PUT /secrets/scopes/rename allows a malformed oldScope with a valid newScope', async () => {
+      (deps.secretStore.renameScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'bad%name', newScope: 'good/name' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.renameScope).toHaveBeenCalledWith('org-1', 'bad%name', 'good/name');
+    });
+
+    it('PUT /secrets/:orgId/:scope/:key rejects a malformed scope with 400', async () => {
+      // 'a%25b' decodes to the literal scope 'a%b' at the handler.
+      const res = await request(app, 'PUT', '/secrets/org-1/a%25b/KEY', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Backend-qualified scopes ──────────────────────────────────
+  describe('backend-qualified scopes', () => {
+    it('PUT /secrets accepts a pg: qualifier and stores the BARE path', async () => {
+      (deps.secretStore.setSecret as any).mockResolvedValue(undefined);
+      const res = await request(app, 'PUT', '/secrets/org-1/pg%3Aaws%2Fprod/DB_PASSWORD', {
+        token: validToken,
+        body: { value: 'secret' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.setSecret).toHaveBeenCalledWith(
+        'org-1',
+        'aws/prod',
+        'DB_PASSWORD',
+        'secret',
+      );
+    });
+
+    it('PUT /secrets audits the scope in QUALIFIED wire form', async () => {
+      (deps.secretStore.setSecret as any).mockResolvedValue(undefined);
+      await request(app, 'PUT', '/secrets/org-1/pg%3Aaws%2Fprod/DB_PASSWORD', {
+        token: validToken,
+        body: { value: 'secret' },
+      });
+      expect(deps.auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'setSecret', contextName: 'pg:aws/prod' }),
+      );
+    });
+
+    it('DELETE /secrets strips the qualifier and audits the wire form', async () => {
+      (deps.secretStore.deleteSecret as any).mockResolvedValue(undefined);
+      const res = await request(app, 'DELETE', '/secrets/org-1/pg%3Aaws%2Fprod/DB_PASSWORD', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.deleteSecret).toHaveBeenCalledWith(
+        'org-1',
+        'aws/prod',
+        'DB_PASSWORD',
+      );
+      expect(deps.auditLogger.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'deleteSecret', contextName: 'pg:aws/prod' }),
+      );
+    });
+
+    it('POST /secrets/scopes creates the bare path for a qualified scope', async () => {
+      (deps.secretStore.createScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'POST', '/secrets/scopes', {
+        token: validToken,
+        body: { orgId: 'org-1', scope: 'pg:aws/prod' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.createScope).toHaveBeenCalledWith('org-1', 'aws/prod');
+    });
+
+    it('GET /secrets/keys strips the qualifier before listing', async () => {
+      (deps.secretStore.listKeys as any).mockResolvedValue(['DB_HOST']);
+      const res = await request(app, 'GET', '/secrets/keys?orgId=org-1&scope=pg%3Aaws%2Fprod', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.listKeys).toHaveBeenCalledWith('org-1', 'aws/prod');
+    });
+
+    it('DELETE /secrets/scopes/:orgId/:scope strips the qualifier', async () => {
+      (deps.secretStore.deleteScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'DELETE', '/secrets/scopes/org-1/pg%3Aaws%2Fprod', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.deleteScope).toHaveBeenCalledWith('org-1', 'aws/prod');
+    });
+
+    it('rename strips the qualifier on both sides', async () => {
+      (deps.secretStore.renameScope as any).mockResolvedValue(undefined);
+      const res = await request(app, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'pg:old', newScope: 'pg:new' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.renameScope).toHaveBeenCalledWith('org-1', 'old', 'new');
+    });
+
+    it('rename rejects a cross-backend move with 400 and touches no store', async () => {
+      const vaultStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+        renameScope: vi.fn(),
+      };
+      const crossDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
+        } as any,
+      });
+      (crossDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      const crossApp = createAdminRoutes(crossDeps);
+      const res = await request(crossApp, 'PUT', '/secrets/scopes/rename', {
+        token: validToken,
+        body: { orgId: 'org-1', oldScope: 'pg:old', newScope: 'vault:new' },
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: expect.stringContaining('across backends') });
+      expect(crossDeps.secretStore.renameScope).not.toHaveBeenCalled();
+      expect(vaultStore.renameScope).not.toHaveBeenCalled();
+    });
+
+    it('routes a registered non-pg qualifier to that backend store', async () => {
+      const vaultStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn().mockResolvedValue(undefined),
+        deleteSecret: vi.fn(),
+      };
+      const multiDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
+        } as any,
+      });
+      (multiDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      const multiApp = createAdminRoutes(multiDeps);
+      const res = await request(multiApp, 'PUT', '/secrets/org-1/vault%3Aaws%2Fprod/K', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(200);
+      expect(vaultStore.setSecret).toHaveBeenCalledWith('org-1', 'aws/prod', 'K', 'v');
+      expect(multiDeps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+
+    it('routes pg: to the CONFIGURED store, never the registry-built one', async () => {
+      // The registry synthesizes its own PgSecretStore for the default `pg`
+      // row — one with customerSecretsEnabled defaulted to true, key version
+      // hardcoded to 1, and no old-master-key fallback. Routing `pg:<path>`
+      // there would bypass the operator's pgCustomerSecrets toggle and make
+      // `pg:x` behave differently from `x`.
+      const registryPgStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+      };
+      const shadowedDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockResolvedValue(new Map([['pg', registryPgStore]])),
+        } as any,
+      });
+      (shadowedDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      (shadowedDeps.secretStore.setSecret as any).mockResolvedValue(undefined);
+      const shadowedApp = createAdminRoutes(shadowedDeps);
+      const res = await request(shadowedApp, 'PUT', '/secrets/org-1/pg%3Aaws/K', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(200);
+      expect(shadowedDeps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'aws', 'K', 'v');
+      expect(registryPgStore.setSecret).not.toHaveBeenCalled();
+    });
+
+    it('keys an UNREGISTERED head whole so routing keys stay 400-rejected', async () => {
+      const res = await request(app, 'PUT', '/secrets/org-1/github%3A42/K', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+
+    it('fails closed with a 5xx when the backend registry throws', async () => {
+      const brokenDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockRejectedValue(new Error('registry down')),
+        } as any,
+      });
+      (brokenDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      const brokenApp = createAdminRoutes(brokenDeps);
+      const res = await request(brokenApp, 'PUT', '/secrets/org-1/pg%3Aaws/K', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(500);
+      expect(brokenDeps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Cross-backend scope listing ───────────────────────────────
+  describe('GET /secrets/scopes ?allBackends', () => {
+    it('defaults to the bare pg-only listing (byte-identical to before)', async () => {
+      (deps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
+      const res = await request(app, 'GET', '/secrets/scopes?orgId=org-1', { token: validToken });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ scopes: ['aws/prod'] });
+    });
+
+    it('qualifies every scope when allBackends=true', async () => {
+      const vaultStore = {
+        listScopes: vi.fn().mockResolvedValue(['aws/staging']),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+      };
+      const multiDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
+        } as any,
+      });
+      (multiDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      (multiDeps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
+      const multiApp = createAdminRoutes(multiDeps);
+      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1&allBackends=true', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ scopes: ['pg:aws/prod', 'vault:aws/staging'] });
+    });
+
+    it('skips an unreachable backend instead of failing the whole listing', async () => {
+      const vaultStore = {
+        listScopes: vi.fn().mockRejectedValue(new Error('vault unreachable')),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+      };
+      const multiDeps = createMockDeps({
+        backendRegistry: {
+          loadAllStores: vi.fn().mockResolvedValue(new Map([['vault', vaultStore]])),
+        } as any,
+      });
+      (multiDeps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'admin' });
+      (multiDeps.secretStore.listScopes as any).mockResolvedValue(['aws/prod']);
+      const multiApp = createAdminRoutes(multiDeps);
+      const res = await request(multiApp, 'GET', '/secrets/scopes?orgId=org-1&allBackends=true', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ scopes: ['pg:aws/prod'] });
     });
   });
 
@@ -646,6 +950,37 @@ describe('admin routes', () => {
       expect(body.reEncrypted).toBe(5);
     });
 
+    it('sweeps secret backend configs and surfaces the counters in body + audit', async () => {
+      const backendRegistry = {
+        rotateKey: vi.fn().mockResolvedValue({ reEncrypted: 3, skipped: 1 }),
+      };
+      const sharedStore = { rotateKey: vi.fn().mockResolvedValue({ reEncrypted: 2, skipped: 0 }) };
+      const localDeps = createMockDeps({
+        backendRegistry: backendRegistry as any,
+        sharedStore: sharedStore as any,
+      });
+      (localDeps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey: null,
+        label: 'test',
+      });
+      (localDeps.secretStore.rotateKey as any).mockResolvedValue({ reEncrypted: 5 });
+      const localApp = createAdminRoutes(localDeps);
+
+      const res = await request(localApp, 'POST', '/rotate-key', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.reEncryptedBackends).toBe(3);
+      expect(body.skippedBackends).toBe(1);
+      expect(backendRegistry.rotateKey).toHaveBeenCalledTimes(1);
+
+      // Audit metadata carries the same two fields.
+      const auditCall = (localDeps.auditLogger.log as any).mock.calls[0][0];
+      expect(auditCall.metadata.reEncryptedBackends).toBe(3);
+      expect(auditCall.metadata.skippedBackends).toBe(1);
+    });
+
     it('admin cannot rotate keys', async () => {
       (deps.tokenManager.validate as any).mockResolvedValue({
         id: 'user-1',
@@ -761,5 +1096,69 @@ describe('admin routes', () => {
       expect(res.status).toBe(403); // requireUnscopedToken denies scoped tokens
       expect(retryAttestations).not.toHaveBeenCalled();
     });
+  });
+
+  // A scope is a single already-decoded Hono path param. The handler must NOT
+  // decode it a second time — a second decode throws a URIError (500) when the
+  // literal scope carries a stray `%`. `validateScopeName` restricts scope
+  // segments to [A-Za-z0-9_.-], so a `%`-bearing scope can never be created;
+  // the fix here turns a 500 on client-controlled input into a clean structured
+  // response, and is not an exploitable wrong-scope mutation for valid scopes.
+  // The sibling PUT /secrets/:orgId/:scope/:key route already reads the param
+  // plain — that is the shape this route now matches.
+  describe('scope path param is decoded exactly once (no double-decode)', () => {
+    it('DELETE scope forwards a literal-% scope verbatim (was a 500)', async () => {
+      // URL segment `100%25done` decodes (once, by Hono) to the literal `100%done`.
+      const res = await request(app, 'DELETE', '/secrets/scopes/org-1/100%25done', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.deleteScope).toHaveBeenCalledWith('org-1', '100%done');
+    });
+
+    it('does not collapse a %NN-looking scope onto a different scope', async () => {
+      // URL `a%2520b` → Hono decodes ONCE → `a%20b` (a five-char scope). A
+      // second decode would wrongly yield `a b` and target a different scope.
+      const res = await request(app, 'DELETE', '/secrets/scopes/org-1/a%2520b', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.deleteScope).toHaveBeenCalledWith('org-1', 'a%20b');
+      expect(deps.secretStore.deleteScope).not.toHaveBeenCalledWith('org-1', 'a b');
+    });
+  });
+});
+
+describe('trust-policy mount requires an audit sink', () => {
+  const validToken = 'test-token-abc123';
+
+  function withDeps(overrides: Partial<AdminRouteDeps>) {
+    const deps = createMockDeps({ db: {} as never, mode: 'independent', ...overrides });
+    (deps.tokenManager.validate as any).mockResolvedValue({
+      id: 'user-1',
+      role: 'owner' as Role,
+      routingKey: null,
+      label: 'test',
+    });
+    return createAdminRoutes(deps);
+  }
+
+  it('mounts the route when an access log is wired', async () => {
+    // Positive control: without this, the negative below would also pass if the
+    // route had simply been deleted or renamed.
+    const app = withDeps({ accessLog: { recordInTransaction: vi.fn() } as never });
+    const res = await request(app, 'GET', '/trust-policy', { token: validToken });
+    expect(res.status).not.toBe(404);
+  });
+
+  it('does not mount the route without one', async () => {
+    // The route guarantees a trust-policy write is always attributable. An
+    // orchestrator assembled with no access log gets NO trust-policy route
+    // rather than one that would accept an unauditable write.
+    const app = withDeps({ accessLog: undefined });
+    const res = await request(app, 'GET', '/trust-policy', { token: validToken });
+    expect(res.status).toBe(404);
   });
 });

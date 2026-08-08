@@ -91,6 +91,16 @@ export interface HostApi {
 
 // --- Bootstrap API ---
 
+/** Version-convergence status for a fleet host (the availability-gate probe). */
+export interface AgentVersionStatus {
+  /** The orchestrator's own version — the convergence target. */
+  targetVersion: string;
+  /** The version last staged onto the host, or null when never staged. */
+  stagedVersion: string | null;
+  /** True only when the target's payload objects exist for the host's platform. */
+  available: boolean;
+}
+
 export interface BootstrapApi {
   /**
    * Bring up a temporary privileged init-runner on a declared-but-un-agented
@@ -122,6 +132,25 @@ export interface BootstrapApi {
     targetAgentId: string,
     opts: { inputSecret: string; port?: number; command?: string },
   ): Promise<void>;
+
+  /**
+   * Read a fleet host's agent-version convergence status: the orchestrator's
+   * target version, the version last staged on the host, and whether the
+   * target's self-contained payloads are available for the host's platform. The
+   * availability-gate probe the `agentVersionConverge()` check-step calls; a
+   * `false` `available` means the convergence HOLDS the host (never a skew).
+   */
+  agentVersionStatus(targetAgentId: string): Promise<AgentVersionStatus>;
+
+  /**
+   * Re-stage a fleet host onto the orchestrator's version and restart its agent,
+   * driven by THIS (ops) agent as an external actor over SSH — no
+   * self-update-handoff. Availability-gated server-side: refuses when the target
+   * version's payloads are unavailable. Returns `{ restaged: false }` when the
+   * host is already on the target version. The step calling this must run on an
+   * agent holding `kici:capability:ssh-transport`.
+   */
+  restageAgent(targetAgentId: string): Promise<{ restaged: boolean }>;
 }
 
 // --- Top-level KiCI API ---
@@ -204,6 +233,13 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
         transport('kici.ensureInitRunner', { targetAgentId }) as Promise<{ broughtUp: boolean }>,
       preBootSend: (targetAgentId, opts) =>
         transport('kici.preBootSend', { targetAgentId, ...opts }) as Promise<void>,
+      // A pure read (no SSH) — relayed straight to the orchestrator.
+      agentVersionStatus: (targetAgentId) =>
+        transport('kici.agentVersionStatus', { targetAgentId }) as Promise<AgentVersionStatus>,
+      // Intercepted in the agent process (external-actor SSH re-stage); the
+      // orchestrator's privileged resolve is availability-gated + audited.
+      restageAgent: (targetAgentId) =>
+        transport('kici.restageAgent', { targetAgentId }) as Promise<{ restaged: boolean }>,
     },
   };
 }

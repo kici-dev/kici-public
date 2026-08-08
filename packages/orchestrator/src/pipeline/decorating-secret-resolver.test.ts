@@ -55,4 +55,22 @@ describe('DecoratingSecretResolver', () => {
     expect(await r.resolveNamed('org', 'scope', 'key')).toBe('named');
     expect(base.resolveNamed).toHaveBeenCalledWith('org', 'scope', 'key', undefined);
   });
+
+  it('forwards hostCtx to the base resolveForJob (per-host fan-out scoping, not fleet-wide)', async () => {
+    const base = baseResolver({ A: 'env' });
+    const r = new DecoratingSecretResolver(base, { flat: {}, contexts: {} });
+    const hostCtx = { agentId: 'agent-01', host: 'runner-eu', labels: ['region=eu'] };
+    await r.resolveForJob('org', 'prod', hostCtx);
+    // The wrapped resolver must receive the host context — dropping it would
+    // silently degrade per-host resolution to fleet-wide.
+    expect(base.resolveForJob).toHaveBeenCalledWith('org', 'prod', hostCtx);
+  });
+
+  it('forwards hostCtx to the base resolveForJobWithMeta', async () => {
+    const base = baseResolver({});
+    const r = new DecoratingSecretResolver(base, { flat: {}, contexts: {} });
+    const hostCtx = { agentId: 'agent-02', host: 'runner-us', labels: [] };
+    await r.resolveForJobWithMeta('org', 'staging', hostCtx);
+    expect(base.resolveForJobWithMeta).toHaveBeenCalledWith('org', 'staging', hostCtx);
+  });
 });

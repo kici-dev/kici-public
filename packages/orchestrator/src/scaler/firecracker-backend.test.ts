@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { LabelSetConfig } from './types.js';
 import type { IpAllocationResult } from './ip-allocator.js';
+import type { BridgeHealth } from '../firecracker/host-network.js';
 
 // ── Mocks ────────────────────────────────────────────────────────
 
@@ -519,8 +520,7 @@ describe('FirecrackerScalerBackend', () => {
 
     function getMmdsKiciEnv(): Record<string, string> | undefined {
       const call = mockPutMmds.mock.calls[0]?.[0] as
-        | { latest: { 'meta-data': Record<string, unknown> } }
-        | undefined;
+        { latest: { 'meta-data': Record<string, unknown> } } | undefined;
       return call?.latest['meta-data']['kici-env'] as Record<string, string> | undefined;
     }
 
@@ -1555,6 +1555,83 @@ describe('FirecrackerScalerBackend', () => {
       expect(backend.getSocketPath('test')).toBe(
         '/custom/jailer/firecracker/test/root/run/firecracker.socket',
       );
+    });
+  });
+
+  describe('ensureHostReady', () => {
+    const healthy: BridgeHealth = {
+      bridgeName: 'kici-br0',
+      bridgeExists: true,
+      bridgeUp: true,
+      addrPresent: true,
+      tablePresent: true,
+      healthy: true,
+      detail: 'healthy',
+    };
+    const unhealthy: BridgeHealth = {
+      ...healthy,
+      healthy: false,
+      tablePresent: false,
+      detail: 'nft table missing',
+    };
+
+    it('is a no-op when autoProvisionHost is false', async () => {
+      const verifyBridgeFn = vi.fn(async () => unhealthy);
+      const provisionBridgeFn = vi.fn(async () => {});
+      const { backend } = createBackend({
+        autoProvisionHost: false,
+        verifyBridgeFn,
+        provisionBridgeFn,
+      });
+      await backend.ensureHostReady();
+      expect(verifyBridgeFn).not.toHaveBeenCalled();
+      expect(provisionBridgeFn).not.toHaveBeenCalled();
+    });
+
+    it('does not provision when the bridge is already healthy', async () => {
+      const verifyBridgeFn = vi.fn(async () => healthy);
+      const provisionBridgeFn = vi.fn(async () => {});
+      const { backend } = createBackend({
+        autoProvisionHost: true,
+        verifyBridgeFn,
+        provisionBridgeFn,
+      });
+      await backend.ensureHostReady();
+      expect(verifyBridgeFn).toHaveBeenCalledOnce();
+      expect(provisionBridgeFn).not.toHaveBeenCalled();
+    });
+
+    it('provisions with the bridge config + requireSudo when unhealthy', async () => {
+      const verifyBridgeFn = vi.fn(async () => unhealthy);
+      const provisionBridgeFn = vi.fn(async () => {});
+      const { backend } = createBackend({
+        autoProvisionHost: true,
+        requireSudo: true,
+        verifyBridgeFn,
+        provisionBridgeFn,
+      });
+      await backend.ensureHostReady();
+      expect(provisionBridgeFn).toHaveBeenCalledOnce();
+      const [cfg, opts] = provisionBridgeFn.mock.calls[0];
+      expect(cfg).toMatchObject({
+        bridgeName: 'kici-br0',
+        bridgeCidr: '10.0.0.1/24',
+        table: 'kici',
+      });
+      expect(opts).toMatchObject({ requireSudo: true });
+    });
+
+    it('propagates a provision failure (manager decides degraded)', async () => {
+      const verifyBridgeFn = vi.fn(async () => unhealthy);
+      const provisionBridgeFn = vi.fn(async () => {
+        throw new Error('sudo: a password is required');
+      });
+      const { backend } = createBackend({
+        autoProvisionHost: true,
+        verifyBridgeFn,
+        provisionBridgeFn,
+      });
+      await expect(backend.ensureHostReady()).rejects.toThrow(/password is required/);
     });
   });
 });

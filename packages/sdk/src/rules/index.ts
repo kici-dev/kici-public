@@ -4,6 +4,10 @@ export { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from '
 // Rule evaluator
 export { evaluateRules, type RuleEvaluationResult } from './evaluator.js';
 
+// Rule context factory + changed-files availability error
+export { createRuleContext, ChangedFilesUnavailableError } from './context.js';
+export type { CreateRuleContextInput } from './context.js';
+
 // Types
 export type { Rule, RuleCheckFn, RuleContext, RuleResult, EventPayload } from './types.js';
 

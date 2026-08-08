@@ -10,8 +10,8 @@
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
-import * as path from 'node:path';
 import { chunkBuffer, toErrorMessage } from '@kici-dev/shared';
+import { makeTempFile } from '@kici-dev/shared/tmp';
 import type { PeerLogsCollectRequest, PeerToPeerMessage, FleetSelection } from '@kici-dev/engine';
 import type { AgentRegistry } from '../agent/registry.js';
 import type { PeerRegistry } from '../cluster/peer-registry.js';
@@ -66,7 +66,7 @@ export interface FleetRuntime {
 
 /** Build this node's own debug bundle as a Buffer via a temp file. */
 async function buildLocalBundleBuffer(runtime: FleetRuntime): Promise<Buffer> {
-  const tmp = path.join(os.tmpdir(), `kici-fleet-local-${runtime.instanceId}-${randomUUID()}.zip`);
+  const { path: tmp, cleanup } = await makeTempFile('fleet-local', { suffix: '.zip' });
   try {
     await createDebugBundle({
       outputPath: tmp,
@@ -79,7 +79,7 @@ async function buildLocalBundleBuffer(runtime: FleetRuntime): Promise<Buffer> {
     });
     return fs.readFileSync(tmp);
   } finally {
-    fs.rmSync(tmp, { force: true });
+    await cleanup();
   }
 }
 

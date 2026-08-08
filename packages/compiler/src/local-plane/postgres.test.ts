@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 const embeddedStart = vi.fn();
 const embeddedInit = vi.fn();
@@ -51,5 +54,46 @@ describe('startPlanePostgres', () => {
       expect.arrayContaining(['run', '-d']),
       expect.anything(),
     );
+  });
+});
+
+describe('embeddedClusterIsServing', () => {
+  /** Write a postmaster.pid whose 4th line is the port, as PostgreSQL does. */
+  function seedPidFile(port: number): string {
+    const dir = mkdtempSync(join(tmpdir(), 'kici-pgserving-'));
+    process.env.KICI_CONFIG_DIR = dir;
+    const pgData = join(dir, 'local', 'pgdata');
+    mkdirSync(pgData, { recursive: true });
+    writeFileSync(
+      join(pgData, 'postmaster.pid'),
+      ['4242', pgData, '1785000000', String(port), '/tmp', '', 'ready   '].join('\n'),
+    );
+    return dir;
+  }
+
+  it('is false when the data dir has no postmaster.pid', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'kici-pgserving-'));
+    process.env.KICI_CONFIG_DIR = dir;
+    const { embeddedClusterIsServing } = await import('./postgres.js');
+    expect(await embeddedClusterIsServing(45432)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is false when a postmaster is running on a DIFFERENT port', async () => {
+    // Reusing it would hand the plane a database on the wrong port; the check
+    // must return before it ever consults pg_ctl.
+    const dir = seedPidFile(45999);
+    const { embeddedClusterIsServing } = await import('./postgres.js');
+    expect(await embeddedClusterIsServing(45432)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is false when pg_ctl reports the cluster is not running (stale pid file)', async () => {
+    // pg_ctl is unresolvable/failing under the mocked module graph, which is the
+    // same signal as a non-zero status: start it rather than assume it is up.
+    const dir = seedPidFile(45432);
+    const { embeddedClusterIsServing } = await import('./postgres.js');
+    expect(await embeddedClusterIsServing(45432)).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -65,7 +65,7 @@ const configureNginx = step('configure-nginx', {
 `summarize` is **required** whenever `check` is declared. `run` and `whenInSync`
 both produce the same output type — one output shape per step, whichever path
 runs. Every other step facet (`cache`, `rules`, `continueOnError`, `timeout`,
-`approval`, `onCancel`, `cleanup`, `outputs`) composes unchanged.
+`retry`, `approval`, `onCancel`, `cleanup`, `outputs`) composes unchanged.
 
 A plain `step()` without `check` keeps its exact current behavior — the check
 facet is fully optional.

@@ -1,26 +1,31 @@
 /**
  * Local dev-signed identity for the offline local dev plane (independent mode).
  *
- * The hosted KiCI Platform is the ONLY real OIDC minter in production
- * (`packages/platform/src/oidc/*`, private); a Platform-connected orchestrator
- * relays to it (`ws/oidc-token-relay.ts`). The offline local dev plane has no
- * Platform, so `ctx.kici.oidc.token()` / `ctx.attestProvenance()` would return
- * "unknown method". This module gives the plane a clearly-non-prod substitute:
+ * A production orchestrator mints identity tokens locally with its own
+ * long-lived signing key under its own real issuer
+ * (`oidc/orchestrator-mint.ts`), falling back to the deprecated Platform relay
+ * (`ws/oidc-token-relay.ts`) only when no provenance signer is configured. The
+ * offline local dev plane has neither a configured signer nor a Platform
+ * connection, so `ctx.kici.oidc.token()` / `ctx.attestProvenance()` would
+ * return "unknown method". This module gives the plane a clearly-non-prod
+ * substitute:
  * an in-process ES256 signer keyed to a keypair the CLI generates fresh under
  * `~/.kici/local/dev-identity/` (mode 0600, never derived from any sops secret),
  * minting tokens whose issuer is the fixed sentinel `kici-local`.
  *
- * `kici-local` can NEVER masquerade as the prod issuer (`https://api.kici.dev`):
+ * `kici-local` can NEVER masquerade as a real issuer (an orchestrator's
+ * provenance issuer, or the hosted Platform's `https://api.kici.dev`):
  * `kici verify-attestation` pins the token `iss` to the trust root supplied
- * out-of-band (default = the prod issuer), so a `kici-local` bundle rejects
- * structurally against prod and only verifies against a `kici local trust-root`
- * export. See `.claude/rules/platform-hosting-model.md`.
+ * out-of-band (default = the configured orchestrator's issuer), so a
+ * `kici-local` bundle rejects structurally against a real trust root and only
+ * verifies against a `kici local trust-root` export. See
+ * `.claude/rules/platform-hosting-model.md`.
  *
  * This signer is constructed ONLY when the orchestrator runs in `independent`
  * mode with `KICI_INDEPENDENT_IDENTITY=1` (set solely by the local dev plane's
- * boot). A Platform-connected orchestrator never builds it and never registers
- * the local mint path — it keeps minting via the Platform relay exactly as
- * today.
+ * boot). A production orchestrator never builds it and never registers the
+ * local mint path — it mints with its own signer (or the deprecated Platform
+ * relay when none is configured).
  */
 import { readFile } from 'node:fs/promises';
 import { calculateJwkThumbprint, type JWK } from 'jose';

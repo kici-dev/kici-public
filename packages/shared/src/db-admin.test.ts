@@ -16,7 +16,11 @@ import {
   createContextTemplateDirect,
   setContextSecretDirect,
   waitForPlatformRegistrationsDirect,
+  waitForExecutionRunReachesStatusSinceDirect,
+  seedCiSecurityFixturesDirect,
+  listCheckRunTrackingDirect,
 } from './db-admin.js';
+import { HoldType, unknownContributorHoldReason } from '@kici-dev/engine';
 
 describe('parseDatabaseUrl', () => {
   it('extracts db name, owner, and admin URL', () => {
@@ -380,7 +384,20 @@ describe('seedContextDirect', () => {
         name: 'staging',
         holdExpirySeconds: -1,
       }),
-    ).rejects.toThrow(/holdExpirySeconds must be >= 0/);
+    ).rejects.toThrow(/holdExpirySeconds must be >= 1/);
+  });
+
+  it('rejects a zero holdExpirySeconds', async () => {
+    // A stored 0 puts every hold's deadline at the current instant, so the
+    // hold is swept to `expired` before a reviewer can act.
+    pool = installPoolMock([]);
+    await expect(
+      seedContextDirect('postgresql://u:p@h:5432/d', {
+        orgId: 'org1',
+        name: 'staging',
+        holdExpirySeconds: 0,
+      }),
+    ).rejects.toThrow(/holdExpirySeconds must be >= 1/);
   });
 
   it('serialises empty branch restrictions as []', async () => {
@@ -403,6 +420,29 @@ describe('seedContextDirect', () => {
     });
     expect(pool.calls[0].sql).toMatch(/glob_pattern/);
     expect(pool.calls[0].params).toContain('review/*');
+  });
+
+  it('writes an omitted hold expiry as NULL rather than a create-time literal', async () => {
+    // The column carries no DDL default, so "never set" must land NULL and
+    // resolve through DEFAULT_HOLD_EXPIRY_SECONDS on read. A COALESCE literal
+    // here gave this path its own longer default that no reader knew about.
+    pool = installPoolMock([{ rows: [{ id: 'env-2', inserted: true }], rowCount: 1 }]);
+    await seedContextDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      name: 'prod',
+    });
+    expect(pool.calls[0].params[7]).toBeNull();
+    expect(pool.calls[0].sql).not.toMatch(/86400/);
+  });
+
+  it('passes an explicit hold expiry through unchanged', async () => {
+    pool = installPoolMock([{ rows: [{ id: 'env-3', inserted: true }], rowCount: 1 }]);
+    await seedContextDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      name: 'prod',
+      holdExpirySeconds: 900,
+    });
+    expect(pool.calls[0].params[7]).toBe(900);
   });
 });
 
@@ -629,6 +669,24 @@ describe('createContextTemplateDirect', () => {
     expect(sqls.filter((s) => /INSERT INTO context_variables/.test(s))).toHaveLength(2);
   });
 
+  it('writes an omitted hold expiry as NULL rather than a create-time literal', async () => {
+    // Same invariant as seedContextDirect: no DDL default on the column, so a
+    // template created without an expiry must land NULL and resolve through
+    // DEFAULT_HOLD_EXPIRY_SECONDS.
+    pool = installPoolMock([
+      { rows: [{ id: 'tpl-2', inserted: true }], rowCount: 1 },
+      { rows: [], rowCount: 1 },
+    ]);
+    await createContextTemplateDirect('postgresql://u:p@h:5432/d', {
+      orgId: 'org1',
+      templateName: 'standard',
+    });
+    const insert = pool.calls.find((c) => /INSERT INTO contexts/.test(c.sql));
+    expect(insert).toBeDefined();
+    expect(insert!.params[6]).toBeNull();
+    expect(insert!.sql).not.toMatch(/86400/);
+  });
+
   it('rolls back on failure', async () => {
     const failingResponses: MockQueryResult[] = [
       { rows: [{ id: 'tpl-1', inserted: true }], rowCount: 1 },
@@ -751,6 +809,322 @@ describe('waitForPlatformRegistrationsDirect', () => {
       timeoutMs: 5_000,
     });
     expect(pool.calls[0].sql).toMatch(/orchestrator_connection_id != 'e2e-synthetic'/);
+  });
+});
+
+describe('waitForExecutionRunReachesStatusSinceDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  it('returns the first status in the set that appears (polls until a match)', async () => {
+    // First poll: no terminal run yet. Second poll: the run reached success.
+    pool = installPoolMock([{ rows: [] }, { rows: [{ status: 'success' }] }]);
+    const since = new Date('2026-07-17T00:00:00.000Z');
+    const result = await waitForExecutionRunReachesStatusSinceDirect('postgresql://u:p@h:5432/db', {
+      since,
+      statuses: ['success', 'failed', 'cancelled'],
+      timeoutMs: 1_000,
+      intervalMs: 5,
+    });
+    expect(result).toEqual({ status: 'success' });
+    // SQL binds `since` as $1 and the status array as $2.
+    expect(pool.calls[0].sql).toMatch(/started_at > \$1/);
+    expect(pool.calls[0].sql).toMatch(/status = ANY\(\$2\)/);
+    expect(pool.calls[0].params).toEqual([since, ['success', 'failed', 'cancelled']]);
+    expect(pool.endCalls).toBe(1);
+  });
+
+  it('surfaces a terminal failure fast (returns the failed status, not null)', async () => {
+    pool = installPoolMock([{ rows: [{ status: 'failed' }] }]);
+    const result = await waitForExecutionRunReachesStatusSinceDirect('postgresql://u:p@h:5432/db', {
+      since: new Date('2026-07-17T00:00:00.000Z'),
+      statuses: ['success', 'failed', 'cancelled'],
+      timeoutMs: 1_000,
+      intervalMs: 5,
+    });
+    expect(result).toEqual({ status: 'failed' });
+  });
+
+  it('returns { status: null } when no run reaches a target status before the deadline', async () => {
+    // Every poll comes back empty; the loop must give up at the deadline.
+    pool = installPoolMock(Array.from({ length: 50 }, () => ({ rows: [] })));
+    const result = await waitForExecutionRunReachesStatusSinceDirect('postgresql://u:p@h:5432/db', {
+      since: new Date('2026-07-17T00:00:00.000Z'),
+      statuses: ['success', 'failed', 'cancelled'],
+      timeoutMs: 30,
+      intervalMs: 5,
+    });
+    expect(result).toEqual({ status: null });
+    expect(pool.endCalls).toBe(1);
+  });
+});
+
+describe('seedCiSecurityFixturesDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  /**
+   * The helper issues exactly 19 queries in a fixed order: the sources upsert,
+   * the contexts upsert, then three per seeded hold (execution_runs,
+   * execution_jobs, held_runs) for holds A–E, then the trusted run's
+   * execution_runs + execution_jobs pair. The mock replays responses
+   * positionally, so the count and order matter — if the helper's query order
+   * shifts, correct this fixture rather than loosening the assertions.
+   */
+  const RESPONSES = [
+    { rows: [] }, // INSERT INTO sources
+    { rows: [{ id: 'env-ci-sec' }] }, // INSERT INTO contexts RETURNING id
+    ...Array.from({ length: 5 }, () => [
+      { rows: [] }, // INSERT INTO execution_runs
+      { rows: [] }, // INSERT INTO execution_jobs
+      { rows: [{ id: 'held-x' }] }, // INSERT INTO held_runs RETURNING id
+    ]).flat(),
+    { rows: [] }, // trusted INSERT INTO execution_runs
+    { rows: [] }, // trusted INSERT INTO execution_jobs
+  ];
+
+  const OPTS = {
+    orgId: 'org1',
+    runsRoutingKey: 'generic:org1:runs',
+    unknownRunId: 'run-unknown',
+    unknownDeliveryId: 'del-unknown',
+    unknownJobId: 'job-unknown',
+    trustedRunId: 'run-trusted',
+    trustedDeliveryId: 'del-trusted',
+    trustedJobId: 'job-trusted',
+    secondPrRunId: 'run-second',
+    secondPrDeliveryId: 'del-second',
+    secondPrJobId: 'job-second',
+    otherRepoRunId: 'run-other',
+    otherRepoDeliveryId: 'del-other',
+    otherRepoJobId: 'job-other',
+    wfModRunId: 'run-wfmod',
+    wfModDeliveryId: 'del-wfmod',
+    wfModJobId: 'job-wfmod',
+    forkPrRunId: 'run-forkpr',
+    forkPrDeliveryId: 'del-forkpr',
+    forkPrJobId: 'job-forkpr',
+  };
+
+  /** The `hold_type` bind param of every `held_runs` insert, in seed order. */
+  function seededHoldTypes(calls: QueryCall[]): unknown[] {
+    return calls.filter((c) => /INSERT INTO held_runs/.test(c.sql)).map((c) => c.params[4]); // ($1 org, $2 run, $3 job, $4 context, $5 hold_type)
+  }
+
+  it('seeds every hold with a hold type production can actually emit', async () => {
+    pool = installPoolMock(RESPONSES);
+    await seedCiSecurityFixturesDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    const holdTypes = seededHoldTypes(pool.calls);
+    expect(holdTypes).toHaveLength(5);
+    // Every seeded value must be in the engine gate vocabulary — a fixture that
+    // seeds a spelling no gate writes proves nothing about real behavior. This
+    // is the assertion that fails if the vocabulary ever changes underneath the
+    // fixture, which is the point of pinning it here.
+    for (const holdType of holdTypes) {
+      expect(HoldType.options).toContain(holdType);
+    }
+    // All five are security-queue holds, so all five carry the security gate's
+    // hold type; the per-hold detail lives in `reason`, a different column.
+    expect(holdTypes).toEqual(Array(5).fill(HoldType.enum.security));
+  });
+
+  it('seeds a hold reason the trust gate can actually produce', async () => {
+    pool = installPoolMock(RESPONSES);
+    const result = await seedCiSecurityFixturesDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    // Holds A/B/C are unknown-contributor security holds, so their `reason` is
+    // the trust gate's own templated sentence, read from the same shared engine
+    // template the gate emits — not a fixture-local literal. Holds D and E are
+    // the workflow-modification and fork-PR holds, whose reasons are the slugs
+    // the dispatch path persists.
+    const reasons = pool.calls
+      .filter((c) => /INSERT INTO held_runs/.test(c.sql))
+      .map((c) => c.params[5]);
+    expect(reasons).toEqual([
+      unknownContributorHoldReason(result.contextName),
+      unknownContributorHoldReason(result.contextName),
+      unknownContributorHoldReason(result.contextName),
+      'workflow_modification',
+      'fork_pr',
+    ]);
+  });
+
+  it('returns the context name it seeded', async () => {
+    pool = installPoolMock(RESPONSES);
+    const result = await seedCiSecurityFixturesDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    // The returned name is what assertions build the expected reason from, so a
+    // caller overriding `contextName` can never desync them.
+    expect(result.contextName).toBe('ci-security-env');
+  });
+
+  it('threads a caller-supplied contextName into both the seeded reason and the result', async () => {
+    pool = installPoolMock(RESPONSES);
+    const result = await seedCiSecurityFixturesDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      contextName: 'custom-ci-security-ctx',
+    });
+
+    // Expectations are built from the literal override, not from
+    // `result.contextName` — a seeder that ignored the override (or returned a
+    // hardcoded default) fails here, which the default-path tests above cannot
+    // detect because the default and the hardcode are the same string.
+    expect(result.contextName).toBe('custom-ci-security-ctx');
+    const contextsInsert = pool.calls.find((c) => /INSERT INTO contexts/.test(c.sql));
+    expect(contextsInsert?.params[1]).toBe('custom-ci-security-ctx');
+    const reasons = pool.calls
+      .filter((c) => /INSERT INTO held_runs/.test(c.sql))
+      .map((c) => c.params[5]);
+    expect(reasons.slice(0, 3)).toEqual(
+      Array(3).fill(unknownContributorHoldReason('custom-ci-security-ctx')),
+    );
+  });
+});
+
+describe('listCheckRunTrackingDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  it('returns tracking rows for a sha, ordered by check name', async () => {
+    pool = installPoolMock([
+      {
+        rows: [
+          {
+            provider: 'github',
+            owner: 'kici-dev',
+            repo: 'test-repo',
+            sha: 'abc123',
+            check_name: 'kici/e2e-test',
+            check_run_id: '42',
+            build_creation_state: 'completed',
+            run_id: 'run-1',
+            in_progress_sent_at: null,
+          },
+        ],
+        rowCount: 1,
+      },
+    ]);
+    const { rows } = await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', {
+      sha: 'abc123',
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].check_run_id).toBe('42');
+    expect(rows[0].build_creation_state).toBe('completed');
+    expect(pool.calls[0].sql).toMatch(
+      /SELECT .* FROM check_run_tracking\s+WHERE sha = \$1\s+ORDER BY check_name/s,
+    );
+    expect(pool.calls[0].params).toEqual(['abc123']);
+    expect(pool.endCalls).toBe(1);
+  });
+
+  // A null check_run_id is NOT proof the post failed — build_creation_state is
+  // 'pending' while a create is still in flight, so the command cannot answer
+  // "did we post it?" without selecting both.
+  it('selects build_creation_state so an in-flight create is distinguishable', async () => {
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
+    expect(pool.calls[0].sql).toMatch(/build_creation_state/);
+  });
+
+  // The column is BIGINT; node-postgres maps int8 to a string. The `::text`
+  // cast pins that at the query level so the declared type stays true even if a
+  // global int8 type parser is added later.
+  it('selects check_run_id as text so the BIGINT never arrives as a lossy number', async () => {
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
+    expect(pool.calls[0].sql).toMatch(/check_run_id::text AS check_run_id/);
+  });
+
+  it('filters by check name when given', async () => {
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', {
+      sha: 'abc123',
+      checkName: 'kici/e2e-test',
+    });
+    expect(pool.calls[0].sql).toMatch(/WHERE sha = \$1 AND check_name = \$2/);
+    expect(pool.calls[0].params).toEqual(['abc123', 'kici/e2e-test']);
+  });
+
+  it('defaults the limit to 50 and clamps an oversized one to 1000', async () => {
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
+    expect(pool.calls[0].sql).toMatch(/LIMIT 50/);
+    pool.restore();
+
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123', limit: 99_999 });
+    expect(pool.calls[0].sql).toMatch(/LIMIT 1000/);
+  });
+
+  it('closes the pool even when the query throws', async () => {
+    pool = installPoolMock([]);
+    await expect(
+      listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' }),
+    ).rejects.toThrow(/no response queued/);
+    expect(pool.endCalls).toBe(1);
+  });
+
+  // `check_run_id` answers "did we create it?"; only `terminal_sent_at`
+  // answers "did we complete it?". Selecting it is what makes the command able
+  // to attribute a check run that never left `queued`.
+  it('selects terminal_sent_at so a completed update is distinguishable', async () => {
+    pool = installPoolMock([{ rows: [], rowCount: 0 }]);
+    await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
+    expect(pool.calls[0].sql).toMatch(/terminal_sent_at/);
+  });
+
+  it('returns terminal_sent_at for a completed check run', async () => {
+    pool = installPoolMock([
+      {
+        rows: [
+          {
+            provider: 'github',
+            owner: 'kici-dev',
+            repo: 'test-repo',
+            sha: 'abc123',
+            check_name: 'kici/e2e-test',
+            check_run_id: '42',
+            build_creation_state: 'completed',
+            run_id: 'run-1',
+            in_progress_sent_at: null,
+            terminal_sent_at: new Date('2026-08-04T00:00:00.000Z'),
+          },
+        ],
+        rowCount: 1,
+      },
+    ]);
+    const { rows } = await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', {
+      sha: 'abc123',
+    });
+    expect(rows[0].terminal_sent_at?.toISOString()).toBe('2026-08-04T00:00:00.000Z');
+  });
+
+  it('returns a null terminal_sent_at for a check run that was only created', async () => {
+    pool = installPoolMock([
+      {
+        rows: [
+          {
+            provider: 'github',
+            owner: 'kici-dev',
+            repo: 'test-repo',
+            sha: 'abc123',
+            check_name: 'kici/e2e-test',
+            check_run_id: '42',
+            build_creation_state: 'completed',
+            run_id: 'run-1',
+            in_progress_sent_at: null,
+            terminal_sent_at: null,
+          },
+        ],
+        rowCount: 1,
+      },
+    ]);
+    const { rows } = await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', {
+      sha: 'abc123',
+    });
+    expect(rows[0].check_run_id).toBe('42');
+    expect(rows[0].terminal_sent_at).toBeNull();
   });
 });
 

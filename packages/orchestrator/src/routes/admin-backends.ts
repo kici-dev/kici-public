@@ -141,7 +141,7 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminBackendsE
   // DELETE /backends/:name -- remove a backend
   app.delete('/backends/:name', async (c) => {
     try {
-      const name = decodeURIComponent(c.req.param('name'));
+      const name = c.req.param('name');
 
       // Get scope count before removal for response
       const backend = await deps.registry.getBackend(name);
@@ -174,7 +174,7 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminBackendsE
   // GET /backends/:name -- get a single backend
   app.get('/backends/:name', async (c) => {
     try {
-      const name = decodeURIComponent(c.req.param('name'));
+      const name = c.req.param('name');
       const backend = await deps.registry.getBackend(name);
       if (!backend) {
         return c.json({ error: 'Backend not found' }, 404);
@@ -188,7 +188,7 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminBackendsE
   // POST /backends/:name/test -- test a named registered backend
   app.post('/backends/:name/test', async (c) => {
     try {
-      const name = decodeURIComponent(c.req.param('name'));
+      const name = c.req.param('name');
 
       const backend = await deps.registry.getBackend(name);
       if (!backend) {
@@ -228,7 +228,7 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminBackendsE
         return c.json({ error: 'Sync manager not available' }, 503);
       }
 
-      const name = decodeURIComponent(c.req.param('name'));
+      const name = c.req.param('name');
 
       const backend = await deps.registry.getBackend(name);
       if (!backend) {

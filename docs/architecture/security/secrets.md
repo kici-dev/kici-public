@@ -88,6 +88,10 @@ This ensures zero-downtime during rolling restarts: instances with the new key c
 - **With `oldMasterKey` set:** Decrypts each secret with the old key and re-encrypts with the current (new) key. This is true key rotation.
 - **Without `oldMasterKey`:** Decrypts and re-encrypts with the same key at an incremented version. This is periodic re-encryption (same-key version bump).
 
+**Three rotation sweeps:** a single `rotate-key` invocation runs three separately-committed sweeps — `scoped_secrets`, then `config_versions`, then the external secret-backend configs in `secret_backends`. Each uses the same dual-key fallback for decrypt and re-encrypts under the current key at `max(keyVersion) + 1`. The `secret_backends` sweep is transactionally isolated so a backend problem cannot roll back a successful secrets rotation, and an undecryptable backend row is counted and skipped rather than aborting the sweep.
+
+**Backend-config self-heal:** secret-backend connection configs also decrypt with dual-key fallback on the load path. When a backend row decrypts only under the old key at boot (a config stranded by an earlier rotation), it is transparently re-sealed under the current key while `oldMasterKey` is configured. A row decryptable under neither key fails startup loud rather than being silently dropped.
+
 **Configuration:**
 
 The old key is loaded from `KICI_SECRET_KEY_OLD` (env var) or `KICI_SECRET_KEY_FILE_OLD` (file path). The `loadOldMasterKey()` function returns `undefined` when neither is set, making the old key entirely optional.

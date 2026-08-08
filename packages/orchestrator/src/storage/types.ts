@@ -60,6 +60,16 @@ export interface CacheStorage {
   getUrl(key: string, ttlMsOverride?: number): Promise<string | null>;
 
   /**
+   * The validity window, in seconds, of the pre-signed download URLs this
+   * backend mints via `getUrl` — i.e. how long after minting a `getUrl` link
+   * still authorizes a download before its signature expires. This is the
+   * signature expiry, NOT the artifact-retention TTL; consumers that render a
+   * `getUrl` link (e.g. the dashboard artifacts panel) use it to refresh the
+   * link before it stops working.
+   */
+  presignedGetTtlSeconds(): number;
+
+  /**
    * Generate a pre-signed PUT URL for direct agent upload.
    * Uses the external endpoint (container-routable) when configured.
    */
@@ -99,6 +109,14 @@ export interface CacheStorage {
    * eviction to order candidates by access recency.
    */
   getMetadata(key: string): Promise<CacheMetadata | null>;
+
+  /**
+   * Byte size of the stored object, or null when the object is missing. A pure
+   * stat — no metadata write and no TTL/last-accessed side effect. Used to
+   * verify an artifact's real size server-side instead of trusting the
+   * agent-declared value.
+   */
+  getObjectSize(key: string): Promise<number | null>;
 }
 
 import type { SharedS3Config } from '@kici-dev/shared';

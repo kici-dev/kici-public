@@ -2,6 +2,14 @@ import { z } from 'zod';
 import { AttestationOrigin } from '../../provenance/attestation-origin.js';
 
 /**
+ * @deprecated The `oidc.mint.*` RPC pair (Platform-rooted identity mint) is
+ * hard-deprecated in favor of orchestrator-owned signing. It is kept
+ * wire-compatible for the mixed-version rollout window and removed at v1.0; a
+ * fresh orchestrator with its own signer never sends it. See
+ * docs/user/deprecations.md.
+ */
+
+/**
  * Error discriminator for a failed provenance mint, carried on
  * `oidc.mint.response.error.code`. Mirrors the three orchestrator-side error
  * classes that consume it:

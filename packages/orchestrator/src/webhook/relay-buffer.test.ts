@@ -1,4 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Capture the module logger so tests can assert the metadata passed to warn().
+// createLogger() is only used by relay-buffer.ts for its module-level logger,
+// and no other test in this file inspects logging, so a warn-spying stub is safe.
+const mockWarn = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: mockWarn, error: vi.fn(), debug: vi.fn() }),
+  };
+});
+
 import { RelayBufferRegistry, type RelayStartMeta } from './relay-buffer.js';
 
 const META: RelayStartMeta = {
@@ -19,6 +32,7 @@ const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
 describe('RelayBufferRegistry', () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    mockWarn.mockClear();
   });
   afterEach(() => {
     vi.useRealTimers();
@@ -156,6 +170,23 @@ describe('RelayBufferRegistry', () => {
     expect(reg.size).toBe(1);
     vi.advanceTimersByTime(1_500);
     expect(reg.size).toBe(0);
+  });
+
+  it('logs the actual received chunk count when a buffer expires mid-stream', () => {
+    const reg = new RelayBufferRegistry({ bufferTtlMs: 1_000 });
+    reg.start('m-ttl-count', { ...META, totalSize: 4, chunkCount: 2 });
+    reg.chunk('m-ttl-count', 0, b64('aa'), false); // one chunk applied → expectedSequence = 1
+    expect(reg.size).toBe(1);
+
+    vi.advanceTimersByTime(1_500);
+    expect(reg.size).toBe(0);
+
+    // The TTL warning must report the chunk count that had actually arrived,
+    // not 0 — the entry is read before it is deleted.
+    expect(mockWarn).toHaveBeenCalledWith(
+      'Reassembly buffer TTL expired before final chunk',
+      expect.objectContaining({ messageId: 'm-ttl-count', receivedChunks: 1 }),
+    );
   });
 
   it('clear() drops every in-flight buffer', () => {

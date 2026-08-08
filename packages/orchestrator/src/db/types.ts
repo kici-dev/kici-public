@@ -14,6 +14,7 @@ import type {
 export interface Database {
   dispatch_queue: DispatchQueueTable;
   dedup_cache: DedupCacheTable;
+  ingest_overflow_buffer: IngestOverflowBufferTable;
   ip_allocations: IpAllocationTable;
   execution_runs: ExecutionRunTable;
   execution_jobs: ExecutionJobTable;
@@ -44,6 +45,8 @@ export interface Database {
   cluster_meta: ClusterMetaTable;
   join_tokens: JoinTokenTable;
   org_settings: OrgSettingsTable;
+  org_trust_policy: OrgTrustPolicyTable;
+  cluster_settings: ClusterSettingsTable;
   execution_job_needs: ExecutionJobNeedsTable;
   pending_job_contexts: PendingJobContextsTable;
   pending_workflow_contexts: PendingWorkflowContextsTable;
@@ -56,11 +59,73 @@ export interface Database {
   scaler_agent_jobs: ScalerAgentJobsTable;
   scaler_reservations: ScalerReservationsTable;
   attestations: AttestationsTable;
+  orchestrator_signing_keys: OrchestratorSigningKeysTable;
+  dashboard_encryption_keys: DashboardEncryptionKeysTable;
   pending_attestations: PendingAttestationsTable;
+  artifacts: ArtifactsTable;
   remote_sources: RemoteSourcesTable;
   host_roster: HostRosterTable;
   request_idempotency: RequestIdempotencyTable;
+  batch_accumulation_windows: BatchAccumulationWindowsTable;
+  batch_accumulation_items: BatchAccumulationItemsTable;
+  backup_runs: BackupRunsTable;
 }
+
+/**
+ * Open accumulation window for a `workflowsFailedBatch` registration.
+ * One live window per subscribing workflow (`registration_id` is unique);
+ * the first matching failure opens it and the leader sweep closes it once
+ * `expires_at` passes, emitting a single `__workflows_failed_batch` event.
+ */
+export interface BatchAccumulationWindowsTable {
+  /** Window id (primary key). */
+  id: string;
+  /** Owning customer/org id. */
+  customer_id: string;
+  /** Subscribing registration id (unique — open-once). */
+  registration_id: string;
+  /** Routing key captured at open time so the sweep can emit without the index. */
+  routing_key: string;
+  /** Repo identifier captured at open time. */
+  repo_identifier: string;
+  /** Accumulation window length in milliseconds. */
+  accumulate_for_ms: number;
+  /** When the window opened (first failure). */
+  opened_at: Generated<Date>;
+  /** When the window is due for the leader sweep. */
+  expires_at: Date;
+}
+
+// Convenience types for batch_accumulation_windows
+export type BatchAccumulationWindow = Selectable<BatchAccumulationWindowsTable>;
+export type NewBatchAccumulationWindow = Insertable<BatchAccumulationWindowsTable>;
+
+/**
+ * A single failed run buffered into a batch-accumulation window.
+ * Deleted with its window via `ON DELETE CASCADE` when the window is swept.
+ */
+export interface BatchAccumulationItemsTable {
+  /** Item id (primary key). */
+  id: string;
+  /** Owning window id (FK, cascade-deleted). */
+  window_id: string;
+  /** The failed run's id. */
+  run_id: string;
+  /** Repo identifier of the failed run. */
+  repo_identifier: string;
+  /** Workflow name of the failed run. */
+  workflow_name: string;
+  /** Failure class (`RunFailureClass`) when known. */
+  failure_class: string | null;
+  /** Triggering actor username when known. */
+  sender_username: string | null;
+  /** When the item was buffered. */
+  created_at: Generated<Date>;
+}
+
+// Convenience types for batch_accumulation_items
+export type BatchAccumulationItem = Selectable<BatchAccumulationItemsTable>;
+export type NewBatchAccumulationItem = Insertable<BatchAccumulationItemsTable>;
 
 /**
  * Request idempotency claim table.
@@ -82,6 +147,31 @@ export interface RequestIdempotencyTable {
 export type RequestIdempotency = Selectable<RequestIdempotencyTable>;
 export type NewRequestIdempotency = Insertable<RequestIdempotencyTable>;
 export type RequestIdempotencyUpdate = Updateable<RequestIdempotencyTable>;
+
+/**
+ * Backup run log. One row per successful `kici-admin db backup`. Read by the
+ * `checkBackupFreshness` diagnostic (`MAX(created_at)`).
+ */
+export interface BackupRunsTable {
+  id: Generated<string>;
+  created_at: Generated<Date>;
+  /** Local path the dump was written to (informational). */
+  dump_path: string;
+  /** Size of the dump file in bytes. */
+  byte_size: string | bigint;
+  /** Secret-key generation the DB's encrypted config was under (null when no encrypted config). */
+  secret_key_version: number | null;
+  /** Server version string the dump was taken from (e.g. "160003"). */
+  pg_server_version: string;
+  /** Bundled-migrations content hash at backup time. */
+  migrations_hash: string;
+  /** Host that ran the backup. */
+  hostname: string;
+}
+
+// Convenience types for backup_runs
+export type BackupRun = Selectable<BackupRunsTable>;
+export type NewBackupRun = Insertable<BackupRunsTable>;
 
 /**
  * Cluster metadata table
@@ -228,6 +318,15 @@ export interface DispatchQueueTable {
    * to another. NULL for normal label-routed jobs.
    */
   pinned_agent_id: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * Durable owner of a dispatched job: the agent the job was handed to. Written
+   * at dispatch, cleared on requeue. Distinct from `ack_agent_id`, which is
+   * cleared as soon as the agent answers the dispatch and so cannot resolve
+   * ownership later — this column lets a coordinator that never saw the
+   * dispatch answer "does this agent own this job?" from the database alone.
+   * NULL for pending rows and for rows dispatched before the column existed.
+   */
+  agent_id: ColumnType<string | null, string | null | undefined, string | null>;
 }
 
 /**
@@ -241,6 +340,40 @@ export interface DedupCacheTable {
   received_at: Generated<Date>;
   /** When this cache entry expires (24h TTL) */
   expires_at: Date;
+}
+
+/**
+ * Durable overflow buffer for shed webhook-ingest deliveries (migration 075).
+ * `status` values come from OverflowStatus, `source_kind` from OverflowSourceKind
+ * (packages/orchestrator/src/webhook/ingest-overflow-types.ts). `body` is base64.
+ */
+export interface IngestOverflowBufferTable {
+  /** Surrogate PK (bigint identity). */
+  id: Generated<number>;
+  /** Delivery id — the dedup key. */
+  delivery_id: string;
+  /** Routing key (e.g. "github:42"). */
+  routing_key: string;
+  /** Ingest boundary: 'direct' (HTTP, verified) | 'relay' (WS, unverified). */
+  source_kind: string;
+  /** Provider type; null for relay (resolved at replay). */
+  provider: string | null;
+  /** Provider event type. */
+  event: string;
+  /** Payload action, or null. */
+  action: string | null;
+  /** Base64 of the raw delivery bytes. */
+  body: string;
+  /** Verify-input envelope (relay) or {} (direct). */
+  meta: Generated<Record<string, unknown>>;
+  /** Capture timestamp (defaults to now()). */
+  captured_at: Generated<Date>;
+  /** Replay attempt counter. */
+  replay_attempts: Generated<number>;
+  /** OverflowStatus value. */
+  status: Generated<string>;
+  /** Last replay error, or null. */
+  last_error: string | null;
 }
 
 // Convenience types for dispatch_queue
@@ -279,6 +412,12 @@ export interface ExecutionRunTable {
   run_id: string;
   /** Routing key (e.g. github:appId) for Platform StaleOrchDetector when sharing DB */
   routing_key: string | null;
+  /**
+   * Owning org (customer_id), denormalized from routing_key at insert time so
+   * the concurrency-gate running count can be scoped per tenant. Defaults to
+   * '__default__' (the no-source fallback org) via the column DEFAULT.
+   */
+  customer_id: Generated<string>;
   /** Workflow name from lock file */
   workflow_name: string;
   /** Run status: running | success | failed | cancelled */
@@ -340,6 +479,8 @@ export interface ExecutionRunTable {
   lock_file_source: string | null;
   /** Username of the contributor (null for non-PR events) */
   contributor_username: string | null;
+  /** Pull-request number for PR-triggered runs (null for non-PR events). Scopes `/kici approve|reject` hold selection to the comment's PR. */
+  pr_number: number | null;
   /**
    * Origin provider of the triggering actor (`github` today). Provider-generic
    * so GitLab/Bitbucket extend later. Null when no actor was captured.
@@ -358,6 +499,12 @@ export interface ExecutionRunTable {
   trigger_actor_user_id: string | null;
   /** Human-readable reason why the run failed (null for non-failed runs). */
   failure_reason: string | null;
+  /**
+   * Why the run failed (`RunFailureClass` from `@kici-dev/engine`): never_started
+   * / timed_out / dead_orchestrator / step_failure / cancelled. Derived at run
+   * completion from the terminal job statuses. NULL for success / not-yet-terminal.
+   */
+  failure_class: string | null;
   /**
    * Structured init-phase failure detail (shape: `InitFailure` from
    * `@kici-dev/engine`). Non-null means the run never executed a step
@@ -641,16 +788,20 @@ export interface ContextsTable {
   repo_patterns: Generated<string>;
   /** Max concurrent runs (null = unlimited) */
   concurrency_limit: number | null;
-  /** Strategy when concurrency exceeded: 'queue' | 'cancel-pending' */
-  concurrency_strategy: Generated<string>;
+  /**
+   * Strategy when concurrency exceeded; see `ConcurrencyStrategy` in
+   * `@kici-dev/engine` for the vocabulary. Stays a plain `string` so a row
+   * written by another orchestrator version always maps (null = unset).
+   */
+  concurrency_strategy: Generated<string | null>;
   /** Timeout for queued runs in milliseconds */
   concurrency_timeout_ms: Generated<number>;
   /** JSONB array of required reviewer identities (null = no approval required) */
   required_reviewers: string | null;
   /** Seconds to wait before deploying (null = no wait timer) */
   wait_timer_seconds: number | null;
-  /** Seconds before a held run expires */
-  hold_expiry_seconds: Generated<number>;
+  /** Seconds before a held run expires (null = unset, the default window applies) */
+  hold_expiry_seconds: Generated<number | null>;
   /** Minimum trust tier required for CI execution (null = no trust requirement) */
   minimum_trust: string | null;
   /** Whether this context allows local (no-remote) executions. Default false. */
@@ -798,7 +949,12 @@ export interface HeldRunsTable {
   job_id: string;
   /** Context ID (FK to contexts.id); null once the context is deleted */
   context_id: string | null;
-  /** Hold type: 'approval' | 'wait_timer' | 'concurrency' */
+  /**
+   * Hold type — an engine `HoldType` member ('reviewer' | 'timer' |
+   * 'concurrency' | 'security'). Stays `string` so a row written by a
+   * different orchestrator version is never rejected; read it through
+   * `normalizePersistedHoldType`.
+   */
   hold_type: string;
   /** Hold status: 'pending' | 'approved' | 'rejected' | 'expired' | 'released' */
   status: Generated<string>;
@@ -1330,6 +1486,8 @@ export type RegistryVersionUpdate = Updateable<RegistryVersionsTable>;
 export interface CronLastFiredTable {
   /** References workflow_registrations.id (cascade delete) */
   registration_id: string;
+  /** Per-schedule identity: `${cronExpression}\n${timezone}` (see scheduleTriggerKey) */
+  schedule_key: string;
   /** When this cron trigger last fired */
   last_fired_at: Date;
   /** When this record was last updated */
@@ -1525,11 +1683,79 @@ export interface OrgSettingsTable {
    */
   user_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
+   * Per-org byte quota for user-facing artifacts (ArtifactStore). NULL = use the
+   * cluster-wide default (`KICI_ARTIFACT_QUOTA_BYTES`, 20 GiB). Postgres BIGINT —
+   * pg returns a string on select; accept a number on insert/update.
+   */
+  artifact_quota_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-artifact TTL (ms) for user-facing artifacts (ArtifactStore). NULL = use
+   * the cluster-wide default (`KICI_ARTIFACT_TTL_MS`, 30 days). Postgres BIGINT —
+   * pg returns a string on select; accept a number on insert/update.
+   */
+  artifact_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org per-artifact size cap (bytes) for user-facing artifacts
+   * (ArtifactStore). NULL = use the cluster-wide default
+   * (`KICI_ARTIFACT_MAX_BYTES`, 1 GiB). Postgres BIGINT — pg returns a string on
+   * select; accept a number on insert/update.
+   */
+  artifact_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org per-run artifact count cap for user-facing artifacts
+   * (ArtifactStore). NULL = use the cluster-wide default
+   * (`KICI_ARTIFACT_MAX_PER_RUN`, 50). Postgres BIGINT — pg returns a string on
+   * select; accept a number on insert/update.
+   */
+  artifact_max_per_run: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
    * Per-org dispatch-acknowledgment deadline (ms); null = cluster default
    * (config.dispatchAckTimeoutMs / KICI_DISPATCH_ACK_TIMEOUT_MS). Postgres
    * BIGINT — pg returns a string on select; accept a number on insert/update.
    */
   dispatch_ack_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org webhook-ingest concurrency cap; null = cluster default
+   * (config.ingestOrgMaxConcurrency / KICI_INGEST_ORG_MAX_CONCURRENCY). Postgres
+   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   */
+  ingest_max_concurrency: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org scaler spawn deadline (ms) for a single `backend.spawn` (image pull
+   * + container create + start); null = cluster default
+   * (config.scalerSpawnTimeoutMs / KICI_SCALER_SPAWN_TIMEOUT_MS). Postgres
+   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   */
+  scaler_spawn_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org reroute spawn window (ms): how long the coordinator waits after a
+   * peer ACKs a reroute before treating "accepted but no progress" as a spawn
+   * failure and re-dispatching. Null = cluster default (config.rerouteSpawnWindowMs).
+   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   */
+  reroute_spawn_window_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org reroute ACK timeout (ms) for the reroute sendAndWaitAck deadline.
+   * Null = cluster default (config.rerouteAckTimeoutMs). BIGINT.
+   */
+  reroute_ack_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Per-org maximum peer hops for a rerouted job. Null = cluster default
+   * (config.rerouteMaxHops). Plain INTEGER — pg returns a number on select.
+   */
+  reroute_max_hops: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Per-org staleness threshold (hours) for the DB-backup freshness diagnostic.
+   * Null = cluster default (config.backupStalenessWarnHours). Plain INTEGER.
+   */
+  backup_staleness_warn_hours: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Per-org dispatch-queue job timeout (ms). A queued job's deadline is
+   * `job.timeoutMs ?? <this> ?? config.queueTimeoutMs`. Null = cluster default
+   * (config.queueTimeoutMs / KICI_QUEUE_TIMEOUT_MS). Postgres BIGINT — pg
+   * returns a string on select; accept a number on insert/update.
+   */
+  queue_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
    * Per-org expiry (seconds) for a held approval element before it is rejected
    * and its run/job/step fails. NOT NULL, default 86400 (one day). An SDK
@@ -1541,6 +1767,26 @@ export interface OrgSettingsTable {
    * NOT NULL, default true. Operators turn it off to enforce four-eyes review.
    */
   allow_self_approval: ColumnType<boolean, boolean | undefined, boolean>;
+  /**
+   * Container-sandbox escape-hatch allow-list: the Linux capabilities a workflow
+   * may request via the SDK `sandbox: { capabilities }` field. NULL / absent
+   * reads as `[]` (deny every capability request). Postgres TEXT[].
+   */
+  sandbox_allowed_capabilities: ColumnType<
+    string[] | null,
+    string[] | null | undefined,
+    string[] | null
+  >;
+  /**
+   * Container-sandbox escape-hatch allow-list: whether a workflow may request
+   * `sandbox: { network: 'host' }`. NULL / absent reads as `false` (deny host
+   * networking). Postgres BOOLEAN.
+   */
+  sandbox_allow_host_network: ColumnType<
+    boolean | null,
+    boolean | null | undefined,
+    boolean | null
+  >;
   /** When this setting was created */
   created_at: Generated<Date>;
   /** When this setting was last updated */
@@ -1551,6 +1797,110 @@ export interface OrgSettingsTable {
 export type OrgSettings = Selectable<OrgSettingsTable>;
 export type NewOrgSettings = Insertable<OrgSettingsTable>;
 export type OrgSettingsUpdate = Updateable<OrgSettingsTable>;
+
+/**
+ * Org trust policy (org_trust_policy) — the orchestrator's cache of the
+ * Platform-owned per-org trust policy delivered on `trust_policy.update`.
+ * Distinct from `org_settings`, which holds operator-owned config: the operator
+ * tunes org_settings, the Platform owns this. `source` records which of the two
+ * wrote the row.
+ *
+ * The three policy columns are plain `string`, not the Zod enums that name the
+ * known vocabulary — same reasoning as `held_runs.hold_type`: a value written by
+ * a newer Platform must still be readable rather than failing the row.
+ */
+export interface OrgTrustPolicyTable {
+  /** Customer/org identifier (primary key) */
+  customer_id: string;
+  /** How to treat a pull request opened from a fork: hold | reject | allow */
+  fork_policy: string;
+  /** How to treat a PR from a contributor with no resolved identity: hold | reject */
+  unknown_contributor_policy: string;
+  /** How to treat a PR that modifies workflow files: hold | reject | allow */
+  workflow_change_policy: string;
+  /** How long a security hold stays approvable before it expires */
+  approval_expiry_hours: number;
+  /** Which side last wrote this row: platform | local */
+  source: string;
+  /** When this policy was last written */
+  updated_at: ColumnType<Date, Date | undefined, Date>;
+}
+
+// Convenience types for org_trust_policy
+export type OrgTrustPolicy = Selectable<OrgTrustPolicyTable>;
+export type NewOrgTrustPolicy = Insertable<OrgTrustPolicyTable>;
+export type OrgTrustPolicyUpdate = Updateable<OrgTrustPolicyTable>;
+
+/**
+ * Cluster-global settings (cluster_settings) — a single row (id='default') of
+ * fleet-wide operator tunables. Each knob is nullable; NULL = use the cluster
+ * default from config.ts. Read via ClusterSettingsReader. Distinct from
+ * org_settings (per customer_id) — these knobs have no per-tenant meaning.
+ * Byte-valued knobs are Postgres BIGINT (pg returns a string on select); count
+ * / seconds knobs are INTEGER (pg returns a number).
+ */
+export interface ClusterSettingsTable {
+  id: ColumnType<string, string | undefined, never>;
+  max_github_payload_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  event_log_max_payload_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  lock_file_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  webhook_dedup_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  contributor_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  event_router_event_ttl_seconds: ColumnType<
+    number | null,
+    number | null | undefined,
+    number | null
+  >;
+  event_router_max_dispatch_attempts: ColumnType<
+    number | null,
+    number | null | undefined,
+    number | null
+  >;
+  queue_max_depth: ColumnType<number | null, number | null | undefined, number | null>;
+  reroute_flap_grace_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  max_fanout_hosts: ColumnType<number | null, number | null | undefined, number | null>;
+  event_router_rate_limit_per_workflow_per_minute: ColumnType<
+    number | null,
+    number | null | undefined,
+    number | null
+  >;
+  cache_max_tarball_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  cache_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Retention window in days for `check_run_tracking` rows. The hourly cleanup
+   * sweep deletes rows untouched for longer than this; 0 disables the sweep.
+   * NULL ⇒ the orchestrator's configured default.
+   */
+  check_run_tracking_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
+  concurrency_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  agent_token_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Deadline for one database-backed agent-ownership lookup. Past it the lookup
+   * resolves as undecided and the frame is refused without counting a
+   * violation. NULL ⇒ the orchestrator's configured default.
+   */
+  ownership_db_check_timeout_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
+   * Verified-tier origin the dashboard fetches the orchestrator's X25519
+   * dashboard-encryption public key from (and always displays) under the
+   * `encrypted` dashboard-write posture. The tier is explicit opt-in: NULL ⇒ it
+   * is not offered and the convenient tier is used.
+   */
+  dashboard_verified_issuer: ColumnType<string | null, string | null | undefined, string | null>;
+  /** Monotonic settings version; bumped on each real settings change, advertised to workers. */
+  version: ColumnType<string | number, number | undefined, number>;
+  created_at: Generated<Date>;
+  updated_at: Generated<Date>;
+}
+
+// Convenience types for cluster_settings
+export type ClusterSettings = Selectable<ClusterSettingsTable>;
+export type NewClusterSettings = Insertable<ClusterSettingsTable>;
+export type ClusterSettingsUpdate = Updateable<ClusterSettingsTable>;
 
 /**
  * Pending job contexts table
@@ -1776,8 +2126,21 @@ export interface CheckRunTrackingTable {
    */
   in_progress_sent_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * KiCI run identifier this check-run belongs to. Indexed (partial, NOT
-   * NULL) to power `cleanupRun(runId)` without scanning the table.
+   * When the terminal (`completed`) check-run update was accepted by the
+   * provider. NULL means we have no record of sending it — either it never
+   * happened, or the best-effort write failed. Never treat NULL as proof the
+   * update failed.
+   *
+   * `check_run_id` is written at create time, while the check run is still
+   * `queued`, so it proves creation and never completion. This column is the
+   * completion signal.
+   */
+  terminal_sent_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  /**
+   * KiCI run identifier this check-run belongs to, written at create time.
+   * Indexed (partial, NOT NULL) so a per-run lookup never scans the table.
+   * It is an attribution key, not a retention key — rows are reclaimed by
+   * the `updated_at`-age sweep, which deliberately ignores this column.
    */
   run_id: ColumnType<string | null, string | null | undefined, string | null>;
   /** When this row was first inserted. */
@@ -1831,6 +2194,98 @@ export interface AttestationsTable {
 // Convenience types for attestations
 export type AttestationRow = Selectable<AttestationsTable>;
 export type NewAttestationRow = Insertable<AttestationsTable>;
+
+/**
+ * Cluster-scoped ES256 provenance signing keys. The orchestrator signs its own
+ * build attestations with the one `active` key and serves the public halves of
+ * every non-`revoked` key at `/.well-known/jwks.json`.
+ */
+export interface OrchestratorSigningKeysTable {
+  /** RFC 7638 thumbprint of the public JWK (primary key, also the token `kid`). */
+  kid: string;
+  /** The non-secret public JWK (JSONB) served in the JWKS. */
+  public_jwk: unknown;
+  /**
+   * AES-256-GCM-wrapped private JWK for `db` custody (master-key wrapped). NULL
+   * for `aws-kms` / `command` custody where the private key never lives here.
+   */
+  encrypted_private_jwk: string | null;
+  key_version: Generated<number>;
+  /** JOSE alg (always `ES256`). */
+  alg: string;
+  /** Custody backend discriminator (`db` | `aws-kms` | `command`). */
+  signer_kind: string;
+  /** External key locator (KMS ARN / signer command) for non-`db` custody; NULL for `db`. */
+  key_ref: string | null;
+  /** Lifecycle status (`SigningKeyStatus`: active | retiring | retired | revoked). */
+  status: Generated<string>;
+  revocation_reason: string | null;
+  created_at: Generated<Date>;
+  activated_at: Date | null;
+  retired_at: Date | null;
+  revoked_at: Date | null;
+}
+
+export type OrchestratorSigningKeyRow = Selectable<OrchestratorSigningKeysTable>;
+export type NewOrchestratorSigningKeyRow = Insertable<OrchestratorSigningKeysTable>;
+
+/**
+ * The orchestrator's X25519 dashboard-encryption keys — the trust root for
+ * browser-sealed dashboard writes under the `encrypted` posture. One `active`
+ * key seals; rotated-out keys go `revoked` and leave the published JWKS, while
+ * their rows stay so envelopes already sealed to the old `kid` still decrypt.
+ */
+export interface DashboardEncryptionKeysTable {
+  /** RFC 7638 thumbprint of the public JWK (primary key, also the `kid`). */
+  kid: string;
+  /** The non-secret OKP/X25519 public JWK (`use:'enc'`) served in the JWKS. */
+  public_jwk: unknown;
+  /** AES-256-GCM-wrapped DER private key (master-key wrapped under KICI_SECRET_KEY). */
+  encrypted_private_key: string;
+  /** Lifecycle status (`active` | `revoked`). */
+  status: Generated<string>;
+  revocation_reason: string | null;
+  created_at: Generated<Date>;
+  activated_at: Date | null;
+  revoked_at: Date | null;
+}
+
+export type DashboardEncryptionKeyRow = Selectable<DashboardEncryptionKeysTable>;
+export type NewDashboardEncryptionKeyRow = Insertable<DashboardEncryptionKeysTable>;
+
+/**
+ * A user-facing build artifact (`ctx.artifacts.upload`). Named + immutable per
+ * run: `UNIQUE (run_id, name)` enforces the first-upload-wins semantics at the
+ * DB layer. `customer_id` scopes the row to an org for quota accounting; the
+ * tarball lives at `storage_key` (`artifacts/{run_id}/{name}-{discriminator}.tar.gz`,
+ * where the discriminator is a hash of the exact name). Reads go through the
+ * stored key rather than re-deriving it, so a row written under an earlier key
+ * format resolves unchanged.
+ */
+export interface ArtifactsTable {
+  /** Random id (primary key). */
+  id: string;
+  /** Owning customer/org id (quota-accounting scope). */
+  customer_id: string;
+  /** KiCI run this artifact belongs to. */
+  run_id: string;
+  /** KiCI job that produced this artifact. */
+  job_id: string;
+  /** Caller-supplied artifact name (unique within the run). */
+  name: string;
+  /** Packed tarball size in bytes. Postgres BIGINT — pg returns a string on select. */
+  size_bytes: ColumnType<string, number, number>;
+  /** SHA-256 (hex) of the tarball bytes. */
+  sha256: string;
+  /** Object-storage key the tarball was written to. */
+  storage_key: string;
+  /** When this row was inserted. */
+  created_at: Generated<Date>;
+}
+
+// Convenience types for artifacts
+export type ArtifactRow = Selectable<ArtifactsTable>;
+export type NewArtifactRow = Insertable<ArtifactsTable>;
 
 /**
  * Deferred-attestation outbox: a build whose provenance mint failed transiently
@@ -1957,6 +2412,12 @@ export interface HostRosterTable {
   ssh_port: ColumnType<number | null, number | null | undefined, number | null>;
   /** Scoped-secret ref (`scope/key`) holding the bring-up private key. */
   ssh_key_secret: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * Delivery hint: when true, the box can reach the orchestrator's object
+   * storage, so bring-up picks `s3-direct` (the box pulls the payload via a
+   * presigned URL). NULL / false ⇒ the conservative `ssh-push` fallback.
+   */
+  s3_reachable: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
   created_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
 }

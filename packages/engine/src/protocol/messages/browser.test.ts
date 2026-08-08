@@ -365,6 +365,16 @@ describe('browserToPlatformMessageSchema', () => {
     expect(browserToPlatformMessageSchema.parse(msg)).toEqual(msg);
   });
 
+  it('accepts orch-log.subscribe', () => {
+    const msg = { type: 'orch-log.subscribe', runId: 'r1', jobId: 'j1' };
+    expect(browserToPlatformMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts orch-log.unsubscribe', () => {
+    const msg = { type: 'orch-log.unsubscribe', runId: 'r1', jobId: 'j1' };
+    expect(browserToPlatformMessageSchema.parse(msg)).toEqual(msg);
+  });
+
   it('accepts status.subscribe', () => {
     const msg = { type: 'status.subscribe', scope: 'org', orgId: 'org-1' };
     expect(browserToPlatformMessageSchema.parse(msg)).toEqual(msg);
@@ -405,6 +415,28 @@ describe('platformToBrowserMessageSchema', () => {
 
   it('accepts auth.failure', () => {
     const msg = { type: 'auth.failure', reason: 'expired' };
+    expect(platformToBrowserMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts orch-log.lines (live form with phase + ts)', () => {
+    const msg = {
+      type: 'orch-log.lines',
+      runId: 'r1',
+      jobId: 'j1',
+      phase: 'provisioning',
+      lines: ['Provisioning agent'],
+      ts: 1234,
+    };
+    expect(platformToBrowserMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts orch-log.lines (backfill form without phase/ts)', () => {
+    const msg = {
+      type: 'orch-log.lines',
+      runId: 'r1',
+      jobId: 'j1',
+      lines: ['{"ts":1,"phase":"dispatch","message":"queued"}'],
+    };
     expect(platformToBrowserMessageSchema.parse(msg)).toEqual(msg);
   });
 

@@ -9,7 +9,12 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 
-import { EventEmitter, type WorkflowCompleteData, type JobCompleteData } from './event-emitter.js';
+import {
+  EventEmitter,
+  type WorkflowCompleteData,
+  type WorkflowsFailedBatchData,
+  type JobCompleteData,
+} from './event-emitter.js';
 import type { EventRouter } from './event-router.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
@@ -25,6 +30,42 @@ function createMockRouter() {
 // ── Tests ────────────────────────────────────────────────────────
 
 describe('EventEmitter', () => {
+  describe('emitWorkflowsFailedBatch', () => {
+    it('should emit __workflows_failed_batch targeting the registration with the run list', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const data: WorkflowsFailedBatchData = {
+        routingKey: 'github:42',
+        repo: 'owner/repo',
+        registrationId: 'reg-notifier',
+        total: 3,
+        runs: [
+          { runId: 'run-1', repo: 'owner/repo', workflowName: 'CI', failureClass: 'step_failure' },
+          { runId: 'run-2', repo: 'owner/repo', workflowName: 'CI' },
+          { runId: 'run-3', repo: 'owner/repo', workflowName: 'Deploy' },
+        ],
+      };
+
+      const eventId = await emitter.emitWorkflowsFailedBatch(data);
+
+      expect(eventId).toBe('evt-sys-001');
+      expect(router.emit).toHaveBeenCalledWith({
+        eventName: '__workflows_failed_batch',
+        payload: {
+          registrationId: 'reg-notifier',
+          total: 3,
+          runs: data.runs,
+          sourceRepo: 'owner/repo',
+          sourceRoutingKey: 'github:42',
+        },
+        sourceRepo: 'owner/repo',
+        sourceRoutingKey: 'github:42',
+        chainDepth: 0,
+      });
+    });
+  });
+
   describe('emitWorkflowComplete', () => {
     it('should emit __workflow_complete with correct event name and payload', async () => {
       const router = createMockRouter();

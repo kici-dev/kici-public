@@ -1,7 +1,15 @@
+# DHI base-image registry prefix. Default `dhi.io` keeps staging / local / dev
+# builds pulling the upstream Docker Hardened Image verbatim; the prod publish
+# (`packages/ci/src/publish-images.ts`) overrides it to the byte-locked
+# `<ECR>/dhi` namespace via `--build-arg DHI_PREFIX=<ecr>/dhi`. Declared before
+# the first FROM so this one global ARG resolves every `FROM ${DHI_PREFIX}/…`
+# stage below (standard Docker global-ARG semantics).
+ARG DHI_PREFIX=dhi.io
+
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile in the usual pnpm flow). DHI ships ca-certificates
 # in both variants by default, so no apt-get for certs is needed.
-FROM dhi.io/node:24.18.0-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin matches the root package.json `packageManager` field and
@@ -32,6 +40,18 @@ COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
 # container build — the host's own .npmrc is unchanged.
 RUN printf '\nnetwork-concurrency=6\nfetch-retries=6\nfetch-timeout=120000\n' >> .npmrc
 
+# Route the in-container install through a Verdaccio pull-through cache when the
+# build passes KICI_NPM_REGISTRY (e.g. http://verdaccio.local:4873/, set by the
+# E2E deploy when Verdaccio is reachable). Empty — the default / production
+# build — leaves the default registry as npmjs, unchanged. The copied .npmrc
+# already scopes @kici-dev to Verdaccio; this additionally routes the public
+# tree through Verdaccio so cached tarballs are served from its disk instead of
+# re-downloaded from npmjs on every build-layer cache miss.
+ARG KICI_NPM_REGISTRY=
+RUN if [ -n "$KICI_NPM_REGISTRY" ]; then \
+      printf '\nregistry=%s\n' "$KICI_NPM_REGISTRY" >> .npmrc; \
+    fi
+
 # Copy package.json files for dependency resolution
 COPY packages/orchestrator/package.json packages/orchestrator/
 COPY packages/core/package.json packages/core/
@@ -44,6 +64,9 @@ RUN pnpm install --frozen-lockfile --filter @kici-dev/orchestrator... --filter .
 
 # Copy build scripts and source code
 COPY scripts/build-ts.mjs scripts/build-service.mjs scripts/
+# The whole directory, not the one helper the build scripts import today: a file
+# list here rots silently, and the build only fails once it is already running.
+COPY scripts/lib/ scripts/lib/
 COPY packages/core/ packages/core/
 COPY packages/shared/ packages/shared/
 COPY packages/engine/ packages/engine/
@@ -69,7 +92,7 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts \
 # binary + its shared-library closure into the distroless runtime. The runtime
 # stays distroless (no apt/shell/perl); nft is the only host tool it needs
 # (agent network isolation, requires --cap-add=NET_ADMIN at runtime).
-FROM dhi.io/node:24.18.0-0-debian13-dev AS nft
+FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev AS nft
 RUN apt-get update \
   && apt-get install -y --no-install-recommends nftables \
   && rm -rf /var/lib/apt/lists/*
@@ -81,6 +104,15 @@ RUN apt-get update \
 # no hardcoded triplet, and the list self-maintains if nft's deps change.
 # libc.so.6 + the dynamic loader are excluded: they already ship with the Node
 # runtime base. cp -L dereferences the SONAME symlinks to copy the real files.
+#
+# Each lib's DIRECTORY is canonicalised to its usr-merged realpath (`readlink
+# -f` on the dir only — the SONAME basename is preserved) so the staging rootfs
+# holds only real `/usr/lib/...` + `/usr/sbin/...` paths, never the `/lib`→
+# `/usr/lib` usr-merge symlink. The final `COPY --from=nft /nft-rootfs/ /` then
+# lands on directories that exist as real dirs in the distroless base: docker
+# BuildKit refuses to copy a directory over the base's `/lib` symlink
+# ("cannot copy to non-directory") where podman/buildah would follow it, so
+# staging on `/usr/lib` keeps the image buildable under both build engines.
 RUN set -eux; \
     mkdir -p /nft-rootfs/usr/sbin; \
     cp /usr/sbin/nft /nft-rootfs/usr/sbin/nft; \
@@ -90,14 +122,15 @@ RUN set -eux; \
       | sort -u \
       | while IFS= read -r lib; do \
           [ -e "$lib" ] || continue; \
-          mkdir -p "/nft-rootfs$(dirname "$lib")"; \
-          cp -L "$lib" "/nft-rootfs$lib"; \
+          dir="$(readlink -f "$(dirname "$lib")")"; \
+          mkdir -p "/nft-rootfs$dir"; \
+          cp -L "$lib" "/nft-rootfs$dir/$(basename "$lib")"; \
         done
 
 # Stage 3: Runtime (distroless -debian13 — no apt, no shell, no perl). The nft
 # binary + its shared-library closure are COPYed from the nft extractor stage;
 # libc + the dynamic loader already ship with the Node base.
-FROM dhi.io/node:24.18.0-0-debian13
+FROM ${DHI_PREFIX}/node:24.18.0-0-debian13
 WORKDIR /app
 
 # nft binary + its shared-library closure, staged at arch-correct absolute

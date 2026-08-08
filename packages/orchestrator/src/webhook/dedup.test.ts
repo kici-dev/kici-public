@@ -232,4 +232,33 @@ describe('DedupCache', () => {
       expect(db.selectFrom).not.toHaveBeenCalled();
     });
   });
+
+  describe('cluster_settings webhook_dedup_ttl_ms', () => {
+    it('uses the cluster override TTL for a marked entry', async () => {
+      const overrideDb = createMockDb();
+      const clusterSettings = {
+        getNumber: async (_col: string, _fallback: number) => 5_000, // 5s override
+      } as never;
+      const overrideDedup = new DedupCache(overrideDb, {
+        clusterSettings,
+        defaultTtlMs: 86_400_000,
+      });
+      const before = Date.now();
+      await overrideDedup.mark('ttl-override-001');
+      const stored = overrideDb._store.get('ttl-override-001')!;
+      expect(new Date(stored.expires_at).getTime()).toBeLessThanOrEqual(before + 6_000);
+    });
+
+    it('falls back to the config default TTL when the cluster value is null', async () => {
+      const fallbackDb = createMockDb();
+      const clusterSettings = {
+        getNumber: async (_col: string, fallback: number) => fallback,
+      } as never;
+      const fallbackDedup = new DedupCache(fallbackDb, { clusterSettings, defaultTtlMs: 90_000 });
+      const before = Date.now();
+      await fallbackDedup.mark('ttl-fallback-001');
+      const stored = fallbackDb._store.get('ttl-fallback-001')!;
+      expect(new Date(stored.expires_at).getTime()).toBeGreaterThanOrEqual(before + 90_000);
+    });
+  });
 });

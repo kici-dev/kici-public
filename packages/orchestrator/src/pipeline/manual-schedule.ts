@@ -10,41 +10,20 @@
  * correlation to return the newRunId to the dashboard.
  */
 
-import { randomUUID } from 'node:crypto';
 import { createLogger } from '@kici-dev/shared';
-import {
-  isLockStaticJob,
-  materializeFanout,
-  matrixEnvelopeFields,
-  partitionMatchers,
-  resolveScheduleInputs,
-} from '@kici-dev/engine';
+import { isLockStaticJob, matrixEnvelopeFields, resolveScheduleInputs } from '@kici-dev/engine';
 import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 import type { RerunDeps } from './rerun.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
-import type { QueuedJobInput } from '../queue/job-queue.js';
-import type { JobToRoute, RunContext } from '../cluster/coordinator.js';
+import type { RunContext } from '../cluster/coordinator.js';
+import { routeOrDispatchJobs, registerDispatchedJobs } from './route-or-dispatch-jobs.js';
 import { claimRequestId } from './request-idempotency.js';
 
 const logger = createLogger({ prefix: 'manual-schedule' });
 
-const ROUTE_JOBS_TIMEOUT_MS = 30_000;
-
 interface ManualScheduleDeps extends RerunDeps {
   registrationIndex: RegistrationIndex;
-}
-
-interface DispatchedJobEntry {
-  jobId: string;
-  jobName: string;
-  matrixValues?: Record<string, unknown>;
-  runsOnLabels?: string[];
-}
-
-interface RejectedJobEntry {
-  jobId: string;
-  reason: string;
 }
 
 interface ValidatedRequest {
@@ -92,7 +71,6 @@ export async function handleManualSchedule(
   });
 
   const staticJobs = workflow.jobs.filter(isLockStaticJob);
-  const materializedJobs = materializeFanout(staticJobs).jobs;
   const repoUrl = resolveRepoUrl(registration, deps);
 
   await recordExecutionStart({
@@ -106,18 +84,52 @@ export async function handleManualSchedule(
     deps,
   });
 
-  const { dispatchedJobs, rejectedJobs } = await dispatchScheduledJobs({
-    newRunId,
-    materializedJobs,
-    workflow,
-    registration,
-    commitSha,
+  const installationId =
+    typeof (registration.providerContext as { installationId?: unknown }).installationId ===
+    'number'
+      ? ((registration.providerContext as { installationId: number }).installationId as number)
+      : undefined;
+
+  const runContext: RunContext = {
+    runId: newRunId,
+    deliveryId: `manual_schedule:${newRunId}`,
+    routingKey: registration.routingKey,
+    event: 'manual_schedule',
+    action: null,
     provider,
+    payload: {},
+    repoIdentifier: registration.repoIdentifier,
+    sha: commitSha,
+    ref: '',
+    workflowName: workflow.name,
+    ...(installationId !== undefined && { installationId }),
+  };
+
+  const { dispatchedJobs, rejectedJobs } = await routeOrDispatchJobs({
+    newRunId,
+    staticJobs,
+    workflowName: workflow.name,
     repoUrl,
-    deps,
+    ref: '',
+    sha: commitSha,
+    deliveryId: `manual_schedule:${newRunId}`,
+    provider,
+    providerContext: registration.providerContext as Record<string, unknown>,
+    routingKey: registration.routingKey,
+    runContext,
+    buildJobConfig: (mat) => buildManualJobConfig(workflow, mat),
+    logger,
+    label: 'Manual schedule',
+    coordinator: deps.coordinator,
+    dispatcher: deps.dispatcher,
   });
 
-  await registerJobsWithTracker({ newRunId, dispatchedJobs, rejectedJobs, deps });
+  await registerDispatchedJobs({
+    newRunId,
+    dispatchedJobs,
+    rejectedJobs,
+    executionTracker: deps.executionTracker,
+  });
   await emitScheduleEvent({ newRunId, workflow, registration, triggeredBy, deps });
 
   return { newRunId };
@@ -157,14 +169,37 @@ function resolveRepoUrl(registration: RegisteredWorkflow, deps: ManualScheduleDe
   return providerBundle?.repoUrlBuilder?.buildCloneUrl(registration.repoIdentifier) ?? '';
 }
 
+/**
+ * A manual "fire now" targets no specific schedule, so merge the declared
+ * default inputs across ALL of the workflow's schedule triggers (later triggers
+ * win on key collision) rather than arbitrarily taking the first. Returns
+ * undefined when no schedule declares resolvable inputs.
+ */
+export function mergeScheduleInputs(
+  scheduleTriggers: LockScheduleTrigger[],
+): Record<string, unknown> | undefined {
+  const merged: Record<string, unknown> = {};
+  let any = false;
+  for (const trigger of scheduleTriggers) {
+    const resolved = resolveScheduleInputs(trigger.inputs);
+    if (resolved) {
+      Object.assign(merged, resolved);
+      any = true;
+    }
+  }
+  return any ? merged : undefined;
+}
+
 export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
   const job = mat.lockJob;
-  // A schedule fire carries no operator input — resolve the trigger's declared
-  // defaults so steps and rules see them as ctx.dispatchInputs.
-  const scheduleTrigger = workflow.triggers.find(
+  // A schedule fire carries no operator input — resolve the declared defaults
+  // so steps and rules see them as ctx.dispatchInputs. A workflow may declare
+  // several schedule() triggers; a manual fire targets none in particular, so
+  // merge every schedule's defaults rather than only the first.
+  const scheduleTriggers = workflow.triggers.filter(
     (t): t is LockScheduleTrigger => t._type === 'schedule',
   );
-  const dispatchInputs = resolveScheduleInputs(scheduleTrigger?.inputs);
+  const dispatchInputs = mergeScheduleInputs(scheduleTriggers);
   return {
     source: workflow.source,
     workflowName: workflow.name,
@@ -238,239 +273,6 @@ async function recordExecutionStart(args: {
     undefined, // triggerActorUserId
     triggeredByAgentLabel, // triggeredByAgentLabel
   );
-}
-
-/**
- * Coordinator-routed (cluster mode) or direct (standalone) dispatch.
- * The coordinator tries local dispatch first, then reroutes to peers whose
- * scalers can satisfy the labels. Without this, a manual trigger handled by
- * a peer that can't spawn the requested label sits in dispatch_queue forever.
- */
-async function dispatchScheduledJobs(args: {
-  newRunId: string;
-  materializedJobs: MaterializedJob[];
-  workflow: LockWorkflow;
-  registration: RegisteredWorkflow;
-  commitSha: string;
-  provider: string;
-  repoUrl: string;
-  deps: ManualScheduleDeps;
-}): Promise<{ dispatchedJobs: DispatchedJobEntry[]; rejectedJobs: RejectedJobEntry[] }> {
-  const coordResult = await tryRouteViaCoordinator(args);
-  if (coordResult) {
-    return { dispatchedJobs: coordResult, rejectedJobs: [] };
-  }
-  return dispatchDirectly(args);
-}
-
-async function tryRouteViaCoordinator(args: {
-  newRunId: string;
-  materializedJobs: MaterializedJob[];
-  workflow: LockWorkflow;
-  registration: RegisteredWorkflow;
-  commitSha: string;
-  provider: string;
-  repoUrl: string;
-  deps: ManualScheduleDeps;
-}): Promise<DispatchedJobEntry[] | null> {
-  const { newRunId, materializedJobs, workflow, registration, commitSha, provider, repoUrl, deps } =
-    args;
-  if (!deps.coordinator || materializedJobs.length === 0) {
-    return null;
-  }
-
-  const matrixByName = new Map<string, Record<string, unknown>>();
-  for (const mj of materializedJobs) {
-    if (mj.variantValues) matrixByName.set(mj.expandedName, mj.variantValues);
-  }
-
-  const installationId =
-    typeof (registration.providerContext as { installationId?: unknown }).installationId ===
-    'number'
-      ? ((registration.providerContext as { installationId: number }).installationId as number)
-      : undefined;
-
-  const jobsToRoute: JobToRoute[] = materializedJobs.map((mat) => {
-    const job = mat.lockJob;
-    const runsOnSel = partitionMatchers(job.runsOn ?? []);
-    const excludeSel = partitionMatchers(job.excludeLabels ?? []);
-    return {
-      jobName: mat.expandedName,
-      runsOnLabels: [runsOnSel.exact],
-      runsOnPatterns: runsOnSel.regex,
-      excludeLabels: excludeSel.exact,
-      excludePatterns: excludeSel.regex,
-      jobConfig: buildManualJobConfig(workflow, mat),
-      repoUrl,
-      ref: '',
-      sha: commitSha,
-      ...(job.resources && { resources: job.resources }),
-    };
-  });
-
-  const runCtx: RunContext = {
-    runId: newRunId,
-    deliveryId: `manual_schedule:${newRunId}`,
-    routingKey: registration.routingKey,
-    event: 'manual_schedule',
-    action: null,
-    provider,
-    payload: {},
-    repoIdentifier: registration.repoIdentifier,
-    sha: commitSha,
-    ref: '',
-    workflowName: workflow.name,
-    ...(installationId !== undefined && { installationId }),
-  };
-
-  const routeResult = await Promise.race([
-    deps.coordinator.routeJobs(runCtx, jobsToRoute),
-    new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`routeJobs timed out after ${ROUTE_JOBS_TIMEOUT_MS}ms`)),
-        ROUTE_JOBS_TIMEOUT_MS,
-      ),
-    ),
-  ]).catch((err: unknown) => {
-    logger.warn(
-      'Coordinator routing timed out for manual schedule, falling back to direct dispatch',
-      {
-        newRunId,
-        workflow: workflow.name,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    );
-    return null;
-  });
-
-  if (!routeResult) {
-    return null;
-  }
-
-  const dispatchedJobs: DispatchedJobEntry[] = routeResult.localJobs.map((local) => {
-    const job = materializedJobs.find((m) => m.expandedName === local.jobName)?.lockJob;
-    const runsOnLabels = job ? partitionMatchers(job.runsOn ?? []).exact : undefined;
-    const matrixValues = matrixByName.get(local.jobName);
-    return {
-      jobId: local.jobId,
-      jobName: local.jobName,
-      ...(matrixValues && { matrixValues }),
-      runsOnLabels,
-    };
-  });
-
-  for (const rerouted of routeResult.reroutedJobs) {
-    logger.info('Manual schedule job rerouted to peer', {
-      newRunId,
-      workflow: workflow.name,
-      job: rerouted.jobName,
-      peerId: rerouted.peerId,
-    });
-  }
-  for (const failed of routeResult.failedJobs) {
-    logger.warn('Manual schedule job routing failed', {
-      newRunId,
-      workflow: workflow.name,
-      job: failed.jobName,
-      reason: failed.reason,
-    });
-  }
-
-  return dispatchedJobs;
-}
-
-/**
- * Standalone mode OR coordinator timeout: direct dispatch locally.
- */
-async function dispatchDirectly(args: {
-  newRunId: string;
-  materializedJobs: MaterializedJob[];
-  workflow: LockWorkflow;
-  registration: RegisteredWorkflow;
-  commitSha: string;
-  provider: string;
-  repoUrl: string;
-  deps: ManualScheduleDeps;
-}): Promise<{ dispatchedJobs: DispatchedJobEntry[]; rejectedJobs: RejectedJobEntry[] }> {
-  const { newRunId, materializedJobs, workflow, registration, commitSha, provider, repoUrl, deps } =
-    args;
-  const dispatchedJobs: DispatchedJobEntry[] = [];
-  const rejectedJobs: RejectedJobEntry[] = [];
-
-  for (const mat of materializedJobs) {
-    const job = mat.lockJob;
-    const matrixValues = mat.variantValues;
-    const runsOnSel = partitionMatchers(job.runsOn ?? []);
-    const excludeSel = partitionMatchers(job.excludeLabels ?? []);
-    const runsOnLabels = runsOnSel.exact;
-    const jobInput: QueuedJobInput = {
-      runId: newRunId,
-      workflowName: workflow.name,
-      jobName: mat.expandedName,
-      runsOnLabels,
-      runsOnPatterns: runsOnSel.regex,
-      excludeLabels: excludeSel.exact,
-      excludePatterns: excludeSel.regex,
-      jobConfig: buildManualJobConfig(workflow, mat),
-      repoUrl,
-      ref: '',
-      sha: commitSha,
-      deliveryId: `manual_schedule:${newRunId}`,
-      provider,
-      providerContext: registration.providerContext,
-      routingKey: registration.routingKey,
-    };
-
-    const result = await deps.dispatcher.dispatch(jobInput);
-    if (result.status === 'rejected') {
-      const syntheticId = `rejected-${randomUUID()}`;
-      dispatchedJobs.push({
-        jobId: syntheticId,
-        jobName: mat.expandedName,
-        ...(matrixValues && { matrixValues }),
-        runsOnLabels,
-      });
-      rejectedJobs.push({ jobId: syntheticId, reason: result.reason });
-    } else {
-      dispatchedJobs.push({
-        jobId: result.jobId,
-        jobName: mat.expandedName,
-        ...(matrixValues && { matrixValues }),
-        runsOnLabels,
-      });
-    }
-
-    logger.info('Manual schedule job dispatched', {
-      newRunId,
-      workflow: workflow.name,
-      job: mat.expandedName,
-      status: result.status,
-    });
-  }
-
-  return { dispatchedJobs, rejectedJobs };
-}
-
-async function registerJobsWithTracker(args: {
-  newRunId: string;
-  dispatchedJobs: DispatchedJobEntry[];
-  rejectedJobs: RejectedJobEntry[];
-  deps: ManualScheduleDeps;
-}): Promise<void> {
-  const { newRunId, dispatchedJobs, rejectedJobs, deps } = args;
-  if (dispatchedJobs.length === 0) {
-    return;
-  }
-
-  await deps.executionTracker.addJobsToRun(newRunId, dispatchedJobs);
-
-  // Mark rejected jobs as failed (standalone-fallback path only — the coordinator
-  // logs failed jobs separately and does not produce synthetic rejected IDs).
-  for (const { jobId, reason } of rejectedJobs) {
-    await deps.executionTracker.onJobStatus(newRunId, jobId, 'failed', Date.now(), undefined, {
-      error: reason,
-    });
-  }
 }
 
 async function emitScheduleEvent(args: {

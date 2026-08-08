@@ -9,7 +9,9 @@
  * the admin auth middleware in admin.ts.
  */
 import { Hono } from 'hono';
+import { OrchestratorMode } from '@kici-dev/engine';
 import type { SourceStore } from '../sources/source-store.js';
+import { OBSERVED_GITHUB_APP_SOURCE_ERROR } from '../sources/source-manager.js';
 import { validateGitHubSource } from '../sources/source-validator.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
@@ -17,6 +19,7 @@ import type { Role } from '../secrets/rbac.js';
 import { fetchGithubAppIdentity } from '../providers/github/manifest.js';
 import {
   refreshGithubSourceIdentity,
+  refreshResolvedGithubSource,
   type FetchGithubAppIdentity,
   type RefreshResult,
 } from '../github-app-name-refresher/github-app-name-refresher.js';
@@ -51,6 +54,12 @@ interface SourceRouteDeps {
    * `source refresh` route.
    */
   fetchAppIdentity?: FetchGithubAppIdentity;
+  /**
+   * Orchestrator operating mode. `observed` refuses GitHub-App source creation:
+   * those sources are ingested through the Platform relay, and an observed
+   * orchestrator never accepts a relay. Omitted (undefined) behaves as before.
+   */
+  mode?: OrchestratorMode;
 }
 
 type AdminSourcesEnv = {
@@ -77,6 +86,12 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
 
       if (!provider || !name || !appId || !privateKey) {
         return c.json({ error: 'Missing required fields: provider, name, appId, privateKey' }, 400);
+      }
+
+      // GitHub-App sources are Platform-relayed by construction; an observed
+      // orchestrator ingests only its own webhooks, so it must not hold one.
+      if (provider === 'github' && deps.mode === OrchestratorMode.enum.observed) {
+        return c.json({ error: OBSERVED_GITHUB_APP_SOURCE_ERROR }, 400);
       }
 
       // For GitHub sources, GitHub is the source of truth for the stored name +
@@ -192,7 +207,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
   // PATCH /api/v1/admin/sources/:routingKey -- update a source
   app.patch('/sources/:routingKey', async (c) => {
     try {
-      const routingKey = decodeURIComponent(c.req.param('routingKey'));
+      const routingKey = c.req.param('routingKey');
       const denied = enforceRoutingKeyScope(c, routingKey);
       if (denied) return denied;
       const body = await c.req.json();
@@ -235,16 +250,14 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
       const denied = requireUnscopedToken(c);
       if (denied) return denied;
       const all = await deps.sourceStore.listSources();
-      const githubKeys = all.filter((s) => s.provider === 'github').map((s) => s.routing_key);
+      const githubSources = all.filter((s) => s.provider === 'github');
       const results: RefreshResult[] = [];
       const errors: Array<{ routingKey: string; error: string }> = [];
-      for (const routingKey of githubKeys) {
+      for (const row of githubSources) {
         try {
-          results.push(
-            await refreshGithubSourceIdentity(deps.sourceStore, routingKey, fetchAppIdentity),
-          );
+          results.push(await refreshResolvedGithubSource(deps.sourceStore, row, fetchAppIdentity));
         } catch (err) {
-          errors.push({ routingKey, error: toErrorMessage(err) });
+          errors.push({ routingKey: row.routing_key, error: toErrorMessage(err) });
         }
       }
       return c.json({ results, errors });
@@ -259,7 +272,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
   // fires the `sources_change` trigger, which re-registers to the Platform.
   app.post('/sources/:routingKey/refresh', async (c) => {
     try {
-      const routingKey = decodeURIComponent(c.req.param('routingKey'));
+      const routingKey = c.req.param('routingKey');
       const denied = enforceRoutingKeyScope(c, routingKey);
       if (denied) return denied;
       const result = await refreshGithubSourceIdentity(
@@ -280,7 +293,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
   // GET /api/v1/admin/sources/:routingKey/webhook-secret -- get webhook secret for a source
   app.get('/sources/:routingKey/webhook-secret', async (c) => {
     try {
-      const routingKey = decodeURIComponent(c.req.param('routingKey'));
+      const routingKey = c.req.param('routingKey');
       const denied = enforceRoutingKeyScope(c, routingKey);
       if (denied) return denied;
       const source = await deps.sourceStore.getSourceWithSecrets(routingKey);
@@ -299,7 +312,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminSourcesEnv>
   // DELETE /api/v1/admin/sources/:routingKey -- remove a source
   app.delete('/sources/:routingKey', async (c) => {
     try {
-      const routingKey = decodeURIComponent(c.req.param('routingKey'));
+      const routingKey = c.req.param('routingKey');
       const denied = enforceRoutingKeyScope(c, routingKey);
       if (denied) return denied;
       await deps.sourceStore.removeSource(routingKey);

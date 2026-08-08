@@ -316,5 +316,15 @@ function parseGenericVerificationConfig(
     }
     case 'none':
       return { method: 'none' };
+    default: {
+      // Compile-time exhaustiveness: a new VerificationMethod added to the union
+      // without a case here fails to build. Runtime guard: verification_method is a
+      // runtime DB-string cast, so an out-of-union value throws — the caller's
+      // try/catch maps it to rejected_misconfigured instead of returning undefined
+      // (which would then be dereferenced outside the try/catch and break the
+      // never-throws contract).
+      const _exhaustive: never = method;
+      throw new Error(`unsupported verification_method: ${String(_exhaustive)}`);
+    }
   }
 }

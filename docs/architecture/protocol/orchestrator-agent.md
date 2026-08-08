@@ -7,6 +7,25 @@ This layer carries job dispatch commands and execution status reports between cu
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
 
+## Error fields never carry raw exception text
+
+Nine orchestrator-to-agent fields describe a failure in free text: `error` on `event.emit.response`, `agent.api.response`, `artifacts.upload.response` and `artifacts.download.response`, and `reason` on `step.approval-resolved`, `artifacts.upload.complete.ack`, `auth.failure`, `job.cancel` and `job.concurrency.ack`.
+
+None of them ever carries the text of an orchestrator exception. The rule is the same in every family:
+
+- A failure the workflow author can act on — an unknown job context, a rejected upload name, an approver's decline note, an expired approval window — rides the orchestrator's own return value with fixed, author-facing wording. It stays specific enough to fix the workflow without operator log access.
+- An internal failure is recorded in the orchestrator's own logs with the full exception, and the agent receives a safe fixed string that classifies the failure without naming any infrastructure.
+
+The reason is the trust boundary: the agent executes customer workflow code, and whatever these fields carry is readable by that code and persisted into the author's step logs. Raw exception text there would disclose database and storage endpoints, constraint names and internal identifiers to anyone who can write a workflow.
+
+A new orchestrator-to-agent failure field inherits this rule; it does not need its own entry here.
+
+## Job dispatch and lifecycle messages
+
+These messages carry job dispatch and cancellation, agent registration, and the status, log and heartbeat reports an agent sends back while it executes.
+
+> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
+
 ### Orchestrator -> Agent
 
 #### job.dispatch
@@ -83,13 +102,14 @@ Cancels a running or queued job on the agent.
 
 Acknowledges agent registration and sends confirmed config back to the agent. The agent transitions to `registered` state only after receiving this message (with a 10s fallback for backward compatibility with older orchestrators).
 
-| Field           | Type             | Required | Description                                                                                                                                                                                                                                                                                                                                                |
-| --------------- | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type            | `"register.ack"` | Yes      | Message discriminator                                                                                                                                                                                                                                                                                                                                      |
-| agentId         | string           | Yes      | Confirmed agent identifier                                                                                                                                                                                                                                                                                                                                 |
-| labels          | string[]         | Yes      | Confirmed capability labels                                                                                                                                                                                                                                                                                                                                |
-| scalerManaged   | boolean          | No       | Whether agent is managed by auto-scaler (default: `false`)                                                                                                                                                                                                                                                                                                 |
-| pendingDispatch | boolean          | No       | When set, the orchestrator's scaler bound a specific queued job to this agent at spawn time and the `job.dispatch` message is in flight. Scaler-managed agents that see this flag must not arm the short `KICI_SCALER_IDLE_TIMEOUT` timer on register — the `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` safety net still applies if the dispatch never arrives. |
+| Field           | Type             | Required | Description                                                                                                                                                                                                                                                                                                                                                 |
+| --------------- | ---------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type            | `"register.ack"` | Yes      | Message discriminator                                                                                                                                                                                                                                                                                                                                       |
+| agentId         | string           | Yes      | Confirmed agent identifier                                                                                                                                                                                                                                                                                                                                  |
+| labels          | string[]         | Yes      | Confirmed capability labels                                                                                                                                                                                                                                                                                                                                 |
+| scalerManaged   | boolean          | No       | Whether agent is managed by auto-scaler (default: `false`)                                                                                                                                                                                                                                                                                                  |
+| pendingDispatch | boolean          | No       | When set, the orchestrator's scaler bound a specific queued job to this agent at spawn time and the `job.dispatch` message is in flight. Scaler-managed agents that see this flag must not arm the short `KICI_SCALER_IDLE_TIMEOUT` timer on register — the `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` safety net still applies if the dispatch never arrives.  |
+| capabilities    | object           | No       | Optional agent-facing capabilities this orchestrator supports (absent on orchestrators that predate capability advertisement). Every flag is optional and absent means unsupported, so a newer agent falls back to the unnegotiated behavior. Today: `artifactCompleteAck` — the orchestrator acks [`artifacts.upload.complete`](#artifactsuploadcomplete). |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `registerAckSchema`
 
@@ -143,19 +163,35 @@ Periodic capacity update. Tells the orchestrator how many job slots are availabl
 
 Reports a job execution state transition. Sent at each lifecycle boundary (queued, running, success, failed, etc.).
 
-| Field         | Type                                                          | Required | Description                                                                                                                                         |
-| ------------- | ------------------------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type          | `"job.status"`                                                | Yes      | Message discriminator                                                                                                                               |
-| messageId     | string                                                        | Yes      | Unique message ID                                                                                                                                   |
-| runId         | string                                                        | Yes      | Execution run ID                                                                                                                                    |
-| jobId         | string                                                        | Yes      | Job ID within the run                                                                                                                               |
-| state         | enum                                                          | Yes      | One of: `pending`, `queued`, `running`, `recovering`, `cancelling`, `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped` |
-| timestamp     | number                                                        | Yes      | Unix timestamp (milliseconds)                                                                                                                       |
-| data          | Record<string, unknown>                                       | No       | Optional state-specific data (error messages, timing, etc.)                                                                                         |
-| droppedJobs   | string[]                                                      | No       | Job names dropped by determinism drift (agent re-eval produced fewer jobs than expected)                                                            |
-| secretOutputs | Record<string, { agentPublicKey: string, encrypted: string }> | No       | Encrypted secret outputs from agent (present on job success when secret outputs exist)                                                              |
+| Field         | Type                                                          | Required | Description                                                                                                                                                       |
+| ------------- | ------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type          | `"job.status"`                                                | Yes      | Message discriminator                                                                                                                                             |
+| messageId     | string                                                        | Yes      | Unique message ID                                                                                                                                                 |
+| runId         | string                                                        | Yes      | Execution run ID                                                                                                                                                  |
+| jobId         | string                                                        | Yes      | Job ID within the run                                                                                                                                             |
+| state         | enum                                                          | Yes      | One of: `pending`, `queued`, `running`, `recovering`, `cancelling`, `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` |
+| timestamp     | number                                                        | Yes      | Unix timestamp (milliseconds)                                                                                                                                     |
+| data          | Record<string, unknown>                                       | No       | Optional state-specific data (error messages, timing, etc.)                                                                                                       |
+| droppedJobs   | string[]                                                      | No       | Job names dropped by determinism drift (agent re-eval produced fewer jobs than expected)                                                                          |
+| secretOutputs | Record<string, { agentPublicKey: string, encrypted: string }> | No       | Encrypted secret outputs from agent (present on job success when secret outputs exist)                                                                            |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `jobStatusSchema`
+
+`job.status` (and `step.status` below) ride the agent's durable send path: when the
+WebSocket is down or the agent has not yet re-registered, the frame is enqueued in
+the agent's reconnect buffer and replayed after `register.ack`, in order, ahead of
+new frames. A terminal transition (`success`/`failed`/`cancelled`) reported the
+instant the connection drops is therefore delivered on reconnect rather than lost —
+the same replay guarantee log lines have. The orchestrator treats a re-delivered
+terminal frame idempotently (a completed dispatch row is not reopened). Only
+connection-liveness frames like `job.heartbeat` remain unbuffered.
+
+The upstream tier closes the complementary gap: if a run's terminal transition is
+lost on a still-live connection (never disconnected, so no reconnect replay
+fires), a periodic reconciliation sweep re-reads the run's current state from the
+owning orchestrator and settles the run. A run therefore reaches its terminal
+state even when the deciding frame is dropped mid-flight, not only when the
+connection drops and reconnects.
 
 #### job.ack
 
@@ -221,15 +257,16 @@ Reports a step-level execution state transition. Sent for each step within a job
 
 Streams log output from step execution to the orchestrator. The orchestrator may forward these upstream for dashboard display.
 
-| Field     | Type          | Required | Description                   |
-| --------- | ------------- | -------- | ----------------------------- |
-| type      | `"log.chunk"` | Yes      | Message discriminator         |
-| messageId | string        | Yes      | Unique message ID             |
-| runId     | string        | Yes      | Execution run ID              |
-| jobId     | string        | Yes      | Job ID within the run         |
-| stepIndex | number        | Yes      | Zero-based step index         |
-| lines     | string[]      | Yes      | Array of log output lines     |
-| timestamp | number        | Yes      | Unix timestamp (milliseconds) |
+| Field     | Type          | Required | Description                                                                              |
+| --------- | ------------- | -------- | ---------------------------------------------------------------------------------------- |
+| type      | `"log.chunk"` | Yes      | Message discriminator                                                                    |
+| messageId | string        | Yes      | Unique message ID                                                                        |
+| runId     | string        | Yes      | Execution run ID                                                                         |
+| jobId     | string        | Yes      | Job ID within the run                                                                    |
+| stepIndex | number        | Yes      | Zero-based step index                                                                    |
+| lines     | string[]      | Yes      | Array of log output lines                                                                |
+| timestamp | number        | Yes      | Unix timestamp (milliseconds)                                                            |
+| stream    | enum          | No       | Stream these lines came from: `stdout`, `stderr`. Absent (older agent) reads as `stdout` |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentLogChunkSchema`
 
@@ -309,6 +346,8 @@ Response confirming event delivery. Contains either a `deliveryId` on success or
 | requestId  | string                  | Yes      | Correlates to the original `event.emit` requestId |
 | deliveryId | string                  | No       | Delivery ID assigned by orchestrator (on success) |
 | error      | string                  | No       | Error description (on failure)                    |
+
+`error` is either a deliberate author-facing reason — an unknown job context — or a safe fixed string classifying an internal failure. It is never raw exception text.
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `eventEmitResponseSchema`
 
@@ -425,7 +464,7 @@ Return the pre-signed upload URL, or signal `skip` when the immutable key alread
 
 ## Provenance attestation messages
 
-These messages mirror the cache-upload handshake for build provenance bundles: the agent requests a pre-signed PUT URL keyed by the artifact's subject digest, uploads the attestation directly to object storage, then confirms completion so the orchestrator records an attestations row.
+These messages mirror the cache-upload handshake for build provenance bundles: the agent requests a pre-signed PUT URL keyed by the artifact's subject digest, uploads the attestation directly to object storage, then confirms completion so the orchestrator records an attestations row. When the signed statement cannot be minted at build time, the agent instead sends `provenance.upload.defer` carrying the frozen DSSE envelope so the mint can complete later.
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
 
@@ -455,6 +494,23 @@ Confirm a provenance bundle upload so the orchestrator records an attestations r
 | subjectDigest | string                         | Yes      | Primary subject digest (lowercase hex) |
 | mediaType     | string                         | Yes      | Bundle media type                      |
 
+#### provenance.upload.defer
+
+Hand a frozen, DSSE-signed statement to the orchestrator for a later mint when the attestation cannot be signed at build time. The envelope and its ephemeral public key are carried inline; `statementHash` binds the deferred mint to this exact payload.
+
+| Field         | Type                        | Required | Description                                           |
+| ------------- | --------------------------- | -------- | ----------------------------------------------------- |
+| type          | `"provenance.upload.defer"` | Yes      | Message discriminator                                 |
+| messageId     | string                      | Yes      | Unique message ID                                     |
+| jobId         | string                      | Yes      | Job producing the attestation                         |
+| subjectName   | string                      | Yes      | Caller-supplied artifact name                         |
+| subjectDigest | string                      | Yes      | Primary subject digest (lowercase hex)                |
+| audience      | string                      | Yes      | Requested token audience for the later mint           |
+| mediaType     | string                      | Yes      | Bundle media type                                     |
+| statementHash | string                      | Yes      | SHA-256 of the frozen DSSE statement payload          |
+| dsseEnvelope  | object                      | Yes      | The frozen, DSSE-signed statement envelope            |
+| publicKey     | object                      | Yes      | Ephemeral public key JWK the envelope was signed with |
+
 ### Orchestrator -> Agent
 
 #### provenance.upload.response
@@ -466,6 +522,104 @@ Return the pre-signed PUT URL for the agent to upload the bundle directly to obj
 | type      | `"provenance.upload.response"` | Yes      | Message discriminator                                   |
 | requestId | string                         | Yes      | Correlates to the original request                      |
 | uploadUrl | string                         | Yes      | Pre-signed PUT URL, or `""` when storage is unavailable |
+
+## Artifact messages
+
+These messages carry the run-scoped artifact upload/download handshake. When a step uploads a named artifact, the agent requests a pre-signed PUT URL; the orchestrator validates the artifact name and runs the enforcement gates (duplicate name, per-artifact/per-run size cap, org quota) before minting the URL, so a granted URL is always safe to upload to. Downloads resolve a named artifact within the same run to a pre-signed GET.
+
+The orchestrator checks the artifact name itself rather than trusting the agent's own check, because the name becomes a path segment of the storage key. It must be a short token of letters, digits, `.`, `_`, and `-`, up to 128 characters, and not made only of dots. Under that contract the name maps to its storage segment unchanged, so two distinct names can never produce the same key — a name outside it would be folded onto another name's key, letting a second upload overwrite the first object while both records keep their own hash. The same check runs on the upload request and on the upload completion, since either message can carry a name. The key also carries a hash of the exact name, so two names differing only by case differ by more than case and address distinct objects on a case-insensitive object store as well.
+
+> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
+
+### Agent -> Orchestrator
+
+#### artifacts.upload.request
+
+Request a pre-signed PUT URL for a named artifact upload.
+
+| Field             | Type                         | Required | Description                                                                    |
+| ----------------- | ---------------------------- | -------- | ------------------------------------------------------------------------------ |
+| type              | `"artifacts.upload.request"` | Yes      | Message discriminator                                                          |
+| messageId         | string                       | Yes      | Unique message ID                                                              |
+| jobId             | string                       | Yes      | Job producing the artifact (ownership-checked; run + org resolved server-side) |
+| name              | string                       | Yes      | Artifact name (immutability + storage-key discriminator within the run)        |
+| declaredSizeBytes | number (int >= 0)            | Yes      | Packed tarball size in bytes; drives the size/run/quota enforcement gates      |
+
+#### artifacts.upload.complete
+
+Confirm an artifact upload finished so the orchestrator records the artifacts row. The orchestrator replies with an [`artifacts.upload.complete.ack`](#artifactsuploadcompleteack) when it advertises the `artifactCompleteAck` capability, and the agent waits for it before the upload step returns.
+
+The orchestrator does not trust the agent's `storageKey` or `sizeBytes`: it derives the storage key from the run and artifact name it resolved server-side, and records the real object size it reads back from storage. Both fields stay on the wire (deprecated, still sent) for compatibility with older orchestrators — see [deprecations](../../user/deprecations.md).
+
+| Field      | Type                          | Required | Description                                                                                      |
+| ---------- | ----------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| type       | `"artifacts.upload.complete"` | Yes      | Message discriminator                                                                            |
+| messageId  | string                        | Yes      | Unique message ID                                                                                |
+| jobId      | string                        | Yes      | Job producing the artifact                                                                       |
+| name       | string                        | Yes      | Artifact name                                                                                    |
+| sizeBytes  | number (int >= 0)             | Yes      | Packed tarball size in bytes. Deprecated — advisory; the orchestrator records the verified size  |
+| sha256     | string                        | Yes      | SHA-256 (hex) of the tarball bytes                                                               |
+| storageKey | string                        | Yes      | Storage key echoed from the grant response. Deprecated — ignored; the key is derived server-side |
+
+#### artifacts.download.request
+
+Request a pre-signed GET URL for a named artifact of this run.
+
+| Field     | Type                           | Required | Description                                                               |
+| --------- | ------------------------------ | -------- | ------------------------------------------------------------------------- |
+| type      | `"artifacts.download.request"` | Yes      | Message discriminator                                                     |
+| messageId | string                         | Yes      | Unique message ID                                                         |
+| jobId     | string                         | Yes      | Job requesting the download (ownership-checked; run resolved server-side) |
+| name      | string                         | Yes      | Artifact name to resolve within the run                                   |
+
+### Orchestrator -> Agent
+
+#### artifacts.upload.response
+
+Return a pre-signed PUT (`granted`) or a refusal (`rejected`). All enforcement happens before minting, so a `granted` URL is safe to upload to.
+
+A `rejected` carries either `reason` (an enforcement gate was hit) or `error` (the request could not be serviced at all — the name violates the artifact-name contract, artifact storage is not configured, the job's run could not be resolved, the job is not owned by this agent, or the grant failed internally), never both. Keeping the two apart is what stops a bad name or an orchestrator-side problem from reaching the workflow author as a storage-quota rejection. `error` is a safe fixed string, never raw exception text; an agent that predates the field falls back to a generic rejection message.
+
+| Field      | Type                          | Required | Description                                                                                                                  |
+| ---------- | ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| type       | `"artifacts.upload.response"` | Yes      | Message discriminator                                                                                                        |
+| requestId  | string                        | Yes      | Correlates to the original request                                                                                           |
+| outcome    | enum                          | Yes      | One of: `granted`, `rejected`                                                                                                |
+| uploadUrl  | string                        | No       | Pre-signed PUT URL (present only on `granted`)                                                                               |
+| storageKey | string                        | No       | Final storage key the agent echoes back on complete (present only on `granted`)                                              |
+| reason     | enum                          | No       | Enforcement refusal reason (present only on an enforcement `rejected`): `duplicate_name`, `size_cap`, `run_cap`, `org_quota` |
+| error      | string                        | No       | Failure detail — invalid name or internal failure (present only on a `rejected` with no `reason`)                            |
+
+#### artifacts.upload.complete.ack
+
+Report the outcome of committing an `artifacts.upload.complete`. The commit is retried a few times before `failed` is reported, because it is idempotent and a momentary storage/database blip should not fail a run. An agent that sees the `artifactCompleteAck` capability on `register.ack` waits for this message and fails the workflow step on `failed` (or on a 25-second timeout, deliberately inside the step's own artifact-request timeout so the specific reason is what surfaces), so a commit that never landed surfaces as a failed step instead of a green run with a missing artifact. An orchestrator that does not advertise the capability sends nothing, and the agent then treats the complete message as fire-and-forget and does not wait.
+
+Losing the connection while an ack is in flight does not fail the step. Because the commit is idempotent, the agent parks the in-flight complete instead of failing it, and re-sends it under a fresh `messageId` after the next `register.ack` — up to twice, and only while the reconnected orchestrator still advertises the capability. The correlation id is re-minted on every resend, so a late ack for the pre-disconnect send is ignored rather than answering for the new one. The original 25-second deadline is never restarted, so an orchestrator that never comes back still fails the step on the same schedule; when the resends run out, when the reconnected orchestrator no longer acks, or when the agent's token is rejected outright so no reconnect will be attempted, the step fails with an error saying the artifact may nevertheless have been committed.
+
+A `failed` ack carries `reason`, a safe fixed string classifying the failure — artifact storage is not configured, the job's run could not be resolved, the job is not owned by this agent, the uploaded object was missing at commit time, the name violates the artifact-name contract, or the commit failed internally. As on the upload and download responses, `reason` is never raw exception text: the exception stays in the orchestrator's own logs, so a database endpoint or a storage key never reaches the workflow author.
+
+| Field     | Type                              | Required | Description                                                  |
+| --------- | --------------------------------- | -------- | ------------------------------------------------------------ |
+| type      | `"artifacts.upload.complete.ack"` | Yes      | Message discriminator                                        |
+| requestId | string                            | Yes      | Echoes the complete message's `messageId`                    |
+| outcome   | enum                              | Yes      | One of: `committed`, `failed`                                |
+| reason    | string                            | No       | Safe fixed failure classification (present only on `failed`) |
+
+#### artifacts.download.response
+
+Return a pre-signed GET plus size/sha256 for the named artifact, or `not_found` when the run never uploaded an artifact by that name.
+
+`not_found` is also the outcome when the orchestrator could not perform the lookup at all — artifact storage is not configured, the job's run could not be resolved, the job is not owned by this agent, or the lookup failed internally. Those replies carry `error`, which is what separates "this artifact does not exist" from "this orchestrator could not look it up"; a genuine miss carries no `error`. As on the upload response, `error` is a safe fixed string, never raw exception text, and an agent that predates the field renders the plain not-found message.
+
+| Field       | Type                            | Required | Description                                                                               |
+| ----------- | ------------------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| type        | `"artifacts.download.response"` | Yes      | Message discriminator                                                                     |
+| requestId   | string                          | Yes      | Correlates to the original request                                                        |
+| outcome     | enum                            | Yes      | One of: `found`, `not_found`                                                              |
+| downloadUrl | string                          | No       | Pre-signed GET URL (present only on `found`)                                              |
+| sizeBytes   | number (int >= 0)               | No       | Artifact size in bytes (present only on `found`)                                          |
+| sha256      | string                          | No       | SHA-256 (hex) of the tarball bytes for integrity verification (present only on `found`)   |
+| error       | string                          | No       | Internal-failure detail (present only on a `not_found` caused by an orchestrator failure) |
 
 ## Fleet log collection messages
 
@@ -510,6 +664,44 @@ Reported when an agent fails to build or stream its mini-bundle.
 | requestId | string                 | Yes      | Correlates to the originating request |
 | message   | string                 | Yes      | Failure description                   |
 
+## Agent private API messages
+
+These messages carry a generic request/response envelope over the existing agent connection. The orchestrator registers each callable method by name and required role; the agent names a method and passes its parameters, and the orchestrator replies with the method's result or an error. Adding a method is a server-side registration, not a new message type.
+
+> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts`
+
+### Agent -> Orchestrator
+
+#### agent.api.request
+
+Calls a registered method on the orchestrator.
+
+| Field     | Type                  | Required | Description                                             |
+| --------- | --------------------- | -------- | ------------------------------------------------------- |
+| type      | `"agent.api.request"` | Yes      | Message discriminator                                   |
+| requestId | string                | Yes      | Correlates the response                                 |
+| method    | string                | Yes      | Dot-namespaced method name (e.g. `infrastructure.list`) |
+| params    | object                | No       | Method-specific parameters (default: empty object)      |
+
+> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentApiRequestSchema`
+
+### Orchestrator -> Agent
+
+#### agent.api.response
+
+Result of one `agent.api.request`.
+
+| Field     | Type                   | Required | Description                                       |
+| --------- | ---------------------- | -------- | ------------------------------------------------- |
+| type      | `"agent.api.response"` | Yes      | Message discriminator                             |
+| requestId | string                 | Yes      | Correlates to the originating `agent.api.request` |
+| result    | unknown                | No       | The method's return value (on success)            |
+| error     | string                 | No       | Failure description (on failure)                  |
+
+`error` carries the two deliberate rejections verbatim — the method is not registered, or the caller lacks the role the method requires — because both name only the caller's own request. Any other failure is a safe fixed string, never raw exception text.
+
+> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentApiResponseSchema`
+
 ## Step approval messages
 
 These messages carry the step-level approval round-trip. When a step declares `approval`, the agent blocks its step loop and sends a `step.approval-request`; the orchestrator creates a step-scoped held-run from the requirement and replies with `step.approval-resolved` once the hold is approved, rejected, or expired. The agent keeps heartbeats flowing during the wait so it is not reaped as stale.
@@ -551,6 +743,8 @@ Resolution of a step-level approval hold. On `approved` the agent runs the step 
 | outcome   | enum                       | Yes      | One of: `approved`, `rejected`, `expired`                       |
 | reason    | string                     | No       | Optional human reason (e.g. the reject reason)                  |
 
+On `rejected`, `reason` is either deliberate rejection wording — an invalid per-gate timeout, or the approver's own decline note — or a safe fixed string classifying an internal failure. It is never raw exception text.
+
 ## Execution status messages
 
 These messages flow from the orchestrator upstream to KiCI for execution metadata tracking and real-time dashboard updates.
@@ -561,27 +755,37 @@ These messages flow from the orchestrator upstream to KiCI for execution metadat
 
 Structured execution status update sent by the orchestrator when an execution run starts, completes, or changes status. The upstream tier stores this metadata for dashboard queries.
 
-| Field          | Type                 | Required | Description                                                                  |
-| -------------- | -------------------- | -------- | ---------------------------------------------------------------------------- |
-| type           | `"execution.status"` | Yes      | Message discriminator                                                        |
-| messageId      | string               | Yes      | Unique message ID                                                            |
-| runId          | string               | Yes      | Execution run ID                                                             |
-| workflowName   | string               | Yes      | Name of the workflow being executed                                          |
-| status         | enum                 | Yes      | One of: `pending`, `running`, `success`, `failed`, `cancelled`, `cancelling` |
-| repoIdentifier | string               | No       | Repository identifier (e.g., `owner/repo`)                                   |
-| sha            | string               | No       | Commit SHA                                                                   |
-| ref            | string               | No       | Git branch or tag (e.g., `main`, `refs/tags/v1.0`)                           |
-| triggerEvent   | string               | No       | Trigger event type (e.g., `push`, `pr:open`)                                 |
-| commitMessage  | string               | No       | First line of the commit message                                             |
-| jobCount       | number               | No       | Total number of jobs in this execution                                       |
-| startedAt      | number               | Yes      | Unix timestamp when execution started                                        |
-| completedAt    | number               | No       | Unix timestamp when execution completed                                      |
-| durationMs     | number               | No       | Total execution duration in milliseconds                                     |
-| timestamp      | number               | Yes      | Unix timestamp (milliseconds)                                                |
-| parentRunId    | string or null       | No       | Parent run ID for re-run lineage (null/undefined for originals)              |
-| originalRunId  | string or null       | No       | Root ancestor run ID (always points to first run in chain)                   |
-| triggeredBy    | string or null       | No       | User identity that triggered this re-run (null for webhook)                  |
-| failureReason  | string               | No       | Human-readable reason why the run failed (only present for failed runs)      |
+| Field                 | Type                 | Required | Description                                                                                                                                                                                            |
+| --------------------- | -------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| type                  | `"execution.status"` | Yes      | Message discriminator                                                                                                                                                                                  |
+| messageId             | string               | Yes      | Unique message ID                                                                                                                                                                                      |
+| runId                 | string               | Yes      | Execution run ID                                                                                                                                                                                       |
+| workflowName          | string               | Yes      | Name of the workflow being executed                                                                                                                                                                    |
+| status                | enum                 | Yes      | One of: `pending`, `running`, `success`, `failed`, `cancelled`, `cancelling`, `held`                                                                                                                   |
+| routingKey            | string               | No       | Routing key of the run's own source, so each run is attributed to its real source when one connection serves multiple sources (absent → the upstream falls back to the connection's first routing key) |
+| repoIdentifier        | string               | No       | Repository identifier (e.g., `owner/repo`)                                                                                                                                                             |
+| repoProvider          | string               | No       | Run-level repo provider (origin host: `github` / `gitlab` / `bitbucket` / `local`); drives provider-aware repo links in the dashboard                                                                  |
+| localWorkingTree      | boolean              | No       | True when the run executed a developer's uploaded local working tree (`kici run remote`)                                                                                                               |
+| sha                   | string               | No       | Commit SHA                                                                                                                                                                                             |
+| ref                   | string               | No       | Git branch or tag (e.g., `main`, `refs/tags/v1.0`)                                                                                                                                                     |
+| triggerEvent          | string               | No       | Trigger event type (e.g., `push`, `pr:open`)                                                                                                                                                           |
+| commitMessage         | string               | No       | First line of the commit message                                                                                                                                                                       |
+| jobCount              | number               | No       | Total number of jobs in this execution                                                                                                                                                                 |
+| startedAt             | number               | Yes      | Unix timestamp when execution started                                                                                                                                                                  |
+| completedAt           | number               | No       | Unix timestamp when execution completed                                                                                                                                                                |
+| durationMs            | number               | No       | Total execution duration in milliseconds                                                                                                                                                               |
+| timestamp             | number               | Yes      | Unix timestamp (milliseconds)                                                                                                                                                                          |
+| parentRunId           | string or null       | No       | Parent run ID for re-run lineage (null/undefined for originals)                                                                                                                                        |
+| originalRunId         | string or null       | No       | Root ancestor run ID (always points to first run in chain)                                                                                                                                             |
+| triggeredBy           | string or null       | No       | User identity that triggered this re-run (null for webhook)                                                                                                                                            |
+| triggeredByAgentLabel | string or null       | No       | Agent provenance label when the run was triggered through an agent credential                                                                                                                          |
+| triggerActorProvider  | string or null       | No       | Provider of the triggering actor captured from the provider event (the pusher / PR author), distinct from `triggeredBy`                                                                                |
+| triggerActorUsername  | string or null       | No       | Provider login of the triggering actor                                                                                                                                                                 |
+| triggerActorUserId    | string or null       | No       | Provider user ID of the triggering actor                                                                                                                                                               |
+| failureReason         | string               | No       | Human-readable reason why the run failed (only present for failed runs)                                                                                                                                |
+| logBytes              | number               | No       | Total raw log bytes accumulated across all jobs of this run; only set on terminal run states                                                                                                           |
+| initFailure           | object               | No       | Structured init-failure signal (`scope`, `category`, `message`, optional `jobName`) set when the run never executed a single step; only present when status is `failed`                                |
+| failureClass          | enum                 | No       | Why a terminal run failed: `never_started`, `timed_out`, `dead_orchestrator`, `step_failure`, `cancelled` (only present for failed/cancelled runs)                                                     |
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `executionStatusSchema`
 
@@ -589,19 +793,21 @@ Structured execution status update sent by the orchestrator when an execution ru
 
 Per-step status forwarded from agent through the orchestrator upstream in real-time. Enables live step-by-step progress in the dashboard.
 
-| Field           | Type                    | Required | Description                                                                        |
-| --------------- | ----------------------- | -------- | ---------------------------------------------------------------------------------- |
-| type            | `"step.status.forward"` | Yes      | Message discriminator                                                              |
-| messageId       | string                  | Yes      | Unique message ID                                                                  |
-| runId           | string                  | Yes      | Execution run ID                                                                   |
-| jobId           | string                  | Yes      | Job ID within the run                                                              |
-| jobName         | string                  | Yes      | Human-readable job name                                                            |
-| stepIndex       | number                  | Yes      | Zero-based step index                                                              |
-| stepName        | string                  | Yes      | Human-readable step name                                                           |
-| state           | enum                    | Yes      | One of: `running`, `success`, `failed`, `skipped`                                  |
-| timestamp       | number                  | Yes      | Unix timestamp (milliseconds)                                                      |
-| data            | Record<string, unknown> | No       | Optional state-specific data                                                       |
-| secretsAccessed | string[]                | No       | Secret key names accessed by this step. Forwarded from agent for dashboard display |
+| Field           | Type                    | Required | Description                                                                                                       |
+| --------------- | ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| type            | `"step.status.forward"` | Yes      | Message discriminator                                                                                             |
+| messageId       | string                  | Yes      | Unique message ID                                                                                                 |
+| runId           | string                  | Yes      | Execution run ID                                                                                                  |
+| jobId           | string                  | Yes      | Job ID within the run                                                                                             |
+| jobName         | string                  | Yes      | Human-readable job name                                                                                           |
+| stepIndex       | number                  | Yes      | Zero-based step index                                                                                             |
+| stepName        | string                  | Yes      | Human-readable step name                                                                                          |
+| state           | enum                    | Yes      | One of: `running`, `success`, `failed`, `skipped`, `pending`, `cancelled`                                         |
+| timestamp       | number                  | Yes      | Unix timestamp (milliseconds)                                                                                     |
+| data            | Record<string, unknown> | No       | Optional state-specific data                                                                                      |
+| secretsAccessed | string[]                | No       | Secret key names accessed by this step. Forwarded from agent for dashboard display                                |
+| concurrencyKind | enum                    | No       | Step concurrency role: `sequential`, `parallel-child`, `parallel-group`; absent means an ordinary sequential step |
+| groupId         | string                  | No       | Parallel-group correlation ID shared by a group's children (e.g., `g0`)                                           |
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `stepStatusForwardSchema`
 
@@ -609,23 +815,26 @@ Per-step status forwarded from agent through the orchestrator upstream in real-t
 
 Per-job status forwarded from orchestrator upstream in real-time. Enables live job-level progress in the dashboard.
 
-| Field          | Type                    | Required | Description                                                                                                                                         |
-| -------------- | ----------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type           | `"job.status.forward"`  | Yes      | Message discriminator                                                                                                                               |
-| messageId      | string                  | Yes      | Unique message ID                                                                                                                                   |
-| runId          | string                  | Yes      | Execution run ID                                                                                                                                    |
-| jobId          | string                  | Yes      | Job ID within the run                                                                                                                               |
-| jobName        | string                  | Yes      | Human-readable job name                                                                                                                             |
-| status         | enum                    | Yes      | One of: `pending`, `queued`, `running`, `recovering`, `cancelling`, `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped` |
-| matrixValues   | Record<string, unknown> | No       | Matrix parameter values for this job instance                                                                                                       |
-| startedAt      | number                  | No       | Unix timestamp when job started                                                                                                                     |
-| completedAt    | number                  | No       | Unix timestamp when job completed                                                                                                                   |
-| durationMs     | number                  | No       | Job duration in milliseconds                                                                                                                        |
-| errorMessage   | string or null          | No       | Error message if job failed                                                                                                                         |
-| agentId        | string or null          | No       | Agent ID executing this job                                                                                                                         |
-| orchestratorId | string or null          | No       | Orchestrator ID that dispatched this job                                                                                                            |
-| runsOnLabels   | string[]                | No       | Labels used for agent routing                                                                                                                       |
-| timestamp      | number                  | Yes      | Unix timestamp (milliseconds)                                                                                                                       |
+| Field          | Type                    | Required | Description                                                                                                                                                       |
+| -------------- | ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type           | `"job.status.forward"`  | Yes      | Message discriminator                                                                                                                                             |
+| messageId      | string                  | Yes      | Unique message ID                                                                                                                                                 |
+| runId          | string                  | Yes      | Execution run ID                                                                                                                                                  |
+| jobId          | string                  | Yes      | Job ID within the run                                                                                                                                             |
+| jobName        | string                  | Yes      | Human-readable job name                                                                                                                                           |
+| status         | enum                    | Yes      | One of: `pending`, `queued`, `running`, `recovering`, `cancelling`, `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` |
+| matrixValues   | Record<string, unknown> | No       | Matrix parameter values for this job instance                                                                                                                     |
+| startedAt      | number                  | No       | Unix timestamp when job started                                                                                                                                   |
+| completedAt    | number                  | No       | Unix timestamp when job completed                                                                                                                                 |
+| durationMs     | number                  | No       | Job duration in milliseconds                                                                                                                                      |
+| errorMessage   | string or null          | No       | Error message if job failed                                                                                                                                       |
+| agentId        | string or null          | No       | Agent ID executing this job                                                                                                                                       |
+| orchestratorId | string or null          | No       | Orchestrator ID that dispatched this job                                                                                                                          |
+| runsOnLabels   | string[]                | No       | Labels used for agent routing                                                                                                                                     |
+| contexts       | string[]                | No       | Ordered bound context names for this job (multi-context jobs)                                                                                                     |
+| logBytes       | number                  | No       | Total raw log bytes accumulated across all steps of this job; only set on terminal job states                                                                     |
+| timestamp      | number                  | Yes      | Unix timestamp (milliseconds)                                                                                                                                     |
+| initFailure    | object                  | No       | Structured init-failure signal (`scope`, `category`, `message`, optional `jobName`) — set for synthetic rejected / init-failed jobs                               |
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `jobStatusForwardSchema`
 

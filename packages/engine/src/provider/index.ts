@@ -16,7 +16,7 @@ export type { ProviderType } from './types.js';
 export type { WebhookNormalizer, AccessCacheInvalidation } from './webhook-normalizer.js';
 export type { LockFileFetcher } from './lock-file-fetcher.js';
 export { LockFileParseError } from './lock-file-parse-error.js';
-export type { ChangedFilesFetcher } from './changed-files-fetcher.js';
+export type { ChangedFilesFetcher, ChangedFilesResult } from './changed-files-fetcher.js';
 export type { CloneTokenProvider, ProviderGitAuth } from './clone-token-provider.js';
 export type { RepoUrlBuilder } from './repo-url-builder.js';
 export type {
@@ -24,5 +24,9 @@ export type {
   ContributorInfo,
   ContributorPermission,
 } from './contributor-resolver.js';
-export type { CheckStatusPoster, CheckStatus } from './check-status-poster.js';
+export type {
+  CheckStatusPoster,
+  CheckStatus,
+  WorkflowModificationInfo,
+} from './check-status-poster.js';
 export * from './check-run-conclusion.js';

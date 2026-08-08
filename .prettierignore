@@ -15,9 +15,19 @@ packages/engine/src/metrics/metric-catalog.generated.ts
 # Lock files
 pnpm-lock.yaml
 
+# Captured real-world HTML fixtures (dependency-status parser test inputs) —
+# these must stay verbatim; reformatting changes the structure the parser and
+# the real upstream pages rely on.
+packages/ci/src/dep-status/fixtures/
+
 testing/**/*.yaml
 
 # Claude Code rules (preserve YAML frontmatter)
 .claude/rules/
 
 **/*.enc.yaml
+
+# Auto-generated overlay build markers (written by packages/ci/src/build-overlays.ts
+# as JSON.stringify(…, null, 2) — prettier collapses the fromRefs array, so every
+# `pnpm build:overlays` run would otherwise show a formatting-only diff)
+infra/prod/overlays/*.last-built.json

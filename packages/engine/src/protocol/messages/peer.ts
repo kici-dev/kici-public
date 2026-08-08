@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ExecutionJobStatus } from './execution-status.js';
+import { LogStream } from './log-stream.js';
 import { ScalerEventType } from './scaler-event.js';
 import { LabelMatcher } from '../../labels-match.js';
 
@@ -142,6 +143,8 @@ export const peerHeartbeatSchema = z.object({
   configVersion: z.number().optional(),
   /** Registry version for cross-orchestrator registration sync (backward compatible). */
   registryVersion: z.number().optional(),
+  /** Shared cluster-settings version for leader→worker settings pull (backward compatible). */
+  clusterSettingsVersion: z.number().optional(),
   timestamp: z.number(),
   // --- OS metadata (optional, for diagnostics visibility) ---
   hostname: z.string().optional(),
@@ -331,7 +334,7 @@ const peerLogChunkSchema = z.object({
     z.object({
       text: z.string(),
       timestamp: z.number(),
-      stream: z.enum(['stdout', 'stderr']).optional(),
+      stream: LogStream.optional(),
     }),
   ),
 });
@@ -383,6 +386,39 @@ export const peerConfigReloadResponseSchema = z.object({
   errors: z.array(z.string()).optional(),
   restartRequired: z.array(z.string()).optional(),
   fieldsChanged: z.array(z.string()).optional(),
+});
+
+/**
+ * Worker-relevant cluster settings a DB-less worker pulls from the leader.
+ *
+ * A typed, concrete snapshot (not an open key/value bus): each worker-consumed
+ * cluster knob is a field here. Adding the next worker-relevant knob is one
+ * field on this schema, not a new protocol message.
+ */
+export const workerClusterSettingsSchema = z.object({
+  agentTokenTtlMs: z.number(),
+});
+
+/**
+ * Cluster-settings pull request: a DB-less worker asks the leader for the
+ * current worker-settings snapshot after observing the leader's advertised
+ * clusterSettingsVersion ahead of its own. The leader replies with
+ * peer.clusterSettings.response.
+ */
+export const peerClusterSettingsRequestSchema = z.object({
+  type: z.literal('peer.clusterSettings.request'),
+  messageId: z.string(),
+});
+
+/**
+ * Cluster-settings pull response: the leader resolves the snapshot from
+ * cluster_settings and replies with it plus the current version.
+ */
+export const peerClusterSettingsResponseSchema = z.object({
+  type: z.literal('peer.clusterSettings.response'),
+  messageId: z.string(),
+  version: z.number(),
+  settings: workerClusterSettingsSchema,
 });
 
 // --- Fleet log collection (orchestrator → peer subtree request / peer → orchestrator chunked response) ---
@@ -493,6 +529,8 @@ export const peerToPeerMessageSchema = z.discriminatedUnion('type', [
   peerCacheUploadResponseSchema,
   peerConfigReloadSchema,
   peerConfigReloadResponseSchema,
+  peerClusterSettingsRequestSchema,
+  peerClusterSettingsResponseSchema,
   peerLogsCollectRequestSchema,
   peerLogsCollectChunkSchema,
   peerLogsCollectErrorSchema,
@@ -521,6 +559,8 @@ export const peerFromPeerMessageSchema = z.discriminatedUnion('type', [
   peerCacheUploadResponseSchema,
   peerConfigReloadSchema,
   peerConfigReloadResponseSchema,
+  peerClusterSettingsRequestSchema,
+  peerClusterSettingsResponseSchema,
   peerLogsCollectRequestSchema,
   peerLogsCollectChunkSchema,
   peerLogsCollectErrorSchema,
@@ -547,6 +587,9 @@ export type PeerCacheUploadRequest = z.infer<typeof peerCacheUploadRequestSchema
 export type PeerCacheUploadResponse = z.infer<typeof peerCacheUploadResponseSchema>;
 export type PeerConfigReload = z.infer<typeof peerConfigReloadSchema>;
 export type PeerConfigReloadResponse = z.infer<typeof peerConfigReloadResponseSchema>;
+export type WorkerClusterSettings = z.infer<typeof workerClusterSettingsSchema>;
+export type PeerClusterSettingsRequest = z.infer<typeof peerClusterSettingsRequestSchema>;
+export type PeerClusterSettingsResponse = z.infer<typeof peerClusterSettingsResponseSchema>;
 export type PeerLeaving = z.infer<typeof peerLeavingSchema>;
 export type PeerAgentTokenRevoke = z.infer<typeof peerAgentTokenRevokeSchema>;
 export type FleetSelection = z.infer<typeof fleetSelectionSchema>;

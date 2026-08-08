@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.1.27",
+  "version": "0.2.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -50,9 +50,17 @@
       "import": "./dist/ts-loader-hook.js",
       "types": "./dist/ts-loader-hook.d.ts"
     },
+    "./tmp": {
+      "import": "./dist/tmp.js",
+      "types": "./dist/tmp.d.ts"
+    },
     "./idempotency": {
       "import": "./dist/idempotency.js",
       "types": "./dist/idempotency.d.ts"
+    },
+    "./ci-env": {
+      "import": "./dist/ci-env.js",
+      "types": "./dist/ci-env.d.ts"
     },
     "./idempotency-files": {
       "import": "./dist/idempotency-files.js",
@@ -84,28 +92,29 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsgo --noEmit",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/shared --name @kici-dev/shared"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1064.0",
+    "@aws-sdk/client-s3": "^3.1089.0",
     "@kici-dev/core": "workspace:*",
+    "@kici-dev/engine": "workspace:*",
     "@opentelemetry/api": "^1.9.1",
-    "@opentelemetry/exporter-metrics-otlp-http": "^0.218.0",
-    "@opentelemetry/exporter-prometheus": "^0.218.0",
-    "@opentelemetry/exporter-trace-otlp-http": "^0.218.0",
-    "@opentelemetry/instrumentation-runtime-node": "^0.31.0",
-    "@opentelemetry/resources": "^2.7.1",
-    "@opentelemetry/sdk-node": "^0.218.0",
-    "@opentelemetry/semantic-conventions": "^1.41.1",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.221.0",
+    "@opentelemetry/exporter-prometheus": "^0.221.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+    "@opentelemetry/instrumentation-runtime-node": "^0.34.0",
+    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/sdk-node": "^0.221.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
     "archiver": "^8.0.0",
     "diff": "^9.0.0",
-    "hono": "^4.12.25",
-    "kysely": "^0.29.2",
-    "oxc-transform": "0.135.0",
-    "pg": "^8.21.0",
+    "hono": "^4.12.32",
+    "kysely": "^0.29.4",
+    "oxc-transform": "0.140.0",
+    "pg": "^8.22.0",
     "picocolors": "^1.1.1",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",
@@ -114,7 +123,7 @@
     "zx": "^8.8.5"
   },
   "devDependencies": {
-    "@opentelemetry/sdk-trace-base": "^2.7.1",
+    "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@types/archiver": "^8.0.0"
   }
 }

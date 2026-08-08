@@ -1,6 +1,7 @@
 /**
  * Concurrency gate -- checks concurrency limits.
  */
+import { ConcurrencyStrategy, HoldType } from '@kici-dev/engine';
 import type { Context, ProtectionGateResult } from '@kici-dev/engine';
 
 /** Evaluate concurrency limits for the context. */
@@ -9,8 +10,11 @@ export function evaluateConcurrencyGate(
   currentRunningCount: number,
   _concurrencyGroup: string,
 ): ProtectionGateResult {
-  // No limit = unlimited
-  if (env.concurrencyLimit === null) {
+  // No limit (null), or a degenerate non-positive limit, = unlimited.
+  // A concurrencyLimit of 0 is rejected at the write boundary, but any legacy
+  // or edge value that reaches the gate must never create an unreleasable
+  // workflow-install concurrency hold.
+  if (env.concurrencyLimit === null || env.concurrencyLimit <= 0) {
     return { action: 'pass' };
   }
 
@@ -20,17 +24,21 @@ export function evaluateConcurrencyGate(
   }
 
   // At or above limit
-  if (env.concurrencyStrategy === 'cancel-pending') {
+  if (env.concurrencyStrategy === ConcurrencyStrategy.enum['cancel-pending']) {
     return {
+      // `action` here is the gate vocabulary (`'hold' | 'wait' | 'queue'`), a
+      // different enum that merely shares the `queue` spelling — not the
+      // concurrency strategy. The `reason` is the free-form detail string the
+      // dispatcher surfaces, which happens to name the strategy that produced it.
       action: 'queue',
       reason: 'cancel-pending',
-      holdType: 'concurrency',
+      holdType: HoldType.enum.concurrency,
     };
   }
 
   return {
     action: 'queue',
     reason: `Concurrency limit reached (${currentRunningCount}/${env.concurrencyLimit})`,
-    holdType: 'concurrency',
+    holdType: HoldType.enum.concurrency,
   };
 }

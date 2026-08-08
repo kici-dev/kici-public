@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { LogStream } from './log-stream.js';
 import {
   jobDispatchSchema,
   jobCancelSchema,
@@ -6,6 +7,8 @@ import {
   jobAckSchema,
   JobRejectReason,
   registerAckSchema,
+  artifactsUploadCompleteAckSchema,
+  ArtifactCompleteAckOutcome,
   agentRegisterSchema,
   agentStatusSchema,
   jobStatusSchema,
@@ -29,6 +32,14 @@ import {
   cacheUserSaveRequestSchema,
   cacheUserSaveResponseSchema,
   cacheUserSaveCompleteSchema,
+  ArtifactUploadOutcome,
+  ArtifactRejectReason,
+  ArtifactDownloadOutcome,
+  artifactsUploadRequestSchema,
+  artifactsUploadResponseSchema,
+  artifactsUploadCompleteSchema,
+  artifactsDownloadRequestSchema,
+  artifactsDownloadResponseSchema,
   stepApprovalRequestSchema,
   stepApprovalResolvedSchema,
   StepApprovalOutcome,
@@ -113,11 +124,13 @@ describe('jobDispatchSchema', () => {
       token: 'ghs_abc123xyz',
       secrets: { NPM_TOKEN: 'npm_xxxx', DEPLOY_KEY: 'deploy_yyyy' },
       maxLogSizeBytes: 5242880,
+      concurrencyWaitTimeoutMs: 900_000,
     };
     const parsed = jobDispatchSchema.parse(withNewFields);
     expect(parsed.token).toBe('ghs_abc123xyz');
     expect(parsed.secrets).toEqual({ NPM_TOKEN: 'npm_xxxx', DEPLOY_KEY: 'deploy_yyyy' });
     expect(parsed.maxLogSizeBytes).toBe(5242880);
+    expect(parsed.concurrencyWaitTimeoutMs).toBe(900_000);
   });
 
   it('parses successfully without the new optional fields (backward compatibility)', () => {
@@ -125,6 +138,7 @@ describe('jobDispatchSchema', () => {
     expect(parsed.token).toBeUndefined();
     expect(parsed.secrets).toBeUndefined();
     expect(parsed.maxLogSizeBytes).toBeUndefined();
+    expect(parsed.concurrencyWaitTimeoutMs).toBeUndefined();
   });
 
   it('parses upstreamJobStatuses keyed by upstream job name', () => {
@@ -453,6 +467,207 @@ describe('user-cache union discrimination', () => {
   });
 });
 
+// --- User-facing artifacts protocol tests ---
+
+describe('artifact protocol enums', () => {
+  it('ArtifactUploadOutcome enumerates granted + rejected', () => {
+    expect(ArtifactUploadOutcome.options).toEqual(['granted', 'rejected']);
+  });
+  it('ArtifactRejectReason enumerates the four enforcement gates', () => {
+    expect(ArtifactRejectReason.options).toEqual([
+      'duplicate_name',
+      'size_cap',
+      'run_cap',
+      'org_quota',
+    ]);
+  });
+  it('ArtifactDownloadOutcome enumerates found + not_found', () => {
+    expect(ArtifactDownloadOutcome.options).toEqual(['found', 'not_found']);
+  });
+});
+
+describe('artifactsUploadRequestSchema', () => {
+  it('parses a well-formed upload request', () => {
+    const m = artifactsUploadRequestSchema.parse({
+      type: 'artifacts.upload.request',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+      declaredSizeBytes: 4096,
+    });
+    expect(m.name).toBe('bundle');
+    expect(m.declaredSizeBytes).toBe(4096);
+  });
+  it('rejects a negative declaredSizeBytes', () => {
+    expect(() =>
+      artifactsUploadRequestSchema.parse({
+        type: 'artifacts.upload.request',
+        messageId: 'm1',
+        jobId: 'j1',
+        name: 'bundle',
+        declaredSizeBytes: -1,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('artifactsUploadResponseSchema', () => {
+  it('parses a granted response with presigned PUT + storage key', () => {
+    const m = artifactsUploadResponseSchema.parse({
+      type: 'artifacts.upload.response',
+      requestId: 'm1',
+      outcome: 'granted',
+      uploadUrl: 'https://s3/put',
+      storageKey: 'artifacts/run1/bundle.tar.gz',
+    });
+    expect(m.outcome).toBe('granted');
+    expect(m.uploadUrl).toBe('https://s3/put');
+  });
+  it('parses a rejected response with a named reason', () => {
+    const m = artifactsUploadResponseSchema.parse({
+      type: 'artifacts.upload.response',
+      requestId: 'm1',
+      outcome: 'rejected',
+      reason: 'duplicate_name',
+    });
+    expect(m.reason).toBe('duplicate_name');
+    expect(m.uploadUrl).toBeUndefined();
+  });
+  it('rejects an unknown reason', () => {
+    expect(() =>
+      artifactsUploadResponseSchema.parse({
+        type: 'artifacts.upload.response',
+        requestId: 'm1',
+        outcome: 'rejected',
+        reason: 'nope',
+      }),
+    ).toThrow();
+  });
+  it('parses an internal-failure rejection carrying error and no reason', () => {
+    const m = artifactsUploadResponseSchema.parse({
+      type: 'artifacts.upload.response',
+      requestId: 'm1',
+      outcome: 'rejected',
+      error: 'the orchestrator hit an internal error while starting the upload',
+    });
+    expect(m.reason).toBeUndefined();
+    expect(m.error).toBe('the orchestrator hit an internal error while starting the upload');
+  });
+  it('leaves error undefined on a granted response', () => {
+    const m = artifactsUploadResponseSchema.parse({
+      type: 'artifacts.upload.response',
+      requestId: 'm1',
+      outcome: 'granted',
+      uploadUrl: 'https://s3/put',
+      storageKey: 'artifacts/run1/bundle.tar.gz',
+    });
+    expect(m.error).toBeUndefined();
+  });
+});
+
+describe('artifactsUploadCompleteSchema', () => {
+  it('parses a well-formed complete', () => {
+    const m = artifactsUploadCompleteSchema.parse({
+      type: 'artifacts.upload.complete',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+      sizeBytes: 4096,
+      sha256: 'deadbeef',
+      storageKey: 'artifacts/run1/bundle.tar.gz',
+    });
+    expect(m.sizeBytes).toBe(4096);
+    expect(m.sha256).toBe('deadbeef');
+  });
+});
+
+describe('artifactsDownloadResponseSchema', () => {
+  it('parses a found response', () => {
+    const m = artifactsDownloadResponseSchema.parse({
+      type: 'artifacts.download.response',
+      requestId: 'm1',
+      outcome: 'found',
+      downloadUrl: 'https://s3/get',
+      sizeBytes: 4096,
+      sha256: 'deadbeef',
+    });
+    expect(m.outcome).toBe('found');
+    expect(m.sizeBytes).toBe(4096);
+  });
+  it('parses a not_found response', () => {
+    const m = artifactsDownloadResponseSchema.parse({
+      type: 'artifacts.download.response',
+      requestId: 'm1',
+      outcome: 'not_found',
+    });
+    expect(m.outcome).toBe('not_found');
+    expect(m.downloadUrl).toBeUndefined();
+    expect(m.error).toBeUndefined();
+  });
+  it('parses a not_found response carrying an internal-failure error', () => {
+    const m = artifactsDownloadResponseSchema.parse({
+      type: 'artifacts.download.response',
+      requestId: 'm1',
+      outcome: 'not_found',
+      error: 'artifact downloads are not configured on this orchestrator',
+    });
+    expect(m.outcome).toBe('not_found');
+    expect(m.error).toBe('artifact downloads are not configured on this orchestrator');
+  });
+});
+
+describe('artifacts union discrimination', () => {
+  it('agentToOrchestratorMessageSchema accepts artifacts.upload.request', () => {
+    const msg = {
+      type: 'artifacts.upload.request',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+      declaredSizeBytes: 10,
+    };
+    expect(agentToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
+  });
+  it('agentToOrchestratorMessageSchema accepts artifacts.upload.complete', () => {
+    const msg = {
+      type: 'artifacts.upload.complete',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+      sizeBytes: 10,
+      sha256: 'h',
+      storageKey: 'artifacts/run1/bundle.tar.gz',
+    };
+    expect(agentToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
+  });
+  it('agentToOrchestratorMessageSchema accepts artifacts.download.request', () => {
+    const msg = {
+      type: 'artifacts.download.request',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+    };
+    expect(agentToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
+  });
+  it('orchestratorToAgentMessageSchema accepts artifacts.upload.response', () => {
+    const msg = { type: 'artifacts.upload.response', requestId: 'm1', outcome: 'granted' };
+    expect(orchestratorToAgentMessageSchema.parse(msg)).toEqual(msg);
+  });
+  it('orchestratorToAgentMessageSchema accepts artifacts.download.response', () => {
+    const msg = { type: 'artifacts.download.response', requestId: 'm1', outcome: 'not_found' };
+    expect(orchestratorToAgentMessageSchema.parse(msg)).toEqual(msg);
+  });
+  it('orchestratorToAgentMessageSchema rejects artifacts.upload.request (wrong direction)', () => {
+    const msg = {
+      type: 'artifacts.upload.request',
+      messageId: 'm1',
+      jobId: 'j1',
+      name: 'bundle',
+      declaredSizeBytes: 10,
+    };
+    expect(() => orchestratorToAgentMessageSchema.parse(msg)).toThrow();
+  });
+});
+
 describe('gitAuthSchema', () => {
   it('accepts kind=basic with user and secret', () => {
     expect(gitAuthSchema.parse({ kind: 'basic', user: 'alice', secret: 'pw' })).toEqual({
@@ -716,6 +931,22 @@ describe('agentLogChunkSchema', () => {
 
   it('accepts empty lines array', () => {
     expect(agentLogChunkSchema.parse({ ...validLogChunk, lines: [] })).toBeDefined();
+  });
+
+  it('accepts a chunk carrying an explicit stream', () => {
+    const parsed = agentLogChunkSchema.parse({
+      ...validLogChunk,
+      stream: LogStream.enum.stderr,
+    });
+    expect(parsed.stream).toBe(LogStream.enum.stderr);
+  });
+
+  it('accepts a chunk with no stream and leaves it undefined', () => {
+    expect(agentLogChunkSchema.parse(validLogChunk).stream).toBeUndefined();
+  });
+
+  it('rejects an unknown stream value', () => {
+    expect(() => agentLogChunkSchema.parse({ ...validLogChunk, stream: 'syslog' })).toThrow();
   });
 
   it('rejects missing jobId', () => {
@@ -1689,5 +1920,63 @@ describe('provenanceUploadDeferSchema', () => {
     const { statementHash, ...rest } = msg;
     void statementHash;
     expect(provenanceUploadDeferSchema.safeParse(rest).success).toBe(false);
+  });
+});
+
+describe('artifactsUploadCompleteAckSchema', () => {
+  it('parses a committed ack', () => {
+    const m = artifactsUploadCompleteAckSchema.parse({
+      type: 'artifacts.upload.complete.ack',
+      requestId: 'req-1',
+      outcome: ArtifactCompleteAckOutcome.enum.committed,
+    });
+    expect(m.outcome).toBe(ArtifactCompleteAckOutcome.enum.committed);
+    expect(m.reason).toBeUndefined();
+  });
+
+  it('parses a failed ack with a reason', () => {
+    const m = artifactsUploadCompleteAckSchema.parse({
+      type: 'artifacts.upload.complete.ack',
+      requestId: 'req-2',
+      outcome: ArtifactCompleteAckOutcome.enum.failed,
+      reason: 'db insert failed',
+    });
+    expect(m.reason).toBe('db insert failed');
+  });
+
+  it('rejects an unknown outcome', () => {
+    expect(
+      artifactsUploadCompleteAckSchema.safeParse({
+        type: 'artifacts.upload.complete.ack',
+        requestId: 'req-3',
+        outcome: 'maybe',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('is a member of the orchestrator->agent union', () => {
+    const parsed = orchestratorToAgentMessageSchema.safeParse({
+      type: 'artifacts.upload.complete.ack',
+      requestId: 'req-4',
+      outcome: ArtifactCompleteAckOutcome.enum.committed,
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe('registerAckSchema capabilities', () => {
+  it('accepts an optional capabilities object', () => {
+    const m = registerAckSchema.parse({
+      type: 'register.ack',
+      agentId: 'a1',
+      labels: [],
+      capabilities: { artifactCompleteAck: true },
+    });
+    expect(m.capabilities?.artifactCompleteAck).toBe(true);
+  });
+
+  it('accepts register.ack with no capabilities (pre-capability orchestrator)', () => {
+    const m = registerAckSchema.parse({ type: 'register.ack', agentId: 'a1', labels: [] });
+    expect(m.capabilities).toBeUndefined();
   });
 });

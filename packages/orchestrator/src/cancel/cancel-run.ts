@@ -19,7 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
 import { createLogger } from '@kici-dev/shared';
-import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '@kici-dev/engine';
+import { ExecutionJobStatus, TERMINAL_JOB_STATES, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { JobQueue } from '../queue/job-queue.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
@@ -50,6 +50,11 @@ export interface CancelRunResult {
   agentsNotified: number;
   /** Number of pending/queued execution_jobs rows marked cancelled. */
   pendingCancelled: number;
+  /**
+   * True when the run was already in a terminal status, so the cancel was a
+   * no-op: no agent was notified and no row was written.
+   */
+  alreadyTerminal: boolean;
 }
 
 /**
@@ -60,9 +65,11 @@ export interface CancelRunResult {
  * the run to its terminal status immediately so the run does not linger in
  * `cancelling`.
  *
- * Idempotent against terminal runs: callers should pre-check terminal state
- * (the cancel route returns 409); the underlying UPDATEs are status-guarded so
- * a double-call is harmless.
+ * A cancel targeting a run that is already terminal is a no-op: the run's
+ * status is read first and, when terminal, the function returns
+ * `alreadyTerminal: true` having written nothing. Entry points map that to
+ * their own convention (the operator route answers 409; the dashboard/MCP path
+ * returns a structured already-terminal result).
  */
 export async function cancelRunWithReason(
   deps: CancelRunDeps,
@@ -72,6 +79,22 @@ export async function cancelRunWithReason(
 ): Promise<CancelRunResult> {
   const { db, jobQueue, dispatcher, registry, executionTracker } = deps;
   const force = options.force ?? false;
+
+  // A cancel racing a run that already finished must not touch the finished
+  // record: overwriting a terminal status, completed_at, attribution or
+  // failure_reason destroys a historical result that nothing else preserves.
+  // A missing row does NOT short-circuit — every entry point answers 404 before
+  // reaching here, and the status-guarded UPDATEs below no-op on a row that
+  // does not exist.
+  const runRow = await db
+    .selectFrom('execution_runs')
+    .select(['status'])
+    .where('run_id', '=', runId)
+    .executeTakeFirst();
+  if (runRow && TERMINAL_RUN_STATES.has(runRow.status)) {
+    logger.info('Cancel ignored: run already terminal', { runId, status: runRow.status });
+    return { agentsNotified: 0, pendingCancelled: 0, alreadyTerminal: true };
+  }
 
   // Notify agents running this run's jobs so in-flight work unwinds (graceful
   // hooks unless force).
@@ -127,8 +150,11 @@ export async function cancelRunWithReason(
   // Cancel queued dispatch_queue entries for the run.
   await jobQueue.cancelByRunId(runId);
 
-  // Stamp attribution + the cancellation reason. failure_reason is
-  // clobber-guarded so a more specific cause already recorded wins.
+  // Stamp attribution + the cancellation reason. Both writes are status-guarded
+  // so a cancel that loses the race against the run finishing writes nothing —
+  // the status read above narrows the window, these predicates close it.
+  // failure_reason is additionally clobber-guarded so a more specific cause
+  // already recorded wins.
   if (options.cancelledBy) {
     await db
       .updateTable('execution_runs')
@@ -139,6 +165,7 @@ export async function cancelRunWithReason(
         }),
       })
       .where('run_id', '=', runId)
+      .where('status', 'not in', [...TERMINAL_RUN_STATES])
       .execute();
   }
   await db
@@ -146,6 +173,7 @@ export async function cancelRunWithReason(
     .set({ failure_reason: reason })
     .where('run_id', '=', runId)
     .where('failure_reason', 'is', null)
+    .where('status', 'not in', [...TERMINAL_RUN_STATES])
     .execute();
 
   // When no agent had outstanding work, the run won't get a later job.complete
@@ -180,5 +208,5 @@ export async function cancelRunWithReason(
     orphansCancelled,
     force,
   });
-  return { agentsNotified, pendingCancelled };
+  return { agentsNotified, pendingCancelled, alreadyTerminal: false };
 }

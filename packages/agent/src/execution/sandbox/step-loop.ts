@@ -17,7 +17,8 @@ import type {
   NormalizedRetry,
 } from '@kici-dev/sdk';
 import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk';
-import { ExecutionStepStatus, CheckMode, CheckStepOutcome } from '@kici-dev/engine';
+import { ExecutionStepStatus, CheckMode, CheckStepOutcome, LogStream } from '@kici-dev/engine';
+import type { ChangedFilesStatus } from '@kici-dev/engine';
 import { runIdempotentStep, type IdempotentStep } from '@kici-dev/core/idempotency';
 import { computeBackoffDelay } from '@kici-dev/core';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
@@ -346,6 +347,83 @@ async function runStepWithCheckMode(
   };
 }
 
+/** Most lines of a failing step's error message that reach the run log. */
+export const STEP_FAILURE_LOG_MAX_LINES = 100;
+/** Most characters of a failing step's error message that reach the run log. */
+export const STEP_FAILURE_LOG_MAX_CHARS = 8192;
+
+/**
+ * Emit a failing step's error message into the step's own log stream.
+ *
+ * A step failure is otherwise reported only on `step.complete` (which persists
+ * to the step row), so a reader of the run log sees a step go red with nothing
+ * explaining why. Subprocess wrappers routinely pack the real diagnosis —
+ * captured stderr, exit code, kill signal — into the thrown error's message, so
+ * that message is the diagnosis and it belongs in the log.
+ *
+ * Tagged `stderr`: it is a failure, not progress. Bounded to
+ * {@link STEP_FAILURE_LOG_MAX_LINES} lines / {@link STEP_FAILURE_LOG_MAX_CHARS}
+ * characters, because a wrapped process error can carry a subprocess's entire
+ * output; what is dropped is stated in the log rather than silently cut. The
+ * full untruncated message still travels on `step.complete`.
+ *
+ * Goes through the same `sendFn` as every other log line, so the runner's
+ * secret masking applies exactly as it does to the step's ordinary output.
+ *
+ * One consequence to know: a `$({ quiet: true })` command's output is kept out
+ * of the log by the `verbose` gate in `streaming-zx-log.ts`, but when such a
+ * command FAILS, zx packs its captured output into the thrown error's message —
+ * which this function then writes to the log. That text is already persisted
+ * unmasked on `step.complete` (the step row the dashboard renders), so the copy
+ * written here is the more protected of the two, and surfacing it is the whole
+ * point: a quiet command that fails is exactly the failure an operator cannot
+ * otherwise diagnose. Registered secret values are masked; anything the masker
+ * has never been told about is not.
+ */
+function emitStepFailureLog(
+  stepName: string,
+  stepIndex: number,
+  message: string,
+  sendFn: (msg: RunnerToAgentMessage) => void,
+): void {
+  const prefix = `[kici] Step '${stepName}' failed: `;
+  const capped =
+    message.length > STEP_FAILURE_LOG_MAX_CHARS
+      ? message.slice(0, STEP_FAILURE_LOG_MAX_CHARS)
+      : message;
+  const kept = (prefix + capped).split('\n').slice(0, STEP_FAILURE_LOG_MAX_LINES);
+
+  for (const line of kept) {
+    if (line) sendFn({ type: 'log.line', stepIndex, line, stream: LogStream.enum.stderr });
+  }
+
+  // Both counts are measured against the ORIGINAL message, never against the
+  // char-capped copy: a char cap landing mid-message also drops every line
+  // after the cut, and a line cap trimming the tail also drops that tail's
+  // characters. Counting either from the capped copy reports "0 more" for a cap
+  // that did fire, which reads as "nothing else was lost".
+  //
+  // `kept.join('\n')` reconstructs exactly the emitted prefix of `prefix +
+  // capped`, so subtracting the prefix gives the message characters that got
+  // out; the remaining newlines in `message` are the lines that did not.
+  const emittedChars = Math.max(0, kept.join('\n').length - prefix.length);
+  const omittedChars = message.length - emittedChars;
+  if (omittedChars > 0) {
+    let omittedLines = 0;
+    for (let i = emittedChars; i < message.length; i++) {
+      if (message.charCodeAt(i) === 10 /* \n */) omittedLines++;
+    }
+    sendFn({
+      type: 'log.line',
+      stepIndex,
+      line:
+        `[kici] … error message truncated (${omittedLines} more line(s), ` +
+        `${omittedChars} more character(s)); see the step's recorded error for the full text`,
+      stream: LogStream.enum.stderr,
+    });
+  }
+}
+
 /**
  * Execute a single step with timeout enforcement.
  *
@@ -468,6 +546,14 @@ async function executeStepInLoop(
     const exitCode = extractExitCode(e);
     const signal = extractSignal(e);
 
+    // Emit the failure into the step's log stream BEFORE `step.complete`, so
+    // the line is ordered ahead of the terminal status on the runner->agent IPC
+    // channel and lands in the step's log rather than leaving a bare red step.
+    // The agent batches log lines through its LogStreamer while step statuses
+    // go out immediately, so the enclosing log chunk can still reach the
+    // orchestrator after the terminal status; the ordering guarantee is IPC-level.
+    emitStepFailureLog(step.name, stepIndex, error.message, sendFn);
+
     const secretsAccessed = getSecretsAccessLog?.(stepIndex);
     emitSecretMountEvents(getSecretMountRecords?.(stepIndex), stepIndex, sendFn);
 
@@ -558,25 +644,67 @@ export interface StepIterationOutcome {
 }
 
 /**
- * Evaluate step-level rules. Returns a 'skipped' result + emits IPC when a rule
- * fails; returns null when the step should run normally.
+ * Evaluate step-level rules. Returns null when the step should run normally.
+ * Otherwise returns a terminal `StepIterationOutcome`:
+ *
+ * - a rule's `check()` **threw** (`evaluationError`) → FAIL the step (`failed`
+ *   status + error surfaced, `shouldBreak: true`): the gate could not be
+ *   evaluated, so silently skipping would be a false green.
+ * - a rule cleanly returned `false` → clean skip (`skipped` status,
+ *   `shouldBreak: false`), the loop continues to the next step (unchanged).
  */
 async function evaluateStepRulesAndMaybeSkip(
   step: Step,
   stepIndex: number,
   opts: StepLoopOptions,
-): Promise<SandboxStepResult | null> {
+): Promise<StepIterationOutcome | null> {
   if (!step.rules || step.rules.length === 0) return null;
-  const ruleCtx = createRuleContext(
-    opts.event,
-    [],
-    opts.env,
-    opts.dispatchInputs ?? {},
-    opts.fanout,
-  );
+  const ev = opts.event as {
+    changedFiles?: string[];
+    changedFilesStatus?: ChangedFilesStatus;
+  };
+  const ruleCtx = createRuleContext({
+    event: opts.event,
+    changedFiles: ev.changedFiles,
+    changedFilesStatus: ev.changedFilesStatus,
+    env: opts.env,
+    dispatchInputs: opts.dispatchInputs ?? {},
+    fanout: opts.fanout,
+  });
   const ruleResult = await evaluateRules(step.rules, ruleCtx, step.name);
   if (ruleResult.allPassed) return null;
 
+  // A rule's check() threw -- fail the step, never a silent skip.
+  if (ruleResult.evaluationError) {
+    const message = `rule '${ruleResult.evaluationError.label}' errored: ${ruleResult.evaluationError.message}`;
+    opts.sendIpc({ type: 'step.start', stepIndex, stepName: step.name });
+    opts.sendIpc({
+      type: 'step.complete',
+      stepIndex,
+      status: ExecutionStepStatus.enum.failed,
+      durationMs: 0,
+      error: { message },
+    });
+    opts.sendIpc({
+      type: 'log.line',
+      stepIndex,
+      line: `[kici] Step '${step.name}' failed: ${message}`,
+      stream: LogStream.enum.stderr,
+    });
+    return {
+      result: {
+        name: step.name,
+        stepIndex,
+        status: ExecutionStepStatus.enum.failed,
+        durationMs: 0,
+        error: { message },
+      },
+      shouldBreak: true,
+      failedStepName: step.name,
+    };
+  }
+
+  // A rule cleanly returned false -- legitimate skip.
   opts.sendIpc({ type: 'step.start', stepIndex, stepName: step.name });
   opts.sendIpc({
     type: 'step.complete',
@@ -590,10 +718,13 @@ async function evaluateStepRulesAndMaybeSkip(
     line: `[kici] Step '${step.name}' skipped: rule '${ruleResult.results.find((r) => !r.passed)?.label}' did not pass`,
   });
   return {
-    name: step.name,
-    stepIndex,
-    status: ExecutionStepStatus.enum.skipped,
-    durationMs: 0,
+    result: {
+      name: step.name,
+      stepIndex,
+      status: ExecutionStepStatus.enum.skipped,
+      durationMs: 0,
+    },
+    shouldBreak: false,
   };
 }
 
@@ -649,6 +780,7 @@ async function maybeGateStepApproval(
     type: 'log.line',
     stepIndex,
     line: `[kici] Step '${step.name}' ${why}.`,
+    stream: LogStream.enum.stderr,
   });
   await opts.disposeStepResources?.(stepIndex);
   return {
@@ -704,6 +836,7 @@ async function runObserverHook(args: {
       type: 'log.line',
       stepIndex,
       line: `[kici] ${hookType} hook failed: ${hookResult.error} (continuing -- hooks are observers)`,
+      stream: LogStream.enum.stderr,
     });
   }
 }
@@ -765,6 +898,7 @@ async function runStepWithRetry(
       type: 'log.line',
       stepIndex,
       line: `[kici] Step '${step.name}' attempt ${n}/${max} failed: ${err.message}; retrying in ${delay}ms`,
+      stream: LogStream.enum.stderr,
     });
     await new Promise((r) => setTimeout(r, delay));
   }
@@ -776,14 +910,15 @@ export async function runStepIteration(
   stepIndex: number,
   opts: StepLoopOptions,
 ): Promise<StepIterationOutcome> {
-  const skippedResult = await evaluateStepRulesAndMaybeSkip(step, stepIndex, opts);
-  if (skippedResult) {
+  const ruleOutcome = await evaluateStepRulesAndMaybeSkip(step, stepIndex, opts);
+  if (ruleOutcome) {
+    // A rule short-circuited the step (clean skip or a throwing-rule failure).
     // Even a rule-skipped step may have allocated context state via a prior
     // `createStepContext` call (when `getSecretMountRecords` is wired the
     // outer caller may have pre-allocated the secrets handle). Dispose to be
     // safe.
     await opts.disposeStepResources?.(stepIndex);
-    return { result: skippedResult, shouldBreak: false };
+    return ruleOutcome;
   }
 
   // Manual approval gate: block this step until the orchestrator resolves an

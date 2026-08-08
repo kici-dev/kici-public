@@ -127,10 +127,10 @@ records (no heuristics). It is `null` for a run that did not fail, and otherwise
 | -------------- | -------------------------------------------------------------------- |
 | `init_failure` | The run/job recorded an init-phase failure (e.g. secret resolution). |
 | `infra`        | The init failure was an infrastructure cause (no agent available).   |
-| `timed_out`    | A job hit a configured wall-clock timeout.                            |
+| `timed_out`    | A job hit a configured wall-clock timeout.                           |
 | `cancelled`    | The run was cancelled.                                               |
 | `step_failed`  | A step exited non-zero.                                              |
-| `unknown`      | The run failed with no clearer signal.                              |
+| `unknown`      | The run failed with no clearer signal.                               |
 
 ## Secret safety
 

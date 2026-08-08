@@ -21,6 +21,30 @@ export interface ProvenanceTrustRoot {
   setIssuer(issuer: string | null): void;
 }
 
+/**
+ * A trust root backed by the orchestrator's OWN signing keys (Phase 1
+ * orchestrator-owned attestations). Verify-at-ingest resolves the key set from
+ * the `orchestrator_signing_keys` table so fresh rotations / revocations are
+ * reflected immediately, and the issuer is the orchestrator's own configured
+ * provenance issuer. The key set is read fresh from the DB each resolve (a cheap
+ * read; ingest verification is not hot), so a rotated-in `kid` is always found.
+ */
+export function provenanceTrustRootFromRepo(
+  repo: { listTrusted: () => Promise<{ public_jwk: unknown }[]> },
+  issuer: string,
+): ProvenanceTrustRoot {
+  return {
+    getIssuer: () => issuer,
+    getJwks: async () => {
+      const rows = await repo.listTrusted();
+      return { keys: rows.map((r) => r.public_jwk) } as JSONWebKeySet;
+    },
+    setIssuer: () => {
+      // The orchestrator's own issuer is fixed by config; ignore live mutations.
+    },
+  };
+}
+
 export function createProvenanceTrustRoot(
   opts: {
     issuer?: string | null;

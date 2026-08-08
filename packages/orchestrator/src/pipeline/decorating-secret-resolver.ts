@@ -12,6 +12,7 @@
  * wins.
  */
 
+import type { HostFacts } from '@kici-dev/engine';
 import type { SecretResolverApi, ResolvedSecretMeta } from '../secrets/secret-resolver.js';
 
 /** Decrypted CLI-uploaded local secrets: flat keys + per-context namespaces. */
@@ -26,8 +27,14 @@ export class DecoratingSecretResolver implements SecretResolverApi {
     private readonly cli: CliSecrets,
   ) {}
 
-  async resolveForJob(orgId: string, contextName: string): Promise<Record<string, string>> {
-    const envSecrets = await this.base.resolveForJob(orgId, contextName);
+  async resolveForJob(
+    orgId: string,
+    contextName: string,
+    hostCtx?: HostFacts,
+  ): Promise<Record<string, string>> {
+    // Forward hostCtx so the wrapped resolver keeps per-host fan-out scoping;
+    // dropping it would silently degrade a per-host resolution to fleet-wide.
+    const envSecrets = await this.base.resolveForJob(orgId, contextName, hostCtx);
     return {
       ...envSecrets,
       ...(this.cli.contexts[contextName] ?? {}),
@@ -47,7 +54,9 @@ export class DecoratingSecretResolver implements SecretResolverApi {
   resolveForJobWithMeta(
     orgId: string,
     contextName: string,
+    hostCtx?: HostFacts,
   ): Promise<Record<string, ResolvedSecretMeta>> {
-    return this.base.resolveForJobWithMeta(orgId, contextName);
+    // Forward hostCtx for the same per-host-scoping reason as resolveForJob.
+    return this.base.resolveForJobWithMeta(orgId, contextName, hostCtx);
   }
 }

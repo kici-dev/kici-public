@@ -21,6 +21,7 @@
 
 import { Hono } from 'hono';
 import { createLogger } from '@kici-dev/shared';
+import { CANONICAL_STATUSES } from '@kici-dev/engine';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
@@ -34,19 +35,19 @@ import { aggregateRunDetail } from '../reporting/run-aggregator.js';
 import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import { readStepLogLines, toAgentStepLogs } from '../reporting/step-log-reader.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-runs' });
 
-/** Statuses that can appear in `execution_runs.status`. */
-const RUN_STATUSES = new Set([
-  'pending',
-  'running',
-  'success',
-  'failed',
-  'cancelled',
-  'timed_out_stale',
-  'skipped',
-]);
+/**
+ * Statuses accepted by the `?status=` filter.
+ *
+ * The full canonical union rather than just `ExecutionRunStatus.options`: only
+ * run statuses can appear in `execution_runs.status`, but the job-only members
+ * were accepted before and simply match no row, so keeping them avoids turning
+ * an empty result into a rejected request.
+ */
+export const RUN_STATUSES: ReadonlySet<string> = new Set<string>(CANONICAL_STATUSES);
 
 /** Safely parse a JSON string, returning null on invalid input. */
 function safeJsonParse(value: string | null | undefined): unknown {
@@ -132,21 +133,10 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
   const app = new Hono<AdminRunEnv>();
 
   // ── Auth middleware ────────────────────────────────────────────
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin-runs',
+  });
   app.use('/api/v1/admin/runs', authMiddleware);
   app.use('/api/v1/admin/runs/*', authMiddleware);
 
@@ -158,6 +148,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
       const statuses = parseStatus(c.req.query('status'));
       const workflowName = c.req.query('workflowName');
       const repo = c.req.query('repo');
+      const deliveryId = c.req.query('deliveryId');
       const sinceParsed = parseSince(c.req.query('since'));
       if (!sinceParsed.ok) {
         return c.json(
@@ -197,6 +188,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
       if (statuses && statuses.length > 1) countQuery = countQuery.where('status', 'in', statuses);
       if (workflowName) countQuery = countQuery.where('workflow_name', '=', workflowName);
       if (repo) countQuery = countQuery.where('repo_identifier', '=', repo);
+      if (deliveryId) countQuery = countQuery.where('delivery_id', '=', deliveryId);
       if (since) countQuery = countQuery.where('created_at', '>', since);
       if (tokenRoutingKey) countQuery = countQuery.where('routing_key', '=', tokenRoutingKey);
 
@@ -239,6 +231,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
       if (statuses && statuses.length > 1) query = query.where('status', 'in', statuses);
       if (workflowName) query = query.where('workflow_name', '=', workflowName);
       if (repo) query = query.where('repo_identifier', '=', repo);
+      if (deliveryId) query = query.where('delivery_id', '=', deliveryId);
       if (since) query = query.where('created_at', '>', since);
       if (tokenRoutingKey) query = query.where('routing_key', '=', tokenRoutingKey);
 

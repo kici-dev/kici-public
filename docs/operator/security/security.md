@@ -16,7 +16,7 @@ Trust policies control how KiCI handles PR-triggered runs based on contributor t
 | Fork PR policy             | `hold` / `reject` / `allow` | `hold`  | Whether fork PRs are held for approval, rejected outright, or allowed              |
 | Unknown contributor policy | `hold` / `reject`           | `hold`  | Whether unknown contributors are held for approval or rejected                     |
 | Workflow change policy     | `hold` / `reject` / `allow` | `hold`  | Whether workflow modifications by non-trusted users are held, rejected, or allowed |
-| Approval expiry            | Duration (hours)            | 72      | How long a security hold waits before expiring                                     |
+| Approval expiry            | Duration (hours)            | 72      | How long a security hold stays approvable before it expires                        |
 
 ### Default behavior
 
@@ -28,6 +28,56 @@ KiCI defaults to **fail-closed, deny-untrusted**:
 - Contributors without identity links are treated as unknown
 - If trust policy cannot be fetched from Platform, all contributors are treated as unknown
 
+The policy applies to sources with a contributor model (GitHub today). Sources
+without one -- generic webhooks, local sources, plain Git remotes -- have no
+contributor to resolve and are not gated by it.
+
+Note that the workflow change policy is not fork-only: it applies to a same-repo
+PR from any contributor below the `trusted` tier, which is the default for
+ordinary org members.
+
+An organization that has never opened **Settings > CI trust** is pushed these
+same documented defaults, so its orchestrator enforces exactly what this table
+describes rather than waiting for a policy that was never created.
+
+### Organization-wide global workflows
+
+Organization-wide global workflows do not run for a pull request that the trust
+policy holds or rejects. Approving the hold releases the pull request's own
+workflows; it does not retroactively run the organization's global workflows for
+that event. A separate neutral check, `KiCI: Organization workflows`, reports
+that they were skipped -- the `KiCI Security` check keeps showing the hold.
+
+This matters because a global workflow runs with **organization** credentials
+against the pull request's head commit, so letting one run for an untrusted
+event would defeat the policy that held the event in the first place.
+
+### Allowing fork pull requests
+
+Setting fork PR policy to `allow` dispatches a fork pull request even though
+fork contributors always resolve to the `unknown` trust tier -- the fork is what
+made them unknown, so the fork setting decides the outcome.
+
+This is deliberately narrow. A **non-fork** unknown contributor is still governed
+by the unknown contributor policy, and a fork pull request that edits `.kici/`
+workflow definitions is still governed by the workflow change policy. So `allow`
+opens exactly one door: pull requests from forks by contributors you cannot
+identify, which is the open-source case it exists for.
+
+### Allowing workflow changes
+
+Setting workflow change policy to `allow` is narrow in the same way, and for the
+same reason: it removes only the workflow-change objection. The pull request is
+still evaluated against the other policies, so a fork PR is still governed by the
+fork PR policy and a contributor you cannot identify is still governed by the
+unknown contributor policy -- and that policy has no `allow` value. A pull
+request from an unidentified contributor that also edits `.kici/` workflow
+definitions is therefore still held or rejected under `allow`; what changes is
+the reason, from workflow modification to unknown contributor.
+
+`allow` never means "dispatch this pull request". It means "this particular
+objection no longer applies".
+
 ### Changing defaults
 
 To change the default policy:
@@ -35,6 +85,12 @@ To change the default policy:
 1. Navigate to **Settings > CI trust** in the dashboard
 2. Adjust the policy values (e.g., set fork PR policy to `allow` for open-source projects, or `reject` to block fork PRs entirely)
 3. Save -- the policy is pushed to all connected orchestrators via WebSocket
+
+An **independent** orchestrator has no Platform to push the policy, so it is managed with the orchestrator admin CLI instead: `kici-admin trust-policy show --customer-id <id>` and `kici-admin trust-policy set --customer-id <id> --fork-policy <hold|reject|allow> …`. On a Platform-attached orchestrator `set` refuses with a 409, because the next Platform push would overwrite a local write. See [kici-admin: org settings](../orchestrator/kici-admin/org-settings.md).
+
+The admin token behind those commands needs the orchestrator-side `ci_trust.read` permission to `show` and `ci_trust.admin` to `set` — both held by the `owner` and `admin` roles, and by neither `auditor` nor a routing-key-scoped token (the policy is org-wide, not per routing key). Every successful `set` writes a `trust_policy.updated` row to the access log in the same transaction as the policy itself, so a policy change can never land unattributed; read it back with `kici-admin access-log list --action trust_policy.updated`.
+
+Until an independent orchestrator has a policy stored, no policy arm is in force at all — only the legacy rule that holds a workflow change by a non-trusted contributor. `trust-policy show` reports that state as `Enforcement: legacy` and prints **no** policy values, rather than showing defaults it is not applying.
 
 ## ci_trust RBAC resource
 
@@ -105,24 +161,31 @@ Example: set production to `minimumTrust: 'trusted'` so only verified org member
 
 ## Security approval queue
 
-The security approval queue is separate from environment approval queues. View it in **Settings > CI trust > Approval queue**.
+The security approval queue is separate from context approval queues. View it in **Settings > CI trust > Approval queue**.
 
 ### Hold reasons
 
-| Reason                  | Trigger                                                                  |
-| ----------------------- | ------------------------------------------------------------------------ |
-| `workflow_modification` | PR modifies `.kici/` files by non-trusted user                           |
-| `environment_trust`     | Environment `minimumTrust` gate blocks contributor with lower trust tier |
+| Reason                  | Trigger                                                              |
+| ----------------------- | -------------------------------------------------------------------- |
+| `workflow_modification` | PR modifies `.kici/` files by non-trusted user                       |
+| `fork_pr`               | PR opened from a fork, with fork PR policy set to `hold`             |
+| `unknown_contributor`   | Contributor could not be resolved to a known identity                |
+| `context_trust`         | Context `minimumTrust` gate blocks contributor with lower trust tier |
+
+A PR that trips several policy arms produces exactly one hold. The arms are
+evaluated in the order above, and any `reject` outcome takes precedence over any
+`hold`. The trust policy is evaluated before the context `minimumTrust` gate, so
+a run held by policy never also lands a competing `context_trust` hold.
 
 ### Approving or rejecting
 
 **Dashboard:** Click approve or reject in the security approval queue.
 
-**PR comment:** Post `/kici approve` or `/kici reject` as a PR comment. The commenter must have ci_trust:write or higher (verified via identity link + RBAC).
+**PR comment:** Post `/kici approve` or `/kici reject` as a PR comment. The commenter must have ci_trust:write or higher (verified via identity link + RBAC). The command acts only on the held runs for the PR (and repo) the comment was posted on -- it never releases or rejects holds belonging to other PRs or repos.
 
 ### Expiry
 
-Held runs expire after the configured approval expiry duration (default 72 hours). Expired runs transition to `expired` status and a GitHub Check is updated with a timeout explanation.
+A hold raised by the trust policy -- `workflow_modification`, `fork_pr`, or `unknown_contributor` -- covers a whole PR and is not attached to an environment, so it uses the org's **Approval expiry** setting (default 72 hours). A `context_trust` hold is raised by an environment rather than by the org policy, so it uses that environment's own hold expiry (`hold_expiry_seconds`, default one hour), configurable under **Settings > Environments > [env] > Protection**. Expired runs transition to `expired` status and a GitHub Check is updated with a timeout explanation.
 
 ## Monitoring
 

@@ -27,7 +27,16 @@ vi.mock('kysely', async (importOriginal) => {
   };
 });
 
+// Mock the batch accumulator so the buffer-branch tests assert on the calls
+// without needing a real DB executor for the window/item queries.
+vi.mock('./batch-accumulator.js', () => ({
+  openOrGetBatchWindow: vi.fn().mockResolvedValue({ windowId: 'w1', opened: true }),
+  appendBatchItem: vi.fn().mockResolvedValue(undefined),
+  sweepExpiredBatchWindows: vi.fn().mockResolvedValue([]),
+}));
+
 import { EventRouter, type EmitEventInput, type EventRouterOptions } from './event-router.js';
+import { openOrGetBatchWindow, appendBatchItem } from './batch-accumulator.js';
 import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig, type StoredEvent } from './types.js';
 import { EVENT_CATCHUP_BATCH_SIZE, type EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
@@ -131,6 +140,21 @@ function makeWorkflowCompleteWorkflow(name: string, triggerName?: string): LockW
   };
 }
 
+function makeWorkflowsFailedBatchWorkflow(name: string): LockWorkflow {
+  return {
+    name,
+    contentHash: 'hash-3',
+    compileSchemaVersion: 2,
+    triggers: [
+      {
+        _type: 'workflows_failed_batch' as const,
+        accumulateFor: 3000,
+      },
+    ],
+    jobs: [],
+  };
+}
+
 // ── Create mocks ────────────────────────────────────────────────
 
 function createMockEventStore(options: { events?: StoredEvent[] } = {}) {
@@ -180,7 +204,7 @@ function createMockCircuitBreaker(options: { chainAllowed?: boolean; rateAllowed
       allowed: chainAllowed,
       reason: chainAllowed ? undefined : 'Event chain depth 10 exceeds maximum 10',
     }),
-    checkRateLimit: vi.fn().mockReturnValue({
+    checkRateLimit: vi.fn().mockResolvedValue({
       allowed: rateAllowed,
       retryAfterMs: rateAllowed ? undefined : 5000,
     }),
@@ -1488,6 +1512,129 @@ describe('EventRouter', () => {
         'exhausted_retries',
         expect.stringContaining('fault-injection'),
       );
+    });
+  });
+
+  describe('workflowsFailedBatch buffering', () => {
+    beforeEach(() => {
+      vi.mocked(openOrGetBatchWindow).mockClear();
+      vi.mocked(appendBatchItem).mockClear();
+    });
+
+    function makeBatchReg(): RegisteredWorkflow {
+      return {
+        id: 'reg-notifier',
+        repoIdentifier: 'owner/repo',
+        workflowName: 'notifier',
+        lockEntry: makeWorkflowsFailedBatchWorkflow('notifier'),
+        triggerTypes: ['workflows_failed_batch'],
+        routingKey: 'github:42',
+        providerContext: {},
+        disabled: false,
+        commitSha: null,
+        sourceFile: null,
+      } as unknown as RegisteredWorkflow;
+    }
+
+    function makeFailedCompletionEvent(): StoredEvent {
+      return makeStoredEvent({
+        eventName: '__workflow_complete',
+        payload: {
+          workflowName: 'CI',
+          runId: 'run-9',
+          status: 'failed',
+          sourceRepo: 'owner/repo',
+          failureClass: 'step_failure',
+        },
+        sourceRunId: 'run-9',
+        sourceRoutingKey: 'github:42',
+      });
+    }
+
+    function batchRegIndex(): RegistrationIndex {
+      return {
+        ...createMockRegistrationIndex([]),
+        getByEventType: vi.fn().mockReturnValue([makeBatchReg()]),
+      } as unknown as RegistrationIndex;
+    }
+
+    it('buffers a failed workflow_complete instead of dispatching now', async () => {
+      const event = makeFailedCompletionEvent();
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      const opts = createRouterOptions({
+        eventStore: createMockEventStore({ events: [event] }),
+        onEventMatched,
+        registrationIndex: batchRegIndex(),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      await simulateNotification(opts.mockPool, 'kici_event_channel', event.id);
+
+      expect(openOrGetBatchWindow).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ registrationId: 'reg-notifier', accumulateForMs: 3000 }),
+      );
+      expect(appendBatchItem).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          windowId: 'w1',
+          run: expect.objectContaining({ runId: 'run-9', workflowName: 'CI' }),
+        }),
+      );
+      expect(onEventMatched).not.toHaveBeenCalled();
+    });
+
+    it('dispatches the synthetic workflows_failed_batch event to its registration', async () => {
+      const event = makeStoredEvent({
+        eventName: '__workflows_failed_batch',
+        payload: {
+          registrationId: 'reg-notifier',
+          total: 3,
+          runs: [{ runId: 'run-1', repo: 'owner/repo', workflowName: 'CI' }],
+          sourceRepo: 'owner/repo',
+        },
+        sourceRoutingKey: 'github:42',
+      });
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      const opts = createRouterOptions({
+        eventStore: createMockEventStore({ events: [event] }),
+        onEventMatched,
+        registrationIndex: batchRegIndex(),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      await simulateNotification(opts.mockPool, 'kici_event_channel', event.id);
+
+      expect(onEventMatched).toHaveBeenCalledTimes(1);
+      expect(appendBatchItem).not.toHaveBeenCalled();
+    });
+
+    it('self-excludes a failed run dispatched by a failure-lifecycle trigger', async () => {
+      const event = makeFailedCompletionEvent();
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      const { db } = _createSharedMockDb({
+        selectFirstRow: {
+          trigger_decision: JSON.stringify({ matched: true, dispatchedByFailureLifecycle: true }),
+        },
+      });
+      (db as any).transaction = vi.fn().mockReturnValue({
+        execute: vi.fn().mockImplementation((fn: (tx: any) => Promise<unknown>) => fn({})),
+      });
+      const opts = createRouterOptions({
+        db,
+        eventStore: createMockEventStore({ events: [event] }),
+        onEventMatched,
+        registrationIndex: batchRegIndex(),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      await simulateNotification(opts.mockPool, 'kici_event_channel', event.id);
+
+      expect(appendBatchItem).not.toHaveBeenCalled();
+      expect(onEventMatched).not.toHaveBeenCalled();
     });
   });
 });

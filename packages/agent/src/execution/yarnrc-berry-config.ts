@@ -19,9 +19,9 @@
  * shapes as the npm overlay so `dep-installer` can pick either by flavor.
  */
 
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import { parse, stringify } from 'yaml';
 import type {
   ApplyNpmRegistryConfigArgs,
@@ -72,7 +72,7 @@ export async function applyYarnrcBerryConfig(
   const yarnrcPath = join(args.kiciDir, '.yarnrc.yml');
   const { raw: original, doc } = await readOriginalYarnrc(yarnrcPath);
 
-  const cacheFolder = await mkdtemp(join(tmpdir(), 'kici-yarn-berry-cache-'));
+  const { path: cacheFolder, cleanup: cleanupCache } = await makeTempDir('yarn-berry-cache');
 
   // Agent-managed keys win over committed ones (managed token beats committed).
   const merged: Record<string, unknown> = {
@@ -122,7 +122,7 @@ export async function applyYarnrcBerryConfig(
     } catch {
       // best-effort restore; never fail the install on a restore error
     }
-    await rm(cacheFolder, { recursive: true, force: true }).catch(() => {});
+    await cleanupCache().catch(() => {});
   };
 
   return {

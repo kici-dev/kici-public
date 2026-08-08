@@ -1,7 +1,8 @@
 /**
  * Build a SLSA v1.0 in-toto provenance statement from the server-truth identity
  * token claims plus the caller-supplied subject. The build context comes
- * entirely from the JWT claims (Platform-minted, unforgeable), so the
+ * entirely from the JWT claims (minted server-side by the orchestrator,
+ * unforgeable), so the
  * statement's identity equals the token's identity by construction.
  */
 import {
@@ -12,7 +13,7 @@ import {
 } from '@kici-dev/engine/provenance/schema';
 import type { SourceOrigin } from '@kici-dev/engine';
 
-/** The KiCI identity-token claims the builder reads (Platform server-truth). */
+/** The KiCI identity-token claims the builder reads (minter server-truth). */
 export interface ProvenanceTokenClaims {
   iss: string;
   repository?: string | null;

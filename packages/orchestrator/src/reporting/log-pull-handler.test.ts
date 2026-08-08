@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { LogPullHandler, type LogPullHandlerDeps } from './log-pull-handler.js';
+import { assertSafeLogPath } from './log-storage.js';
 import type { LogStorage, LogReadResult } from './log-storage.js';
 import type { ExecutionTracker } from './execution-tracker.js';
 
 // -- In-memory LogStorage mock ────────────────────────────────────
 
+// The mock calls assertSafeLogPath on every path-taking verb so it refuses
+// exactly what the real backends refuse. A fake that accepts inputs the
+// product rejects eventually certifies handler behaviour that does not exist.
 class MockLogStorage implements LogStorage {
   private files = new Map<string, string>();
 
@@ -14,11 +18,24 @@ class MockLogStorage implements LogStorage {
   }
 
   async append(path: string, data: string): Promise<void> {
+    assertSafeLogPath(path);
     const existing = this.files.get(path) ?? '';
     this.files.set(path, existing + data);
   }
 
+  async appendStreaming(path: string, data: string): Promise<void> {
+    await this.append(path, data);
+  }
+
+  async finalize(path: string): Promise<void> {
+    // Nothing to seal (the mock stores appends immediately), but the path is
+    // still validated: S3LogStorage.finalize() routes through objectKey() and
+    // rejects a malformed key, so the mock must not be laxer than it.
+    assertSafeLogPath(path);
+  }
+
   async read(path: string, options?: { cursor?: number; limit?: number }): Promise<LogReadResult> {
+    assertSafeLogPath(path);
     const content = this.files.get(path);
     if (!content) {
       return { data: '', cursor: 0, complete: true };
@@ -41,10 +58,12 @@ class MockLogStorage implements LogStorage {
   }
 
   async exists(path: string): Promise<boolean> {
+    assertSafeLogPath(path);
     return this.files.has(path);
   }
 
   async list(prefix: string): Promise<string[]> {
+    assertSafeLogPath(prefix);
     return [...this.files.keys()].filter((k) => k.startsWith(prefix));
   }
 }

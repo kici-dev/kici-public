@@ -32,21 +32,23 @@ pnpm kici preview push --config workflows/hello-world.ts
 
 Single-file workflows, runnable with `pnpm kici preview <event> --config <path>`:
 
-| Example                                                              | Description                                                             | Triggers     |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------------ |
-| [hello-world.ts](./workflows/hello-world.ts)                         | Minimal workflow that echoes "Hello, World!"                            | `push`       |
-| [ci-monorepo.ts](./workflows/ci-monorepo.ts)                         | Dynamic matrix discovered at runtime, a shared step, conditional deploy | `pr`, `push` |
-| [mise-init.ts](./workflows/mise-init.ts)                             | Generic init phase provisions jq via mise (`mise.toml`)                 | `push`       |
-| [mise-preset.ts](./workflows/mise-preset.ts)                         | Zero-config `init: 'mise'` preset (sugar over the generic mise init)    | `push`       |
-| [wait-for-marker.ts](./workflows/wait-for-marker.ts)                 | `waitForStep` polls until a producer job writes a marker file           | `push`       |
-| [parallel-lint-typecheck.ts](./workflows/parallel-lint-typecheck.ts) | `parallel([...])` runs independent checks concurrently within a job     | `push`       |
+| Example                                                                            | Description                                                                                                       | Triggers           |
+| ---------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------ |
+| [hello-world.ts](./workflows/hello-world.ts)                                       | Minimal workflow that echoes "Hello, World!"                                                                      | `push`             |
+| [ci-monorepo.ts](./workflows/ci-monorepo.ts)                                       | Dynamic matrix discovered at runtime, a shared step, conditional deploy                                           | `pr`, `push`       |
+| [typed-pipeline.ts](./workflows/typed-pipeline.ts)                                 | Typed step outputs read across steps in a job, `needs` + cross-job job outputs                                    | `push`             |
+| [mise-init.ts](./workflows/mise-init.ts)                                           | Generic init phase provisions jq via mise (`mise.toml`)                                                           | `push`             |
+| [mise-preset.ts](./workflows/mise-preset.ts)                                       | Zero-config `init: 'mise'` preset (sugar over the generic mise init)                                              | `push`             |
+| [wait-for-marker.ts](./workflows/wait-for-marker.ts)                               | `waitForStep` polls until a producer job writes a marker file                                                     | `push`             |
+| [parallel-lint-typecheck.ts](./workflows/parallel-lint-typecheck.ts)               | `parallel([...])` runs independent checks concurrently within a job                                               | `push`             |
+| [failed-workflow-slack-notifier.ts](./workflows/failed-workflow-slack-notifier.ts) | Global workflow: any failed workflow org-wide routes to a Slack channel + @-mentions via an inline repo→route map | `workflowComplete` |
 
 ### Project layout (`dynamic-context/`)
 
 A repo-shaped example showing the real `.kici/workflows/` directory layout rather than a single file:
 
-| Example                                                                      | Description                                               | Triggers |
-| ---------------------------------------------------------------------------- | --------------------------------------------------------- | -------- |
+| Example                                                                  | Description                                           | Triggers |
+| ------------------------------------------------------------------------ | ----------------------------------------------------- | -------- |
 | [dynamic-deploy.ts](./dynamic-context/.kici/workflows/dynamic-deploy.ts) | Per-event `context` and `env` callbacks select target | `push`   |
 
 ## Adding Examples

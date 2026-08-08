@@ -47,3 +47,43 @@ describe('developer operation registry', () => {
     expect(developerOpsForEntrypoint('ui').every((o) => o.entrypoints.ui)).toBe(true);
   });
 });
+
+describe('repoScoped declaration', () => {
+  it('declares repoScoped on every row', () => {
+    for (const op of DEVELOPER_OPERATIONS) {
+      expect(typeof op.repoScoped, `${op.id} must declare repoScoped`).toBe('boolean');
+    }
+  });
+
+  it('marks every runs / workflows / held-runs op repo-scoped', () => {
+    const scopedDomains = ['runs', 'workflows', 'held-runs'];
+    for (const op of DEVELOPER_OPERATIONS) {
+      if (scopedDomains.includes(op.domain)) {
+        expect(op.repoScoped, `${op.id} acts on a repository's resource`).toBe(true);
+      }
+    }
+  });
+
+  it('never marks a secrets op repo-scoped', () => {
+    // Scoped secrets are keyed by context / environment on the customer's
+    // orchestrator, so there is no repository to scope against.
+    for (const op of DEVELOPER_OPERATIONS) {
+      if (op.domain === 'secrets') {
+        expect(op.repoScoped, `${op.id} has no repository to scope on`).toBe(false);
+      }
+    }
+  });
+
+  it('covers the registration write ops the HTTP surface exposes', () => {
+    const ids = DEVELOPER_OPERATIONS.map((o) => o.id);
+    expect(ids).toContain('workflows.disable');
+    expect(ids).toContain('workflows.delete');
+    for (const id of ['workflows.disable', 'workflows.delete']) {
+      const op = DEVELOPER_OPERATIONS.find((o) => o.id === id)!;
+      expect(op.entrypoints.http).toBe(true);
+      expect(op.entrypoints.mcp).toBe(false);
+      expect(op.mcpAppropriate).toBe(false);
+      expect(op.repoScoped).toBe(true);
+    }
+  });
+});

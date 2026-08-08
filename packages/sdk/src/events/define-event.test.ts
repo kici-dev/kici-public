@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
-import { defineEvent } from './define-event.js';
+import { defineEvent, isEventDefinition } from './define-event.js';
 
 describe('defineEvent()', () => {
   it('creates a frozen EventDefinition', () => {
@@ -77,5 +77,23 @@ describe('defineEvent()', () => {
     const result = event.schema.parse({ count: 1, label: 'test' });
     expect(result.count).toBe(1);
     expect(result.label).toBe('test');
+  });
+});
+
+describe('isEventDefinition', () => {
+  it('returns true for a value built by defineEvent', () => {
+    const def = defineEvent('deploy-complete', z.object({ env: z.string() }));
+    expect(isEventDefinition(def)).toBe(true);
+  });
+
+  it('returns false for a plain event-name string', () => {
+    expect(isEventDefinition('deploy-complete')).toBe(false);
+  });
+
+  it('returns false for null, undefined, and unrelated objects', () => {
+    expect(isEventDefinition(null)).toBe(false);
+    expect(isEventDefinition(undefined)).toBe(false);
+    expect(isEventDefinition({ name: 'x', schema: z.string() })).toBe(false);
+    expect(isEventDefinition({ _tag: 'Step', name: 'x' })).toBe(false);
   });
 });

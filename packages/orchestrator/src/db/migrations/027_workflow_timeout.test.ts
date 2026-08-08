@@ -1,15 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m027 from './027_workflow_timeout.js';
 
 /**
  * Real-Postgres test for migration 027.
  *
  * Creates a uniquely-named throwaway database inside the admin Postgres
- * server, runs every migration up to 027 via the production migration
+ * server, applies migrations 001..027 via the production migration
  * provider, and asserts the resulting schema with information_schema. The
  * throwaway database is dropped in teardown, so the test never mutates any
  * shared schema or data.
@@ -68,10 +67,9 @@ describeDb('migration 027_workflow_timeout', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    // Apply every migration (001..027) via the production provider so the
+    // Apply migrations 001..027 via the production provider so the
     // execution_runs table the column attaches to exists.
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

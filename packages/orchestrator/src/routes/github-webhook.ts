@@ -1,16 +1,18 @@
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { WebhookRelayResult } from '@kici-dev/engine';
+import { WebhookRelayResult, OWN_INGRESS_MODES } from '@kici-dev/engine';
+import type { OrchestratorMode } from '@kici-dev/engine';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { SourceStore } from '../sources/source-store.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import { verifyInboundWebhook, type VerifyInboundDeps } from '../webhook/verify-inbound.js';
 import { WebhookIngestOutcome } from '../pipeline/process-webhook.js';
 import { webhooksReceivedTotal, dedupHitsTotal } from '../metrics/prometheus.js';
 
 const logger = createLogger({ prefix: 'orch:github-webhook' });
 
-/** GitHub caps webhook payloads at 25MB. */
+/** GitHub caps webhook payloads at 25MB — cluster-wide fallback default. */
 const MAX_GITHUB_PAYLOAD_BYTES = 25 * 1024 * 1024;
 
 /** Dependencies for the direct GitHub webhook ingress route. */
@@ -21,15 +23,19 @@ export interface GithubWebhookRoutesDeps {
   verifyDeps: VerifyInboundDeps;
   /** Pipeline entry — owns the atomic dedup claim + dispatch. */
   onWebhook: (info: WebhookInfo) => Promise<WebhookIngestOutcome>;
+  /** Fleet-wide settings reader; overrides the payload cap per request. */
+  clusterSettings?: ClusterSettingsReader;
+  /** Cluster default payload cap (bytes) when no cluster_settings override is set. */
+  maxGithubPayloadBytes?: number;
 }
 
 /**
  * Whether the orchestrator serves the direct GitHub ingress route for a given
- * operating mode. Hybrid and independent modes serve a local GitHub source
- * config; platform mode is relay-only (no local GitHub source to serve).
+ * operating mode. Hybrid, independent, and observed modes serve their own
+ * ingress; platform mode is relay-only (no local GitHub source to serve).
  */
-export function shouldServeGithubIngress(mode: 'platform' | 'hybrid' | 'independent'): boolean {
-  return mode === 'hybrid' || mode === 'independent';
+export function shouldServeGithubIngress(mode: OrchestratorMode): boolean {
+  return OWN_INGRESS_MODES.includes(mode);
 }
 
 /**
@@ -50,9 +56,26 @@ export function shouldServeGithubIngress(mode: 'platform' | 'hybrid' | 'independ
 export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
   const app = new Hono();
 
+  // Per-request body cap: resolve the fleet-wide payload cap (a live cluster
+  // override wins over the config default), then delegate to Hono's bodyLimit,
+  // which rejects an over-Content-Length request AND streams a chunked body,
+  // aborting with 413 the instant it exceeds the cap — so a hostile chunked
+  // request can never buffer an unbounded body into memory.
   app.post(
     '/webhook/:orgId/github/:sourceId',
-    bodyLimit({ maxSize: MAX_GITHUB_PAYLOAD_BYTES }),
+    async (c, next) => {
+      const maxSize =
+        (await deps.clusterSettings?.getNumber(
+          'max_github_payload_bytes',
+          deps.maxGithubPayloadBytes ?? MAX_GITHUB_PAYLOAD_BYTES,
+        )) ??
+        deps.maxGithubPayloadBytes ??
+        MAX_GITHUB_PAYLOAD_BYTES;
+      return bodyLimit({
+        maxSize,
+        onError: (c) => c.json({ rejected: true, reason: 'Payload too large' }, 413),
+      })(c, next);
+    },
     async (c) => {
       const orgId = c.req.param('orgId');
       const sourceId = c.req.param('sourceId');
@@ -161,6 +184,13 @@ export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
         if (ingest === WebhookIngestOutcome.enum.duplicate) {
           dedupHitsTotal.add(1);
           return c.json({ accepted: true, deliveryId, duplicate: true }, 200);
+        }
+        if (ingest === WebhookIngestOutcome.enum.shed) {
+          c.header('Retry-After', '5');
+          return c.json(
+            { rejected: true, reason: 'Orchestrator busy, retry later', deliveryId },
+            429,
+          );
         }
         return c.json({ accepted: true, deliveryId }, 202);
       } catch (err) {

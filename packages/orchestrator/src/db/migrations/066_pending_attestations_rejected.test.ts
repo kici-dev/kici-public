@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './066_pending_attestations_rejected.js';
 
 /**
- * Real-Postgres test for migration 066. Creates a throwaway database, runs every
- * migration to latest, and asserts the pending_attestations.rejected_at column
+ * Real-Postgres test for migration 066. Creates a throwaway database, applies
+ * migrations 001..066, and asserts the pending_attestations.rejected_at column
  * exists and is nullable; down() drops it and up() is idempotent. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
@@ -45,10 +44,7 @@ describeDb('migration 066_pending_attestations_rejected', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -67,7 +63,7 @@ describeDb('migration 066_pending_attestations_rejected', () => {
     }
   }, 60_000);
 
-  it('adds a nullable rejected_at column (migrateToLatest ran it)', async () => {
+  it('adds a nullable rejected_at column (the beforeAll migration ran it)', async () => {
     const info = await columnInfo();
     expect(info).toBeDefined();
     expect(info!.is_nullable).toBe('YES');

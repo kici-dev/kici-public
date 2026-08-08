@@ -1,6 +1,13 @@
 import type { Workflow, Job } from '@kici-dev/sdk';
 import { isDynamicJobFn } from '@kici-dev/sdk';
-import { expandMatrix, applyIncludeExclude, type MatrixValues } from '@kici-dev/engine';
+import {
+  expandMatrix,
+  applyIncludeExclude,
+  matrixCombinationCount,
+  MatrixShapeError,
+  MAX_MATRIX_MATERIALIZATION,
+  type MatrixValues,
+} from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
 
 /**
@@ -76,7 +83,25 @@ export async function evaluateDynamicFields(
       timeoutMs,
       `dynamicMatrix for job '${jobName}'`,
     );
-    let combos = expandMatrix(resolved as Parameters<typeof expandMatrix>[0]);
+    // `resolved` is whatever the customer's matrix function returned — arbitrary
+    // runtime data. Count before expanding so an oversized matrix fails with a
+    // typed error instead of exhausting the agent, and name the job on the way
+    // out so the failure is diagnosable from the job log.
+    let combos: MatrixValues[];
+    try {
+      const rawCount = matrixCombinationCount(resolved);
+      if (rawCount > MAX_MATRIX_MATERIALIZATION) {
+        throw new MatrixShapeError(
+          `matrix is too large to expand: ${rawCount} raw combinations (max ${MAX_MATRIX_MATERIALIZATION})`,
+        );
+      }
+      combos = expandMatrix(resolved);
+    } catch (err) {
+      if (err instanceof MatrixShapeError) {
+        throw new MatrixShapeError(`dynamicMatrix for job '${jobName}': ${err.message}`);
+      }
+      throw err;
+    }
     if (job.include || job.exclude) {
       combos = applyIncludeExclude(combos, job.include, job.exclude);
     }

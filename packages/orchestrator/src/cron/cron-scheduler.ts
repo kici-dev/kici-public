@@ -1,12 +1,13 @@
 import { Cron } from 'croner';
 import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import type { LockScheduleTrigger } from '@kici-dev/engine';
+import { scheduleTriggerKey, type LockScheduleTrigger } from '@kici-dev/engine';
 
 import type { Database } from '../db/types.js';
 import type { RegistrationIndex, RegisteredWorkflow } from '../registration/registration-index.js';
 import type { EventRouter } from '../events/event-router.js';
-import type { CronStore } from './cron-store.js';
+import { LeaderGatedScheduler } from '../cluster/leader-gated-scheduler.js';
+import { cronCacheKey, type CronStore } from './cron-store.js';
 
 const logger = createLogger({ prefix: 'cron-scheduler' });
 
@@ -41,9 +42,15 @@ export class CronScheduler {
   private readonly eventRouter: EventRouter;
   private readonly evaluationIntervalMs: number;
 
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private isLeader = false;
+  private readonly scheduler: LeaderGatedScheduler;
   private lastFiredCache = new Map<string, Date>();
+
+  /**
+   * Set when the leader-election cache load fails. While true, each evaluation
+   * tick re-attempts the load (see reloadCacheAfterFailure) so a transient DB
+   * error at leader election does not leave the cache cold for the whole tenure.
+   */
+  private cacheLoadPending = false;
 
   constructor(options: CronSchedulerOptions) {
     this.db = options.db;
@@ -51,6 +58,40 @@ export class CronScheduler {
     this.cronStore = options.cronStore;
     this.eventRouter = options.eventRouter;
     this.evaluationIntervalMs = options.evaluationIntervalMs ?? 30_000;
+    this.scheduler = new LeaderGatedScheduler({
+      name: 'cron evaluation',
+      intervalMs: this.evaluationIntervalMs,
+      logger,
+      // Cron keeps the loop alive (does not unref) so evaluation continues.
+      unref: false,
+      // Load the last-fired cache and recover missed schedules before the first tick.
+      onBecomeLeader: async () => {
+        try {
+          this.lastFiredCache = await this.cronStore.getAll();
+          this.cacheLoadPending = false;
+          logger.info('Became leader, loaded cron cache', {
+            cachedSchedules: this.lastFiredCache.size,
+          });
+          await this.recoverMissedSchedules();
+        } catch (err) {
+          // A transient DB error while loading the cache / recovering missed
+          // schedules must NOT propagate out of onBecomeLeader: the scheduler
+          // awaits this callback BEFORE starting the evaluation interval, so a
+          // throw here would leave cron disabled for the whole leadership
+          // tenure. Instead, start evaluation with whatever cache we have and
+          // re-attempt the load on the next tick. Double-fire safety is
+          // preserved by cronStore.tryClaimFire's DB-side `last_fired_at <
+          // firedAt` guard, so a cold or stale cache never re-fires an
+          // already-fired schedule.
+          this.cacheLoadPending = true;
+          logger.error(
+            'Cron cache load/recovery failed at leader election; starting with cold cache, will retry on next tick',
+            { error: toErrorMessage(err) },
+          );
+        }
+      },
+      tick: () => this.evaluate(),
+    });
   }
 
   /**
@@ -58,30 +99,7 @@ export class CronScheduler {
    * Loads last-fired cache, recovers missed schedules, starts periodic evaluation.
    */
   async onBecomeLeader(): Promise<void> {
-    // Clear any existing timer from a previous leader tenure to prevent leaks
-    // during rapid leader transitions (async onBecomeLeader may overlap with
-    // onLoseLeadership + a second onBecomeLeader)
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-
-    this.isLeader = true;
-    this.lastFiredCache = await this.cronStore.getAll();
-
-    logger.info('Became leader, loaded cron cache', {
-      cachedSchedules: this.lastFiredCache.size,
-    });
-
-    await this.recoverMissedSchedules();
-
-    this.timer = setInterval(() => {
-      this.evaluate().catch((err) => {
-        logger.error('Cron evaluation failed', {
-          error: toErrorMessage(err),
-        });
-      });
-    }, this.evaluationIntervalMs);
+    await this.scheduler.onBecomeLeader();
   }
 
   /**
@@ -89,23 +107,14 @@ export class CronScheduler {
    * Stops the evaluation timer immediately.
    */
   onLoseLeadership(): void {
-    this.isLeader = false;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    logger.info('Lost leadership, stopped cron evaluation');
+    this.scheduler.onLoseLeadership();
   }
 
   /**
    * Stop the scheduler entirely. Clears timer and resets leader state.
    */
   stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.isLeader = false;
+    this.scheduler.stop();
   }
 
   /**
@@ -128,13 +137,39 @@ export class CronScheduler {
    * fires the schedule.
    */
   async evaluate(): Promise<void> {
-    if (!this.isLeader) return;
+    if (!this.scheduler.isLeader) return;
+
+    // If the leader-election cache load failed, re-attempt it now so we
+    // converge back to a warm cache. Failure here is non-fatal: evaluation
+    // proceeds with whatever cache we have (dedup is enforced DB-side by
+    // cronStore.tryClaimFire).
+    if (this.cacheLoadPending) await this.reloadCacheAfterFailure();
 
     const schedules = this.registrationIndex.getCronSchedules();
     if (schedules.length === 0) return;
 
     for (const registration of schedules) {
       await this.evaluateRegistration(registration, false);
+    }
+  }
+
+  /**
+   * Re-attempt the last-fired cache load after an earlier failure at leader
+   * election. On success, clears the pending flag; on repeated failure, leaves
+   * it set so the next tick tries again. Evaluation continues either way — the
+   * DB-side tryClaimFire guard prevents double-fires with a stale or cold cache.
+   */
+  private async reloadCacheAfterFailure(): Promise<void> {
+    try {
+      this.lastFiredCache = await this.cronStore.getAll();
+      this.cacheLoadPending = false;
+      logger.info('Reloaded cron last-fired cache after earlier load failure', {
+        cachedSchedules: this.lastFiredCache.size,
+      });
+    } catch (err) {
+      logger.error('Cron cache reload still failing; will retry on next tick', {
+        error: toErrorMessage(err),
+      });
     }
   }
 
@@ -157,23 +192,41 @@ export class CronScheduler {
   }
 
   /**
-   * Evaluate a single registration and fire if due.
+   * Evaluate a single registration and fire every due schedule trigger.
+   *
+   * A workflow may declare multiple `schedule()` triggers; each is tracked and
+   * fired independently (keyed per (registration, schedule)), so a second or
+   * third schedule is never silently skipped.
    */
   private async evaluateRegistration(
     registration: RegisteredWorkflow,
     isRecovery: boolean,
   ): Promise<void> {
     // Bail if leadership was lost mid-recovery or between evaluations
-    if (!this.isLeader) return;
+    if (!this.scheduler.isLeader) return;
 
-    // Find the schedule trigger in the lock entry
-    const scheduleTrigger = registration.lockEntry.triggers.find(
+    const scheduleTriggers = registration.lockEntry.triggers.filter(
       (t): t is LockScheduleTrigger => t._type === 'schedule',
     );
 
-    if (!scheduleTrigger) return;
+    for (const trigger of scheduleTriggers) {
+      // Leadership can drop mid-loop; stop firing further schedules.
+      if (!this.scheduler.isLeader) return;
+      await this.evaluateScheduleTrigger(registration, trigger, isRecovery);
+    }
+  }
 
+  /**
+   * Evaluate one schedule trigger of a registration and fire if due.
+   */
+  private async evaluateScheduleTrigger(
+    registration: RegisteredWorkflow,
+    scheduleTrigger: LockScheduleTrigger,
+    isRecovery: boolean,
+  ): Promise<void> {
     const { cronExpression, timezone } = scheduleTrigger;
+    const schedKey = scheduleTriggerKey(cronExpression, timezone);
+    const cacheKey = cronCacheKey(registration.id, schedKey);
 
     try {
       const cron = new Cron(cronExpression, { timezone: timezone || undefined });
@@ -194,7 +247,7 @@ export class CronScheduler {
 
       if (!previousRun) return; // No previous scheduled time exists
 
-      const lastFiredAt = this.lastFiredCache.get(registration.id);
+      const lastFiredAt = this.lastFiredCache.get(cacheKey);
 
       // Only fire if the previous scheduled time is after the last-fired time
       // (or if we've never fired this schedule)
@@ -225,7 +278,7 @@ export class CronScheduler {
       let eventId: string | null = null;
       try {
         await this.db.transaction().execute(async (tx) => {
-          claimed = await this.cronStore.tryClaimFire(registration.id, previousRun, tx);
+          claimed = await this.cronStore.tryClaimFire(registration.id, schedKey, previousRun, tx);
           if (!claimed) return;
 
           eventId = await this.eventRouter.emitInTx(
@@ -269,12 +322,12 @@ export class CronScheduler {
           cronExpression,
           scheduledAt: previousRun.toISOString(),
         });
-        this.lastFiredCache.set(registration.id, previousRun);
+        this.lastFiredCache.set(cacheKey, previousRun);
         return;
       }
 
       // Tx committed: claim AND emit are durable.
-      this.lastFiredCache.set(registration.id, previousRun);
+      this.lastFiredCache.set(cacheKey, previousRun);
 
       logger.info('Cron schedule fired', {
         workflowName: registration.workflowName,

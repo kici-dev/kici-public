@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { LockFileParseError, SCHEMA_VERSION, type LockFile } from '@kici-dev/engine';
+import {
+  LockFileParseError,
+  SCHEMA_VERSION,
+  BREAKING_FLOOR,
+  type LockFile,
+} from '@kici-dev/engine';
 import {
   parseLockDocument,
   assertLockFileSchemaCompatible,
@@ -55,15 +60,63 @@ describe('parseLockDocument', () => {
   });
 });
 
-describe('assertLockFileSchemaCompatible', () => {
-  it('passes when schemaVersion equals SCHEMA_VERSION', () => {
-    expect(() => assertLockFileSchemaCompatible(baseLock())).not.toThrow();
+describe('assertLockFileSchemaCompatible (compatibility window)', () => {
+  const REPO = 'owner/repo';
+  const REF = 'main';
+
+  it('accepts a lock at the current version', () => {
+    expect(() => assertLockFileSchemaCompatible(baseLock(), REPO, REF)).not.toThrow();
   });
 
-  it('throws when schemaVersion differs', () => {
+  it('accepts a newer additive lock (schemaVersion above current, minReaderVersion at floor)', () => {
     expect(() =>
-      assertLockFileSchemaCompatible(baseLock({ schemaVersion: (SCHEMA_VERSION - 1) as never })),
-    ).toThrow(/recompile/i);
+      assertLockFileSchemaCompatible(
+        baseLock({
+          schemaVersion: (SCHEMA_VERSION + 3) as never,
+          minReaderVersion: BREAKING_FLOOR,
+        }),
+        REPO,
+        REF,
+      ),
+    ).not.toThrow();
+  });
+
+  it('accepts an older-but-post-floor lock (down to the breaking floor)', () => {
+    expect(() =>
+      assertLockFileSchemaCompatible(
+        baseLock({ schemaVersion: BREAKING_FLOOR as never }),
+        REPO,
+        REF,
+      ),
+    ).not.toThrow();
+  });
+
+  it('rejects a below-floor lock as LockFileParseError with compile-and-push guidance', () => {
+    const stale = baseLock({ schemaVersion: (BREAKING_FLOOR - 1) as never });
+    expect(() => assertLockFileSchemaCompatible(stale, REPO, REF)).toThrow(LockFileParseError);
+    expect(() => assertLockFileSchemaCompatible(stale, REPO, REF)).toThrow(/kici compile/);
+  });
+
+  it('rejects a lock demanding a newer reader with the upgrade guidance', () => {
+    const future = baseLock({
+      schemaVersion: (SCHEMA_VERSION + 5) as never,
+      minReaderVersion: SCHEMA_VERSION + 2,
+    });
+    expect(() => assertLockFileSchemaCompatible(future, REPO, REF)).toThrow(LockFileParseError);
+    expect(() => assertLockFileSchemaCompatible(future, REPO, REF)).toThrow(
+      /upgrade the orchestrator/i,
+    );
+  });
+
+  it('missing minReaderVersion falls back to exact-match strictness for newer locks', () => {
+    expect(() =>
+      assertLockFileSchemaCompatible(
+        baseLock({ schemaVersion: (SCHEMA_VERSION + 1) as never }),
+        REPO,
+        REF,
+      ),
+    ).toThrow(/upgrade the orchestrator/i);
+    expect(() => assertLockFileSchemaCompatible(baseLock(), REPO, REF)).not.toThrow();
   });
 });
 

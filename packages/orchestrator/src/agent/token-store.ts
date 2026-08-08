@@ -15,6 +15,25 @@ import type { Database, AgentTokenRow } from '../db/types.js';
 /** Token prefix for KiCI Agent Tokens */
 const TOKEN_PREFIX = 'kat_';
 
+/**
+ * `created_by` marker prefix for single-use bootstrap (init-runner) tokens.
+ * A bootstrap token stores `created_by: '<this prefix><targetAgentId>'` so the
+ * register-time identity binding (agent-handler Gate 2) and the single-use
+ * consume check can both recognize it and resolve the bound agent id.
+ */
+export const BOOTSTRAP_CREATED_BY_PREFIX = 'bootstrap:';
+
+/**
+ * Resolve the agent id an ephemeral token binds its holder to. Scaler tokens
+ * store the id verbatim in `created_by`; bootstrap tokens store it behind
+ * `BOOTSTRAP_CREATED_BY_PREFIX`. Returns the bare target agent id in both cases.
+ */
+export function boundAgentIdFromCreatedBy(createdBy: string): string {
+  return createdBy.startsWith(BOOTSTRAP_CREATED_BY_PREFIX)
+    ? createdBy.slice(BOOTSTRAP_CREATED_BY_PREFIX.length)
+    : createdBy;
+}
+
 /** Number of random bytes for token generation */
 const TOKEN_BYTES = 32;
 
@@ -141,7 +160,7 @@ export class AgentTokenStore {
         token_prefix: tokenPrefix,
         labels: JSON.stringify(opts.labels),
         agent_type: 'ephemeral',
-        created_by: `bootstrap:${opts.targetAgentId}`,
+        created_by: `${BOOTSTRAP_CREATED_BY_PREFIX}${opts.targetAgentId}`,
         expires_at: new Date(Date.now() + opts.ttlMs),
         consumed_at: null,
       })

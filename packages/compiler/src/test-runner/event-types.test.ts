@@ -546,6 +546,11 @@ describe('triggerToEventArg', () => {
       expected: 'workflow_complete:success',
     },
     {
+      name: 'workflows_failed_batch',
+      trigger: { _type: 'workflows_failed_batch', accumulateFor: 3000 },
+      expected: 'workflows_failed_batch',
+    },
+    {
       name: 'job_complete without status',
       trigger: { _type: 'job_complete', workflow: 'ci', job: 'test' },
       expected: 'job_complete',

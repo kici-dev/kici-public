@@ -50,6 +50,11 @@ class InMemoryCacheStorage implements CacheStorage {
   async initMeta(_key: string): Promise<void> {
     // no-op for testing
   }
+
+  /** Pure stat: byte size of the stored blob, null when the key is absent. */
+  async getObjectSize(key: string): Promise<number | null> {
+    return this.store.get(key)?.data.length ?? null;
+  }
 }
 
 describe('DepCache', () => {
@@ -100,6 +105,68 @@ describe('DepCache', () => {
       // Should not find linux/x64 entry
       const miss = await cache.getUrlAndHash('lock1', 'linux', 'x64');
       expect(miss).toBeNull();
+    });
+  });
+
+  describe('cluster_settings overrides', () => {
+    function makeClusterSettings(values: {
+      cache_max_tarball_bytes?: number;
+      cache_ttl_days?: number;
+    }) {
+      return {
+        getNumber: async (col: string, fallback: number) =>
+          (values as Record<string, number | undefined>)[col] ?? fallback,
+      } as unknown as import('../cluster/cluster-settings-reader.js').ClusterSettingsReader;
+    }
+
+    it('enforces cache_max_tarball_bytes live from cluster_settings (override wins)', async () => {
+      const overridden = new DepCache({
+        storage,
+        maxTarballBytes: 500_000_000,
+        clusterSettings: makeClusterSettings({ cache_max_tarball_bytes: 10 }),
+      });
+      // 11 bytes > 10-byte override → rejected even though the ctor cap is 500MB.
+      await expect(
+        overridden.store('lock1', 'linux', 'x64', Buffer.from('12345678901')),
+      ).rejects.toThrow(/exceeds max size/);
+    });
+
+    it('falls back to the constructor cap when cache_max_tarball_bytes is null', async () => {
+      const fallbackCache = new DepCache({
+        storage,
+        maxTarballBytes: 100,
+        clusterSettings: makeClusterSettings({}), // reader returns the fallback
+      });
+      // 11 bytes < 100-byte fallback → stored fine.
+      await expect(
+        fallbackCache.store('lock1', 'linux', 'x64', Buffer.from('12345678901')),
+      ).resolves.toBeUndefined();
+    });
+
+    it('passes a live cache_ttl_days TTL override to storage reads', async () => {
+      const calls: (number | undefined)[] = [];
+      const recordingStorage = {
+        ...storage,
+        has: async (_k: string, ttlMsOverride?: number) => {
+          calls.push(ttlMsOverride);
+          return true;
+        },
+        getUrl: async (k: string, ttlMsOverride?: number) => {
+          calls.push(ttlMsOverride);
+          return `https://mock/${k}`;
+        },
+        touch: async () => {},
+      } as unknown as CacheStorage;
+      const ttlCache = new DepCache({
+        storage: recordingStorage,
+        cacheTtlDaysFallback: 30,
+        clusterSettings: makeClusterSettings({ cache_ttl_days: 7 }),
+      });
+      await ttlCache.has('lock1', 'linux', 'x64');
+      await ttlCache.getUrl('lock1', 'linux', 'x64');
+      // 7 days → ms override on every read/expiry call.
+      const sevenDaysMs = 7 * 86_400_000;
+      expect(calls).toEqual([sevenDaysMs, sevenDaysMs]);
     });
   });
 });

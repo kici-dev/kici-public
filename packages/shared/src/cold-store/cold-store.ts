@@ -63,6 +63,7 @@ import {
   coldStoreReplayRowsTotal,
   coldStoreVerifyFailuresTotal,
 } from './metrics.js';
+import { resolveTableConfig } from './config.js';
 import type { ColdStoreConfig } from './config.js';
 import type { ChunkCommitMetadata, TableAdapter } from './table-adapter.js';
 import type { ArchiveCycleSummary, ChunkManifest, ColdRetention } from './types.js';
@@ -74,7 +75,12 @@ export interface ColdStoreFetchRangeArgs<TRow> {
   table: string;
   tenantId: string;
   fromTs: Date;
-  toTs: Date;
+  /**
+   * Upper bound (exclusive). Omit to use `warmCutoff(table)` — the table's
+   * resolved warm/cold boundary. Pass an explicit value only when the caller
+   * genuinely owns the range (e.g. a user-supplied time filter).
+   */
+  toTs?: Date;
   decode?: (line: string) => TRow;
 }
 
@@ -170,6 +176,23 @@ export interface PurgeableChunk {
  * flow.
  */
 export interface ColdStore {
+  /**
+   * The table's warm/cold boundary: `now − warmTtlDays`, resolved from the
+   * SAME config the archival writer uses — the registered adapter's effective
+   * config (built-in defaults merged with any
+   * `KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS` env override). Rows older than
+   * this may live in cold storage; rows newer are guaranteed PG-only.
+   *
+   * Readers MUST derive their cold-read upper bound from this rather than
+   * restating a literal. A reader-side value LARGER than the writer's
+   * produces an EARLIER cutoff, which silently hides archived rows: a
+   * manifest whose `min` timestamp is newer than the bound is skipped
+   * entirely, so a read 404s on data that exists in S3.
+   *
+   * A `warmTtlDays` of zero or less yields a cutoff at or after `now` — the
+   * widest window, which is the safe direction.
+   */
+  warmCutoff(table: string): Date;
   /** Stream archived rows that overlap [fromTs, toTs). */
   fetchRange<TRow>(args: ColdStoreFetchRangeArgs<TRow>): AsyncIterable<TRow>;
   hasRange(args: Omit<ColdStoreFetchRangeArgs<unknown>, 'decode'>): Promise<boolean>;
@@ -415,7 +438,7 @@ export abstract class BaseColdStore implements ColdStore {
       return;
     }
 
-    const warmCutoff = new Date(Date.now() - adapter.config.warmTtlDays * 86_400_000);
+    const warmCutoff = this.warmCutoff(adapter.table);
     let rowsThisCycle = 0;
 
     for await (const { tenantId, partitionDate } of adapter.listEligiblePartitions({
@@ -594,8 +617,7 @@ export abstract class BaseColdStore implements ColdStore {
           rowId: adapter.rowId.bind(adapter) as (r: unknown) => string | number,
           rowTimestamp: adapter.rowTimestamp.bind(adapter) as (r: unknown) => Date | string,
           replayLookupKey: adapter.replayLookupKey?.bind(adapter) as
-            | ((r: unknown) => string | undefined)
-            | undefined,
+            ((r: unknown) => string | undefined) | undefined,
         });
       } catch (err) {
         // arrayToAsync produces a non-empty stream by construction (we
@@ -849,6 +871,11 @@ export abstract class BaseColdStore implements ColdStore {
 
   // ── Read-through ───────────────────────────────────────────────────
 
+  warmCutoff(table: string): Date {
+    const cfg = this.adapters.get(table)?.config ?? resolveTableConfig(this.config.tables[table]);
+    return new Date(Date.now() - cfg.warmTtlDays * 86_400_000);
+  }
+
   async *fetchRange<TRow>(args: ColdStoreFetchRangeArgs<TRow>): AsyncIterable<TRow> {
     if (!this.config.enabled) return;
 
@@ -862,12 +889,14 @@ export abstract class BaseColdStore implements ColdStore {
       ? (row: TRow) => this.toDate((adapter.rowTimestamp as (r: unknown) => Date | string)(row))
       : null;
 
+    const toTs = args.toTs ?? this.warmCutoff(args.table);
+
     const manifests = await this.listRelevantManifests({
       db: args.db,
       table: args.table,
       tenantId: args.tenantId,
       fromTs: args.fromTs,
-      toTs: args.toTs,
+      toTs,
     });
 
     const label = { db: args.db, table: args.table };
@@ -892,7 +921,7 @@ export abstract class BaseColdStore implements ColdStore {
       for await (const row of decodeChunk<TRow>({ gzipped, decodeLine })) {
         if (rowTimestamp) {
           const ts = rowTimestamp(row);
-          if (ts < args.fromTs || ts >= args.toTs) continue;
+          if (ts < args.fromTs || ts >= toTs) continue;
         }
         yield row;
       }
@@ -901,13 +930,19 @@ export abstract class BaseColdStore implements ColdStore {
 
   async hasRange(args: Omit<ColdStoreFetchRangeArgs<unknown>, 'decode'>): Promise<boolean> {
     if (!this.config.enabled) return false;
-    const manifests = await this.listRelevantManifests(args);
+    const manifests = await this.listRelevantManifests({
+      ...args,
+      toTs: args.toTs ?? this.warmCutoff(args.table),
+    });
     return manifests.length > 0;
   }
 
   async countRange(args: Omit<ColdStoreFetchRangeArgs<unknown>, 'decode'>): Promise<number> {
     if (!this.config.enabled) return 0;
-    const manifests = await this.listRelevantManifests(args);
+    const manifests = await this.listRelevantManifests({
+      ...args,
+      toTs: args.toTs ?? this.warmCutoff(args.table),
+    });
     let total = 0;
     for (const m of manifests) total += m.rowCount;
     return total;

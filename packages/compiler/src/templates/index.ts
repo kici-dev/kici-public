@@ -19,7 +19,7 @@ import { tsconfigTemplate } from './tsconfig-json.js';
 // Re-export real workflows for programmatic use and type checking
 export { helloWorldWorkflow } from './workflows/hello-world.js';
 export { prChecksWorkflow } from './workflows/pr-checks.js';
-export { generatePackageJson } from './package-json.js';
+export { generatePackageJson, sdkDependencyRange } from './package-json.js';
 export { tsconfigTemplate } from './tsconfig-json.js';
 export { agentsMdTemplate } from './agents-md.js';
 

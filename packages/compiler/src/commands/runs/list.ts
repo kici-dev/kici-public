@@ -22,7 +22,29 @@ export async function runsListCommand(options: RunsListOptions = {}): Promise<bo
       return true;
     }
     if (page.runs.length === 0) {
-      console.log(pc.gray('No runs found.'));
+      // When the runs window is empty, surface recent webhook activity so an
+      // "almost there" evaluator sees that webhooks arrived but nothing matched
+      // — with the next step to test triggers locally. Silent-degrades to the
+      // plain "No runs found." when the endpoint is unavailable (older Platform).
+      const activity = await client.getWebhookActivity().catch(() => null);
+      if (activity && activity.received > 0) {
+        const win =
+          activity.windowMinutes === 60
+            ? 'the last hour'
+            : `the last ${activity.windowMinutes} minutes`;
+        // Mirror the dashboard strip copy: when the matched fact is available,
+        // "N received in <win>, M matched"; when the orchestrator was
+        // unavailable, degrade honestly to "N received in <win> but none
+        // produced a run" (no "matched" claim).
+        const headline =
+          activity.orchestratorUnavailable || activity.matched === undefined
+            ? `${activity.received} webhooks received in ${win} but none produced a run`
+            : `${activity.received} webhooks received in ${win}, ${activity.matched} matched`;
+        console.log(pc.yellow(`${headline}.`));
+        console.log(pc.gray(`Run ${pc.cyan('kici preview push')} to test your triggers locally.`));
+      } else {
+        console.log(pc.gray('No runs found.'));
+      }
       return true;
     }
     const rows = page.runs.map((r) => [
@@ -42,8 +64,8 @@ export async function runsListCommand(options: RunsListOptions = {}): Promise<bo
     );
     console.log(
       pc.gray(
-        `\nPage ${page.page} · ${page.runs.length} of ${page.total}${
-          page.hasMore ? ' (more — use --page)' : ''
+        `\n${page.runs.length} of ~${page.approxTotal} runs${
+          page.nextCursor ? `  (more — use --cursor ${page.nextCursor})` : ''
         }`,
       ),
     );

@@ -224,6 +224,55 @@ describe('generic webhook routes', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({ duplicate: true });
     });
+
+    it('returns 429 + Retry-After and does NOT mark idempotency when the pipeline sheds', async () => {
+      const source = {
+        id: 'src-shed',
+        customer_id: 'org-1',
+        name: 'shed-source',
+        routing_key: 'generic:org-1:src-shed',
+        enabled: true,
+        max_payload_bytes: 1048576,
+        rate_limit_rpm: 1000,
+        verification_method: 'none' as const,
+        verification_config: '{}',
+        event_type_header: 'x-event-type',
+        event_type_path: null,
+        idempotency_key_header: 'x-idem',
+        idempotency_key_path: null,
+        dedup_window_seconds: 300,
+        allowed_events: null,
+        strip_headers: '[]',
+      };
+      const markIdempotency = vi.fn().mockResolvedValue(undefined);
+      const deps = createMockDeps({
+        sourceManager: {
+          getByOrgAndName: vi.fn().mockResolvedValue(source),
+          getByRoutingKey: vi.fn().mockResolvedValue(source),
+          checkIdempotency: vi.fn().mockResolvedValue(false),
+          markIdempotency,
+        } as any,
+        onWebhook: vi.fn().mockResolvedValue(WebhookIngestOutcome.enum.shed),
+      });
+
+      const app = createGenericWebhookRoutes(deps);
+      const res = await app.request('http://localhost/webhook/org-1/generic/shed-source', {
+        method: 'POST',
+        body: JSON.stringify({ data: 'x' }),
+        headers: {
+          'Content-Type': 'application/json',
+          'x-event-type': 'deploy',
+          'x-idem': 'k-1',
+        },
+      });
+
+      expect(res.status).toBe(429);
+      expect(res.headers.get('retry-after')).toBe('5');
+      expect(await res.json()).toMatchObject({ rejected: true });
+      // A shed delivery must remain redeliverable — the idempotency key must NOT
+      // be marked, or the retry would be deduped away as a lost webhook.
+      expect(markIdempotency).not.toHaveBeenCalled();
+    });
   });
 
   describe('local provider routing', () => {

@@ -1,6 +1,11 @@
 /**
  * Trust gate -- checks contributor trust tier against context minimumTrust.
  */
+import {
+  HoldType,
+  trustedContributorHoldReason,
+  unknownContributorHoldReason,
+} from '@kici-dev/engine';
 import type { Context, ProtectionGateResult, TrustTier } from '@kici-dev/engine';
 
 /** Evaluate minimumTrust requirements for the context. */
@@ -23,16 +28,16 @@ export function evaluateTrustGate(
   if (required === 'trusted' && trustTier !== 'trusted') {
     return {
       action: 'hold',
-      reason: `Context '${env.name}' requires trusted contributors (contributor is ${trustTier})`,
-      holdType: 'security',
+      reason: trustedContributorHoldReason(env.name, trustTier),
+      holdType: HoldType.enum.security,
     };
   }
 
   if (required === 'known' && trustTier === 'unknown') {
     return {
       action: 'hold',
-      reason: `Context '${env.name}' requires known contributors (contributor is unknown)`,
-      holdType: 'security',
+      reason: unknownContributorHoldReason(env.name),
+      holdType: HoldType.enum.security,
     };
   }
 

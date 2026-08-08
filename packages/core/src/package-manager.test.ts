@@ -5,8 +5,10 @@ import os from 'node:os';
 import {
   PackageManager,
   PNPM_IGNORE_BUILD_GATE_ARG,
+  WorkspaceKind,
   YarnFlavor,
   detectPackageManager,
+  detectWorkspaceRoot,
   detectYarnFlavor,
   detectYarnFlavorSync,
   installBuildPolicyArgs,
@@ -216,5 +218,77 @@ describe('detectYarnFlavor', () => {
       JSON.stringify({ packageManager: 'yarn@4.1.0' }),
     );
     expect(detectYarnFlavorSync(dir)).toBe(YarnFlavor.Berry);
+  });
+});
+
+describe('detectWorkspaceRoot', () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-ws-'));
+    // A .git marker bounds the upward walk to this repo root.
+    await fs.writeFile(path.join(dir, '.git'), 'gitdir: irrelevant\n');
+  });
+
+  afterEach(async () => {
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it('detects a pnpm workspace via pnpm-workspace.yaml', async () => {
+    await fs.writeFile(path.join(dir, 'pnpm-workspace.yaml'), "packages:\n  - 'packages/*'\n");
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'root', private: true }),
+    );
+    expect(await detectWorkspaceRoot(dir)).toEqual({ root: dir, kind: WorkspaceKind.Pnpm });
+  });
+
+  it('detects an npm workspace via a workspaces array', async () => {
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }),
+    );
+    expect(await detectWorkspaceRoot(dir)).toEqual({ root: dir, kind: WorkspaceKind.Npm });
+  });
+
+  it('detects an npm workspace via the { packages: [...] } object form', async () => {
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'root', private: true, workspaces: { packages: ['packages/*'] } }),
+    );
+    expect(await detectWorkspaceRoot(dir)).toEqual({ root: dir, kind: WorkspaceKind.Npm });
+  });
+
+  it('detects a yarn workspace when the packageManager field names yarn', async () => {
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({
+        name: 'root',
+        private: true,
+        packageManager: 'yarn@1.22.22',
+        workspaces: ['packages/*'],
+      }),
+    );
+    expect(await detectWorkspaceRoot(dir)).toEqual({ root: dir, kind: WorkspaceKind.Yarn });
+  });
+
+  it('detects a workspace root that is an ancestor of the start dir', async () => {
+    await fs.writeFile(path.join(dir, 'pnpm-workspace.yaml'), "packages:\n  - 'packages/*'\n");
+    const sub = path.join(dir, 'packages', 'app');
+    await fs.mkdir(sub, { recursive: true });
+    expect(await detectWorkspaceRoot(sub)).toEqual({ root: dir, kind: WorkspaceKind.Pnpm });
+  });
+
+  it('returns null when no workspace marker exists up to the git root', async () => {
+    await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ name: 'plain' }));
+    expect(await detectWorkspaceRoot(dir)).toBeNull();
+  });
+
+  it('ignores an empty workspaces array', async () => {
+    await fs.writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'root', workspaces: [] }),
+    );
+    expect(await detectWorkspaceRoot(dir)).toBeNull();
   });
 });

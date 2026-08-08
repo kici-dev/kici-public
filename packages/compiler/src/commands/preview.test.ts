@@ -158,5 +158,39 @@ describe('kici preview command (dry-run only)', () => {
       const result = await previewEvent('webhook:stripe', { kiciDir: '.kici' });
       expect(typeof result).toBe('boolean');
     });
+
+    it('passes an impure dynamic value as a purity warning to displayDryRun', async () => {
+      const { discoverWorkflows } = await import('../execution/index.js');
+      const { matchAllWorkflows } = await import('@kici-dev/engine');
+      const { displayDryRun } = await import('../test-runner/dry-run.js');
+
+      const workflow = {
+        name: 'ci',
+        on: [],
+        triggers: [],
+        jobs: [
+          {
+            name: 'build',
+            runsOn: 'kici:os:linux',
+            context: async (event: { targetBranch: string }) => event.targetBranch,
+            steps: [],
+          },
+        ],
+      };
+      vi.mocked(discoverWorkflows).mockResolvedValueOnce({
+        workflows: [{ workflow }],
+      } as never);
+      vi.mocked(matchAllWorkflows).mockReturnValueOnce([
+        { workflowName: 'ci', matched: true, matchedTrigger: 0, checks: [], summary: 'matched' },
+      ] as never);
+
+      await previewEvent('push', { kiciDir: '.kici' });
+
+      const call = vi.mocked(displayDryRun).mock.calls.at(-1)!;
+      const purityWarnings = call[3] as Array<{ jobName: string; field: string; reason: string }>;
+      expect(purityWarnings).toHaveLength(1);
+      expect(purityWarnings[0]).toMatchObject({ jobName: 'build', field: 'context' });
+      expect(purityWarnings[0].reason).toContain('async');
+    });
   });
 });

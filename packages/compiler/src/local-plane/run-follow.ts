@@ -5,15 +5,61 @@
  */
 
 import { AdminApiClient } from '@kici-dev/orchestrator';
-import { TERMINAL_RUN_STATES, TERMINAL_JOB_STATES, ExecutionJobStatus } from '@kici-dev/engine';
+import {
+  TERMINAL_RUN_STATES,
+  TERMINAL_JOB_STATES,
+  ExecutionJobStatus,
+  ExecutionRunStatus,
+} from '@kici-dev/engine';
 
-/** Job states that mean the job did NOT succeed (failed / stale / cancelled / dropped). */
+/**
+ * Job states that mean the job did NOT succeed (failed / stale / cancelled /
+ * dropped / unroutable). Read only by the anti-false-green guard below, so a
+ * missing member lets a lagging `success` run header be reported verbatim even
+ * though a job settled badly.
+ */
 const FAILED_JOB_STATES: ReadonlySet<string> = new Set<string>([
   ExecutionJobStatus.enum.failed,
   ExecutionJobStatus.enum.timed_out_stale,
   ExecutionJobStatus.enum.cancelled,
   ExecutionJobStatus.enum.drift_dropped,
+  ExecutionJobStatus.enum.unroutable,
 ]);
+
+/** Job states in which no agent has claimed the job yet. */
+const UNCLAIMED_JOB_STATES: ReadonlySet<string> = new Set<string>([
+  ExecutionJobStatus.enum.pending,
+  ExecutionJobStatus.enum.queued,
+]);
+
+/**
+ * How often the acceptance check re-fetches jobs. Deliberately far coarser than
+ * the poll interval: at 750 ms a two-minute window would cost ~160 extra admin
+ * requests to answer a question that changes once.
+ */
+const ACCEPTANCE_CHECK_INTERVAL_MS = 5_000;
+
+/** Default window for an agent to claim the run before the follow gives up. */
+const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120_000;
+
+/**
+ * Resolve the acceptance window, falling back to the default for any value that
+ * is not a positive number of milliseconds.
+ *
+ * A malformed override must never reach the deadline arithmetic: `Number('')`
+ * is `0` (every run fails instantly) and `Number('2 min')` is `NaN`, which makes
+ * `now > deadline` permanently false and silently restores the 900 s hang this
+ * window exists to prevent. Both failure modes are worse than ignoring a typo.
+ */
+export function resolveAcceptanceTimeoutMs(
+  explicitMs: number | undefined,
+  raw: string | undefined,
+): number {
+  if (explicitMs !== undefined) return explicitMs;
+  if (raw === undefined) return DEFAULT_ACCEPTANCE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACCEPTANCE_TIMEOUT_MS;
+}
 
 /** A minimal admin-read client (AdminApiClient.get) — injectable for tests. */
 export interface RunFollowClient {
@@ -63,6 +109,16 @@ export interface FollowRunOptions {
   timeoutMs?: number;
   /** Absolute cap regardless of progress (safety net against a runaway follow). Default 2 h. */
   maxTotalMs?: number;
+  /**
+   * Max time for the FIRST job to leave `pending`/`queued` — that is, for some
+   * agent to claim the run. A plane whose scaler matches no label set, or whose
+   * agent cannot start, never gets past this, so it fails in seconds instead of
+   * consuming the whole idle window. Default 2 min; override with
+   * `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS`.
+   */
+  acceptanceTimeoutMs?: number;
+  /** Plane log path named in the acceptance-failure message. */
+  hintLogPath?: string;
 }
 
 /** Poll a run to completion, streaming step logs. */
@@ -76,6 +132,10 @@ export async function followRun(
   const pollIntervalMs = opts.pollIntervalMs ?? 750;
   const idleTimeoutMs = opts.idleTimeoutMs ?? opts.timeoutMs ?? 900_000;
   const maxTotalMs = opts.maxTotalMs ?? 7_200_000;
+  const acceptanceTimeoutMs = resolveAcceptanceTimeoutMs(
+    opts.acceptanceTimeoutMs,
+    process.env.KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS,
+  );
   // Per-step log cursor (key `<jobId>:<stepIndex>` → next line offset string).
   const cursors = new Map<string, string>();
   const stream = !opts.quiet && opts.onLine ? opts.onLine : undefined;
@@ -83,6 +143,9 @@ export async function followRun(
   const startedAt = Date.now();
   let lastProgressAt = startedAt;
   let lastStatus = '';
+  let accepted = false;
+  let acceptanceDeadline = startedAt + acceptanceTimeoutMs;
+  let lastAcceptanceCheck = 0;
 
   for (;;) {
     const now = Date.now();
@@ -98,6 +161,36 @@ export async function followRun(
     }
 
     const { run } = await client.get<RunHeaderResponse>(`/api/v1/admin/runs/${runId}`);
+
+    // Acceptance: some agent must claim a job. A run nothing can serve — no
+    // scaler label set matches its runsOn, or the agent failed to start — sits
+    // in queued until the orchestrator's own hour-long queue timeout, so
+    // without this it would consume the entire idle window instead.
+    // A run that already reached a terminal state is never blamed on acceptance:
+    // its outcome is known, so reporting "no agent picked up this run" for a run
+    // that was cancelled — or that finished — as the window elapsed would be the
+    // same misdiagnosis this window exists to remove.
+    if (!accepted && !TERMINAL_RUN_STATES.has(run.status)) {
+      if (run.status === ExecutionRunStatus.enum.held) {
+        // A held run is waiting for a reviewer, not for an agent — push the
+        // window out rather than blaming the plane for the wait.
+        acceptanceDeadline = now + acceptanceTimeoutMs;
+      } else if (now - lastAcceptanceCheck >= ACCEPTANCE_CHECK_INTERVAL_MS) {
+        lastAcceptanceCheck = now;
+        const claimedJobs = await fetchJobs(client, runId);
+        accepted =
+          claimedJobs.length > 0 && claimedJobs.some((j) => !UNCLAIMED_JOB_STATES.has(j.status));
+      }
+      if (!accepted && now > acceptanceDeadline) {
+        const seconds = Math.round(acceptanceTimeoutMs / 1000);
+        throw new Error(
+          `offline run: no agent picked up this run within ${seconds}s — no scaler label set ` +
+            `matched the job's runsOn, or the agent failed to start.` +
+            (opts.hintLogPath ? ` Plane log: ${opts.hintLogPath}` : ''),
+        );
+      }
+    }
+
     let progressed = false;
     if (run.status !== lastStatus) {
       lastStatus = run.status;

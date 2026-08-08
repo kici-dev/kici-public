@@ -118,6 +118,43 @@ describe('validateDag()', () => {
     }
   });
 
+  it('excludes a node downstream of the cycle (A<->B, C needs A)', () => {
+    // A<->B is the only cycle; C merely depends on A and must NOT be reported.
+    const nodes: DagNode[] = [
+      { id: 'A', needs: ['B'] },
+      { id: 'B', needs: ['A'] },
+      { id: 'C', needs: ['A'] },
+    ];
+    const result = validateDag(nodes);
+    expect(result.valid).toBe(false);
+    if (result.valid === false && result.error === 'cycle') {
+      expect(result.nodesInCycle).toContain('A');
+      expect(result.nodesInCycle).toContain('B');
+      // C depends on the cycle but is not part of it.
+      expect(result.nodesInCycle).not.toContain('C');
+    }
+  });
+
+  it('reports two disjoint cycles and excludes a downstream node', () => {
+    // A<->B and D<->E are two independent cycles; C depends on A (downstream).
+    const nodes: DagNode[] = [
+      { id: 'A', needs: ['B'] },
+      { id: 'B', needs: ['A'] },
+      { id: 'C', needs: ['A'] },
+      { id: 'D', needs: ['E'] },
+      { id: 'E', needs: ['D'] },
+    ];
+    const result = validateDag(nodes);
+    expect(result.valid).toBe(false);
+    if (result.valid === false && result.error === 'cycle') {
+      expect(result.nodesInCycle).toContain('A');
+      expect(result.nodesInCycle).toContain('B');
+      expect(result.nodesInCycle).toContain('D');
+      expect(result.nodesInCycle).toContain('E');
+      expect(result.nodesInCycle).not.toContain('C');
+    }
+  });
+
   it('returns sortedOrder in topological order for valid DAGs', () => {
     const nodes: DagNode[] = [
       { id: 'build', needs: [] },

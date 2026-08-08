@@ -1,7 +1,12 @@
-/** kici diagnostics — mirrors the dashboard Diagnostics page (infra tree). */
+/** kici diagnostics — mirrors the dashboard Infrastructure page (infra tree). */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
-import type { DiagnosticsOrchestrator, DiagnosticsSummaryResponse } from '@kici-dev/engine';
+import type {
+  DiagnosticsInfraAlert,
+  DiagnosticsOrchestrator,
+  DiagnosticsSummaryResponse,
+} from '@kici-dev/engine';
+import { InfraAlertSeverity, normalizeInfraAlertSeverity } from '@kici-dev/engine';
 import { DashboardClient, DashboardClientError } from '../remote/dashboard-client.js';
 import { relativeTime } from '../remote/render.js';
 
@@ -55,9 +60,25 @@ function printSummary(s: DiagnosticsSummaryResponse): void {
   );
 }
 
-function printAlerts(alerts: { type: string; message: string; severity: string }[]): void {
+/**
+ * Alert colour per known severity.
+ *
+ * Typed `Record<InfraAlertSeverity, …>`: adding a severity to the engine enum
+ * without colouring it fails `pnpm typecheck` instead of silently inheriting
+ * the warning colour.
+ */
+const ALERT_SEVERITY_COLOR: Record<InfraAlertSeverity, (text: string) => string> = {
+  [InfraAlertSeverity.enum.warning]: pc.yellow,
+  [InfraAlertSeverity.enum.critical]: pc.red,
+};
+
+function printAlerts(alerts: DiagnosticsInfraAlert[]): void {
   for (const a of alerts) {
-    const color = a.severity === 'critical' ? pc.red : pc.yellow;
+    // The severity arrives as an unvalidated string from a Platform that may be
+    // newer than this CLI, so it is resolved against the known vocabulary
+    // rather than compared directly — an unrecognised value escalates instead
+    // of printing as a yellow warning.
+    const color = ALERT_SEVERITY_COLOR[normalizeInfraAlertSeverity(a.severity)];
     console.log(color(`  ! [${a.type}] ${a.message}`));
   }
 }

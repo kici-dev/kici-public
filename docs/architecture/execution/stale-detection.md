@@ -30,7 +30,7 @@ Tier 2 (Upstream):
                               Stale-orch detector --scan after threshold
                                     |
                                     v
-                              Mark execution_runs timed_out_stale
+                              Mark execution_runs failed (jobs timed_out_stale)
 ```
 
 ### Why two tiers
@@ -125,9 +125,9 @@ After all sub-scans and held run expiry, collects the unique `runId` values of a
 - **Separate metrics**: Stale timeouts counted independently from regular failures.
 - **GitHub distinction**: Maps to `timed_out` conclusion (not `failure`).
 
-### Relationship to engine state machine
+### Membership in the job status vocabulary
 
-The engine's 11-state `ExecutionState` type (the pure-function state machine) is **not modified**. `timed_out_stale` is included in the engine's `ExecutionJobStatus` Zod enum and `TERMINAL_JOB_STATES` set (defined in `packages/engine/src/protocol/messages/execution-status.ts`), so it's recognized as a terminal state for run completion logic across all tiers.
+`timed_out_stale` is a member of the engine's `ExecutionJobStatus` Zod enum and the `TERMINAL_JOB_STATES` set (defined in `packages/engine/src/protocol/messages/execution-status.ts`), so it's recognized as a terminal status for run-completion logic across all tiers.
 
 ### Overall run status
 
@@ -161,6 +161,8 @@ On orchestrator startup, `StaleRunDetector.start()` runs an **immediate scan** b
 
 - **Path A (normal)**: In-memory `RunState` Map available. Checks `isRunComplete()`, computes status from in-memory job states, updates DB, fires callback.
 - **Path B (crash recovery)**: In-memory Map is empty (post-restart). Queries `execution_jobs` from DB, checks if all are terminal, computes status from DB rows, updates `execution_runs`, fires callback.
+
+Both paths write the run row only while it is still non-terminal, and both fire their callbacks only when that write actually changed the row. A run that already finished through the normal path — so the detector's recomputed status is not the recorded one — is left alone on both planes, rather than having a stale recomputation forwarded to the Platform.
 
 Path B is critical for crash recovery: after a restart, in-memory state is empty, but the DB contains jobs that were marked `timed_out_stale` by the immediate startup scan. Without Path B, `execution_runs.status` would never be updated from `running` to `failed`.
 

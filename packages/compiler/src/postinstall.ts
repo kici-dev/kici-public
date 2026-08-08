@@ -7,6 +7,7 @@
  */
 
 import { confirm } from '@inquirer/prompts';
+import { isCiEnvironment } from '@kici-dev/core/ci-env';
 import { spawn } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -48,7 +49,7 @@ async function main() {
   }
 
   // Skip in CI environments or non-TTY
-  if (process.env.CI === 'true' || !process.stdout.isTTY) {
+  if (isCiEnvironment() || !process.stdout.isTTY) {
     return;
   }
 

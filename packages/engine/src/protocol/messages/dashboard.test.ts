@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { InfraAlertSeverity, InfraAlertType } from '../../diagnostics/infra-alert.js';
 import {
   DASHBOARD_REQUEST_TYPES,
   DASHBOARD_REQUEST_TYPE_SET,
@@ -13,6 +14,8 @@ import {
   dashboardStepLogsResponseSchema,
   dashboardPlatformToOrchSchema,
   dashboardOrchToPlatformSchema,
+  dashboardEventLogActivityRequestSchema,
+  dashboardEventLogActivityResponseSchema,
   dashboardJobDetailSchema,
   runCancelRequestSchema,
   dashboardDiagnosticsResponseSchema,
@@ -28,8 +31,15 @@ import {
   fleetHostDeclareResponseSchema,
   dashboardRunStructuredRequestSchema,
   dashboardRunStructuredResponseSchema,
+  contextCreateRequestSchema,
+  contextUpdateRequestSchema,
+  contextHistoryResponseSchema,
+  heldRunsListRequestSchema,
+  HeldRunStatus,
+  HeldRunQueueType,
 } from './dashboard.js';
 import { InitFailureCategory } from './execution-status.js';
+import { HoldType } from '../../context/hold-type.js';
 
 const testActor = { type: 'user' as const, sub: 'zsub-test' };
 
@@ -578,6 +588,87 @@ describe('dashboardOrchToPlatformSchema (discriminated union)', () => {
   });
 });
 
+describe('dashboardEventLogActivityRequestSchema', () => {
+  it('parses a valid request', () => {
+    const valid = {
+      type: 'dashboard.event-log.activity',
+      requestId: 'r-1',
+      actor: testActor,
+      orgId: 'org-1',
+      fromTimestamp: '2026-07-17T00:00:00.000Z',
+      toTimestamp: '2026-07-17T01:00:00.000Z',
+    };
+    expect(dashboardEventLogActivityRequestSchema.parse(valid)).toEqual(valid);
+  });
+
+  it('rejects a missing window bound', () => {
+    expect(() =>
+      dashboardEventLogActivityRequestSchema.parse({
+        type: 'dashboard.event-log.activity',
+        requestId: 'r-1',
+        actor: testActor,
+        orgId: 'org-1',
+        fromTimestamp: '2026-07-17T00:00:00.000Z',
+      }),
+    ).toThrow();
+  });
+
+  it('is a member of the platform→orch union', () => {
+    const msg = {
+      type: 'dashboard.event-log.activity',
+      requestId: 'r-1',
+      actor: testActor,
+      orgId: 'org-1',
+      fromTimestamp: '2026-07-17T00:00:00.000Z',
+      toTimestamp: '2026-07-17T01:00:00.000Z',
+    };
+    expect(dashboardPlatformToOrchSchema.parse(msg)).toEqual(msg);
+  });
+});
+
+describe('dashboardEventLogActivityResponseSchema', () => {
+  it('parses counts', () => {
+    const valid = {
+      type: 'dashboard.event-log.activity.response',
+      requestId: 'r-1',
+      counts: {
+        total: 5,
+        matched: 1,
+        unmatched: 3,
+        lockfileMissing: 1,
+        lockfileCorrupt: 0,
+        failed: 0,
+      },
+    };
+    expect(dashboardEventLogActivityResponseSchema.parse(valid)).toEqual(valid);
+  });
+
+  it('parses an error response with no counts', () => {
+    const valid = {
+      type: 'dashboard.event-log.activity.response',
+      requestId: 'r-1',
+      error: 'boom',
+    };
+    expect(dashboardEventLogActivityResponseSchema.parse(valid)).toEqual(valid);
+  });
+
+  it('is a member of the orch→platform union', () => {
+    const msg = {
+      type: 'dashboard.event-log.activity.response',
+      requestId: 'r-1',
+      counts: {
+        total: 0,
+        matched: 0,
+        unmatched: 0,
+        lockfileMissing: 0,
+        lockfileCorrupt: 0,
+        failed: 0,
+      },
+    };
+    expect(dashboardOrchToPlatformSchema.parse(msg)).toEqual(msg);
+  });
+});
+
 // --- Diagnostics metadata and scaler tests ---
 
 describe('dashboardDiagnosticsResponseSchema metadata fields', () => {
@@ -815,6 +906,34 @@ describe('runCancelRequestSchema force flag', () => {
   });
 });
 
+describe('run.cancel.response alreadyTerminal flag', () => {
+  const base = {
+    type: 'run.cancel.response' as const,
+    requestId: 'req-001',
+  };
+
+  it('carries alreadyTerminal when the orchestrator reports it', () => {
+    const parsed = dashboardOrchToPlatformSchema.parse({
+      ...base,
+      cancelledJobs: 0,
+      alreadyTerminal: true,
+    });
+    expect(parsed.type).toBe('run.cancel.response');
+    expect((parsed as { alreadyTerminal?: boolean }).alreadyTerminal).toBe(true);
+  });
+
+  it('still parses without alreadyTerminal (an orchestrator predating the field)', () => {
+    const parsed = dashboardOrchToPlatformSchema.parse({ ...base, cancelledJobs: 2 });
+    expect((parsed as { alreadyTerminal?: boolean }).alreadyTerminal).toBeUndefined();
+  });
+
+  it('rejects a non-boolean alreadyTerminal', () => {
+    expect(() =>
+      dashboardOrchToPlatformSchema.parse({ ...base, alreadyTerminal: 'yes' }),
+    ).toThrow();
+  });
+});
+
 describe('dashboardEventLogPayloadStreamRequestSchema', () => {
   const valid = {
     type: 'dashboard.event-log.payload.stream',
@@ -987,10 +1106,11 @@ describe('REST response schemas (CLI reuse)', () => {
   it('runListResponseSchema validates a minimal page envelope', () => {
     const ok = runListResponseSchema.parse({
       runs: [],
-      total: 0,
-      page: 1,
-      pageSize: 20,
+      nextCursor: null,
+      prevCursor: null,
       hasMore: false,
+      approxTotal: 0,
+      pageSize: 20,
     });
     expect(ok.pageSize).toBe(20);
   });
@@ -1024,10 +1144,11 @@ describe('REST response schemas (CLI reuse)', () => {
           source: null,
         },
       ],
-      total: 1,
-      page: 1,
-      pageSize: 20,
+      nextCursor: 'eyJ2IjoxLCJpZCI6InIxIn0',
+      prevCursor: null,
       hasMore: false,
+      approxTotal: 1,
+      pageSize: 20,
     });
     expect(ok.runs[0].runId).toBe('r1');
   });
@@ -1058,6 +1179,8 @@ describe('REST response schemas (CLI reuse)', () => {
             mode: 'compose',
             containerName: 'kici-orchestrator',
             containerRuntime: 'podman',
+            adminInvocation: 'podman exec kici-orchestrator kici-admin',
+            adminPath: null,
           },
           statefulAgentCount: 0,
           scalers: [
@@ -1085,13 +1208,21 @@ describe('REST response schemas (CLI reuse)', () => {
           ],
         },
       ],
-      alerts: [{ type: 'zero-agents', message: 'none', severity: 'warning' }],
+      alerts: [
+        {
+          type: InfraAlertType.enum['zero-agents'],
+          message: 'none',
+          severity: InfraAlertSeverity.enum.warning,
+        },
+      ],
     });
     expect(ok.orchestrators[0].agents[0].labels).toContain('linux');
     expect(ok.orchestrators[0].deployment).toEqual({
       mode: 'compose',
       containerName: 'kici-orchestrator',
       containerRuntime: 'podman',
+      adminInvocation: 'podman exec kici-orchestrator kici-admin',
+      adminPath: null,
     });
   });
 
@@ -1107,7 +1238,13 @@ describe('REST response schemas (CLI reuse)', () => {
           queuedJobs: 0,
           pendingLabelGaps: [],
           scalerBackends: [],
-          deployment: { mode: 'unknown', containerName: null, containerRuntime: null },
+          deployment: {
+            mode: 'unknown',
+            containerName: null,
+            containerRuntime: null,
+            adminInvocation: null,
+            adminPath: null,
+          },
           statefulAgentCount: 0,
           scalers: [],
           agents: [],
@@ -1208,5 +1345,248 @@ describe('attestation deferred-marker schemas', () => {
     });
     expect(res).toMatchObject({ minted: 2, stillPending: 1 });
     expect(DASHBOARD_REQUEST_TYPE_SET.has('dashboard.attestation.retry')).toBe(true);
+  });
+});
+
+describe('context concurrencyLimit boundary validation', () => {
+  const baseCreate = {
+    type: 'dashboard.contexts.create' as const,
+    requestId: 'r1',
+    actor: testActor,
+    name: 'ctx',
+    contextType: 'fixed' as const,
+  };
+
+  it('rejects concurrencyLimit: 0 on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, concurrencyLimit: 0 });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a negative concurrencyLimit on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, concurrencyLimit: -1 });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a fractional concurrencyLimit on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, concurrencyLimit: 1.5 });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts a positive integer concurrencyLimit on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, concurrencyLimit: 3 });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts an omitted concurrencyLimit on create (unlimited)', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects concurrencyLimit: 0 on update', () => {
+    const r = contextUpdateRequestSchema.safeParse({
+      type: 'dashboard.contexts.update',
+      requestId: 'r2',
+      actor: testActor,
+      contextId: 'c1',
+      updates: { concurrencyLimit: 0 },
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts concurrencyLimit: null on update (unlimited)', () => {
+    const r = contextUpdateRequestSchema.safeParse({
+      type: 'dashboard.contexts.update',
+      requestId: 'r3',
+      actor: testActor,
+      contextId: 'c1',
+      updates: { concurrencyLimit: null },
+    });
+    expect(r.success).toBe(true);
+  });
+});
+
+describe('context holdExpirySeconds boundary validation', () => {
+  // A stored `0` puts every hold's deadline at the instant it is created, so
+  // the stale detector sweeps it to `expired` before a reviewer can act. The
+  // orchestrator's admin routes reject it; the dashboard write path is the
+  // other way a value reaches the same column and must agree.
+  const baseCreate = {
+    type: 'dashboard.contexts.create' as const,
+    requestId: 'r1',
+    actor: testActor,
+    name: 'ctx',
+    contextType: 'fixed' as const,
+  };
+
+  const update = (updates: Record<string, unknown>) =>
+    contextUpdateRequestSchema.safeParse({
+      type: 'dashboard.contexts.update',
+      requestId: 'r2',
+      actor: testActor,
+      contextId: 'c1',
+      updates,
+    });
+
+  it('rejects holdExpirySeconds: 0 on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, holdExpirySeconds: 0 });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a negative holdExpirySeconds on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, holdExpirySeconds: -1 });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects a fractional holdExpirySeconds on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, holdExpirySeconds: 1.5 });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts a positive integer holdExpirySeconds on create', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate, holdExpirySeconds: 900 });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts an omitted holdExpirySeconds on create (falls back on read)', () => {
+    const r = contextCreateRequestSchema.safeParse({ ...baseCreate });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects holdExpirySeconds: 0 on update', () => {
+    expect(update({ holdExpirySeconds: 0 }).success).toBe(false);
+  });
+
+  it('accepts holdExpirySeconds: null on update — the emptied dashboard field', () => {
+    expect(update({ holdExpirySeconds: null }).success).toBe(true);
+  });
+
+  it('still accepts waitTimerSeconds: 0 on update', () => {
+    // The wait-timer gate skips on `null` only, so a 0-second wait timer is a
+    // coherent "release immediately" and must not be caught by the tightening.
+    expect(update({ waitTimerSeconds: 0 }).success).toBe(true);
+  });
+});
+
+describe('contextHistoryResponseSchema hasMore', () => {
+  it('accepts hasMore and defaults to undefined when absent', () => {
+    const withFlag = contextHistoryResponseSchema.parse({
+      type: 'dashboard.contexts.history.response',
+      requestId: 'r1',
+      runs: [],
+      hasMore: true,
+    });
+    expect(withFlag.hasMore).toBe(true);
+
+    const without = contextHistoryResponseSchema.parse({
+      type: 'dashboard.contexts.history.response',
+      requestId: 'r2',
+      runs: [],
+    });
+    expect(without.hasMore).toBeUndefined();
+  });
+});
+
+describe('held-runs list response — status and queue-type vocabulary', () => {
+  /** Minimal valid row; every field below is required by the schema. */
+  const row = (status: string, queueType: string = HeldRunQueueType.enum.context) => ({
+    id: 'hold-1',
+    runId: 'run-1',
+    contextId: null,
+    contextName: null,
+    holdType: HoldType.enum.timer,
+    queueType,
+    status,
+    requestedAt: '2026-07-26T00:00:00.000Z',
+    resolvedAt: null,
+    resolvedBy: null,
+    reason: null,
+    expiresAt: null,
+  });
+
+  const message = (...rows: ReturnType<typeof row>[]) => ({
+    type: 'dashboard.held-runs.list.response',
+    requestId: 'req-1',
+    heldRuns: rows,
+  });
+
+  it('includes released in the known status vocabulary', () => {
+    expect(HeldRunStatus.options).toEqual([
+      'pending',
+      'approved',
+      'rejected',
+      'expired',
+      'released',
+    ]);
+  });
+
+  it('accepts a released row', () => {
+    const parsed = dashboardOrchToPlatformSchema.safeParse(
+      message(row(HeldRunStatus.enum.released)),
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it('does not reject the whole message on one unknown status', () => {
+    // The defect: a strict enum failed safeParse for the ENTIRE relayed message
+    // on a single unrecognized row. Because `dashboard.held-runs.list.response`
+    // is a type the Platform *knows*, the recognition chain treats the failure
+    // as malformed rather than version skew and closes the orchestrator's
+    // WebSocket — taking every in-flight run, log stream and webhook relay with
+    // it, in a reconnect loop.
+    const parsed = dashboardOrchToPlatformSchema.safeParse(
+      message(row(HeldRunStatus.enum.pending), row('a_status_from_a_newer_orchestrator')),
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it('does not reject the whole message on one unknown queue type', () => {
+    const parsed = dashboardOrchToPlatformSchema.safeParse(
+      message(row(HeldRunStatus.enum.pending, 'a_queue_from_a_newer_orchestrator')),
+    );
+    expect(parsed.success).toBe(true);
+  });
+
+  it('still rejects a client-supplied status filter that is not a known status', () => {
+    // The REQUEST side stays strict: a filter with a typo must be rejected, not
+    // silently matched against nothing.
+    const parsed = heldRunsListRequestSchema.safeParse({
+      type: 'dashboard.held-runs.list',
+      requestId: 'req-1',
+      actor: testActor,
+      status: 'pendign',
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('accepts released as a client-supplied status filter', () => {
+    const parsed = heldRunsListRequestSchema.safeParse({
+      type: 'dashboard.held-runs.list',
+      requestId: 'req-1',
+      actor: testActor,
+      status: HeldRunStatus.enum.released,
+    });
+    expect(parsed.success).toBe(true);
+  });
+});
+
+describe('heldRunsListRequestSchema — heldRunId filter', () => {
+  const base = {
+    type: 'dashboard.held-runs.list' as const,
+    requestId: 'req-1',
+    actor: testActor,
+  };
+
+  it('accepts a heldRunId filter', () => {
+    const parsed = heldRunsListRequestSchema.parse({ ...base, heldRunId: 'hr-1' });
+    expect(parsed.heldRunId).toBe('hr-1');
+  });
+
+  it('stays valid without heldRunId (older callers)', () => {
+    const parsed = heldRunsListRequestSchema.parse(base);
+    expect(parsed.heldRunId).toBeUndefined();
+  });
+
+  it('rejects a non-string heldRunId', () => {
+    expect(() => heldRunsListRequestSchema.parse({ ...base, heldRunId: 7 })).toThrow();
   });
 });

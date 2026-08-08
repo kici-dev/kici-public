@@ -25,6 +25,19 @@ export class SecretScopeNotFoundError extends Error {
 }
 
 /**
+ * Thrown by `renameScope` when the destination scope already holds secret rows
+ * or context bindings. Renaming onto it would merge two scopes rather than move
+ * one. The admin HTTP route maps it to a 409; the dashboard rename handler
+ * relays its message as the operation's error text.
+ */
+export class SecretScopeExistsError extends Error {
+  constructor(public readonly scope: string) {
+    super(`Secret scope '${scope}' already exists`);
+    this.name = 'SecretScopeExistsError';
+  }
+}
+
+/**
  * PostgreSQL secret store with AES-256-GCM encryption.
  * Uses scoped_secrets table keyed by (org_id, scope, key).
  */
@@ -291,28 +304,45 @@ export class PgSecretStore implements SecretStore {
    */
   async renameScope(orgId: string, oldScope: string, newScope: string): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      // Fetch all secret rows for this scope — need to re-encrypt with new AAD
-      // because AAD includes scope name (orgId:scope:key).
-      const rows = await trx
+      // Fetch the source rows (they need re-encrypting under the new AAD,
+      // which includes the scope name) and the destination's rows in one
+      // query, so the occupancy check runs inside the same transaction as the
+      // rename it guards.
+      const scopeRows = await trx
         .selectFrom('scoped_secrets')
         .selectAll()
         .where('org_id', '=', orgId)
-        .where('scope', '=', oldScope)
+        .where('scope', 'in', [oldScope, newScope])
         .execute();
+      const rows = scopeRows.filter((r) => r.scope === oldScope);
 
       // A scope exists when it has at least one secret row (empty scopes carry
       // an `__empty__` sentinel) or an context binding references it.
       // Renaming a scope that exists in neither would silently commit zero
       // changes and report success — reject it so the caller gets a 4xx
       // instead of a misleading 200.
-      const bindings = await trx
+      const bindingRows = await trx
         .selectFrom('context_bindings')
-        .select('id')
+        .select(['id', 'scope_pattern'])
         .where('org_id', '=', orgId)
-        .where('scope_pattern', '=', oldScope)
+        .where('scope_pattern', 'in', [oldScope, newScope])
         .execute();
+      const bindings = bindingRows.filter((b) => b.scope_pattern === oldScope);
       if (rows.length === 0 && bindings.length === 0) {
         throw new SecretScopeNotFoundError(oldScope);
+      }
+
+      // Renaming onto an occupied scope MERGES two scopes: every source key
+      // that does not collide lands under the destination name while the
+      // caller is told the rename succeeded, and the rows are re-encrypted
+      // under the destination AAD so the original grouping is unrecoverable.
+      // A rename never means a merge — refuse.
+      if (
+        oldScope !== newScope &&
+        (scopeRows.some((r) => r.scope === newScope) ||
+          bindingRows.some((b) => b.scope_pattern === newScope))
+      ) {
+        throw new SecretScopeExistsError(newScope);
       }
 
       for (const row of rows) {

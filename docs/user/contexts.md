@@ -129,9 +129,7 @@ job('deploy', {
   concurrencyGroup: 'production-api',
   // Or dynamic:
   // concurrencyGroup: (event) => `review-${event.payload.pull_request.number}`,
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 ```
 
@@ -196,7 +194,7 @@ Require manual approval before a job can proceed:
 Required reviewers: alice, bob
 ```
 
-When reviewers are required, the job enters a "held" state. Reviewers can approve or reject via the dashboard, the [`kici approve`](cli-reference.md#kici-approve) command, or the API. Held runs expire after a configurable timeout.
+When reviewers are required, the job enters a "held" state. Reviewers can approve or reject via the dashboard, the [`kici approve`](./cli/runs-and-approvals.md#kici-approve) command, or the API. Held runs expire after a configurable timeout.
 
 This operator-set rule is the **mandatory** form of an approval gate. Workflow authors can also declare gates in code with `approval` at step, job, or workflow level — see [Approval gates](approvals.md). Both forms use the same held-element mechanism and the same queue.
 
@@ -237,14 +235,16 @@ See the [CI security architecture docs](../architecture/security/ci-security.md)
 
 ### Security approval queue
 
-When a PR is held for security review (unknown contributor, workflow modification, or trust policy violation), it enters the security approval queue. This is separate from context-level approval queues.
+When a PR is held for security review — the org trust policy held it (a non-trusted contributor modified `.kici/` files, the PR came from a fork, or the contributor could not be resolved to a known identity), or a `minimumTrust` gate blocked the contributor — it enters the security approval queue. This is separate from the context approval queue: a security hold asks "is it safe to run this contributor's code at all?", while a context approval hold asks "should this job be promoted?". The two never cross — releasing a security hold needs `ci_trust:write` or higher, releasing a context approval hold needs `contexts:write` plus eligibility for one of the gate's clauses. See [Approval holds vs security holds](../architecture/approvals.md#approval-holds-vs-security-holds) for the full comparison.
 
 Held runs can be approved:
 
 - Via the **dashboard** in Settings > CI trust > Approval queue
 - Via a PR comment: `/kici approve` (commenter must have `ci_trust:write+`)
 
-Security holds expire after a configurable timeout (default 1 hour).
+A hold raised by the org trust policy covers the whole PR and uses the org's approval expiry (default 72 hours). A `minimumTrust` hold is raised by a context rather than by the org policy, so it uses that context's own hold expiry (default one hour).
+
+While the org trust policy is holding a pull request, your organization's global workflows do not run for it. Approving the hold releases that pull request's own workflows; it does not retroactively run the organization's global workflows for the event.
 
 ### Concurrency limits
 
@@ -254,6 +254,8 @@ Control how many jobs can run simultaneously in a context:
 Concurrency limit: 1
 Strategy: queue (or cancel-pending)
 ```
+
+The concurrency limit is a positive integer; leave it unset for unlimited concurrency.
 
 - **queue** -- new jobs wait in a FIFO queue (with configurable timeout, default 1 hour)
 - **cancel-pending** -- pending (queued) jobs are cancelled when the limit is reached
@@ -277,7 +279,7 @@ Each context has four tabs:
 
 2. **Secrets** -- view bound secret scopes and their resolved secret count. Add bindings by specifying scope glob patterns (e.g., `aws/prod/**`).
 
-3. **Protection** -- configure branch restrictions, required reviewers, wait timers, and concurrency limits with enable toggles for each section.
+3. **Protection** -- configure branch restrictions, required reviewers, wait timers, and concurrency limits with enable toggles for each section. Turning a section's toggle off and saving clears that rule on the context, so the gate stops applying to new runs. Emptying the hold expiry field clears it too, and held runs fall back to the default one-hour hold window.
 
 4. **History** -- view filtered runs targeting this context.
 

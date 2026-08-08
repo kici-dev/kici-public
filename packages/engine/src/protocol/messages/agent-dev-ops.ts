@@ -12,6 +12,7 @@
  */
 import { z } from 'zod';
 import { untrusted } from './agent-run-result.js';
+import { connectionHealthStatusSchema } from './heartbeat-health.js';
 
 const untrustedString = untrusted(z.string());
 const untrustedStringNullable = untrusted(z.string()).nullable();
@@ -53,7 +54,7 @@ export type AgentOrchestratorSummary = z.infer<typeof agentOrchestratorSummarySc
 /** One orchestrator connection row inside the diagnostics summary. */
 export const agentDiagnosticsConnectionSchema = z.object({
   connectionId: z.string(),
-  healthBadge: z.enum(['connected', 'unhealthy', 'stale']),
+  healthBadge: connectionHealthStatusSchema,
   routingKeys: z.array(untrustedString),
   lastHeartbeatAt: z.string().nullable(),
 });

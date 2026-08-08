@@ -11,6 +11,12 @@
 import { describe, it, expect } from 'vitest';
 import { RbacEnforcer, PermissionDeniedError, type Permission, type Role } from './rbac.js';
 
+/**
+ * Every member of `Permission`. The owner test below is named "has all
+ * permissions", so this list has to actually be all of them — a partial list
+ * lets a newly added permission be missing from the owner role unnoticed.
+ * Keep it in sync with the union in `rbac.ts`.
+ */
 const ALL_PERMISSIONS: Permission[] = [
   'context.create',
   'context.read',
@@ -19,10 +25,22 @@ const ALL_PERMISSIONS: Permission[] = [
   'secret.read',
   'secret.write',
   'secret.delete',
+  'secret.reveal',
   'audit.read',
   'token.manage',
   'key.rotate',
   'run.read',
+  'run.cancel',
+  'event_log.read',
+  'event_log.read_payload',
+  'access_log.read',
+  'scheduled_job.trigger',
+  'attestation.retry',
+  'event_dlq.read',
+  'event_dlq.manage',
+  'orchestrator.drain',
+  'ci_trust.read',
+  'ci_trust.admin',
 ];
 
 describe('RbacEnforcer', () => {
@@ -76,10 +94,23 @@ describe('RbacEnforcer', () => {
         'token.manage',
         'key.rotate',
         'attestation.retry',
+        'orchestrator.drain',
+        'ci_trust.read',
+        'ci_trust.admin',
       ];
       for (const perm of deniedPerms) {
         expect(enforcer.hasPermission('auditor', perm)).toBe(false);
       }
+    });
+  });
+
+  describe('orchestrator.drain permission', () => {
+    it('owner and admin hold orchestrator.drain', () => {
+      expect(enforcer.hasPermission('owner', 'orchestrator.drain')).toBe(true);
+      expect(enforcer.hasPermission('admin', 'orchestrator.drain')).toBe(true);
+    });
+    it('auditor does NOT hold orchestrator.drain', () => {
+      expect(enforcer.hasPermission('auditor', 'orchestrator.drain')).toBe(false);
     });
   });
 
@@ -90,6 +121,19 @@ describe('RbacEnforcer', () => {
     });
     it('auditor does NOT hold attestation.retry', () => {
       expect(enforcer.hasPermission('auditor', 'attestation.retry')).toBe(false);
+    });
+  });
+
+  describe('ci_trust permissions', () => {
+    it('owner and admin hold ci_trust.read and ci_trust.admin', () => {
+      for (const role of ['owner', 'admin'] as const) {
+        expect(enforcer.hasPermission(role, 'ci_trust.read')).toBe(true);
+        expect(enforcer.hasPermission(role, 'ci_trust.admin')).toBe(true);
+      }
+    });
+    it('auditor holds neither — the trust policy decides whether a fork PR runs', () => {
+      expect(enforcer.hasPermission('auditor', 'ci_trust.read')).toBe(false);
+      expect(enforcer.hasPermission('auditor', 'ci_trust.admin')).toBe(false);
     });
   });
 

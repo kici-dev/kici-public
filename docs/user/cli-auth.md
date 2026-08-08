@@ -20,7 +20,7 @@ The default `kici login` flow:
 kici login
 ```
 
-The CLI auto-detects headless environments (SSH sessions, CI runners) and switches to device flow automatically.
+The CLI auto-detects headless environments (SSH sessions, CI runners, containers) and switches to device flow automatically. On WSL, `kici login` opens your Windows browser when Windows interop is reachable; if it is not (interop disabled, or the Windows drive not mounted), the CLI falls back to the device flow rather than waiting for a browser that cannot open.
 
 ### Device flow (headless)
 
@@ -227,10 +227,35 @@ The CLI stores authentication data in `~/.kici/config` with `0600` permissions (
 
 If `kici login` can't open a browser:
 
+- Copy the authorization URL the CLI prints under `If it does not open, visit:` and open it in any browser — the CLI keeps waiting for the callback for up to 5 minutes (see [Browser callback never arrives](#browser-callback-never-arrives) if it never lands)
 - Use `kici login --device` for the device flow
 - Or set the `KICI_BROWSER_CMD` environment variable to your browser command (e.g., `KICI_BROWSER_CMD='firefox {url}'`)
 
+### Browser callback never arrives
+
+If the browser opens and you complete sign-in, but `kici login` keeps waiting:
+
+- The CLI is waiting on a callback to `127.0.0.1`. A corporate firewall, an unusual loopback policy, or a WSL `portproxy` rule can block it.
+- After 90 seconds of waiting the CLI prints a reminder that `kici login --device` needs no callback. It is safe to ignore if you are still signing in. After 5 minutes it gives up with `Authentication timed out after 5 minutes`.
+- Retry with `kici login --device` — the device flow needs no local callback.
+- If you must keep the browser flow, set `KICI_CALLBACK_PORT` to a fixed port your firewall allows.
+
+### Callback port already in use
+
+If `KICI_CALLBACK_PORT` names a port something else is already listening on, `kici login` stops immediately and names the port instead of hanging or crashing.
+
+It deliberately does **not** pick another port for you. A fixed port is something you set on purpose — usually because a firewall rule or a WSL `portproxy` entry allows exactly that one — so binding somewhere else would hand the browser a callback URL nothing can reach, and you would wait out the full 5-minute timeout instead of seeing a clear error.
+
+Two ways forward:
+
+- Free the port (stop whatever holds it) or point `KICI_CALLBACK_PORT` at a different free port your firewall allows.
+- Run `kici login --device` — the device flow needs no local callback at all.
+
+A port below 1024 fails the same way, with a permissions message rather than an "in use" one: those ports need elevated privileges. Pick a port above 1024. A value that is not a port number at all — non-numeric, negative, or above 65535 — is rejected before the login starts, naming the value you set.
+
 ### Device flow timeout
+
+This is the device flow's own expiry, not the browser flow's callback timeout above.
 
 The device flow has a 5-minute timeout. If it expires:
 

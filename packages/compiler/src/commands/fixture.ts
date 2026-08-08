@@ -20,6 +20,7 @@ export interface FixtureOptions {
 const INTERNAL_EVENT_TYPES = new Set([
   'kici_event',
   'workflow_complete',
+  'workflows_failed_batch',
   'job_complete',
   'generic_webhook',
   'schedule',
@@ -62,6 +63,15 @@ function generateInternalFixture(eventType: ReturnType<typeof parseEventArg>): u
         workflowName: 'workflowName' in eventType ? eventType.workflowName : 'ci',
         status: 'status' in eventType ? eventType.status : 'success',
         sourceRepo: 'owner/repo',
+      };
+
+    case 'workflows_failed_batch':
+      return {
+        total: 2,
+        runs: [
+          { runId: 'run-1', repo: 'owner/repo', workflowName: 'ci' },
+          { runId: 'run-2', repo: 'owner/repo', workflowName: 'deploy' },
+        ],
       };
 
     case 'job_complete':

@@ -130,6 +130,10 @@ function makeDeps(
     dispatcher: mocks.dispatcher as unknown as StaleRunDetectorDeps['dispatcher'],
     registry: mocks.registry as unknown as StaleRunDetectorDeps['registry'],
     peerRegistry: mocks.peerRegistry as unknown as StaleRunDetectorDeps['peerRegistry'],
+    clusterSettings: {
+      getNumber: async (_col: string, fallback: number) => fallback,
+    } as unknown as StaleRunDetectorDeps['clusterSettings'],
+    rerouteFlapGraceFallbackMs: 120_000,
     staleThresholdMs: 120_000,
     scanIntervalMs: 60_000,
   };

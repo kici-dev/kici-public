@@ -55,6 +55,11 @@ const mockFollowProgress = vi.fn((_stream: unknown, onFinished: (err: Error | nu
   onFinished(null);
 });
 
+// Image inspect drives the IfNotPresent branch: resolve = image already local
+// (no pull), reject = image absent (pull once).
+const mockImageInspect = vi.fn().mockResolvedValue({ Id: 'sha256:mock' });
+const mockGetImage = vi.fn().mockReturnValue({ inspect: mockImageInspect });
+
 // Network-related mocks
 const mockListNetworks = vi.fn().mockResolvedValue([]);
 const mockCreateNetwork = vi.fn().mockResolvedValue({ id: 'net-abc123456789' });
@@ -74,6 +79,7 @@ vi.mock('dockerode', () => {
         listNetworks: mockListNetworks,
         createNetwork: mockCreateNetwork,
         getNetwork: mockGetNetwork,
+        getImage: mockGetImage,
         pull: mockPull,
         modem: {
           followProgress: mockFollowProgress,
@@ -137,6 +143,9 @@ describe('ContainerScalerBackend', () => {
       Options: { 'com.docker.network.bridge.name': 'br-abc123456789' },
     });
     mockGetNetwork.mockReturnValue({ inspect: mockNetworkInspect });
+    // Default: image already present locally (IfNotPresent → no pull).
+    mockImageInspect.mockResolvedValue({ Id: 'sha256:mock' });
+    mockGetImage.mockReturnValue({ inspect: mockImageInspect });
     mockValidateNftablesAvailability.mockResolvedValue(undefined);
     mockEnsureKiciTable.mockResolvedValue(undefined);
     mockAddIsolationRules.mockResolvedValue(undefined);
@@ -289,12 +298,114 @@ describe('ContainerScalerBackend', () => {
       expect(managed.labelSet).toEqual(['linux', 'docker']);
     });
 
-    it('pulls image before creating container', async () => {
+    it('pulls image before creating container when it is absent', async () => {
+      // Default policy is IfNotPresent: the image must be missing locally for a
+      // pull to happen. Make the inspect reject to simulate an absent image.
+      mockImageInspect.mockRejectedValue(new Error('no such image'));
       const backend = await createBackend();
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
 
-      expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest');
+      expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+        abortSignal: undefined,
+      });
       expect(mockFollowProgress).toHaveBeenCalledOnce();
+    });
+
+    describe('abort signal', () => {
+      it('forwards the abort signal into pull, createContainer and start opts', async () => {
+        // Force a pull so the pull call site is exercised too.
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const controller = new AbortController();
+        const backend = await createBackend();
+        await backend.spawn(
+          ['linux', 'docker'],
+          'agent-abrt',
+          'http://localhost:4000',
+          undefined,
+          undefined,
+          undefined,
+          controller.signal,
+        );
+
+        expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+          abortSignal: controller.signal,
+        });
+        expect(mockCreateContainer.mock.calls[0][0].abortSignal).toBe(controller.signal);
+        expect(mockStart).toHaveBeenCalledWith({ abortSignal: controller.signal });
+      });
+
+      it('best-effort removes a created container and clears tracking when start fails after abort', async () => {
+        const controller = new AbortController();
+        // The container is created, then start rejects (as a cancelled request
+        // would once the signal aborts).
+        mockStart.mockRejectedValueOnce(new Error('start aborted'));
+        const backend = await createBackend();
+
+        const p = backend.spawn(
+          ['linux', 'docker'],
+          'agent-hung',
+          'http://localhost:4000',
+          undefined,
+          undefined,
+          undefined,
+          controller.signal,
+        );
+        controller.abort(new Error('scaler spawn timed out'));
+        await expect(p).rejects.toThrow();
+
+        // The created container was removed best-effort and tracking was pruned,
+        // so the semaphore/cap accounting sees the backend as idle again.
+        expect(mockRemove).toHaveBeenCalledWith({ force: true });
+        expect(backend.getActiveCount()).toBe(0);
+      });
+    });
+
+    describe('imagePullPolicy', () => {
+      it('with no imagePullPolicy set, does not pull when the image is already present', async () => {
+        mockImageInspect.mockResolvedValue({ Id: 'sha256:present' });
+        const backend = await createBackend();
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockGetImage).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest');
+        expect(mockPull).not.toHaveBeenCalled();
+        expect(mockCreateContainer).toHaveBeenCalledOnce();
+      });
+
+      it('with no imagePullPolicy set, pulls once when the image is absent', async () => {
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const backend = await createBackend();
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).toHaveBeenCalledTimes(1);
+        expect(mockPull).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest', {
+          abortSignal: undefined,
+        });
+      });
+
+      it('explicit imagePullPolicy Always pulls even when the image is present', async () => {
+        mockImageInspect.mockResolvedValue({ Id: 'sha256:present' });
+        const backend = await createBackend({
+          labelSets: [
+            { labels: ['linux', 'docker'], image: 'moving:latest', imagePullPolicy: 'Always' },
+          ],
+        });
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).toHaveBeenCalledTimes(1);
+        expect(mockPull).toHaveBeenCalledWith('moving:latest', { abortSignal: undefined });
+      });
+
+      it('imagePullPolicy Never does not pull even when the image is absent', async () => {
+        mockImageInspect.mockRejectedValue(new Error('no such image'));
+        const backend = await createBackend({
+          labelSets: [
+            { labels: ['linux', 'docker'], image: 'pinned:1.0', imagePullPolicy: 'Never' },
+          ],
+        });
+        await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+        expect(mockPull).not.toHaveBeenCalled();
+      });
     });
 
     it('starts container after creation', async () => {

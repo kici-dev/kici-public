@@ -15,6 +15,11 @@ import {
   platformToOrchestratorMessageSchema,
   orchestratorToPlatformMessageSchema,
   trustPolicyUpdateSchema,
+  trustPolicySchema,
+  DEFAULT_APPROVAL_EXPIRY_HOURS,
+  collectDiscriminatorTypes,
+  ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
+  PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
 } from './platform-orchestrator.js';
 import { sourceRegistrationSchema, sourceRegistrationAckSchema } from './source-registration.js';
 import { logPullPlatformToOrchSchema } from './log-pull.js';
@@ -871,6 +876,16 @@ describe('platformToOrchestratorMessageSchema', () => {
     ).toThrow();
   });
 
+  it('accepts a nack frame (Platform → orchestrator version-skew reply)', () => {
+    const msg = { type: 'nack', receivedType: 'some.new.type', reason: 'unsupported' };
+    expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts a platform.capabilities advertisement', () => {
+    const msg = { type: 'platform.capabilities', capabilities: { orchMetrics: true } };
+    expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
+  });
+
   it('accepts dashboard.contexts.test_access.set messages', () => {
     // The Platform proxies this message verbatim to the orchestrator; if the
     // wire union rejects it, the orchestrator drops the frame and the
@@ -936,6 +951,30 @@ describe('orchestratorToPlatformMessageSchema', () => {
     expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
   });
 
+  it('accepts orch-log.chunk messages', () => {
+    const msg = {
+      type: 'orch-log.chunk',
+      runId: 'run-1',
+      jobId: 'job-1',
+      phase: 'dispatch',
+      lines: ['Job dispatched to queue'],
+      ts: 123,
+    };
+    expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('rejects orch-log.chunk with an unknown phase', () => {
+    const msg = {
+      type: 'orch-log.chunk',
+      runId: 'run-1',
+      jobId: 'job-1',
+      phase: 'bogus',
+      lines: ['x'],
+      ts: 1,
+    };
+    expect(() => orchestratorToPlatformMessageSchema.parse(msg)).toThrow();
+  });
+
   it('accepts auth.request messages', () => {
     const msg = {
       type: 'auth.request',
@@ -989,6 +1028,16 @@ describe('orchestratorToPlatformMessageSchema', () => {
       payload: {},
     };
     expect(() => orchestratorToPlatformMessageSchema.parse(wrongDirection)).toThrow();
+  });
+
+  it('accepts a nack frame (orchestrator → Platform version-skew reply)', () => {
+    const msg = { type: 'nack', receivedType: 'some.new.type', reason: 'unsupported' };
+    expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('does NOT accept platform.capabilities in the orch→platform direction', () => {
+    const msg = { type: 'platform.capabilities', capabilities: {} };
+    expect(() => orchestratorToPlatformMessageSchema.parse(msg)).toThrow();
   });
 });
 
@@ -1155,5 +1204,65 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
     const taintedMember = members.find((m) => m.typeLiteral === 'tainted');
     expect(taintedMember).toBeDefined();
     expect(taintedMember!.keys).toContain('platformSignature');
+  });
+});
+
+describe('recognized-type sets', () => {
+  it('collectDiscriminatorTypes extracts every option of a discriminated union', () => {
+    const types = collectDiscriminatorTypes(orchestratorToPlatformMessageSchema);
+    expect(types).toContain('execution.status');
+    expect(types).toContain('webhook.ack');
+    expect(types.length).toBe(orchestratorToPlatformMessageSchema.options.length);
+  });
+
+  it('collectDiscriminatorTypes extracts the single literal of an object schema', () => {
+    expect(collectDiscriminatorTypes(logPullPlatformToOrchSchema)).toEqual(['log.request']);
+  });
+
+  it('ORCH_TO_PLATFORM_RECOGNIZED_TYPES covers the ingestion types (drift guard)', () => {
+    // If a future union edit drops one of these members, the NACK classifier
+    // would start treating a known-but-invalid frame as version skew again.
+    expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('execution.status')).toBe(true);
+    expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('step.status.forward')).toBe(true);
+    expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('job.status.forward')).toBe(true);
+    expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('brand.new.thing')).toBe(false);
+  });
+
+  it('PLATFORM_TO_ORCH_RECOGNIZED_TYPES covers the mainline + dashboard types (drift guard)', () => {
+    expect(PLATFORM_TO_ORCH_RECOGNIZED_TYPES.has('webhook.relay.start')).toBe(true);
+    expect(PLATFORM_TO_ORCH_RECOGNIZED_TYPES.has('trust_policy.update')).toBe(true);
+    expect(PLATFORM_TO_ORCH_RECOGNIZED_TYPES.has('brand.new.thing')).toBe(false);
+  });
+});
+
+describe('trustPolicySchema approvalExpiryHours validation', () => {
+  const validPolicy = {
+    forkPolicy: 'hold',
+    unknownContributorPolicy: 'hold',
+    workflowChangePolicy: 'hold',
+    approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+  };
+
+  it('accepts the documented default', () => {
+    expect(trustPolicySchema.safeParse(validPolicy).success).toBe(true);
+  });
+
+  it('rejects a non-integer approvalExpiryHours', () => {
+    // The column is INTEGER NOT NULL, so a fractional value throws inside the
+    // fire-and-forget persist and the policy is silently never stored.
+    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: 1.5 }).success).toBe(
+      false,
+    );
+  });
+
+  it('rejects a zero or negative approvalExpiryHours', () => {
+    // Either value mints a hold that is already expired the moment it is
+    // written, so the run fails instead of waiting for an approver.
+    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: 0 }).success).toBe(
+      false,
+    );
+    expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: -1 }).success).toBe(
+      false,
+    );
   });
 });

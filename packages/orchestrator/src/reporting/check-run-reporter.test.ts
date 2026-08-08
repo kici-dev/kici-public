@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CheckRunReporter, buildJobFailureDescription } from './check-run-reporter.js';
 import { ProviderRegistry, type ProviderBundle } from '../provider-registry.js';
-import { ExecutionJobStatus, CheckRunConclusion } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  ExecutionStepStatus,
+  CheckRunConclusion,
+  TERMINAL_JOB_STATES,
+} from '@kici-dev/engine';
 
 // Mock Prometheus metrics
 vi.mock('../metrics/prometheus.js', () => ({
@@ -192,6 +197,68 @@ describe('CheckRunReporter', () => {
           }),
         }),
       );
+    });
+
+    it('ignores a step-progress update that arrives after the job completed', async () => {
+      // Observed on staging: `kici/e2e-fail/job/fail-job` sat at
+      // `status: in_progress` with `conclusion: failure` already attached,
+      // because a step status arriving after the completion scheduled a fresh
+      // debounce timer that then PATCHed the check run back open. A check run
+      // stuck in a non-terminal status is the very state this reporter exists
+      // to avoid, so completion has to be a one-way latch.
+      const reporter = new CheckRunReporter({ githubConfig });
+
+      reporter.setPending({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        jobNames: ['test'],
+        installationId: 42,
+      });
+      await vi.waitFor(() => {
+        expect(mockChecksCreate).toHaveBeenCalledTimes(2);
+      });
+
+      reporter.updateJobStatus({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        jobName: 'test',
+        state: ExecutionJobStatus.enum.failed,
+        installationId: 42,
+      });
+      await vi.waitFor(() => {
+        expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
+      });
+      expect(mockChecksUpdate).toHaveBeenLastCalledWith(
+        expect.objectContaining({ status: 'completed' }),
+      );
+
+      // A late step status for the same job. Without the latch this takes the
+      // "first running step" branch and PATCHes `in_progress` immediately.
+      reporter.updateStepProgress({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        jobName: 'test',
+        stepIndex: 0,
+        stepName: 'late-step',
+        state: ExecutionStepStatus.enum.running,
+        installationId: 42,
+      });
+
+      // Drain the queue instead of sleeping: the suppressed path is a few
+      // awaited promises, and a fixed sleep gets shorter than the work on load.
+      for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
+
+      expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
+      expect(mockChecksUpdate.mock.calls.some((c) => c[0]?.status === 'in_progress')).toBe(false);
     });
 
     it('maps failed to failure conclusion', async () => {
@@ -556,6 +623,166 @@ describe('CheckRunReporter', () => {
     });
   });
 
+  describe('terminal check-run updates record that they were sent', () => {
+    /**
+     * Minimal tracking-store double. Only the methods the reporter calls on
+     * this path are implemented; the rest resolve so a write-through never
+     * throws for an unrelated reason.
+     */
+    function makeTrackingStore() {
+      return {
+        setCheckRunId: vi.fn().mockResolvedValue(undefined),
+        getCheckRunId: vi.fn().mockResolvedValue(undefined),
+        markBuildCreationPending: vi.fn().mockResolvedValue(undefined),
+        markBuildCreationComplete: vi.fn().mockResolvedValue(undefined),
+        setStepProgress: vi.fn().mockResolvedValue(undefined),
+        markInProgressSent: vi.fn().mockResolvedValue(undefined),
+        markTerminalSent: vi.fn().mockResolvedValue(undefined),
+        getState: vi.fn().mockResolvedValue(undefined),
+        deleteRow: vi.fn().mockResolvedValue(false),
+        listKeysByRunId: vi.fn().mockResolvedValue([]),
+        deleteByRunId: vi.fn().mockResolvedValue(0),
+      };
+    }
+
+    async function seedWorkflowCheckRun(reporter: CheckRunReporter) {
+      reporter.setPending({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        jobNames: ['test'],
+        installationId: 42,
+      });
+      await vi.waitFor(() => {
+        expect(mockChecksCreate).toHaveBeenCalledTimes(2);
+      });
+    }
+
+    it('stamps terminal_sent_at when a completed update succeeds', async () => {
+      const trackingStore = makeTrackingStore();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+      await seedWorkflowCheckRun(reporter);
+
+      reporter.updateWorkflowStatus({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        overallStatus: ExecutionJobStatus.enum.success,
+        installationId: 42,
+        runId: 'run-xyz',
+      });
+
+      await vi.waitFor(() => {
+        expect(trackingStore.markTerminalSent).toHaveBeenCalledTimes(1);
+      });
+      // The runId must be threaded: the stamp is an upsert, so a row it
+      // INSERTs without run_id could never be reaped by deleteByRunId.
+      expect(trackingStore.markTerminalSent).toHaveBeenCalledWith(
+        {
+          provider: 'github',
+          owner: 'myorg',
+          repo: 'myrepo',
+          sha: 'abc123',
+          checkName: 'kici/CI',
+        },
+        'run-xyz',
+      );
+    });
+
+    it('does NOT stamp it for an in_progress update', async () => {
+      const trackingStore = makeTrackingStore();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+      await seedWorkflowCheckRun(reporter);
+
+      reporter.updateStepProgress({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        jobName: 'test',
+        stepIndex: 0,
+        stepName: 'build',
+        state: ExecutionStepStatus.enum.running,
+        installationId: 42,
+      });
+
+      await vi.waitFor(() => {
+        expect(mockChecksUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({ status: 'in_progress' }),
+        );
+      });
+      expect(trackingStore.markTerminalSent).not.toHaveBeenCalled();
+    });
+
+    it('does not stamp it when the GitHub PATCH throws', async () => {
+      const trackingStore = makeTrackingStore();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+      await seedWorkflowCheckRun(reporter);
+      mockChecksUpdate.mockRejectedValueOnce(new Error('boom'));
+
+      reporter.updateWorkflowStatus({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        overallStatus: ExecutionJobStatus.enum.success,
+        installationId: 42,
+      });
+
+      await vi.waitFor(() => {
+        expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
+      });
+      // Drain the queue rather than sleeping a wall-clock interval. Everything
+      // after the PATCH settles on this path is synchronous or a single awaited
+      // promise, so a handful of macrotask turns is enough — and unlike a fixed
+      // sleep it does not get shorter than the work under load.
+      for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
+      expect(trackingStore.markTerminalSent).not.toHaveBeenCalled();
+    });
+
+    it('still completes the GitHub update when the marker write fails', async () => {
+      const trackingStore = makeTrackingStore();
+      trackingStore.markTerminalSent.mockRejectedValue(new Error('db down'));
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+      await seedWorkflowCheckRun(reporter);
+
+      reporter.updateWorkflowStatus({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'CI',
+        overallStatus: ExecutionJobStatus.enum.success,
+        installationId: 42,
+      });
+
+      await vi.waitFor(() => {
+        expect(trackingStore.markTerminalSent).toHaveBeenCalledTimes(1);
+      });
+      expect(mockChecksUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'completed' }),
+      );
+    });
+  });
+
   describe('full lifecycle', () => {
     it('setPending -> updateJobStatus -> updateWorkflowStatus', async () => {
       const reporter = new CheckRunReporter({ githubConfig });
@@ -692,6 +919,171 @@ describe('CheckRunReporter', () => {
 
       // No exception thrown -- fire-and-forget pattern works
       expect(true).toBe(true);
+    });
+  });
+
+  describe('tracking-store interaction', () => {
+    function createTrackingStoreStub() {
+      return {
+        setCheckRunId: vi.fn().mockResolvedValue(undefined),
+        getCheckRunId: vi.fn().mockResolvedValue(undefined),
+        markBuildCreationPending: vi.fn().mockResolvedValue(undefined),
+        markBuildCreationComplete: vi.fn().mockResolvedValue(undefined),
+        setStepProgress: vi.fn().mockResolvedValue(undefined),
+        markInProgressSent: vi.fn().mockResolvedValue(undefined),
+        markTerminalSent: vi.fn().mockResolvedValue(undefined),
+        getState: vi.fn().mockResolvedValue(undefined),
+        deleteRow: vi.fn().mockResolvedValue(false),
+        listKeysByRunId: vi.fn().mockResolvedValue([]),
+        deleteByRunId: vi.fn().mockResolvedValue(0),
+        pruneStale: vi.fn().mockResolvedValue(0),
+      };
+    }
+
+    it('records the runId when persisting a freshly created check-run ID', async () => {
+      const trackingStore = createTrackingStoreStub();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+
+      reporter.setPending({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'build',
+        jobNames: ['test'],
+        installationId: 42,
+        runId: 'run-xyz',
+      });
+
+      await vi.waitFor(() => {
+        expect(trackingStore.setCheckRunId).toHaveBeenCalledWith(
+          expect.objectContaining({ checkName: 'kici/build' }),
+          expect.any(Number),
+          'run-xyz',
+        );
+      });
+    });
+
+    it('does not delete database rows on cleanupRun', async () => {
+      const trackingStore = createTrackingStoreStub();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+
+      reporter.setPending({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'build',
+        jobNames: ['test'],
+        installationId: 42,
+        runId: 'run-xyz',
+      });
+      await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalled());
+
+      reporter.cleanupRun('run-xyz');
+
+      expect(trackingStore.deleteByRunId).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Tracking-store fake with real row state: `setCheckRunId` inserts and
+     * `deleteByRunId` removes, so a load-through after a delete genuinely
+     * misses. A stub whose delete is a no-op would pass the load-through
+     * assertion below whether or not `cleanupRun` still deleted.
+     */
+    function createStatefulTrackingStore() {
+      const rows = new Map<string, { checkRunId: number; runId?: string }>();
+      const id = (k: { checkName: string }) => k.checkName;
+      const base = createTrackingStoreStub();
+      base.setCheckRunId.mockImplementation(
+        async (k: { checkName: string }, checkRunId: number, runId?: string) => {
+          rows.set(id(k), { checkRunId, runId });
+        },
+      );
+      base.getCheckRunId.mockImplementation(async (k: { checkName: string }) => {
+        return rows.get(id(k))?.checkRunId;
+      });
+      base.deleteByRunId.mockImplementation(async (runId: string) => {
+        let n = 0;
+        for (const [key, row] of rows) {
+          if (row.runId === runId) {
+            rows.delete(key);
+            n++;
+          }
+        }
+        return n;
+      });
+      return { store: base, rows };
+    }
+
+    it('the stateful fake really loses rows when deleteByRunId runs', async () => {
+      // Positive control for the pin below: prove the fake can detect a delete
+      // at all, so a green load-through assertion means something.
+      const { store, rows } = createStatefulTrackingStore();
+      await store.setCheckRunId({ checkName: 'kici/build' } as never, 4242, 'run-xyz');
+      expect(await store.getCheckRunId({ checkName: 'kici/build' } as never)).toBe(4242);
+
+      expect(await store.deleteByRunId('run-xyz')).toBe(1);
+
+      expect(rows.size).toBe(0);
+      expect(await store.getCheckRunId({ checkName: 'kici/build' } as never)).toBeUndefined();
+    });
+
+    it('still resolves a check-run ID from the store after cleanupRun evicted L1', async () => {
+      // The point of leaving the row in place: a terminal PATCH that lands
+      // after the run was pruned must still find its check-run ID. With the
+      // row deleted at prune time this load-through returns undefined and the
+      // check run stays unresolved on the commit forever.
+      const { store: trackingStore } = createStatefulTrackingStore();
+      const reporter = new CheckRunReporter({
+        githubConfig,
+        trackingStore: trackingStore as never,
+      });
+
+      reporter.setPending({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'build',
+        jobNames: ['test'],
+        installationId: 42,
+        runId: 'run-xyz',
+      });
+      await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalledTimes(2));
+      const workflowCheckRunId = await trackingStore.getCheckRunId({
+        checkName: 'kici/build',
+      } as never);
+      expect(workflowCheckRunId).toEqual(expect.any(Number));
+
+      reporter.cleanupRun('run-xyz');
+      // L1 is empty now, so the update has to load through to the store.
+
+      reporter.updateWorkflowStatus({
+        provider: 'github',
+        owner: 'myorg',
+        repo: 'myrepo',
+        sha: 'abc123',
+        workflowName: 'build',
+        overallStatus: ExecutionJobStatus.enum.success,
+        installationId: 42,
+        runId: 'run-xyz',
+      });
+
+      await vi.waitFor(() => {
+        expect(trackingStore.getCheckRunId).toHaveBeenCalledWith(
+          expect.objectContaining({ checkName: 'kici/build' }),
+        );
+        expect(mockChecksUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({ check_run_id: workflowCheckRunId, status: 'completed' }),
+        );
+      });
     });
   });
 });
@@ -1273,5 +1665,63 @@ describe('details_url with public alias', () => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
     expect((mockChecksCreate.mock.calls[1][0] as any).details_url).toContain(`r/orgs/${ALIAS}/`);
+  });
+});
+
+describe('check-run conclusion mappers cover every terminal job status', () => {
+  type Mapper = (s: string, d?: string) => { conclusion: string; description: string };
+  const mappers = ['mapBuildConclusion', 'mapJobConclusion', 'mapWorkflowConclusion'] as const;
+
+  const call = (mapper: string, status: string): { conclusion: string; description: string } => {
+    const reporter = new CheckRunReporter({ githubConfig });
+    return (reporter as unknown as Record<string, Mapper>)[mapper](status);
+  };
+
+  /**
+   * The conclusion each terminal status must map to — named explicitly rather
+   * than asserted as "defined".
+   *
+   * A `toBeDefined()` loop would be satisfied by the catch-all `default` arm for
+   * ANY input, including a future terminal status falling through it, so it
+   * could not fail for the thing it exists to catch. Pinning the expected
+   * conclusion means a status reaching the default arm (which returns `failure`
+   * plus an "unrecognised status" description) fails every row that expects
+   * something else, and the description assertion below catches the rest.
+   */
+  const EXPECTED_CONCLUSION: Record<string, string> = {
+    [ExecutionJobStatus.enum.success]: CheckRunConclusion.enum.success,
+    [ExecutionJobStatus.enum.failed]: CheckRunConclusion.enum.failure,
+    [ExecutionJobStatus.enum.cancelled]: CheckRunConclusion.enum.cancelled,
+    [ExecutionJobStatus.enum.skipped]: CheckRunConclusion.enum.cancelled,
+    [ExecutionJobStatus.enum.timed_out_stale]: CheckRunConclusion.enum.timed_out,
+    [ExecutionJobStatus.enum.drift_dropped]: CheckRunConclusion.enum.failure,
+    [ExecutionJobStatus.enum.unroutable]: CheckRunConclusion.enum.failure,
+  };
+
+  it('names an expected conclusion for every terminal status', () => {
+    // Guards the table itself: a terminal status added to the engine without a
+    // row here would otherwise silently skip its assertion below.
+    expect(Object.keys(EXPECTED_CONCLUSION).sort()).toEqual([...TERMINAL_JOB_STATES].sort());
+  });
+
+  for (const mapper of mappers) {
+    for (const status of TERMINAL_JOB_STATES) {
+      it(`${mapper} maps ${status} to its expected conclusion`, () => {
+        const result = call(mapper, status);
+        expect(result).toBeDefined();
+        expect(result.conclusion).toBe(EXPECTED_CONCLUSION[status]);
+        // The default arm's description says "unrecognised status"; a status
+        // that reached it must not pass as a real mapping.
+        expect(result.description).toBeTruthy();
+        expect(result.description).not.toContain('unrecognised');
+      });
+    }
+  }
+
+  it('degrades an unrecognised status rather than returning undefined', () => {
+    const result = call('mapJobConclusion', 'brand_new_status');
+    expect(result).toBeDefined();
+    expect(result.conclusion).toBe(CheckRunConclusion.enum.failure);
+    expect(result.description).toContain('unrecognised');
   });
 });

@@ -87,10 +87,14 @@ export class InMemoryJobQueue {
 
   /**
    * Returns a generated UUID for direct-dispatch tracking, or honors the
-   * caller's pre-allocated jobId when set (cluster reroute path).
+   * caller's pre-allocated jobId when set (cluster reroute path). The in-memory
+   * queue has no unique-key constraint, so an insert is always treated as new.
    */
-  async insertDispatched(input: QueuedJobInput): Promise<string> {
-    return input.jobId ?? randomUUID();
+  async insertDispatched(
+    input: QueuedJobInput,
+    _agentId: string,
+  ): Promise<{ id: string; inserted: boolean }> {
+    return { id: input.jobId ?? randomUUID(), inserted: true };
   }
 
   /**
@@ -270,14 +274,16 @@ export class InMemoryJobQueue {
   }
 
   /** Always returns false. */
-  async markDispatchedIfRecovering(_jobId: string): Promise<boolean> {
+  async markDispatchedIfRecovering(_jobId: string, _agentId: string): Promise<boolean> {
     return false;
   }
 
   /** Always returns empty array. */
   async getJobsByStatus(
     _status: DispatchQueueStatus,
-  ): Promise<Array<{ id: string; runId: string; status: DispatchQueueStatus }>> {
+  ): Promise<
+    Array<{ id: string; runId: string; status: DispatchQueueStatus; agentId: string | null }>
+  > {
     return [];
   }
 

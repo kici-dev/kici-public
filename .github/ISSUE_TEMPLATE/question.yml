@@ -1,6 +1,6 @@
 name: Question
 description: Ask how to do something with KiCI
-labels: ["question"]
+labels: ['question']
 body:
   - type: markdown
     attributes:
@@ -27,6 +27,6 @@ body:
     attributes:
       label: KiCI version
       description: Output of `kici --version`, if relevant.
-      placeholder: "0.1.16"
+      placeholder: '0.1.16'
     validations:
       required: false

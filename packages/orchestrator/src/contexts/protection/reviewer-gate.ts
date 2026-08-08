@@ -1,6 +1,7 @@
 /**
  * Reviewer gate -- checks required reviewers.
  */
+import { HoldType } from '@kici-dev/engine';
 import type { Context, ProtectionGateResult } from '@kici-dev/engine';
 
 /** Evaluate reviewer requirements for the context. */
@@ -17,7 +18,7 @@ export function evaluateReviewerGate(env: Context): ProtectionGateResult {
 
   return {
     action: 'hold',
-    holdType: 'reviewer',
+    holdType: HoldType.enum.reviewer,
     holdUntil,
     reason: `Requires approval from: ${env.requiredReviewers.join(', ')}`,
     clauses,

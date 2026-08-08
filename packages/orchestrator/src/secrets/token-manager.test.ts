@@ -83,6 +83,29 @@ describe('TokenManager', () => {
       expect(r1.token).not.toBe(r2.token);
       expect(r1.id).not.toBe(r2.id);
     });
+
+    it('persists expires_at when an expiry is supplied', async () => {
+      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-exp-1' } });
+      const tm = new TokenManager(db as any);
+      const expiresAt = new Date('2026-12-31T00:00:00.000Z');
+
+      await tm.generateToken('expiring', 'admin', null, expiresAt);
+
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ label: 'expiring', role: 'admin', expires_at: expiresAt }),
+      );
+    });
+
+    it('leaves expires_at null when no expiry is supplied (non-expiring token)', async () => {
+      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-noexp-1' } });
+      const tm = new TokenManager(db as any);
+
+      await tm.generateToken('forever', 'admin');
+
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ label: 'forever', expires_at: null }),
+      );
+    });
   });
 
   describe('validate', () => {
@@ -200,6 +223,19 @@ describe('TokenManager', () => {
 
       expect(result).toBe('my-custom-bootstrap-token');
       expect(db.insertInto).toHaveBeenCalledWith('admin_tokens');
+    });
+
+    it('never sets an expiry on the generated bootstrap token', async () => {
+      // Pin: a bootstrap token must never silently expire and lock out an
+      // operator. The generated-path insert must carry expires_at = null.
+      const { db, mocks } = _createMockDb({ selectFirstRow: undefined });
+      const tm = new TokenManager(db as any);
+
+      await tm.ensureBootstrapToken();
+
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ label: 'bootstrap', expires_at: null }),
+      );
     });
   });
 });

@@ -6,7 +6,7 @@
  * writing the local YAML config.
  *
  * Usage:
- *   kici-admin join --token kici_join_v1.xxx.yyy --platform wss://platform.kici.dev/ws --api-key KEY
+ *   kici-admin join --token kici_join_v1.xxx.yyy --platform wss://api.kici.dev/ws --api-key KEY
  *   kici-admin join --token kici_join_v1.xxx.yyy --peer https://orch-1:8080
  */
 
@@ -21,7 +21,7 @@ export function registerJoinCommand(program: Command): void {
     .requiredOption('--token <token>', 'Join token (kici_join_v1.<routing>.<secret>)')
     .option(
       '--platform <url>',
-      'Platform WebSocket URL for relay mode (e.g., wss://platform.kici.dev/ws)',
+      'Platform WebSocket URL for relay mode (e.g., wss://api.kici.dev/ws)',
     )
     .option('--peer <url>', 'Peer HTTP URL for direct mode (e.g., https://orch-1:8080)')
     .option('--api-key <key>', 'API key for Platform authentication (required for --platform mode)')
@@ -29,6 +29,16 @@ export function registerJoinCommand(program: Command): void {
       '--config <path>',
       'Path to write the resulting local config YAML',
       './kici-orchestrator.yaml',
+    )
+    .addHelpText(
+      'after',
+      `
+Token vocabulary:
+  A join token (kici_join_v1.<routing>.<secret>) adds this orchestrator as a PEER to
+  an existing cluster. For a first, standalone orchestrator you do NOT need a join
+  token -- install it with \`kici-admin orchestrator install\` and set
+  KICI_PLATFORM_TOKEN to the dashboard REGISTRATION token (kici_ok_...).
+`,
     )
     .action(
       async (opts: {

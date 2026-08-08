@@ -38,10 +38,20 @@ export function resolveServerEntry(): string {
   return require.resolve('@kici-dev/orchestrator/server');
 }
 
+/**
+ * Cap on one readiness probe. Generous enough for a server still warming up,
+ * bounded so a socket that accepts and then goes silent cannot stall the poll
+ * for the HTTP client's own multi-minute default — which would make
+ * `awaitOrchestratorReady`'s attempt budget meaningless.
+ */
+const READY_PROBE_TIMEOUT_MS = 5_000;
+
 /** Single `/ready` probe against the local orchestrator. */
 export async function orchestratorReady(port: number): Promise<boolean> {
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/ready`);
+    const r = await fetch(`http://127.0.0.1:${port}/ready`, {
+      signal: AbortSignal.timeout(READY_PROBE_TIMEOUT_MS),
+    });
     return r.status === 200;
   } catch {
     return false;
@@ -83,16 +93,19 @@ export interface SpawnOrchestratorOptions {
 }
 
 /**
- * Spawn the orchestrator's standalone entry in independent mode against the
- * local Postgres, detached, with stdout/stderr redirected to the plane log.
- * Boots with a bootstrap admin token (so the CLI can drive the admin API) and a
- * bare-metal scaler (so a dispatched job auto-spawns an ephemeral agent). Waits
- * for `GET /ready` to report warm, then returns the child pid + port.
+ * Spawn the orchestrator entry against the local Postgres, detached, with
+ * stdout/stderr redirected to the plane log, and return immediately. Boots with
+ * a bootstrap admin token (so the CLI can drive the admin API) and a bare-metal
+ * scaler (so a dispatched job auto-spawns an ephemeral agent).
+ *
+ * Returning before the process is ready is deliberate: it lets the caller record
+ * the pid on disk BEFORE the readiness wait, so a wait that fails or a CLI that
+ * dies mid-boot cannot leave a running orchestrator that nothing can identify.
  */
-export async function spawnOrchestrator(
+export function spawnOrchestratorProcess(
   databaseUrl: string,
   opts: SpawnOrchestratorOptions,
-): Promise<{ pid: number; port: number }> {
+): { pid: number; port: number } {
   const { orchestrator: port } = planePorts();
   const { logFile, root, cacheDir } = planePaths();
   fs.mkdirSync(root, { recursive: true });
@@ -160,9 +173,18 @@ export async function spawnOrchestrator(
     env: { ...commonEnv, ...modeEnv },
   });
   child.unref();
-  for (let i = 0; i < 120; i++) {
-    if (await orchestratorReady(port)) return { pid: child.pid!, port };
-    await new Promise((r) => setTimeout(r, 500));
+  return { pid: child.pid!, port };
+}
+
+/** Poll `/ready` until the orchestrator serves, or throw once the attempts run out. */
+export async function awaitOrchestratorReady(
+  port: number,
+  attempts = 120,
+  intervalMs = 500,
+): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    if (await orchestratorReady(port)) return;
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error('local orchestrator did not become ready');
 }

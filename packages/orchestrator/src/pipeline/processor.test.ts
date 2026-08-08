@@ -155,7 +155,9 @@ function createMockProviderBundle(): ProviderBundle {
     },
     changedFilesFetcher: {
       provider: 'github' as const,
-      getChangedFiles: vi.fn().mockResolvedValue(['src/app.ts', 'src/index.ts']),
+      getChangedFiles: vi
+        .fn()
+        .mockResolvedValue({ files: ['src/app.ts', 'src/index.ts'], status: 'fetched' }),
     },
     cloneTokenProvider: {
       provider: 'github' as const,
@@ -416,7 +418,12 @@ describe('processWebhook', () => {
   it('feeds matrixValues into the execution tracker per matrix child', async () => {
     const onExecutionStarted = vi.fn().mockResolvedValue(undefined);
     const deps = createDeps({
-      executionTracker: { onExecutionStarted, addJobsToRun: vi.fn() } as any,
+      executionTracker: {
+        onExecutionStarted,
+        addJobsToRun: vi.fn(),
+        holdRunForPendingJobs: vi.fn(() => true),
+        releasePendingJobsHold: vi.fn(),
+      } as any,
       lockFileCache: createMockLockFileCache({
         schemaVersion: 1,
         source: { file: '.kici/workflows/ci.ts', export: '#default' },
@@ -805,6 +812,8 @@ describe('processWebhook', () => {
   function makeDynamicTrackerMock() {
     return {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
@@ -1101,6 +1110,65 @@ describe('processWebhook', () => {
     expect(bundle.changedFilesFetcher.getChangedFiles).not.toHaveBeenCalled();
   });
 
+  it('unavailable changed files → path-filtered workflow still matches, event-log row is annotated', async () => {
+    const bundle = createMockProviderBundle();
+    // Fetcher reports the diff is unavailable (e.g. a provider capability gap).
+    (bundle.changedFilesFetcher.getChangedFiles as any).mockResolvedValue({
+      files: [],
+      status: 'unavailable',
+    });
+    const registry = createMockProviderRegistry(bundle);
+    const lockWithPaths = {
+      schemaVersion: 1,
+      source: { file: '.kici/workflows/ci.ts', export: '#default' },
+      contentHash: 'test-hash',
+      workflows: [
+        {
+          name: 'CI',
+          triggers: [
+            {
+              _type: 'pr',
+              events: ['opened', 'synchronize'],
+              targetBranches: [],
+              sourceBranches: [],
+              paths: ['src/**'],
+            },
+          ],
+          jobs: [
+            {
+              _type: 'static',
+              name: 'build',
+              runsOn: [{ kind: 'exact', value: 'linux' }],
+              needs: [],
+              steps: [{ name: 'Build', hasOutputs: false }],
+            },
+          ],
+        },
+      ],
+    };
+    const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
+    const deps = createDeps({
+      providerRegistry: registry,
+      lockFileCache: createMockLockFileCache(lockWithPaths) as any,
+      eventLog: mockEventLog as any,
+    });
+
+    await processWebhook(basePrInfo(), deps);
+
+    // Conservative match: the path-filtered workflow ran despite an empty diff.
+    expect(deps.dispatcher.dispatch).toHaveBeenCalled();
+    // The processed event-log row carries the degraded annotation (not a silent
+    // processed / matched 0).
+    expect(mockEventLog.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        status: 'processed',
+        errorMessage: expect.stringContaining('changed files unavailable'),
+      }),
+    );
+  });
+
   it('uses repoUrlBuilder from provider bundle for clone URL', async () => {
     const bundle = createMockProviderBundle();
     const registry = createMockProviderRegistry(bundle);
@@ -1232,6 +1300,8 @@ describe('processWebhook', () => {
   it('calls executionTracker.onExecutionStarted() when provided', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1270,6 +1340,8 @@ describe('processWebhook', () => {
       false, // localWorkingTree (github webhook, not a `kici run remote` upload)
       undefined, // triggerActorUsername (no sender in the test PR fixture)
       undefined, // triggerActorUserId (no sender in the test PR fixture)
+      undefined, // triggeredByAgentLabel (webhook-triggered, not agent)
+      null, // prNumber (no PR number in the test fixture)
     );
   });
 
@@ -1283,6 +1355,8 @@ describe('processWebhook', () => {
     };
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1596,6 +1670,8 @@ describe('processWebhook', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1679,6 +1755,8 @@ describe('processWebhook', () => {
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1744,6 +1822,8 @@ describe('processWebhook', () => {
   it('records a lock_resolution init-failure run when the inbound lock is corrupt', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1789,6 +1869,8 @@ describe('processWebhook', () => {
   it('does NOT record a run for a plain absent lock file (miss path unchanged)', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1819,6 +1901,8 @@ describe('processWebhook', () => {
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1887,6 +1971,8 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -1968,6 +2054,8 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -2067,6 +2155,8 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -2131,6 +2221,8 @@ describe('processWebhook', () => {
     const mockAgentRegistry = createMockAgentRegistry([{ platform: 'linux', arch: 'x64' }]);
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -3904,6 +3996,8 @@ describe('processWebhook — context integration', () => {
     };
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
       updateJobHeartbeat: vi.fn(),
@@ -4197,6 +4291,7 @@ describe('issue_comment /kici approve commitSha lookup', () => {
     const mockHeldRunStore = {
       create: vi.fn().mockResolvedValue(undefined),
       listByQueueType: vi.fn().mockResolvedValue([]),
+      listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
     };
 
     // Create a provider bundle that handles issue_comment events
@@ -4250,6 +4345,13 @@ describe('issue_comment /kici approve commitSha lookup', () => {
     );
     expect(repoFilter).toBeDefined();
     expect(repoFilter![2]).toBe('myorg/myrepo');
+
+    // Verify the SHA lookup is ALSO scoped to the comment's PR number, so the
+    // post-approval check status lands on this PR's head commit — not the
+    // latest repo-wide hold's commit.
+    const prFilter = whereClauses.find(([col, _op, _val]) => col === 'execution_runs.pr_number');
+    expect(prFilter).toBeDefined();
+    expect(prFilter![2]).toBe(5);
   });
 
   it('uses resolved org ID (not __default__) for held run SHA lookup', async () => {
@@ -4289,6 +4391,7 @@ describe('issue_comment /kici approve commitSha lookup', () => {
     const mockHeldRunStore = {
       create: vi.fn().mockResolvedValue(undefined),
       listByQueueType: vi.fn().mockResolvedValue([]),
+      listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
     };
 
     const bundle = createMockProviderBundle();
@@ -4588,6 +4691,8 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),
@@ -4648,6 +4753,8 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
       onStepStatus: vi.fn(),

@@ -19,17 +19,22 @@ import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { defineEnv, validateUnknownKiciVars, LOGGER_ENV_VARS } from '@kici-dev/shared/env';
+import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX } from './cluster/cluster-identity.js';
+
+/** Human-readable rendering of `PLATFORM_CONNECTED_MODES` for validation messages. */
+const PLATFORM_CONNECTED_MODES_TEXT = `${PLATFORM_CONNECTED_MODES.slice(0, -1).join(', ')}, or ${PLATFORM_CONNECTED_MODES[PLATFORM_CONNECTED_MODES.length - 1]}`;
 
 const baseSchema = z.object({
   // Operating mode
-  mode: z.enum(['platform', 'hybrid', 'independent']).default('platform'),
+  mode: OrchestratorMode.default('platform'),
   // Server
   port: z.coerce.number().default(4000),
   basePath: z.string().default('/'),
   // TLS cert path for expiry diagnostic (optional)
   tlsCertPath: z.string().optional(),
-  // Platform relay connection (required in platform/hybrid modes)
+  // Platform connection (required in platform/hybrid/observed modes — the
+  // relay leg in platform/hybrid, observability only in observed)
   platformUrl: z.string().optional(),
   platformToken: z.string().optional(),
   /**
@@ -49,6 +54,31 @@ const baseSchema = z.object({
    */
   provenanceIssuer: z.string().optional(),
   /**
+   * The orchestrator's OWN provenance issuer identity (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`).
+   * When set, orchestrator-owned attestation signing is ON: the orchestrator
+   * generates/holds its own ES256 key, mints identity tokens locally, and serves
+   * `/.well-known/openid-configuration` + `/.well-known/jwks.json` at this base
+   * URL. Distinct from `provenanceIssuer` (the verification trust-root). Must be a
+   * stable, durable URL — a change re-roots the cluster's provenance identity.
+   */
+  provenanceSigningIssuer: z.string().optional(),
+  /**
+   * Custody backend for the orchestrator signing key (`KICI_ORCHESTRATOR_SIGNER_KIND`):
+   * `db` (default — private JWK master-key-wrapped in the DB), `aws-kms`, or
+   * `command` (generic external signer). Only consulted when signing is on.
+   */
+  provenanceSignerKind: z.string().optional(),
+  /** AWS KMS key ARN for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_KEY_ARN`). */
+  provenanceKmsKeyArn: z.string().optional(),
+  /** AWS region for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_REGION`). */
+  provenanceKmsRegion: z.string().optional(),
+  /** AWS access key id for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_ACCESS_KEY_ID`). */
+  provenanceKmsAccessKeyId: z.string().optional(),
+  /** AWS secret access key for `aws-kms` custody (`KICI_ORCHESTRATOR_KMS_SECRET_ACCESS_KEY`). */
+  provenanceKmsSecretAccessKey: z.string().optional(),
+  /** Operator-provided signing command for `command` custody (`KICI_ORCHESTRATOR_SIGNER_COMMAND`). */
+  provenanceSignerCommand: z.string().optional(),
+  /**
    * Public base URL at which this orchestrator's own webhook ingress is
    * reachable (independent/hybrid self-serve generic webhooks:
    * `<base>/webhook/<customerId>/generic/<sourceId>`). Used by
@@ -57,11 +87,33 @@ const baseSchema = z.object({
    * `source.register.ack`, not this value. Trailing slash optional.
    */
   webhookPublicUrl: z.string().optional(),
+  /**
+   * WebSocket URL that agents this orchestrator spawns or bootstraps should
+   * dial to reach it (`ws://<host>:<port>/ws`). Without it the connect-back URL
+   * falls back to `ws://127.0.0.1:<port>/ws`, which only resolves for agents
+   * sharing this host — set it whenever agents live elsewhere: a container
+   * network, a Firecracker guest, or a fresh box being bootstrapped over SSH
+   * from another machine. A per-scaler `orchestratorUrl` in `scalers.yaml`
+   * overrides this for that scaler; the fresh-box bring-up path has no
+   * per-scaler override, so this is its only way to advertise a routable
+   * address.
+   */
+  orchestratorUrl: z.string().optional(),
   // Database (PostgreSQL only — optional for worker role)
   databaseUrl: z.string().default(''),
+  // DB connection pool sizing. Bootstrap config (the pool must exist before the
+  // orchestrator can read org_settings), so these stay env-var/static per the
+  // cluster-config carve-out for connection settings. `max` bounds concurrent
+  // hot-path acquirers; the acquire timeout fails fast when the pool is
+  // saturated (instead of queueing forever); the statement timeout stops a
+  // single runaway query from holding a connection indefinitely.
+  dbPoolMax: z.coerce.number().int().positive().default(20),
+  dbPoolAcquireTimeoutMs: z.coerce.number().int().nonnegative().default(5_000),
+  dbStatementTimeoutMs: z.coerce.number().int().nonnegative().default(30_000),
   // Lockfile cache
   lockfileCacheMax: z.coerce.number().default(500),
   lockfileCacheTtlMs: z.coerce.number().default(3_600_000), // 1 hour
+  lockfileCacheMaxBytes: z.coerce.number().default(64 * 1024 * 1024), // 64 MiB
   // Dispatch queue
   queueMaxDepth: z.coerce.number().default(1000),
   queueTimeoutMs: z.coerce.number().default(3_600_000), // 1 hour, 0 = indefinite
@@ -89,6 +141,94 @@ const baseSchema = z.object({
   // (requeue + disconnect the agent). Per-org override in
   // org_settings.dispatch_ack_timeout_ms (set via kici-admin org-settings).
   dispatchAckTimeoutMs: z.coerce.number().int().min(1000).default(10_000),
+  // Deadline for one database-backed agent-ownership lookup, used when the
+  // in-memory ownership map misses (typically right after a coordinator
+  // failover). Past the deadline the lookup resolves as undecided: the frame is
+  // refused, but no ownership violation is recorded against the agent.
+  // Fleet-wide override in cluster_settings.ownership_db_check_timeout_ms.
+  ownershipDbCheckTimeoutMs: z.coerce.number().int().min(100).default(5_000),
+  // Webhook-ingest admission controller tunables. Generous defaults → the
+  // controller is a no-op under normal load; the event-loop-lag gate is what
+  // tightens under real pressure. All are cluster-wide except the per-org
+  // fairness cap, which is overridable per tenant via
+  // org_settings.ingest_max_concurrency (kici-admin org-settings).
+  // ingestMaxConcurrency (G): global in-flight pipeline backstop.
+  ingestMaxConcurrency: z.coerce.number().int().min(1).default(256),
+  // ingestMaxQueueDepth (Q): CoDel queue length backstop (HTTP direct ingress).
+  ingestMaxQueueDepth: z.coerce.number().int().min(0).default(1000),
+  // ingestCodelTargetMs (T): CoDel target sojourn.
+  ingestCodelTargetMs: z.coerce.number().int().min(1).default(50),
+  // ingestCodelIntervalMs (I): CoDel interval.
+  ingestCodelIntervalMs: z.coerce.number().int().min(1).default(100),
+  // ingestQueueMaxWaitMs (W_max): hard sojourn ceiling (< the 5s WS ack timeout).
+  ingestQueueMaxWaitMs: z.coerce.number().int().min(1).default(3000),
+  // ingestLoopLagShedMs (L_shed): p99 event-loop delay shed threshold
+  // (generous; calibrate down on staging via the always-emitted p99 gauge).
+  ingestLoopLagShedMs: z.coerce.number().int().min(1).default(200),
+  // ingestLoopLagResumeMs (L_resume): hysteresis re-open threshold — the gate
+  // closes only when p99 falls below this, preventing bang-bang flapping.
+  ingestLoopLagResumeMs: z.coerce.number().int().min(1).default(150),
+  // ingestLoopLagSampleMs (S): loop-lag sample + gauge-refresh + queue-sweep
+  // interval. Must be <= ingestCodelIntervalMs so T/I are honored.
+  ingestLoopLagSampleMs: z.coerce.number().int().min(1).default(100),
+  // ingestOrgMaxConcurrency (P): per-org fairness cap cluster default; a per-org
+  // override lives in org_settings.ingest_max_concurrency.
+  ingestOrgMaxConcurrency: z.coerce.number().int().min(1).default(32),
+  // ingestOverflowEnabled: default-on durable buffer for shed deliveries. When
+  // true, a shed still returns 429/shed_retry_later AND additively persists the
+  // delivery to ingest_overflow_buffer for replay once capacity recovers.
+  ingestOverflowEnabled: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  // ingestOverflowMax: buffered-row cap. At the cap, capture drops the delivery
+  // (429 still stands — lossy fallback, never unbounded rows).
+  ingestOverflowMax: z.coerce.number().int().min(1).default(5000),
+  // ingestOverflowReplayIntervalMs: replayer pass interval.
+  ingestOverflowReplayIntervalMs: z.coerce.number().int().min(1).default(2000),
+  // ingestOverflowReplayBatch: max rows re-injected per pass (rate bound).
+  ingestOverflowReplayBatch: z.coerce.number().int().min(1).default(50),
+  // ingestOverflowMaxAttempts: replay attempts before a row goes `failed`.
+  ingestOverflowMaxAttempts: z.coerce.number().int().min(1).default(10),
+  // Cluster-wide defaults for the cross-peer reroute subsystem. Per-org
+  // overrides live in org_settings.reroute_spawn_window_ms /
+  // reroute_ack_timeout_ms / reroute_max_hops (set via kici-admin org-settings).
+  // rerouteSpawnWindowMs: after a peer ACKs a reroute, how long the coordinator
+  // waits for the first job.progress before treating "accepted but no progress"
+  // as a spawn failure and re-dispatching to another backend / local fallback.
+  rerouteSpawnWindowMs: z.coerce.number().int().min(1000).default(90_000),
+  // rerouteAckTimeoutMs: the reroute sendAndWaitAck deadline.
+  rerouteAckTimeoutMs: z.coerce.number().int().min(1000).default(15_000),
+  // rerouteMaxHops: maximum peer hops for a rerouted job (loop prevention).
+  rerouteMaxHops: z.coerce.number().int().min(1).default(3),
+  // rerouteFlapGraceMs: grace window during which a rerouted job stays deferred
+  // from the recovery sweepers while its worker peer momentarily flaps. Matches
+  // DEFAULT_REROUTE_FLAP_GRACE_MS in cluster/rerouted-job-guard.ts. Cluster-wide
+  // default; overridable per cluster via cluster_settings.reroute_flap_grace_ms.
+  rerouteFlapGraceMs: z.coerce.number().int().min(1000).default(120_000),
+  // Cluster-wide default deadline for a single scaler `backend.spawn` (image
+  // pull + container create + start). Bounds a hung runtime/registry so a stuck
+  // provision cannot hold its per-backend spawn-semaphore slot forever and
+  // head-of-line block every spawn queued behind it. Generous by default (a
+  // cold-cache pull of a large agent image is legitimate); operators tune it
+  // down per tenant via org_settings.scaler_spawn_timeout_ms (kici-admin
+  // org-settings scaler-spawn-timeout). NULL org row → this default applies.
+  scalerSpawnTimeoutMs: z.coerce.number().int().min(1000).default(300_000),
+  // Cluster-wide default staleness threshold (hours) for the DB-backup
+  // freshness diagnostic. Per-org override lives in
+  // org_settings.backup_staleness_warn_hours (set via kici-admin org-settings);
+  // the global diagnose check warns when the newest backup_runs row is older
+  // than the strictest effective threshold.
+  backupStalenessWarnHours: z.coerce.number().int().min(1).default(24),
+  // scalerPendingSweepIntervalMs: leader-gated backstop interval for the scaler
+  // capacity-freed re-drive. The capacity-freed hook handles the common case at
+  // near-zero latency; this sweep re-offers pending at-capacity jobs to the
+  // scaler on a timer so nothing is stranded if the hook misses an edge case
+  // (silent spawn failure, reservation freed on a non-leader coord, lost event).
+  // A cluster-singleton leader-gated infra timer (like the host-roster reaper /
+  // event-retry scanner) — not per-tenant behavior, so it is a cluster-wide
+  // config default, not a per-org org_settings knob.
+  scalerPendingSweepIntervalMs: z.coerce.number().int().min(1000).default(10_000),
   // Cache storage (for compiled bundle caching). Two backends:
   //   - s3:         pre-signed URLs, multi-host / production
   //   - filesystem: local files served via /api/v1/cache/blob/, single-host
@@ -104,6 +244,21 @@ const baseSchema = z.object({
     .enum(['true', 'false'])
     .transform((v) => v === 'true')
     .optional(), // Path-style access for S3-compatible services
+  // Source for fresh-box agent payloads (the `agent-packages/` prefix). Unset ⇒
+  // the orchestrator's OWN cache bucket (the secure default — never a vendor
+  // CDN). An `s3://bucket[/prefix]` value points the bring-up presign at another
+  // bucket on the same S3 endpoint (the customer supply-chain mirror). An
+  // external HTTP(S) source is rejected so a vendor-CDN default can never slip in.
+  agentBinarySource: z
+    .string()
+    .describe(
+      "Source for fresh-box agent payloads. Unset uses the orchestrator's own cache bucket (the secure default — never a vendor CDN); an s3://bucket[/prefix] value points the bring-up presign at a mirror bucket. An external HTTP(S) source is rejected.",
+    )
+    .refine((v) => !/^https?:\/\//i.test(v), {
+      message:
+        'KICI_AGENT_BINARY_SOURCE must not be an external HTTP(S) source (no vendor CDN); leave it unset for the orchestrator cache bucket, or use an s3://bucket[/prefix] mirror',
+    })
+    .optional(),
   // Filesystem backend: absolute base directory for cached blobs. Required
   // when cacheStorageType === 'filesystem'.
   cacheStorageFsPath: z.string().optional(),
@@ -112,7 +267,43 @@ const baseSchema = z.object({
   // When unset, derived from the orchestrator's bind host:port at boot.
   cacheStorageFsBaseUrl: z.string().optional(),
   logStorageS3Bucket: z.string().optional(), // Separate bucket for logs (defaults to cache bucket)
+  // Step-log segment sealing (S3 backend). The S3 log store buffers per step
+  // key in memory and seals an immutable `seg-NNNNNN` object when the buffer
+  // reaches logSegmentFlushBytes OR its oldest byte reaches logSegmentFlushMs.
+  // Larger values mean fewer/larger objects (less PUT IOPS) at the cost of a
+  // slightly staler durable record; the live dashboard tail is unaffected (it
+  // is served by the WS fan-out, not S3).
+  logSegmentFlushBytes: z.coerce.number().int().positive().default(1_048_576), // 1 MB
+  logSegmentFlushMs: z.coerce.number().int().positive().default(2_000),
   cacheTtlDays: z.coerce.number().default(30), // TTL in days (minimum 30)
+  // Terminal dispatch_queue row retention (days). The cleanup sweep deletes
+  // completed/failed/expired rows older than this; the durable run history
+  // lives in the cold-stored execution_* tables. 0 disables pruning. Cluster-
+  // wide (dispatch_queue carries no tenant column), mirroring cacheTtlDays.
+  dispatchQueueTtlDays: z.coerce.number().default(30),
+  // Step-log object retention (days). The cleanup sweep bulk-deletes S3 log
+  // objects older than this. Longer than the cache window (CI norm ≈ 90 days).
+  // 0 disables the sweep — the opt-out for operators running their own bucket
+  // lifecycle rule.
+  stepLogTtlDays: z.coerce.number().default(90),
+  // Check-run tracking row retention (days). The cleanup sweep deletes rows
+  // untouched for longer than this. Generous on purpose: the rows are narrow,
+  // and a late check-run status update resolves its check-run ID by reading
+  // one. 0 disables the sweep. Cluster-wide, mirroring dispatchQueueTtlDays.
+  //
+  // `.int()` is load-bearing rather than cosmetic: the sweep interpolates this
+  // into `make_interval(days => $1)`, which Postgres rejects for a fractional
+  // value, and the caller swallows that error — so a non-integer would leave
+  // the table growing unbounded with nothing but a log line to say so. The
+  // admin route enforces the same floor on the cluster-settings knob.
+  checkRunTrackingTtlDays: z.coerce.number().int().nonnegative().default(7),
+  // Window of terminal runs the reconnect `state.replay` frame carries back to
+  // Platform. Declared here rather than read straight off `process.env` so the
+  // unknown-KICI_*-var startup guard recognises it: an undeclared name makes
+  // the orchestrator refuse to boot, which turned this documented operator
+  // knob into a way to take the service down rather than a way to recover it.
+  // Not `.int()` — any finite positive value is meaningful for a time window.
+  reconnectReplayWindowHours: z.coerce.number().positive().default(24),
   cacheBuildTimeoutMs: z.coerce.number().default(600_000), // 10 min build timeout
   cacheMaxTarballBytes: z.coerce.number().default(524_288_000), // Max dep tarball size (500MB)
   // User-facing cache (ctx.cache / declarative job/step cache). Per-org byte
@@ -136,6 +327,52 @@ const baseSchema = z.object({
       'Cluster-wide default per-entry TTL (ms) for the user-facing cache. ' +
         'A per-org override in org_settings.user_cache_ttl_ms (set via ' +
         '`kici-admin org-settings user-cache set-ttl`) takes precedence when present.',
+    ),
+  // User-facing artifacts (ctx.artifacts.upload/download). Per-org byte quota +
+  // per-artifact TTL for the ArtifactStore. Defaults: 20 GiB / 30 days.
+  artifactQuotaBytes: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(20 * 1024 * 1024 * 1024)
+    .describe(
+      'Cluster-wide default per-org byte quota for user-facing artifacts (ctx.artifacts). ' +
+        'A per-org override in org_settings.artifact_quota_bytes (set via ' +
+        '`kici-admin org-settings artifacts set-quota`) takes precedence when present.',
+    ),
+  artifactTtlMs: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30 * 24 * 60 * 60 * 1000)
+    .describe(
+      'Cluster-wide default per-artifact TTL (ms) for user-facing artifacts. ' +
+        'A per-org override in org_settings.artifact_ttl_ms (set via ' +
+        '`kici-admin org-settings artifacts set-ttl`) takes precedence when present.',
+    ),
+  // Per-artifact size cap + per-run count cap for user-facing artifacts. Each is
+  // a cluster-wide default with a per-org override in org_settings
+  // (artifact_max_bytes / artifact_max_per_run), settable via
+  // `kici-admin org-settings artifacts set-max-bytes` / `set-max-per-run`.
+  artifactMaxBytes: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(1 * 1024 * 1024 * 1024)
+    .describe(
+      'Cluster-wide default max size (bytes) of a single user-facing artifact tarball (1 GiB). ' +
+        'A per-org override in org_settings.artifact_max_bytes (set via ' +
+        '`kici-admin org-settings artifacts set-max-bytes`) takes precedence when present.',
+    ),
+  artifactMaxPerRun: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(50)
+    .describe(
+      'Cluster-wide default max number of user-facing artifacts a single run may upload (50). ' +
+        'A per-org override in org_settings.artifact_max_per_run (set via ' +
+        '`kici-admin org-settings artifacts set-max-per-run`) takes precedence when present.',
     ),
   // Webhook payload storage (optional -- if set, writes raw payloads to this directory)
   webhookPayloadDir: z.string().optional(),
@@ -270,11 +507,51 @@ const baseSchema = z.object({
    * `KICI_TEST_MODE=1`. Production deployments leave this unset.
    */
   testRerunDelayMs: z.coerce.number().optional(),
+  /**
+   * **Test-only.** Comma-separated list of `dashboard.*` request types to drop
+   * from the capability manifest this orchestrator advertises to the Platform,
+   * so an integration test can reproduce an older / sourceless orchestrator that
+   * predates a given capability (e.g. `dashboard.contexts.list`). Only ever
+   * *removes* advertised types. Ignored unless `KICI_TEST_MODE=1`. Production
+   * deployments leave this unset.
+   */
+  testOmitDashboardRequestTypes: z.string().optional(),
   // Inbound webhook delivery log (event_log table). Default soft-cap 5MB.
   // Phase E retired the row TTL: rows are now archived to cold-store after
   // 30 days rather than hard-deleted. Oversized payloads are still recorded
   // with payload_omitted=true rather than 413'd.
   eventLogMaxPayloadBytes: z.coerce.number().default(5 * 1024 * 1024),
+  // Cluster defaults for the fleet-wide tunables backed by cluster_settings.
+  // Each is the fallback when the cluster_settings row's column is NULL; an
+  // operator overrides them at runtime via `kici-admin cluster-settings`.
+  // GitHub webhook body cap (bytes). GitHub itself caps at 25MB.
+  maxGithubPayloadBytes: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .default(25 * 1024 * 1024),
+  // Per-lockfile fetch size cap (bytes).
+  lockFileMaxBytes: z.coerce
+    .number()
+    .int()
+    .min(1024)
+    .default(5 * 1024 * 1024),
+  // Webhook dedup entry TTL (ms).
+  webhookDedupTtlMs: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .default(24 * 60 * 60 * 1000),
+  // Contributor-cache entry TTL (ms).
+  contributorCacheTtlMs: z.coerce
+    .number()
+    .int()
+    .min(1000)
+    .default(15 * 60 * 1000),
+  // How long ClusterSettingsReader caches the single cluster_settings row (ms).
+  // Bootstrap/perf detail about reaching the config store — env-only by design,
+  // deliberately NOT itself a cluster_settings knob.
+  clusterSettingsCacheTtlMs: z.coerce.number().int().min(0).default(10_000),
   // Logging
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
   nodeEnv: z.enum(['development', 'production', 'test']).default('development'),
@@ -373,49 +650,23 @@ const baseSchema = z.object({
     .prefault({}),
 });
 
-const configSchema = baseSchema.superRefine((data, ctx) => {
-  const isWorker = data.cluster.role === 'worker';
+/**
+ * Validation scope for orchestrator config: a running orchestrator (`runtime`)
+ * vs a build-artifact (agent packaging) operation (`packaging`). Packaging only
+ * needs the object-storage config, so it skips the runtime coordinator/platform
+ * cross-field requirements.
+ */
+export const ConfigScope = z.enum(['runtime', 'packaging']);
+export type ConfigScope = z.infer<typeof ConfigScope>;
 
-  // Workers require at least one coordinator URL (singular or plural form).
-  if (
-    isWorker &&
-    !data.cluster.coordinatorUrl &&
-    (!data.cluster.coordinatorUrls || data.cluster.coordinatorUrls.length === 0)
-  ) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message:
-        'KICI_CLUSTER_COORDINATOR_URL or KICI_CLUSTER_COORDINATOR_URLS is required when KICI_CLUSTER_ROLE=worker',
-      path: ['cluster', 'coordinatorUrls'],
-    });
-  }
+type ConfigData = z.infer<typeof baseSchema>;
 
-  // KICI_DATABASE_URL is required for coordinator mode (workers don't need it)
-  if (!isWorker && !data.databaseUrl) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'KICI_DATABASE_URL is required for coordinator mode',
-      path: ['databaseUrl'],
-    });
-  }
-
-  // Platform/hybrid modes require relay connection (skip for workers — they don't connect to Platform)
-  if (!isWorker && (data.mode === 'platform' || data.mode === 'hybrid')) {
-    if (!data.platformUrl) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'KICI_PLATFORM_URL is required when KICI_MODE is platform or hybrid',
-        path: ['platformUrl'],
-      });
-    }
-    if (!data.platformToken) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'KICI_PLATFORM_TOKEN is required when KICI_MODE is platform or hybrid',
-        path: ['platformToken'],
-      });
-    }
-  }
+/**
+ * Storage-shape cross-field rules: cache backend (S3 bucket / filesystem path)
+ * and the cluster address-when-peers structural check. Enforced in every scope,
+ * including packaging (a package upload confirms an S3 bucket is configured).
+ */
+function refineStorageShape(data: ConfigData, ctx: z.RefinementCtx): void {
   // Cache: S3 type requires bucket
   if (data.cacheStorageType === 's3' && !data.cacheStorageS3Bucket) {
     ctx.addIssue({
@@ -449,7 +700,81 @@ const configSchema = baseSchema.superRefine((data, ctx) => {
       path: ['cluster', 'address'],
     });
   }
+}
+
+/**
+ * Runtime cross-field rules for a running orchestrator: worker coordinator URL,
+ * coordinator database URL, and platform/hybrid relay connection. These fields
+ * are not read by the agent-packaging path, so packaging scope skips them.
+ */
+function refineRuntimeRequirements(data: ConfigData, ctx: z.RefinementCtx): void {
+  const isWorker = data.cluster.role === 'worker';
+
+  // Workers require at least one coordinator URL (singular or plural form).
+  if (
+    isWorker &&
+    !data.cluster.coordinatorUrl &&
+    (!data.cluster.coordinatorUrls || data.cluster.coordinatorUrls.length === 0)
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        'KICI_CLUSTER_COORDINATOR_URL or KICI_CLUSTER_COORDINATOR_URLS is required when KICI_CLUSTER_ROLE=worker',
+      path: ['cluster', 'coordinatorUrls'],
+    });
+  }
+
+  // KICI_DATABASE_URL is required for coordinator mode (workers don't need it)
+  if (!isWorker && !data.databaseUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'KICI_DATABASE_URL is required for coordinator mode',
+      path: ['databaseUrl'],
+    });
+  }
+
+  // Platform-connected modes require the Platform connection (skip for workers
+  // — they don't connect to Platform). `observed` connects for observability
+  // only; `platform`/`hybrid` also use it for the webhook relay.
+  if (!isWorker && PLATFORM_CONNECTED_MODES.includes(data.mode)) {
+    if (!data.platformUrl) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `KICI_PLATFORM_URL is required when KICI_MODE is ${PLATFORM_CONNECTED_MODES_TEXT}`,
+        path: ['platformUrl'],
+      });
+    }
+    if (!data.platformToken) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `KICI_PLATFORM_TOKEN is required when KICI_MODE is ${PLATFORM_CONNECTED_MODES_TEXT}`,
+        path: ['platformToken'],
+      });
+    }
+  }
+
+  // `observed` serves its OWN webhook ingress, so it must advertise the public
+  // URL providers post to (the Platform never fronts a URL for it).
+  if (!isWorker && data.mode === OrchestratorMode.enum.observed && !data.webhookPublicUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'KICI_WEBHOOK_PUBLIC_URL is required when KICI_MODE is observed',
+      path: ['webhookPublicUrl'],
+    });
+  }
+}
+
+// Full runtime validation: runtime requirements first, then storage shape
+// (preserves the issue order the runtime path has always emitted).
+const configSchema = baseSchema.superRefine((data, ctx) => {
+  refineRuntimeRequirements(data, ctx);
+  refineStorageShape(data, ctx);
 });
+
+// Packaging validation: storage shape only — the agent-packaging path reads
+// only the object-storage config, so runtime coordinator/platform fields are
+// not required.
+export const packagingConfigSchema = baseSchema.superRefine(refineStorageShape);
 
 /**
  * App configuration type. Includes computed instanceId for multi-instance support.
@@ -503,8 +828,19 @@ export const envDef = defineEnv({
     platformToken: 'KICI_PLATFORM_TOKEN',
     dashboardUrl: 'KICI_DASHBOARD_URL',
     provenanceIssuer: 'KICI_PROVENANCE_ISSUER',
+    provenanceSigningIssuer: 'KICI_ORCHESTRATOR_PROVENANCE_ISSUER',
+    provenanceSignerKind: 'KICI_ORCHESTRATOR_SIGNER_KIND',
+    provenanceKmsKeyArn: 'KICI_ORCHESTRATOR_KMS_KEY_ARN',
+    provenanceKmsRegion: 'KICI_ORCHESTRATOR_KMS_REGION',
+    provenanceKmsAccessKeyId: 'KICI_ORCHESTRATOR_KMS_ACCESS_KEY_ID',
+    provenanceKmsSecretAccessKey: 'KICI_ORCHESTRATOR_KMS_SECRET_ACCESS_KEY',
+    provenanceSignerCommand: 'KICI_ORCHESTRATOR_SIGNER_COMMAND',
     webhookPublicUrl: 'KICI_WEBHOOK_PUBLIC_URL',
+    orchestratorUrl: 'KICI_ORCHESTRATOR_URL',
     databaseUrl: 'KICI_DATABASE_URL',
+    dbPoolMax: 'KICI_DB_POOL_MAX',
+    dbPoolAcquireTimeoutMs: 'KICI_DB_POOL_ACQUIRE_TIMEOUT_MS',
+    dbStatementTimeoutMs: 'KICI_DB_STATEMENT_TIMEOUT_MS',
     cacheStorageType: 'KICI_STORAGE_TYPE',
     cacheStoragePath: 'KICI_STORAGE_PATH',
     cacheStorageS3Bucket: 'KICI_STORAGE_BUCKET',
@@ -516,20 +852,54 @@ export const envDef = defineEnv({
     cacheStorageS3ForcePathStyle: 'KICI_STORAGE_FORCE_PATH_STYLE',
     cacheStorageFsPath: 'KICI_STORAGE_FS_PATH',
     cacheStorageFsBaseUrl: 'KICI_STORAGE_FS_BASE_URL',
+    agentBinarySource: 'KICI_AGENT_BINARY_SOURCE',
     logStorageS3Bucket: 'KICI_STORAGE_LOG_BUCKET',
+    logSegmentFlushBytes: 'KICI_LOG_STORAGE_SEGMENT_FLUSH_BYTES',
+    logSegmentFlushMs: 'KICI_LOG_STORAGE_SEGMENT_FLUSH_MS',
     cacheTtlDays: 'KICI_CACHE_TTL_DAYS',
+    dispatchQueueTtlDays: 'KICI_DISPATCH_QUEUE_TTL_DAYS',
+    stepLogTtlDays: 'KICI_STEP_LOG_TTL_DAYS',
+    checkRunTrackingTtlDays: 'KICI_CHECK_RUN_TRACKING_TTL_DAYS',
+    reconnectReplayWindowHours: 'KICI_ORCH_RECONNECT_REPLAY_WINDOW_HOURS',
     cacheBuildTimeoutMs: 'KICI_CACHE_BUILD_TIMEOUT_MS',
     cacheMaxTarballBytes: 'KICI_CACHE_MAX_TARBALL_BYTES',
     userCacheQuotaBytes: 'KICI_USER_CACHE_QUOTA_BYTES',
     userCacheTtlMs: 'KICI_USER_CACHE_TTL_MS',
+    artifactQuotaBytes: 'KICI_ARTIFACT_QUOTA_BYTES',
+    artifactTtlMs: 'KICI_ARTIFACT_TTL_MS',
+    artifactMaxBytes: 'KICI_ARTIFACT_MAX_BYTES',
+    artifactMaxPerRun: 'KICI_ARTIFACT_MAX_PER_RUN',
     lockfileCacheMax: 'KICI_LOCKFILE_CACHE_MAX',
     lockfileCacheTtlMs: 'KICI_LOCKFILE_CACHE_TTL_MS',
+    lockfileCacheMaxBytes: 'KICI_LOCKFILE_CACHE_MAX_BYTES',
     queueMaxDepth: 'KICI_QUEUE_MAX_DEPTH',
     queueTimeoutMs: 'KICI_QUEUE_TIMEOUT_MS',
     queueBackpressureThreshold: 'KICI_QUEUE_BACKPRESSURE_THRESHOLD',
     workerConcurrency: 'KICI_WORKER_CONCURRENCY',
     concurrencyWaitTimeoutMs: 'KICI_CONCURRENCY_WAIT_TIMEOUT_MS',
     dispatchAckTimeoutMs: 'KICI_DISPATCH_ACK_TIMEOUT_MS',
+    ownershipDbCheckTimeoutMs: 'KICI_OWNERSHIP_DB_CHECK_TIMEOUT_MS',
+    ingestMaxConcurrency: 'KICI_INGEST_MAX_CONCURRENCY',
+    ingestMaxQueueDepth: 'KICI_INGEST_MAX_QUEUE_DEPTH',
+    ingestCodelTargetMs: 'KICI_INGEST_CODEL_TARGET_MS',
+    ingestCodelIntervalMs: 'KICI_INGEST_CODEL_INTERVAL_MS',
+    ingestQueueMaxWaitMs: 'KICI_INGEST_QUEUE_MAX_WAIT_MS',
+    ingestLoopLagShedMs: 'KICI_INGEST_LOOP_LAG_SHED_MS',
+    ingestLoopLagResumeMs: 'KICI_INGEST_LOOP_LAG_RESUME_MS',
+    ingestLoopLagSampleMs: 'KICI_INGEST_LOOP_LAG_SAMPLE_MS',
+    ingestOrgMaxConcurrency: 'KICI_INGEST_ORG_MAX_CONCURRENCY',
+    ingestOverflowEnabled: 'KICI_INGEST_OVERFLOW_ENABLED',
+    ingestOverflowMax: 'KICI_INGEST_OVERFLOW_MAX',
+    ingestOverflowReplayIntervalMs: 'KICI_INGEST_OVERFLOW_REPLAY_INTERVAL_MS',
+    ingestOverflowReplayBatch: 'KICI_INGEST_OVERFLOW_REPLAY_BATCH',
+    ingestOverflowMaxAttempts: 'KICI_INGEST_OVERFLOW_MAX_ATTEMPTS',
+    rerouteSpawnWindowMs: 'KICI_REROUTE_SPAWN_WINDOW_MS',
+    rerouteAckTimeoutMs: 'KICI_REROUTE_ACK_TIMEOUT_MS',
+    rerouteMaxHops: 'KICI_REROUTE_MAX_HOPS',
+    rerouteFlapGraceMs: 'KICI_REROUTE_FLAP_GRACE_MS',
+    scalerSpawnTimeoutMs: 'KICI_SCALER_SPAWN_TIMEOUT_MS',
+    backupStalenessWarnHours: 'KICI_BACKUP_STALENESS_WARN_HOURS',
+    scalerPendingSweepIntervalMs: 'KICI_SCALER_PENDING_SWEEP_INTERVAL_MS',
     webhookPayloadDir: 'KICI_WEBHOOK_PAYLOAD_DIR',
     dataDir: 'KICI_DATA_DIR',
     scalerConfigPath: 'KICI_SCALER_CONFIG_PATH',
@@ -570,7 +940,13 @@ export const envDef = defineEnv({
     testMintDeferAudience: 'KICI_TEST_MINT_DEFER_AUDIENCE',
     testMintRejectAudience: 'KICI_TEST_MINT_REJECT_AUDIENCE',
     testRerunDelayMs: 'KICI_TEST_RERUN_DELAY_MS',
+    testOmitDashboardRequestTypes: 'KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES',
     eventLogMaxPayloadBytes: 'KICI_EVENT_LOG_MAX_PAYLOAD_BYTES',
+    maxGithubPayloadBytes: 'KICI_MAX_GITHUB_PAYLOAD_BYTES',
+    lockFileMaxBytes: 'KICI_LOCK_FILE_MAX_BYTES',
+    webhookDedupTtlMs: 'KICI_WEBHOOK_DEDUP_TTL_MS',
+    contributorCacheTtlMs: 'KICI_CONTRIBUTOR_CACHE_TTL_MS',
+    clusterSettingsCacheTtlMs: 'KICI_CLUSTER_SETTINGS_CACHE_TTL_MS',
     logLevel: 'KICI_LOG_LEVEL',
     nodeEnv: 'NODE_ENV',
     autoMigrate: 'KICI_AUTO_MIGRATE',
@@ -679,18 +1055,27 @@ const DEPLOY_IDENTITY_ENV_VARS = [
   'KICI_DEPLOY_CONTAINER_RUNTIME',
 ];
 
-export function loadConfig(): AppConfig {
-  const data = envDef.parse();
+export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppConfig {
+  const packaging = scope === ConfigScope.enum.packaging;
+  const data = packaging ? envDef.parse(process.env, packagingConfigSchema) : envDef.parse();
 
   // Reject typo'd KICI_* env vars at boot. Adds the logger's vars
   // (KICI_LOG_DIR, KICI_LOG_MAX_SIZE, …) and the cold-store overrides to the
-  // known set so they don't trip the check.
-  validateUnknownKiciVars([
-    ...envDef.listKnownEnvVars(),
-    ...LOGGER_ENV_VARS,
-    ...COLD_STORE_ENV_VARS,
-    ...DEPLOY_IDENTITY_ENV_VARS,
-  ]);
+  // known set so they don't trip the check. This boot-time typo guard is a
+  // runtime concern: a build-artifact packaging operation runs in an arbitrary
+  // operator shell that may carry unrelated KICI_* vars, so packaging scope
+  // skips it (the storage-shape validation already guards the only config the
+  // packaging path reads).
+  if (!packaging) {
+    validateUnknownKiciVars([
+      ...envDef.listKnownEnvVars(),
+      ...LOGGER_ENV_VARS,
+      ...COLD_STORE_ENV_VARS,
+      ...DEPLOY_IDENTITY_ENV_VARS,
+      'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
+      'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres
+    ]);
+  }
 
   // Use cluster instanceId if provided, otherwise generate one
   const instanceId = data.cluster.instanceId || `${hostname()}-${randomUUID().slice(0, 8)}`;

@@ -20,6 +20,7 @@ import {
   DASHBOARD_WRITE_OPERATIONS_BY_NAME,
   DashboardWriteCategory,
   DashboardWriteOperation,
+  DashboardWritePolicyState,
   DashboardWriteSensitivity,
   type DashboardWritePolicyMap,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
@@ -38,9 +39,24 @@ interface GlobalWorkflowSettings {
   allowHttpNpmRegistries: boolean;
   userCacheQuotaBytes: number | null;
   userCacheTtlMs: number | null;
+  artifactQuotaBytes: number | null;
+  artifactTtlMs: number | null;
+  artifactMaxBytes: number | null;
+  artifactMaxPerRun: number | null;
   dispatchAckTimeoutMs: number | null;
+  ingestMaxConcurrency: number | null;
+  scalerSpawnTimeoutMs: number | null;
+  rerouteSpawnWindowMs: number | null;
+  rerouteAckTimeoutMs: number | null;
+  rerouteMaxHops: number | null;
+  backupStalenessWarnHours: number | null;
+  queueTimeoutMs: number | null;
   approvalExpirySeconds: number;
   allowSelfApproval: boolean;
+  // Optional: an older orchestrator's /org-settings response predates the
+  // sandbox escape-hatch allow-list, so a newer CLI must tolerate their absence.
+  sandboxAllowedCapabilities?: string[];
+  sandboxAllowHostNetwork?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -58,9 +74,22 @@ interface PatchBody {
   allowHttpNpmRegistries?: boolean;
   userCacheQuotaBytes?: number | null;
   userCacheTtlMs?: number | null;
+  artifactQuotaBytes?: number | null;
+  artifactTtlMs?: number | null;
+  artifactMaxBytes?: number | null;
+  artifactMaxPerRun?: number | null;
   dispatchAckTimeoutMs?: number | null;
+  ingestMaxConcurrency?: number | null;
+  scalerSpawnTimeoutMs?: number | null;
+  rerouteSpawnWindowMs?: number | null;
+  rerouteAckTimeoutMs?: number | null;
+  rerouteMaxHops?: number | null;
+  backupStalenessWarnHours?: number | null;
+  queueTimeoutMs?: number | null;
   approvalExpirySeconds?: number;
   allowSelfApproval?: boolean;
+  sandboxAllowedCapabilities?: string[] | null;
+  sandboxAllowHostNetwork?: boolean | null;
 }
 
 type ListField = 'allowedRepos' | 'deniedRepos' | 'elevatedRepos';
@@ -88,10 +117,50 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
     `User-cache TTL:        ${s.userCacheTtlMs === null ? '(cluster default)' : `${s.userCacheTtlMs} ms`}`,
   );
   lines.push(
+    `Artifact quota:        ${s.artifactQuotaBytes === null ? '(cluster default)' : `${s.artifactQuotaBytes} bytes`}`,
+  );
+  lines.push(
+    `Artifact TTL:          ${s.artifactTtlMs === null ? '(cluster default)' : `${s.artifactTtlMs} ms`}`,
+  );
+  lines.push(
+    `Artifact max bytes:    ${s.artifactMaxBytes === null ? '(cluster default)' : `${s.artifactMaxBytes} bytes`}`,
+  );
+  lines.push(
+    `Artifact max/run:      ${s.artifactMaxPerRun === null ? '(cluster default)' : `${s.artifactMaxPerRun}`}`,
+  );
+  lines.push(
     `Dispatch ack timeout:  ${s.dispatchAckTimeoutMs === null ? '(cluster default)' : `${s.dispatchAckTimeoutMs} ms`}`,
+  );
+  lines.push(
+    `Ingest max concurrency:${s.ingestMaxConcurrency === null ? ' (cluster default)' : ` ${s.ingestMaxConcurrency}`}`,
+  );
+  lines.push(
+    `Scaler spawn timeout:  ${s.scalerSpawnTimeoutMs === null ? '(cluster default)' : `${s.scalerSpawnTimeoutMs} ms`}`,
+  );
+  lines.push(
+    `Reroute spawn window:  ${s.rerouteSpawnWindowMs === null ? '(cluster default)' : `${s.rerouteSpawnWindowMs} ms`}`,
+  );
+  lines.push(
+    `Reroute ack timeout:   ${s.rerouteAckTimeoutMs === null ? '(cluster default)' : `${s.rerouteAckTimeoutMs} ms`}`,
+  );
+  lines.push(
+    `Reroute max hops:      ${s.rerouteMaxHops === null ? '(cluster default)' : `${s.rerouteMaxHops}`}`,
+  );
+  lines.push(
+    `Backup staleness warn: ${s.backupStalenessWarnHours === null ? '(cluster default)' : `${s.backupStalenessWarnHours} h`}`,
+  );
+  lines.push(
+    `Queue timeout:         ${s.queueTimeoutMs === null ? '(cluster default)' : `${s.queueTimeoutMs} ms`}`,
   );
   lines.push(`Approval expiry:       ${s.approvalExpirySeconds} s`);
   lines.push(`Allow self-approval:   ${s.allowSelfApproval}`);
+  // Tolerate an older orchestrator whose /org-settings response predates these
+  // fields (a newer CLI must not crash against an older orchestrator).
+  const sandboxCaps = s.sandboxAllowedCapabilities ?? [];
+  lines.push(
+    `Sandbox capabilities:  ${sandboxCaps.length === 0 ? '(none — deny all)' : sandboxCaps.join(', ')}`,
+  );
+  lines.push(`Sandbox host network:  ${s.sandboxAllowHostNetwork ?? false}`);
   if (s.createdAt) lines.push(`Created at:            ${s.createdAt}`);
   if (s.updatedAt) lines.push(`Updated at:            ${s.updatedAt}`);
   return lines.join('\n');
@@ -228,12 +297,282 @@ export function registerOrgSettingsCommands(
 
   // ── user-cache ───────────────────────────────────────────────────
   registerUserCacheCommands(orgSettings, getClient);
+  registerArtifactCommands(orgSettings, getClient);
 
   // ── dispatch-ack ─────────────────────────────────────────────────
   registerDispatchAckCommands(orgSettings, getClient);
 
+  registerScalerSpawnTimeoutCommands(orgSettings, getClient);
+
+  // ── ingest-concurrency ───────────────────────────────────────────
+  registerIngestConcurrencyCommands(orgSettings, getClient);
+
+  // ── sandbox-allowlist ────────────────────────────────────────────
+  registerSandboxAllowlistCommands(orgSettings, getClient);
+
+  // ── reroute ──────────────────────────────────────────────────────
+  registerRerouteCommands(orgSettings, getClient);
+
+  // ── backup-freshness ─────────────────────────────────────────────
+  registerBackupFreshnessCommands(orgSettings, getClient);
+
+  // ── queue-timeout ────────────────────────────────────────────────
+  registerQueueTimeoutCommands(orgSettings, getClient);
+
   // ── approval ─────────────────────────────────────────────────────
   registerApprovalCommands(orgSettings, getClient);
+}
+
+/**
+ * `kici-admin org-settings backup-freshness <show|set|reset>`.
+ *
+ * The per-org DB-backup freshness WARN threshold (hours). Null (unset) means
+ * the cluster-wide config default (`config.backupStalenessWarnHours`) applies.
+ */
+function registerBackupFreshnessCommands(
+  orgSettings: Command,
+  getClient: () => AdminApiClient,
+): void {
+  const bf = orgSettings
+    .command('backup-freshness')
+    .description('Manage the per-org DB-backup freshness WARN threshold (null = cluster default)');
+
+  bf.command('show')
+    .description('Print the current per-org backup-freshness threshold')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        console.log(formatSettings(await fetchSettings(getClient(), customerId), opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  bf.command('set')
+    .description('Set the per-org backup-freshness WARN threshold in hours (>= 1)')
+    .requiredOption('--hours <n>', 'Threshold in hours (integer >= 1)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { hours: string; customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      const hours = parseIntFlag(opts.hours, 1, 'hours');
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          backupStalenessWarnHours: hours,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  bf.command('reset')
+    .description('Clear the per-org override (fall back to the cluster default)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          backupStalenessWarnHours: null,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/**
+ * `kici-admin org-settings reroute <show|set|reset>`.
+ *
+ * The per-org cross-peer reroute tunables: the post-ACK spawn window
+ * (`reroute_spawn_window_ms`), the reroute ACK timeout
+ * (`reroute_ack_timeout_ms`), and the max peer hops (`reroute_max_hops`). A
+ * null (unset) value means the cluster-wide config default applies. `set`
+ * flips one or more; `reset` clears all three overrides at once.
+ */
+function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
+  const rr = orgSettings
+    .command('reroute')
+    .description('Manage the per-org cross-peer reroute tunables (null = cluster default)');
+
+  rr.command('show')
+    .description('Print the current per-org reroute tunables')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  rr.command('set')
+    .description(
+      'Set one or more reroute tunables. At least one of --window / --ack-timeout / --max-hops.',
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--window <ms>', 'Spawn window (integer milliseconds, >= 1000)')
+    .option('--ack-timeout <ms>', 'Reroute ACK timeout (integer milliseconds, >= 1000)')
+    .option('--max-hops <n>', 'Maximum peer hops (integer >= 1)')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(
+      async (opts: {
+        customerId?: string;
+        org?: string;
+        window?: string;
+        ackTimeout?: string;
+        maxHops?: string;
+        format: string;
+      }) => {
+        const customerId = resolveCustomerId(opts);
+        const patch = buildReroutePatch(customerId, opts);
+        try {
+          const updated = await patchSettings(getClient(), patch);
+          console.log(formatSettings(updated, opts.format));
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      },
+    );
+
+  rr.command('reset')
+    .description('Clear all per-org reroute overrides (fall back to the cluster defaults)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          rerouteSpawnWindowMs: null,
+          rerouteAckTimeoutMs: null,
+          rerouteMaxHops: null,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/** Validate `reroute set` flags and assemble the PATCH body (exits on bad input). */
+function buildReroutePatch(
+  customerId: string,
+  opts: { window?: string; ackTimeout?: string; maxHops?: string },
+): PatchBody {
+  const patch: PatchBody = { customerId };
+  if (opts.window !== undefined) {
+    patch.rerouteSpawnWindowMs = parseIntFlag(opts.window, 1000, 'window (milliseconds)');
+  }
+  if (opts.ackTimeout !== undefined) {
+    patch.rerouteAckTimeoutMs = parseIntFlag(opts.ackTimeout, 1000, 'ack-timeout (milliseconds)');
+  }
+  if (opts.maxHops !== undefined) {
+    patch.rerouteMaxHops = parseIntFlag(opts.maxHops, 1, 'max-hops');
+  }
+  if (
+    patch.rerouteSpawnWindowMs === undefined &&
+    patch.rerouteAckTimeoutMs === undefined &&
+    patch.rerouteMaxHops === undefined
+  ) {
+    console.error('Error: pass at least one of --window / --ack-timeout / --max-hops');
+    process.exit(1);
+  }
+  return patch;
+}
+
+/**
+ * `kici-admin org-settings queue-timeout <show|set|reset>`.
+ *
+ * The per-org dispatch-queue job timeout (`org_settings.queue_timeout_ms`): a
+ * queued job's deadline is `job.timeoutMs ?? <this> ?? config.queueTimeoutMs`.
+ * null clears the override → cluster default. `set 0` = indefinite (no expiry).
+ */
+function registerQueueTimeoutCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
+  const qt = orgSettings
+    .command('queue-timeout')
+    .description('Manage the per-org dispatch-queue job timeout (null = cluster default)');
+
+  qt.command('show')
+    .description('Print the current per-org queue timeout')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  qt.command('set')
+    .description('Set the per-org queue timeout in milliseconds (0 = indefinite)')
+    .argument('<ms>', 'Queue timeout in milliseconds (integer >= 0)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (ms: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      const queueTimeoutMs = parseIntFlag(ms, 0, 'ms (milliseconds)');
+      try {
+        const updated = await patchSettings(getClient(), { customerId, queueTimeoutMs });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  qt.command('reset')
+    .description('Clear the per-org queue-timeout override (fall back to the cluster default)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), { customerId, queueTimeoutMs: null });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/** Parse an integer CLI flag with a minimum, exiting with an error on failure. */
+function parseIntFlag(value: string, min: number, fieldLabel: string): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min) {
+    console.error(`Error: --${fieldLabel.split(' ')[0]} must be an integer >= ${min}`);
+    process.exit(1);
+  }
+  return n;
 }
 
 /**
@@ -389,6 +728,270 @@ function registerDispatchAckCommands(orgSettings: Command, getClient: () => Admi
 }
 
 /**
+ * `kici-admin org-settings scaler-spawn-timeout <show|set|reset>`.
+ *
+ * The per-org deadline (ms) for a single scaler `backend.spawn` (image pull +
+ * container create + start). A hung runtime/registry that blows this deadline
+ * is aborted so it can no longer pin its per-backend spawn-semaphore slot and
+ * head-of-line block every queued spawn. A null (unset) value means the
+ * cluster-wide default applies (`KICI_SCALER_SPAWN_TIMEOUT_MS`, default 300s).
+ */
+function registerScalerSpawnTimeoutCommands(
+  orgSettings: Command,
+  getClient: () => AdminApiClient,
+): void {
+  const ss = orgSettings
+    .command('scaler-spawn-timeout')
+    .description('Manage the per-org scaler spawn deadline (null = cluster default)');
+
+  ss.command('show')
+    .description('Print the current per-org scaler spawn deadline')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  ss.command('set <value>')
+    .description('Set the per-org scaler spawn deadline (integer milliseconds, >= 1000)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1000) {
+        console.error('Error: value must be an integer >= 1000 (milliseconds)');
+        process.exit(1);
+      }
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          scalerSpawnTimeoutMs: n,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  ss.command('reset')
+    .description(
+      'Clear the per-org scaler spawn deadline override (fall back to the cluster default)',
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          scalerSpawnTimeoutMs: null,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/**
+ * `kici-admin org-settings ingest-concurrency <show|set|reset>`.
+ *
+ * The per-org webhook-ingest concurrency cap — the maximum number of
+ * concurrent `processWebhook` pipelines the admission controller admits for
+ * this org before shedding with `429 + Retry-After`. A null (unset) value
+ * means the cluster-wide default applies (`KICI_INGEST_ORG_MAX_CONCURRENCY`,
+ * default 32). Operators lower it to rein in a noisy tenant or raise it for a
+ * high-fan-in org.
+ */
+function registerIngestConcurrencyCommands(
+  orgSettings: Command,
+  getClient: () => AdminApiClient,
+): void {
+  const ic = orgSettings
+    .command('ingest-concurrency')
+    .description('Manage the per-org webhook-ingest concurrency cap (null = cluster default)');
+
+  ic.command('show')
+    .description('Print the current per-org webhook-ingest concurrency cap')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  ic.command('set <value>')
+    .description('Set the per-org webhook-ingest concurrency cap (integer, >= 1)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error('Error: value must be an integer >= 1');
+        process.exit(1);
+      }
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          ingestMaxConcurrency: n,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  ic.command('reset')
+    .description(
+      'Clear the per-org webhook-ingest concurrency override (fall back to the cluster default)',
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          ingestMaxConcurrency: null,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/**
+ * `kici-admin org-settings sandbox-allowlist <show|set-capabilities|allow-host-network|reset>`.
+ *
+ * The per-org container-sandbox escape-hatch allow-list. `set-capabilities`
+ * replaces the allowed Linux capability list a workflow may request via the SDK
+ * `sandbox: { capabilities }` field (comma-separated; empty = clear → deny all).
+ * `allow-host-network` toggles whether a workflow may request
+ * `sandbox: { network: 'host' }`. Empty / false is the safe deny-all default; a
+ * non-allow-listed request FAILS the run at dispatch.
+ */
+function registerSandboxAllowlistCommands(
+  orgSettings: Command,
+  getClient: () => AdminApiClient,
+): void {
+  const sa = orgSettings
+    .command('sandbox-allowlist')
+    .description('Manage the per-org container-sandbox escape-hatch allow-list (empty = deny all)');
+
+  sa.command('show')
+    .description('Print the current per-org sandbox capability + host-network allow-list')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  sa.command('set-capabilities <capabilities>')
+    .description(
+      'Set the allowed capabilities (comma-separated, e.g. NET_ADMIN,SYS_PTRACE; empty clears)',
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(
+      async (capabilities: string, opts: { customerId?: string; org?: string; format: string }) => {
+        const list = capabilities
+          .split(',')
+          .map((c) => c.trim())
+          .filter((c) => c.length > 0);
+        const customerId = resolveCustomerId(opts);
+        try {
+          const updated = await patchSettings(getClient(), {
+            customerId,
+            sandboxAllowedCapabilities: list,
+          });
+          console.log(formatSettings(updated, opts.format));
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      },
+    );
+
+  sa.command('allow-host-network <value>')
+    .description('Allow (true) or deny (false) workflow-requested host networking')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
+      if (value !== 'true' && value !== 'false') {
+        console.error('Error: value must be "true" or "false"');
+        process.exit(1);
+      }
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          sandboxAllowHostNetwork: value === 'true',
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  sa.command('reset')
+    .description('Clear the allow-list (deny all capabilities and host networking)')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          sandboxAllowedCapabilities: null,
+          sandboxAllowHostNetwork: false,
+        });
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+}
+
+/**
  * `kici-admin org-settings user-cache <show|set-quota|set-ttl|reset-quota|reset-ttl>`.
  *
  * The per-org byte quota and per-entry TTL for the user-facing cache. A null
@@ -418,6 +1021,119 @@ function registerUserCacheCommands(orgSettings: Command, getClient: () => AdminA
 
   registerUserCacheSetter(uc, getClient, 'quota');
   registerUserCacheSetter(uc, getClient, 'ttl');
+}
+
+/**
+ * `kici-admin org-settings artifacts
+ *   <show|set-quota|set-ttl|set-max-bytes|set-max-per-run|reset-*>`.
+ *
+ * The per-org byte quota, per-artifact TTL, per-artifact size cap, and per-run
+ * artifact count cap for user-facing artifacts. A null (unset) value means the
+ * cluster-wide default applies (the `KICI_ARTIFACT_QUOTA_BYTES` /
+ * `KICI_ARTIFACT_TTL_MS` / `KICI_ARTIFACT_MAX_BYTES` /
+ * `KICI_ARTIFACT_MAX_PER_RUN` env vars).
+ */
+function registerArtifactCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
+  const art = orgSettings
+    .command('artifacts')
+    .description(
+      'Manage per-org artifact quota / TTL / size cap / per-run cap (null = cluster default)',
+    );
+
+  art
+    .command('show')
+    .description('Print the current per-org artifact quota + TTL settings')
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await fetchSettings(getClient(), customerId);
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  registerArtifactSetter(art, getClient, 'quota');
+  registerArtifactSetter(art, getClient, 'ttl');
+  registerArtifactSetter(art, getClient, 'max-bytes');
+  registerArtifactSetter(art, getClient, 'max-per-run');
+}
+
+/**
+ * Register `set-<knob>` / `reset-<knob>` for a per-org artifact knob: the byte
+ * quota, ms TTL, per-artifact size cap (`max-bytes`), or per-run count cap
+ * (`max-per-run`). A null (reset) value falls back to the cluster default.
+ */
+function registerArtifactSetter(
+  art: Command,
+  getClient: () => AdminApiClient,
+  knob: 'quota' | 'ttl' | 'max-bytes' | 'max-per-run',
+): void {
+  const field = (
+    {
+      quota: 'artifactQuotaBytes',
+      ttl: 'artifactTtlMs',
+      'max-bytes': 'artifactMaxBytes',
+      'max-per-run': 'artifactMaxPerRun',
+    } as const
+  )[knob];
+  const unit = (
+    {
+      quota: 'bytes',
+      ttl: 'milliseconds',
+      'max-bytes': 'bytes',
+      'max-per-run': 'artifacts',
+    } as const
+  )[knob];
+
+  art
+    .command(`set-${knob} <value>`)
+    .description(`Set the per-org artifact ${knob} (positive integer ${unit})`)
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const n = Number(value);
+      if (!Number.isInteger(n) || n <= 0) {
+        console.error(`Error: value must be a positive integer (${unit})`);
+        process.exit(1);
+      }
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          [field]: n,
+        } as PatchBody);
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  art
+    .command(`reset-${knob}`)
+    .description(`Clear the per-org artifact ${knob} override (fall back to the cluster default)`)
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (opts: { customerId?: string; org?: string; format: string }) => {
+      const customerId = resolveCustomerId(opts);
+      try {
+        const updated = await patchSettings(getClient(), {
+          customerId,
+          [field]: null,
+        } as PatchBody);
+        console.log(formatSettings(updated, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
 }
 
 /** Register `set-<knob>` and `reset-<knob>` for the byte-quota / ms-TTL knobs. */
@@ -584,6 +1300,17 @@ interface DashboardWritesResponse {
   customerId: string;
   stored: DashboardWritePolicyMap;
   effective: Record<DashboardWriteOperation, boolean>;
+  /** Tri-state posture per operation (permissive | encrypted | disabled). */
+  states?: Record<DashboardWriteOperation, DashboardWritePolicyState>;
+}
+
+/** Legacy boolean sugar for --op / --enabled: true→permissive, false→disabled. */
+function parseStateToken(token: string): DashboardWritePolicyState | null {
+  const t = token.toLowerCase();
+  if (t === 'true') return 'permissive';
+  if (t === 'false') return 'disabled';
+  const parsed = DashboardWritePolicyState.safeParse(t);
+  return parsed.success ? parsed.data : null;
 }
 
 function formatDashboardWrites(
@@ -607,25 +1334,33 @@ function formatDashboardWrites(
   for (const [category, descriptors] of byCategory) {
     lines.push(`${category.toUpperCase()}`);
     for (const descriptor of descriptors) {
-      const enabled = response.effective[descriptor.name] ?? true;
-      const state = enabled ? 'enabled ' : 'disabled';
-      lines.push(`  ${state}  ${descriptor.name.padEnd(40)}  (${descriptor.cliEquivalent})`);
+      const state =
+        response.states?.[descriptor.name] ??
+        ((response.effective[descriptor.name] ?? true) ? 'permissive' : 'disabled');
+      lines.push(
+        `  ${state.padEnd(10)}  ${descriptor.name.padEnd(40)}  (${descriptor.cliEquivalent})`,
+      );
     }
     lines.push('');
   }
   return lines.join('\n').trimEnd();
 }
 
-function parseOpFlag(value: string, previous: Array<[DashboardWriteOperation, boolean]>) {
+function parseOpFlag(
+  value: string,
+  previous: Array<[DashboardWriteOperation, DashboardWritePolicyState]>,
+) {
   const eq = value.indexOf('=');
   if (eq < 1 || eq === value.length - 1) {
-    console.error(`Error: --op expects <operation>=<true|false>, got: ${value}`);
+    console.error(`Error: --op expects <operation>=<permissive|encrypted|disabled>, got: ${value}`);
     process.exit(1);
   }
   const op = value.slice(0, eq);
-  const bool = value.slice(eq + 1).toLowerCase();
-  if (bool !== 'true' && bool !== 'false') {
-    console.error(`Error: --op value must be "true" or "false", got: ${bool}`);
+  const state = parseStateToken(value.slice(eq + 1));
+  if (state === null) {
+    console.error(
+      `Error: --op value must be one of permissive|encrypted|disabled (or legacy true|false), got: ${value.slice(eq + 1)}`,
+    );
     process.exit(1);
   }
   if (!DASHBOARD_WRITE_OPERATIONS_BY_NAME.has(op as DashboardWriteOperation)) {
@@ -634,7 +1369,7 @@ function parseOpFlag(value: string, previous: Array<[DashboardWriteOperation, bo
     );
     process.exit(1);
   }
-  previous.push([op as DashboardWriteOperation, bool === 'true']);
+  previous.push([op as DashboardWriteOperation, state]);
   return previous;
 }
 
@@ -685,16 +1420,18 @@ function registerDashboardWritesCommands(
 
   dw.command('set')
     .description(
-      'Set one or more operations. Use --op <name>=<true|false> per operation. ' +
-        'Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.',
+      'Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation ' +
+        '(legacy true|false accepted). "encrypted" is valid only for plaintext operations ' +
+        '(secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> ' +
+        'expands to the matching operations.',
     )
     .option('--customer-id <id>', 'Customer / org id (alias: --org)')
     .option('--org <id>', 'Alias for --customer-id')
     .option(
-      '--op <op=bool>',
-      'Single operation flip; repeatable (e.g. --op secrets.set=false --op variables.set=false)',
+      '--op <op=state>',
+      'Single operation posture; repeatable (e.g. --op secrets.set=encrypted --op variables.set=disabled)',
       parseOpFlag,
-      [] as Array<[DashboardWriteOperation, boolean]>,
+      [] as Array<[DashboardWriteOperation, DashboardWritePolicyState]>,
     )
     .option('--category <name>', 'Apply --enabled to every operation in this category')
     .option('--sensitivity <name>', 'Apply --enabled to every operation in this sensitivity bucket')
@@ -704,7 +1441,7 @@ function registerDashboardWritesCommands(
       async (opts: {
         customerId?: string;
         org?: string;
-        op: Array<[DashboardWriteOperation, boolean]>;
+        op: Array<[DashboardWriteOperation, DashboardWritePolicyState]>;
         category?: string;
         sensitivity?: string;
         enabled?: string;
@@ -779,7 +1516,7 @@ function parseFilters(opts: {
 }
 
 function collectUpdates(opts: {
-  op: Array<[DashboardWriteOperation, boolean]>;
+  op: Array<[DashboardWriteOperation, DashboardWritePolicyState]>;
   category?: string;
   sensitivity?: string;
   enabled?: string;
@@ -797,7 +1534,9 @@ function collectUpdates(opts: {
     if (enabled !== 'true' && enabled !== 'false') {
       throw new Error('--enabled must be "true" or "false"');
     }
-    const value = enabled === 'true';
+    // Group sugar flips the whole set enabled (permissive) / disabled — the
+    // encrypted posture is per-operation only, set via --op.
+    const value: DashboardWritePolicyState = enabled === 'true' ? 'permissive' : 'disabled';
     const cat = opts.category ? DashboardWriteCategory.parse(opts.category) : undefined;
     const sens = opts.sensitivity ? DashboardWriteSensitivity.parse(opts.sensitivity) : undefined;
     for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
@@ -815,11 +1554,14 @@ function printPlannedChange(
 ): void {
   const lines: string[] = ['Planned changes:'];
   let any = false;
-  for (const [op, next] of Object.entries(updates) as Array<[DashboardWriteOperation, boolean]>) {
-    const prior = before.effective[op] ?? true;
+  for (const [op, next] of Object.entries(updates) as Array<
+    [DashboardWriteOperation, DashboardWritePolicyState]
+  >) {
+    const prior =
+      before.states?.[op] ?? ((before.effective[op] ?? true) ? 'permissive' : 'disabled');
     if (prior === next) continue;
     any = true;
-    lines.push(`  ${op}: ${prior ? 'enabled' : 'disabled'} -> ${next ? 'enabled' : 'disabled'}`);
+    lines.push(`  ${op}: ${prior} -> ${next}`);
   }
   if (!any) {
     lines.push('  (no effective change)');

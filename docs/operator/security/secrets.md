@@ -51,6 +51,8 @@ export KICI_SECRET_KEY=a1b2c3d4e5f6...  # 64 hex characters
 
 **Cluster requirement:** All orchestrators in a cluster MUST share the same `KICI_SECRET_KEY`. Secrets encrypted by one orchestrator must be decryptable by all others.
 
+**When the key is not set:** the secrets subsystem is disabled and the orchestrator logs a warning at startup. The dashboard's secrets page then lists nothing, and any attempt to set or delete a secret is refused with _"Secrets are unavailable in this deployment: the orchestrator has no secret store configured."_ The refusal is deliberate — a write that appeared to succeed would leave the operator believing a credential is stored (or revoked) when the orchestrator has nowhere to keep it.
+
 ### KICI_SECRET_KEY_FILE (alternative)
 
 Instead of setting the key directly in the environment, point to a file:
@@ -77,18 +79,16 @@ export KICI_BOOTSTRAP_ADMIN_TOKEN=my-fixed-admin-token
 
 ### Vault backend configuration
 
-For HashiCorp Vault integration, set these additional environment variables:
+A HashiCorp Vault (or OpenBao) instance is not configured through orchestrator environment variables. It is **registered as a named backend** with `kici-admin backend add`, and its connection config is stored encrypted at rest in the `secret_backends` table. See [Multi-backend secrets](#multi-backend-secrets) for the full registration flow.
 
-| Variable                 | Description                                               | Required    |
-| ------------------------ | --------------------------------------------------------- | ----------- |
-| `KICI_VAULT_URL`         | Vault server URL (e.g., `https://vault.example.com:8200`) | Yes         |
-| `KICI_VAULT_AUTH_METHOD` | Authentication method: `token` or `approle`               | Yes         |
-| `KICI_VAULT_TOKEN`       | Vault token (when using `token` auth method)              | Conditional |
-| `KICI_VAULT_ROLE_ID`     | AppRole role ID (when using `approle` auth method)        | Conditional |
-| `KICI_VAULT_SECRET_ID`   | AppRole secret ID (when using `approle` auth method)      | Conditional |
-| `KICI_VAULT_NAMESPACE`   | Vault namespace (enterprise feature)                      | No          |
-| `KICI_VAULT_MOUNT_PATH`  | KV v2 mount path (default: `secret`)                      | No          |
-| `KICI_VAULT_BASE_PATH`   | Base path within the mount (default: `kici/secrets`)      | No          |
+Four of the registration flags read a fallback environment variable, so the credentials never have to appear in shell history:
+
+| Variable                 | Description                                               | Flag equivalent |
+| ------------------------ | --------------------------------------------------------- | --------------- |
+| `KICI_BACKEND_VAULT_URL` | Vault server URL (e.g., `https://vault.example.com:8200`) | `--vault-url`   |
+| `KICI_BACKEND_ROLE_ID`   | AppRole role ID (when using `approle` auth method)        | `--role-id`     |
+| `KICI_BACKEND_SECRET_ID` | AppRole secret ID (when using `approle` auth method)      | `--secret-id`   |
+| `KICI_BACKEND_TOKEN`     | Vault token (when using `token` auth method)              | `--token`       |
 
 ## First-time setup
 
@@ -332,11 +332,11 @@ kici-admin secret set --scope production DB_PASSWORD --prompt \
 
 The orchestrator secrets admin API enforces a fixed three-role model (`owner`, `admin`, `auditor`) defined in `packages/orchestrator/src/secrets/rbac.ts`. There is no `member` role at this layer -- workflow-author secret access happens via the environment/scope binding flow, not via an admin token.
 
-| Role        | Permissions                                                                                                                                                                                                                                           | Use case                    |
-| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
-| **owner**   | All 19 permissions: context.\*, secret.\* (read/write/delete/reveal), audit.read, token.manage, key.rotate, run.read, run.cancel, event_log.read, event_log.read_payload, access_log.read, scheduled_job.trigger, event_dlq.read, event_dlq.manage    | Bootstrap token, full admin |
-| **admin**   | 17 permissions: context.\*, secret.\* (read/write/delete/reveal), audit.read, run.read, run.cancel, event_log.read, event_log.read_payload, access_log.read, scheduled_job.trigger, event_dlq.read, event_dlq.manage (no token.manage, no key.rotate) | Day-to-day operations       |
-| **auditor** | 6 permissions: context.read, audit.read, run.read, event_log.read, access_log.read, event_dlq.read (metadata only -- no secret values, no raw payload bodies, no DLQ requeue/discard)                                                                 | Compliance review           |
+| Role        | Permissions                                                                                                                                                                                                                                                                                                                 | Use case                    |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| **owner**   | All 23 permissions: context.\*, secret.\* (read/write/delete/reveal), audit.read, token.manage, key.rotate, run.read, run.cancel, event_log.read, event_log.read_payload, access_log.read, scheduled_job.trigger, attestation.retry, event_dlq.read, event_dlq.manage, orchestrator.drain, ci_trust.read, ci_trust.admin    | Bootstrap token, full admin |
+| **admin**   | 21 permissions: context.\*, secret.\* (read/write/delete/reveal), audit.read, run.read, run.cancel, event_log.read, event_log.read_payload, access_log.read, scheduled_job.trigger, attestation.retry, event_dlq.read, event_dlq.manage, orchestrator.drain, ci_trust.read, ci_trust.admin (no token.manage, no key.rotate) | Day-to-day operations       |
+| **auditor** | 6 permissions: context.read, audit.read, run.read, event_log.read, access_log.read, event_dlq.read (metadata only -- no secret values, no raw payload bodies, no DLQ requeue/discard)                                                                                                                                       | Compliance review           |
 
 ## Access control
 
@@ -363,7 +363,7 @@ kici-admin context set-policy --env test-database --allow-local-execution true
 kici-admin context set-policy --env production --allow-local-execution false
 ```
 
-The same toggle is available on the environment detail page in the dashboard (the "Test runs" switch), gated by the same permission as writing a secret. Whether the dashboard surface accepts the change is decided by the [dashboard-write policy](./dashboard-write-policy.md) operation `environments.test_access.set`.
+The same toggle is available on the context detail page in the dashboard (the "Test runs" switch), gated by the same permission as writing a secret. Whether the dashboard surface accepts the change is decided by the [dashboard-write policy](./dashboard-write-policy.md) operation `contexts.test_access.set`.
 
 ## Backend configuration
 
@@ -373,21 +373,21 @@ No additional configuration needed beyond `KICI_SECRET_KEY`. Secrets are encrypt
 
 ### Vault backend
 
-Vault is configured globally at the orchestrator level using environment variables (see [Vault backend configuration](#vault-backend-configuration) above). Secrets stored with the Vault backend delegate encryption and storage to HashiCorp Vault's KV v2 engine. The `backend_type` field on each secret row determines which backend handles it.
+Vault is registered as a named backend with `kici-admin backend add` (see [Backend registration](#backend-registration)). Secrets stored with the Vault backend delegate encryption and storage to HashiCorp Vault's KV v2 engine. The `backend_type` field on each secret row determines which backend handles it.
 
 **AppRole setup** (recommended for production):
 
 1. Create an AppRole in Vault with read access to the KV path
 2. Generate a role ID and secret ID
-3. Set `KICI_VAULT_AUTH_METHOD=approle`, `KICI_VAULT_ROLE_ID`, and `KICI_VAULT_SECRET_ID` environment variables
+3. Register the backend with `--auth-method approle --role-id … --secret-id-file …` (or the `KICI_BACKEND_ROLE_ID` / `KICI_BACKEND_SECRET_ID` environment variables)
 
 **Token auth** (suitable for development):
 
-Set `KICI_VAULT_AUTH_METHOD=token` and `KICI_VAULT_TOKEN=hvs.xxxxx` environment variables.
+Register the backend with `--auth-method token --token hvs.xxxxx` (or `KICI_BACKEND_TOKEN`).
 
 ## Key rotation
 
-KiCI supports zero-downtime master key rotation using a dual-key mechanism. During the transition window, both secrets and config values encrypted with either the old or new key are readable. **A single `kici-admin rotate-key` invocation re-encrypts both `scoped_secrets` and `config_versions`** — both stores use the same master key (`KICI_SECRET_KEY`), so rotating them together keeps the two domains in lockstep and avoids a drift window where one has moved on but the other hasn't.
+KiCI supports zero-downtime master key rotation using a dual-key mechanism. During the transition window, both secrets and config values encrypted with either the old or new key are readable. **A single `kici-admin rotate-key` invocation re-encrypts `scoped_secrets`, `config_versions`, and the external secret-backend configs in `secret_backends`** — all three stores use the same master key (`KICI_SECRET_KEY`), so rotating them together keeps every domain in lockstep and avoids a drift window where one has moved on but the others haven't.
 
 ### Cadence
 
@@ -440,15 +440,26 @@ curl -X POST $KICI_ADMIN_URL/api/v1/admin/rotate-key \
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
 ```
 
-The command runs two sequential transactions — `scoped_secrets` first, then `config_versions` — and prints `Re-encrypted N secrets, M config versions.` Both operations decrypt with the old key, re-encrypt with the new key, and bump `key_version = max + 1`. Historical rows in `config_versions` are also re-sealed, so subsequent `kici-admin config rollback` calls work after the old key is retired.
+The command runs three separately-committed transactions — `scoped_secrets` first, then `config_versions`, then `secret_backends` — and prints `Re-encrypted N secrets, M config versions, K secret backend configs.` Each sweep decrypts with the old key, re-encrypts with the new key, and bumps the row's key version to `max + 1`. Historical rows in `config_versions` are also re-sealed, so subsequent `kici-admin config rollback` calls work after the old key is retired. The `secret_backends` sweep runs in its own transaction so a backend problem cannot roll back a successful `scoped_secrets` rotation; an undecryptable backend row is counted (`Skipped K undecryptable secret backend config(s)`) and left in place rather than aborting the sweep.
 
 **Step 5: Remove the old key**
 
-After re-encryption, remove `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) from the configuration and do another rolling restart. All secrets and config values are now encrypted with the new key only.
+After re-encryption, remove `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) from the configuration and do another rolling restart. All secrets, config values, and secret-backend configs are now encrypted with the new key only.
 
 ### Same-key re-encryption
 
-When `KICI_SECRET_KEY_OLD` is **not** set, `rotate-key` re-encrypts all secrets and config rows with the same master key at an incremented key version (`keyVersion = max + 1`). This is useful for periodic re-encryption without changing the actual key.
+When `KICI_SECRET_KEY_OLD` is **not** set, `rotate-key` re-encrypts all secrets, config rows, and secret-backend configs with the same master key at an incremented key version (`keyVersion = max + 1`). This is useful for periodic re-encryption without changing the actual key.
+
+### Secret-backend self-heal and stranded-backend recovery
+
+Registered secret backends (external Vault/OpenBao instances) store their connection config encrypted at rest in `secret_backends`. These configs participate in rotation exactly like `scoped_secrets`: they decrypt with dual-key fallback during the transition window and are re-encrypted by the third sweep.
+
+If a backend config was left encrypted under an older key — for example, a deployment that rotated before backend configs were part of the sweep — the orchestrator **self-heals** it at boot: while `KICI_SECRET_KEY_OLD` (or `KICI_SECRET_KEY_FILE_OLD`) is still configured, any backend row that decrypts only under the old key is transparently re-encrypted under the current key during startup and logged as `secret backend config was sealed under the old master key — re-encrypted under the current key (self-heal)`.
+
+If a backend config can be decrypted by **neither** the current nor the old key, the orchestrator refuses to start and names the offending backend. Failing loud is deliberate: silently dropping a secret backend would let workflows run with missing secrets. Recover in this order:
+
+1. **Restore the previous key.** Set `KICI_SECRET_KEY_OLD` to the key the backend was last sealed under and restart — the self-heal re-encrypts it under the current key automatically. This is the correct fix and preserves the config.
+2. **Last resort — purge and re-add.** If the previous key is genuinely lost, `kici-admin backend purge-stale` deletes the stranded config so the backend can be re-registered from scratch. This discards the stored config, so use it only when self-heal is impossible.
 
 ### Emergency rotation (compromised key)
 
@@ -456,7 +467,7 @@ A compromise means the attacker can decrypt every current ciphertext — so the 
 
 1. **Rotate the upstream credentials first.** Invalidate the leaked plaintexts at their source: regenerate the Platform token, rotate the orchestrator bootstrap admin token, and rotate any third-party credentials stored in `scoped_secrets` (database passwords, provider API keys, webhook signing keys, etc.). Update the corresponding `scoped_secrets` rows via `kici-admin` with the new plaintext.
 2. **Generate a new `KICI_SECRET_KEY` and set the old one as `KICI_SECRET_KEY_OLD`.** Rolling-restart all orchestrator instances with both keys configured (same as Step 3 of the normal procedure).
-3. **Run `kici-admin rotate-key`.** Verify the output reports non-zero counts for both stores and that the counts match your expectation (e.g., `SELECT count(*) FROM scoped_secrets` and `SELECT count(*) FROM config_versions`). A mismatch is a red flag — do not proceed.
+3. **Run `kici-admin rotate-key`.** Verify the output reports non-zero counts for the populated stores and that the counts match your expectation (e.g., `SELECT count(*) FROM scoped_secrets`, `SELECT count(*) FROM config_versions`, and `SELECT count(*) FROM secret_backends WHERE config_encrypted <> ''`). A mismatch — or any non-zero skipped count — is a red flag; do not proceed.
 4. **Remove the old key.** Unset `KICI_SECRET_KEY_OLD` / `KICI_SECRET_KEY_FILE_OLD` and rolling-restart again. The leaked key is now retired.
 5. **Audit.** Query the orchestrator audit log over HTTP for the rotation entry and confirm the metadata shows the expected counts:
 
@@ -465,7 +476,7 @@ A compromise means the attacker can decrypt every current ciphertext — so the 
      -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
    ```
 
-   Each entry carries `metadata.reEncrypted` and `metadata.reEncryptedConfigs`. If a count drops to zero unexpectedly on the second pass (step 4 would surface this), investigate before declaring rotation complete.
+   Each entry carries `metadata.reEncrypted`, `metadata.reEncryptedConfigs`, and `metadata.reEncryptedBackends` (plus `skippedConfigs` / `skippedBackends`). If a count drops to zero unexpectedly on the second pass (step 4 would surface this), or any skipped count is non-zero, investigate before declaring rotation complete.
 
 The critical difference from a scheduled rotation: you rotate the _upstream_ secrets before the master key, because a compromised master key has already leaked every current plaintext — rotating the master key alone only invalidates the ciphertext, not the secrets the ciphertext protected.
 
@@ -484,26 +495,25 @@ KiCI supports managing secrets from multiple named backend instances simultaneou
 Register backends using the `kici-admin backend` CLI commands:
 
 ```bash
-# Add a Vault/OpenBao backend
-kici-admin backend add \
-  --name openbao-prod \
+# Add a Vault/OpenBao backend (the backend name is positional)
+kici-admin backend add openbao-prod \
   --type vault \
-  --url https://vault.example.com:8200 \
+  --vault-url https://vault.example.com:8200 \
   --auth-method approle \
   --role-id "$VAULT_ROLE_ID" \
-  --secret-id "$VAULT_SECRET_ID"
+  --secret-id-file /run/secrets/vault-secret-id
 
 # List all registered backends
 kici-admin backend list
 
 # Test backend connectivity
-kici-admin backend test --name openbao-prod
+kici-admin backend test openbao-prod
 
-# Trigger scope discovery sync
-kici-admin backend sync --name openbao-prod
+# Trigger scope discovery sync (all backends if the name is omitted)
+kici-admin backend sync openbao-prod
 
 # Remove a backend
-kici-admin backend remove --name openbao-prod
+kici-admin backend remove openbao-prod
 ```
 
 Alternatively, use the admin API directly:
@@ -513,7 +523,7 @@ Alternatively, use the admin API directly:
 curl -X POST $KICI_ADMIN_URL/api/v1/admin/backends \
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name": "openbao-prod", "backendType": "vault", "config": {"url": "https://vault:8200", "authMethod": "approle", "roleId": "...", "secretId": "..."}}'
+  -d '{"name": "openbao-prod", "backendType": "vault", "config": {"vaultUrl": "https://vault:8200", "authMethod": "approle", "roleId": "...", "secretId": "..."}}'
 
 # List backends
 curl $KICI_ADMIN_URL/api/v1/admin/backends \
@@ -527,7 +537,7 @@ curl -X POST $KICI_ADMIN_URL/api/v1/admin/backends/sync \
 curl -X POST $KICI_ADMIN_URL/api/v1/admin/backends/test \
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"name": "openbao-prod", "backendType": "vault", "config": {"url": "https://vault:8200", ...}}'
+  -d '{"name": "openbao-prod", "backendType": "vault", "config": {"vaultUrl": "https://vault:8200", ...}}'
 
 # Remove a backend
 curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/backends/openbao-prod \
@@ -536,12 +546,32 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/backends/openbao-prod \
 
 ### Scope namespacing
 
-All scopes use a `backend-name:scope/path` format with colon separator:
+A scope has two forms, and the difference matters when you read raw storage:
 
-- `pg:production/db` -- PG-stored secret in `production/db` scope
-- `openbao-prod:aws/credentials` -- Vault-stored secret in `aws/credentials` scope
+- **Wire form** -- `backend-name:scope/path`, the qualified name you type at the
+  CLI, send to the admin API, or see in the dashboard and the audit log. The
+  qualifier picks the backend.
+- **Stored form** -- `scope/path`, the bare path each backend stores. The
+  qualifier is not part of it: `pg:production/db` and `openbao-prod:production/db`
+  are two different scopes, each stored as `production/db` inside its own backend.
 
-This prevents overlap between backends -- each scope is uniquely identified by its backend prefix. At resolution time, the prefix is stripped and secrets are injected by key name only (e.g., `secrets.get('DB_PASSWORD')` returns the value regardless of which backend provided it).
+Examples in wire form:
+
+- `pg:production/db` -- PG-stored secret in the `production/db` scope
+- `openbao-prod:aws/credentials` -- Vault-stored secret in the `aws/credentials` scope
+
+The qualifier prevents overlap between backends -- each scope is uniquely
+identified by backend plus path. An unqualified scope (`production/db`) targets
+the PG backend.
+
+A head that does not name a registered backend is **not** a qualifier -- it stays
+part of the path. That is what keeps routing keys (`github:42`) out of the scope
+namespace; such a name is rejected as an invalid scope path rather than routed
+to a backend called `github`.
+
+At resolution time the qualifier is stripped and secrets are injected by key
+name only (e.g., `secrets.get('DB_PASSWORD')` returns the value regardless of
+which backend provided it).
 
 Use `secrets.getMeta('DB_PASSWORD')` to inspect which backend and scope provided a specific secret:
 
@@ -549,6 +579,83 @@ Use `secrets.getMeta('DB_PASSWORD')` to inspect which backend and scope provided
 const meta = secrets.getMeta('DB_PASSWORD');
 // { value: '...', backend: 'pg', scope: 'pg:production/db' }
 ```
+
+### Writing to a specific backend
+
+Every write path -- the CLI, the admin API, and the dashboard -- accepts a
+qualified scope and routes the write to that backend:
+
+```bash
+# Write into the PG backend
+kici-admin secret set org-1 pg:production/db DB_PASSWORD --prompt
+
+# Write into a registered Vault/OpenBao backend
+kici-admin secret set org-1 openbao-prod:aws/credentials AWS_SECRET_KEY --prompt
+```
+
+Renaming a scope is a per-backend operation: the source backend re-encrypts
+every secret under the new scope name. Renaming _across_ backends is rejected --
+recreate the secrets in the destination backend instead.
+
+### Listing scopes across backends
+
+`secret scopes` lists the PG backend only, unqualified:
+
+```bash
+kici-admin secret scopes org-1
+#   - production/db
+```
+
+Pass `--all-backends` to aggregate every registered backend and print scopes in
+qualified form:
+
+```bash
+kici-admin secret scopes org-1 --all-backends
+#   - pg:production/db
+#   - openbao-prod:aws/credentials
+```
+
+A backend that is unreachable at that moment is skipped with a warning rather
+than failing the whole listing. `--all-backends` becomes the default at v1.0.0
+(see [Deprecations](/user/deprecations/)).
+
+### Repairing scopes stored with a stale qualifier
+
+Orchestrators that predate backend-qualified routing stored the qualifier as
+part of the scope name, so a secret written to `pg:production` was saved under
+the literal scope `pg:production`. Reads now address the bare `production`, so
+those rows are unreachable.
+
+`secret fix-prefixed-scopes` repairs them. The scope name is bound into each
+secret's authenticated encryption, so the command re-encrypts every value as it
+renames -- a direct SQL rename would leave the ciphertext undecryptable.
+
+```bash
+# Preview
+kici-admin secret fix-prefixed-scopes org-1 --dry-run --database-url "$KICI_DATABASE_URL"
+
+# Apply
+kici-admin secret fix-prefixed-scopes org-1 --database-url "$KICI_DATABASE_URL"
+```
+
+Run it once per organization after upgrading. It is idempotent -- a second run
+finds nothing to repair.
+
+The command repairs only the `pg:` qualifier, and it never merges two scopes.
+A scope is reported as `SKIPPED` and left untouched when:
+
+- the bare target already exists (both `pg:production` and `production` hold
+  secrets) -- merging would silently overwrite whichever keys the two share; or
+- the stored name carries another backend's qualifier (e.g. a PG row named
+  `openbao-prod:aws/creds`) -- repairing it here would turn it into a genuine PG
+  secret, moving it across a backend boundary. Copy those values into the named
+  backend yourself, then delete the stale scope; or
+- the stored name is a bare qualifier with no path after it (`pg:`) -- there is
+  no bare name to rename it to, so it needs a hand-written name.
+
+The command exits `2` when anything was skipped, so an upgrade script can tell
+"some scopes need a human" apart from a hard failure (exit `1`) and a clean
+repair (exit `0`).
 
 ### PG customer secrets toggle
 
@@ -560,10 +667,33 @@ kici-admin config set pgCustomerSecrets false
 
 When disabled:
 
-- Dashboard users cannot create PG-stored secrets
+- Dashboard users cannot create PG-stored secrets, under either spelling of the
+  scope — a bare `production` and an explicitly qualified `pg:production` are
+  the same scope in the same backend and are refused alike
 - Internal scopes (`__source__/*`, `__webhook__/*`) continue working normally
 - Existing PG secrets remain resolvable (read path unaffected)
 - Secret resolution still includes PG secrets for jobs
+
+### Renaming a scope
+
+A rename is a **per-backend** operation: the scope name is bound into each
+value's authenticated encryption, so the owning store has to re-encrypt every
+secret under the new name. Two renames are therefore refused rather than
+performed:
+
+- **Across backends** (`pg:a` → `vault:b`) — the admin HTTP API answers `400`.
+  Moving a scope between backends is a copy plus a delete, which the rename path
+  does not do. Create the secrets in the destination backend and delete the
+  source scope.
+- **Onto a scope that already exists** — the admin HTTP API answers `409`. A
+  scope counts as existing when it holds secrets, is an empty-scope placeholder,
+  or is referenced by a context binding. Merging two scopes is not what a rename
+  means, and the losing rows would be unrecoverable once re-encrypted under the
+  destination name. Set the keys explicitly in the target instead.
+
+Both refusals apply on the dashboard too, which reports them as the rename's
+error message. The status codes above are the admin HTTP API's; the dashboard
+answers `400` for either refusal and carries the same message.
 
 ### Auto-discovery and sync
 
@@ -619,11 +749,23 @@ The orchestrator cannot find `KICI_SECRET_KEY` or `KICI_SECRET_KEY_FILE`. Verify
 
 ### "Invalid or expired token"
 
-The admin API token is not valid. Possible causes:
+Returned with HTTP 401. The admin API token is not valid. Possible causes:
 
 - Token was revoked
 - Token was generated by a different orchestrator (different database)
 - Bootstrap token was overridden by `KICI_BOOTSTRAP_ADMIN_TOKEN`
+
+A request that carries no `Authorization: Bearer <token>` header at all gets a
+different 401 body, `Missing authorization`, so the two cases stay
+distinguishable.
+
+### "Authentication unavailable"
+
+Returned with HTTP 503. The orchestrator could not reach its database to look
+your token up, so it cannot authenticate anyone right now — your credential is
+not the problem and regenerating it will not help. The request is retryable.
+Check database reachability (failover, connection-pool exhaustion, a migration
+window) and retry once the orchestrator's database is healthy.
 
 ### Vault connection errors
 

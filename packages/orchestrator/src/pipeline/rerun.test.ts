@@ -108,7 +108,7 @@ function createMockJobQueue() {
   return {
     enqueue: vi.fn().mockResolvedValue('job-1'),
     getDispatchedJobIdsByRunId: vi.fn().mockResolvedValue([]),
-    insertDispatched: vi.fn().mockResolvedValue('job-1'),
+    insertDispatched: vi.fn().mockResolvedValue({ id: 'job-1', inserted: true }),
     dequeueForLabels: vi.fn().mockResolvedValue(null),
     getDepth: vi.fn().mockResolvedValue(0),
   };

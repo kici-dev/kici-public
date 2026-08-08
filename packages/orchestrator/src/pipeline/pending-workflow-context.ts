@@ -12,7 +12,8 @@
  * Writes to both an in-memory Map (fast read on the same process) and the DB
  * (crash recovery + cross-orchestrator read), mirroring the pending-job store.
  */
-import type { Kysely } from 'kysely';
+import { sql, type Kysely } from 'kysely';
+import { TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { WorkflowDispatchContext } from './dispatch-matched-workflow.js';
 
@@ -31,7 +32,16 @@ export function toSerializableInputs(
   ctx: WorkflowDispatchContext,
 ): SerializableWorkflowDispatchInputs {
   // Strip the two non-serializable deps; everything else is JSON-safe.
-  const { deps: _deps, bundle: _bundle, ...rest } = ctx;
+  // `buildWindowTokenHeld` also goes: it records that THIS dispatch call is
+  // holding a pending-jobs token, which it releases before returning. Carrying
+  // it into a resumed dispatch would make that call release a token it never
+  // took — stealing one held by a deferred init / dynamic task.
+  const {
+    deps: _deps,
+    bundle: _bundle,
+    buildWindowTokenHeld: _buildWindowTokenHeld,
+    ...rest
+  } = ctx;
   return rest;
 }
 
@@ -84,6 +94,21 @@ export async function deletePendingWorkflowContext(
  * Returns the number of restored contexts.
  */
 export async function restorePendingWorkflowContexts(db: Kysely<Database>): Promise<number> {
+  // Clean up stale rows for runs that already reached terminal state.
+  // These can linger if the orchestrator crashed after run completion but before
+  // the fire-and-forget deletePendingWorkflowContext DB delete finished.
+  await db
+    .deleteFrom('pending_workflow_contexts')
+    .where(
+      'run_id',
+      'in',
+      db
+        .selectFrom('execution_runs')
+        .select(sql<string>`run_id::text`.as('run_id'))
+        .where('status', 'in', [...TERMINAL_RUN_STATES]),
+    )
+    .execute();
+
   const rows = await db.selectFrom('pending_workflow_contexts').selectAll().execute();
   let restored = 0;
   for (const row of rows) {

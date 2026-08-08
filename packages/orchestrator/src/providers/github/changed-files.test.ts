@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   GitHubChangedFilesFetcher,
   isRateLimitError,
+  isTransientServerError,
   withRateLimitRetry,
 } from './changed-files.js';
 
@@ -116,7 +117,10 @@ describe('GitHubChangedFilesFetcher', () => {
         },
       );
 
-      expect(result).toEqual(['src/index.ts', 'package.json', 'README.md']);
+      expect(result).toEqual({
+        files: ['src/index.ts', 'package.json', 'README.md'],
+        status: 'fetched',
+      });
       expect(mock.paginate).toHaveBeenCalledWith(mock.rest.pulls.listFiles, {
         owner: 'test-owner',
         repo: 'test-repo',
@@ -125,7 +129,7 @@ describe('GitHubChangedFilesFetcher', () => {
       });
     });
 
-    it('returns empty array when pull_request data is missing', async () => {
+    it('reports unavailable when pull_request data is missing', async () => {
       setupMockOctokit();
       const payload = makePayload(); // no pull_request
 
@@ -136,7 +140,7 @@ describe('GitHubChangedFilesFetcher', () => {
         { installationId: 1 },
       );
 
-      expect(result).toEqual([]);
+      expect(result).toEqual({ files: [], status: 'unavailable' });
       expect(mockLogger.warn).toHaveBeenCalled();
     });
   });
@@ -155,7 +159,7 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual(['src/app.ts', 'tests/app.test.ts']);
+      expect(result).toEqual({ files: ['src/app.ts', 'tests/app.test.ts'], status: 'fetched' });
       expect(mock.rest.repos.compareCommits).toHaveBeenCalledWith({
         owner: 'test-owner',
         repo: 'test-repo',
@@ -164,7 +168,7 @@ describe('GitHubChangedFilesFetcher', () => {
       });
     });
 
-    it('returns empty array for initial push (zero SHA before)', async () => {
+    it('initial push (zero SHA before) is fetched + [] (deliberate no-diff)', async () => {
       const mock = setupMockOctokit();
       const payload = makePayload({
         before: '0000000000000000000000000000000000000000',
@@ -175,7 +179,7 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual([]);
+      expect(result).toEqual({ files: [], status: 'fetched' });
       expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.stringContaining('Initial push'),
@@ -197,14 +201,14 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toHaveLength(300);
+      expect(result.files).toHaveLength(300);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining('300'),
         expect.any(Object),
       );
     });
 
-    it('returns empty array when before/after SHAs are missing', async () => {
+    it('reports unavailable when before/after SHAs are missing', async () => {
       setupMockOctokit();
       const payload = makePayload(); // no before/after
 
@@ -212,11 +216,11 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual([]);
+      expect(result).toEqual({ files: [], status: 'unavailable' });
       expect(mockLogger.warn).toHaveBeenCalled();
     });
 
-    it('returns empty array for branch deletion (zero SHA after)', async () => {
+    it('branch deletion (zero SHA after) is fetched + [] (deliberate no-diff)', async () => {
       const mock = setupMockOctokit();
       const payload = makePayload({
         before: 'abc123',
@@ -227,7 +231,7 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual([]);
+      expect(result).toEqual({ files: [], status: 'fetched' });
       expect(mock.rest.repos.compareCommits).not.toHaveBeenCalled();
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.stringContaining('Branch deletion'),
@@ -237,7 +241,7 @@ describe('GitHubChangedFilesFetcher', () => {
   });
 
   describe('unknown events', () => {
-    it('returns empty array for unknown event type', async () => {
+    it('reports unavailable for unknown event type', async () => {
       setupMockOctokit();
       const payload = makePayload();
 
@@ -245,15 +249,15 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual([]);
-      expect(mockLogger.debug).toHaveBeenCalledWith(
+      expect(result).toEqual({ files: [], status: 'unavailable' });
+      expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining('Unknown event type'),
         expect.any(Object),
       );
     });
   });
 
-  describe('429 rate limit retry', () => {
+  describe('retry envelope (429 + 5xx)', () => {
     it('retries on 429 and succeeds', async () => {
       const mock = setupMockOctokit();
       const rateLimitError = Object.assign(new Error('rate limited'), { status: 429 });
@@ -266,7 +270,7 @@ describe('GitHubChangedFilesFetcher', () => {
         installationId: 1,
       });
 
-      expect(result).toEqual(['retried.ts']);
+      expect(result).toEqual({ files: ['retried.ts'], status: 'fetched' });
       expect(mock.rest.repos.compareCommits).toHaveBeenCalledTimes(2);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining('rate limited'),
@@ -274,15 +278,49 @@ describe('GitHubChangedFilesFetcher', () => {
       );
     });
 
-    it('throws non-429 errors immediately without retry', async () => {
+    it('retries a 500 once with backoff then succeeds', async () => {
       const mock = setupMockOctokit();
       const serverError = Object.assign(new Error('server error'), { status: 500 });
-      mock.rest.repos.compareCommits.mockRejectedValueOnce(serverError);
+      mock.rest.repos.compareCommits.mockRejectedValueOnce(serverError).mockResolvedValueOnce({
+        data: { files: [{ filename: 'after-5xx.ts' }] },
+      });
+
+      const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
+      const result = await fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, {
+        installationId: 1,
+      });
+
+      expect(result).toEqual({ files: ['after-5xx.ts'], status: 'fetched' });
+      expect(mock.rest.repos.compareCommits).toHaveBeenCalledTimes(2);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('server error (5xx)'),
+        expect.objectContaining({ attempt: 1 }),
+      );
+    });
+
+    it('rethrows after bounded 5xx retries with the degraded message', async () => {
+      const mock = setupMockOctokit();
+      const serverError = Object.assign(new Error('server error'), { status: 500 });
+      mock.rest.repos.compareCommits.mockRejectedValue(serverError);
 
       const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
       await expect(
         fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, { installationId: 1 }),
-      ).rejects.toThrow('server error');
+      ).rejects.toThrow(/changed-files fetch failed — trigger evaluation degraded/);
+
+      // 1 initial + 2 retries = 3 calls
+      expect(mock.rest.repos.compareCommits).toHaveBeenCalledTimes(3);
+    }, 10_000);
+
+    it('rethrows a 4xx immediately without retry (still degraded-wrapped)', async () => {
+      const mock = setupMockOctokit();
+      const clientError = Object.assign(new Error('not found'), { status: 404 });
+      mock.rest.repos.compareCommits.mockRejectedValueOnce(clientError);
+
+      const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
+      await expect(
+        fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, { installationId: 1 }),
+      ).rejects.toThrow('not found');
 
       expect(mock.rest.repos.compareCommits).toHaveBeenCalledTimes(1);
     });
@@ -295,7 +333,7 @@ describe('GitHubChangedFilesFetcher', () => {
       const payload = makePayload({ before: 'aaa111', after: 'bbb222' });
       await expect(
         fetcher.getChangedFiles('test-owner/test-repo', 'push', payload, { installationId: 1 }),
-      ).rejects.toThrow('rate limited');
+      ).rejects.toThrow(/changed-files fetch failed — trigger evaluation degraded/);
 
       // 1 initial + 3 retries = 4 calls
       expect(mock.rest.repos.compareCommits).toHaveBeenCalledTimes(4);
@@ -316,7 +354,7 @@ describe('GitHubChangedFilesFetcher', () => {
         { installationId: 1 },
       );
 
-      expect(result).toEqual(['pr-file.ts']);
+      expect(result).toEqual({ files: ['pr-file.ts'], status: 'fetched' });
       expect(mock.paginate).toHaveBeenCalledTimes(2);
     });
   });
@@ -338,6 +376,23 @@ describe('isRateLimitError', () => {
   it('returns false for null/undefined', () => {
     expect(isRateLimitError(null)).toBe(false);
     expect(isRateLimitError(undefined)).toBe(false);
+  });
+});
+
+describe('isTransientServerError', () => {
+  it('returns true for 5xx status codes', () => {
+    expect(isTransientServerError(Object.assign(new Error(), { status: 500 }))).toBe(true);
+    expect(isTransientServerError(Object.assign(new Error(), { status: 503 }))).toBe(true);
+  });
+
+  it('returns false for 4xx and 429', () => {
+    expect(isTransientServerError(Object.assign(new Error(), { status: 404 }))).toBe(false);
+    expect(isTransientServerError(Object.assign(new Error(), { status: 429 }))).toBe(false);
+  });
+
+  it('returns false for a network error with no status', () => {
+    expect(isTransientServerError(new Error('ECONNRESET'))).toBe(false);
+    expect(isTransientServerError(null)).toBe(false);
   });
 });
 

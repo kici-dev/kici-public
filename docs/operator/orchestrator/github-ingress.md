@@ -57,8 +57,12 @@ Keep the App pointed at the Platform and add a **repository-level** webhook
 (repo Settings → Webhooks → Add webhook) pointing at the same ingress URL, with
 the same secret and `application/json` content type. GitHub then delivers to
 both destinations. The orchestrator deduplicates the two copies by their shared
-`X-GitHub-Delivery` id, so exactly one job is dispatched. This belt-and-braces
-setup keeps CI triggering even if one delivery path is briefly unavailable.
+`X-GitHub-Delivery` id, so exactly one job is dispatched. Because GitHub delivers
+directly to your orchestrator as well as through the Platform, a Platform outage
+never drops a build trigger — the direct copy still arrives and dispatches the
+job. This is the reliability reason to run hybrid mode. For the full picture of
+what the Platform still provides, see
+[What requires the hosted Platform](./platform-capabilities.md).
 
 A classic per-repo webhook does not carry the App installation-target headers;
 the source id in the URL already identifies the source, so the orchestrator

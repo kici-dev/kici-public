@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import pg from 'pg';
 import type { MigrationProvider } from 'kysely/migration';
+import { HoldType, unknownContributorHoldReason } from '@kici-dev/engine';
 import { createPool } from './db.js';
 
 /**
@@ -578,9 +579,15 @@ export interface SeedContextResult {
 }
 
 /**
- * Upsert an context row keyed by (org_id, name). Returns the env id and
+ * Upsert a context row keyed by (org_id, name). Returns the env id and
  * whether the row was newly inserted. `branchRestrictions` / `requiredReviewers`
  * are JSON-serialised server-side; pass them as plain arrays or objects.
+ *
+ * An omitted `holdExpirySeconds` is written as NULL rather than a literal
+ * window: the column carries no DDL default, so "never set" and "cleared" both
+ * land on NULL and resolve through the one `DEFAULT_HOLD_EXPIRY_SECONDS`
+ * fallback on read. Writing a literal here would give this path a second,
+ * longer default that no read-side code knows about.
  */
 export async function seedContextDirect(
   databaseUrl: string,
@@ -589,8 +596,8 @@ export async function seedContextDirect(
   if (opts.waitTimerSeconds != null && opts.waitTimerSeconds < 0) {
     throw new Error(`context: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
   }
-  if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 0) {
-    throw new Error(`context: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
+  if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 1) {
+    throw new Error(`context: holdExpirySeconds must be >= 1 (got ${opts.holdExpirySeconds})`);
   }
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
@@ -602,7 +609,7 @@ export async function seedContextDirect(
           (org_id, name, type, enabled, branch_restrictions, required_reviewers,
            wait_timer_seconds, hold_expiry_seconds, minimum_trust, glob_pattern)
         VALUES ($1, $2, COALESCE($3, 'fixed'), COALESCE($4, true), $5::jsonb, $6::jsonb,
-                $7, COALESCE($8, 86400), $9, $10)
+                $7, $8, $9, $10)
         ON CONFLICT (org_id, name) DO UPDATE SET
           type = COALESCE(EXCLUDED.type, contexts.type),
           enabled = EXCLUDED.enabled,
@@ -641,7 +648,7 @@ export interface DeleteContextOpts {
 }
 
 /**
- * Delete an context keyed by (org_id, name). Returns whether a row was
+ * Delete a context keyed by (org_id, name). Returns whether a row was
  * removed. The `context_bindings`, `context_variables`, and
  * `context_source_overrides` children all carry
  * `FOREIGN KEY (context_id) REFERENCES contexts(id) ON DELETE CASCADE`,
@@ -747,8 +754,8 @@ export async function setContextPolicyDirect(
   if (opts.waitTimerSeconds != null && opts.waitTimerSeconds < 0) {
     throw new Error(`context: waitTimerSeconds must be >= 0 (got ${opts.waitTimerSeconds})`);
   }
-  if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 0) {
-    throw new Error(`context: holdExpirySeconds must be >= 0 (got ${opts.holdExpirySeconds})`);
+  if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 1) {
+    throw new Error(`context: holdExpirySeconds must be >= 1 (got ${opts.holdExpirySeconds})`);
   }
 
   const setClauses: string[] = [];
@@ -919,14 +926,21 @@ export interface CreateContextTemplateOpts {
 }
 
 /**
- * Create (or update) an context template + its seed variables in one
+ * Create (or update) a context template + its seed variables in one
  * transaction. Templates are represented as contexts with `type='template'`
  * by convention. Returns `{ envId, variablesSet }`.
+ *
+ * An omitted `holdExpirySeconds` is written as NULL rather than a literal
+ * window, for the same reason as `seedContextDirect`: the column has no DDL
+ * default and every read resolves NULL through `DEFAULT_HOLD_EXPIRY_SECONDS`.
  */
 export async function createContextTemplateDirect(
   databaseUrl: string,
   opts: CreateContextTemplateOpts,
 ): Promise<{ envId: string; created: boolean; variablesSet: number }> {
+  if (opts.holdExpirySeconds != null && opts.holdExpirySeconds < 1) {
+    throw new Error(`context: holdExpirySeconds must be >= 1 (got ${opts.holdExpirySeconds})`);
+  }
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   const client = await pool.connect();
   try {
@@ -935,7 +949,7 @@ export async function createContextTemplateDirect(
       `INSERT INTO contexts
           (org_id, name, type, enabled, branch_restrictions, required_reviewers,
            wait_timer_seconds, hold_expiry_seconds, minimum_trust)
-        VALUES ($1, $2, COALESCE($3, 'template'), true, $4::jsonb, $5::jsonb, $6, COALESCE($7, 86400), $8)
+        VALUES ($1, $2, COALESCE($3, 'template'), true, $4::jsonb, $5::jsonb, $6, $7, $8)
         ON CONFLICT (org_id, name) DO UPDATE SET
           type = COALESCE(EXCLUDED.type, contexts.type),
           branch_restrictions = EXCLUDED.branch_restrictions,
@@ -1235,6 +1249,107 @@ export async function listExecutionRunsDirect(
       params,
     );
     return { runs: result.rows };
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * One `check_run_tracking` row: the orchestrator's record of a check run it posted.
+ *
+ * Named `...DirectRow` rather than `CheckRunTrackingRow` because the
+ * orchestrator's own `db/types.ts` already exports that name for the Kysely
+ * `Selectable`, whose `check_run_id` is a `number`. Two same-named types with
+ * different field types, both in scope inside the orchestrator package, is a
+ * silent-comparison-bug waiting to happen.
+ */
+export interface CheckRunTrackingDirectRow {
+  provider: string;
+  owner: string;
+  repo: string;
+  sha: string;
+  check_name: string;
+  /**
+   * The id the provider returned when the check run was CREATED. It is written
+   * once, at create time, when the check run is still `queued` — the later
+   * terminal update is a PATCH that writes nothing here. So a non-null value
+   * proves creation, NOT that the check run reached a conclusion.
+   *
+   * Null does not prove the create failed either: the write is best-effort and
+   * falls back to cache-only on a DB error, so the check run can exist at the
+   * provider with no id recorded here.
+   *
+   * Selected as `::text` because the column is BIGINT and node-postgres maps
+   * int8 to a string to avoid precision loss. The cast makes that explicit in
+   * the query rather than depending on driver defaults, so adding a global
+   * int8 type parser later cannot silently change this field's type.
+   */
+  check_run_id: string | null;
+  /**
+   * `'pending'` is stamped BEFORE the create call and `'completed'` after it
+   * returns an id. Nothing resets it when a create fails, so a row stuck on
+   * `'pending'` means the create never returned — still in flight or
+   * permanently failed, which this column alone cannot distinguish.
+   */
+  build_creation_state: string | null;
+  run_id: string | null;
+  /**
+   * Written only for per-job check names (`kici/<workflow>/job/<job>`). The
+   * workflow-level `kici/<workflow>` row always has null here.
+   */
+  in_progress_sent_at: Date | null;
+  /**
+   * When the terminal (`completed`) update was accepted by the provider. This
+   * is the column that answers "did we complete it?" — `check_run_id` only
+   * answers "did we create it?".
+   *
+   * Best-effort like every write on this table, so null means "we have no
+   * record of sending it", not "it was never sent".
+   */
+  terminal_sent_at: Date | null;
+}
+
+export interface ListCheckRunTrackingOpts {
+  sha: string;
+  checkName?: string;
+  limit?: number;
+}
+
+/**
+ * READ-ONLY: SELECT check_run_tracking rows for a commit. One row per
+ * `(provider, owner, repo, sha, check_name)`, ordered by check_name.
+ *
+ * Each column answers a different question. `check_run_id` is written once,
+ * when the check run is created in the `queued` state, so it answers "did we
+ * create it?". `terminal_sent_at` is stamped only after the provider accepts
+ * the terminal `completed` PATCH, so it answers "did we complete it?". Every
+ * write here is best-effort, so a null column is "no record", never proof of
+ * failure — see the per-field notes for what each one does and does not prove.
+ */
+export async function listCheckRunTrackingDirect(
+  databaseUrl: string,
+  opts: ListCheckRunTrackingOpts,
+): Promise<{ rows: CheckRunTrackingDirectRow[] }> {
+  const pool = createPool(databaseUrl);
+  try {
+    const clauses: string[] = ['sha = $1'];
+    const params: unknown[] = [opts.sha];
+    if (opts.checkName !== undefined) {
+      clauses.push(`check_name = $2`);
+      params.push(opts.checkName);
+    }
+    const limit = Math.max(1, Math.min(1000, opts.limit ?? 50));
+    const result = await pool.query<CheckRunTrackingDirectRow>(
+      `SELECT provider, owner, repo, sha, check_name,
+              check_run_id::text AS check_run_id,
+              build_creation_state, run_id, in_progress_sent_at, terminal_sent_at
+         FROM check_run_tracking
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY check_name
+        LIMIT ${limit}`,
+      params,
+    );
+    return { rows: result.rows };
   } finally {
     await pool.end();
   }
@@ -2547,12 +2662,64 @@ export interface SeedCiSecurityFixturesOpts {
   trustedRunId: string;
   trustedDeliveryId: string;
   trustedJobId: string;
+  /**
+   * Second PR on the SAME repo (`repo_identifier='.'`, `pr_number=2`) with its
+   * own pending security hold. Seeded so PR-scoping tests can prove that a
+   * `/kici approve` on the first PR (pr_number=1) leaves this one held.
+   */
+  secondPrRunId: string;
+  secondPrDeliveryId: string;
+  secondPrJobId: string;
+  /**
+   * Hold on a DIFFERENT repo (`repo_identifier='other/repo'`, `pr_number=1`) —
+   * same PR number as the first hold but a different repo, proving the scoping
+   * isolates on repo as well as PR number.
+   */
+  otherRepoRunId: string;
+  otherRepoDeliveryId: string;
+  otherRepoJobId: string;
+  /**
+   * Workflow-modification hold (`repo_identifier='.'`, `pr_number=3`,
+   * `reason='workflow_modification'`) — the hold a non-trusted contributor's
+   * workflow-editing PR produces. Seeded so the PR-scoped `/kici approve`
+   * (which joins on `pr_number`) can find and resolve it.
+   */
+  wfModRunId: string;
+  wfModDeliveryId: string;
+  wfModJobId: string;
+  /**
+   * Fork-PR hold (`repo_identifier='.'`, `pr_number=4`, `reason='fork_pr'`) —
+   * the hold the org trust policy's fork arm produces. Reachable only since the
+   * policy became enforced, so it is seeded to prove PR-scoped selection and
+   * approval work for it exactly as they do for the workflow-modification hold.
+   */
+  forkPrRunId: string;
+  forkPrDeliveryId: string;
+  forkPrJobId: string;
 }
 
 export interface SeedCiSecurityFixturesResult {
+  /**
+   * The context name the fixture seeded (the `contextName` option, or its
+   * default). Assertions build the expected `held_runs.reason` from this rather
+   * than re-deriving the name, so an override cannot desync them.
+   */
+  contextName: string;
   envId: string;
+  /** Held run for the unknown contributor (repo `.`, pr_number 1). */
   heldRunId: string;
+  /** Held run for the same-repo second PR (repo `.`, pr_number 2). */
+  secondHeldRunId: string;
+  /** Held run for the different-repo run (repo `other/repo`, pr_number 1). */
+  otherRepoHeldRunId: string;
+  /** Held run for the workflow-modification PR (repo `.`, pr_number 3). */
+  wfModHeldRunId: string;
+  /** Held run for the fork PR (repo `.`, pr_number 4). */
+  forkPrHeldRunId: string;
 }
+
+/** repo_identifier used for the different-repo isolation hold. */
+export const CI_SECURITY_OTHER_REPO = 'other/repo';
 
 export async function seedCiSecurityFixturesDirect(
   databaseUrl: string,
@@ -2577,35 +2744,139 @@ export async function seedCiSecurityFixturesDirect(
       [opts.orgId, contextName],
     );
     const envId = envResult.rows[0].id;
+
+    // Seed one PR-scoped run + pending security hold. Returns the held-run id.
+    async function seedPrHold(args: {
+      runId: string;
+      deliveryId: string;
+      jobId: string;
+      repoIdentifier: string;
+      prNumber: number;
+      sha: string;
+      /**
+       * Held-run `hold_type` — the gate vocabulary, defaulting to the security
+       * gate. Every hold this helper seeds sits in the security queue, so the
+       * per-hold detail (unknown contributor, workflow modification) belongs in
+       * `reason`, not here.
+       */
+      holdType?: HoldType;
+      /**
+       * Held-run `reason` text. Defaults to the trust gate's unknown-contributor
+       * sentence for this context — the same shared template production emits —
+       * so an unknown-contributor hold seeds a reason production can produce.
+       */
+      reason?: string;
+      /** Held-run `context_id`; null for context-free holds (workflow_modification). */
+      contextId?: string | null;
+    }): Promise<string> {
+      await pool.query(
+        `INSERT INTO execution_runs (
+          run_id, workflow_name, provider, repo_identifier,
+          ref, sha, delivery_id, status, trust_tier, lock_file_source,
+          contributor_username, routing_key, pr_number
+        ) VALUES ($1, \'e2e-security-wf\', \'internal\', $4, \'refs/heads/feature\',
+          $5, $2, \'pending\', \'unknown\', \'base\', \'unknown-dev\', $3, $6)`,
+        [
+          args.runId,
+          args.deliveryId,
+          opts.runsRoutingKey,
+          args.repoIdentifier,
+          args.sha,
+          args.prNumber,
+        ],
+      );
+      await pool.query(
+        `INSERT INTO execution_jobs (job_id, run_id, job_name, status)
+         VALUES ($1, $2, \'security-test-job\', \'pending\')`,
+        [args.jobId, args.runId],
+      );
+      const held = await pool.query<{ id: string }>(
+        `INSERT INTO held_runs (org_id, run_id, job_id, context_id, hold_type, queue_type, reason, expires_at)
+         VALUES ($1, $2, $3, $4, $5, \'security\', $6, NOW() + INTERVAL \'72 hours\')
+         RETURNING id`,
+        [
+          opts.orgId,
+          args.runId,
+          args.jobId,
+          args.contextId === undefined ? envId : args.contextId,
+          args.holdType ?? HoldType.enum.security,
+          args.reason ?? unknownContributorHoldReason(contextName),
+        ],
+      );
+      return held.rows[0].id;
+    }
+
+    // Hold A — repo `.`, pr_number 1. `hold_type='security'` names the gate that
+    // held the run; `reason` carries the per-hold detail, defaulted to the trust
+    // gate's own templated sentence via the shared engine template. A
+    // trust-gate hold persists exactly this shape — `hold_type='security'`,
+    // `queue_type='security'`, a bound context id — so the assertions built on
+    // this hold model production rather than the fixture.
+    const heldRunId = await seedPrHold({
+      runId: opts.unknownRunId,
+      deliveryId: opts.unknownDeliveryId,
+      jobId: opts.unknownJobId,
+      repoIdentifier: '.',
+      prNumber: 1,
+      sha: 'abc123',
+    });
+    // Hold B — repo `.`, pr_number 2 (same repo, different PR).
+    const secondHeldRunId = await seedPrHold({
+      runId: opts.secondPrRunId,
+      deliveryId: opts.secondPrDeliveryId,
+      jobId: opts.secondPrJobId,
+      repoIdentifier: '.',
+      prNumber: 2,
+      sha: 'bbb222',
+    });
+    // Hold C — repo `other/repo`, pr_number 1 (different repo, same PR number).
+    const otherRepoHeldRunId = await seedPrHold({
+      runId: opts.otherRepoRunId,
+      deliveryId: opts.otherRepoDeliveryId,
+      jobId: opts.otherRepoJobId,
+      repoIdentifier: CI_SECURITY_OTHER_REPO,
+      prNumber: 1,
+      sha: 'ccc333',
+    });
+    // Hold D — repo `.`, pr_number 3, workflow-modification hold. Context-free
+    // (`context_id=null`), `hold_type='security'`, `reason='workflow_modification'`
+    // — exactly what a non-trusted contributor's workflow-editing PR produces.
+    const wfModHeldRunId = await seedPrHold({
+      runId: opts.wfModRunId,
+      deliveryId: opts.wfModDeliveryId,
+      jobId: opts.wfModJobId,
+      repoIdentifier: '.',
+      prNumber: 3,
+      sha: 'ddd444',
+      holdType: HoldType.enum.security,
+      reason: 'workflow_modification',
+      contextId: null,
+    });
+
+    // Hold E — repo `.`, pr_number 4, fork-PR hold. Same shape as hold D but a
+    // different reason: reachable only since the org trust policy became
+    // enforced, so PR-scoped selection and approval are proven for it too.
+    const forkPrHeldRunId = await seedPrHold({
+      runId: opts.forkPrRunId,
+      deliveryId: opts.forkPrDeliveryId,
+      jobId: opts.forkPrJobId,
+      repoIdentifier: '.',
+      prNumber: 4,
+      sha: 'eee555',
+      holdType: HoldType.enum.security,
+      reason: 'fork_pr',
+      contextId: null,
+    });
+
+    // Trusted contributor run (repo `.`, pr_number 1) — no hold; used by the
+    // trusted-contributor assertions.
     await pool.query(
       `INSERT INTO execution_runs (
         run_id, workflow_name, provider, repo_identifier,
         ref, sha, delivery_id, status, trust_tier, lock_file_source,
-        contributor_username, routing_key
+        contributor_username, routing_key, pr_number
       ) VALUES ($1, \'e2e-security-wf\', \'internal\', \'.\', \'refs/heads/feature\',
-        \'abc123\', $2, \'pending\', \'unknown\', \'base\', \'unknown-dev\', $3)`,
-      [opts.unknownRunId, opts.unknownDeliveryId, opts.runsRoutingKey],
-    );
-    await pool.query(
-      `INSERT INTO execution_jobs (job_id, run_id, job_name, status)
-       VALUES ($1, $2, \'security-test-job\', \'pending\')`,
-      [opts.unknownJobId, opts.unknownRunId],
-    );
-    const heldResult = await pool.query<{ id: string }>(
-      `INSERT INTO held_runs (org_id, run_id, job_id, context_id, hold_type, queue_type, reason, expires_at)
-       VALUES ($1, $2, $3, $4, \'unknown_contributor\', \'security\',
-        \'Unknown contributor requires approval\', NOW() + INTERVAL \'72 hours\')
-       RETURNING id`,
-      [opts.orgId, opts.unknownRunId, opts.unknownJobId, envId],
-    );
-    const heldRunId = heldResult.rows[0].id;
-    await pool.query(
-      `INSERT INTO execution_runs (
-        run_id, workflow_name, provider, repo_identifier,
-        ref, sha, delivery_id, status, trust_tier, lock_file_source,
-        contributor_username, routing_key
-      ) VALUES ($1, \'e2e-security-wf\', \'internal\', \'.\', \'refs/heads/feature\',
-        \'def456\', $2, \'running\', \'trusted\', \'head\', \'trusted-dev\', $3)`,
+        \'def456\', $2, \'running\', \'trusted\', \'head\', \'trusted-dev\', $3, 1)`,
       [opts.trustedRunId, opts.trustedDeliveryId, opts.runsRoutingKey],
     );
     await pool.query(
@@ -2613,7 +2884,15 @@ export async function seedCiSecurityFixturesDirect(
        VALUES ($1, $2, \'security-test-job\', \'running\')`,
       [opts.trustedJobId, opts.trustedRunId],
     );
-    return { envId, heldRunId };
+    return {
+      contextName,
+      envId,
+      heldRunId,
+      secondHeldRunId,
+      otherRepoHeldRunId,
+      wfModHeldRunId,
+      forkPrHeldRunId,
+    };
   } finally {
     await pool.end();
   }
@@ -2622,35 +2901,41 @@ export async function seedCiSecurityFixturesDirect(
 // ── Stage 5c remainder: Direct helpers for remaining e2e pg.Pool sites ──
 
 /**
- * Poll `execution_runs` for at least one row matching `status` whose
- * `started_at > since`. Used by cluster/job-reroute tests to gate on
- * a workflow reaching the terminal state after a webhook trigger.
+ * Poll `execution_runs` for the newest run started since `since` whose status
+ * is in `statuses`, returning that status. Resolves `{ status: null }` if the
+ * deadline passes before any run reaches a target status.
+ *
+ * Callers wanting "did the run finish?" pass the terminal status set and read
+ * the landed status — a terminal failure is reported immediately rather than
+ * indistinguishable from a timeout. Used by the cluster reroute tests to gate
+ * on a workflow reaching a terminal state after a webhook trigger.
  */
-export async function waitForExecutionRunStatusSinceDirect(
+export async function waitForExecutionRunReachesStatusSinceDirect(
   databaseUrl: string,
   opts: {
-    status: string;
     since: Date;
+    statuses: readonly string[];
     timeoutMs?: number;
     intervalMs?: number;
   },
-): Promise<{ found: boolean }> {
-  const timeoutMs = opts.timeoutMs ?? 120_000;
+): Promise<{ status: string | null }> {
+  const timeoutMs = opts.timeoutMs ?? 240_000;
   const intervalMs = opts.intervalMs ?? 5_000;
   const deadline = Date.now() + timeoutMs;
   const pool = createPool(databaseUrl);
   try {
     while (Date.now() < deadline) {
-      const result = await pool.query(
-        `SELECT 1 FROM execution_runs
-         WHERE started_at > $1 AND status = $2
+      const result = await pool.query<{ status: string }>(
+        `SELECT status FROM execution_runs
+         WHERE started_at > $1 AND status = ANY($2)
+         ORDER BY started_at DESC
          LIMIT 1`,
-        [opts.since, opts.status],
+        [opts.since, [...opts.statuses]],
       );
-      if (result.rows.length > 0) return { found: true };
+      if (result.rows.length > 0) return { status: result.rows[0].status };
       await new Promise((r) => setTimeout(r, intervalMs));
     }
-    return { found: false };
+    return { status: null };
   } finally {
     await pool.end();
   }
@@ -3538,17 +3823,17 @@ export async function bumpRegistryVersionSimpleDirect(
  */
 export async function upsertCronLastFiredDirect(
   databaseUrl: string,
-  opts: { registrationId: string; agoInterval: string },
+  opts: { registrationId: string; agoInterval: string; scheduleKey: string },
 ): Promise<void> {
   const pool = createPool(databaseUrl);
   try {
     await pool.query(
-      `INSERT INTO cron_last_fired (registration_id, last_fired_at)
-         VALUES ($1, NOW() - ($2)::interval)
-         ON CONFLICT (registration_id) DO UPDATE SET
+      `INSERT INTO cron_last_fired (registration_id, schedule_key, last_fired_at)
+         VALUES ($1, $3, NOW() - ($2)::interval)
+         ON CONFLICT (registration_id, schedule_key) DO UPDATE SET
            last_fired_at = NOW() - ($2)::interval,
            updated_at = NOW()`,
-      [opts.registrationId, opts.agoInterval],
+      [opts.registrationId, opts.agoInterval, opts.scheduleKey],
     );
   } finally {
     await pool.end();
@@ -3581,13 +3866,13 @@ export async function countCronLastFiredDirect(
  */
 export async function insertCronLastFiredNowDirect(
   databaseUrl: string,
-  opts: { registrationId: string },
+  opts: { registrationId: string; scheduleKey: string },
 ): Promise<void> {
   const pool = createPool(databaseUrl);
   try {
     await pool.query(
-      `INSERT INTO cron_last_fired (registration_id, last_fired_at) VALUES ($1, NOW())`,
-      [opts.registrationId],
+      `INSERT INTO cron_last_fired (registration_id, schedule_key, last_fired_at) VALUES ($1, $2, NOW())`,
+      [opts.registrationId, opts.scheduleKey],
     );
   } finally {
     await pool.end();

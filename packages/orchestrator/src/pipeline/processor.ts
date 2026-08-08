@@ -15,6 +15,7 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
+import type { SandboxAllowListReader } from './sandbox-allowlist-reader.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { DedupCache } from '../webhook/dedup.js';
 import type { ProviderRegistry, ProviderBundle } from '../provider-registry.js';
@@ -33,6 +34,7 @@ import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { AgentRegistry } from '../agent/registry.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
 import type { RunCoordinator } from '../cluster/coordinator.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { TeamMembershipLookup } from '../approvals/team-membership-lookup.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
@@ -58,8 +60,9 @@ import type { LockJob } from '@kici-dev/engine';
 import type { ContextStore } from '../contexts/context-store.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 import type { TrustResolver, IdentityLink, PermissionLevel } from '../security/trust-resolver.js';
-import type { HeldRunStore } from '../contexts/held-runs.js';
-import type { WorkflowDecision } from '@kici-dev/engine';
+import { SecurityHoldReason, type HeldRunStore } from '../contexts/held-runs.js';
+import type { OrchestratorMode, WorkflowDecision } from '@kici-dev/engine';
+import type { TrustPolicyStore } from '../security/trust-policy-store.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -598,12 +601,8 @@ export function buildTriggerEvent(event: string, action: string | null | undefin
 }
 
 /**
- * Extract the first line of the commit message from a webhook payload.
- * Handles push (head_commit.message) and PR (pull_request.title) events.
- */
-/**
  * Best-effort extraction of a repository identifier from a generic webhook
- * payload for cross-source dispatch (phase 28.5). Generic webhooks have no
+ * payload for cross-source dispatch. Generic webhooks have no
  * canonical repo shape, so we probe the conventions a sender is most likely
  * to use:
  *
@@ -641,6 +640,10 @@ export function extractInboundRepoIdentifier(payload: unknown): string | null {
   return null;
 }
 
+/**
+ * Extract the first line of the commit message from a webhook payload.
+ * Handles push (head_commit.message) and PR (pull_request.title) events.
+ */
 export function extractCommitMessage(event: string, payload: unknown): string | undefined {
   const p = payload as Record<string, unknown>;
   if (event === 'push') {
@@ -675,18 +678,18 @@ export function buildSecurityHoldSummary(
 ): string {
   const parts: string[] = [];
 
-  if (reason === 'workflow_modification') {
+  if (reason === SecurityHoldReason.enum.workflow_modification) {
     parts.push(
       'This PR modifies workflow files (.kici/) and was submitted by a non-trusted contributor.',
     );
     parts.push('Workflow changes require approval from a user with ci_trust:write or higher.');
-  } else if (reason === 'unknown_contributor') {
+  } else if (reason === SecurityHoldReason.enum.unknown_contributor) {
     parts.push('Unknown contributor. Requires approval from a user with ci_trust:write or higher.');
-  } else if (reason === 'fork_pr') {
+  } else if (reason === SecurityHoldReason.enum.fork_pr) {
     parts.push(
       'Fork PR requires approval. Requires approval from a user with ci_trust:write or higher.',
     );
-  } else if (reason === 'context_trust') {
+  } else if (reason === SecurityHoldReason.enum.context_trust) {
     parts.push('Context requires a higher trust level than the contributor has.');
     parts.push('Requires approval from a user with ci_trust:write or higher.');
   } else {
@@ -697,6 +700,34 @@ export function buildSecurityHoldSummary(
     parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier})`);
   }
 
+  return parts.join('\n');
+}
+
+/**
+ * Build the failure check-run description for a run the org trust policy
+ * REJECTED.
+ *
+ * Deliberately not `buildSecurityHoldSummary`: a rejected run creates no
+ * `held_runs` row, so telling the contributor to seek "approval from a user
+ * with ci_trust:write or higher" points at a queue the run will never appear
+ * in. Only an org policy change can unblock it.
+ */
+export function buildSecurityRejectionSummary(
+  reason: string,
+  message: string,
+  tier: string,
+  contributorUsername?: string,
+): string {
+  const parts: string[] = [
+    `**Rejected by the org trust policy** (${reason}).`,
+    message,
+    'This run was not held for approval and cannot be approved. An org owner must ' +
+      'change the trust policy under Settings > CI trust, after which a new push ' +
+      'or a re-opened pull request will be evaluated again.',
+  ];
+  if (contributorUsername) {
+    parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier})`);
+  }
   return parts.join('\n');
 }
 
@@ -756,6 +787,12 @@ export interface ProcessingDeps {
   coordinator?: RunCoordinator;
   /** Secret resolver for dispatch-time secret resolution. Optional -- if not set, secrets are not resolved. */
   secretResolver?: SecretResolverApi;
+  /**
+   * Cached per-org container-sandbox escape-hatch allow-list reader. Optional --
+   * when absent, dispatch defaults to the safe deny-all allow-list, so no
+   * workflow can escalate capabilities / host networking.
+   */
+  sandboxAllowListReader?: SandboxAllowListReader;
   /** Optional callback when source locations are extracted from a lock file workflow. */
   onSourceLocationsExtracted?: (
     workflowName: string,
@@ -784,6 +821,20 @@ export interface ProcessingDeps {
   heldRunStore?: HeldRunStore;
   /** Trust resolver for determining contributor trust tiers. Optional -- if not set, trust resolution is skipped. */
   trustResolver?: TrustResolver;
+  /**
+   * Cache of the Platform-owned org trust policy. Read per PR event by the
+   * trust-policy gate. Optional so existing tests and independent deployments
+   * that construct deps by hand keep working.
+   */
+  trustPolicyStore?: TrustPolicyStore;
+  /**
+   * This orchestrator's mode. The trust-policy gate needs it to decide what an
+   * absent policy means: Platform-attached modes fail closed (a push is
+   * imminent), independent mode has no upstream authority and keeps legacy
+   * behavior. Defaults to `'platform'` at the read site — the fail-closed side —
+   * so a hand-built deps object never accidentally opens the gate.
+   */
+  orchestratorMode?: OrchestratorMode;
   /** Identity links pushed from Platform for trust resolution. Optional -- defaults to empty. */
   identityLinks?: IdentityLink[];
   /** ci_trust permission levels per user ID from Platform push. Optional -- defaults to empty. */
@@ -817,8 +868,11 @@ export interface ProcessingDeps {
   instanceId?: string;
   /** Static-host grace before a disconnected static host reads unreachable (ms). */
   rosterGraceMs?: number;
-  /** Cap on runsOnAll per-host children (default 1024). */
+  /** Cap on runsOnAll per-host children (default 1024). Cluster default; the
+   * live per-cluster override is read from `cluster_settings.max_fanout_hosts`. */
   maxFanoutHosts?: number;
+  /** Reader for fleet-wide cluster tunables (max_fanout_hosts live override). */
+  clusterSettings?: ClusterSettingsReader;
 }
 
 /**
@@ -897,12 +951,18 @@ export async function dispatchReadyJob(
           { error: `dispatch rejected: ${(result as any).reason}` },
         );
       }
-    } else if (result.status === 'queued-no-backend') {
-      logger.warn('Scheduler-dispatched job has no matching backend', {
-        runId,
-        jobName,
-      });
     } else {
+      // `queued-no-backend` is handled exactly like `queued`: the job IS in the
+      // dispatch queue under `result.jobId`, so swapping the synthetic
+      // `needs-pending-*` placeholder for the real id is what lets the queue
+      // expiry sweep terminalize it (`unroutable`) instead of leaving the run
+      // pinned on a placeholder no agent will ever update.
+      if (result.status === 'queued-no-backend') {
+        logger.warn('Scheduler-dispatched job has no matching backend (tracked)', {
+          runId,
+          jobName,
+        });
+      }
       // Update the execution tracker with the real job ID from the dispatcher.
       // Find and replace the synthetic needs-pending-* entry so isRunComplete
       // doesn't block on a placeholder that no agent will ever update.

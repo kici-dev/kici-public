@@ -85,7 +85,11 @@ export function buildProgram(): Command {
   program
     .command('compile')
     .description('Compile workflows from .kici/workflows/ to kici.lock.json')
-    .option('--check', 'Validate workflows without writing lock file', false)
+    .option(
+      '--check',
+      'Validate workflows and type-check sources (tsc --noEmit) without writing lock file',
+      false,
+    )
     .option('--kici-dir <path>', 'Path to .kici directory', '.kici')
     .option('--verbose', 'Detailed output', false)
     .option('--watch', 'Watch for changes and recompile', false)
@@ -327,6 +331,12 @@ export function buildProgram(): Command {
       'Force a package manager for the install step (default: auto-detect)',
     )
     .option('--mjs', 'JavaScript-only mode (no TypeScript, no dependencies)', false)
+    .option(
+      '--workspace',
+      'Integrate .kici/ into the detected pnpm/npm/yarn workspace so workflows can import sibling packages',
+      false,
+    )
+    .option('--standalone', 'Force a self-contained .kici/ even inside a workspace', false)
     .option('--no-agents-md', 'Skip writing .kici/AGENTS.md (LLM authoring context)')
     .option('--private-registry <url>', 'Scaffold a workflow registries: entry pointing at <url>')
     .option(
@@ -465,6 +475,164 @@ Environment variables:
       process.exit(success ? 0 : 1);
     });
 
+  const notificationsCommand = program
+    .command('notifications')
+    .description("Manage the org's notification channels, subscriptions, and Slack roster");
+
+  const notificationsChannels = notificationsCommand
+    .command('channels')
+    .description('Manage notification channels (Slack / email)');
+  notificationsChannels
+    .command('list')
+    .description('List notification channels')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .option('--json', 'Output as JSON')
+    .action(async (options) => {
+      const { notificationsChannelsListCommand } = await import('./commands/index.js');
+      const ok = await notificationsChannelsListCommand({ org: options.org, json: options.json });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsChannels
+    .command('add')
+    .description('Add a notification channel')
+    .requiredOption('--type <slack|email>', 'Channel transport type')
+    .requiredOption('--name <name>', 'Channel display name')
+    .option('--connection <id>', 'Slack connection id (slack channels)')
+    .option('--slack-channel <id>', 'Slack channel id (slack channels)')
+    .option('--from-name <name>', 'Sender name (email channels)')
+    .option('--reply-to <email>', 'Reply-to address (email channels)')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (options) => {
+      const { notificationsChannelsAddCommand } = await import('./commands/index.js');
+      const ok = await notificationsChannelsAddCommand({
+        org: options.org,
+        type: options.type,
+        name: options.name,
+        connection: options.connection,
+        slackChannel: options.slackChannel,
+        fromName: options.fromName,
+        replyTo: options.replyTo,
+      });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsChannels
+    .command('remove')
+    .argument('<id>', 'Channel id')
+    .description('Remove a notification channel')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (id, options) => {
+      const { notificationsChannelsRemoveCommand } = await import('./commands/index.js');
+      const ok = await notificationsChannelsRemoveCommand(id, { org: options.org });
+      process.exit(ok ? 0 : 1);
+    });
+
+  const notificationsSubscriptions = notificationsCommand
+    .command('subscriptions')
+    .description('Manage notification subscriptions');
+  notificationsSubscriptions
+    .command('list')
+    .description('List notification subscriptions')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .option('--json', 'Output as JSON')
+    .action(async (options) => {
+      const { notificationsSubscriptionsListCommand } = await import('./commands/index.js');
+      const ok = await notificationsSubscriptionsListCommand({
+        org: options.org,
+        json: options.json,
+      });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsSubscriptions
+    .command('add')
+    .description('Add a notification subscription')
+    .requiredOption('--channel <id>', 'Target channel id')
+    .requiredOption('--on-status <csv>', 'Statuses to notify on (e.g. failed,success)')
+    .option('--level <run|job>', 'Subscription granularity', 'run')
+    .option('--scope <org|team|user|actor>', 'Subscription scope', 'org')
+    .option('--scope-id <id>', 'Scope id (required for team/user scope)')
+    .option('--repo-glob <glob>', 'Match runs whose repo matches this glob')
+    .option('--workflow-glob <glob>', 'Match runs whose workflow matches this glob')
+    .option('--job-glob <glob>', 'Match jobs matching this glob (job level)')
+    .option('--mentions <csv>', 'Literal Slack member/group ids or emails to mention')
+    .option('--recipient-override <csv>', 'Override the email recipient set')
+    .option('--on-failure-class <csv>', 'Only match these failure classes')
+    .option('--accumulate-for <ms>', 'Digest accumulation window in milliseconds')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (options) => {
+      const { notificationsSubscriptionsAddCommand } = await import('./commands/index.js');
+      const ok = await notificationsSubscriptionsAddCommand({
+        org: options.org,
+        channel: options.channel,
+        onStatus: options.onStatus,
+        level: options.level,
+        scope: options.scope,
+        scopeId: options.scopeId,
+        repoGlob: options.repoGlob,
+        workflowGlob: options.workflowGlob,
+        jobGlob: options.jobGlob,
+        mentions: options.mentions,
+        recipientOverride: options.recipientOverride,
+        onFailureClass: options.onFailureClass,
+        accumulateFor: options.accumulateFor,
+      });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsSubscriptions
+    .command('remove')
+    .argument('<id>', 'Subscription id')
+    .description('Remove a notification subscription')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (id, options) => {
+      const { notificationsSubscriptionsRemoveCommand } = await import('./commands/index.js');
+      const ok = await notificationsSubscriptionsRemoveCommand(id, { org: options.org });
+      process.exit(ok ? 0 : 1);
+    });
+
+  const notificationsRoster = notificationsCommand
+    .command('roster')
+    .description('Manage the Layer 1 Slack-identity roster (actor tagging)');
+  notificationsRoster
+    .command('list')
+    .description('List Slack-identity roster entries')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .option('--json', 'Output as JSON')
+    .action(async (options) => {
+      const { notificationsRosterListCommand } = await import('./commands/index.js');
+      const ok = await notificationsRosterListCommand({ org: options.org, json: options.json });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsRoster
+    .command('add')
+    .description('Add a Slack-identity roster entry')
+    .requiredOption('--connection <id>', 'Slack connection id')
+    .requiredOption('--subject-kind <kici_user|git_login|email>', 'What the subject keys on')
+    .requiredOption('--subject <value>', 'The KiCI user sub, git login, or email')
+    .requiredOption('--value <slackIdEmailOrHandle>', 'Slack member id, email, or @handle')
+    .option('--input-form <id|username|email>', 'How --value should be resolved', 'id')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (options) => {
+      const { notificationsRosterAddCommand } = await import('./commands/index.js');
+      const ok = await notificationsRosterAddCommand({
+        org: options.org,
+        connection: options.connection,
+        subjectKind: options.subjectKind,
+        subject: options.subject,
+        inputForm: options.inputForm,
+        value: options.value,
+      });
+      process.exit(ok ? 0 : 1);
+    });
+  notificationsRoster
+    .command('remove')
+    .argument('<id>', 'Roster entry id')
+    .description('Remove a Slack-identity roster entry')
+    .option('--org <id>', 'Target organization (overrides the active org)')
+    .action(async (id, options) => {
+      const { notificationsRosterRemoveCommand } = await import('./commands/index.js');
+      const ok = await notificationsRosterRemoveCommand(id, { org: options.org });
+      process.exit(ok ? 0 : 1);
+    });
+
   const localCommand = program
     .command('local')
     .description('Manage the local dev orchestrator plane');
@@ -486,8 +654,16 @@ Environment variables:
       const ok = await localUpCommand({ offline: options.offline, connected: options.connected });
       process.exit(ok ? 0 : 1);
     });
+  localCommand
+    .command('status')
+    .description('Show local dev plane status and control commands')
+    .option('--json', 'Emit machine-readable JSON (exits 0 for every state)', false)
+    .action(async (options: { json?: boolean }) => {
+      const { localStatusCommand } = await import('./commands/index.js');
+      const ok = await localStatusCommand({ json: options.json });
+      process.exit(ok ? 0 : 1);
+    });
   for (const [name, desc, fn] of [
-    ['status', 'Show local dev plane status and control commands', 'localStatusCommand'],
     ['down', 'Stop the local dev plane', 'localDownCommand'],
     ['logs', 'Print the local dev plane orchestrator log path', 'localLogsCommand'],
     ['attach', 'Attach the local dev plane to the Platform (hybrid)', 'localAttachCommand'],
@@ -554,7 +730,7 @@ Environment variables:
     .option('--trigger <t>', 'Filter by trigger type')
     .option('--source <routingKey>', 'Filter by source routing key')
     .option('--since <ts>', 'Only runs since (ISO-8601 or epoch ms)')
-    .option('--page <n>', 'Page number', (v) => parseInt(v, 10))
+    .option('--cursor <cursor>', 'Keyset cursor for the next page (from a prior nextCursor)')
     .option('--json', 'Output raw JSON', false)
     .action(async (options) => {
       const { runsListCommand } = await import('./commands/index.js');
@@ -616,6 +792,37 @@ Environment variables:
       process.exit(success ? 0 : 1);
     });
 
+  const runsArtifacts = runsCommand
+    .command('artifacts')
+    .description("List and download a run's artifacts");
+
+  runsArtifacts
+    .command('list')
+    .argument('<run-id>', 'Run ID whose artifacts to list')
+    .description('List the artifacts a run uploaded')
+    .option('--json', 'Output raw JSON', false)
+    .action(async (runId, options) => {
+      const { runsArtifactsListCommand } = await import('./commands/index.js');
+      const success = await runsArtifactsListCommand(runId, { json: options.json });
+      process.exit(success ? 0 : 1);
+    });
+
+  runsArtifacts
+    .command('download')
+    .argument('<run-id>', 'Run ID whose artifacts to download')
+    .argument('[name]', 'Artifact name (omit to download every artifact of the run)')
+    .description('Download one artifact, or all of them — extracts by default')
+    .option('--archive', 'Save the raw .tar.gz instead of extracting', false)
+    .option('-o, --output <dir>', 'Output directory (default: current directory)')
+    .action(async (runId, name, options) => {
+      const { runsArtifactsDownloadCommand } = await import('./commands/index.js');
+      const success = await runsArtifactsDownloadCommand(runId, name, {
+        archive: options.archive,
+        output: options.output,
+      });
+      process.exit(success ? 0 : 1);
+    });
+
   program
     .command('approve')
     .argument('<run-id>', 'Run ID whose approval gate to approve')
@@ -673,8 +880,21 @@ Environment variables:
     });
 
   program
+    .command('doctor')
+    .description('Diagnose your KiCI setup and print the exact next command for each problem')
+    .option('--json', 'Output raw JSON instead of a table', false)
+    .option('--kici-dir <path>', 'Path to the .kici directory', '.kici')
+    .action(async (options) => {
+      const { doctorCommand } = await import('./commands/index.js');
+      const exitCode = await doctorCommand({ json: options.json, kiciDir: options.kiciDir });
+      process.exit(exitCode);
+    });
+
+  program
     .command('diagnostics')
-    .description('Show orchestrators, scalers, and agents (mirrors the dashboard Diagnostics page)')
+    .description(
+      'Show orchestrators, scalers, and agents (mirrors the dashboard Infrastructure page)',
+    )
     .option('--json', 'Output raw JSON', false)
     .option('--verbose', 'Show extended per-agent fields', false)
     .option('--orchestrator <id>', 'Scope the tree to one connection id')
@@ -760,7 +980,7 @@ Environment variables:
     .option('--bundle <path>', 'Path or URL to the attestation bundle JSON')
     .option(
       '--trust-root <url-or-file>',
-      'Trusted issuer URL, or a self-contained { issuer, jwks } file (default: hosted KiCI platform)',
+      'Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator, else the hosted KiCI platform)',
     )
     .option('--audience <aud>', 'Expected token audience')
     .option('--json', 'Output structured JSON result', false)

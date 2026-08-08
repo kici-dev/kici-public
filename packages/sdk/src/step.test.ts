@@ -113,6 +113,14 @@ describe('step()', () => {
     expect(s._sourceLocation!.line).toBeGreaterThan(0);
   });
 
+  it('captured _sourceLocation.file carries no loader cache-buster query', () => {
+    // The compiler imports workflow modules as `file://…/ci.ts?t=<epoch>`; the
+    // captured location must strip that query so the path is a clean, clickable
+    // filesystem path.
+    const s = step('clean-path', async () => {});
+    expect(s._sourceLocation!.file).not.toContain('?');
+  });
+
   it('accepts async run functions', async () => {
     let executed = false;
     const asyncStep = step('async', async (ctx) => {

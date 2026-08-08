@@ -14,6 +14,7 @@ import { evaluateReviewerGate } from './reviewer-gate.js';
 import { evaluateTrustGate } from './trust-gate.js';
 import { evaluateWaitTimerGate } from './wait-timer-gate.js';
 import type { Context } from '@kici-dev/engine';
+import { HoldType } from '@kici-dev/engine';
 
 // ── Fixtures ──────────────────────────────────────────────────────
 
@@ -146,6 +147,18 @@ describe('evaluateConcurrencyGate', () => {
     expect(result.action).toBe('queue');
     expect(result.reason).toBe('cancel-pending');
   });
+
+  it('should pass (unlimited) when concurrency limit is 0 — a degenerate value', () => {
+    const env = makeEnv({ concurrencyLimit: 0 });
+    const result = evaluateConcurrencyGate(env, 0, 'group-1');
+    expect(result.action).toBe('pass');
+  });
+
+  it('should pass (unlimited) when concurrency limit is negative', () => {
+    const env = makeEnv({ concurrencyLimit: -1 });
+    const result = evaluateConcurrencyGate(env, 5, 'group-1');
+    expect(result.action).toBe('pass');
+  });
 });
 
 // ── Reviewer gate tests ───────────────────────────────────────────
@@ -177,7 +190,7 @@ describe('evaluateReviewerGate', () => {
     });
     const result = evaluateReviewerGate(env);
     expect(result.action).toBe('hold');
-    expect(result.holdType).toBe('reviewer');
+    expect(result.holdType).toBe(HoldType.enum.reviewer);
     expect(result.holdUntil).toBe('2026-03-08T13:00:00.000Z');
   });
 });
@@ -203,7 +216,7 @@ describe('evaluateWaitTimerGate', () => {
     const env = makeEnv({ waitTimerSeconds: 300 });
     const result = evaluateWaitTimerGate(env);
     expect(result.action).toBe('wait');
-    expect(result.holdType).toBe('timer');
+    expect(result.holdType).toBe(HoldType.enum.timer);
     expect(result.holdUntil).toBe('2026-03-08T12:05:00.000Z');
   });
 });
@@ -253,7 +266,7 @@ describe('evaluateProtectionRules', () => {
       });
       const result = await evaluateProtectionRules(env, makeCtx(), 0, 'group-1');
       expect(result.action).toBe('hold');
-      expect(result.holdType).toBe('reviewer');
+      expect(result.holdType).toBe(HoldType.enum.reviewer);
     } finally {
       vi.useRealTimers();
     }
@@ -266,7 +279,7 @@ describe('evaluateProtectionRules', () => {
       const env = makeEnv({ waitTimerSeconds: 60 });
       const result = await evaluateProtectionRules(env, makeCtx(), 0, 'group-1');
       expect(result.action).toBe('wait');
-      expect(result.holdType).toBe('timer');
+      expect(result.holdType).toBe(HoldType.enum.timer);
     } finally {
       vi.useRealTimers();
     }
@@ -300,7 +313,7 @@ describe('evaluateProtectionRules', () => {
       'known', // known contributor, but context requires trusted
     );
     expect(result.action).toBe('hold');
-    expect(result.holdType).toBe('security');
+    expect(result.holdType).toBe(HoldType.enum.security);
     expect(result.reason).toContain('trusted contributors');
   });
 
@@ -319,7 +332,7 @@ describe('evaluateProtectionRules', () => {
       'unknown',
     );
     expect(result.action).toBe('hold');
-    expect(result.holdType).toBe('security');
+    expect(result.holdType).toBe(HoldType.enum.security);
     // Reviewer gate should NOT be reached
     expect(result.reason).toContain('known contributors');
   });

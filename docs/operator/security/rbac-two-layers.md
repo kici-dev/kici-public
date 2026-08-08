@@ -9,29 +9,33 @@ The asymmetry IS the industry-standard pattern for systems with a SaaS control p
 
 ## The two surfaces at a glance
 
-| Property                                    | Dashboard path (control plane)                                                                                                                                                           | CLI path (orchestrator)               |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| Audience                                    | Developers, release engineers                                                                                                                                                            | Ops / SRE / operators                 |
-| Authority                                   | Control-plane database (`roles`, `role_assignments`)                                                                                                                                     | Orchestrator database (`api_keys`)    |
-| Granularity                                 | Per-user, per-resource, per-verb                                                                                                                                                         | Three fixed roles                     |
-| Identity key                                | OIDC `sub` from the user's session                                                                                                                                                       | Opaque bearer token                   |
-| Configured via                              | Dashboard → Settings → Roles + Members                                                                                                                                                   | `kici-admin api-key create`           |
-| Resources                                   | 17 typed resources (`runs`, `secrets`, `environments`, `workflows`, `members`, `api_keys`, `webhooks`, `org-settings`, `audit`, `event_log`, `ci_trust`, `support`, `teams`, `fleet`, …) | Coarse — admin tokens get every write |
-| Verbs                                       | `none`, `read`, `read_payload`, `write`, `admin`                                                                                                                                         | Fixed per role                        |
-| Per-resource scoping                        | Yes (give `contexts:write` without `secrets:write`)                                                                                                                                      | No (admin = every write)              |
-| Per-path scoping (e.g. "scope `prod` only") | Not today                                                                                                                                                                                | Not today                             |
+| Property                                    | Dashboard path (control plane)                                                                                                                                                              | CLI path (orchestrator)                |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| Audience                                    | Developers, release engineers                                                                                                                                                               | Ops / SRE / operators                  |
+| Authority                                   | Control-plane database (`roles`, `role_assignments`)                                                                                                                                        | Orchestrator database (`admin_tokens`) |
+| Granularity                                 | Per-user, per-resource, per-verb                                                                                                                                                            | Three fixed roles                      |
+| Identity key                                | OIDC `sub` from the user's session                                                                                                                                                          | Opaque bearer token                    |
+| Configured via                              | Dashboard → Settings → Roles + Members                                                                                                                                                      | `kici-admin token create`              |
+| Resources                                   | 18 typed resources (`runs`, `secrets`, `contexts`, `workflows`, `members`, `api_keys`, `webhook_sources`, `org_settings`, `audit`, `event_log`, `ci_trust`, `support`, `teams`, `fleet`, …) | Coarse — admin tokens get every write  |
+| Verbs                                       | `none`, `read`, `read_payload`, `write`, `admin`                                                                                                                                            | Fixed per role                         |
+| Per-resource scoping                        | Yes (give `contexts:write` without `secrets:write`)                                                                                                                                         | No (admin = every write)               |
+| Per-path scoping (e.g. "scope `prod` only") | Not today                                                                                                                                                                                   | Not today                              |
 
 ## Dashboard RBAC (control plane)
 
 The control plane authorizes every dashboard-routed write. The check runs **before** any request reaches the orchestrator, and it runs **after** the membership / cross-tenant check.
 
-- **Resources** map to the dashboard's nouns: `runs`, `workflows`, `secrets`, `environments`, `members`, `api_keys`, `webhooks`, `org-settings`, `audit`, `event_log`, `ci_trust`, `support`, plus a small number of admin-mode resources visible only to the SaaS operator's own org.
+- **Resources** map to the dashboard's nouns: `runs`, `workflows`, `secrets`, `contexts`, `members`, `api_keys`, `webhook_sources`, `webhook_endpoints`, `org_settings`, `billing`, `audit`, `event_log`, `event_dlq`, `ci_trust`, `support`, `teams`, `fleet`, `notifications`.
 - **Verbs** are `none`, `read`, `read_payload` (for log payloads + webhook bodies), `write`, `admin`. Each role assignment picks one verb per resource.
-- **Built-in roles** ship with sensible defaults: `Owner` gets `admin` on every resource, `Member` gets `read` on most things and `none` on the privileged ones (members must be explicitly granted write).
+- **Built-in roles** ship with sensible defaults: `Owner` gets the highest level on every resource (`admin` everywhere except `fleet`, whose gates top out at `write`), `Member` gets `read` on most things and `none` on the privileged ones — `ci_trust`, `support`, and `fleet` (members must be explicitly granted write).
 - **Custom roles** are configured per-org in the dashboard's Settings → Roles tab. A custom role is a typed `{resource → verb}` map.
 - **Identity** is the user's OIDC `sub`, resolved from the session cookie issued at login.
 
 The control plane returns a `403` with the resource and the required verb in the response body when the check fails.
+
+### Denied-page experience
+
+Sidebar entries for a resource are hidden when the viewer lacks its read permission. Because pages remain reachable by direct URL or bookmark, a gated page that a viewer cannot read renders a "Permission required" panel rather than a dead-end error. The panel names the exact permission the viewer is missing (for example `fleet:read`), tells them to ask an organization owner or admin to grant it, and links to the members page when the viewer can see it. This applies to the fleet roster, fleet host detail, activity log, and event DLQ pages.
 
 Under the [dashboard-write policy](./dashboard-write-policy.md), the `secrets:write` permission becomes mostly vestigial when `secrets.set` is disabled — the value-write route is gated at a higher layer and the dashboard user never reaches the permission check. **Keep `secrets:write` configured anyway**: it still gates the dashboard's secret-name and scope CRUD (the operations that stay on the dashboard even when value writes are CLI-only).
 
@@ -47,9 +51,9 @@ Three fixed roles:
 | `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                     | Day-to-day operations, CI scripts     |
 | `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read` (metadata, no payload bodies, no secret values) | Compliance review, log inspection     |
 
-The full permission list (19 fine-grained permissions in total) lives in the orchestrator's `secrets/rbac.ts` and is exposed via `kici-admin api-key permissions show`.
+The full permission list (21 fine-grained permissions in total) lives in the orchestrator's `secrets/rbac.ts`, and the per-role matrix is in the [`kici-admin` CLI reference](../orchestrator/kici-admin-cli.md#rbac-roles).
 
-- **Identity** is the opaque bearer token. The orchestrator looks up the token's role from its `api_keys` table; nothing about the token's identity exists outside the orchestrator.
+- **Identity** is the opaque bearer token. The orchestrator looks up the token's role from its `admin_tokens` table; nothing about the token's identity exists outside the orchestrator.
 - **Per-resource scoping** is intentionally absent at this layer. An `admin` token can write every secret in every scope. The granularity is "operator-equivalent or read-only".
 
 ## The asymmetry to manage
@@ -64,11 +68,11 @@ The mitigation is operational: keep the two surfaces' authority equivalent for a
 
 ### Recommended pattern: one token per ops engineer, never shared
 
-1. **Issue one orchestrator admin token per ops engineer.** No shared tokens. Sharing makes audit attribution impossible and increases the radius of a leak.
-2. **Match the orchestrator role to the dashboard role.** If a person has dashboard `admin` on `secrets`, `environments`, and `runs`, give them an orchestrator `admin` token. If a person has only read access in the dashboard, give them an orchestrator `auditor` token — never an `admin` token, and never an `owner` token.
+1. **Issue one orchestrator admin token per ops engineer** with `kici-admin token create <label> --role admin`. No shared tokens. Sharing makes audit attribution impossible and increases the radius of a leak.
+2. **Match the orchestrator role to the dashboard role.** If a person has dashboard `admin` on `secrets`, `contexts`, and `runs`, give them an orchestrator `admin` token. If a person has only read access in the dashboard, give them an orchestrator `auditor` token — never an `admin` token, and never an `owner` token.
 3. **Use `owner` tokens only for break-glass.** Lock the bootstrap `owner` token in the operator's vault, alongside the recovery procedures for `KICI_SECRET_KEY` and the postgres credentials. Day-to-day ops uses `admin` tokens.
-4. **Revoke promptly.** When a person leaves the ops team, revoke both their dashboard membership and their orchestrator token. `kici-admin api-key revoke` writes an `access_log` row, so the revocation is itself auditable.
-5. **Rotate the bootstrap token after orchestrator first-boot.** The orchestrator generates a bootstrap `owner` token on first start and prints it to the logs. After you've created at least one named `owner` token via `kici-admin api-key create`, revoke the bootstrap token.
+4. **Revoke promptly.** When a person leaves the ops team, revoke both their dashboard membership and their orchestrator token. `kici-admin token revoke <id>` (list ids with `kici-admin token list`) writes an `access_log` row, so the revocation is itself auditable.
+5. **Rotate the bootstrap token after orchestrator first-boot.** The orchestrator generates a bootstrap `owner` token on first start and prints it to the logs. After you've created at least one named `owner` token via `kici-admin token create <label> --role owner`, revoke the bootstrap token.
 
 ### Worked example
 
@@ -91,7 +95,7 @@ The asymmetry shifts from "two layers, watch the gap" to "two layers, one of the
 - **Settings → Orchestrator keys** — orchestrator-to-control-plane WebSocket auth tokens (used by the orchestrator process itself; not CLI bearer tokens).
 - **Settings → Security → Dashboard policy** — the read-only view of the [dashboard-write policy](./dashboard-write-policy.md).
 
-Orchestrator CLI tokens are **not** visible in the dashboard. They live entirely in the orchestrator's database and are managed via `kici-admin api-key`.
+Orchestrator CLI tokens are **not** visible in the dashboard. They live entirely in the orchestrator's database and are managed via `kici-admin token`.
 
 ## Common questions
 

@@ -12,6 +12,31 @@ export interface WorkflowCompleteData {
   conclusion: string;
   duration: number;
   jobResults: Array<{ name: string; status: string }>;
+  /** Why the run failed (`RunFailureClass`); carried on the event so Plane B can route on it. */
+  failureClass?: string;
+}
+
+/** One failed run carried in a workflows_failed_batch event. */
+export interface WorkflowsFailedBatchRun {
+  runId: string;
+  repo: string;
+  workflowName: string;
+  failureClass?: string;
+  senderUsername?: string;
+}
+
+/**
+ * Input data for emitting a __workflows_failed_batch system event.
+ * One event per swept accumulation window; `registrationId` targets the single
+ * subscribing workflow so the batch dispatches once.
+ */
+export interface WorkflowsFailedBatchData {
+  routingKey: string;
+  repo: string;
+  registrationId: string;
+  /** Total failed runs in the window (may exceed `runs.length` when capped). */
+  total: number;
+  runs: WorkflowsFailedBatchRun[];
 }
 
 /**
@@ -54,10 +79,34 @@ export class EventEmitter {
         jobResults: data.jobResults,
         sourceRepo: data.repo,
         sourceRoutingKey: data.routingKey,
+        ...(data.failureClass && { failureClass: data.failureClass }),
       },
       sourceRepo: data.repo,
       sourceRoutingKey: data.routingKey,
       sourceRunId: data.runId,
+      chainDepth: 0,
+    });
+  }
+
+  /**
+   * Emit a __workflows_failed_batch system event: one synthetic event per swept
+   * accumulation window carrying the batched failed runs. Targeted at the single
+   * subscribing registration via `payload.registrationId` so the batch workflow
+   * dispatches exactly once, no matter how many failures landed in the window.
+   * Returns the event ID as delivery receipt.
+   */
+  async emitWorkflowsFailedBatch(data: WorkflowsFailedBatchData): Promise<string> {
+    return this.router.emit({
+      eventName: '__workflows_failed_batch',
+      payload: {
+        registrationId: data.registrationId,
+        total: data.total,
+        runs: data.runs,
+        sourceRepo: data.repo,
+        sourceRoutingKey: data.routingKey,
+      },
+      sourceRepo: data.repo,
+      sourceRoutingKey: data.routingKey,
       chainDepth: 0,
     });
   }

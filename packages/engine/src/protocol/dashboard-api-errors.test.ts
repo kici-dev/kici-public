@@ -10,6 +10,10 @@ describe('DashboardApiErrorCode', () => {
     expect(DashboardApiErrorCode.enum.session_max_age_exceeded).toBe('session_max_age_exceeded');
   });
 
+  it('exposes run_outside_retention', () => {
+    expect(DashboardApiErrorCode.enum.run_outside_retention).toBe('run_outside_retention');
+  });
+
   it('rejects an unknown code', () => {
     expect(DashboardApiErrorCode.safeParse('nope').success).toBe(false);
   });

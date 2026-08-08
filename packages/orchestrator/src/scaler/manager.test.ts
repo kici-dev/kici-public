@@ -53,6 +53,7 @@ function createMockBackend(
       vi.fn((): ValidationResult => {
         return { valid: true };
       }),
+    ...(overrides.ensureHostReady ? { ensureHostReady: overrides.ensureHostReady } : {}),
   };
 }
 
@@ -122,6 +123,7 @@ describe('ScalerManager', () => {
         { name: 'bare-metal-gpu', backend: bareMetalBackend },
       ],
       onScalerEvent,
+      spawnTimeoutMs: 300_000,
     });
   }
 
@@ -133,6 +135,20 @@ describe('ScalerManager', () => {
 
       expect(result).toEqual({ action: 'spawning', backendType: 'container' });
       expect(containerBackend.spawn).toHaveBeenCalled();
+    });
+
+    it('is a no-op while draining (no fresh capacity spawned)', async () => {
+      const manager = new ScalerManager({
+        config: createDefaultConfig(),
+        backends: [{ name: 'container-prod', backend: containerBackend }],
+        isDraining: () => true,
+        spawnTimeoutMs: 300_000,
+      });
+
+      const result = await manager.requestScale(['linux', 'docker'], 'job-drain', 'run-test');
+
+      expect(result).toEqual({ action: 'skipped', reason: 'draining' });
+      expect(containerBackend.spawn).not.toHaveBeenCalled();
     });
 
     it('routes to bare-metal backend for gpu labels', async () => {
@@ -275,6 +291,7 @@ describe('ScalerManager', () => {
         expect.any(Function),
         undefined,
         { boundJobId: 'job-6', runId: 'run-test' },
+        expect.any(AbortSignal),
       );
     });
 
@@ -295,6 +312,7 @@ describe('ScalerManager', () => {
       const manager = new ScalerManager({
         config,
         backends: [{ name: 'container-prod', backend: containerBackend }],
+        spawnTimeoutMs: 300_000,
       });
 
       // Clear the spawn mock to track fresh calls
@@ -304,6 +322,218 @@ describe('ScalerManager', () => {
       const result = await manager.requestScale(['linux', 'docker'], 'job-warm', 'run-test');
       expect(result.action).toBe('spawning');
       expect(containerBackend.spawn).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('spawn throttling (maxConcurrentSpawns)', () => {
+    /** Yield a macrotask so all pending microtasks (semaphore hand-offs) flush. */
+    const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it('never runs more than maxConcurrentSpawns concurrent backend.spawn per backend', async () => {
+      // Real timers: the semaphore hand-off is a microtask chain, not a timer.
+      vi.useRealTimers();
+
+      let inFlight = 0;
+      let peak = 0;
+      const releasers: Array<() => void> = [];
+      const spawn = vi.fn((labelSet: string[], agentId: string) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        return new Promise<ManagedAgent>((resolve) => {
+          releasers.push(() => {
+            inFlight--;
+            resolve({
+              id: agentId,
+              labelSet,
+              backendRef: `ref-${agentId}`,
+              spawnedAt: Date.now(),
+              state: 'running',
+            });
+          });
+        });
+      });
+
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 100,
+        // Population cap never hit — isolate the provisioning-rate throttle.
+        getActiveCount: () => 0,
+        spawn,
+      });
+
+      const manager = createManager(
+        {
+          globalMaxAgents: 100,
+          scalers: [
+            {
+              name: 'throttled',
+              type: 'container' as const,
+              maxAgents: 100,
+              maxConcurrentSpawns: 3,
+              labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+            },
+          ],
+        } as unknown as Partial<ReturnType<typeof createDefaultConfig>>,
+        [{ name: 'throttled', backend }],
+      );
+
+      // Fire 20 in-cap scale requests. Each reserves + kicks a throttled spawn.
+      for (let i = 0; i < 20; i++) {
+        const result = await manager.requestScale(['linux', 'docker'], `job-${i}`, `run-${i}`);
+        expect(result.action).toBe('spawning');
+      }
+      await flush();
+
+      // Only maxConcurrentSpawns (3) provision at once; the rest queue.
+      expect(peak).toBeLessThanOrEqual(3);
+      expect(spawn).toHaveBeenCalledTimes(3);
+
+      // Drain: release the in-flight spawns in batches; each release lets the
+      // semaphore admit the next queued spawn. Peak must stay at or below 3.
+      let released = 0;
+      while (released < 20) {
+        await flush();
+        const batch = releasers.splice(0);
+        if (batch.length === 0) break;
+        batch.forEach((release) => release());
+        released += batch.length;
+      }
+      await flush();
+
+      // All 20 eventually spawned; the cap was never exceeded.
+      expect(spawn).toHaveBeenCalledTimes(20);
+      expect(peak).toBeLessThanOrEqual(3);
+    });
+
+    it('releases a semaphore slot when a spawn rejects (no permanent starvation)', async () => {
+      vi.useRealTimers();
+
+      let inFlight = 0;
+      let peak = 0;
+      let call = 0;
+      const releasers: Array<() => void> = [];
+      const rejecters: Array<() => void> = [];
+      const spawn = vi.fn(() => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        const mine = call++;
+        return new Promise<ManagedAgent>((resolve, reject) => {
+          // Every 2nd spawn rejects; its slot must still be freed via finally.
+          if (mine % 2 === 0) {
+            rejecters.push(() => {
+              inFlight--;
+              reject(new Error('boom'));
+            });
+          } else {
+            releasers.push(() => {
+              inFlight--;
+              resolve({
+                id: `agent-${mine}`,
+                labelSet: ['linux', 'docker'],
+                backendRef: `ref-${mine}`,
+                spawnedAt: Date.now(),
+                state: 'running',
+              });
+            });
+          }
+        });
+      });
+
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 100,
+        getActiveCount: () => 0,
+        spawn,
+      });
+
+      const manager = createManager(
+        {
+          globalMaxAgents: 100,
+          scalers: [
+            {
+              name: 'throttled',
+              type: 'container' as const,
+              maxAgents: 100,
+              maxConcurrentSpawns: 2,
+              labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+            },
+          ],
+        } as unknown as Partial<ReturnType<typeof createDefaultConfig>>,
+        [{ name: 'throttled', backend }],
+      );
+
+      for (let i = 0; i < 6; i++) {
+        await manager.requestScale(['linux', 'docker'], `job-${i}`, `run-${i}`);
+      }
+      await flush();
+      expect(spawn).toHaveBeenCalledTimes(2);
+
+      // Drain a mix of rejects and resolves; a rejected spawn must free its slot
+      // so the next queued spawn proceeds — otherwise the queue would wedge.
+      let settled = 0;
+      while (settled < 6) {
+        await flush();
+        const toReject = rejecters.splice(0);
+        const toResolve = releasers.splice(0);
+        if (toReject.length === 0 && toResolve.length === 0) break;
+        toReject.forEach((r) => r());
+        toResolve.forEach((r) => r());
+        settled += toReject.length + toResolve.length;
+      }
+      await flush();
+
+      expect(spawn).toHaveBeenCalledTimes(6);
+      expect(peak).toBeLessThanOrEqual(2);
+    });
+
+    it('does not prune spawns still queued behind the semaphore, only started-and-stale ones', async () => {
+      // Fake timers (the suite default) so we can advance past the 5-min
+      // stale-prune threshold. One slot, a spawn that never resolves — it holds
+      // the slot so the other two requests stay queued.
+      const spawn = vi.fn(() => new Promise<ManagedAgent>(() => {}));
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 100,
+        getActiveCount: () => 0,
+        spawn,
+      });
+
+      const manager = createManager(
+        {
+          globalMaxAgents: 100,
+          scalers: [
+            {
+              name: 'throttled',
+              type: 'container' as const,
+              maxAgents: 100,
+              maxConcurrentSpawns: 1,
+              labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+            },
+          ],
+        } as unknown as Partial<ReturnType<typeof createDefaultConfig>>,
+        [{ name: 'throttled', backend }],
+      );
+
+      // 3 in-cap requests: 1 spawn starts (occupies the only slot), 2 queue.
+      for (let i = 0; i < 3; i++) {
+        await manager.requestScale(['linux', 'docker'], `job-${i}`, `run-${i}`);
+      }
+      await vi.advanceTimersByTimeAsync(0); // let the admitted spawn start
+      expect(spawn).toHaveBeenCalledTimes(1);
+      expect(manager.getStatus().spawningCount).toBe(3);
+
+      // Advance well past the 5-min stale window, then trigger a prune via a
+      // no-match request (prunes first, then returns without adding an entry).
+      await vi.advanceTimersByTimeAsync(6 * 60_000);
+      const noMatch = await manager.requestScale(['windows', 'arm64'], 'job-x', 'run-x');
+      expect(noMatch.action).toBe('no-backend');
+
+      // The started-but-never-registered spawn is reaped; the two still-queued
+      // spawns survive (they had not started, so the stale clock never began).
+      expect(manager.getStatus().spawningCount).toBe(2);
     });
   });
 
@@ -490,6 +720,65 @@ describe('ScalerManager', () => {
 
       // Single-job model: agent disconnects on its own, no destroy called
       expect(containerBackend.destroy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('onCapacityFreed hook', () => {
+    async function spawnAndRegister(manager: ScalerManager): Promise<string> {
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
+      const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as string;
+      await vi.advanceTimersToNextTimerAsync();
+      manager.onAgentRegistered(agentId, ['linux', 'docker']);
+      return agentId;
+    }
+
+    it('fires (debounced) when a reserved agent releases on disconnect', async () => {
+      const manager = createManager();
+      const agentId = await spawnAndRegister(manager);
+      const onCapacityFreed = vi.fn();
+      manager.onCapacityFreed = onCapacityFreed;
+
+      manager.onAgentDisconnected(agentId);
+
+      // Debounced: not fired synchronously.
+      expect(onCapacityFreed).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(250);
+      expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+
+    it('coalesces a burst of releases into a single call', async () => {
+      const manager = createManager();
+      const agentId = await spawnAndRegister(manager);
+      const onCapacityFreed = vi.fn();
+      manager.onCapacityFreed = onCapacityFreed;
+
+      manager.onJobComplete(agentId);
+      manager.onJobComplete(agentId);
+      manager.onJobComplete(agentId);
+      await vi.advanceTimersByTimeAsync(250);
+
+      expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+
+    it('fires from onJobComplete for a managed agent', async () => {
+      const manager = createManager();
+      const agentId = await spawnAndRegister(manager);
+      const onCapacityFreed = vi.fn();
+      manager.onCapacityFreed = onCapacityFreed;
+
+      manager.onJobComplete(agentId);
+      await vi.advanceTimersByTimeAsync(250);
+
+      expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not throw when no callback is configured', async () => {
+      const manager = createManager();
+      const agentId = await spawnAndRegister(manager);
+
+      expect(() => manager.onAgentDisconnected(agentId)).not.toThrow();
+      await vi.advanceTimersByTimeAsync(250);
     });
   });
 
@@ -795,6 +1084,158 @@ describe('ScalerManager', () => {
     });
   });
 
+  describe('platform taints', () => {
+    function createPlatformManager(): ScalerManager {
+      const winBackend = createMockBackend({
+        type: 'bare-metal',
+        labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath: '/kici-agent.exe' }],
+        maxAgents: 2,
+      });
+      const linBackend = createMockBackend({
+        type: 'bare-metal',
+        labelSets: [{ labels: ['linux', 'bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
+        maxAgents: 2,
+      });
+      return new ScalerManager({
+        spawnTimeoutMs: 300_000,
+        config: {
+          version: 1 as const,
+          globalMaxAgents: 10,
+          scalers: [
+            {
+              name: 'win-pool',
+              type: 'bare-metal',
+              maxAgents: 2,
+              labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath: '/kici-agent.exe' }],
+            },
+            {
+              name: 'linux-pool',
+              type: 'bare-metal',
+              maxAgents: 2,
+              labelSets: [
+                { labels: ['linux', 'bare-metal'], binaryPath: '/usr/local/bin/kici-agent' },
+              ],
+            },
+          ],
+        },
+        backends: [
+          { name: 'win-pool', backend: winBackend },
+          { name: 'linux-pool', backend: linBackend },
+        ],
+      });
+    }
+
+    it('taints a windows bare-metal backend mandatoryLabels (advertisement)', () => {
+      const status = createPlatformManager().getStatus();
+      const win = status.backends.find((b) => b.name === 'win-pool');
+      expect(win?.mandatoryLabels).toContain('windows');
+      const lin = status.backends.find((b) => b.name === 'linux-pool');
+      expect(lin?.mandatoryLabels ?? []).not.toContain('windows');
+    });
+
+    it('rejects an unqualified bare-metal job on the windows pool (local matcher)', async () => {
+      const manager = createPlatformManager();
+      // Unqualified: no `windows` in required labels → windows pool must not match.
+      const result = await manager.requestScale(['bare-metal'], 'job-u', 'run-u');
+      expect(result.action).toBe('spawning');
+      const status = manager.getStatus();
+      // Only the linux pool may have an active/spawning agent.
+      const win = status.backends.find((b) => b.name === 'win-pool');
+      expect(win?.activeCount).toBe(0);
+    });
+
+    it('routes an OS-qualified job to the windows pool', async () => {
+      const manager = createPlatformManager();
+      const result = await manager.requestScale(['windows', 'bare-metal'], 'job-w', 'run-w');
+      expect(result.action).toBe('spawning');
+      expect(result).toMatchObject({ backendType: 'bare-metal' });
+    });
+
+    it('stamps the platform taint onto a registered windows-pool agent gate', async () => {
+      const manager = createPlatformManager();
+      // Spawn a windows-pool agent for an OS-qualified job.
+      await manager.requestScale(['windows', 'bare-metal'], 'job-w', 'run-w');
+      // On registration, the returned gate must include the derived `windows`
+      // taint even though the pool declared no explicit mandatoryLabels — so the
+      // local queue-drain and eager-dispatch paths reject an unqualified job that
+      // would otherwise land on this wrong-OS agent.
+      const spawnedId = [
+        ...(manager as unknown as { spawningAgents: Map<string, unknown> }).spawningAgents.keys(),
+      ][0];
+      const registered = manager.onAgentRegistered(spawnedId, ['windows', 'bare-metal']);
+      expect(registered?.mandatoryLabels).toContain('windows');
+    });
+
+    // A pool that declares a non-canonical OS label (`windows-2022`) that the
+    // denylist would NOT catch, but supplies the structured platform field so
+    // the taint still applies. Proves the synonym-escape gap is closed.
+    function createStructuredPlatformManager(): ScalerManager {
+      const winBackend = createMockBackend({
+        type: 'bare-metal',
+        labelSets: [{ labels: ['windows-2022', 'bare-metal'], binaryPath: '/kici-agent.exe' }],
+        maxAgents: 2,
+      });
+      return new ScalerManager({
+        spawnTimeoutMs: 300_000,
+        config: {
+          version: 1 as const,
+          globalMaxAgents: 10,
+          scalers: [
+            {
+              name: 'win2022-pool',
+              type: 'bare-metal',
+              maxAgents: 2,
+              platform: { os: 'windows', arch: 'x64' },
+              labelSets: [
+                { labels: ['windows-2022', 'bare-metal'], binaryPath: '/kici-agent.exe' },
+              ],
+            },
+          ],
+        },
+        backends: [{ name: 'win2022-pool', backend: winBackend }],
+      });
+    }
+
+    it('taints a synonym-labeled pool via the structured platform field (closes the denylist gap)', () => {
+      const status = createStructuredPlatformManager().getStatus();
+      const pool = status.backends.find((b) => b.name === 'win2022-pool');
+      // Without the structured field, `windows-2022` escapes PLATFORM_TAINT_LABELS
+      // and the pool would carry no taint. With it, the pool is tainted.
+      expect(pool?.mandatoryLabels).toContain('windows');
+    });
+
+    it('injects the declared-platform os/arch labels into the pool label set', () => {
+      const status = createStructuredPlatformManager().getStatus();
+      const pool = status.backends.find((b) => b.name === 'win2022-pool');
+      const flat = pool?.labelSets.flat() ?? [];
+      expect(flat).toContain('kici:os:windows');
+      expect(flat).toContain('kici:os:win32');
+    });
+
+    it('rejects an unqualified job on the structured-field windows pool', async () => {
+      const manager = createStructuredPlatformManager();
+      const result = await manager.requestScale(['bare-metal'], 'job-u2', 'run-u2');
+      // No windows pool matches an unqualified job → no backend.
+      expect(result.action).toBe('no-backend');
+    });
+
+    it('routes an os-qualified job to the structured-field windows pool', async () => {
+      const manager = createStructuredPlatformManager();
+      const result = await manager.requestScale(['windows', 'bare-metal'], 'job-w2', 'run-w2');
+      expect(result.action).toBe('spawning');
+    });
+
+    it('stamps the structured-field taint onto a registered agent gate', async () => {
+      const manager = createStructuredPlatformManager();
+      await manager.requestScale(['windows', 'bare-metal'], 'job-w3', 'run-w3');
+      const spawnedId = [
+        ...(manager as unknown as { spawningAgents: Map<string, unknown> }).spawningAgents.keys(),
+      ][0];
+      const registered = manager.onAgentRegistered(spawnedId, ['windows', 'bare-metal']);
+      expect(registered?.mandatoryLabels).toContain('windows');
+    });
+  });
+
   describe('resource caps', () => {
     it('refuses spawn when per-scaler cpu cap would be exceeded', async () => {
       const manager = createManager({
@@ -1032,6 +1473,133 @@ describe('ScalerManager', () => {
         lastError: 'no such image',
         lastAtMs: ts,
       });
+    });
+  });
+
+  describe('spawn timeout', () => {
+    function makeContainerConfig(maxConcurrentSpawns = 1) {
+      return {
+        version: 1 as const,
+        globalMaxAgents: 10,
+        scalers: [
+          {
+            name: 'c',
+            type: 'container' as const,
+            maxAgents: 5,
+            maxConcurrentSpawns,
+            labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+          },
+        ],
+      };
+    }
+
+    it('rejects a hung spawn at the deadline, releases the semaphore slot and lets the next spawn proceed', async () => {
+      const spawnCalls: string[] = [];
+      const signals: (AbortSignal | undefined)[] = [];
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        // The spawn never actually completes, so the backend stays "empty".
+        getActiveCount: () => 0,
+        spawn: vi.fn((_ls, agentId, _url, _ev, _lim, _ctx, signal) => {
+          spawnCalls.push(agentId);
+          signals.push(signal);
+          return new Promise<never>(() => {}); // hangs forever
+        }),
+      });
+      const manager = new ScalerManager({
+        config: makeContainerConfig(1),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 50,
+      });
+
+      const r1 = await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      expect(r1.action).toBe('spawning');
+
+      // Let the fire-and-forget spawn start; job-2 then queues behind the
+      // single-slot semaphore.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(spawnCalls.length).toBe(1);
+
+      const r2 = await manager.requestScale(['linux', 'docker'], 'job-2', 'run-2');
+      expect(r2.action).toBe('spawning');
+      await vi.advanceTimersByTimeAsync(1);
+      // Still head-of-line blocked behind the hung first spawn.
+      expect(spawnCalls.length).toBe(1);
+
+      // Blow the first spawn's deadline: it aborts, rejects, and frees the slot.
+      await vi.advanceTimersByTimeAsync(60);
+      expect(signals[0]?.aborted).toBe(true);
+      // Reservation released so cap accounting is back to zero usage.
+      expect(manager.getGlobalActiveCount()).toBe(0);
+
+      // The second spawn was admitted the moment the slot freed.
+      await vi.advanceTimersByTimeAsync(1);
+      expect(spawnCalls.length).toBe(2);
+    });
+
+    it('uses the per-org resolved timeout when resolveSpawnTimeoutMs is provided', async () => {
+      const resolve = vi.fn(async (orgId?: string) => (orgId === 'org-fast' ? 20 : 5000));
+      let aborted = false;
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        getActiveCount: () => 0,
+        spawn: vi.fn((_ls, _id, _url, _ev, _lim, _ctx, signal) => {
+          signal?.addEventListener('abort', () => {
+            aborted = true;
+          });
+          return new Promise<never>(() => {});
+        }),
+      });
+      const manager = new ScalerManager({
+        config: makeContainerConfig(1),
+        backends: [{ name: 'c', backend }],
+        spawnTimeoutMs: 5000,
+        resolveSpawnTimeoutMs: resolve,
+      });
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1', [], undefined, 'org-fast');
+      await vi.advanceTimersByTimeAsync(30);
+      expect(resolve).toHaveBeenCalledWith('org-fast');
+      // The 20ms per-org deadline fired, not the 5000ms cluster default.
+      expect(aborted).toBe(true);
+    });
+  });
+
+  describe('ensureHostsReady()', () => {
+    it('runs every backend and continues past a throwing one', async () => {
+      const calls: string[] = [];
+      const good = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+        maxAgents: 5,
+        ensureHostReady: async () => {
+          calls.push('good');
+        },
+      });
+      const bad = createMockBackend({
+        type: 'bare-metal',
+        labelSets: [{ labels: ['linux', 'gpu'], binaryPath: '/usr/local/bin/kici-agent' }],
+        maxAgents: 3,
+        ensureHostReady: async () => {
+          calls.push('bad');
+          throw new Error('no sudo');
+        },
+      });
+      const manager = createManager(undefined, [
+        { name: 'container-prod', backend: good },
+        { name: 'bare-metal-gpu', backend: bad },
+      ]);
+      await expect(manager.ensureHostsReady()).resolves.toBeUndefined();
+      expect(calls).toEqual(['good', 'bad']);
+    });
+
+    it('skips a backend without ensureHostReady', async () => {
+      const manager = createManager();
+      await expect(manager.ensureHostsReady()).resolves.toBeUndefined();
     });
   });
 });

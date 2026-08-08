@@ -50,12 +50,37 @@ import { createDepthRefresher, type DepthRefresher } from './queue/depth-refresh
 import { EventLogWriter } from './webhook/event-log.js';
 import { AccessLogWriter } from './audit/access-log.js';
 import { SamplingRateLimiter } from './audit/sampling-rate-limiter.js';
-import { Dispatcher } from './agent/dispatcher.js';
+import { Dispatcher, DEFAULT_REDRIVE_BATCH } from './agent/dispatcher.js';
+import { PendingScaleSweeper } from './scaler/pending-scale-sweeper.js';
 import { LockFileCache } from './lockfile-cache.js';
 import { DedupCache } from './webhook/dedup.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
 import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
-import { scalerConfigReloadsTotal, pgPoolClientErrorsTotal } from './metrics/prometheus.js';
+import {
+  scalerConfigReloadsTotal,
+  pgPoolClientErrorsTotal,
+  setIngestAdmissionState,
+  setIngestAdmissionLimits,
+  ingestShedTotal,
+  ingestAdmittedTotal,
+} from './metrics/prometheus.js';
+import {
+  IngestAdmissionController,
+  type IngestAdmissionSnapshot,
+} from './webhook/ingest-admission.js';
+import { RealLoopLagSource } from './webhook/loop-lag-source.js';
+import {
+  createOrgIngestCapReader,
+  type OrgIngestCapReader,
+} from './webhook/org-ingest-cap-reader.js';
+import {
+  createSandboxAllowListReader,
+  type SandboxAllowListReader,
+  type SandboxAllowList,
+} from './pipeline/sandbox-allowlist-reader.js';
+import { resolveSandboxGrant } from './pipeline/resolve-sandbox-grant.js';
+import { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
+import { IngestOverflowReplayer } from './webhook/ingest-overflow-replayer.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
 import { createApp, SourceLocationStore } from './app.js';
 import { LocalDevSigner, KICI_LOCAL_ISSUER, type LocalSigner } from './oidc/local-dev-signer.js';
@@ -76,11 +101,13 @@ import {
   resolveScheduleInputs,
   VariantKind,
   ExecutionJobStatus,
+  InitFailureCategory,
   type LabelMatcher,
   type PeerHeartbeat,
   type CacheRefScope,
   type PeerLogsCollectRequest,
   type PeerToPeerMessage,
+  type ResolvedSandboxGrant,
 } from '@kici-dev/engine';
 import {
   ScalerManager,
@@ -95,7 +122,20 @@ import type { ScalerBackend, ScalerConfig, ScalerEvent } from './scaler/index.js
 import { createCacheStorage, generateSigningSecret } from './storage/index.js';
 import type { CacheStorage } from './storage/index.js';
 import { assertAgentReachableStorage } from './storage/loopback-guard.js';
-import { createProvenanceTrustRoot, type ProvenanceTrustRoot } from './provenance/trust-root.js';
+import {
+  createProvenanceTrustRoot,
+  provenanceTrustRootFromRepo,
+  type ProvenanceTrustRoot,
+} from './provenance/trust-root.js';
+import { OrchestratorSigningKeyRepo } from './db/repos/signing-keys-repo.js';
+import { reconcileOrchestratorSigningKey } from './oidc/reconcile-signing-key.js';
+import { DashboardEncryptionKeyRepo } from './db/repos/dashboard-encryption-keys-repo.js';
+import {
+  reconcileDashboardEncryptionKey,
+  type ResolvedDashboardEncryptionKey,
+} from './secrets/dashboard-encryption-key.js';
+import { isProvenanceSigningEnabled } from './oidc/orchestrator-signer-factory.js';
+import type { Signer } from './oidc/signer.js';
 import {
   SourceCache,
   BuildCoordinator,
@@ -108,8 +148,14 @@ import {
   type UserCacheOrgLimits,
   type UserCacheOrgLimitsReader,
 } from './cache/index.js';
+import {
+  ArtifactStore,
+  type ArtifactOrgLimits,
+  type ArtifactOrgLimitsReader,
+} from './artifacts/artifact-store.js';
 import { CheckRunReporter } from './reporting/check-run-reporter.js';
 import { CheckRunTrackingStore } from './reporting/check-run-tracking-store.js';
+import { reportJobCheckRunCompletion } from './reporting/job-check-run-completion.js';
 import { ScalerStateStore } from './scaler/scaler-state-store.js';
 import {
   dispatchReadyJob,
@@ -117,6 +163,7 @@ import {
   restorePendingJobContexts,
   openEvalGate,
   clearEvalGatesForRun,
+  resolveOrgId,
 } from './pipeline/processor.js';
 import { restorePendingWorkflowContexts } from './pipeline/pending-workflow-context.js';
 import { recomputeNeedsSatisfied } from './pipeline/needs-scheduler.js';
@@ -124,6 +171,8 @@ import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { createLogStorage, type LogStorage } from './reporting/log-storage.js';
 import { ExecutionTracker, type ExecutionTrackerDeps } from './reporting/execution-tracker.js';
 import { LogWriter } from './reporting/log-writer.js';
+import { createLogChunkSink, type NormalizedLogChunk } from './reporting/log-chunk-sink.js';
+import { normalizePeerLogChunk } from './reporting/peer-log-normalize.js';
 import { StaleRunDetector } from './stale-detector/stale-run-detector.js';
 import { WorkflowDeadlineDetector } from './stale-detector/workflow-deadline-detector.js';
 import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
@@ -157,6 +206,7 @@ import {
   createOrphanSecretCleanupHandler,
 } from './secrets/index.js';
 import { BackendRegistry } from './secrets/backend-registry.js';
+import { loadRoutableStores } from './secrets/scope-routing.js';
 import { BackendHealthChecker } from './secrets/backend-health.js';
 import { BackendSyncManager } from './secrets/backend-sync.js';
 import type { SecretStore } from '@kici-dev/engine';
@@ -178,7 +228,10 @@ import {
   universalGitRegistrationErrorsTotal,
   setDeclaredHostsUnreachable,
   setDbCollationDrift,
+  incScalerRedispatch,
+  setDraining,
 } from './metrics/prometheus.js';
+import { DrainController } from './drain/drain-controller.js';
 import { ConcurrencyGroupTracker, ConcurrencyQueueManager } from './concurrency/index.js';
 import { RegistrationStore } from './registration/registration-store.js';
 import { RegistrationIndex } from './registration/registration-index.js';
@@ -189,6 +242,7 @@ import { decryptPrivateKey, decryptSecretOutput } from './secrets/ephemeral-keys
 import { encrypt, decrypt as pskDecrypt, deriveKey } from '@kici-dev/shared';
 import { ProviderRegistry } from './provider-registry.js';
 import { ClusterIdentity } from './cluster/cluster-identity.js';
+import { ClusterSettingsReader } from './cluster/cluster-settings-reader.js';
 import { resolveAndPersistClusterName } from './config/cluster-name.js';
 import { getClusterId } from './config/cluster-id.js';
 import { JoinHandler } from './cluster/join-handler.js';
@@ -215,6 +269,8 @@ export interface OrchestratorSubsystems {
   config: AppConfig;
   db: Kysely<Database>;
   pool: pg.Pool;
+  /** Cluster-global settings reader (fleet-wide tunables on cluster_settings). */
+  clusterSettings: ClusterSettingsReader;
   providerRegistry: ProviderRegistry;
   agentRegistry: AgentRegistry;
   hostRosterStore: HostRosterStore;
@@ -232,6 +288,7 @@ export interface OrchestratorSubsystems {
   sourceCache: SourceCache | undefined;
   depCache: DepCache | undefined;
   userCache: UserCache | undefined;
+  artifactStore: ArtifactStore | undefined;
   /** Server-side jobId -> user-cache-namespace store, written at dispatch, read by the agent-WS handler. */
   dispatchCacheRefs: DispatchCacheRefTracker;
   buildCoordinator: BuildCoordinator | undefined;
@@ -248,6 +305,16 @@ export interface OrchestratorSubsystems {
   secretResolver: SecretResolver | null;
   adminDeps: AdminRouteDeps | undefined;
   pgSecretStore: PgSecretStore | undefined;
+  /**
+   * Dashboard-encryption (X25519) key resolver for browser-sealed dashboard
+   * writes under the `encrypted` posture. Present whenever KICI_SECRET_KEY is
+   * configured; absent ⇒ `encrypted` writes fail closed at the WS handler.
+   */
+  dashboardEncryption:
+    | {
+        resolve: () => Promise<ResolvedDashboardEncryptionKey | null>;
+      }
+    | undefined;
   tokenStore: AgentTokenStore;
   ownershipTracker: OwnershipTracker;
   lockFileCache: LockFileCache;
@@ -318,6 +385,16 @@ export interface OrchestratorSubsystems {
     msg: PeerLogsCollectRequest,
     send: (out: PeerToPeerMessage) => boolean,
   ) => Promise<void>;
+  /** Shared webhook-ingest admission controller (HTTP + WS relay paths). */
+  ingestController: IngestAdmissionController;
+  /** Cached per-org ingest cap reader for admission fairness keying. */
+  ingestCapReader: OrgIngestCapReader;
+  /** Cached per-org container-sandbox escape-hatch allow-list reader (dispatch). */
+  sandboxAllowListReader: SandboxAllowListReader;
+  /** Durable overflow buffer capturing shed deliveries (HTTP + WS relay). */
+  ingestOverflowBuffer: IngestOverflowBuffer;
+  /** Background replayer draining the overflow buffer once capacity recovers. */
+  ingestOverflowReplayer: IngestOverflowReplayer;
 }
 
 /**
@@ -336,8 +413,16 @@ export interface OrchestratorHooks {
     onStepStatusForward?: ExecutionTrackerDeps['onStepStatusForward'];
     onJobStatusChange?: ExecutionTrackerDeps['onJobStatusChange'];
     onRunEventEmit?: ExecutionTrackerDeps['onRunEventEmit'];
+    onOrchLog?: ExecutionTrackerDeps['onOrchLog'];
     orgId?: string;
   };
+
+  /**
+   * Forward a step-log chunk to the Platform for browser fan-out. Implemented
+   * by modes that hold a Platform connection; left undefined in independent
+   * mode, where logs are persisted but not relayed.
+   */
+  forwardLogChunk?: (chunk: NormalizedLogChunk) => void;
 
   /**
    * Called after the secrets subsystem is initialized.
@@ -414,6 +499,8 @@ async function initializeScaler(
   db: Kysely<Database>,
   tokenStore: AgentTokenStore,
   onScalerEvent: (runId: string, jobId: string, event: ScalerEvent) => void,
+  isDraining: () => boolean,
+  clusterSettings: ClusterSettingsReader,
 ): Promise<{ manager: ScalerManager; config: ScalerConfig } | null> {
   if (!config.scalerConfigPath) return null;
 
@@ -475,6 +562,10 @@ async function initializeScaler(
             networkIsolation: s.networkIsolation,
             tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // Live per-spawn resolve of the fleet-wide agent-token TTL override
+            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
+            tokenTtlProvider: () =>
+              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
             roles: s.roles,
           }),
         };
@@ -488,6 +579,10 @@ async function initializeScaler(
             defaultResources: scalerConfig.defaults?.resources,
             tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // Live per-spawn resolve of the fleet-wide agent-token TTL override
+            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
+            tokenTtlProvider: () =>
+              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
             roles: s.roles,
             enforceCgroups: s.enforceCgroups,
           }),
@@ -499,6 +594,7 @@ async function initializeScaler(
         const gateway = fcNet?.gateway ?? '10.0.0.1';
         const netmask = fcNet?.netmask ?? '255.255.255.0';
         const table = fcNet?.table ?? 'kici';
+        const autoProvisionHost = fcNet?.autoProvisionHost ?? true;
         const ipAllocator = new DbIpAllocator({ db, cidr, gateway, netmask });
         return {
           name: s.name,
@@ -520,8 +616,13 @@ async function initializeScaler(
             gateway,
             netmask,
             table,
+            autoProvisionHost,
             tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // Live per-spawn resolve of the fleet-wide agent-token TTL override
+            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
+            tokenTtlProvider: () =>
+              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
             roles: s.roles,
           }),
         };
@@ -545,6 +646,13 @@ async function initializeScaler(
       instanceId: config.instanceId,
     },
     onScalerEvent,
+    isDraining,
+    spawnTimeoutMs: config.scalerSpawnTimeoutMs,
+    resolveSpawnTimeoutMs: makeOrgTimeoutReaderById(
+      db,
+      'scaler_spawn_timeout_ms',
+      config.scalerSpawnTimeoutMs,
+    ),
   });
 
   // Hydrate scaler state from DB so a Raft leader switch / coord
@@ -589,6 +697,10 @@ async function initializeScaler(
     }
   }
 
+  // Verify + self-provision each backend's host prerequisites (Firecracker
+  // bridge) before spawning starts. Degraded-on-failure — never aborts startup.
+  await scalerManager.ensureHostsReady();
+
   // Start warm pool idle check interval
   scalerManager.start();
 
@@ -607,6 +719,7 @@ interface CacheInfra {
   sourceCache: SourceCache | undefined;
   depCache: DepCache | undefined;
   userCache: UserCache | undefined;
+  artifactStore: ArtifactStore | undefined;
   buildCoordinator: BuildCoordinator | undefined;
   pendingBuilds: PendingBuildTracker | undefined;
   pendingInits: PendingInitTracker;
@@ -617,8 +730,7 @@ interface CacheInfra {
    * for the s3 backend (and when caching is disabled).
    */
   fsCache:
-    | { basePath: string; signingSecret: string; ttlMs: number; maxUploadBytes: number }
-    | undefined;
+    { basePath: string; signingSecret: string; ttlMs: number; maxUploadBytes: number } | undefined;
 }
 
 function buildCacheLayers(
@@ -626,11 +738,14 @@ function buildCacheLayers(
   config: AppConfig,
   storageType: 's3' | 'filesystem',
   db: Kysely<Database> | undefined,
+  clusterSettings?: ClusterSettingsReader,
 ): CacheInfra {
   const sourceCache = new SourceCache({ storage: cacheStorage });
   const depCache = new DepCache({
     storage: cacheStorage,
     maxTarballBytes: config.cacheMaxTarballBytes,
+    cacheTtlDaysFallback: config.cacheTtlDays,
+    clusterSettings,
   });
   const userCache = new UserCache({
     storage: cacheStorage,
@@ -640,6 +755,19 @@ function buildCacheLayers(
     // columns fall back to the cluster-wide defaults above.
     orgLimitsReader: db ? makeOrgCacheLimitsReader(db) : undefined,
   });
+  // Artifacts require a DB (row store + org-quota accounting); only built when
+  // a DB is present, otherwise ctx.artifacts is unavailable in this mode.
+  const artifactStore = db
+    ? new ArtifactStore({
+        storage: cacheStorage,
+        db,
+        quotaBytes: config.artifactQuotaBytes,
+        ttlMs: config.artifactTtlMs,
+        maxBytes: config.artifactMaxBytes,
+        maxPerRun: config.artifactMaxPerRun,
+        orgLimitsReader: makeOrgArtifactLimitsReader(db),
+      })
+    : undefined;
   const buildCoordinator = new BuildCoordinator({ timeoutMs: config.cacheBuildTimeoutMs });
   const pendingBuilds = new PendingBuildTracker();
   logger.info('Cache initialized', {
@@ -654,6 +782,7 @@ function buildCacheLayers(
     sourceCache,
     depCache,
     userCache,
+    artifactStore,
     buildCoordinator,
     pendingBuilds,
     pendingInits: new PendingInitTracker(),
@@ -678,6 +807,31 @@ function makeOrgCacheLimitsReader(db: Kysely<Database>): UserCacheOrgLimitsReade
       quotaBytes:
         row?.user_cache_quota_bytes != null ? Number(row.user_cache_quota_bytes) : undefined,
       ttlMs: row?.user_cache_ttl_ms != null ? Number(row.user_cache_ttl_ms) : undefined,
+    };
+  };
+}
+
+/**
+ * Build the per-org artifact-limits reader backed by `org_settings`. Returns the
+ * per-org quota/TTL overrides (NULL columns → undefined → cluster default).
+ */
+function makeOrgArtifactLimitsReader(db: Kysely<Database>): ArtifactOrgLimitsReader {
+  return async (customerId: string): Promise<ArtifactOrgLimits> => {
+    const row = await db
+      .selectFrom('org_settings')
+      .select([
+        'artifact_quota_bytes',
+        'artifact_ttl_ms',
+        'artifact_max_bytes',
+        'artifact_max_per_run',
+      ])
+      .where('customer_id', '=', customerId)
+      .executeTakeFirst();
+    return {
+      quotaBytes: row?.artifact_quota_bytes != null ? Number(row.artifact_quota_bytes) : undefined,
+      ttlMs: row?.artifact_ttl_ms != null ? Number(row.artifact_ttl_ms) : undefined,
+      maxBytes: row?.artifact_max_bytes != null ? Number(row.artifact_max_bytes) : undefined,
+      maxPerRun: row?.artifact_max_per_run != null ? Number(row.artifact_max_per_run) : undefined,
     };
   };
 }
@@ -713,7 +867,80 @@ function makeAckTimeoutReader(
   };
 }
 
-function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefined): CacheInfra {
+/** org_settings numeric columns readable per-org by {@link makeOrgNumberReader}. */
+type OrgNumberColumn =
+  'reroute_spawn_window_ms' | 'reroute_ack_timeout_ms' | 'reroute_max_hops' | 'queue_timeout_ms';
+
+/**
+ * Build a per-job resolver for a numeric `org_settings` column: the job's org
+ * (jobConfig.cacheOrgId) override wins, falling back to the cluster-wide
+ * default when the DB, the org row, or the column value is absent. Mirrors
+ * {@link makeAckTimeoutReader} for the reroute-tunable columns.
+ */
+function makeOrgNumberReader(
+  db: Kysely<Database> | undefined,
+  column: OrgNumberColumn,
+  fallback: number,
+): (job: { jobConfig?: Record<string, unknown> }) => Promise<number> {
+  return async (job) => {
+    const orgId =
+      typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined;
+    if (db && orgId) {
+      try {
+        const row = await db
+          .selectFrom('org_settings')
+          .select(column)
+          .where('customer_id', '=', orgId)
+          .executeTakeFirst();
+        const value = row?.[column];
+        if (value != null) return Number(value);
+      } catch (err) {
+        logger.warn(`Failed to read org_settings.${column}, using cluster default`, {
+          error: toErrorMessage(err),
+        });
+      }
+    }
+    return fallback;
+  };
+}
+
+/**
+ * Build a per-org resolver for a numeric `org_settings` column keyed directly
+ * on the org id: the org's override wins, falling back to the cluster-wide
+ * default when the DB, the org row, or the column value is absent. Sibling of
+ * {@link makeOrgNumberReader} for callers (the scaler) that already hold the
+ * org id rather than a job object.
+ */
+function makeOrgTimeoutReaderById(
+  db: Kysely<Database> | undefined,
+  column: 'scaler_spawn_timeout_ms',
+  fallback: number,
+): (orgId: string | undefined) => Promise<number> {
+  return async (orgId) => {
+    if (db && orgId) {
+      try {
+        const row = await db
+          .selectFrom('org_settings')
+          .select(column)
+          .where('customer_id', '=', orgId)
+          .executeTakeFirst();
+        const value = row?.[column];
+        if (value != null) return Number(value);
+      } catch (err) {
+        logger.warn(`Failed to read org_settings.${column}, using cluster default`, {
+          error: toErrorMessage(err),
+        });
+      }
+    }
+    return fallback;
+  };
+}
+
+function initializeCacheInfra(
+  config: AppConfig,
+  db: Kysely<Database> | undefined,
+  clusterSettings?: ClusterSettingsReader,
+): CacheInfra {
   if (config.storage?.type === 's3') {
     const cacheStorage = createCacheStorage({
       type: 's3',
@@ -726,7 +953,7 @@ function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefine
       uploadEndpoint: config.storage.uploadEndpoint,
       forcePathStyle: config.storage.forcePathStyle,
     });
-    return buildCacheLayers(cacheStorage, config, 's3', db);
+    return buildCacheLayers(cacheStorage, config, 's3', db, clusterSettings);
   }
 
   if (config.storage?.type === 'filesystem') {
@@ -741,7 +968,7 @@ function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefine
       baseUrl,
       signingSecret,
     });
-    const layers = buildCacheLayers(cacheStorage, config, 'filesystem', db);
+    const layers = buildCacheLayers(cacheStorage, config, 'filesystem', db, clusterSettings);
     return {
       ...layers,
       fsCache: { basePath, signingSecret, ttlMs, maxUploadBytes: config.cacheMaxTarballBytes },
@@ -754,6 +981,7 @@ function initializeCacheInfra(config: AppConfig, db: Kysely<Database> | undefine
     sourceCache: undefined,
     depCache: undefined,
     userCache: undefined,
+    artifactStore: undefined,
     buildCoordinator: undefined,
     pendingBuilds: undefined,
     pendingInits: new PendingInitTracker(),
@@ -800,16 +1028,19 @@ async function initializeSecrets(
   pgSecretStore.customerSecretsEnabled = config.pgCustomerSecrets;
 
   // Load registered backends from DB via BackendRegistry (replaces hardcoded Map)
-  const backendRegistry = new BackendRegistry(db, masterKey, logger);
+  const backendRegistry = new BackendRegistry(db, masterKey, logger, oldMasterKey);
   // Self-heal: ensure the default `pg` backend row exists (idempotent). Covers
   // DBs where the row was lost to operator error or a buggy purge.
   await backendRegistry.ensureDefaultPgBackend();
-  const backendStores = await backendRegistry.loadAllStores(auditLogger);
-
-  // Ensure PG default backend is always present
-  if (!backendStores.has('pg')) {
-    backendStores.set('pg', pgSecretStore);
-  }
+  // The `pg` entry is always the configured `pgSecretStore`, never the one the
+  // registry synthesizes for the seeded row — only the configured instance
+  // carries `pgCustomerSecrets`, the resolved key version and the old-master-key
+  // fallback. See `loadRoutableStores`.
+  const backendStores = await loadRoutableStores<SecretStore, AuditLogger>(
+    backendRegistry,
+    auditLogger,
+    pgSecretStore,
+  );
 
   // Initialize health checker and sync manager for external backends
   const healthChecker = new BackendHealthChecker(backendRegistry, logger);
@@ -1047,15 +1278,18 @@ export function buildMatrixOutputsEnvelope(
   baseName: string,
   children: Array<{ job_name: string; parsed: Record<string, unknown> }>,
 ): { byMatrix: Record<string, Record<string, unknown>>; merged: Record<string, unknown> } {
-  const byMatrix: Record<string, Record<string, unknown>> = {};
   let merged: Record<string, unknown> = {};
   const ordered = [...children].sort((a, b) => a.job_name.localeCompare(b.job_name));
   for (const child of ordered) {
-    // `${base} (${suffix})` -> suffix
-    const suffix = child.job_name.slice(baseName.length + 2, -1);
-    byMatrix[suffix] = child.parsed;
     merged = { ...merged, ...child.parsed };
   }
+  // `Object.fromEntries` defines own properties. Assigning `byMatrix[suffix]`
+  // in the loop would run the inherited setter for a matrix value named
+  // `__proto__` and silently drop that child's outputs from the envelope.
+  const byMatrix: Record<string, Record<string, unknown>> = Object.fromEntries(
+    // `${base} (${suffix})` -> suffix
+    ordered.map((child) => [child.job_name.slice(baseName.length + 2, -1), child.parsed]),
+  );
   return { byMatrix, merged };
 }
 
@@ -1257,6 +1491,7 @@ function buildOnDispatch(
   agentRegistry: AgentRegistry,
   providerRegistryRef: { current: ProviderRegistry },
   dispatchCacheRefs: DispatchCacheRefTracker,
+  clusterSettings: ClusterSettingsReader,
 ) {
   return async (agentId: string, job: any) => {
     const entry = agentRegistry.get(agentId);
@@ -1295,15 +1530,12 @@ function buildOnDispatch(
 
     const dispatchSecrets = job.jobConfig.secrets as Record<string, string> | undefined;
     const dispatchNamespacedSecrets = job.jobConfig.namespacedSecrets as
-      | Record<string, Record<string, string>>
-      | undefined;
+      Record<string, Record<string, string>> | undefined;
     const dispatchRunPublicKey = job.jobConfig.runPublicKey as string | undefined;
     const dispatchNpmRegistries = job.jobConfig.npmRegistries as
-      | Array<Record<string, unknown>>
-      | undefined;
+      Array<Record<string, unknown>> | undefined;
     const dispatchInstallEnvSecrets = job.jobConfig.installEnvSecrets as
-      | Record<string, string>
-      | undefined;
+      Record<string, string> | undefined;
     // Strip secrets/runPublicKey/internal-auth-context — agent never sees these.
     const cleanJobConfig = Object.fromEntries(
       Object.entries(job.jobConfig).filter(
@@ -1338,6 +1570,13 @@ function buildOnDispatch(
       lockFileUrl,
       jobConfig: cleanJobConfig,
       timestamp: Date.now(),
+      // Fleet-wide concurrency-slot wait timeout, resolved live from
+      // cluster_settings (live override wins) and pushed to the agent; the
+      // agent falls back to its own default when absent.
+      concurrencyWaitTimeoutMs: await clusterSettings.getNumber(
+        'concurrency_wait_timeout_ms',
+        config.concurrencyWaitTimeoutMs,
+      ),
       // Lift user-cache namespacing from jobConfig to top-level dispatch fields
       // (jobDispatchSchema carries orgId/repoId/cacheRefScope) so the agent-WS
       // handler resolves the cache ref from the tracked dispatch.
@@ -1482,6 +1721,8 @@ interface InternalEventDispatchDeps {
   dispatcher: Dispatcher;
   coordinator: RunCoordinator | null;
   executionTracker: ExecutionTracker;
+  db: Kysely<Database>;
+  sandboxAllowListReader: SandboxAllowListReader;
 }
 
 /**
@@ -1592,7 +1833,8 @@ async function dispatchInternalJobsDirect(
   logEachDispatch: boolean,
 ): Promise<Array<{ jobId: string; jobName: string }>> {
   const dispatchedJobs: Array<{ jobId: string; jobName: string }> = [];
-  const buildJobConfig = (job: any) => buildInternalJobConfigForWorkflow(workflow, job);
+  const buildJobConfig = (job: any) =>
+    buildInternalJobConfigForWorkflow(workflow, job, undefined, ctx.event?.payload);
 
   for (const job of staticJobs) {
     const sel = internalJobRunsOnSelectors(job);
@@ -1635,13 +1877,30 @@ async function dispatchInternalJobsDirect(
 export function buildInternalJobConfigForWorkflow(
   workflow: any,
   job: any,
+  sandboxGrant?: ResolvedSandboxGrant,
+  firedSchedule?: { cronExpression?: string; timezone?: string },
 ): Record<string, unknown> {
   // Schedule fires carry no operator input — resolve the trigger's declared
-  // defaults. Non-schedule internal events (workflow_complete, job_complete)
-  // have no schedule trigger, so this is undefined and the field is omitted.
-  const scheduleTrigger = (workflow.triggers ?? []).find(
-    (t: { _type?: string }) => t._type === 'schedule',
-  ) as { inputs?: Parameters<typeof resolveScheduleInputs>[0] } | undefined;
+  // defaults. A workflow may declare several schedule() triggers, so for a
+  // __schedule_fire event resolve the trigger whose cron matches the schedule
+  // that actually fired; fall back to the first schedule for internal events
+  // that carry no cron (workflow_complete, job_complete). Non-schedule events
+  // have no schedule trigger, so dispatchInputs stays undefined and is omitted.
+  const scheduleTriggers = (
+    (workflow.triggers ?? []) as Array<{
+      _type?: string;
+      cronExpression?: string;
+      timezone?: string;
+      inputs?: Parameters<typeof resolveScheduleInputs>[0];
+    }>
+  ).filter((t) => t._type === 'schedule');
+  const firedCron = firedSchedule?.cronExpression;
+  const firedTz = firedSchedule?.timezone;
+  const scheduleTrigger = firedCron
+    ? (scheduleTriggers.find(
+        (t) => t.cronExpression === firedCron && (t.timezone ?? '') === (firedTz ?? ''),
+      ) ?? scheduleTriggers[0])
+    : scheduleTriggers[0];
   const dispatchInputs = resolveScheduleInputs(scheduleTrigger?.inputs);
   return {
     source: workflow.source ?? undefined,
@@ -1656,6 +1915,13 @@ export function buildInternalJobConfigForWorkflow(
     ...(dispatchInputs && { dispatchInputs }),
     ...(workflow.contentHash && { contentHash: workflow.contentHash }),
     ...(job.resources && { resources: job.resources }),
+    // The job's container image selects the container execution backend on the
+    // agent (determineExecutionMode gives jobConfig.container top priority), so
+    // it must survive dispatch or a container:-field job silently runs bare-metal.
+    ...(job.container && { container: job.container }),
+    // The dispatch-resolved sandbox escape-hatch grant (allow-listed by the
+    // caller). Absent ⇒ no grant ⇒ default hardened posture.
+    ...(sandboxGrant && { sandboxGrant }),
   };
 }
 
@@ -1667,6 +1933,37 @@ export function buildInternalJobConfigForWorkflow(
  * try/catch by the caller so a single bad decision doesn't poison the
  * batch.
  */
+/**
+ * Resolve the static jobs' `sandbox:` escape-hatch requests for an internally
+ * triggered workflow against the org allow-list. Populates `out` with the
+ * authorized grants and returns a denial reason (to fail the run) on the first
+ * non-allow-listed request — deny is loud + total, never a silent strip. When no
+ * job requests an escape hatch the allow-list is not even read. An org that
+ * cannot be resolved from the routing key falls back to deny-all (safe).
+ */
+async function resolveInternalSandboxGrants(
+  staticJobs: any[],
+  routingKey: string,
+  db: Kysely<Database>,
+  reader: SandboxAllowListReader,
+  out: Map<string, ResolvedSandboxGrant>,
+): Promise<string | null> {
+  if (!staticJobs.some((j) => j.sandbox)) return null;
+  let allowList: SandboxAllowList = { capabilities: [], allowHostNetwork: false };
+  try {
+    allowList = await reader.read(await resolveOrgId(db, routingKey));
+  } catch {
+    // Org unresolvable → keep the deny-all default (a request will be denied).
+  }
+  for (const job of staticJobs) {
+    if (!job.sandbox) continue;
+    const res = resolveSandboxGrant(job.sandbox, allowList);
+    if ('denied' in res) return `job '${job.name}': ${res.denied.reason}`;
+    if (res.grant) out.set(job.name, res.grant);
+  }
+  return null;
+}
+
 async function dispatchInternalEventDecision(
   decision: any,
   lockFile: any,
@@ -1676,9 +1973,19 @@ async function dispatchInternalEventDecision(
   const workflow = lockFile.workflows.find((w: any) => w.name === decision.workflowName);
   if (!workflow) return;
 
+  // Dispatch-resolved sandbox escape-hatch grants, keyed by lock-job name.
+  // Populated below (after the run is started) from the org allow-list; the
+  // closure reads it by reference at job-dispatch time.
+  const sandboxGrants = new Map<string, ResolvedSandboxGrant>();
+
   // Patch source field for buildInternalJobConfig — needs lockFile fallback
   const buildJobConfig = (job: any): Record<string, unknown> => ({
-    ...buildInternalJobConfigForWorkflow(workflow, job),
+    ...buildInternalJobConfigForWorkflow(
+      workflow,
+      job,
+      sandboxGrants.get(job.name),
+      ctx.event?.payload,
+    ),
     source: workflow.source ?? lockFile.source,
   });
 
@@ -1693,6 +2000,16 @@ async function dispatchInternalEventDecision(
         ? ctx.event.eventName.slice(2)
         : ctx.event.eventName;
 
+  // Mark runs dispatched by a failure-lifecycle trigger so their own completion
+  // is excluded from batch accumulation (a broken notifier must not re-trigger
+  // itself). See EventRouter.isFailureLifecycleRun.
+  const matchedTrigger = workflow.triggers?.[decision.matchedTrigger ?? -1];
+  const dispatchedByFailureLifecycle =
+    matchedTrigger?._type === 'workflows_failed_batch' ||
+    (matchedTrigger?._type === 'workflow_complete' &&
+      Array.isArray(matchedTrigger.status) &&
+      matchedTrigger.status.includes('failed'));
+
   await deps.executionTracker.onExecutionStarted(
     runId,
     workflow.name,
@@ -1702,7 +2019,11 @@ async function dispatchInternalEventDecision(
     ctx.cronCommitSha,
     ctx.event.id,
     ctx.providerContext,
-    { matched: true, eventName: ctx.event.eventName },
+    {
+      matched: true,
+      eventName: ctx.event.eventName,
+      ...(dispatchedByFailureLifecycle && { dispatchedByFailureLifecycle: true }),
+    },
     [],
     ctx.routingKey,
     undefined,
@@ -1721,6 +2042,32 @@ async function dispatchInternalEventDecision(
   );
 
   const staticJobs = workflow.jobs.filter(isLockStaticJob);
+
+  // Resolve each static job's `sandbox:` escape-hatch request against the org
+  // allow-list (the single enforcement point — the agent never reads it). A
+  // denied request fails the run loudly before any job is dispatched; an org
+  // that cannot be resolved from the routing key defaults to deny-all (safe).
+  const sandboxDenial = await resolveInternalSandboxGrants(
+    staticJobs,
+    ctx.routingKey,
+    deps.db,
+    deps.sandboxAllowListReader,
+    sandboxGrants,
+  );
+  if (sandboxDenial) {
+    await deps.executionTracker.failRun(runId, sandboxDenial, {
+      scope: 'run',
+      category: InitFailureCategory.enum.sandbox_denied,
+      message: sandboxDenial,
+    });
+    logger.warn('Internal event run failed: sandbox escape-hatch denied', {
+      runId,
+      workflow: workflow.name,
+      reason: sandboxDenial,
+    });
+    return;
+  }
+
   const dispatchedJobs =
     deps.coordinator && staticJobs.length > 0
       ? await routeInternalJobsViaCoordinator(
@@ -1754,6 +2101,8 @@ function buildOnEventMatched(
   executionTracker: ExecutionTracker,
   providerRegistryRef: { current: ProviderRegistry },
   coordinatorRef: { current: RunCoordinator | null },
+  db: Kysely<Database>,
+  sandboxAllowListReader: SandboxAllowListReader,
 ) {
   return async (
     event: any,
@@ -1803,6 +2152,8 @@ function buildOnEventMatched(
       dispatcher: dispatcherRef.current,
       coordinator: coordinatorRef.current,
       executionTracker,
+      db,
+      sandboxAllowListReader,
     };
 
     for (const decision of matchedWorkflows) {
@@ -1865,6 +2216,10 @@ function initializeCluster(
   localConfigVersionRef: { value: number },
   stepLogBuffer: StepLogBuffer,
   eventRetryScannerRef: { onBecomeLeader: () => void; onLoseLeadership: () => void },
+  isDraining: () => boolean,
+  clusterSettings: ClusterSettingsReader,
+  logWriter: LogWriter,
+  forwardLogChunk: ((chunk: NormalizedLogChunk) => void) | undefined,
 ): ClusterInfra {
   const peerClients = new Map<string, PeerClient>();
 
@@ -1882,7 +2237,7 @@ function initializeCluster(
       mandatoryLabels: [...e.mandatoryLabels],
       scalerName: scalerManager?.getBackendForAgent(e.agentId) ?? null,
     })),
-    draining: false,
+    draining: isDraining(),
     capabilities: { s3LogAccess: !!cacheStorage },
     ...(scalerManager && {
       scalerCapacity: scalerManager.getStatus().backends.map((b) => ({
@@ -1897,6 +2252,7 @@ function initializeCluster(
     }),
     configVersion: localConfigVersionRef.value,
     registryVersion: registrationIndex.getVersion(),
+    clusterSettingsVersion: clusterSettings.getCachedVersion(),
     term: raftRef?.getCurrentTerm() ?? 0,
     leaderId: raftRef?.getLeaderId() ?? null,
   });
@@ -2009,6 +2365,17 @@ function initializeCluster(
     sendAndWaitAckViaHandler: (targetId, msg, timeoutMs) =>
       peerHandlerObj?.sendAndWaitAck(targetId, msg, timeoutMs) ?? Promise.resolve(false),
     sendToPeerViaHandler: (targetId, msg) => peerHandlerObj?.sendToPeer(targetId, msg) ?? false,
+    getRerouteSpawnWindowMs: makeOrgNumberReader(
+      db,
+      'reroute_spawn_window_ms',
+      config.rerouteSpawnWindowMs,
+    ),
+    getRerouteAckTimeoutMs: makeOrgNumberReader(
+      db,
+      'reroute_ack_timeout_ms',
+      config.rerouteAckTimeoutMs,
+    ),
+    getRerouteMaxHops: makeOrgNumberReader(db, 'reroute_max_hops', config.rerouteMaxHops),
   });
 
   // Orphan recovery (leader-only)
@@ -2017,6 +2384,8 @@ function initializeCluster(
     raft: raftNode,
     peerRegistry,
     executionTracker,
+    clusterSettings,
+    rerouteFlapGraceFallbackMs: config.rerouteFlapGraceMs,
   });
   orphanRecoveryRef = orphanRecovery;
 
@@ -2028,6 +2397,19 @@ function initializeCluster(
       | ((msg: PeerLogsCollectRequest, send: (out: PeerToPeerMessage) => boolean) => Promise<void>)
       | null;
   } = { current: null };
+
+  // A worker orchestrator has no database and no log storage, so the
+  // coordinator that owns the run persists the bytes its worker relays. The
+  // storage key comes from the same `getJobName` call that fills
+  // `execution_steps.log_path`, so the reader and the writer agree by
+  // construction.
+  const peerLogChunkSink = createLogChunkSink({
+    source: 'peer',
+    stepLogBuffer,
+    logWriter,
+    executionTracker,
+    ...(forwardLogChunk && { forwardToPlatform: forwardLogChunk }),
+  });
 
   // Peer handler for incoming WS connections
   const peerHandlerRef = createPeerHandler({
@@ -2051,12 +2433,9 @@ function initializeCluster(
       }
     },
     onPeerLogChunk: (chunk, _peerId) => {
-      // Forward worker log chunks to the same log buffer used for local agents
-      const textLines = chunk.lines.map((l) => l.text);
-      stepLogBuffer.addLines(
-        { runId: chunk.runId, jobId: chunk.jobId, stepIndex: chunk.stepIndex },
-        textLines,
-      );
+      for (const group of normalizePeerLogChunk(chunk)) {
+        peerLogChunkSink(group);
+      }
     },
     onPeerCacheUploadRequest: async (req, _peerId) => {
       if (!cacheStorage) {
@@ -2078,8 +2457,9 @@ function initializeCluster(
         uploadUrl,
       };
     },
-    onJobProgress: (msg, reply) => coordinator.onPeerJobProgress(msg, reply),
-    onPeerScalerEvent: (msg) => coordinator.onPeerScalerEvent(msg),
+    onJobProgress: (msg, fromPeerId, reply) =>
+      coordinator.onPeerJobProgress(msg, fromPeerId, reply),
+    onPeerScalerEvent: (msg, fromPeerId) => coordinator.onPeerScalerEvent(msg, fromPeerId),
     onJobCancel: (msg) => {
       if (!msg.jobId) return;
       const agentId = dispatcher.getAgentIdForJob(msg.jobId);
@@ -2124,6 +2504,21 @@ function initializeCluster(
         };
       }
       return reloader.executeReload({ source: 'cluster', drain: msg.drain });
+    },
+    onPeerClusterSettingsRequest: async () => {
+      // A DB-less worker pulls the worker-relevant settings snapshot. The async
+      // DB read lives here (off the synchronous heartbeat hot path). The leader
+      // is the sole holder of cluster_settings, so this resolves live.
+      const agentTokenTtlMs = await clusterSettings.getNumber(
+        'agent_token_ttl_ms',
+        config.agentTokenTtlMs,
+      );
+      const version = clusterSettings.getCachedVersion();
+      logger.info('Serving worker cluster-settings pull', { version, agentTokenTtlMs });
+      return {
+        version,
+        settings: { agentTokenTtlMs },
+      };
     },
   });
 
@@ -2199,6 +2594,11 @@ export async function bootstrapOrchestrator(
 ): Promise<void> {
   // 1. Initialize database
   const pool = createPool(config.databaseUrl, {
+    config: {
+      max: config.dbPoolMax,
+      connectionTimeoutMillis: config.dbPoolAcquireTimeoutMs,
+      statement_timeout: config.dbStatementTimeoutMs,
+    },
     onError: (_err, source) => pgPoolClientErrorsTotal.add(1, { source }),
   });
   const db = createDb(pool);
@@ -2321,14 +2721,42 @@ export async function bootstrapOrchestrator(
   // the fleet fan-out below (which issues the requests and awaits the bundles).
   const fleetAgentCollector = new FleetAgentCollector({ timeoutMs: FLEET_NODE_TIMEOUT_MS });
 
-  // 8. Create job queue
+  // Cluster-global settings reader: one whole-row short-TTL cache shared by
+  // every consumer of a fleet-wide tunable (cluster_settings) — the queue,
+  // cache, event circuit-breaker, dispatch build, scaler backends, and the
+  // cluster recovery sweepers. Degrades to the config.ts defaults on a sick DB.
+  const clusterSettings = new ClusterSettingsReader(db, config.clusterSettingsCacheTtlMs);
+
+  // 8. Create job queue. `queue_max_depth` is fleet-wide (cluster_settings);
+  // `queue_timeout_ms` is genuinely per-job (org resolved from the job's
+  // jobConfig.cacheOrgId inside enqueue).
   const queue = new JobQueue(db, {
     maxDepth: config.queueMaxDepth,
     defaultTimeoutMs: config.queueTimeoutMs,
+    clusterSettings,
+    getQueueTimeoutMs: makeOrgNumberReader(db, 'queue_timeout_ms', config.queueTimeoutMs),
   });
 
   // 8b. Create dedup cache (cleanup scheduler started later after execution tracker)
-  const dedup = new DedupCache(db);
+  const dedup = new DedupCache(db, {
+    clusterSettings,
+    defaultTtlMs: config.webhookDedupTtlMs,
+  });
+
+  // 8c. Coordinator drain controller (pre-upgrade quiescing). Ephemeral,
+  // in-memory: a restart comes back accepting and the startup recovery drains
+  // the Pending backlog. `jobsRunning` is the live quiesce signal read by
+  // `kici-admin orchestrator drain --wait`.
+  const drainController = new DrainController({
+    activeJobsTotal: () => {
+      let sum = 0;
+      for (const e of agentRegistry.getAllEntries()) sum += e.activeJobs;
+      return sum;
+    },
+    dispatchedJobsOwned: async () =>
+      (await queue.getDepthBreakdown()).byStatus[DispatchQueueStatus.Dispatched] ?? 0,
+    onChange: setDraining,
+  });
 
   // 9. Initialize scaler
   // The execution tracker is constructed below (it depends on cache + log
@@ -2337,8 +2765,13 @@ export async function bootstrapOrchestrator(
   // job dispatch — long after the tracker is assigned to the ref — so the
   // ref is always populated by the time a scaler.failed event arrives.
   let executionTrackerRef: ExecutionTracker | null = null;
-  const scalerResult = await initializeScaler(config, db, tokenStore, (runId, jobId, ev) =>
-    executionTrackerRef?.emitScalerEvent(runId, jobId, ev),
+  const scalerResult = await initializeScaler(
+    config,
+    db,
+    tokenStore,
+    (runId, jobId, ev) => executionTrackerRef?.emitScalerEvent(runId, jobId, ev),
+    () => drainController.isDraining(),
+    clusterSettings,
   );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
@@ -2356,12 +2789,13 @@ export async function bootstrapOrchestrator(
     sourceCache,
     depCache,
     userCache,
+    artifactStore,
     buildCoordinator,
     pendingBuilds,
     pendingInits,
     pendingDynamics,
     fsCache,
-  } = initializeCacheInfra(config, db);
+  } = initializeCacheInfra(config, db, clusterSettings);
 
   // 11. Create commit status reporter
   const stepLogBuffer = new StepLogBuffer();
@@ -2392,6 +2826,8 @@ export async function bootstrapOrchestrator(
           region: config.storage.region,
           endpoint: config.storage.endpoint,
           forcePathStyle: config.storage.forcePathStyle,
+          segmentFlushBytes: config.logSegmentFlushBytes,
+          segmentFlushMs: config.logSegmentFlushMs,
         }
       : {
           type: 'filesystem',
@@ -2432,9 +2868,24 @@ export async function bootstrapOrchestrator(
     db,
     observerRegistry,
     jobQueue: queue,
+    resolveOrgId: (rk: string) => resolveOrgId(db, rk),
     onExecutionComplete: (runId, status, context, description) => {
       const doWork = () => {
         logger.info('Execution completed', { runId, status });
+
+        // Seal any buffered step-log tail segments for this run so the durable
+        // S3 record is complete for the dashboard / rerun / follow reads. This
+        // fires for EVERY terminal run (not just test runs). Ordering is safe:
+        // log chunks and the completion signal arrive in-order on the agent WS,
+        // and appendChunk registers its pending promise synchronously before
+        // this callback runs, so drain (await-pending -> finalize) captures
+        // every chunk.
+        logWriter.drain(runId).catch((err) => {
+          logger.warn('Failed to drain log writer on run completion', {
+            runId,
+            error: toErrorMessage(err),
+          });
+        });
 
         // Clean up any un-dispatched pending job contexts for this run
         // Fire-and-forget: in-memory Map cleanup is synchronous inside the function;
@@ -2530,6 +2981,7 @@ export async function bootstrapOrchestrator(
     onStepStatusForward: trackerExtras?.onStepStatusForward,
     onJobStatusChange: trackerExtras?.onJobStatusChange,
     onRunEventEmit: trackerExtras?.onRunEventEmit,
+    onOrchLog: trackerExtras?.onOrchLog,
     logStorage,
     orgId: trackerExtras?.orgId,
     onRunPruned: (runId) => {
@@ -2548,12 +3000,37 @@ export async function bootstrapOrchestrator(
           conclusion: data.status,
           duration: data.duration,
           jobResults: data.jobResults,
+          ...(data.failureClass && { failureClass: data.failureClass }),
         })
         .catch((err) => {
           logger.warn('Failed to emit workflow_complete event', { error: String(err) });
         });
     },
     onJobComplete: (data) => {
+      // Resolve the job's check run. This hook fires for every job the tracker
+      // terminalizes — agent-reported completions, orchestrator-set skips and
+      // drift drops, and peer-forwarded completions in cluster mode alike — so
+      // posting from here is what stops a check run being left `queued` forever
+      // on the commit. Two sweeps that terminalize a job without going through
+      // the tracker — the stale-run detector and the queue-expiry sweep in
+      // `queue/cleanup.ts` — post their own completion for the same reason.
+      // They are not the only direct writers: whole-run cancellation and
+      // cluster orphan recovery still settle rows without resolving the job
+      // check run (see `docs/architecture/webhooks/github-checks.md`).
+      reportJobCheckRunCompletion(
+        {
+          checkRunReporter,
+          getExecutionContext: (runId) => executionTrackerRef?.getExecutionContext(runId),
+        },
+        {
+          runId: data.runId,
+          jobId: data.jobId,
+          jobName: data.jobName,
+          status: data.status,
+          data: data.data,
+        },
+      );
+
       if (!eventEmitter) return;
       eventEmitter
         .emitJobComplete({
@@ -2596,6 +3073,7 @@ export async function bootstrapOrchestrator(
   // ingress paths (app.ts), and the cleanup scheduler.
   const eventLogWriter = new EventLogWriter(db, logStorage, {
     maxPayloadBytes: config.eventLogMaxPayloadBytes,
+    clusterSettings,
   });
 
   // 12b-bis. Access log writer — read + mutation attribution for dashboard
@@ -2647,7 +3125,30 @@ export async function bootstrapOrchestrator(
     {
       cleanup: {
         intervalMs: 60 * 60 * 1000,
-        handler: createCleanupHandler(dedup, queue, { db, executionTracker }),
+        handler: createCleanupHandler(dedup, queue, {
+          db,
+          executionTracker,
+          // The expiry sweep terminalizes jobs without going through
+          // `onJobStatus`, so it resolves their check runs itself.
+          checkRunReporter,
+          dispatchQueueTtlDays: config.dispatchQueueTtlDays,
+          stepLogTtlDays: config.stepLogTtlDays,
+          checkRunTrackingTtlDays: config.checkRunTrackingTtlDays,
+          // The SAME store instance the reporter writes through, so the sweep
+          // and the writer cannot disagree about what is in the table.
+          checkRunTrackingStore,
+          clusterSettings,
+          logStorage,
+          logStorageIsS3: config.storage?.type === 's3',
+          // Lets the expiry sweep tell "nothing can ever run this" apart from
+          // "something could, but never produced an agent" — see
+          // `CleanupExtras`. A scaler-managed pool at zero has no registered
+          // agent, so the backend half is what keeps scale-from-zero out of the
+          // unroutable bucket.
+          canRouteLabels: (labels, patterns, excludeLabels, excludePatterns) =>
+            agentRegistry.hasMatchingAgent(labels, patterns, excludeLabels, excludePatterns) ||
+            (scalerManager?.hasBackendForLabels(labels, excludeLabels) ?? false),
+        }),
       },
       orphanSecretCleanup: {
         intervalMs: 60 * 60 * 1000,
@@ -2701,6 +3202,9 @@ export async function bootstrapOrchestrator(
   // joinTokenManager / sourceStore / db / pool.
   if (adminDeps) {
     adminDeps.agentRegistry = agentRegistry;
+    // Expose the drain controller so the admin route
+    // (POST/GET /api/v1/admin/orchestrator/drain) can drive it.
+    adminDeps.drainController = drainController;
     // The cross-peer broadcaster is bound below after `cluster` is
     // initialized -- it depends on the peer fabric that doesn't exist
     // yet at this point in the bootstrap.
@@ -2718,6 +3222,7 @@ export async function bootstrapOrchestrator(
   const sourceManager = new SourceManager({
     pool,
     sourceStore,
+    mode: config.mode,
     onSourcesChanged: () => {
       // Wired by mode-specific hook in onSubsystemsReady
     },
@@ -2739,6 +3244,7 @@ export async function bootstrapOrchestrator(
 
   if (adminDeps) {
     adminDeps.sourceStore = sourceStore;
+    adminDeps.mode = config.mode;
     adminDeps.db = db;
     adminDeps.pool = pool;
   }
@@ -2803,7 +3309,12 @@ export async function bootstrapOrchestrator(
   try {
     const universalGitSources = await genericSourceManager.listUniversalGitSources();
     for (const row of universalGitSources) {
-      registerProviderBundleForSource(row, { providerRegistry, config, secretResolver });
+      registerProviderBundleForSource(row, {
+        providerRegistry,
+        config,
+        secretResolver,
+        clusterSettings,
+      });
     }
   } catch (err) {
     universalGitRegistrationErrorsTotal.add(1, { reason: 'registration' });
@@ -2850,7 +3361,7 @@ export async function bootstrapOrchestrator(
     );
   }
   const eventStore = new EventStore(db, eventRouterConfig);
-  const circuitBreaker = new EventCircuitBreaker(eventRouterConfig);
+  const circuitBreaker = new EventCircuitBreaker(eventRouterConfig, clusterSettings);
   const trustStore = new TrustStore(db);
 
   // Forward-declare dispatcher and coordinator for event router callback
@@ -2861,6 +3372,12 @@ export async function bootstrapOrchestrator(
   const registrationStore = new RegistrationStore(db);
   const registrationIndex = new RegistrationIndex(registrationStore);
 
+  // Cached per-org sandbox escape-hatch allow-list reader, consumed at dispatch
+  // (both the webhook and internal-event paths) to resolve `sandbox:` requests —
+  // the single enforcement point. Created here so the internal-event dispatcher
+  // (buildOnEventMatched, below) and the subsystems bundle share one instance.
+  const sandboxAllowListReader = createSandboxAllowListReader({ db });
+
   const eventRouter = new EventRouter({
     db,
     pool,
@@ -2868,11 +3385,14 @@ export async function bootstrapOrchestrator(
     circuitBreaker,
     trustStore,
     config: eventRouterConfig,
+    clusterSettings,
     onEventMatched: buildOnEventMatched(
       dispatcherRef,
       executionTracker,
       providerRegistryRef,
       coordinatorRef,
+      db,
+      sandboxAllowListReader,
     ),
     registrationIndex,
     nodeId: config.instanceId,
@@ -2897,6 +3417,7 @@ export async function bootstrapOrchestrator(
   const eventRetryScanner = new EventRetryScanner({
     db,
     eventStore,
+    eventEmitter: eventEmitter!,
     config: eventRouterConfig,
   });
   // Leader-only host-roster reaper (deletes ephemeral rows past their ttl).
@@ -2910,13 +3431,20 @@ export async function bootstrapOrchestrator(
     scanIntervalMs: 60_000,
     setUnreachableGauge: setDeclaredHostsUnreachable,
   });
+  // Leader-gated backstop for the scaler capacity-freed re-drive. Constructed
+  // after the dispatcher exists (below) but before initializeCluster fires any
+  // leadership callback; the closures reference it lazily so a null (no scaler)
+  // deployment no-ops.
+  let pendingScaleSweeper: PendingScaleSweeper | null = null;
   eventRetryScannerRef.onBecomeLeader = () => {
     eventRetryScanner.onBecomeLeader();
     hostRosterReaper.onBecomeLeader();
+    pendingScaleSweeper?.onBecomeLeader();
   };
   eventRetryScannerRef.onLoseLeadership = () => {
     eventRetryScanner.onLoseLeadership();
     hostRosterReaper.onLoseLeadership();
+    pendingScaleSweeper?.onLoseLeadership();
   };
 
   // 17. Initialize cron scheduler
@@ -2941,12 +3469,21 @@ export async function bootstrapOrchestrator(
     metrics: {
       incJobsDispatched: () => {},
       setQueueDepth: () => {},
+      incScalerRedispatch: (trigger, count) => incScalerRedispatch(trigger, count),
     },
-    onDispatch: buildOnDispatch(config, db, agentRegistry, providerRegistryRef, dispatchCacheRefs),
+    onDispatch: buildOnDispatch(
+      config,
+      db,
+      agentRegistry,
+      providerRegistryRef,
+      dispatchCacheRefs,
+      clusterSettings,
+    ),
     onNoMatchingAgent: scalerManager
-      ? (labels, jobId, runId, excludeLabels, resources) =>
-          scalerManager!.requestScale(labels, jobId, runId, excludeLabels ?? [], resources)
+      ? (labels, jobId, runId, excludeLabels, resources, orgId) =>
+          scalerManager!.requestScale(labels, jobId, runId, excludeLabels ?? [], resources, orgId)
       : undefined,
+    isDraining: () => drainController.isDraining(),
     maxReconnectDelayMs: config.agentMaxReconnectDelayMs,
     onJobFailedPermanently: (agentId, jobId, runId, reason) => {
       logger.warn('Job permanently failed before/outside agent execution', {
@@ -2999,19 +3536,38 @@ export async function bootstrapOrchestrator(
   });
   dispatcherRef.current = dispatcher;
 
+  // Capacity-freed re-drive: when a scaler agent releases its slot, re-offer the
+  // oldest pending jobs to the scaler (near-zero latency) instead of letting them
+  // sit until they time out. Fire-and-forget; the dispatcher single-flights it.
+  if (scalerManager) {
+    scalerManager.onCapacityFreed = () => {
+      void dispatcher.retryPendingScaleRequests();
+    };
+    pendingScaleSweeper = new PendingScaleSweeper({
+      redrive: () => dispatcher.retryPendingScaleRequests(DEFAULT_REDRIVE_BATCH, 'sweep'),
+      intervalMs: config.scalerPendingSweepIntervalMs,
+    });
+  }
+
   // 19. Create ownership tracker
   //
-  // The DB fallback (`isJobOwnedByAgentInDb`) makes the per-message
-  // ownership check HA-safe: after a Raft leader switch the local
-  // `agentJobs` Map is empty, but the DB still knows which agent
-  // owned which job. `validateAsync` accepts late `log.chunk` /
-  // `step.status` chunks for jobs marked `recovering` (with matching
-  // `recovery_agent_id`) or already terminal — making the log writer
-  // tolerant of post-complete duplicates without the previous 30s
-  // per-coord grace map.
+  // The DB fallback (`isJobOwnedByAgentInDb`) makes the per-message ownership
+  // check HA-safe: after a Raft leader switch the local `agentJobs` Map is
+  // empty, but the DB still records which agent owns which job. `validateAsync`
+  // accepts frames for a `dispatched` row whose `agent_id` matches, a
+  // `recovering` row whose `recovery_agent_id` matches, or a row that is
+  // already terminal — so a post-failover or post-complete frame is handled
+  // rather than dropped.
+  //
+  // The lookup is bounded by `ownership_db_check_timeout_ms`, read fresh per
+  // call. A query that fails or outruns the deadline resolves `unknown`, which
+  // refuses the frame without counting a violation.
   const ownershipTracker = new OwnershipTracker({
     isJobOwnedByAgent: (agentId, jobId) => dispatcher.isJobOwnedByAgent(agentId, jobId),
-    isJobOwnedByAgentInDb: (agentId, jobId) => queue.hasAgentOwnedJob(agentId, jobId),
+    isJobOwnedByAgentInDb: async (agentId, jobId) =>
+      (await queue.hasAgentOwnedJob(agentId, jobId)) ? 'owned' : 'not-owned',
+    getTimeoutMs: () =>
+      clusterSettings.getNumber('ownership_db_check_timeout_ms', config.ownershipDbCheckTimeoutMs),
     onDisconnect: (agentId, reason) => {
       logger.warn('Disconnecting agent due to ownership violations', { agentId, reason });
       const entry = agentRegistry.get(agentId);
@@ -3028,6 +3584,7 @@ export async function bootstrapOrchestrator(
   const lockFileCache = new LockFileCache({
     max: config.lockfileCacheMax,
     ttl: config.lockfileCacheTtlMs,
+    maxBytes: config.lockfileCacheMaxBytes,
   });
 
   // 21. Initialize cluster
@@ -3048,6 +3605,10 @@ export async function bootstrapOrchestrator(
     localConfigVersionRef,
     stepLogBuffer,
     eventRetryScannerRef,
+    () => drainController.isDraining(),
+    clusterSettings,
+    logWriter,
+    hooks.forwardLogChunk,
   );
   coordinatorRef.current = cluster.coordinator;
 
@@ -3115,19 +3676,182 @@ export async function bootstrapOrchestrator(
   // from the Platform `auth.success`; the config/env value seeds the CLI path.
   // For the local dev plane, serve the in-process signer's JWKS directly under
   // the `kici-local` issuer (not a URL, so no discovery/fetch).
-  const provenanceTrustRoot = localOidcSigner
-    ? createProvenanceTrustRoot({
-        issuer: KICI_LOCAL_ISSUER,
-        staticJwks: { keys: [localOidcSigner.getPublicJwk() as Record<string, unknown>] },
-      })
-    : createProvenanceTrustRoot({
-        issuer: config.provenanceIssuer ?? null,
+  // Orchestrator-owned provenance signing (Phase 1 root of trust). When
+  // KICI_ORCHESTRATOR_PROVENANCE_ISSUER is set, the orchestrator holds its own
+  // ES256 key: it mints + signs identity tokens locally, serves its own JWKS,
+  // and verifies at ingest against its own keys. The signer is resolved LAZILY
+  // (memoized) on first use so the Raft leader-election race at boot never
+  // blocks or crash-loops — the key is reconciled when the first agent requests
+  // a token (by which point the cluster has a leader and the key exists).
+  const provenanceSigningEnabled = isProvenanceSigningEnabled({
+    provenanceSigningIssuer: config.provenanceSigningIssuer,
+  });
+  const orchestratorSigningRepo = provenanceSigningEnabled
+    ? new OrchestratorSigningKeyRepo(db)
+    : undefined;
+  let cachedOrchestratorSigner: Signer | null = null;
+  const reconcileSignerOnce = (): Promise<{ signer: Signer } | null> =>
+    reconcileOrchestratorSigningKey({
+      repo: orchestratorSigningRepo!,
+      config: {
+        provenanceSigningIssuer: config.provenanceSigningIssuer,
+        provenanceSignerKind: config.provenanceSignerKind,
+        provenanceKmsKeyArn: config.provenanceKmsKeyArn,
+        provenanceKmsRegion: config.provenanceKmsRegion,
+        provenanceKmsAccessKeyId: config.provenanceKmsAccessKeyId,
+        provenanceKmsSecretAccessKey: config.provenanceKmsSecretAccessKey,
+        provenanceSignerCommand: config.provenanceSignerCommand,
+      },
+      isLeader: () => cluster.raft?.isLeader() ?? true,
+      secretKey: config.secretKey,
+      audit: ({ kid, signerKind }) => {
+        logger.info('activated orchestrator provenance signing key', { kid, signerKind });
+      },
+    });
+  // Resolve the signer, WAITING (bounded) for the key to be provisioned rather
+  // than immediately deferring. This closes the security-critical mint-in-boot-
+  // window race: a mint that arrives before the leader has generated the key
+  // must NOT fall back to the Platform relay (which would produce an intermittent
+  // Platform-signed bundle that fails verification against the orchestrator trust
+  // root). Once provisioned (eager reconcile at boot, or the first mint), the
+  // signer is memoized and returned immediately.
+  const resolveOrchestratorSigner = async (): Promise<Signer | null> => {
+    if (!orchestratorSigningRepo) return null;
+    if (cachedOrchestratorSigner) return cachedOrchestratorSigner;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const reconciled = await reconcileSignerOnce().catch(() => null);
+      if (reconciled) {
+        cachedOrchestratorSigner = reconciled.signer;
+        return cachedOrchestratorSigner;
+      }
+      await new Promise((res) => setTimeout(res, 500));
+    }
+    return null;
+  };
+
+  // Dashboard-encryption (X25519) key: the trust root for browser-sealed
+  // dashboard writes under the `encrypted` posture. Available whenever the
+  // master key (KICI_SECRET_KEY) is configured — it wraps the private half.
+  // Leader-gated generation (same HA-safe pattern as the signer), resolved
+  // lazily + memoized so the leader-election race at boot never crash-loops.
+  const dashboardEncryptionRepo = config.secretKey ? new DashboardEncryptionKeyRepo(db) : undefined;
+  let cachedDashboardEncryptionKey: ResolvedDashboardEncryptionKey | null = null;
+  const resolveDashboardEncryptionKey =
+    async (): Promise<ResolvedDashboardEncryptionKey | null> => {
+      if (!dashboardEncryptionRepo) return null;
+      if (cachedDashboardEncryptionKey) return cachedDashboardEncryptionKey;
+      const reconciled = await reconcileDashboardEncryptionKey({
+        repo: dashboardEncryptionRepo,
+        isLeader: () => cluster.raft?.isLeader() ?? true,
+        secretKey: config.secretKey,
+        audit: ({ kid }) => {
+          logger.info('activated dashboard encryption key', { kid });
+        },
+      }).catch((err) => {
+        logger.warn('dashboard encryption key reconcile failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return null;
       });
+      if (reconciled) cachedDashboardEncryptionKey = reconciled;
+      return reconciled;
+    };
+  // Eagerly provision the key at boot so the JWKS publishes it before the first
+  // sealed write. Bounded-retry (same shape as the signer resolve) because the
+  // reconcile is leader-gated: at cold boot no node is raft-leader yet, so the
+  // first attempts return null; we retry until the elected leader generates the
+  // key (or any node reads the row the leader wrote to the shared DB).
+  if (dashboardEncryptionRepo) {
+    void (async () => {
+      for (let attempt = 0; attempt < 120; attempt++) {
+        const resolved = await resolveDashboardEncryptionKey();
+        if (resolved) return;
+        await new Promise((res) => setTimeout(res, 500));
+      }
+      logger.warn('dashboard encryption key not provisioned after boot retries');
+    })();
+  }
+
+  // Provenance trust root: for orchestrator-owned signing, verify at ingest
+  // against the orchestrator's own key set (fresh rotations/revocations). For the
+  // offline local dev plane, serve the in-process signer's JWKS under the fixed
+  // `kici-local` issuer. Otherwise the config/env value seeds the CLI path.
+  const provenanceTrustRoot =
+    provenanceSigningEnabled && orchestratorSigningRepo
+      ? provenanceTrustRootFromRepo(
+          orchestratorSigningRepo,
+          config.provenanceSigningIssuer as string,
+        )
+      : localOidcSigner
+        ? createProvenanceTrustRoot({
+            issuer: KICI_LOCAL_ISSUER,
+            staticJwks: { keys: [localOidcSigner.getPublicJwk() as Record<string, unknown>] },
+          })
+        : createProvenanceTrustRoot({
+            issuer: config.provenanceIssuer ?? null,
+          });
+
+  // Single webhook-ingest admission controller for the process, shared by the
+  // HTTP direct-ingress closure (createApp) and the Platform-WS relay path
+  // (server.ts wires PlatformClient.onAdmit from subsystems.ingestController).
+  const ingestCapReader = createOrgIngestCapReader({
+    db,
+    clusterDefault: config.ingestOrgMaxConcurrency,
+  });
+  const ingestController = new IngestAdmissionController({
+    config: {
+      maxConcurrency: config.ingestMaxConcurrency,
+      maxQueueDepth: config.ingestMaxQueueDepth,
+      codelTargetMs: config.ingestCodelTargetMs,
+      codelIntervalMs: config.ingestCodelIntervalMs,
+      queueMaxWaitMs: config.ingestQueueMaxWaitMs,
+      loopLagShedMs: config.ingestLoopLagShedMs,
+      loopLagResumeMs: config.ingestLoopLagResumeMs,
+      loopLagSampleMs: config.ingestLoopLagSampleMs,
+    },
+    loopLag: new RealLoopLagSource(),
+    onStateChange: (s: IngestAdmissionSnapshot) => setIngestAdmissionState(s),
+    onShedMetric: (reason) => ingestShedTotal.add(1, { reason }),
+    onAdmitMetric: () => ingestAdmittedTotal.add(1),
+  });
+  // Config-sourced limit gauges so the dashboard overlays current-vs-limit and
+  // the ratio alerts track the deployed caps (never a hardcoded threshold).
+  setIngestAdmissionLimits({
+    maxConcurrency: config.ingestMaxConcurrency,
+    maxQueueDepth: config.ingestMaxQueueDepth,
+    orgMaxConcurrency: config.ingestOrgMaxConcurrency,
+    loopLagShedMs: config.ingestLoopLagShedMs,
+    loopLagResumeMs: config.ingestLoopLagResumeMs,
+    overflowMax: config.ingestOverflowMax,
+  });
+
+  // Durable overflow buffer: capture shed deliveries and replay them once the
+  // admission controller stops shedding. Default-on (config.ingestOverflowEnabled).
+  const ingestOverflowBuffer = new IngestOverflowBuffer({
+    db,
+    maxRows: config.ingestOverflowMax,
+  });
+  const ingestOverflowReplayer = new IngestOverflowReplayer({
+    db,
+    controller: ingestController,
+    intervalMs: config.ingestOverflowReplayIntervalMs,
+    batchSize: config.ingestOverflowReplayBatch,
+    maxAttempts: config.ingestOverflowMaxAttempts,
+  });
+  if (config.ingestOverflowEnabled) {
+    ingestOverflowReplayer.start();
+  }
 
   const subsystems: OrchestratorSubsystems = {
     config,
     db,
     pool,
+    clusterSettings,
+    ingestController,
+    ingestCapReader,
+    sandboxAllowListReader,
+    ingestOverflowBuffer,
+    ingestOverflowReplayer,
     providerRegistry,
     agentRegistry,
     hostRosterStore,
@@ -3140,6 +3864,7 @@ export async function bootstrapOrchestrator(
     sourceCache,
     depCache,
     userCache,
+    artifactStore,
     dispatchCacheRefs,
     buildCoordinator,
     pendingBuilds,
@@ -3155,6 +3880,9 @@ export async function bootstrapOrchestrator(
     secretResolver,
     adminDeps,
     pgSecretStore,
+    dashboardEncryption: dashboardEncryptionRepo
+      ? { resolve: resolveDashboardEncryptionKey }
+      : undefined,
     tokenStore,
     ownershipTracker,
     lockFileCache,
@@ -3210,6 +3938,28 @@ export async function bootstrapOrchestrator(
   //     long-lived LISTEN/NOTIFY subscription to start here anymore.
   await cluster.raft.start();
   cluster.peerRegistry.setLocalRegistryVersion(registrationIndex.getVersion());
+
+  // Eagerly provision the provenance signing key once leadership settles, so the
+  // public JWKS endpoint is populated shortly after boot instead of only on the
+  // first agent token request. Fire-and-forget with a bounded retry (the resolve
+  // is memoized + leader-gated for db custody, so a non-leader just waits).
+  if (provenanceSigningEnabled) {
+    void (async () => {
+      for (let i = 0; i < 120; i++) {
+        const resolved = await resolveOrchestratorSigner().catch(() => null);
+        if (resolved) {
+          logger.info('provenance signing key provisioned', {
+            kid: await resolved.getKid().catch(() => 'unknown'),
+          });
+          return;
+        }
+        await new Promise((res) => setTimeout(res, 1000));
+      }
+      logger.warn(
+        'provenance signing key not provisioned after boot retries (still lazy on demand)',
+      );
+    })();
+  }
 
   // Start stale peer eviction timer (removes peers that miss heartbeats)
   cluster.coordinator.startStaleEvictionTimer(config.cluster.peerStaleTimeoutMs);
@@ -3444,9 +4194,10 @@ export async function bootstrapOrchestrator(
   // than merely process-live.
   let warm = false;
 
-  const { app, injectWebSocket, tryDispatchNextQueued } = createApp({
+  const { app, wss, tryDispatchNextQueued, reinjectDirect } = createApp({
     config,
     db,
+    clusterSettings,
     isWarm: () => warm,
     pool,
     registry: agentRegistry,
@@ -3456,6 +4207,10 @@ export async function bootstrapOrchestrator(
     dedup,
     lockFileCache,
     providerRegistry,
+    ingestController,
+    ingestCapReader,
+    sandboxAllowListReader,
+    ingestOverflowBuffer,
     scalerManager: scalerManager ?? undefined,
     tokenStore,
     ownershipTracker,
@@ -3464,10 +4219,28 @@ export async function bootstrapOrchestrator(
     buildCoordinator,
     depCache,
     userCache,
+    artifactStore,
     dispatchCacheRefs,
     cacheStorage,
     provenanceTrustRoot,
     localOidcSigner,
+    ...(provenanceSigningEnabled && orchestratorSigningRepo
+      ? {
+          provenanceSigning: {
+            issuer: config.provenanceSigningIssuer as string,
+            resolveSigner: resolveOrchestratorSigner,
+            repo: orchestratorSigningRepo,
+          },
+        }
+      : {}),
+    ...(dashboardEncryptionRepo
+      ? {
+          dashboardEncryption: {
+            repo: dashboardEncryptionRepo,
+            resolve: resolveDashboardEncryptionKey,
+          },
+        }
+      : {}),
     fsCache,
     pendingBuilds,
     pendingInits,
@@ -3533,11 +4306,17 @@ export async function bootstrapOrchestrator(
   // forward-declared ref consumed by `onExecutionComplete` above.
   tryDispatchNextQueuedRef = tryDispatchNextQueued;
 
+  // Wire the HTTP-direct overflow re-injector (built inside createApp, closes
+  // over runWebhookIngest) into the replayer. The relay re-injector is wired in
+  // server.ts where the verify + relay processing closures live.
+  ingestOverflowReplayer.setReinjectDirect(reinjectDirect);
+
   // 28. Start HTTP server
   const server = serve(
     {
       fetch: app.fetch,
       port: config.port,
+      websocket: { server: wss },
     },
     (info) => {
       logger.info(hooks.startupLogMessage(info.port), {
@@ -3547,9 +4326,6 @@ export async function bootstrapOrchestrator(
       });
     },
   );
-
-  // Inject WebSocket support
-  injectWebSocket(server);
 
   // 29. Start heartbeat monitor
   const heartbeatMonitor = new AgentHeartbeatMonitor({
@@ -3568,6 +4344,8 @@ export async function bootstrapOrchestrator(
     dispatcher,
     registry: agentRegistry,
     peerRegistry: cluster.peerRegistry,
+    clusterSettings,
+    rerouteFlapGraceFallbackMs: config.rerouteFlapGraceMs,
     staleThresholdMs: config.jobHeartbeatIntervalMs * config.staleDetectorThresholdMultiplier,
     scanIntervalMs: config.staleDetectorScanIntervalMs,
     // Approval-hold expiry: the held-run store (so overdue holds are expired)
@@ -3575,8 +4353,7 @@ export async function bootstrapOrchestrator(
     // waiting agent). Both are supplied by the platform/hybrid mode hook.
     heldRunStore: modeResult.appDepsExtras?.heldRunStore as HeldRunStore | undefined,
     stepApprovalBridge: modeResult.appDepsExtras?.stepApprovalBridge as
-      | StepApprovalBridge
-      | undefined,
+      StepApprovalBridge | undefined,
     // Job/workflow approval-hold expiry fails the run (terminal `failed`), not
     // cancels it: a lapsed reviewer hold is a failure outcome, distinct from a
     // user-initiated cancel. The gated job was held (never dispatched), so
@@ -3586,8 +4363,7 @@ export async function bootstrapOrchestrator(
     // Resume a workflow whose install-gate wait-timer hold elapsed (workflow
     // scope). Supplied by the platform/hybrid mode hook alongside heldRunStore.
     onWorkflowRelease: modeResult.appDepsExtras?.onWorkflowRelease as
-      | ((signal: ReleaseSignal) => Promise<void>)
-      | undefined,
+      ((signal: ReleaseSignal) => Promise<void>) | undefined,
     // Audit each approval-hold expiry to the orchestrator access-log stream.
     accessLogWriter,
   });
@@ -3642,7 +4418,12 @@ export async function bootstrapOrchestrator(
       count: dispatchedJobs.length,
     });
     for (const job of dispatchedJobs) {
-      await dispatcher.startRecoveryTimer(job.id, 'unknown', job.runId);
+      // The recovery timer stamps `recovery_agent_id`, which is what a
+      // reconnecting agent is checked against when it claims the job back. A
+      // row whose owner was recorded at dispatch is therefore reclaimable by
+      // that agent; a row from before the owner was recorded keeps the
+      // placeholder and is not reclaimable by anyone.
+      await dispatcher.startRecoveryTimer(job.id, job.agentId ?? 'unknown', job.runId);
     }
   }
 
@@ -3884,6 +4665,18 @@ export async function bootstrapOrchestrator(
       {
         name: 'Stopping host roster reaper',
         fn: () => hostRosterReaper.stop(),
+      },
+      {
+        name: 'Stopping pending-scale sweeper',
+        fn: () => pendingScaleSweeper?.stop(),
+      },
+      {
+        name: 'Stopping ingest admission controller',
+        fn: () => ingestController.stop(),
+      },
+      {
+        name: 'Stopping ingest overflow replayer',
+        fn: () => ingestOverflowReplayer.stop(),
       },
       {
         name: 'Stopping timers, cleanup, and reloader',

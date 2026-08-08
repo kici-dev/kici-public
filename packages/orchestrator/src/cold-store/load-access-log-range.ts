@@ -21,7 +21,6 @@
 import { sql, type Kysely, type Selectable } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import {
-  minAccessLogWarmDays,
   type AccessLogAction,
   type AccessLogItem,
   type AccessLogOutcome,
@@ -32,17 +31,6 @@ import {
 import type { AccessLogTable, Database } from '../db/types.js';
 
 const logger = createLogger({ prefix: 'load-access-log-range' });
-
-/**
- * Warm cutoff = the table's MINIMUM per-category TTL. Any row younger than
- * this is guaranteed still in PG (no category archives sooner). Older rows
- * may be in PG (long-TTL category not yet eligible), in cold (short-TTL
- * category already archived), or both — the merge handles overlap by id.
- *
- * Sourced from the engine's per-action retention table so this constant
- * stays in lockstep with `AccessLogAdapter.DEFAULT_CONFIG.warmTtlDays`.
- */
-const ACCESS_LOG_WARM_TTL_DAYS = minAccessLogWarmDays();
 
 /**
  * Synthetic tenant placeholder for orchestrator-level rows whose `org_id IS
@@ -101,7 +89,6 @@ export async function loadAccessLogRange(
 ): Promise<LoadAccessLogRangeResult> {
   const { db, coldStore, filter, limit } = args;
   const cursor = args.cursor ? parseCursor(args.cursor) : null;
-  const warmCutoff = new Date(Date.now() - ACCESS_LOG_WARM_TTL_DAYS * 86_400_000);
 
   // ── 1. Hot path ────────────────────────────────────────────────
   // Skip when the cursor explicitly resumes in cold; otherwise run
@@ -160,7 +147,13 @@ export async function loadAccessLogRange(
   const wantCold =
     !!coldStore && (cursor?.source === 'cold' || (!hotHasMore && hotItems.length < limit));
   const coldFromTs = fromTs ?? new Date(0);
-  if (!wantCold || coldFromTs >= warmCutoff) {
+  // The bound is the table's MINIMUM per-category TTL, resolved from the same
+  // adapter config the archiver uses: any row younger than it is guaranteed
+  // still in PG (no category archives sooner). The `null` arm covers the
+  // no-cold-store case; the `warmCutoff === null` guard below is what narrows
+  // it to a `Date` for the `coldToTs` clamp.
+  const warmCutoff = coldStore ? coldStore.warmCutoff('access_log') : null;
+  if (!wantCold || warmCutoff === null || coldFromTs >= warmCutoff) {
     return {
       items: hotItems,
       nextCursor:

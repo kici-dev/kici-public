@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { getDefaultFixture } from '../fixtures/defaults/index.js';
 import { detectRepoFromGit } from './git-detector.js';
 import { parseEventArg } from './event-types.js';
-import type { SimulatedEvent } from '@kici-dev/engine';
+import type { SimulatedEvent, ChangedFilesStatus } from '@kici-dev/engine';
 
 export interface PayloadOptions {
   /** Path to custom fixture file */
@@ -17,6 +17,12 @@ export interface PayloadOptions {
   sha?: string;
   /** Simulate changed file paths for onChangedFiles trigger matching */
   files?: string[];
+  /**
+   * Simulate `changedFiles` availability for rule evaluation. Defaults to
+   * `'fetched'` (the author's file list is a genuine diff); set `'unavailable'`
+   * to test a rule's `ctx.changedFilesStatus` guard on a diff-less event.
+   */
+  changedFilesStatus?: ChangedFilesStatus;
 }
 
 /**
@@ -254,6 +260,7 @@ export async function buildEventPayload(
     targetBranch,
     sourceBranch,
     changedFiles: options.files ?? [],
+    changedFilesStatus: options.changedFilesStatus ?? 'fetched',
   };
 }
 
@@ -261,6 +268,7 @@ export async function buildEventPayload(
 type InternalEventType =
   | { type: 'kici_event'; eventName: string }
   | { type: 'workflow_complete'; workflowName: string; status: string }
+  | { type: 'workflows_failed_batch' }
   | { type: 'job_complete'; workflowName: string; jobName: string; status: string }
   | { type: 'generic_webhook'; source?: string }
   | { type: 'schedule'; cronExpression?: string; timezone?: string }
@@ -275,6 +283,7 @@ function isInternalEventType(
   return [
     'kici_event',
     'workflow_complete',
+    'workflows_failed_batch',
     'job_complete',
     'generic_webhook',
     'schedule',
@@ -303,6 +312,9 @@ async function buildInternalEventPayload(
         break;
       case 'workflow_complete':
         payload = { workflowName: eventType.workflowName, status: eventType.status };
+        break;
+      case 'workflows_failed_batch':
+        payload = { total: 0, runs: [] };
         break;
       case 'job_complete':
         payload = {
@@ -334,5 +346,6 @@ async function buildInternalEventPayload(
     payload,
     targetBranch: 'main', // Internal events are not branch-related
     changedFiles: options.files ?? [],
+    changedFilesStatus: options.changedFilesStatus ?? 'fetched',
   };
 }

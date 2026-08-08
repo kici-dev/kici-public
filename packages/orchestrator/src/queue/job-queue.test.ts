@@ -65,6 +65,8 @@ function createMockDb(
     countResult?: { count: number };
     updateResult?: { numUpdatedRows: bigint };
     updateReturning?: unknown;
+    deleteResult?: { numDeletedRows: bigint };
+    insertReturning?: unknown;
   } = {},
 ) {
   const countResult = options.countResult ?? { count: 0 };
@@ -77,6 +79,8 @@ function createMockDb(
     countResult,
     updateResult: options.updateResult ?? { numUpdatedRows: 0n },
     updateReturning: options.updateReturning,
+    deleteResult: options.deleteResult ?? { numDeletedRows: 0n },
+    insertReturning: 'insertReturning' in options ? options.insertReturning : { id: 'mock-id' },
   });
 
   // Expose _mocks for backward-compatible assertions (tests reference db._mocks.values etc.)
@@ -87,11 +91,14 @@ function createMockDb(
     values: mocks.insertValues,
     where: mocks.selectWhere,
     updateWhere: mocks.updateWhere,
+    deleteWhere: mocks.deleteWhere,
     set: mocks.updateSet,
     selectAll: mocks.selectAll,
     orderBy: mocks.selectOrderBy,
     selectForUpdate: mocks.selectForUpdate,
     selectSkipLocked: mocks.selectSkipLocked,
+    limit: mocks.selectLimit,
+    onConflict: mocks.onConflict,
   };
 
   return db;
@@ -118,6 +125,40 @@ describe('JobQueue', () => {
       const queue = new JobQueue(db, { maxDepth: 5, defaultTimeoutMs: 600_000 });
 
       await expect(queue.enqueue(makeJobInput())).rejects.toThrow('queue full');
+    });
+
+    it('uses the cluster_settings queue_max_depth override over the config default', async () => {
+      const db = createMockDb({ countResult: { count: 3 } });
+      // config default 100 would admit; the cluster override of 3 rejects.
+      const clusterSettings = {
+        getNumber: async (_col: string, _fallback: number) => 3,
+      } as never;
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000, clusterSettings });
+      await expect(queue.enqueue(makeJobInput())).rejects.toThrow('queue full');
+    });
+
+    it('falls back to the config queue_max_depth when the cluster override is null', async () => {
+      const db = createMockDb({ countResult: { count: 3 } });
+      // Reader returns the fallback (config default) → 100 admits a depth of 3.
+      const clusterSettings = {
+        getNumber: async (_col: string, fallback: number) => fallback,
+      } as never;
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000, clusterSettings });
+      await expect(queue.enqueue(makeJobInput())).resolves.toBeDefined();
+    });
+
+    it('uses the per-org queue_timeout_ms override for expires_at', async () => {
+      const db = createMockDb({ countResult: { count: 0 } });
+      const queue = new JobQueue(db, {
+        maxDepth: 100,
+        defaultTimeoutMs: 600_000,
+        getQueueTimeoutMs: async () => 1_000, // per-org override
+      });
+      const before = Date.now();
+      await queue.enqueue(makeJobInput());
+      const arg = db._mocks.values.mock.calls[0][0];
+      const expiresAt = new Date(arg.expires_at).getTime();
+      expect(expiresAt).toBeLessThanOrEqual(before + 5_000);
     });
 
     it('passes correct values to insertInto', async () => {
@@ -224,6 +265,34 @@ describe('JobQueue', () => {
       const arg = db._mocks.values.mock.calls[0][0];
       expect(arg.runs_on_patterns).toBe('[]');
       expect(arg.exclude_patterns).toBe('[]');
+    });
+  });
+
+  describe('conflict-tolerant inserts', () => {
+    it('insertDispatched reports inserted:true on a fresh insert', async () => {
+      const db = createMockDb({ countResult: { count: 0 }, insertReturning: { id: 'job-1' } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+      const result = await queue.insertDispatched(makeJobInput({ jobId: 'job-1' }), 'agent-1');
+      expect(result).toEqual({ id: 'job-1', inserted: true });
+      expect(db._mocks.onConflict).toHaveBeenCalled();
+    });
+
+    it('insertDispatched reports inserted:false on ON CONFLICT DO NOTHING (no throw)', async () => {
+      // insertReturning:undefined models RETURNING yielding zero rows => the row
+      // already existed and DO NOTHING skipped the insert.
+      const db = createMockDb({ countResult: { count: 0 }, insertReturning: undefined });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+      const result = await queue.insertDispatched(makeJobInput({ jobId: 'dup-1' }), 'agent-1');
+      expect(result).toEqual({ id: 'dup-1', inserted: false });
+      expect(db._mocks.onConflict).toHaveBeenCalled();
+    });
+
+    it('enqueue is idempotent — the insert uses ON CONFLICT DO NOTHING and never throws on a duplicate id', async () => {
+      const db = createMockDb({ countResult: { count: 0 } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+      const id = await queue.enqueue(makeJobInput({ jobId: 'dup-2' }));
+      expect(id).toBe('dup-2');
+      expect(db._mocks.onConflict).toHaveBeenCalled();
     });
   });
 
@@ -584,7 +653,17 @@ describe('JobQueue', () => {
       expect(db._mocks.set).toHaveBeenCalledWith({
         status: DispatchQueueStatus.Dispatched,
         last_provisioning_error: null,
+        agent_id: 'agent-1',
       });
+    });
+
+    it('records the owning agent so a cold coordinator can resolve ownership', async () => {
+      const db = createMockDb();
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.markDispatched('job-1', 'agent-7');
+
+      expect(db._mocks.set).toHaveBeenCalledWith(expect.objectContaining({ agent_id: 'agent-7' }));
     });
   });
 
@@ -633,6 +712,113 @@ describe('JobQueue', () => {
       expect(db._mocks.set).toHaveBeenCalledWith(
         expect.objectContaining({ ack_deadline: null, ack_agent_id: null }),
       );
+    });
+
+    it('clears the durable owner so the previous agent no longer owns the job', async () => {
+      const db = createMockDb({ updateReturning: { dispatch_attempts: 2 } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.requeue('job-1');
+
+      expect(db._mocks.set).toHaveBeenCalledWith(expect.objectContaining({ agent_id: null }));
+    });
+  });
+
+  describe('markDispatchedIfRecovering', () => {
+    it('records the reclaiming agent as the durable owner', async () => {
+      const db = createMockDb({ updateResult: { numUpdatedRows: 1n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.markDispatchedIfRecovering('job-1', 'agent-3');
+
+      expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
+      expect(db._mocks.set).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: DispatchQueueStatus.Dispatched,
+          agent_id: 'agent-3',
+          recovery_agent_id: null,
+        }),
+      );
+    });
+  });
+
+  describe('hasAgentOwnedJob', () => {
+    it('accepts a live dispatched row whose durable owner is the agent', async () => {
+      const db = createMockDb({
+        selectFirstRow: {
+          status: DispatchQueueStatus.Dispatched,
+          recovery_agent_id: null,
+          agent_id: 'agent-1',
+        },
+      });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.hasAgentOwnedJob('agent-1', 'job-1')).resolves.toBe(true);
+    });
+
+    it('refuses a live dispatched row owned by a different agent', async () => {
+      const db = createMockDb({
+        selectFirstRow: {
+          status: DispatchQueueStatus.Dispatched,
+          recovery_agent_id: null,
+          agent_id: 'agent-2',
+        },
+      });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.hasAgentOwnedJob('agent-1', 'job-1')).resolves.toBe(false);
+    });
+
+    it('refuses a dispatched row with no recorded owner (pre-migration row)', async () => {
+      const db = createMockDb({
+        selectFirstRow: {
+          status: DispatchQueueStatus.Dispatched,
+          recovery_agent_id: null,
+          agent_id: null,
+        },
+      });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.hasAgentOwnedJob('agent-1', 'job-1')).resolves.toBe(false);
+    });
+
+    it('still accepts a recovering row claimed by the agent', async () => {
+      const db = createMockDb({
+        selectFirstRow: {
+          status: DispatchQueueStatus.Recovering,
+          recovery_agent_id: 'agent-1',
+          agent_id: null,
+        },
+      });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.hasAgentOwnedJob('agent-1', 'job-1')).resolves.toBe(true);
+    });
+
+    it('returns false for an unknown job', async () => {
+      const db = createMockDb({ selectFirstRow: undefined });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.hasAgentOwnedJob('agent-1', 'job-missing')).resolves.toBe(false);
+    });
+  });
+
+  describe('getJobsByStatus', () => {
+    it('projects the durable owner alongside id/runId/status', async () => {
+      const db = createMockDb({
+        selectRows: [
+          { id: 'job-1', run_id: 'run-1', status: DispatchQueueStatus.Dispatched, agent_id: 'a-1' },
+          { id: 'job-2', run_id: 'run-2', status: DispatchQueueStatus.Dispatched, agent_id: null },
+        ],
+      });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const jobs = await queue.getJobsByStatus(DispatchQueueStatus.Dispatched);
+
+      expect(jobs).toEqual([
+        { id: 'job-1', runId: 'run-1', status: DispatchQueueStatus.Dispatched, agentId: 'a-1' },
+        { id: 'job-2', runId: 'run-2', status: DispatchQueueStatus.Dispatched, agentId: null },
+      ]);
     });
   });
 
@@ -716,8 +902,11 @@ describe('JobQueue', () => {
   describe('markExpired', () => {
     it('returns details of expired jobs', async () => {
       const expiredRows = [
-        { id: 'q-1', run_id: 'run-1', job_name: 'build' },
-        { id: 'q-2', run_id: 'run-2', job_name: 'test' },
+        // The pg driver auto-parses jsonb, so labels arrive as a real array...
+        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: ['linux'] },
+        // ...while a non-parsing driver (and the test doubles) hand back JSON text.
+        { id: 'q-2', run_id: 'run-2', job_name: 'test', runs_on_labels: '["gpu"]' },
+        // A row with no selector columns at all degrades to empty, never throws.
         { id: 'q-3', run_id: 'run-1', job_name: 'deploy' },
       ];
       const db = createMockDb({ selectRows: expiredRows as any });
@@ -732,20 +921,51 @@ describe('JobQueue', () => {
         runId: 'run-1',
         jobName: 'build',
         lastProvisioningError: null,
+        runsOnLabels: ['linux'],
+        runsOnPatterns: [],
+        excludeLabels: [],
+        excludePatterns: [],
       });
       expect(result[1]).toEqual({
         id: 'q-2',
         runId: 'run-2',
         jobName: 'test',
         lastProvisioningError: null,
+        runsOnLabels: ['gpu'],
+        runsOnPatterns: [],
+        excludeLabels: [],
+        excludePatterns: [],
       });
       expect(result[2]).toEqual({
         id: 'q-3',
         runId: 'run-1',
         jobName: 'deploy',
         lastProvisioningError: null,
+        runsOnLabels: [],
+        runsOnPatterns: [],
+        excludeLabels: [],
+        excludePatterns: [],
       });
       expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
+    });
+
+    it('degrades a malformed selector column to empty instead of stranding the batch', async () => {
+      // The rows are already flipped to `Expired` before these columns are
+      // parsed, so a throw here would leave every job in the batch un-forwarded
+      // and its run stuck non-terminal forever. The sibling row proves the
+      // whole batch still comes back, not just the healthy prefix.
+      const expiredRows = [
+        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: '{not json' },
+        { id: 'q-2', run_id: 'run-1', job_name: 'test', runs_on_labels: '["linux"]' },
+      ];
+      const db = createMockDb({ selectRows: expiredRows as any });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const result = await queue.markExpired();
+
+      expect(result).toHaveLength(2);
+      expect(result[0].runsOnLabels).toEqual([]);
+      expect(result[1].runsOnLabels).toEqual(['linux']);
     });
 
     it('returns empty array when no jobs expired', async () => {
@@ -987,6 +1207,53 @@ describe('JobQueue', () => {
     });
   });
 
+  describe('listPending', () => {
+    it('lists pending jobs oldest-first, filtering on status = pending, with parsed fields', async () => {
+      const rows = [
+        makeDbRow({
+          id: 'job-1',
+          created_at: '2026-02-08T10:00:00.000Z',
+          runs_on_labels: JSON.stringify(['linux']),
+          exclude_labels: JSON.stringify(['windows']),
+          job_config: JSON.stringify({ resources: { requests: { cpus: 2 } } }),
+        }),
+        makeDbRow({ id: 'job-2', created_at: '2026-02-08T10:01:00.000Z' }),
+        makeDbRow({ id: 'job-3', created_at: '2026-02-08T10:02:00.000Z' }),
+      ];
+      const db = createMockDb({ selectRows: rows });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const jobs = await queue.listPending(10);
+
+      expect(jobs.map((j) => j.id)).toEqual(['job-1', 'job-2', 'job-3']);
+      // Filters on status = pending and orders oldest-first.
+      expect(db._mocks.where).toHaveBeenCalledWith('status', '=', DispatchQueueStatus.Pending);
+      expect(db._mocks.orderBy).toHaveBeenCalledWith('created_at', 'asc');
+      // Caps the read at the requested limit.
+      expect(db._mocks.limit).toHaveBeenCalledWith(10);
+      // Fields the re-drive needs are parsed off the row (not left as JSON).
+      expect(jobs[0].runsOnLabels).toEqual(['linux']);
+      expect(jobs[0].excludeLabels).toEqual(['windows']);
+      expect(jobs[0].resources).toEqual({ requests: { cpus: 2 } });
+    });
+
+    it('passes a smaller limit straight through to the query', async () => {
+      const db = createMockDb({ selectRows: [] });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.listPending(2);
+
+      expect(db._mocks.limit).toHaveBeenCalledWith(2);
+    });
+
+    it('returns an empty array when nothing is pending', async () => {
+      const db = createMockDb({ selectRows: [] });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      expect(await queue.listPending(10)).toEqual([]);
+    });
+  });
+
   describe('rowToQueuedJob conversion', () => {
     it('handles null expires_at', async () => {
       const rows = [makeDbRow({ expires_at: null })];
@@ -1048,7 +1315,7 @@ describe('JobQueue', () => {
       const db = createMockDb({ countResult: { count: 0 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      await queue.insertDispatched(makeJobInput({ requestId: 'dispatch-trace' }));
+      await queue.insertDispatched(makeJobInput({ requestId: 'dispatch-trace' }), 'agent-1');
 
       const valuesCall = db._mocks.values;
       const insertArg = valuesCall.mock.calls[0][0];
@@ -1059,7 +1326,7 @@ describe('JobQueue', () => {
       const db = createMockDb({ countResult: { count: 0 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      await queue.insertDispatched(makeJobInput());
+      await queue.insertDispatched(makeJobInput(), 'agent-1');
 
       const valuesCall = db._mocks.values;
       const insertArg = valuesCall.mock.calls[0][0];
@@ -1091,11 +1358,22 @@ describe('JobQueue', () => {
       const db = createMockDb({ countResult: { count: 0 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      await queue.insertDispatched(makeJobInput({ routingKey: 'github:7' }));
+      await queue.insertDispatched(makeJobInput({ routingKey: 'github:7' }), 'agent-1');
 
       const valuesCall = db._mocks.values;
       const insertArg = valuesCall.mock.calls[0][0];
       expect(insertArg.routing_key).toBe('github:7');
+    });
+
+    it('insertDispatched records the owning agent (the row never passes through markDispatched)', async () => {
+      const db = createMockDb({ countResult: { count: 0 } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.insertDispatched(makeJobInput(), 'agent-9');
+
+      const insertArg = db._mocks.values.mock.calls[0][0];
+      expect(insertArg.agent_id).toBe('agent-9');
+      expect(insertArg.status).toBe(DispatchQueueStatus.Dispatched);
     });
   });
 
@@ -1136,6 +1414,22 @@ describe('JobQueue', () => {
         DispatchQueueStatus.Recovering,
       ]);
     });
+
+    it('is a no-op when the row is already terminal (duplicate/replayed terminal frame)', async () => {
+      // Terminal job/step status now rides the agent's reconnect-replay buffer,
+      // so the orchestrator can legitimately receive the same terminal frame
+      // twice (once live, once replayed). The status guard makes the second
+      // markCompleted match zero rows — it must resolve, not throw.
+      const db = createMockDb({ updateResult: { numUpdatedRows: 0n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.markCompleted('job-1')).resolves.toBeUndefined();
+      // The guard is still applied on the redundant call (no unguarded flip).
+      expect(db._mocks.updateWhere).toHaveBeenCalledWith('status', 'in', [
+        DispatchQueueStatus.Dispatched,
+        DispatchQueueStatus.Recovering,
+      ]);
+    });
   });
 
   describe('cancelByRunId', () => {
@@ -1148,6 +1442,36 @@ describe('JobQueue', () => {
       expect(count).toBe(2);
       expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
       expect(db._mocks.set).toHaveBeenCalledWith({ status: DispatchQueueStatus.Expired });
+    });
+  });
+
+  describe('pruneTerminalDispatchRows', () => {
+    it('deletes only terminal rows and returns the deleted count', async () => {
+      const db = createMockDb({ deleteResult: { numDeletedRows: 4n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const deleted = await queue.pruneTerminalDispatchRows(30);
+
+      expect(deleted).toBe(4);
+      expect(db.deleteFrom).toHaveBeenCalledWith('dispatch_queue');
+      // Only the terminal statuses are eligible — a still-active run's
+      // Pending/Dispatched/Recovering rows must never be swept.
+      expect(db._mocks.deleteWhere).toHaveBeenCalledWith('status', 'in', [
+        DispatchQueueStatus.Completed,
+        DispatchQueueStatus.Failed,
+        DispatchQueueStatus.Expired,
+      ]);
+      // And the age cutoff is applied (both predicates must hold).
+      expect(db._mocks.deleteWhere).toHaveBeenCalledWith('created_at', '<', expect.anything());
+    });
+
+    it('is a no-op (no query) when retentionDays <= 0', async () => {
+      const db = createMockDb({ deleteResult: { numDeletedRows: 9n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      expect(await queue.pruneTerminalDispatchRows(0)).toBe(0);
+      expect(await queue.pruneTerminalDispatchRows(-5)).toBe(0);
+      expect(db.deleteFrom).not.toHaveBeenCalled();
     });
   });
 });

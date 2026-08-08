@@ -4,22 +4,37 @@
  * Uses a mock Kysely instance following the established pattern from
  * registration-store.test.ts.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
+import { scheduleTriggerKey } from '@kici-dev/engine';
 
-import { CronStore } from './cron-store.js';
+import { CronStore, cronCacheKey } from './cron-store.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 // ── Tests ──────────────────────────────────────────────────────────
 
+describe('cronCacheKey', () => {
+  it('unites registration id and schedule key with a space', () => {
+    expect(cronCacheKey('reg-1', '0 9 * * 1\nUTC')).toBe('reg-1 0 9 * * 1\nUTC');
+  });
+
+  it('distinguishes two schedules of the same registration', () => {
+    expect(cronCacheKey('reg-1', scheduleTriggerKey('0 9 * * 1', 'UTC'))).not.toBe(
+      cronCacheKey('reg-1', scheduleTriggerKey('0 18 * * 5', 'UTC')),
+    );
+  });
+});
+
 describe('CronStore', () => {
   describe('getAll', () => {
-    it('should return all records as a Map', async () => {
+    it('should return all records as a Map keyed by (registrationId, scheduleKey)', async () => {
       const date1 = new Date('2026-02-25T10:00:00Z');
       const date2 = new Date('2026-02-25T11:00:00Z');
+      const key1 = scheduleTriggerKey('0 9 * * 1', 'UTC');
+      const key2 = scheduleTriggerKey('0 18 * * 5', 'UTC');
       const { db } = createMockDb({
         selectRows: [
-          { registration_id: 'reg-001', last_fired_at: date1 },
-          { registration_id: 'reg-002', last_fired_at: date2 },
+          { registration_id: 'reg-001', schedule_key: key1, last_fired_at: date1 },
+          { registration_id: 'reg-001', schedule_key: key2, last_fired_at: date2 },
         ],
       });
       const store = new CronStore(db);
@@ -28,8 +43,8 @@ describe('CronStore', () => {
 
       expect(result).toBeInstanceOf(Map);
       expect(result.size).toBe(2);
-      expect(result.get('reg-001')).toEqual(date1);
-      expect(result.get('reg-002')).toEqual(date2);
+      expect(result.get(cronCacheKey('reg-001', key1))).toEqual(date1);
+      expect(result.get(cronCacheKey('reg-001', key2))).toEqual(date2);
     });
 
     it('should return empty Map when no records exist', async () => {
@@ -51,10 +66,17 @@ describe('CronStore', () => {
       const store = new CronStore(db);
       const firedAt = new Date('2026-02-25T10:30:00Z');
 
-      const result = await store.tryClaimFire('reg-001', firedAt);
+      const result = await store.tryClaimFire('reg-001', '0 9 * * 1\nUTC', firedAt);
 
       expect(result).toBe(true);
       expect(mocks.insertInto).toHaveBeenCalledWith('cron_last_fired');
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          registration_id: 'reg-001',
+          schedule_key: '0 9 * * 1\nUTC',
+          last_fired_at: firedAt,
+        }),
+      );
       expect(mocks.onConflict).toHaveBeenCalled();
     });
 
@@ -65,7 +87,7 @@ describe('CronStore', () => {
       const store = new CronStore(db);
       const firedAt = new Date('2026-02-25T10:30:00Z');
 
-      const result = await store.tryClaimFire('reg-001', firedAt);
+      const result = await store.tryClaimFire('reg-001', '0 9 * * 1\nUTC', firedAt);
 
       expect(result).toBe(false);
     });

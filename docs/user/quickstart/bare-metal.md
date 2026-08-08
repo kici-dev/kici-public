@@ -151,8 +151,12 @@ kici-admin orchestrator install --env-file ~/.config/kici/kici-orchestrator.env
 kici-admin orchestrator start
 
 # Tail the logs and confirm it boots cleanly.
-kici-admin orchestrator logs --follow
+kici-admin orchestrator logs
 ```
+
+Alternatively, run `kici-admin orchestrator install` with no `--env-file` on an
+interactive terminal to fill these values via the setup wizard; a non-interactive run
+writes a stub enumerating the same keys for you to edit.
 
 Within ~5 seconds you should see:
 
@@ -200,7 +204,7 @@ kici-admin orchestrator restart
 Tail the orchestrator log to confirm the scaler loaded:
 
 ```bash
-kici-admin orchestrator logs --follow
+kici-admin orchestrator logs
 ```
 
 Within a couple of seconds you should see:
@@ -383,17 +387,16 @@ kici-admin orchestrator uninstall
 
 ## Upgrading
 
-When a new KiCI version ships:
+When a new KiCI version ships, one self-driving command does the whole upgrade:
 
 ```bash
-npm install -g kici-admin@latest
-kici-admin orchestrator restart
+kici-admin orchestrator upgrade --version <latest> --yes
 ```
 
-`kici-admin orchestrator restart` re-launches the orchestrator from the freshly-installed binary. Scaler-spawned agents pick up the new agent code on the next job — they respawn fresh from `$(command -v kici-agent)` every time, so a global `kici-admin` upgrade is all that's needed. DB migrations run automatically on first start of the new version.
+It installs the correct global package under the unit's own pinned node runtime, restarts, and verifies the unit now launches the new version. Scaler-spawned agents pick up the new agent code on the next job — they respawn fresh from `$(command -v kici-agent)` every time. DB migrations run automatically on first start of the new version.
 
 :::caution[Don't re-run `install` to upgrade]
-The service unit already points at the global `kici-admin` package, so the `npm install` + `restart` above is the whole upgrade. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup, and against an existing same-named instance it stops with `an orchestrator instance "…" is already installed`. If you see that error, you only needed `kici-admin orchestrator restart`.
+`kici-admin orchestrator upgrade` is the whole upgrade — it installs and restarts for you. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup, and against an existing same-named instance it stops with `an orchestrator instance "…" is already installed`. If you see that error, you wanted `kici-admin orchestrator upgrade` instead.
 :::
 
 ## Where to next
@@ -411,7 +414,7 @@ The service unit already points at the global `kici-admin` package, so the `npm 
 
 **Auth failure to PostgreSQL on first start.** By default both the database and `KICI_DATABASE_URL` (step 5) use the loopback stub `kici-local`, so this only happens if you chose a custom password. With **Option A** (container), the password is baked into the data volume at first boot — if you set a custom `POSTGRES_PASSWORD` after the volume was created, the old password still applies; `docker compose -f ~/.config/kici/docker-compose.postgres.yaml down -v` wipes the volume so a new one takes effect. With **Option B** (native), either the role password doesn't match `KICI_DATABASE_URL`, or `pg_hba.conf` is configured to reject `127.0.0.1` connections — on Debian/Ubuntu the default `pg_hba.conf` accepts loopback with `scram-sha-256`; if you've edited it, restore `host all all 127.0.0.1/32 scram-sha-256`.
 
-**Orchestrator logs show `auth.failed` against api.kici.dev.** The `KICI_PLATFORM_TOKEN` in the env file doesn't match what you minted in step 2. Mint a fresh one and update the env file; then `kici-admin orchestrator restart`.
+**Orchestrator logs show `Platform auth failed` against api.kici.dev.** The `KICI_PLATFORM_TOKEN` in the env file doesn't match what you minted in step 2. Mint a fresh one and update the env file; then `kici-admin orchestrator restart`.
 
 **`kici-admin source add` returns 401 / 403.** The `--token` you passed doesn't match `KICI_BOOTSTRAP_ADMIN_TOKEN` in the orchestrator's env file. Re-extract it with `grep '^KICI_BOOTSTRAP_ADMIN_TOKEN=' ~/.config/kici/kici-orchestrator.env`.
 
@@ -439,7 +442,7 @@ You should see `KICI_STORAGE_TYPE=s3`, `KICI_STORAGE_ENDPOINT=http://localhost:8
 
 **`kici run remote` runs but reports `No jobs dispatched`.** The job's `runsOn` label matches no agent your scaler can provide, so the orchestrator rejects the dispatch. A `runsOn` value must match either a **custom label your scaler declares** — the scalers in step 7 offer `linux` plus `container` / `bare-metal` — or an **auto-label every agent carries automatically**, such as `kici:os:linux` (the agent's operating system), which is what `kici init`'s starter workflows use. A value like `ubuntu-latest` matches neither and never dispatches. Set the job's `runsOn` to one of your scaler's labels (for example `'bare-metal'`) or an auto-label (for example `'kici:os:linux'`), then `kici compile` and re-run.
 
-**Push happens but no agent spawns.** Tail `kici-admin orchestrator logs --follow` immediately after the push and look near the top for one of three failure modes:
+**Push happens but no agent spawns.** Tail `kici-admin orchestrator logs` immediately after the push and look near the top for one of three failure modes:
 
 - `scaler config parse error`: the YAML in `~/.config/kici/scalers.yaml` didn't validate. Re-read the file (`cat ~/.config/kici/scalers.yaml`) — most often `binaryPath:` is empty because `$(command -v kici-agent)` evaluated to nothing at heredoc-write time, which means step 4's `npm install -g kici-admin` didn't put `kici-agent` on PATH. Re-run `command -v kici-agent` from your shell to confirm; if it's empty, re-install with `npm install -g kici-admin@latest` and regenerate the file.
 - `KICI_SCALER_CONFIG_PATH not set` (or the orchestrator boots without loading any scaler): the env-file line you appended in step 7 didn't take effect. The value MUST be an absolute path — systemd env files do NOT expand `~` or `$HOME`. Re-check with `grep '^KICI_SCALER_CONFIG_PATH=' ~/.config/kici/kici-orchestrator.env`; it should look like `KICI_SCALER_CONFIG_PATH=/home/<you>/.config/kici/scalers.yaml`. If it has `~` or `$HOME`, rewrite the line and `kici-admin orchestrator restart`.

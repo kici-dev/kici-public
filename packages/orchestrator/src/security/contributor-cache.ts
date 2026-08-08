@@ -7,6 +7,7 @@
 
 import { LRUCache } from 'lru-cache';
 import type { ContributorResolver, ContributorInfo } from '@kici-dev/engine';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 /** Default TTL for cached contributor info: 15 minutes. */
 const DEFAULT_TTL_MS = 15 * 60 * 1000;
@@ -18,16 +19,34 @@ const DEFAULT_MAX_ENTRIES = 10_000;
  * Caches ContributorResolver results in an LRU cache.
  *
  * Cache key format: `{provider}:{repoFullName}:{username}`
- * TTL: 15 minutes (configurable for testing).
+ * TTL: cluster-configurable (`cluster_settings.contributor_cache_ttl_ms`,
+ * default 15 minutes). The TTL is resolved at each `set()` and applied
+ * per-entry, so a live override affects newly-cached entries without a restart.
  */
 export class ContributorCache {
   private readonly cache: LRUCache<string, ContributorInfo>;
+  private readonly clusterSettings?: ClusterSettingsReader;
+  private readonly defaultTtlMs: number;
 
-  constructor(options?: { ttlMs?: number; maxEntries?: number }) {
+  constructor(options?: {
+    ttlMs?: number;
+    maxEntries?: number;
+    clusterSettings?: ClusterSettingsReader;
+  }) {
+    this.defaultTtlMs = options?.ttlMs ?? DEFAULT_TTL_MS;
+    this.clusterSettings = options?.clusterSettings;
     this.cache = new LRUCache<string, ContributorInfo>({
       max: options?.maxEntries ?? DEFAULT_MAX_ENTRIES,
-      ttl: options?.ttlMs ?? DEFAULT_TTL_MS,
+      ttl: this.defaultTtlMs,
     });
+  }
+
+  /** Resolve the fleet-wide contributor-cache TTL (ms), falling back to the config default. */
+  private async ttlMs(): Promise<number> {
+    return (
+      (await this.clusterSettings?.getNumber('contributor_cache_ttl_ms', this.defaultTtlMs)) ??
+      this.defaultTtlMs
+    );
   }
 
   /**
@@ -62,7 +81,9 @@ export class ContributorCache {
     }
 
     const info = await resolver.resolveContributor(repoFullName, username, credentials);
-    this.cache.set(key, info);
+    // Apply the current cluster TTL per-entry so a live override takes effect
+    // for newly-cached entries without rebuilding the whole LRU.
+    this.cache.set(key, info, { ttl: await this.ttlMs() });
     return info;
   }
 

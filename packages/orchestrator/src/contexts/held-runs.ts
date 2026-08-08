@@ -3,14 +3,18 @@
  *
  * Manages the lifecycle: pending -> approved/rejected/expired.
  */
-import { sql, type Kysely, type Transaction } from 'kysely';
+import { sql, Kysely, PostgresDialect, type Transaction } from 'kysely';
+import { z } from 'zod';
+import pg from 'pg';
 import {
   type ApprovalRequirement,
   type ApproverClause,
   type StepApprovalPayload,
   ApprovalDecision,
   HoldScope,
+  HoldType,
   TriggerSource,
+  persistedHoldTypeSpellings,
 } from '@kici-dev/engine';
 import type { Database, HeldRun, HeldRunApproval } from '../db/types.js';
 
@@ -26,11 +30,24 @@ export enum HeldRunStatus {
   Released = 'released',
 }
 
+/**
+ * Reason a run was held in the security queue. Persisted verbatim in
+ * `held_runs.reason` and switched on by `buildSecurityHoldSummary`.
+ */
+export const SecurityHoldReason = z.enum([
+  'workflow_modification',
+  'unknown_contributor',
+  'fork_pr',
+  'context_trust',
+]);
+export type SecurityHoldReason = z.infer<typeof SecurityHoldReason>;
+
 /** Data required to create a held run. */
 export interface CreateHeldRunData {
   runId: string;
   jobId: string;
-  contextId: string;
+  /** Bound context id, or null for context-free holds (e.g. workflow_modification). */
+  contextId: string | null;
   holdType: string;
   reason: string;
   expiresAt: Date;
@@ -59,8 +76,8 @@ export interface CreateHoldData {
   /** Queue type: 'context' (default) or 'security'. */
   queueType?: 'context' | 'security';
   /**
-   * Held-run `hold_type` discriminator. Defaults to `'approval'` (reviewer
-   * holds). The workflow install gate sets `'wait_timer'` / `'concurrency'` so
+   * Held-run `hold_type` discriminator — an engine `HoldType` member. Defaults
+   * to `reviewer`. The workflow install gate sets `timer` / `concurrency` so
    * the automated release sweeps can find their rows.
    */
   holdType?: string;
@@ -144,7 +161,7 @@ export class HeldRunStore {
         run_id: data.runId,
         job_id: data.jobId,
         context_id: data.contextId ?? null,
-        hold_type: data.holdType ?? 'approval',
+        hold_type: data.holdType ?? HoldType.enum.reviewer,
         queue_type: data.queueType ?? 'context',
         reason: data.requirement.reason,
         expires_at: new Date(data.requirement.expiresAt),
@@ -406,6 +423,33 @@ export class HeldRunStore {
   }
 
   /**
+   * List pending `security` holds whose run belongs to a specific PR (and repo).
+   *
+   * Joins `execution_runs` on `run_id` and filters by `repo_identifier` +
+   * `pr_number` so `/kici approve|reject` only affects the commented PR's holds
+   * rather than every pending security hold in the org. A run with a NULL
+   * `pr_number` (non-PR run, or a legacy run predating the column) never matches
+   * the equality predicate, so such holds are never released here — fail-closed.
+   */
+  async listPendingSecurityHoldsForPr(
+    orgId: string,
+    repoIdentifier: string,
+    prNumber: number,
+  ): Promise<HeldRun[]> {
+    return this.db
+      .selectFrom('held_runs')
+      .innerJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
+      .selectAll('held_runs')
+      .where('held_runs.org_id', '=', orgId)
+      .where('held_runs.queue_type', '=', 'security')
+      .where('held_runs.status', '=', HeldRunStatus.Pending)
+      .where('execution_runs.repo_identifier', '=', repoIdentifier)
+      .where('execution_runs.pr_number', '=', prNumber)
+      .orderBy('held_runs.created_at', 'desc')
+      .execute();
+  }
+
+  /**
    * Approve a pending held run, enforcing queue_type boundary.
    * Prevents context approvals from approving security holds and vice versa.
    * Throws if not found, not pending, or queue_type mismatch.
@@ -465,20 +509,25 @@ export class HeldRunStore {
   }
 
   /**
-   * Release overdue workflow `wait_timer` holds. The install-gate wait action
-   * pauses the workflow as a held run; on timer expiry it must RESUME (not
-   * fail like a reviewer-hold expiry). Flips each overdue pending
-   * `hold_type='wait_timer'`, `hold_scope='workflow'` row to `released` and
-   * returns a `ReleaseSignal` per row so the caller can resume the workflow.
-   * Runs BEFORE `expireOverdue()` so these rows leave the pending pool before
-   * the expire-and-fail sweep sees them.
+   * Release overdue workflow timer holds. The install-gate wait action pauses
+   * the workflow as a held run; on timer expiry it must RESUME (not fail like
+   * a reviewer-hold expiry). Flips each overdue pending `hold_type` timer,
+   * `hold_scope='workflow'` row to `released` and returns a `ReleaseSignal`
+   * per row so the caller can resume the workflow. Runs BEFORE
+   * `expireOverdue()` so these rows leave the pending pool before the
+   * expire-and-fail sweep sees them.
+   *
+   * The filter matches every persisted spelling of the timer hold type, so a
+   * row an un-upgraded orchestrator wrote as `wait_timer` still resumes rather
+   * than falling through to the expire-and-fail sweep. `hold_scope` is what
+   * keeps job-scoped dispatch-gate timer holds out of this sweep.
    */
   async releaseDueWaitHolds(): Promise<ReleaseSignal[]> {
     const rows = await this.db
       .updateTable('held_runs')
       .set({ status: HeldRunStatus.Released, resolved_at: sql`now()` })
       .where('status', '=', HeldRunStatus.Pending)
-      .where('hold_type', '=', 'wait_timer')
+      .where('hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.timer))
       .where('hold_scope', '=', HoldScope.enum.workflow)
       .where('expires_at', '<', sql<Date>`now()`)
       .returningAll()
@@ -492,45 +541,6 @@ export class HeldRunStore {
       // Wait-timer install-gate holds are always context-triggered.
       triggerSource: (row.trigger_source as TriggerSource) ?? TriggerSource.enum.context,
     }));
-  }
-
-  /**
-   * Release the oldest pending workflow `concurrency` hold for a group. Called
-   * when a concurrency slot frees on run completion. Flips the oldest matching
-   * pending row to `released` and returns its `ReleaseSignal`, or null when no
-   * concurrency hold is queued for the group. `group` matches the held row's
-   * `context_id` (workflow-level install concurrency keys on the env id).
-   */
-  async releaseConcurrencyHold(orgId: string, group: string): Promise<ReleaseSignal | null> {
-    const oldest = await this.db
-      .selectFrom('held_runs')
-      .select('id')
-      .where('org_id', '=', orgId)
-      .where('status', '=', HeldRunStatus.Pending)
-      .where('hold_type', '=', 'concurrency')
-      .where('hold_scope', '=', HoldScope.enum.workflow)
-      .where('context_id', '=', group)
-      .orderBy('created_at', 'asc')
-      .limit(1)
-      .executeTakeFirst();
-    if (!oldest) return null;
-    const row = await this.db
-      .updateTable('held_runs')
-      .set({ status: HeldRunStatus.Released, resolved_at: sql`now()` })
-      .where('id', '=', oldest.id)
-      .where('status', '=', HeldRunStatus.Pending)
-      .returningAll()
-      .executeTakeFirst();
-    if (!row) return null;
-    return {
-      holdId: row.id,
-      runId: row.run_id,
-      jobId: row.job_id,
-      scope: (row.hold_scope as HoldScope) ?? HoldScope.enum.workflow,
-      stepIndex: row.step_index,
-      // Concurrency install-gate holds are always context-triggered.
-      triggerSource: (row.trigger_source as TriggerSource) ?? TriggerSource.enum.context,
-    };
   }
 
   /**
@@ -554,4 +564,24 @@ export class HeldRunStore {
     const updateResult = Array.isArray(result) ? result[0] : result;
     return Number(updateResult?.numUpdatedRows ?? 0n);
   }
+}
+
+/**
+ * Build a HeldRunStore backed by its own connection pool to the given
+ * orchestrator database URL. Mirrors `createPeerCredentialStoreFromUrl` /
+ * `createJoinTokenManagerFromUrl`; consumed by E2E tests that exercise the
+ * PR-scoped hold selection against the real deployed orchestrator DB.
+ */
+export function createHeldRunStoreFromUrl(
+  databaseUrl: string,
+  opts?: { maxConnections?: number },
+): { store: HeldRunStore; dispose: () => Promise<void> } {
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: opts?.maxConnections ?? 3 });
+  const db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
+  return {
+    store: new HeldRunStore(db),
+    dispose: async () => {
+      await db.destroy();
+    },
+  };
 }

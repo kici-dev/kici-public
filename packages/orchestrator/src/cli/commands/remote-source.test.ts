@@ -5,9 +5,22 @@
  * missing-DB-URL path fails loudly before opening a pool. Real-DB row-printing
  * is covered by the store's integration test + the E2E suite.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Command } from 'commander';
-import { registerRemoteSourceCommands } from './remote-source.js';
+
+// Lock the read-only invariant: remote-source has no mutating subcommand, so it
+// never records an access-log row. The mock is never triggered because
+// remote-source.ts does not import the helper — that absence is exactly what we
+// assert. If a mutating remote-source subcommand is ever added, its author must
+// wire the recorder and this guard turns into a positive assertion.
+const mockRecordOnDb = vi.fn();
+const mockRecord = vi.fn();
+vi.mock('./shared/admin-cli-access-log.js', () => ({
+  recordAdminCliAccessOnDb: (...a: unknown[]) => mockRecordOnDb(...a),
+  recordAdminCliAccess: (...a: unknown[]) => mockRecord(...a),
+}));
+
+const { registerRemoteSourceCommands } = await import('./remote-source.js');
 
 describe('kici-admin remote-source', () => {
   let savedUrl: string | undefined;
@@ -62,5 +75,34 @@ describe('kici-admin remote-source', () => {
 
     expect(exitCode).toBe(1);
     expect(errors.join('\n')).toMatch(/Database URL required/);
+  });
+
+  it('remote-source show writes no access-log row (read-only invariant)', async () => {
+    mockRecordOnDb.mockClear();
+    mockRecord.mockClear();
+    const program = new Command();
+    program.exitOverride();
+    registerRemoteSourceCommands(program);
+
+    const origError = console.error;
+    console.error = () => undefined;
+    const origExit = process.exit;
+    process.exit = (() => {
+      throw new Error('EXIT');
+    }) as never;
+
+    try {
+      // Runs with no DB URL configured (beforeEach clears both); the command
+      // exits before opening a pool. Either way, no access-log row is written.
+      await program.parseAsync(['node', 'kici-admin', 'remote-source', 'show', 'org_abc']);
+    } catch {
+      // expected: process.exit override throws
+    } finally {
+      console.error = origError;
+      process.exit = origExit;
+    }
+
+    expect(mockRecordOnDb).not.toHaveBeenCalled();
+    expect(mockRecord).not.toHaveBeenCalled();
   });
 });

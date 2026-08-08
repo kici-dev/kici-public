@@ -7,10 +7,14 @@
  * `@kici-dev/engine`. The engine owns all crypto; this command is the thin Node
  * wrapper (fs / fetch / artifact digest / output).
  *
- * `--trust-root` is optional: when omitted it defaults to the hosted KiCI
- * Platform's provenance issuer, so the common case (verifying a bundle attested
- * on the hosted platform) needs no flag. Pass `--trust-root` to verify against a
- * different environment (e.g. staging) or an offline `{ issuer, jwks }` file.
+ * `--trust-root` is optional: when omitted it defaults to the CONFIGURED
+ * ORCHESTRATOR (its own `.well-known`), which now owns provenance signing — the
+ * natural root of trust for a self-hosted customer. When no orchestrator is
+ * configured it falls back to the hosted KiCI Platform's provenance issuer (for
+ * historical Platform-signed bundles, which keep verifying forever). Pass
+ * `--trust-root` to verify against a different environment or an offline
+ * `{ issuer, jwks }` file (air-gap). The token `iss` is always pinned to the
+ * trust root out-of-band — a bundle can never name its own trusted issuer.
  *
  * Returns a boolean (verified) so `cli.ts` can map it to an exit code (0/1).
  */
@@ -21,13 +25,16 @@ import { KICI_PROVENANCE_AUDIENCE } from '@kici-dev/engine/provenance/bundle';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
 import { resolveTrustRoot, type TrustRoot } from '../provenance-trust-root.js';
 import { PROD_PROVENANCE_ISSUER } from '../remote/prod-defaults.js';
+import { loadGlobalConfig } from '../remote/config.js';
 
 export interface VerifyAttestationOptions {
   /** Path or `http(s)` URL to the attestation bundle JSON. Required. */
   bundle?: string;
   /**
    * Trusted issuer URL (online discovery) or a self-contained `{ issuer, jwks }`
-   * file. Optional — defaults to the hosted KiCI Platform's provenance issuer.
+   * file. Optional — defaults to the configured orchestrator, falling back to
+   * the hosted KiCI Platform's provenance issuer when no orchestrator is
+   * configured.
    */
   trustRoot?: string;
   /** Expected token audience (defaults to the KiCI provenance audience). */
@@ -46,10 +53,25 @@ export async function verifyAttestationCommand(
       return false;
     }
 
-    const trustRoot = options.trustRoot ?? PROD_PROVENANCE_ISSUER;
+    // Default trust root resolution order:
+    //   1. explicit --trust-root
+    //   2. the configured orchestrator (its own base URL → its .well-known), the
+    //      natural root of trust for a self-hosted customer whose orchestrator now
+    //      owns provenance signing
+    //   3. the hosted KiCI Platform's provenance issuer, as a last-resort fallback
+    //      for a CLI with no configured orchestrator
+    const globalConfig = await loadGlobalConfig().catch(() => null);
+    const configuredOrchestrator = globalConfig?.endpoint;
+    const trustRoot = options.trustRoot ?? configuredOrchestrator ?? PROD_PROVENANCE_ISSUER;
     const usingDefault = !options.trustRoot;
+    const usingConfiguredOrchestrator = usingDefault && !!configuredOrchestrator;
     if (usingDefault) {
-      logger.info(pc.gray(`Using default trust root ${trustRoot} (pass --trust-root to override)`));
+      const which = usingConfiguredOrchestrator
+        ? 'configured orchestrator'
+        : 'hosted KiCI platform';
+      logger.info(
+        pc.gray(`Using default trust root ${trustRoot} (${which}; pass --trust-root to override)`),
+      );
     }
 
     const bundle = JSON.parse(await readBundle(options.bundle)) as unknown;
@@ -60,11 +82,14 @@ export async function verifyAttestationCommand(
     } catch (error) {
       const msg = toErrorMessage(error);
       if (usingDefault && /\b503\b/.test(msg)) {
+        const where = usingConfiguredOrchestrator
+          ? `your configured orchestrator (${trustRoot})`
+          : `the hosted KiCI platform (${trustRoot})`;
         logger.error(
           pc.red(
-            `Error: build provenance is not enabled on the hosted KiCI platform yet ` +
-              `(${trustRoot} returned 503). Pass --trust-root to verify against another ` +
-              `environment (e.g. staging) or an offline { issuer, jwks } file.`,
+            `Error: build provenance signing is not enabled on ${where} yet ` +
+              `(returned 503). Pass --trust-root to verify against another ` +
+              `environment or an offline { issuer, jwks } file.`,
           ),
         );
         return false;

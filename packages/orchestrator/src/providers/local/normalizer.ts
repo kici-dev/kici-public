@@ -67,8 +67,7 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   extractRepoIdentifier(payload: unknown): string | null {
     const p = payload as Record<string, unknown>;
     const repository = p.repository as
-      | { full_name?: string; owner?: { login?: string }; name?: string }
-      | undefined;
+      { full_name?: string; owner?: { login?: string }; name?: string } | undefined;
 
     return (
       repository?.full_name ??

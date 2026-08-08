@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { LogStream } from '@kici-dev/engine';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 
 /**
@@ -58,5 +59,37 @@ describe('makeStreamingZxLog', () => {
     log(stdout('\n', true)); // blank — dropped
     log(stdout('visible-2\n', true));
     expect(lines).toEqual(['visible-1', 'visible-2']);
+  });
+});
+
+describe('makeStreamingZxLog stream kind', () => {
+  it('forwards the zx entry kind to emit', () => {
+    const seen: Array<{ line: string; stream: LogStream }> = [];
+    const log = makeStreamingZxLog((line, stream) => seen.push({ line, stream }));
+
+    log(stdout('out one\n', true));
+    log(stderr('err one\n', true));
+
+    expect(seen).toEqual([
+      { line: 'out one', stream: LogStream.enum.stdout },
+      { line: 'err one', stream: LogStream.enum.stderr },
+    ]);
+  });
+
+  it('keeps a partial line per stream instead of splicing the two together', () => {
+    const seen: Array<{ line: string; stream: LogStream }> = [];
+    const log = makeStreamingZxLog((line, stream) => seen.push({ line, stream }));
+
+    // stdout leaves a partial line open; stderr completes its own line first.
+    log(stdout('progress: 50', true));
+    log(stderr('warning: deprecated flag\n', true));
+    expect(seen).toEqual([{ line: 'warning: deprecated flag', stream: LogStream.enum.stderr }]);
+
+    // The stdout remainder completes on its own stream, unspliced.
+    log(stdout('%\n', true));
+    expect(seen).toEqual([
+      { line: 'warning: deprecated flag', stream: LogStream.enum.stderr },
+      { line: 'progress: 50%', stream: LogStream.enum.stdout },
+    ]);
   });
 });

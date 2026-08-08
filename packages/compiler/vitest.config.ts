@@ -1,3 +1,4 @@
+import '../../hack/lib/vitest-isolation.ts';
 import { defineConfig } from 'vitest/config';
 import path from 'node:path';
 

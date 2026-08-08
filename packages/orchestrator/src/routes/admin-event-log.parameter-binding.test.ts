@@ -1,5 +1,5 @@
 /**
- * Event-log query parameter-binding tripwire (§4.6).
+ * Event-log query parameter-binding tripwire.
  *
  * The orchestrator's `GET /api/v1/admin/event-log` handler accepts a
  * dozen filter parameters from the query string (`orgId`, `routingKey`,
@@ -37,7 +37,7 @@
  *   before DB work) are the two that matter.
  *
  *   For attacker A1 (external, unauthenticated), the bearer-token
- *   middleware (covered by §4.1) is the perimeter gate; this test
+ *   middleware is the perimeter gate; this test
  *   layers the RBAC + parameter-binding invariants on top.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -88,7 +88,7 @@ function makeDeps(opts: { rolePermitted?: boolean; selectRows?: unknown[] }) {
   return { db, mocks, tokenManager, rbac, logStorage };
 }
 
-describe('§4.6 GET /api/v1/admin/event-log parameter-binding invariants', () => {
+describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });

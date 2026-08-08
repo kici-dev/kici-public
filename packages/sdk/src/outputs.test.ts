@@ -25,21 +25,21 @@ describe('createStepOutputProxy', () => {
 
   it('resolves property access when outputs are populated', () => {
     outputsMap.set('build', { version: '1.0.0', artifact: 'dist/main.js' });
-    const proxy = createStepOutputProxy<{ version: string; artifact: string }>('build');
+    const proxy = createStepOutputProxy<{ version: string; artifact: string }>({ name: 'build' });
 
     expect(proxy.version).toBe('1.0.0');
     expect(proxy.artifact).toBe('dist/main.js');
   });
 
   it('throws when step has not produced outputs yet', () => {
-    const proxy = createStepOutputProxy<{ version: string }>('build');
+    const proxy = createStepOutputProxy<{ version: string }>({ name: 'build' });
 
     expect(() => proxy.version).toThrow("Step 'build' has not produced outputs yet");
   });
 
   it('resolves multiple fields correctly', () => {
     outputsMap.set('test', { a: 1, b: 'hello', c: true });
-    const proxy = createStepOutputProxy<{ a: number; b: string; c: boolean }>('test');
+    const proxy = createStepOutputProxy<{ a: number; b: string; c: boolean }>({ name: 'test' });
 
     expect(proxy.a).toBe(1);
     expect(proxy.b).toBe('hello');
@@ -48,7 +48,7 @@ describe('createStepOutputProxy', () => {
 
   it('well-known string props do not throw', () => {
     // These should not throw even when outputs map is empty
-    const proxy = createStepOutputProxy<{ x: number }>('missing');
+    const proxy = createStepOutputProxy<{ x: number }>({ name: 'missing' });
 
     // toString, valueOf, etc. should delegate to Reflect
     expect(() => proxy.toString).not.toThrow();
@@ -56,7 +56,7 @@ describe('createStepOutputProxy', () => {
   });
 
   it('symbol props delegate to Reflect', () => {
-    const proxy = createStepOutputProxy<{ x: number }>('missing');
+    const proxy = createStepOutputProxy<{ x: number }>({ name: 'missing' });
 
     // Symbol access should not throw
     expect(() => (proxy as any)[Symbol.toPrimitive]).not.toThrow();
@@ -65,7 +65,7 @@ describe('createStepOutputProxy', () => {
 
   it('JSON.stringify works when outputs are populated', () => {
     outputsMap.set('build', { version: '1.0.0' });
-    const proxy = createStepOutputProxy<{ version: string }>('build');
+    const proxy = createStepOutputProxy<{ version: string }>({ name: 'build' });
 
     // Should not throw -- ownKeys and getOwnPropertyDescriptor support JSON.stringify
     const json = JSON.stringify(proxy);
@@ -74,22 +74,61 @@ describe('createStepOutputProxy', () => {
 
   it('ownKeys returns correct keys', () => {
     outputsMap.set('build', { x: 1, y: 2 });
-    const proxy = createStepOutputProxy<{ x: number; y: number }>('build');
+    const proxy = createStepOutputProxy<{ x: number; y: number }>({ name: 'build' });
 
     expect(Object.keys(proxy)).toEqual(['x', 'y']);
   });
 
   it('ownKeys returns empty when step has no outputs', () => {
-    const proxy = createStepOutputProxy<{ x: number }>('missing');
+    const proxy = createStepOutputProxy<{ x: number }>({ name: 'missing' });
     expect(Object.keys(proxy)).toEqual([]);
   });
 
   it('has trap works correctly', () => {
     outputsMap.set('build', { version: '1.0.0' });
-    const proxy = createStepOutputProxy<{ version: string }>('build');
+    const proxy = createStepOutputProxy<{ version: string }>({ name: 'build' });
 
     expect('version' in proxy).toBe(true);
     expect('missing' in proxy).toBe(false);
+  });
+});
+
+describe('createStepOutputProxy late binding', () => {
+  let outputsMap: OutputsMap;
+
+  beforeEach(() => {
+    outputsMap = new Map();
+    setStepOutputsMap(outputsMap);
+  });
+
+  it('resolves outputs under a name assigned after proxy creation', () => {
+    const stepRef = { name: '' };
+    const proxy = createStepOutputProxy<{ v: number }>(stepRef);
+    // Simulate the runner's write-back of the resolved step-N name.
+    stepRef.name = 'step-1';
+    outputsMap.set('step-1', { v: 42 });
+    expect(proxy.v).toBe(42);
+  });
+
+  it('throws a targeted error when accessed while the name is unresolved', () => {
+    const stepRef = {
+      name: '',
+      _sourceLocation: { file: 'wf.ts', line: 7, column: 3 },
+    };
+    const proxy = createStepOutputProxy<{ v: number }>(stepRef);
+    expect(() => proxy.v).toThrow(/has no name yet/);
+    expect(() => proxy.v).toThrow(/wf\.ts:7/);
+  });
+
+  it('ownKeys and has stay inert (no throw) while unresolved', () => {
+    const proxy = createStepOutputProxy<{ v: number }>({ name: '' });
+    expect(Object.keys(proxy)).toEqual([]);
+    expect('v' in proxy).toBe(false);
+  });
+
+  it('keeps the existing not-yet-produced error for resolved names', () => {
+    const proxy = createStepOutputProxy<{ v: number }>({ name: 'step-9' });
+    expect(() => proxy.v).toThrow(/Step 'step-9' has not produced outputs yet/);
   });
 });
 
@@ -216,7 +255,7 @@ describe('setOutputsMap / injection', () => {
     map1.set('build', { version: '1.0' });
     setStepOutputsMap(map1);
 
-    const proxy = createStepOutputProxy<{ version: string }>('build');
+    const proxy = createStepOutputProxy<{ version: string }>({ name: 'build' });
     expect(proxy.version).toBe('1.0');
 
     // Inject a new map (simulating new execution)
@@ -237,7 +276,7 @@ describe('setOutputsMap / injection', () => {
     const map2: OutputsMap = new Map();
     setStepOutputsMap(map2);
 
-    const proxy = createStepOutputProxy<{ data: string }>('old-step');
+    const proxy = createStepOutputProxy<{ data: string }>({ name: 'old-step' });
     expect(() => proxy.data).toThrow("Step 'old-step' has not produced outputs yet");
   });
 

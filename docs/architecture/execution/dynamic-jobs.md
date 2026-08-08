@@ -199,19 +199,17 @@ The `source` field indicates where each scaler/agent is located: `"local"` for t
 
 ## Dynamic fields on generated jobs
 
-Generated jobs may declare function-typed `environment`, `env`, `concurrencyGroup`, and `matrix`. The dynamic job serializer (`packages/agent/src/execution/dynamic-job-serializer.ts`) invokes each user function against the same eval context that was just passed to the parent DynamicJobFn (the normalized event envelope, `$`, `log`, `env`, and workflow name) and embeds the resolved values into the lock job before dispatch. Each call is wrapped in a 60s timeout (mirroring the static-job dynamic-field path in `init-runner.ts`). User functions that throw cause the eval job to fail with the user's error message; functions that return `undefined` leave the field unset.
+Generated jobs may declare function-typed `context`, `env`, `concurrencyGroup`, and `matrix`. The dynamic job serializer (`packages/agent/src/execution/dynamic-job-serializer.ts`) invokes each user function against the same eval context that was just passed to the parent DynamicJobFn (the normalized event envelope, `$`, `log`, `env`, and workflow name) and embeds the resolved values into the lock job before dispatch. Each call is wrapped in a 60s timeout (mirroring the static-job dynamic-field path in `init-runner.ts`). User functions that throw cause the eval job to fail with the user's error message; functions that return `undefined` leave the field unset.
 
 ```ts
 async ({ event }) => [
   job('deploy', {
     runsOn: ['default'],
-    environment: (event) => `staging-${event.targetBranch}`,
+    context: (event) => `staging-${event.targetBranch}`,
     env: (event) => ({ REF: String(event.payload.ref) }),
     concurrencyGroup: (event) => `cg-${event.targetBranch}`,
     matrix: async () => ['us-east', 'eu-west'],
-    steps: [
-      /* ... */
-    ],
+    steps: [/* ... */],
   }),
 ];
 ```

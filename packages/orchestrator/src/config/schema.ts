@@ -12,6 +12,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 
 /**
  * Schema for the local YAML configuration file.
@@ -24,7 +25,7 @@ export const localConfigSchema = z.object({
   instance: z
     .object({
       id: z.string().optional(),
-      mode: z.enum(['platform', 'hybrid', 'independent']).optional(),
+      mode: OrchestratorMode.optional(),
     })
     .optional(),
   server: z
@@ -152,7 +153,7 @@ export type SharedConfigSchemaType = z.infer<typeof sharedConfigSchema>;
 export const appConfigSchema = z
   .object({
     instanceId: z.string().default(() => randomUUID()),
-    mode: z.enum(['platform', 'hybrid', 'independent']).default('platform'),
+    mode: OrchestratorMode.default('platform'),
 
     // From LocalConfig
     databaseUrl: z.string().default(''),
@@ -269,19 +270,20 @@ export const appConfigSchema = z
       });
     }
 
-    // Platform/hybrid modes require relay connection (skip for workers)
-    if (!isWorker && (data.mode === 'platform' || data.mode === 'hybrid')) {
+    // Platform-connected modes require the Platform connection (skip for
+    // workers). `observed` connects for observability only.
+    if (!isWorker && PLATFORM_CONNECTED_MODES.includes(data.mode)) {
       if (!data.platformUrl) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: 'platformUrl is required when mode is platform or hybrid',
+          message: `platformUrl is required when mode is ${PLATFORM_CONNECTED_MODES.join('/')}`,
           path: ['platformUrl'],
         });
       }
       if (!data.platformToken) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: 'platformToken is required when mode is platform or hybrid',
+          message: `platformToken is required when mode is ${PLATFORM_CONNECTED_MODES.join('/')}`,
           path: ['platformToken'],
         });
       }

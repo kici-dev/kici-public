@@ -51,16 +51,6 @@ async function defaultReadyPoller(_port: number): Promise<boolean> {
   return false;
 }
 
-/** Whether a podman binary is available on PATH. */
-export async function isPodmanAvailable(): Promise<boolean> {
-  try {
-    await $`podman --version`.quiet();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Resolve the platform-specific `pg_ctl` binary bundled with embedded-postgres.
  * Mirrors the package's own platform → binary-package mapping, resolving the
@@ -115,12 +105,46 @@ async function ensureEmbeddedCluster(port: number): Promise<void> {
 }
 
 /**
+ * Whether this plane's embedded postmaster is already serving `port`.
+ *
+ * `pg_ctl start` fails outright against a running cluster, so a boot that
+ * reclaims the plane port while leaving PostgreSQL up — reclaiming another
+ * plane's orchestrator does exactly that, since only the port holder is
+ * signalled — would otherwise fall through to the Podman path and fail there.
+ *
+ * The port comes from the cluster's own `postmaster.pid` (line 4) rather than
+ * being assumed, so a postmaster left on a different port is not mistaken for
+ * one this plane can reuse.
+ */
+export async function embeddedClusterIsServing(port: number): Promise<boolean> {
+  const { pgData } = planePaths();
+  const pidFile = path.join(pgData, 'postmaster.pid');
+  let runningPort: number;
+  try {
+    runningPort = Number(fs.readFileSync(pidFile, 'utf-8').split('\n')[3]);
+  } catch {
+    return false; // No pid file — nothing is running from this data dir.
+  }
+  if (runningPort !== port) return false;
+  try {
+    // Exit 0 means the server is running; 3 means it is not, 4 means the data
+    // dir is unusable. Both non-zero cases mean "start it".
+    await $`${resolvePgCtl()} -D ${pgData} status`.quiet();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Start a detached embedded postmaster via `pg_ctl` so it survives the exit of
  * this CLI process (embedded-postgres's in-process server is killed by its own
- * exit hook, so it cannot back a warm plane).
+ * exit hook, so it cannot back a warm plane). A cluster already serving this
+ * plane's port is reused as-is.
  */
 async function defaultEmbeddedDaemon(port: number): Promise<void> {
   const { pgData, logFile } = planePaths();
+  if (await embeddedClusterIsServing(port)) return;
   const pgCtl = resolvePgCtl();
   await $`${pgCtl} -D ${pgData} -o ${`-p ${port}`} -l ${`${logFile}.pg`} -w start`.quiet();
 }

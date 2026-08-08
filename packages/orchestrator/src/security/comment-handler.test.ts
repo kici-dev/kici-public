@@ -63,7 +63,10 @@ describe('parseKiciCommand', () => {
 describe('handleApprovalComment', () => {
   function createMockHeldRunStore() {
     return {
+      // The org-wide list must NOT be called by the handler anymore — kept on
+      // the mock only so tests can assert it is never reached.
       listByQueueType: vi.fn().mockResolvedValue([]),
+      listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
       approveByQueueType: vi.fn().mockResolvedValue({}),
       reject: vi.fn().mockResolvedValue({}),
     } as any;
@@ -131,7 +134,7 @@ describe('handleApprovalComment', () => {
 
   it('approves security hold with ci_trust:write commenter', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
     ]);
 
@@ -144,7 +147,7 @@ describe('handleApprovalComment', () => {
 
   it('rejects security hold on /kici reject', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
     ]);
 
@@ -164,7 +167,7 @@ describe('handleApprovalComment', () => {
 
   it('handles no pending security holds gracefully', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([]);
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([]);
 
     const params = createBaseParams({ heldRunStore: store });
     const result = await handleApprovalComment(params);
@@ -175,7 +178,7 @@ describe('handleApprovalComment', () => {
 
   it('filters to specific run when runId provided', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
       { id: 'hold-2', run_id: 'run-2', queue_type: 'security', status: 'pending' },
     ]);
@@ -193,7 +196,7 @@ describe('handleApprovalComment', () => {
 
   it('allows ci_trust:admin to approve', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
     ]);
 
@@ -219,13 +222,14 @@ describe('handleApprovalComment', () => {
 
   it('posts check status on approval when poster and commitSha are provided', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
     ]);
 
     const mockPoster = {
       provider: 'github' as const,
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
+      postWorkflowModificationCheck: vi.fn().mockResolvedValue(undefined),
     };
 
     const params = createBaseParams({
@@ -248,13 +252,14 @@ describe('handleApprovalComment', () => {
 
   it('posts failure check status on rejection', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
     ]);
 
     const mockPoster = {
       provider: 'github' as const,
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
+      postWorkflowModificationCheck: vi.fn().mockResolvedValue(undefined),
     };
 
     const params = createBaseParams({
@@ -278,7 +283,7 @@ describe('handleApprovalComment', () => {
 
   it('does not post check status when all hold operations fail', async () => {
     const store = createMockHeldRunStore();
-    store.listByQueueType.mockResolvedValue([
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
       { id: 'hold-1', run_id: 'run-1', queue_type: 'security', status: 'pending' },
       { id: 'hold-2', run_id: 'run-2', queue_type: 'security', status: 'pending' },
     ]);
@@ -287,6 +292,7 @@ describe('handleApprovalComment', () => {
     const mockPoster = {
       provider: 'github' as const,
       postCheckStatus: vi.fn().mockResolvedValue(undefined),
+      postWorkflowModificationCheck: vi.fn().mockResolvedValue(undefined),
     };
 
     const params = createBaseParams({
@@ -299,5 +305,71 @@ describe('handleApprovalComment', () => {
     expect(result.handled).toBe(true);
     expect(store.approveByQueueType).toHaveBeenCalledTimes(2);
     expect(mockPoster.postCheckStatus).not.toHaveBeenCalled();
+  });
+
+  // ── PR/repo scoping (the cross-tenant over-approval fix) ──────────────────
+
+  it('scopes hold selection to the comment PR + repo and never lists org-wide', async () => {
+    const store = createMockHeldRunStore();
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
+      { id: 'hold-pr42', run_id: 'run-pr42', queue_type: 'security', status: 'pending' },
+    ]);
+
+    const params = createBaseParams({
+      heldRunStore: store,
+      repoIdentifier: 'owner/repo',
+      prNumber: 42,
+    });
+    const result = await handleApprovalComment(params);
+
+    expect(result.handled).toBe(true);
+    expect(store.listPendingSecurityHoldsForPr).toHaveBeenCalledWith('org-1', 'owner/repo', 42);
+    // The org-wide list is the bug — it must never be reached.
+    expect(store.listByQueueType).not.toHaveBeenCalled();
+    expect(store.approveByQueueType).toHaveBeenCalledTimes(1);
+    expect(store.approveByQueueType).toHaveBeenCalledWith(
+      'org-1',
+      'hold-pr42',
+      'user-1',
+      'security',
+    );
+  });
+
+  it('approves only the runId within the PR scope; ignores other holds in the same PR', async () => {
+    const store = createMockHeldRunStore();
+    // The scoped query already returned only this PR's holds; runId narrows within.
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
+      { id: 'hold-a', run_id: 'run-a', queue_type: 'security', status: 'pending' },
+      { id: 'hold-b', run_id: 'run-b', queue_type: 'security', status: 'pending' },
+    ]);
+
+    const params = createBaseParams({
+      commentBody: '/kici approve run-a',
+      heldRunStore: store,
+    });
+    const result = await handleApprovalComment(params);
+
+    expect(result.handled).toBe(true);
+    expect(store.approveByQueueType).toHaveBeenCalledTimes(1);
+    expect(store.approveByQueueType).toHaveBeenCalledWith('org-1', 'hold-a', 'user-1', 'security');
+  });
+
+  it('explicit runId outside the PR scope matches nothing (no cross-PR bypass)', async () => {
+    const store = createMockHeldRunStore();
+    // Scoped query returns only PR #42's hold; a runId from another PR is absent.
+    store.listPendingSecurityHoldsForPr.mockResolvedValue([
+      { id: 'hold-pr42', run_id: 'run-pr42', queue_type: 'security', status: 'pending' },
+    ]);
+
+    const params = createBaseParams({
+      commentBody: '/kici approve run-from-another-pr',
+      heldRunStore: store,
+      prNumber: 42,
+    });
+    const result = await handleApprovalComment(params);
+
+    expect(result.handled).toBe(true);
+    expect(store.approveByQueueType).not.toHaveBeenCalled();
+    expect(store.reject).not.toHaveBeenCalled();
   });
 });

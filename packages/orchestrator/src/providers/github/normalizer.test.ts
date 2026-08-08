@@ -133,6 +133,46 @@ describe('GitHubWebhookNormalizer', () => {
       expect(result?.senderUserId).toBeUndefined();
     });
 
+    it('sets prNumber for pull_request events', () => {
+      const result = normalizer.normalizeEvent('pull_request', 'opened', {
+        pull_request: { number: 42, base: { ref: 'main' }, head: { ref: 'feature' } },
+        sender: { login: 'alice', id: 1 },
+      });
+      expect(result?.prNumber).toBe(42);
+    });
+
+    it('sets prNumber for pull_request_review events', () => {
+      const result = normalizer.normalizeEvent('pull_request_review', 'submitted', {
+        pull_request: { number: 7, base: { ref: 'main' }, head: { ref: 'feat' } },
+        sender: { login: 'bob', id: 2 },
+      });
+      expect(result?.prNumber).toBe(7);
+    });
+
+    it('sets prNumber for pull_request_review_comment events', () => {
+      const result = normalizer.normalizeEvent('pull_request_review_comment', 'created', {
+        pull_request: { number: 9, base: { ref: 'main' }, head: { ref: 'feat' } },
+        sender: { login: 'carol', id: 3 },
+      });
+      expect(result?.prNumber).toBe(9);
+    });
+
+    it('leaves prNumber undefined for push events', () => {
+      const result = normalizer.normalizeEvent('push', null, {
+        ref: 'refs/heads/main',
+        sender: { login: 'dave', id: 4 },
+      });
+      expect(result?.prNumber).toBeUndefined();
+    });
+
+    it('leaves prNumber undefined when pull_request has no number', () => {
+      const result = normalizer.normalizeEvent('pull_request', 'opened', {
+        pull_request: { base: { ref: 'main' }, head: { ref: 'feat' } },
+        sender: { login: 'eve', id: 5 },
+      });
+      expect(result?.prNumber).toBeUndefined();
+    });
+
     it('normalizes pull_request without source branch', () => {
       const payload = {
         pull_request: {

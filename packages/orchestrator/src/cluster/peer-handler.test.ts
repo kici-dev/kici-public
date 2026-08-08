@@ -1,7 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import type { PeerHeartbeat } from '@kici-dev/engine';
+import type { PeerHeartbeat, PeerLogChunk } from '@kici-dev/engine';
+import { LogStream } from '@kici-dev/engine';
+import { createLogChunkSink } from '../reporting/log-chunk-sink.js';
+import { normalizePeerLogChunk } from '../reporting/peer-log-normalize.js';
+import type { LogWriter } from '../reporting/log-writer.js';
+import type { StepLogBuffer } from '../reporting/step-log-buffer.js';
 import {
   generateEcdhKeyPair,
   deriveSessionKey,
@@ -1045,7 +1050,87 @@ describe('PeerHandler', () => {
 
       expect(onPeerScalerEvent).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'scaler.event', runId: 'run-1', jobId: 'job-1' }),
+        // The authenticated source-peer instanceId is threaded to the callback so
+        // the coordinator can verify signal provenance against the tracked reroute.
+        'remote-peer',
       );
+    });
+
+    it('routes encrypted job.progress to callback with the authenticated source peer id', async () => {
+      const onJobProgress = vi.fn();
+      const { handler } = createTestHandler({ onJobProgress });
+      const ws = new MockPeerWs();
+
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      const jobProgress = {
+        type: 'job.progress',
+        kind: 'job',
+        runId: 'run-1',
+        jobId: 'job-1',
+        jobName: 'build',
+        stepIndex: 0,
+        stepName: '',
+        state: 'running',
+        timestamp: Date.now(),
+      };
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(jobProgress), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onJobProgress).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'job.progress', runId: 'run-1', jobId: 'job-1' }),
+        'remote-peer', // the authenticated source id the handler must thread
+        expect.any(Function),
+      );
+    });
+
+    it('serves a peer.clusterSettings.request with the resolved snapshot + version', async () => {
+      const onPeerClusterSettingsRequest = vi
+        .fn()
+        .mockResolvedValue({ version: 9, settings: { agentTokenTtlMs: 45_000 } });
+      const { handler } = createTestHandler({ onPeerClusterSettingsRequest });
+      const ws = new MockPeerWs();
+
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const before = ws.sentMessages.length;
+
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({ type: 'peer.clusterSettings.request', messageId: 'req-1' }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onPeerClusterSettingsRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.clusterSettings.request', messageId: 'req-1' }),
+      );
+      const reply = JSON.parse(decryptMessage(ws.sentMessages[before], sessionKey));
+      expect(reply).toEqual({
+        type: 'peer.clusterSettings.response',
+        messageId: 'req-1',
+        version: 9,
+        settings: { agentTokenTtlMs: 45_000 },
+      });
+    });
+
+    it('does not reply to a peer.clusterSettings.request when no handler is configured', async () => {
+      const { handler } = createTestHandler(); // no onPeerClusterSettingsRequest
+      const ws = new MockPeerWs();
+
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+      const before = ws.sentMessages.length;
+
+      ws.simulateRawMessage(
+        encryptMessage(
+          JSON.stringify({ type: 'peer.clusterSettings.request', messageId: 'req-2' }),
+          sessionKey,
+        ),
+      );
+      await vi.advanceTimersByTimeAsync(0);
+
+      // No response frame — the worker keeps its boot-time config default.
+      expect(ws.sentMessages.length).toBe(before);
     });
   });
 
@@ -1291,6 +1376,69 @@ describe('PeerHandler', () => {
         }),
         'remote-peer',
       );
+    });
+
+    it('persists a peer log chunk and forwards it to the platform', async () => {
+      const appendChunk = vi.fn().mockResolvedValue(undefined);
+      const forwardToPlatform = vi.fn();
+      const addLines = vi.fn();
+
+      const sink = createLogChunkSink({
+        source: 'peer',
+        stepLogBuffer: { addLines } as unknown as StepLogBuffer,
+        logWriter: { appendChunk } as unknown as LogWriter,
+        executionTracker: { getJobName: () => 'build' },
+        forwardToPlatform,
+      });
+
+      // The normalize -> sink composition `orchestrator-core` installs on the
+      // coordinator, driven here through a real encrypted `peer.log.chunk`
+      // frame so the wire shape has to survive the handler's schema parse.
+      const { handler } = createTestHandler({
+        onPeerLogChunk: (chunk) => {
+          for (const group of normalizePeerLogChunk(chunk)) sink(group);
+        },
+      });
+      const ws = new MockPeerWs();
+      const { sessionKey } = await authenticateWithToken(handler, ws);
+
+      const chunk: PeerLogChunk = {
+        type: 'peer.log.chunk',
+        runId: 'run-1',
+        jobId: 'job-1',
+        stepIndex: 0,
+        lines: [
+          { text: 'out', timestamp: 100, stream: LogStream.enum.stdout },
+          { text: 'err', timestamp: 100, stream: LogStream.enum.stderr },
+        ],
+      };
+
+      ws.simulateRawMessage(encryptMessage(JSON.stringify(chunk), sessionKey));
+
+      expect(addLines).toHaveBeenCalledTimes(2);
+      expect(appendChunk).toHaveBeenNthCalledWith(
+        1,
+        'run-1',
+        'build',
+        0,
+        ['out'],
+        100,
+        'job-1',
+        undefined,
+        LogStream.enum.stdout,
+      );
+      expect(appendChunk).toHaveBeenNthCalledWith(
+        2,
+        'run-1',
+        'build',
+        0,
+        ['err'],
+        100,
+        'job-1',
+        undefined,
+        LogStream.enum.stderr,
+      );
+      expect(forwardToPlatform).toHaveBeenCalledTimes(2);
     });
 
     it('handles peer.cache.upload.request and sends response', async () => {

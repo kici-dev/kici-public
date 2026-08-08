@@ -70,19 +70,19 @@ GitHub includes these headers with every webhook delivery:
 
 ### Step 2: KiCI routes the webhook
 
-KiCI receives the webhook, validates provider headers, resolves the routing key, dedups against its delivery log, and chunk-relays the body bytes byte-identical to the orchestrator that owns the routing key over the existing WebSocket — load-balanced across the pool of connected orchestrators, retried against the next candidate on ACK timeout, and cross-routed to a remote KiCI instance if the orchestrator is connected elsewhere. KiCI never sees customer signing material; signature verification happens entirely on the orchestrator after reassembly.
+KiCI receives the webhook, validates provider headers, resolves the routing key, dedups against its delivery log, and chunk-relays the body bytes byte-identical to the orchestrator that owns the routing key over the existing WebSocket — load-balanced across the pool of relay-eligible connected orchestrators, retried against the next candidate on ACK timeout, and cross-routed to a remote KiCI instance if the orchestrator is connected elsewhere. Orchestrators running in observed mode are excluded from that pool: they ingest provider deliveries directly on their own URL, so their sources are recorded as observe-only and never routed. They stay fully addressable for dashboard reads, re-run, and cancel. KiCI never sees customer signing material; signature verification happens entirely on the orchestrator after reassembly.
 
 ### Failure modes
 
-| Condition                                               | HTTP status            | Where decided                              |
-| ------------------------------------------------------- | ---------------------- | ------------------------------------------ |
-| Body > 25 MiB                                           | 413                    | HTTP body-limit, before any WS work        |
-| Negative-cache hit on unknown `(orgId, routingKey)`     | 404                    | `unknown-source-cache.ts`                  |
-| Orchestrator ACK `result: accepted`                     | 200                    | `statusForResult()`                        |
-| Orchestrator ACK `result: rejected_signature`           | 401                    | `statusForResult()`                        |
-| Orchestrator ACK `result: rejected_unknown_source`      | 404                    | `statusForResult()`; primes negative cache |
-| Orchestrator ACK `result: rejected_misconfigured`       | 500                    | `statusForResult()`                        |
-| No orch in pool, all candidates timed out, or no remote | 503 + `Retry-After: 5` | `routes/webhooks.ts`                       |
+| Condition                                               | HTTP status                                                               | Where decided                                                                       |
+| ------------------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Body > 25 MiB                                           | 413                                                                       | HTTP body-limit, before any WS work                                                 |
+| Negative-cache hit on unknown `(orgId, routingKey)`     | 404                                                                       | `unknown-source-cache.ts`                                                           |
+| Orchestrator ACK `result: accepted`                     | 200                                                                       | `statusForResult()`                                                                 |
+| Orchestrator ACK `result: rejected_signature`           | 401                                                                       | `statusForResult()`                                                                 |
+| Orchestrator ACK `result: rejected_unknown_source`      | 404                                                                       | `statusForResult()`; primes negative cache                                          |
+| Orchestrator ACK `result: rejected_misconfigured`       | 500                                                                       | `statusForResult()`                                                                 |
+| No orch in pool, all candidates timed out, or no remote | 200 `{ status: "buffered" }` (or 503 when the buffer budget is exhausted) | buffered for replay, see [below](#no-orchestrator-connected----any-instance-step-7) |
 
 ### Step 9: Orchestrator processes webhook
 
@@ -182,7 +182,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 29; the orchestrator rejects any fetched lock whose `schemaVersion` does not exactly match the version it was compiled against, so a stale lock must be recompiled with `pnpm kici compile` and pushed again.
+Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 31; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 
@@ -222,7 +222,7 @@ For each matched registration, the orchestrator then:
 1. **Composes a dedup key.** `${inboundDeliveryId}:${registrationId}` — fan-out is idempotent **per registration target** on re-delivery. Replaying the same webhook still dedups; new registrations added after the original delivery will fire on the next replay.
 2. **Resolves the registration's bundle.** `providerRegistry.getByRoutingKey(reg.routingKey)` — the **registration's** routing key, never the inbound generic source's routing key. If the bundle is missing, increment `kici_cross_source_errors_total{reason="bundle_missing"}` and skip the registration.
 3. **Issues a clone token via the registration's bundle.** Calls `regBundle.cloneTokenProvider.createCloneToken(reg.repoIdentifier, reg.providerContext)`. **Fail-fast on error**: if issuance throws (revoked installation, expired app key, etc.), increment `kici_cross_source_errors_total{reason="clone_token"}` and skip the registration. Do **not** fall back to the inbound generic bundle — silently swapping bundles would leak credentials across providers.
-4. **Delegates to `dispatchMatchedWorkflow()`.** Synthesizes a per-registration `WorkflowDispatchContext` and calls `dispatchMatchedWorkflow()` — the **same** helper the same-source path uses for every matched workflow. The helper uniformly handles static jobs, dynamic-fn workflows (`__dynamic__` eval jobs), `__init__` two-phase init dispatch (for static jobs with dynamic environment / env / concurrencyGroup fields), `__build__` build coordinator integration with bundle + dep cache lookup, per-job environment evaluation, protection rules, secrets resolution, held runs, concurrency groups, and check run reporter wiring. The cross-source shell threads provenance (`crossSource: true`, `inboundRoutingKey`, `inboundEventName`, `workflowRepoUrl`, `workflowRef`, `workflowSha`, `workflowRepoIdentifier`) into every dispatched `jobConfig` via a wrapped dispatcher override (`ctx.extraJobConfig`), and uses effective overrides to ensure:
+4. **Delegates to `dispatchMatchedWorkflow()`.** Synthesizes a per-registration `WorkflowDispatchContext` and calls `dispatchMatchedWorkflow()` — the **same** helper the same-source path uses for every matched workflow. The helper uniformly handles static jobs, dynamic-fn workflows (`__dynamic__` eval jobs), `__init__` two-phase init dispatch (for static jobs with dynamic context / env / concurrencyGroup fields), `__build__` build coordinator integration with bundle + dep cache lookup, per-job context evaluation, protection rules, secrets resolution, sandbox capability grant resolution (per-job `sandbox` requests checked against the org's allow-list; a denied grant records a failed run), held runs, concurrency groups, and check run reporter wiring. The cross-source shell threads provenance (`crossSource: true`, `inboundRoutingKey`, `inboundEventName`, `workflowRepoUrl`, `workflowRef`, `workflowSha`, `workflowRepoIdentifier`) into every dispatched `jobConfig` via a wrapped dispatcher override (`ctx.extraJobConfig`), and uses effective overrides to ensure:
    - `provider` and `routingKey` come from the **registration's** bundle, never the inbound generic source
    - `repoUrl` is built from the registration's repo via the registered bundle's `repoUrlBuilder`
    - `providerContext` = registration's context with the freshly issued token merged in
@@ -278,9 +278,11 @@ Routing-key collisions (e.g., a GitHub App source and a universal-git source tar
 
 ### No orchestrator connected -- any instance (Step 7)
 
-**Trigger:** No orchestrator for this routing key is connected to any Platform instance.
+**Trigger:** No orchestrator for this routing key is connected to any Platform instance -- the classic window during an orchestrator restart, upgrade, or transient network blip.
 
-**Result:** Platform returns **503** with `Retry-After: 5` and `{ error: "No orchestrator available" }`. GitHub sees the webhook delivery as failed and **auto-retries** with exponential backoff (see [GitHub's retry behavior](#githubs-retry-behavior) below).
+**Result:** The Platform **buffers the webhook** and returns **200** `{ status: "buffered" }`. The buffered delivery -- body and headers stored verbatim -- is **replayed the moment an orchestrator reconnects** for that routing key, and by a periodic timer as a backstop. Replay re-runs the full delivery sequence, so the orchestrator still verifies the signature and processes the event exactly as if it had arrived live; the Platform never sees signing material. Replays dedup on delivery ID, so a buffered webhook that a customer also manually redelivers produces the run only once.
+
+Buffering is bounded per org and globally (item + byte budgets and a hard cap). When a budget is exhausted the Platform fails loud with **503** `Retry-After: 5` rather than silently dropping. A buffered webhook that no orchestrator returns for within the buffer TTL is dropped as **expired** -- recorded in the delivery log and on a metric, never silently. This buffering is the recovery mechanism for the no-orchestrator window: unlike a queued job, GitHub Apps do **not** auto-retry a failed webhook delivery, so a 503 here would lose the event outright.
 
 ### ACK timeout -- single connection (Step 8)
 
@@ -292,7 +294,7 @@ Routing-key collisions (e.g., a GitHub App source and a universal-git source tar
 
 **Trigger:** All orchestrator connections for this routing key fail to ACK within 5 seconds.
 
-**Result:** Platform returns **503** with `Retry-After: 5`. GitHub auto-retries. If orchestrators are consistently slow, this may indicate capacity issues.
+**Result:** The webhook is **buffered** (tagged as an ACK-timeout cause) and returns **200** `{ status: "buffered" }`, drained by the periodic replay timer once an orchestrator answers again. Consistently slow orchestrators here indicate capacity issues on the customer's fleet. As with the no-orchestrator case, a 503 is returned only when the buffer budget is exhausted.
 
 ### Lock file not found (Step 10)
 
@@ -316,20 +318,24 @@ Routing-key collisions (e.g., a GitHub App source and a universal-git source tar
 
 **Trigger:** The agent's WebSocket connection to the orchestrator drops while a job is running (network failure, agent crash, etc.).
 
-**Result:** The orchestrator marks the job as **failed immediately** -- there is no automatic retry at the orchestrator level. The next webhook from GitHub (e.g., another push) can re-trigger the workflow. This design choice avoids retry storms and leverages GitHub's own retry mechanism for infrastructure-level failures.
+**Result:** depends on whether the agent is a long-lived (static) agent or an ephemeral one an auto-scaler spawned.
 
-## GitHub's retry behavior
+**Static agent -- the job enters a recovery window.** The orchestrator moves the job to the `recovering` state rather than failing it, and persists both the recovery deadline and the owning agent id on the queue row, so a coordinator that takes over after a leader change can re-arm the timer or expire the row. The window is **twice the agent's maximum reconnect delay** (`KICI_AGENT_MAX_RECONNECT_DELAY_MS`, default 60000 -- so 2 minutes by default).
 
-GitHub retries failed webhook deliveries (any non-2xx HTTP response) with exponential backoff. The retry schedule is approximately:
+- **Agent reconnects in time:** it reports its in-flight jobs on `agent.register`, the orchestrator reconciles them against the queue, cancels the recovery timer, flips the row back to `dispatched`, and the job continues. Nothing is re-dispatched and no work is lost.
+- **Window expires:** the job is permanently failed with `Job failed: agent disconnected and did not reconnect within the recovery window`.
 
-- 1st retry: ~1 minute
-- 2nd retry: ~5 minutes
-- 3rd retry: ~30 minutes
-- Subsequent retries: increasing intervals
+**Ephemeral (auto-scaler) agent -- no recovery window.** These agents are destroyed on disconnect, so there is nobody to reconnect and reclaim the job. A job that had already started is failed immediately; a job that had not yet started is requeued for another agent (bounded by the dispatch-attempt limit).
 
-KiCI leverages this as the primary retry mechanism for Platform-level failures. When the Platform returns 503 (no orchestrator connected, all ACK timeouts) with `Retry-After: 5`, GitHub will automatically redeliver the webhook. This eliminates the need for an internal retry queue in the Platform tier -- the retry logic is outsourced to GitHub.
+**No automatic re-dispatch to a different agent.** Once a job is permanently failed, the orchestrator does not hand it to another agent. The next webhook from GitHub (e.g., another push) can re-trigger the workflow. This design choice avoids retry storms and leverages GitHub's own retry mechanism for infrastructure-level failures.
 
-For this to work reliably, the Platform must return quickly: 200 for success, 503 for transient unavailability. It must not hold the connection open waiting for job completion.
+> See [Reconnection and event buffering](../clustering/reconnection.md) for the full recovery protocol.
+
+## Recovery for a missing orchestrator
+
+GitHub Apps do **not** automatically retry a failed webhook delivery -- a delivery that returns a non-2xx status is not redelivered on a schedule; an operator can only replay it by hand from the App's delivery history. So the Platform cannot outsource recovery to the provider for the no-orchestrator window (restart, upgrade, network blip). Instead it **buffers the delivery itself** and replays it when an orchestrator reconnects, as described in [No orchestrator connected](#no-orchestrator-connected----any-instance-step-7) above. This keeps the customer's CI triggers from silently vanishing during an ordinary orchestrator restart.
+
+For this to work reliably, the Platform must return quickly: 200 for success or buffered, 503 only when the buffer budget is exhausted. It must not hold the connection open waiting for job completion.
 
 ## See also
 

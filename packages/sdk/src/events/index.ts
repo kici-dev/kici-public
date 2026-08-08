@@ -1,4 +1,4 @@
-export { defineEvent } from './define-event.js';
+export { defineEvent, isEventDefinition } from './define-event.js';
 export type { EventDefinition } from './define-event.js';
 export type { EventEmitOptions } from './types.js';
 export { isEventType } from './event-payloads.js';

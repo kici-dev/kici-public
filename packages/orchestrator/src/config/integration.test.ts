@@ -243,7 +243,7 @@ describe('Config Integration Tests', () => {
       // Seed a config with sensitive fields
       const config = {
         platform: {
-          url: 'wss://relay.kici.dev',
+          url: 'wss://api.kici.dev/ws',
           token: 'platform-token-value',
         },
         secrets: {
@@ -280,7 +280,7 @@ describe('Config Integration Tests', () => {
 
       const config = {
         platform: {
-          url: 'wss://relay.kici.dev',
+          url: 'wss://api.kici.dev/ws',
           token: 'platform-token-value',
         },
         secrets: {
@@ -298,7 +298,7 @@ describe('Config Integration Tests', () => {
       expect((redacted as any).secrets.key).toBe(REDACTED_VALUE);
 
       // Non-sensitive fields should be visible
-      expect((redacted as any).platform.url).toBe('wss://relay.kici.dev');
+      expect((redacted as any).platform.url).toBe('wss://api.kici.dev/ws');
     });
   });
 

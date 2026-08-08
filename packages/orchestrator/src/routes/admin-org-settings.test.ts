@@ -187,6 +187,62 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     expect(res.status).toBe(400);
   });
 
+  it('GET projects artifact max-bytes/max-per-run as null when the org row is absent', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.artifactMaxBytes).toBeNull();
+    expect(body.settings.artifactMaxPerRun).toBeNull();
+  });
+
+  it('PATCH sets per-org artifact max-bytes + max-per-run and null clears one independently', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'kiciStg00001',
+        artifactMaxBytes: 500,
+        artifactMaxPerRun: 3,
+      }),
+    });
+    expect(patch.status).toBe(200);
+    // Simulate pg returning BIGINT columns as strings on the next read.
+    const stored = rows.get('kiciStg00001')!;
+    stored.artifact_max_bytes = String(stored.artifact_max_bytes);
+    stored.artifact_max_per_run = String(stored.artifact_max_per_run);
+    let get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    let body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.artifactMaxBytes).toBe(500);
+    expect(body.settings.artifactMaxPerRun).toBe(3);
+
+    // Clear only max-bytes; max-per-run stays untouched.
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', artifactMaxBytes: null }),
+    });
+    expect(rows.get('kiciStg00001')!.artifact_max_bytes).toBeNull();
+    rows.get('kiciStg00001')!.artifact_max_per_run = String(3);
+    get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.artifactMaxBytes).toBeNull();
+    expect(body.settings.artifactMaxPerRun).toBe(3);
+  });
+
+  it('PATCH rejects a non-positive artifact max-per-run (Zod)', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', artifactMaxPerRun: 0 }),
+    });
+    expect(res.status).toBe(400);
+  });
+
   it('GET projects dispatchAckTimeoutMs as null when the org row is absent', async () => {
     const { db } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
@@ -212,6 +268,83 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
     expect(body.settings.dispatchAckTimeoutMs).toBe(3000);
   });
 
+  it('PATCH sets ingestMaxConcurrency and GET reads it back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: 12 }),
+    });
+    expect(patch.status).toBe(200);
+    // Simulate pg returning the BIGINT column as a string on the next read.
+    const stored = rows.get('kiciStg00001')!;
+    stored.ingest_max_concurrency = String(stored.ingest_max_concurrency);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.ingestMaxConcurrency).toBe(12);
+  });
+
+  it('PATCH null clears a previously-set ingestMaxConcurrency override', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: 8 }),
+    });
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', ingestMaxConcurrency: null }),
+    });
+    expect(rows.get('kiciStg00001')!.ingest_max_concurrency).toBeNull();
+  });
+
+  it('PATCH sets the sandbox allow-list (canonicalizing caps) and GET reads it back', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'kiciStg00001',
+        sandboxAllowedCapabilities: ['CAP_NET_ADMIN', 'sys_ptrace'],
+        sandboxAllowHostNetwork: true,
+      }),
+    });
+    expect(patch.status).toBe(200);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.sandboxAllowedCapabilities).toEqual(['NET_ADMIN', 'SYS_PTRACE']);
+    expect(body.settings.sandboxAllowHostNetwork).toBe(true);
+  });
+
+  it('PATCH rejects an unknown sandbox capability with a naming 400', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'kiciStg00001',
+        sandboxAllowedCapabilities: ['NOT_A_CAP'],
+      }),
+    });
+    expect(patch.status).toBe(400);
+    const body = (await patch.json()) as { error: string };
+    expect(body.error).toMatch(/NOT_A_CAP/);
+  });
+
+  it('GET on an org with no row reports the safe deny-all sandbox default', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.sandboxAllowedCapabilities).toEqual([]);
+    expect(body.settings.sandboxAllowHostNetwork).toBe(false);
+  });
+
   it('PATCH null clears a previously-set dispatchAckTimeoutMs override', async () => {
     const { db, rows } = makeOrgSettingsDbStub();
     const app = buildWithDb(db);
@@ -235,6 +368,160 @@ describe('org-settings/global-workflows — user-cache quota + TTL', () => {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ customerId: 'kiciStg00001', dispatchAckTimeoutMs: 500 }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('GET projects scalerSpawnTimeoutMs as null when the org row is absent', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.scalerSpawnTimeoutMs).toBeNull();
+  });
+
+  it('PATCH sets scalerSpawnTimeoutMs and GET reads it back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 45000 }),
+    });
+    expect(patch.status).toBe(200);
+    // Simulate pg returning the BIGINT column as a string on the next read.
+    const stored = rows.get('kiciStg00001')!;
+    stored.scaler_spawn_timeout_ms = String(stored.scaler_spawn_timeout_ms);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.scalerSpawnTimeoutMs).toBe(45000);
+  });
+
+  it('PATCH null clears a previously-set scalerSpawnTimeoutMs override', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 60000 }),
+    });
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: null }),
+    });
+    expect(rows.get('kiciStg00001')!.scaler_spawn_timeout_ms).toBeNull();
+  });
+
+  it('PATCH rejects a scalerSpawnTimeoutMs below the 1000ms floor (Zod)', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', scalerSpawnTimeoutMs: 500 }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('GET projects the reroute tunables as null when the org row is absent', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.rerouteSpawnWindowMs).toBeNull();
+    expect(body.settings.rerouteAckTimeoutMs).toBeNull();
+    expect(body.settings.rerouteMaxHops).toBeNull();
+  });
+
+  it('PATCH sets the reroute tunables and GET reads them back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'kiciStg00001',
+        rerouteSpawnWindowMs: 120000,
+        rerouteAckTimeoutMs: 20000,
+        rerouteMaxHops: 5,
+      }),
+    });
+    expect(patch.status).toBe(200);
+    // Simulate pg returning the BIGINT columns as strings on the next read.
+    const stored = rows.get('kiciStg00001')!;
+    stored.reroute_spawn_window_ms = String(stored.reroute_spawn_window_ms);
+    stored.reroute_ack_timeout_ms = String(stored.reroute_ack_timeout_ms);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.rerouteSpawnWindowMs).toBe(120000);
+    expect(body.settings.rerouteAckTimeoutMs).toBe(20000);
+    expect(body.settings.rerouteMaxHops).toBe(5);
+  });
+
+  it('PATCH null clears previously-set reroute overrides', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', rerouteSpawnWindowMs: 30000 }),
+    });
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        customerId: 'kiciStg00001',
+        rerouteSpawnWindowMs: null,
+        rerouteAckTimeoutMs: null,
+        rerouteMaxHops: null,
+      }),
+    });
+    const row = rows.get('kiciStg00001')!;
+    expect(row.reroute_spawn_window_ms).toBeNull();
+    expect(row.reroute_ack_timeout_ms).toBeNull();
+    expect(row.reroute_max_hops).toBeNull();
+  });
+
+  it('PATCH sets queueTimeoutMs and GET reads it back (bigint string → number)', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const patch = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: 120000 }),
+    });
+    expect(patch.status).toBe(200);
+    const stored = rows.get('kiciStg00001')!;
+    stored.queue_timeout_ms = String(stored.queue_timeout_ms);
+    const get = await app.request('/org-settings/global-workflows?customerId=kiciStg00001');
+    const body = (await get.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.queueTimeoutMs).toBe(120000);
+  });
+
+  it('PATCH null clears a previously-set queueTimeoutMs override', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: 60000 }),
+    });
+    await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', queueTimeoutMs: null }),
+    });
+    expect(rows.get('kiciStg00001')!.queue_timeout_ms).toBeNull();
+  });
+
+  it('PATCH rejects a rerouteSpawnWindowMs below the 1000ms floor (Zod)', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', rerouteSpawnWindowMs: 500 }),
     });
     expect(res.status).toBe(400);
   });
@@ -370,13 +657,13 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
     // route's callback runs against the AccessLogWriter spy.
     vi.mocked(setDashboardWritePolicy).mockImplementation(
       async (_db, customerId, updates, options) => {
-        for (const [op, value] of Object.entries(updates) as Array<[string, boolean]>) {
+        for (const [op, value] of Object.entries(updates) as Array<[string, string]>) {
           await options.onChange?.({
             actor: options.actor,
             customerId,
             op: op as never,
-            prior: true,
-            next: value,
+            prior: 'permissive',
+            next: value as never,
           });
         }
         return updates;
@@ -390,8 +677,8 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
           actor: options.actor,
           customerId,
           op,
-          prior: false,
-          next: true,
+          prior: 'disabled',
+          next: 'permissive',
         });
       }
       return {};
@@ -418,8 +705,8 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
       expect(row.outcome).toBe('allowed');
       expect(row.orgId).toBe('kiciStg00001');
       expect(row.actor).toEqual({ type: 'service_account', id: 'tester' });
-      expect(row.meta?.prior_state).toBe(true);
-      expect(row.meta?.new_state).toBe(false);
+      expect(row.meta?.prior_state).toBe('permissive');
+      expect(row.meta?.new_state).toBe('disabled');
       expect(row.meta?.reset).toBeUndefined();
     }
     expect(stub.records.map((r) => r.meta?.operation).sort()).toEqual([
@@ -440,8 +727,8 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
     expect(stub.records).toHaveLength(2);
     for (const row of stub.records) {
       expect(row.meta?.reset).toBe(true);
-      expect(row.meta?.prior_state).toBe(false);
-      expect(row.meta?.new_state).toBe(true);
+      expect(row.meta?.prior_state).toBe('disabled');
+      expect(row.meta?.new_state).toBe('permissive');
     }
   });
 

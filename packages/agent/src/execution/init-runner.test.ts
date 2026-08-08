@@ -265,3 +265,40 @@ describe('evaluateDynamicFields', () => {
     expect(result.contextNames).toEqual(['staging', 'env-main']);
   });
 });
+
+describe('dynamic matrix input guards', () => {
+  const matrixFlags = {
+    dynamicContext: false,
+    dynamicEnv: false,
+    dynamicConcurrencyGroup: false,
+    dynamicMatrix: true,
+  };
+
+  it('fails with an actionable error when the matrix function forgot its return', async () => {
+    const workflow = makeWorkflow({ matrix: (() => undefined) as never });
+    await expect(evaluateDynamicFields(workflow, 'deploy', {}, matrixFlags)).rejects.toThrow(
+      /dynamicMatrix for job 'deploy'/,
+    );
+  });
+
+  it('fails instead of reading a bare string as one dimension per character', async () => {
+    const workflow = makeWorkflow({ matrix: (() => 'linux') as never });
+    await expect(evaluateDynamicFields(workflow, 'deploy', {}, matrixFlags)).rejects.toThrow(
+      /one dimension per character/,
+    );
+  });
+
+  it('fails fast on an oversized matrix instead of exhausting memory', async () => {
+    const big = Array.from({ length: 1000 }, (_, i) => `v${i}`);
+    const workflow = makeWorkflow({ matrix: (() => ({ a: big, b: big, c: big })) as never });
+    await expect(evaluateDynamicFields(workflow, 'deploy', {}, matrixFlags)).rejects.toThrow(
+      /too large to expand/,
+    );
+  });
+
+  it('still expands a valid dynamic matrix', async () => {
+    const workflow = makeWorkflow({ matrix: (() => ['a', 'b']) as never });
+    const result = await evaluateDynamicFields(workflow, 'deploy', {}, matrixFlags);
+    expect(result.matrixValues).toEqual([{ value: 'a' }, { value: 'b' }]);
+  });
+});

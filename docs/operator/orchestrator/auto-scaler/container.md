@@ -18,7 +18,7 @@ The container backend provisions agents as ephemeral containers via the Docker-c
 **Label-set-level fields:**
 
 - `image` — Container image to spawn. Required on every container label set.
-- `imagePullPolicy` — `Always` (default), `IfNotPresent`, or `Never`.
+- `imagePullPolicy` — `IfNotPresent` (default), `Always`, or `Never`. The default inspects the local image and pulls only when it is absent, so a pinned, immutable agent image is not re-pulled on every spawn. Set `Always` on a label set that tracks a **moving tag** (e.g. `:latest`) or otherwise needs a fresh image on each spawn; `Never` fails the spawn if the image is not already local.
 - `volumes` — Bind-mount volumes, e.g. `/host/cache:/cache:ro`.
 - `containerSocket` — Mount the container runtime socket into the agent. Default: `false`. See the [security warning](#container-socket-sharing--security-warning) before enabling.
 
@@ -58,7 +58,7 @@ Use these fields to control runtime selection explicitly:
 
 ## Container lifecycle
 
-1. **Image pull** -- The scaler ensures the image is available before creating the container. First spawn for a new image may be slow (30--60s for large images). Warm pools naturally pre-pull images.
+1. **Image pull** -- The scaler ensures the image is available before creating the container. With the default `imagePullPolicy: IfNotPresent` it inspects the local image and pulls only when it is missing, so a warm image is reused across spawns instead of being re-pulled every time. First spawn for a new image may be slow (30--60s for large images). Warm pools naturally pre-pull images.
 
 2. **Container creation** -- The container is created with:
    - Environment variables: `KICI_ORCHESTRATOR_URL`, `KICI_AGENT_ID`, `KICI_LABELS`, `KICI_SCALER_MANAGED=1`, `KICI_EXECUTION_MODE=bare-metal`, optionally `KICI_AGENT_TOKEN` (when auth is configured) and `KICI_BACKPRESSURE_MODE`, plus any per-label-set `env` entries.

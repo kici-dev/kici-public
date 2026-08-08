@@ -7,6 +7,7 @@
 
 import type { DiagnosticCheck } from '../types.js';
 import { checkDbConnectivity } from './db.js';
+import { checkBackupFreshness } from './backup.js';
 import { checkWsToPlatform } from './ws.js';
 import { checkAgentConnectivity } from './agents.js';
 import { checkDiskSpace } from './disk.js';
@@ -18,6 +19,7 @@ import { checkFirecrackerNetwork } from './firecracker-network.js';
 /** All diagnostic checks in display order. */
 export const defaultChecks: DiagnosticCheck[] = [
   checkDbConnectivity,
+  checkBackupFreshness,
   checkWsToPlatform,
   checkAgentConnectivity,
   checkDiskSpace,
@@ -29,6 +31,7 @@ export const defaultChecks: DiagnosticCheck[] = [
 
 export {
   checkDbConnectivity,
+  checkBackupFreshness,
   checkWsToPlatform,
   checkAgentConnectivity,
   checkDiskSpace,

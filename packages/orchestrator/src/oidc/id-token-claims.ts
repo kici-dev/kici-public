@@ -1,10 +1,12 @@
 /**
- * OIDC ID-token claims for the local dev-signed identity. Mirrors the Platform's
- * `oidc/id-token-claims.ts` so a dev-signed bundle carries the exact same claim
- * shape the agent's statement builder + the engine verifier already expect — the
- * cross-check between the in-toto statement and the token claims is identical to
- * the Platform-minted path. The only differences are the local sentinel issuer
- * (`kici-local`) and the org anchor (`__default__`, the plane's default org).
+ * OIDC ID-token claims for orchestrator-side minting — shared by the
+ * production orchestrator-owned mint (`orchestrator-mint.ts`) and the local
+ * dev-signed identity (`local-mint.ts`). Mirrors the Platform's claim shape so
+ * every bundle carries the exact same claims the agent's statement builder +
+ * the engine verifier expect — the cross-check between the in-toto statement
+ * and the token claims is identical across all minters. The dev-signed path
+ * differs only in the local sentinel issuer (`kici-local`) and the org anchor
+ * (`__default__`, the plane's default org).
  */
 import { AttestationOrigin, SourceOrigin } from '@kici-dev/engine';
 
@@ -34,6 +36,13 @@ export interface BuildClaimsOpts {
   audience: string;
   nowSeconds: number;
   ttlSeconds: number;
+  /**
+   * Deferred-fulfilment marker: binds the frozen DSSE statement hash + the
+   * mint-timing origin. Absent for a live (synchronous) mint. The local dev
+   * plane never sets this; the orchestrator-owned mint sets it when re-minting
+   * for a completed job bound to a frozen statement.
+   */
+  deferred?: { statementHash: string; origin: 'deferred' | 'offline-backfill' };
 }
 
 export interface IdTokenClaims {
@@ -60,9 +69,10 @@ export interface IdTokenClaims {
 
 /**
  * Build the OIDC ID-token claims for a build job from the orchestrator's own
- * execution_runs/execution_jobs rows. The local dev plane only ever mints for a
- * live (running) job, so `attestation_origin` is always `live` and
- * `statement_hash` is null (the statement is cross-checked field-by-field).
+ * execution_runs/execution_jobs rows. A live (synchronous) mint leaves
+ * `attestation_origin=live` and `statement_hash=null` (the statement is
+ * cross-checked field-by-field); a deferred fulfilment stamps the frozen
+ * statement hash + origin marker via `opts.deferred`.
  */
 export function buildIdTokenClaims(
   run: RunClaimSource,
@@ -101,7 +111,9 @@ export function buildIdTokenClaims(
     org_id: run.org_id,
     source_origin: sourceOrigin,
     provider: run.provider,
-    statement_hash: null,
-    attestation_origin: AttestationOrigin.enum.live,
+    statement_hash: opts.deferred?.statementHash ?? null,
+    attestation_origin: opts.deferred?.origin
+      ? AttestationOrigin.enum[opts.deferred.origin]
+      : AttestationOrigin.enum.live,
   };
 }

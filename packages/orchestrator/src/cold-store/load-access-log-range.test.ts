@@ -45,7 +45,11 @@ function buildColdCursorForId(createdAt: Date, id: string): string {
   return Buffer.from(JSON.stringify(payload)).toString('base64url');
 }
 
-function makeColdStoreMock(opts: { rows?: AccessLogColdRow[]; throwOnFetch?: Error }): {
+function makeColdStoreMock(opts: {
+  rows?: AccessLogColdRow[];
+  throwOnFetch?: Error;
+  warmCutoff?: Date;
+}): {
   coldStore: ColdStore;
   fetchRange: ReturnType<typeof vi.fn>;
 } {
@@ -64,7 +68,9 @@ function makeColdStoreMock(opts: { rows?: AccessLogColdRow[]; throwOnFetch?: Err
     }
     return gen();
   });
-  return { coldStore: { fetchRange } as unknown as ColdStore, fetchRange };
+  // 30 days is `minAccessLogWarmDays()` — the value the adapter archives at.
+  const warmCutoff = vi.fn(() => opts.warmCutoff ?? new Date(Date.now() - 30 * 86_400_000));
+  return { coldStore: { fetchRange, warmCutoff } as unknown as ColdStore, fetchRange };
 }
 
 /**

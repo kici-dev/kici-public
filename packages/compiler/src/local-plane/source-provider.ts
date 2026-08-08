@@ -17,10 +17,9 @@
  */
 
 import { execFileSync, execSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import { selectOverlayFiles } from '../remote/uploader.js';
 
 /** The `kici-local` branch the isolated profile commits its overlay onto. */
@@ -78,8 +77,12 @@ function resolveInPlace(repoRoot: string): ResolvedWorkdir {
  * carries the work.
  */
 async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
-  const base = os.tmpdir();
-  const tmpDir = path.join(base, `kici-local-run-${randomBytes(3).toString('hex')}`);
+  // Retained-until-GC clone dir: allocated in persist mode so it is not
+  // auto-registered to any temp scope — its lifetime is owned by the returned
+  // `cleanup`. mkdtemp creates it mode-0700; `git clone` into the empty dir is
+  // fine.
+  const workdir = await makeTempDir('local-run', { persist: true });
+  const tmpDir = workdir.path;
 
   const { sha, existingFiles, deletedFiles } = await selectOverlayFiles(repoRoot);
 
@@ -121,9 +124,7 @@ async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
     ref: `refs/heads/${LOCAL_RUN_BRANCH}`,
     sha: committed,
     branch: LOCAL_RUN_BRANCH,
-    cleanup: async () => {
-      await fs.rm(tmpDir, { recursive: true, force: true });
-    },
+    cleanup: () => workdir.cleanup(),
   };
 }
 

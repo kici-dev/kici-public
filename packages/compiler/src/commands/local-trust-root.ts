@@ -26,7 +26,9 @@ const KICI_LOCAL_ISSUER = 'kici-local';
  */
 export async function localTrustRootCommand(outFile: string): Promise<boolean> {
   if (!outFile) {
-    logger.error(pc.red('Error: an output file path is required (`kici local trust-root <file>`).'));
+    logger.error(
+      pc.red('Error: an output file path is required (`kici local trust-root <file>`).'),
+    );
     return false;
   }
   const pubFile = devIdentityPublicJwkFile();

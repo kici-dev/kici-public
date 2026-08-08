@@ -3,7 +3,7 @@ title: 'Auto-scaler: Firecracker backend'
 description: Firecracker microVM scaler backend — VM networking, jailer fields, rootfs, and the MMDS credential model
 ---
 
-The Firecracker backend provisions agents as ephemeral KVM-backed microVMs. Each job runs in a dedicated VM with hardware-level isolation, sub-125 ms boot times, and automatic cleanup — the strongest isolation model KiCI supports. For fields shared across all backends, see [Common configuration](./common-config.md). For host setup, see the [Firecracker setup guide](../firecracker-setup.md).
+The Firecracker backend provisions agents as ephemeral KVM-backed microVMs. Each job runs in a dedicated VM with hardware-level isolation, sub-125 ms boot times, and automatic cleanup — the strongest isolation model KiCI supports. For fields shared across all backends, see [Common configuration](./common-config.md). For host setup, see the [Firecracker host setup](../firecracker/host-setup.md).
 
 ## When to choose Firecracker
 
@@ -25,7 +25,10 @@ firecracker:
   gateway: '10.0.0.1' # Gateway IP (assigned to the bridge). Default: '10.0.0.1'.
   netmask: '255.255.255.0' # Subnet mask for guest networking. Default: '255.255.255.0'.
   table: 'kici' # nftables table name for this host bridge (disjoint per bridge). Default: 'kici'.
+  autoProvisionHost: true # Verify + provision this host bridge on startup (self-heal). Default: true.
 ```
+
+With `autoProvisionHost` at its default (`true`), the orchestrator verifies and, if needed, provisions this host bridge when it starts — a fresh host needs no manual `kici-admin firecracker provision` step. Set it `false` to keep explicit operator control and provision the host network yourself. See [Firecracker host setup](../firecracker/host-setup.md#automatic-host-provisioning-on-startup) for the full behavior and the manual/`--persist` opt-out flow.
 
 ## Firecracker-specific fields
 
@@ -38,6 +41,7 @@ firecracker:
 - `uid` / `gid` — Jailer UID / GID. Required.
 - `vcpuCount` — Default vCPU count for VMs. Optional; default `2`.
 - `memSizeMib` — Default memory in MiB for VMs. Optional; default `512`.
+- `requireSudo` — Wrap the privileged commands the backend runs (`ip`, `chown`, `chmod`, and `nft` for per-VM network isolation) with `sudo -n`. Optional; default `false`. Set it `true` when the orchestrator runs as a non-root user (for example a user-mode systemd unit) and the operator has a NOPASSWD sudoers entry for those binaries. Leave it unset when the orchestrator is root or already holds the required capabilities — `-n` fails fast rather than prompting, so an unnecessary `true` turns a working setup into a spawn failure.
 
 **Label-set-level fields:**
 
@@ -81,7 +85,7 @@ Key differences from container/bare-metal:
 - The `firecracker` top-level key defines global network configuration (CIDR pool, bridge name).
 - Scaler-level fields include `firecrackerPath`, `jailerPath`, `kernelPath`, `chrootBaseDir`, `uid`, `gid`.
 - Each label set requires a `rootfsPath` pointing to a pre-built ext4 image.
-- `orchestratorUrl` should point to the bridge gateway IP (VMs cannot reach `localhost`).
+- `orchestratorUrl` should point to the bridge gateway IP (VMs cannot reach `localhost`). It resolves in priority order: the scaler-level `orchestratorUrl` field, then the `KICI_ORCHESTRATOR_URL` environment variable, then the default `ws://127.0.0.1:<orchestrator port>/ws` (the orchestrator's own `KICI_PORT`, `4000` unless you changed it).
 
 ## DB migration
 
@@ -111,4 +115,4 @@ KiCI provides host-setup tooling — `kici-admin firecracker` for networking, pl
 | `jailer-setup.sh`                  | Prepare jailer directory structure and cgroups                       |
 | `rootfs-builder.sh`                | Convert Docker images to ext4 rootfs                                 |
 
-For the complete setup guide, see [Firecracker setup guide](../firecracker-setup.md).
+For the complete setup guide, see [Firecracker host setup](../firecracker/host-setup.md).

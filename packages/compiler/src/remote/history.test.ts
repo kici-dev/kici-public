@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { RunHistory, type HistoryEntry } from './history.js';
+import { RunHistory, formatStatus, statusLabelWidth, type HistoryEntry } from './history.js';
+import { CANONICAL_STATUSES, ExecutionRunStatus } from '@kici-dev/engine';
 
 /** Strip ANSI escape codes from a string for test assertions */
 // eslint-disable-next-line no-control-regex
@@ -255,5 +256,44 @@ describe('RunHistory', () => {
       expect(entries).toHaveLength(1);
       expect(entries[0].runId).toBe('cached');
     });
+  });
+});
+
+describe('formatStatus', () => {
+  it('never returns undefined for any canonical status', () => {
+    for (const status of CANONICAL_STATUSES) {
+      const rendered = formatStatus(status);
+      expect(rendered).toBeDefined();
+      expect(rendered).not.toContain('undefined');
+      expect(rendered.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('renders a held run rather than printing undefined', () => {
+    expect(formatStatus(ExecutionRunStatus.enum.held)).toContain('held');
+  });
+
+  it('renders a cancelling run rather than printing undefined', () => {
+    expect(formatStatus(ExecutionRunStatus.enum.cancelling)).toContain('cancelling');
+  });
+
+  it('renders an unknown status verbatim rather than crashing', () => {
+    expect(formatStatus('brand_new_status')).toContain('brand_new_status');
+  });
+});
+
+describe('statusLabelWidth', () => {
+  it('measures the plain label, not the colour-wrapped cell', () => {
+    // The table pads by this width. Measuring the rendered cell would count the
+    // ANSI escape bytes and collapse the column whenever colour is enabled.
+    for (const status of CANONICAL_STATUSES) {
+      expect(statusLabelWidth(status)).toBeLessThanOrEqual(stripAnsi(formatStatus(status)).length);
+      expect(statusLabelWidth(status)).toBe(stripAnsi(formatStatus(status)).length);
+      expect(statusLabelWidth(status)).toBeLessThanOrEqual(12);
+    }
+  });
+
+  it('falls back to the raw length for an unknown status', () => {
+    expect(statusLabelWidth('brand_new_status')).toBe('brand_new_status'.length);
   });
 });

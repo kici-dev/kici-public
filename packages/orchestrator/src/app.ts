@@ -10,12 +10,13 @@
  * - Request ID and logging middleware
  * - 25MB body size limit
  *
- * Pattern follows packages/platform/src/app.ts: returns { app, injectWebSocket }.
+ * Pattern follows packages/platform/src/app.ts: returns { app, wss }.
  */
 
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
-import { createNodeWebSocket } from '@hono/node-ws';
+import { upgradeWebSocket } from '@hono/node-server';
+import { WebSocketServer } from 'ws';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { extractRemoteIp } from './helpers/ip-extraction.js';
 import { randomUUID } from 'node:crypto';
@@ -29,6 +30,7 @@ import type { Database } from './db/types.js';
 import type { AgentRegistry } from './agent/registry.js';
 import type { Dispatcher } from './agent/dispatcher.js';
 import type { RunCoordinator } from './cluster/coordinator.js';
+import type { ClusterSettingsReader } from './cluster/cluster-settings-reader.js';
 import type { PeerRegistry } from './cluster/peer-registry.js';
 import type { JobQueue } from './queue/job-queue.js';
 import type { DedupCache } from './webhook/dedup.js';
@@ -40,6 +42,7 @@ import type { SourceCache } from './cache/index.js';
 import type { BuildCoordinator } from './cache/index.js';
 import type { DepCache } from './cache/index.js';
 import type { UserCache } from './cache/index.js';
+import type { ArtifactStore } from './artifacts/artifact-store.js';
 import type { DispatchCacheRefTracker } from './cache/index.js';
 import type { PendingBuildTracker } from './cache/index.js';
 import type { PendingInitTracker, InitResult } from './cache/index.js';
@@ -53,13 +56,17 @@ import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oi
 import { selectOidcMintRegistration } from './oidc/oidc-mint-registration.js';
 import type { LocalSigner } from './oidc/local-dev-signer.js';
 import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
-import { createEnsureInitRunnerHandler, createPreBootSendHandler } from './ws/bringup-api.js';
+import {
+  createEnsureInitRunnerHandler,
+  createPreBootSendHandler,
+  createPresignAgentPackageHandler,
+  createAgentVersionStatusHandler,
+  createRestageAgentHandler,
+} from './ws/bringup-api.js';
+import { resolveAgentPackageStore } from './agent-packaging/store.js';
 import { resolveScalerOrchestratorUrl } from './scaler/manager.js';
 import { configureSecureWsServer } from './ws/server-options.js';
-import {
-  type CheckRunReporter,
-  buildJobFailureDescription,
-} from './reporting/check-run-reporter.js';
+import type { CheckRunReporter } from './reporting/check-run-reporter.js';
 import type { ExecutionTracker } from './reporting/execution-tracker.js';
 import { cancelRunWithReason } from './cancel/cancel-run.js';
 import type { LogWriter } from './reporting/log-writer.js';
@@ -69,12 +76,13 @@ import type { SourceLocationData } from './reporting/check-run-summary.js';
 import type { Hono as HonoType } from 'hono';
 import type { PeerWsLike } from './cluster/peer-handler.js';
 import type { PeerToPeerMessage, InitFailure } from '@kici-dev/engine';
-import { ExecutionJobStatus, ExecutionRunStatus } from '@kici-dev/engine';
+import { ExecutionJobStatus, ExecutionRunStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import { AgentJobFailedError } from './cache/agent-job-failed-error.js';
 import type { AgentTokenStore } from './agent/token-store.js';
 import type { OwnershipTracker } from './agent/ownership-tracker.js';
 import type { ObserverRegistry } from './ws/observer-registry.js';
 import { createAgentWsHandler } from './ws/agent-handler.js';
+import { AgentWsInternalFailure } from './ws/failure-messages.js';
 import type { FleetAgentCollector } from './ws/fleet-agent-collector.js';
 import type { FleetTopology } from './diagnostics/fleet-topology.js';
 import type { TokenManager } from './secrets/token-manager.js';
@@ -97,12 +105,23 @@ import type { CronScheduler } from './cron/cron-scheduler.js';
 import { createConfigAdminRoutes, type ConfigRouteDeps } from './routes/admin-config.js';
 import { createHealthRoutes } from './routes/health.js';
 import { createCapabilitiesRoutes } from './routes/capabilities.js';
+import { createProvenanceOidcRoutes } from './routes/provenance-oidc.js';
+import { createVerifyAttestationRoutes } from './routes/verify-attestation.js';
 import { createMetricsRoutes } from '@kici-dev/shared';
 import { createDiagnosticsRoutes } from './routes/diagnostics.js';
 import { createFleetRoutes } from './routes/fleet.js';
 import { processWebhook } from './pipeline/processor.js';
 import { WebhookIngestOutcome } from './pipeline/process-webhook.js';
 import type { WebhookInfo } from './webhook/handler.js';
+import type { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
+import {
+  deliveryFromDirect,
+  overflowDeliveryToInfo,
+  type OverflowDelivery,
+} from './webhook/ingest-overflow-types.js';
+import type { AdmitResult, IngestAdmissionController } from './webhook/ingest-admission.js';
+import type { OrgIngestCapReader } from './webhook/org-ingest-cap-reader.js';
+import type { SandboxAllowListReader } from './pipeline/sandbox-allowlist-reader.js';
 import type { ConcurrencyGroupTracker } from './concurrency/group-tracker.js';
 import type { ConcurrencyQueueManager } from './concurrency/queue-manager.js';
 import { ConcurrencyWaiters } from './concurrency/waiters.js';
@@ -113,6 +132,8 @@ import {
 import type { EventRouter } from './events/event-router.js';
 import type { EventStore } from './events/event-store.js';
 import { createAdminEventDlqRoutes } from './routes/admin-event-dlq.js';
+import { resolveBearerAuth } from './routes/admin-auth.js';
+import { createOnErrorHandler } from './app-on-error.js';
 import type { EventEmitter } from './events/event-emitter.js';
 import type { GlobalWorkflowPolicy } from './security/global-workflow-policy.js';
 import type { EventLogWriter } from './webhook/event-log.js';
@@ -125,15 +146,18 @@ import type { VariableStore } from './contexts/variable-store.js';
 import type { HeldRunStore } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import type { ContributorCache } from './security/contributor-cache.js';
-import {
-  logChunksReceivedTotal,
-  logBytesStoredTotal,
-  stepsTotal,
-  registerOrchestratorMetrics,
-} from './metrics/prometheus.js';
+import { stepsTotal, registerOrchestratorMetrics } from './metrics/prometheus.js';
+import { createLogChunkSink } from './reporting/log-chunk-sink.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
 
 const logger = createLogger({ prefix: 'app' });
+
+// Baked into the bundled service at build time (scripts/build-service.mjs); the
+// source/tsx fallback keeps a plain dev run working. Same pattern as
+// server.ts/standalone.ts. This is the version whose agent payload a bring-up
+// stages onto a fresh box (single-version invariant: orchestrator = agent).
+declare const KICI_PKG_VERSION: string;
+const ORCHESTRATOR_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
 
 /**
  * All dependencies needed to create the orchestrator Hono app.
@@ -142,6 +166,8 @@ export interface AppDependencies {
   config: AppConfig;
   db: Kysely<Database>;
   pool: pg.Pool;
+  /** Fleet-wide settings reader; threads the live lock-file cap into warm-added universal-git sources. */
+  clusterSettings?: ClusterSettingsReader;
   registry: AgentRegistry;
   /**
    * Warmth latch surfaced on `GET /ready`. Returns `true` only once the
@@ -157,6 +183,22 @@ export interface AppDependencies {
   lockFileCache: LockFileCache;
   providerRegistry: ProviderRegistry;
   platformClient?: PlatformClient;
+  /**
+   * Webhook-ingest admission controller (shared with the WS relay path). When
+   * present, the HTTP ingest closure admits before running the pipeline and
+   * sheds (429 + Retry-After) when the controller is saturated.
+   */
+  ingestController?: IngestAdmissionController;
+  /** Resolves the fairness key + per-org cap for a routing key (cached, DB-degraded). */
+  ingestCapReader?: OrgIngestCapReader;
+  /** Reads the per-org container-sandbox escape-hatch allow-list at dispatch (uncached, DB-degraded). */
+  sandboxAllowListReader?: SandboxAllowListReader;
+  /**
+   * Durable overflow buffer (capture side). When present and
+   * `config.ingestOverflowEnabled`, a shed HTTP delivery is additively persisted
+   * for later replay; absent → capture disabled.
+   */
+  ingestOverflowBuffer?: IngestOverflowBuffer;
   /**
    * Fulfil deferred attestations on demand (mints in this process, which owns
    * the Platform WS). Backs `POST /api/v1/admin/attestations/retry`. Wired only
@@ -175,6 +217,8 @@ export interface AppDependencies {
   depCache?: DepCache;
   /** User-facing cache (ctx.cache / declarative job-step cache). Optional — requires cache storage. */
   userCache?: UserCache;
+  /** User-facing artifact store (ctx.artifacts). Optional — requires cache storage + DB. */
+  artifactStore?: ArtifactStore;
   /**
    * Server-side jobId -> user-cache-namespace store. Written at dispatch time
    * (orchestrator-core's buildOnDispatch); read by the agent-WS handler to
@@ -193,6 +237,31 @@ export interface AppDependencies {
    * is registered so `ctx.kici.oidc.token()` mints a `kici-local` dev token.
    */
   localOidcSigner?: LocalSigner;
+  /**
+   * Orchestrator-owned provenance signing (Phase 1 root of trust). Present when
+   * `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` is configured: the orchestrator mints +
+   * signs identity tokens locally with its own ES256 key, and serves its own
+   * OIDC discovery + JWKS + native verify endpoint. `resolveOrchestratorSigner`
+   * lazily reconciles the active signing key (leader-election-race-safe); the
+   * repo backs the `.well-known` + verify routes.
+   */
+  provenanceSigning?: {
+    issuer: string;
+    resolveSigner: () => Promise<import('./oidc/signer.js').Signer | null>;
+    repo: import('./db/repos/signing-keys-repo.js').OrchestratorSigningKeyRepo;
+  };
+  /**
+   * Dashboard-encryption (X25519) key custody. Present whenever KICI_SECRET_KEY
+   * is configured. `repo` backs the JWKS enc-key publication; `resolve` lazily
+   * reconciles the active key (leader-election-race-safe) for the WS decrypt
+   * handler.
+   */
+  dashboardEncryption?: {
+    repo: import('./db/repos/dashboard-encryption-keys-repo.js').DashboardEncryptionKeyRepo;
+    resolve: () => Promise<
+      import('./secrets/dashboard-encryption-key.js').ResolvedDashboardEncryptionKey | null
+    >;
+  };
   /**
    * Filesystem cache backend handle. Only set when KICI_STORAGE_TYPE is
    * `filesystem`. Drives the /api/v1/cache/blob/* HTTP route that serves and
@@ -376,7 +445,7 @@ export class SourceLocationStore {
  * Create Hono application with all routes and middleware.
  *
  * @param deps - Application dependencies (injected for testability)
- * @returns Object with Hono app instance and injectWebSocket function
+ * @returns Object with Hono app instance and the configured WebSocket server
  */
 export function createApp(deps: AppDependencies) {
   // Register the orchestrator's observable gauges on the real meter. createApp
@@ -386,9 +455,12 @@ export function createApp(deps: AppDependencies) {
   registerOrchestratorMetrics();
 
   const app = new Hono().basePath(deps.config.basePath);
+  app.onError(createOnErrorHandler({ role: 'coordinator' }));
 
-  // Set up WebSocket support via @hono/node-ws
-  const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
+  // Construct the WebSocket server ourselves (built-in WS support in
+  // @hono/node-server); serve() wires the HTTP upgrade event to it. See
+  // ws/server-options.ts for the compression-bomb defense applied below.
+  const wss = new WebSocketServer({ noServer: true });
 
   // Apply security-relevant WS server options. The compression-bomb
   // defense invariant (`maxPayload` + `serverNoContextTakeover`) lives in this
@@ -542,12 +614,19 @@ export function createApp(deps: AppDependencies) {
         // Single-tenant orchestrator: scoped-secret resolution uses the default
         // org, matching the rest of app.ts's secret-context calls.
         resolveOrgId: () => '__default__',
+        // A bootstrapped fresh box dials this URL back, so it must be routable
+        // from that box — the `ws://127.0.0.1:<port>/ws` fallback only works
+        // when the box shares this host. There is no per-scaler override on the
+        // bring-up path, so `orchestratorUrl` (KICI_ORCHESTRATOR_URL) is the
+        // only way to advertise a cross-host address.
         resolveOrchestratorUrl: () =>
-          resolveScalerOrchestratorUrl(
-            undefined,
-            process.env.KICI_ORCHESTRATOR_URL,
-            deps.config.port,
-          ),
+          resolveScalerOrchestratorUrl(undefined, deps.config.orchestratorUrl, deps.config.port),
+        resolveVersion: () => ORCHESTRATOR_VERSION,
+        // The cache-bucket agent-package store backs the s3-direct delivery mode
+        // + the presign RPC; defaults to the orchestrator's own cache bucket
+        // (KICI_AGENT_BINARY_SOURCE overrides to an s3:// mirror). Undefined when
+        // no cache storage is configured — every bring-up then uses ssh-push.
+        agentPackages: resolveAgentPackageStore(deps.config, deps.cacheStorage),
       };
       agentApiRegistry.register(
         'kici.ensureInitRunner',
@@ -555,21 +634,43 @@ export function createApp(deps: AppDependencies) {
         createEnsureInitRunnerHandler(bringupDeps),
       );
       agentApiRegistry.register('kici.preBootSend', 'write', createPreBootSendHandler(bringupDeps));
+      agentApiRegistry.register(
+        'kici.presignAgentPackage',
+        'write',
+        createPresignAgentPackageHandler(bringupDeps),
+      );
+      // Fleet auto-upgrade convergence (C10): the read probe the check-step calls
+      // (target/staged version + availability) and the availability-gated,
+      // external-actor re-stage authorization.
+      agentApiRegistry.register(
+        'kici.agentVersionStatus',
+        'write',
+        createAgentVersionStatusHandler(bringupDeps),
+      );
+      agentApiRegistry.register(
+        'kici.restageAgent',
+        'write',
+        createRestageAgentHandler(bringupDeps),
+      );
     }
   }
 
-  // Register the OIDC ID-token mint handler (read role). The choice of handler —
-  // Platform relay vs local dev-signed — is the anti-forgery choke point, made
-  // by `selectOidcMintRegistration`: a Platform-connected orchestrator ALWAYS
-  // relays to the Platform (the local signer is UNREACHABLE); the offline local
-  // dev plane mints locally with issuer `kici-local`; a bare independent
-  // orchestrator registers nothing (the method returns "unknown method").
+  // Register the OIDC ID-token mint handler (read role). The choice of handler
+  // is the anti-forgery choke point, made by `selectOidcMintRegistration`:
+  // orchestrator-owned signing (signer + own issuer configured) ALWAYS wins —
+  // even Platform-connected — because the orchestrator is the root of trust;
+  // a Platform-connected orchestrator with no signer falls back to the
+  // deprecated Platform relay; the offline local dev plane mints locally with
+  // issuer `kici-local`; a bare independent orchestrator with no signer
+  // registers nothing (the method returns "unknown method").
   const oidcMintReg = selectOidcMintRegistration({
     platformUrl: deps.config.platformUrl,
     platformToken: deps.config.platformToken,
     platformClient: deps.platformClient,
     independentIdentity: deps.config.independentIdentity,
     localOidcSigner: deps.localOidcSigner,
+    resolveOrchestratorSigner: deps.provenanceSigning?.resolveSigner,
+    provenanceSigningIssuer: deps.provenanceSigning?.issuer,
     dispatcher: deps.dispatcher,
     db: deps.db,
     orchestratorId: deps.config.instanceId,
@@ -635,6 +736,29 @@ export function createApp(deps: AppDependencies) {
     );
   };
 
+  // The local-agent ingress into the shared step-log sink. Built once here
+  // rather than per chunk: `upgradeWebSocket` runs its factory on every agent
+  // connection, so anything constructed inside it is rebuilt per socket.
+  const localLogChunkSink = createLogChunkSink({
+    source: 'local',
+    ...(deps.stepLogBuffer && { stepLogBuffer: deps.stepLogBuffer }),
+    ...(deps.logWriter && { logWriter: deps.logWriter }),
+    ...(deps.executionTracker && { executionTracker: deps.executionTracker }),
+    ...(deps.platformClient && {
+      forwardToPlatform: (chunk) =>
+        deps.platformClient!.send({
+          type: 'log.chunk',
+          messageId: randomUUID(),
+          runId: chunk.runId,
+          jobId: chunk.jobId,
+          stepIndex: chunk.stepIndex,
+          lines: chunk.lines,
+          timestamp: chunk.timestamp,
+          ...(chunk.stream !== undefined && { stream: chunk.stream }),
+        }),
+    }),
+  });
+
   // Mount WebSocket route for agent connections
   app.get(
     '/ws',
@@ -649,14 +773,11 @@ export function createApp(deps: AppDependencies) {
         sourceCache: deps.sourceCache,
         depCache: deps.depCache,
         userCache: deps.userCache,
+        artifactStore: deps.artifactStore,
         dispatchCacheRefs: deps.dispatchCacheRefs,
         cacheStorage: deps.cacheStorage,
         onJobStatus:
-          deps.platformClient ||
-          deps.executionTracker ||
-          deps.checkRunReporter ||
-          deps.pendingBuilds ||
-          deps.pendingInits
+          deps.platformClient || deps.executionTracker || deps.pendingBuilds || deps.pendingInits
             ? (_agentId, msg) => {
                 // Resolve/reject pending builds on terminal states
                 if (deps.pendingBuilds && deps.pendingBuilds.has(msg.jobId)) {
@@ -747,93 +868,24 @@ export function createApp(deps: AppDependencies) {
                   });
                 }
 
-                // Update job-level check run on terminal states
-                if (
-                  deps.checkRunReporter &&
-                  deps.executionTracker &&
-                  (msg.state === ExecutionJobStatus.enum.success ||
-                    msg.state === ExecutionJobStatus.enum.failed ||
-                    msg.state === ExecutionJobStatus.enum.cancelled)
-                ) {
-                  const execContext = deps.executionTracker.getExecutionContext(msg.runId);
-                  if (execContext) {
-                    const [owner, repo] = execContext.repoIdentifier.split('/');
-
-                    // Build a meaningful description from agent data on failure
-                    let description: string | undefined;
-                    if (msg.state === ExecutionJobStatus.enum.failed && msg.data) {
-                      description = buildJobFailureDescription(msg.data);
-                    }
-
-                    deps.checkRunReporter.updateJobStatus({
-                      provider: execContext.provider,
-                      owner,
-                      repo,
-                      sha: execContext.sha,
-                      workflowName: execContext.workflowName,
-                      jobName: deps.executionTracker.getJobName(msg.runId, msg.jobId) ?? msg.jobId,
-                      state: msg.state as Extract<
-                        ExecutionJobStatus,
-                        'success' | 'failed' | 'cancelled'
-                      >,
-                      installationId: execContext.installationId,
-                      routingKey: execContext.routingKey,
-                      description,
-                      // Pass additional data for enriched summaries
-                      data: msg.data,
-                      runIdForLogs: msg.runId,
-                      jobId: msg.jobId,
-                      // Explicit runId — the agent WS message handler runs
-                      // outside the request-context ALS frame that wrapped
-                      // the original dispatch, so the reporter cannot pull
-                      // runId from getRequestContext(). Without it, the
-                      // job-completion check-run update omits details_url
-                      // and GitHub falls back to the App's homepage URL.
-                      runId: msg.runId,
-                    });
-                  }
-                }
+                // The job-level check run is completed from the execution
+                // tracker's terminal-job hook (see `reportJobCheckRunCompletion`
+                // wired in orchestrator-core), not from here. That hook fires for
+                // every job the tracker terminalizes, which is a strict superset
+                // of what this handler sees: the orchestrator-set `skipped` /
+                // `drift_dropped` statuses and peer-forwarded completions never
+                // reach this agent WebSocket handler at all.
               }
             : undefined,
         onLogChunk: (_agentId, msg) => {
-          logChunksReceivedTotal.add(1);
-
-          // Feed lines to StepLogBuffer for check run summaries
-          if (deps.stepLogBuffer) {
-            deps.stepLogBuffer.addLines(
-              { runId: msg.runId, jobId: msg.jobId, stepIndex: msg.stepIndex },
-              msg.lines,
-            );
-          }
-
-          if (deps.logWriter) {
-            const jobName = deps.executionTracker?.getJobName(msg.runId, msg.jobId) ?? msg.jobId;
-            deps.logWriter.appendChunk(
-              msg.runId,
-              jobName,
-              msg.stepIndex,
-              msg.lines,
-              msg.timestamp,
-              msg.jobId,
-            );
-
-            // Track bytes stored (approximate: sum of line lengths + newlines)
-            const byteCount = msg.lines.reduce((sum, line) => sum + line.length + 1, 0);
-            logBytesStoredTotal.add(byteCount);
-          }
-
-          // Forward log.chunk to Platform for browser fan-out
-          if (deps.platformClient) {
-            deps.platformClient.send({
-              type: 'log.chunk',
-              messageId: randomUUID(),
-              runId: msg.runId,
-              jobId: msg.jobId,
-              stepIndex: msg.stepIndex,
-              lines: msg.lines,
-              timestamp: msg.timestamp,
-            });
-          }
+          localLogChunkSink({
+            runId: msg.runId,
+            jobId: msg.jobId,
+            stepIndex: msg.stepIndex,
+            lines: msg.lines,
+            timestamp: msg.timestamp,
+            ...(msg.stream !== undefined && { stream: msg.stream }),
+          });
         },
         onStepStatus: (_agentId, msg) => {
           stepsTotal.add(1, { status: msg.state });
@@ -873,12 +925,7 @@ export function createApp(deps: AppDependencies) {
                 stepIndex: msg.stepIndex,
                 stepName: msg.stepName,
                 state: msg.state as
-                  | 'running'
-                  | 'success'
-                  | 'failed'
-                  | 'skipped'
-                  | 'cancelled'
-                  | 'error',
+                  'running' | 'success' | 'failed' | 'skipped' | 'cancelled' | 'error',
                 durationMs: (msg.data?.durationMs as number) ?? undefined,
                 installationId: execContext.installationId,
                 routingKey: execContext.routingKey,
@@ -938,7 +985,19 @@ export function createApp(deps: AppDependencies) {
                   });
                   return { deliveryId };
                 } catch (err) {
-                  return { error: toErrorMessage(err) };
+                  // The handler forwards this returned `error` to the agent
+                  // verbatim, and the agent runs untrusted workflow code — so the
+                  // raw exception stays in the log line and the author gets a safe
+                  // fixed string. An unknown job context is returned above with
+                  // its own author-actionable wording. This callback stays inline
+                  // here so the agent-wire disclosure check keeps scanning it.
+                  logger.error('event.emit failed in the orchestrator event router', {
+                    jobId: msg.jobId,
+                    runId,
+                    eventName: msg.eventName,
+                    error: toErrorMessage(err),
+                  });
+                  return { error: AgentWsInternalFailure.eventEmitFailed };
                 }
               }
             : undefined,
@@ -1213,15 +1272,14 @@ export function createApp(deps: AppDependencies) {
     if (!deps.adminDeps) {
       return c.json({ error: 'Admin API not available' }, 503);
     }
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
+    const auth = await resolveBearerAuth(c, {
+      tokenManager: deps.adminDeps.tokenManager,
+      scope: 'app-admin',
+    });
+    if (!auth.ok) {
+      return c.json({ error: auth.error }, auth.status);
     }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.adminDeps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
+    const tokenInfo = auth.tokenInfo;
 
     const recordAccess = (outcome: 'allowed' | 'denied' | 'error', errorMessage?: string) => {
       if (!deps.accessLogWriter) return;
@@ -1267,12 +1325,7 @@ export function createApp(deps: AppDependencies) {
         return c.json({ error: 'Run not found' }, 404);
       }
 
-      const terminalStates: ReadonlySet<string> = new Set([
-        ExecutionRunStatus.enum.success,
-        ExecutionRunStatus.enum.failed,
-        ExecutionRunStatus.enum.cancelled,
-      ]);
-      if (terminalStates.has(runRow.status)) {
+      if (TERMINAL_RUN_STATES.has(runRow.status)) {
         recordAccess('allowed', `run already in terminal state ${runRow.status}`);
         return c.json({ error: 'Run already in terminal state', status: runRow.status }, 409);
       }
@@ -1286,7 +1339,7 @@ export function createApp(deps: AppDependencies) {
 
       const reason = force ? 'force cancelled via API' : 'run cancelled via API';
       // Canonical run-cancel path — shared with the WorkflowDeadlineDetector.
-      const { agentsNotified, pendingCancelled } = await cancelRunWithReason(
+      const { agentsNotified, pendingCancelled, alreadyTerminal } = await cancelRunWithReason(
         {
           db: deps.db,
           jobQueue: deps.jobQueue,
@@ -1298,6 +1351,20 @@ export function createApp(deps: AppDependencies) {
         reason,
         { force, cancelledBy: `api_key:${tokenInfo.id}` },
       );
+
+      // The run can finish between the status check above and the cancel. The
+      // shared path then writes nothing, so answering 200 would report a
+      // cancellation that did not happen — give the same 409 the pre-check does,
+      // re-reading the status the run actually settled on.
+      if (alreadyTerminal) {
+        const settled = await deps.db
+          .selectFrom('execution_runs')
+          .select(['status'])
+          .where('run_id', '=', runId)
+          .executeTakeFirst();
+        recordAccess('allowed', `run already in terminal state ${settled?.status ?? 'unknown'}`);
+        return c.json({ error: 'Run already in terminal state', status: settled?.status }, 409);
+      }
 
       const resultStatus =
         agentsNotified > 0 ? ExecutionRunStatus.enum.cancelling : ExecutionRunStatus.enum.cancelled;
@@ -1323,9 +1390,44 @@ export function createApp(deps: AppDependencies) {
   // closure means the two ingestion surfaces can never drift on the dep map or
   // the failure event-log handling. Returns the pipeline's ingest outcome so a
   // route can answer `{ duplicate: true }` on a dedup hit.
-  const runWebhookIngest = async (info: WebhookInfo): Promise<WebhookIngestOutcome> => {
+  const runWebhookIngest = async (
+    info: WebhookInfo,
+    opts?: { captureOnShed?: boolean },
+  ): Promise<WebhookIngestOutcome> => {
     const reqId = randomUUID();
     return requestContext.run({ requestId: reqId, routingKey: info.routingKey }, async () => {
+      // Admission control: resolve the fairness key + per-org cap and admit
+      // before doing any pipeline work. When saturated the controller sheds and
+      // the route answers 429 + Retry-After (the caller redelivers). The
+      // controller/cap-reader are absent in tests / minimal wirings → no gate.
+      let admit: AdmitResult | undefined;
+      if (deps.ingestController && deps.ingestCapReader) {
+        const { key, orgCap } = await deps.ingestCapReader.resolve(info.routingKey);
+        admit = await deps.ingestController.admit(key, orgCap, { allowQueue: true });
+        if (!admit.admitted) {
+          // Additively capture the shed delivery into the durable overflow
+          // buffer for replay once capacity recovers. Best-effort: a capture
+          // failure never changes the 429 response the caller receives. Skipped
+          // for a replay re-injection (`captureOnShed: false`) — the delivery is
+          // already buffered, so re-capturing on a re-shed would duplicate the
+          // row and leak the bounded cap.
+          if (
+            (opts?.captureOnShed ?? true) &&
+            deps.config.ingestOverflowEnabled &&
+            deps.ingestOverflowBuffer
+          ) {
+            try {
+              await deps.ingestOverflowBuffer.capture(deliveryFromDirect(info));
+            } catch (err) {
+              logger.warn('failed to capture shed delivery to overflow buffer', {
+                deliveryId: info.deliveryId,
+                error: toErrorMessage(err),
+              });
+            }
+          }
+          return WebhookIngestOutcome.enum.shed;
+        }
+      }
       try {
         return await processWebhook(info, {
           dedup: deps.dedup,
@@ -1348,6 +1450,7 @@ export function createApp(deps: AppDependencies) {
           db: deps.db,
           secretKey: deps.config.secretKey,
           secretResolver: deps.secretResolver,
+          sandboxAllowListReader: deps.sandboxAllowListReader,
           logStorage: deps.logStorage,
           contextStore: deps.contextStore,
           variableStore: deps.variableStore,
@@ -1363,6 +1466,7 @@ export function createApp(deps: AppDependencies) {
           instanceId: deps.config.instanceId,
           rosterGraceMs: deps.config.rosterGraceMs,
           maxFanoutHosts: deps.config.maxFanoutHosts,
+          clusterSettings: deps.clusterSettings,
         });
       } catch (err) {
         if (deps.eventLogWriter) {
@@ -1381,9 +1485,17 @@ export function createApp(deps: AppDependencies) {
           }
         }
         throw err;
+      } finally {
+        if (admit?.admitted) admit.release();
       }
     });
   };
+
+  // Direct-origin overflow replay: re-inject a captured HTTP delivery through the
+  // same admission-gated ingest closure. runWebhookIngest returns `shed` on a
+  // re-shed, which the replayer treats as "revert to buffered".
+  const reinjectDirect = (d: OverflowDelivery): Promise<WebhookIngestOutcome> =>
+    runWebhookIngest(overflowDeliveryToInfo(d), { captureOnShed: false });
 
   if (deps.genericSourceManager) {
     app.route(
@@ -1395,9 +1507,10 @@ export function createApp(deps: AppDependencies) {
     );
   }
 
-  // Direct GitHub-App ingress (mounted on EVERY instance in hybrid/independent
-  // modes so an external LB/DNS can front-end the whole cluster). Platform mode
-  // is relay-only and has no local GitHub source config.
+  // Direct GitHub-App ingress (mounted on EVERY instance in the own-ingress
+  // modes — hybrid, independent, observed — so an external LB/DNS can
+  // front-end the whole cluster). Platform mode is relay-only and has no local
+  // GitHub source config.
   if (
     deps.githubSourceStore &&
     deps.githubVerifyDeps &&
@@ -1409,6 +1522,8 @@ export function createApp(deps: AppDependencies) {
         sourceStore: deps.githubSourceStore,
         verifyDeps: deps.githubVerifyDeps,
         onWebhook: runWebhookIngest,
+        clusterSettings: deps.clusterSettings,
+        maxGithubPayloadBytes: deps.config.maxGithubPayloadBytes,
       }),
     );
   }
@@ -1445,6 +1560,7 @@ export function createApp(deps: AppDependencies) {
         providerRegistry: deps.providerRegistry,
         config: deps.config,
         secretResolver: deps.secretResolver ?? null,
+        clusterSettings: deps.clusterSettings,
         // Required for the `POST /api/v1/admin/events/emit` route — mirrors
         // `emitKiciEventDirect` in `@kici-dev/shared/db-admin.ts`.
         pool: deps.pool,
@@ -1660,6 +1776,35 @@ export function createApp(deps: AppDependencies) {
   // Public capability manifest for CLI capability-gap error messages
   app.route('/', createCapabilitiesRoutes());
 
+  // Orchestrator-owned provenance: public OIDC discovery + JWKS (public halves
+  // only) and the native POST /v1/verify-attestation endpoint. Discovery and
+  // verify-attestation 503 when orchestrator-owned signing is not configured.
+  // The JWKS does not: it also carries the dashboard-encryption key, which is
+  // independent of signing, and 503s only when it has nothing to publish.
+  {
+    const provenanceEnabled = !!deps.provenanceSigning;
+    const provenanceRepo = deps.provenanceSigning?.repo ?? {
+      listTrusted: async () => [],
+    };
+    app.route(
+      '/',
+      createProvenanceOidcRoutes({
+        issuer: deps.provenanceSigning?.issuer,
+        repo: provenanceRepo,
+        enabled: provenanceEnabled,
+        dashboardEncryptionRepo: deps.dashboardEncryption?.repo,
+      }),
+    );
+    app.route(
+      '/',
+      createVerifyAttestationRoutes({
+        issuer: deps.provenanceSigning?.issuer,
+        repo: provenanceRepo,
+        enabled: provenanceEnabled,
+      }),
+    );
+  }
+
   // Prometheus metrics (served via OTel PrometheusExporter)
   app.route(
     '/',
@@ -1707,7 +1852,8 @@ export function createApp(deps: AppDependencies) {
 
   return {
     app,
-    injectWebSocket,
+    wss,
+    reinjectDirect,
     onSourceLocationsExtracted,
     /**
      * Wake up the FIFO-next queued concurrency waiter for `(group, routingKey)`.

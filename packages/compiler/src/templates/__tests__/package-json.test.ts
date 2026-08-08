@@ -1,5 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { generatePackageJson } from '../package-json.js';
+import { generatePackageJson, sdkDependencyRange } from '../package-json.js';
+
+describe('sdkDependencyRange', () => {
+  it('returns a prerelease-compatible range in dev mode', () => {
+    expect(sdkDependencyRange(true)).toBe('>=0.0.1-0');
+  });
+
+  it('returns a caret range in production mode', () => {
+    expect(sdkDependencyRange(false)).toMatch(/^\^\d+\.\d+\.\d+/);
+  });
+
+  it('is the same range generatePackageJson embeds', () => {
+    const prod = JSON.parse(generatePackageJson(false));
+    expect(prod.devDependencies['@kici-dev/sdk']).toBe(sdkDependencyRange(false));
+    const dev = JSON.parse(generatePackageJson(true));
+    expect(dev.devDependencies['@kici-dev/sdk']).toBe(sdkDependencyRange(true));
+  });
+});
 
 describe('package-json template', () => {
   it('emits a caret-semver SDK pin in production mode', () => {
@@ -37,5 +54,13 @@ describe('package-json template', () => {
     expect(parsed.scripts.typecheck).toBeDefined();
     expect(parsed.devDependencies).toBeDefined();
     expect(parsed.devDependencies['@kici-dev/sdk']).toBeDefined();
+  });
+
+  it('scaffolds typescript so --check / the typecheck script can run', () => {
+    const prod = JSON.parse(generatePackageJson(false));
+    expect(prod.devDependencies.typescript).toBeDefined();
+    expect(prod.devDependencies.typescript).toMatch(/^\^\d+\.\d+\.\d+/);
+    const dev = JSON.parse(generatePackageJson(true));
+    expect(dev.devDependencies.typescript).toBe(prod.devDependencies.typescript);
   });
 });

@@ -102,8 +102,14 @@ That's the entire setup. The agent can now call the tools below.
 - `rerun_run` — re-run a completed run.
 - `cancel_run` — cancel an in-progress run.
 - `approve_run` — approve a held approval gate for a run (name the run, plus
-  `job`/`step` to disambiguate when it has multiple holds).
-- `reject_run` — reject a held approval gate; a `reason` is required.
+  `job`/`step` to disambiguate when it has multiple holds). Requires
+  `runs:write` **and** the permission matching the hold's type — `ci_trust:write`
+  for a security hold, `contexts:admin` for a wait-timer hold, `contexts:write`
+  otherwise. That is the same rule the dashboard and the `kici` CLI answer to,
+  so an agent cannot release a hold a person with the same grants could not.
+  Grant agent credentials accordingly.
+- `reject_run` — reject a held approval gate; a `reason` is required. Gated
+  identically to `approve_run`.
 - `cancel_runs_by_branch` — cancel all in-progress runs on a branch (bounded —
   up to 100 per call; a `truncated` flag tells the agent to re-invoke).
 
@@ -203,6 +209,18 @@ mint it. Leave the scope open and it inherits your role; narrow it and the agent
 is held to that smaller set — its effective permissions are always the
 **minimum** of your role and the token's scope. A token can never grant more than
 you hold, so an agent cannot escalate beyond its creator.
+
+**Repository scope comes along too.** If your role is restricted to a set of
+repositories, an agent token you mint is restricted to the same set. Runs
+outside it are simply not there: they are filtered out of `list_runs`,
+`cancel_runs_by_branch` skips them, and naming one directly answers "not found"
+— the same answer a run id that does not exist gets, so an agent cannot use the
+tools to discover which repositories it is missing. Your organization's audit
+log records the real reason. One thing to know when you choose which credential
+to give an agent: this inheritance applies to a **personal** agent token. An
+**organization** agent API key has no minting user's role to inherit from, so it
+reaches every repository in the organization within its permission level — reach
+for a personal agent token when repository scoping is what you want.
 
 **Fail-closed denial, on every surface the token is used.** The scope is enforced
 wherever the token acts — the MCP tools the agent drives **and** any direct API

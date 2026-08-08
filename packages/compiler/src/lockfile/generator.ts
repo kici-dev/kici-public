@@ -47,6 +47,7 @@ import {
 import type { ApprovalConfig } from '@kici-dev/sdk';
 import {
   SCHEMA_VERSION,
+  BREAKING_FLOOR,
   type LockFile,
   type LockSource,
   type LockWorkflow,
@@ -73,6 +74,7 @@ import {
   type LockWebhookTrigger,
   type LockKiciEventTrigger,
   type LockWorkflowCompleteTrigger,
+  type LockWorkflowsFailedBatchTrigger,
   type LockJobCompleteTrigger,
   type LockGenericWebhookTrigger,
   type LockScheduleTrigger,
@@ -87,9 +89,35 @@ import {
   type WorkflowWithSource,
   type WorkflowSourceInfo,
 } from '../types.js';
+import {
+  compilerError,
+  locationForJob,
+  locationForWorkflow,
+  type SourceLocation,
+} from '../errors/index.js';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { resolveHashFiles } from './hash-files.js';
 import { analyzePurity } from './purity-analyzer.js';
+
+/**
+ * Courtesy compatibility warning for `kici compile`.
+ *
+ * When the current schema version is itself a breaking version
+ * (`floor === version`), locks emitted now stamp `minReaderVersion = version`
+ * and cannot be read by orchestrators older than that version — return a
+ * one-line heads-up naming the required orchestrator schema. When the floor sits
+ * below the current version (`floor < version`) the emitted lock is additive
+ * over older readers down to the floor, so no warning is warranted (return
+ * null). The orchestrator remains the authoritative reject; this is informational.
+ */
+export function schemaWindowWarning(floor: number, version: number): string | null {
+  if (floor < version) return null;
+  return (
+    `This lock uses schema v${version}, a breaking schema version — orchestrators ` +
+    `older than v${version} cannot read it. Upgrade the orchestrator to schema ` +
+    `v${version} or newer before it can dispatch from this lock.`
+  );
+}
 
 /**
  * Detect git repository root by running `git rev-parse --show-toplevel`.
@@ -222,11 +250,19 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
 
   // Compute top-level content hash from the full lock file content (excluding the hash itself).
   // This hash changes only when workflows, triggers, jobs, or bundle hashes change.
-  const partial = { schemaVersion: SCHEMA_VERSION, source: topLevelSource, workflows };
+  // minReaderVersion stamps the newest breaking version at emit time so a reader
+  // that predates a breaking change rejects the lock instead of mis-parsing it.
+  const partial = {
+    schemaVersion: SCHEMA_VERSION,
+    minReaderVersion: BREAKING_FLOOR,
+    source: topLevelSource,
+    workflows,
+  };
   const contentHash = sha256(JSON.stringify(partial));
 
   return {
     schemaVersion: SCHEMA_VERSION,
+    minReaderVersion: BREAKING_FLOOR,
     source: topLevelSource,
     contentHash,
     ...(lockfileHash && { lockfileHash }),
@@ -305,7 +341,7 @@ function transformWorkflow(
     ...(workflow.timeout !== undefined && { timeout: workflow.timeout }),
     ...(workflow.approval !== undefined && {
       approval:
-        (assertNonStepApprovalScope(workflow.approval, 'workflow'),
+        (assertNonStepApprovalScope(workflow.approval, 'workflow', locationForWorkflow(sourceFile)),
         toLockApproval(workflow.approval)),
     }),
   };
@@ -502,6 +538,17 @@ function toLockWorkflowComplete(
   };
 }
 
+function toLockWorkflowsFailedBatch(
+  t: ExtractTrigger<'WorkflowsFailedBatchTrigger'>,
+): LockWorkflowsFailedBatchTrigger {
+  return {
+    _type: 'workflows_failed_batch',
+    accumulateFor: t.accumulateFor,
+    ...(t.name !== undefined && { name: t.name }),
+    ...(t.source !== undefined && { source: t.source }),
+  };
+}
+
 function toLockJobComplete(t: ExtractTrigger<'JobCompleteTrigger'>): LockJobCompleteTrigger {
   return {
     _type: 'job_complete',
@@ -603,6 +650,8 @@ function transformOneTrigger(trigger: TriggerConfig): LockTrigger[] {
       return [toLockKiciEvent(trigger)];
     case 'WorkflowCompleteTrigger':
       return [toLockWorkflowComplete(trigger)];
+    case 'WorkflowsFailedBatchTrigger':
+      return [toLockWorkflowsFailedBatch(trigger)];
     case 'JobCompleteTrigger':
       return [toLockJobComplete(trigger)];
     case 'GenericWebhookTrigger':
@@ -730,7 +779,7 @@ function normalizeRunsOnForLock(
  * The overlap check compares exact matchers only — a glob/regex include and an
  * exact exclude (or vice versa) cannot be statically known to overlap.
  */
-function validateRunsOn(runsOn: RunsOn, jobName: string): void {
+function validateRunsOn(runsOn: RunsOn, jobName: string, location: SourceLocation): void {
   const { include, exclude } = normalizeRunsOnToMatchers(
     runsOn as never,
     `job '${jobName}' runsOn`,
@@ -743,8 +792,13 @@ function validateRunsOn(runsOn: RunsOn, jobName: string): void {
     .map((m) => (m as { value: string }).value)
     .filter((v) => includeExact.has(v));
   if (overlap.length > 0) {
-    throw new Error(
+    throw compilerError(
+      'E112',
       `Job "${jobName}": labels and exclude overlap on [${overlap.join(', ')}]. A label cannot be both required and excluded.`,
+      {
+        location,
+        suggestion: 'Remove the overlapping label(s) from either runsOn or the exclude set.',
+      },
     );
   }
 }
@@ -755,20 +809,18 @@ function validateRunsOn(runsOn: RunsOn, jobName: string): void {
  * function becomes an inline expression resolvable at two-phase eval; an impure
  * one carries only the `dynamic` flag (the agent runs an init job to resolve it).
  */
-function transformContextRef(
-  ref: NonNullable<Job['contexts']>[number],
-  jobName: string,
-): { value: string | LockInlineValue; dynamic: boolean } {
+function transformContextRef(ref: NonNullable<Job['contexts']>[number]): {
+  value: string | LockInlineValue;
+  dynamic: boolean;
+} {
   if (typeof ref === 'function') {
     const fnSource = ref.toString();
     const purity = analyzePurity(fnSource);
     if (purity.pure) {
       return { value: { _type: 'inline', expression: fnSource }, dynamic: true };
     }
-    console.warn(
-      `[kici] Job "${jobName}": context function is not pure (${purity.reason}). ` +
-        'An init job will be required, adding ~5-10s delay.',
-    );
+    // Impure: fall back to the dynamic marker (empty value resolved by the
+    // agent-side __init__ job). The compiler surfaces this as a W101 warning.
     return { value: '', dynamic: true };
   }
   return { value: ref, dynamic: false };
@@ -784,12 +836,23 @@ function transformJob(
   gitRoot: string,
   uuidToName?: Map<string, string>,
 ): LockJob {
+  // Best available source anchor for job-scoped compile errors: the job's first
+  // step location, falling back to the workflow file at line 1.
+  const jobLocation = locationForJob(job, configPath);
+
   // runsOn and runsOnAll are mutually exclusive; exactly one must be present.
   if (job.runsOn !== undefined && job.runsOnAll !== undefined) {
-    throw new Error(`job '${job.name}': runsOn and runsOnAll are mutually exclusive`);
+    throw compilerError('E108', `job '${job.name}': runsOn and runsOnAll are mutually exclusive`, {
+      location: jobLocation,
+      suggestion:
+        'Set exactly one of runsOn (single agent) or runsOnAll (fan-out to every matching agent).',
+    });
   }
   if (job.runsOn === undefined && job.runsOnAll === undefined) {
-    throw new Error(`job '${job.name}': one of runsOn or runsOnAll is required`);
+    throw compilerError('E109', `job '${job.name}': one of runsOn or runsOnAll is required`, {
+      location: jobLocation,
+      suggestion: 'Add runsOn: "kici:os:linux" (or another agent label) to the job.',
+    });
   }
   if (job.onUnreachable !== undefined && job.runsOnAll === undefined) {
     console.warn(`[kici] job '${job.name}': onUnreachable is ignored without runsOnAll`);
@@ -797,7 +860,10 @@ function transformJob(
   // Fan-out concurrency: maxParallel must be >= 1, and both maxParallel/failFast
   // are only meaningful on a fan-out job (matrix or runsOnAll).
   if (job.maxParallel !== undefined && job.maxParallel < 1) {
-    throw new Error(`job '${job.name}': maxParallel must be >= 1`);
+    throw compilerError('E110', `job '${job.name}': maxParallel must be >= 1`, {
+      location: jobLocation,
+      suggestion: 'Set maxParallel to a positive integer, or remove it to run unbounded.',
+    });
   }
   const hasFanout = job.matrix !== undefined || job.runsOnAll !== undefined;
   if (!hasFanout && (job.maxParallel !== undefined || job.failFast !== undefined)) {
@@ -806,7 +872,7 @@ function transformJob(
     );
   }
   // Validate runsOn for overlap between required and excluded labels
-  if (job.runsOn !== undefined) validateRunsOn(job.runsOn, job.name);
+  if (job.runsOn !== undefined) validateRunsOn(job.runsOn, job.name, jobLocation);
 
   // Resolve contexts into an ordered array of { value, dynamic } entries.
   // Either spelling normalizes here: `context: 'x'` becomes a one-element
@@ -817,7 +883,7 @@ function transformJob(
   } = {};
   const contextRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
   if (contextRefs !== undefined && contextRefs.length > 0) {
-    contextFields.contexts = contextRefs.map((ref) => transformContextRef(ref, job.name));
+    contextFields.contexts = contextRefs.map((ref) => transformContextRef(ref));
   }
 
   // Resolve env: static object, inline expression (pure function), or dynamic function marker
@@ -832,12 +898,8 @@ function transformJob(
       envFields.dynamicEnv = true;
       if (purity.pure) {
         envFields.env = { _type: 'inline', expression: fnSource };
-      } else {
-        console.warn(
-          `[kici] Job "${job.name}": env function is not pure (${purity.reason}). ` +
-            'An init job will be required, adding ~5-10s delay.',
-        );
       }
+      // Impure env falls back to the dynamic marker; surfaced as a W101 warning.
     } else if (typeof job.env === 'object') {
       envFields.env = { ...job.env };
     }
@@ -850,7 +912,10 @@ function transformJob(
       validateResourceRequest(job.resources);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      throw new Error(`Job "${job.name}": invalid resources -- ${reason}`);
+      throw compilerError('E111', `Job "${job.name}": invalid resources -- ${reason}`, {
+        location: jobLocation,
+        suggestion: 'Fix the resources request (valid CPU/memory strings, request <= limit).',
+      });
     }
   }
 
@@ -866,12 +931,8 @@ function transformJob(
       concurrencyFields.dynamicConcurrencyGroup = true;
       if (purity.pure) {
         concurrencyFields.concurrencyGroup = { _type: 'inline', expression: fnSource };
-      } else {
-        console.warn(
-          `[kici] Job "${job.name}": concurrencyGroup function is not pure (${purity.reason}). ` +
-            'An init job will be required, adding ~5-10s delay.',
-        );
       }
+      // Impure concurrencyGroup falls back to the dynamic marker; surfaced as a W101 warning.
     } else if (typeof job.concurrencyGroup === 'string') {
       concurrencyFields.concurrencyGroup = job.concurrencyGroup;
     }
@@ -894,7 +955,7 @@ function transformJob(
     ...(job.maxParallel !== undefined && { maxParallel: job.maxParallel }),
     ...(job.failFast !== undefined && { failFast: job.failFast }),
     ...resolveNeedsForLock(job.needs, uuidToName),
-    steps: transformSteps(job.steps, gitRoot),
+    steps: transformSteps(job.steps, gitRoot, jobLocation),
     matrix: job.matrix ? transformMatrix(job.matrix, job.name, configPath) : undefined,
     include: job.include?.map((inc) => ({ ...inc })),
     exclude: job.exclude?.map((exc) => ({ ...exc })),
@@ -903,6 +964,7 @@ function transformJob(
     ...(job.checkout !== undefined && { checkout: job.checkout }),
     ...(job.cache !== undefined && { cache: normalizeCacheSpecs(job.cache) }),
     ...(job.container !== undefined && { container: job.container }),
+    ...(job.sandbox !== undefined && { sandbox: job.sandbox }),
     ...contextFields,
     ...envFields,
     ...concurrencyFields,
@@ -917,7 +979,9 @@ function transformJob(
     ...(job.resources !== undefined && { resources: job.resources }),
     ...(job.init !== undefined && { init: job.init }),
     ...(job.approval !== undefined && {
-      approval: (assertNonStepApprovalScope(job.approval, 'job'), toLockApproval(job.approval)),
+      approval:
+        (assertNonStepApprovalScope(job.approval, 'job', jobLocation),
+        toLockApproval(job.approval)),
     }),
   };
 }
@@ -928,9 +992,7 @@ function transformJob(
  */
 interface ResolvedNeeds {
   readonly needs: readonly (
-    | string
-    | import('../types.js').LockNeedsEntry
-    | import('../types.js').LockNeedsGroupEntry
+    string | import('../types.js').LockNeedsEntry | import('../types.js').LockNeedsGroupEntry
   )[];
   readonly dependsOnGroups?: readonly string[];
 }
@@ -949,9 +1011,7 @@ function resolveNeedsForLock(
   if (!needs) return { needs: [] };
 
   const resolvedNeeds: (
-    | string
-    | import('../types.js').LockNeedsEntry
-    | import('../types.js').LockNeedsGroupEntry
+    string | import('../types.js').LockNeedsEntry | import('../types.js').LockNeedsGroupEntry
   )[] = [];
   const groups: string[] = [];
 
@@ -1006,9 +1066,21 @@ function toLockApproval(c: ApprovalConfig): LockApproval {
  * step-scope-only gate (it fires between a step's check and run), so it is a
  * compile error anywhere else.
  */
-function assertNonStepApprovalScope(c: ApprovalConfig, scope: 'job' | 'workflow'): void {
+function assertNonStepApprovalScope(
+  c: ApprovalConfig,
+  scope: 'job' | 'workflow',
+  location: SourceLocation,
+): void {
   if (normalizeApproval(c).when === 'drift') {
-    throw new Error(`approval.when "drift" is only valid on steps (found at ${scope} scope)`);
+    throw compilerError(
+      'E113',
+      `approval.when "drift" is only valid on steps (found at ${scope} scope)`,
+      {
+        location,
+        suggestion:
+          'Move the drift-gated approval onto a step, or use when: "always" at job/workflow scope.',
+      },
+    );
   }
 }
 
@@ -1016,18 +1088,27 @@ function assertNonStepApprovalScope(c: ApprovalConfig, scope: 'job' | 'workflow'
  * Validate a step's approval config: `when: 'drift'` fires between the step's
  * check and run, so it requires a `check` facet. A compile error otherwise.
  */
-function assertStepApprovalCheckFacet(step: {
-  name?: string;
-  approval?: ApprovalConfig;
-  check?: unknown;
-}): void {
+function assertStepApprovalCheckFacet(
+  step: {
+    name?: string;
+    approval?: ApprovalConfig;
+    check?: unknown;
+    _sourceLocation?: SourceLocation;
+  },
+  jobLocation: SourceLocation,
+): void {
   if (
     step.approval !== undefined &&
     normalizeApproval(step.approval).when === 'drift' &&
     step.check === undefined
   ) {
-    throw new Error(
+    throw compilerError(
+      'E114',
       `step '${step.name || '(unnamed)'}': approval.when "drift" requires a check facet`,
+      {
+        location: step._sourceLocation ?? jobLocation,
+        suggestion: 'Add a check facet to the step, or use approval when: "always".',
+      },
     );
   }
 }
@@ -1047,15 +1128,22 @@ interface StepCounter {
 export function transformSteps(
   steps: readonly StepInput[],
   gitRoot: string,
+  jobLocation?: SourceLocation,
 ): readonly LockStepEntry[] {
+  const anchor = jobLocation ?? { file: '', line: 1, column: 1 };
   const counter: StepCounter = { n: 0 };
   let groupOrdinal = 0;
   return steps.map((entry) => {
     if (isParallelGroup(entry)) {
-      return transformParallelGroup(entry, gitRoot, counter, groupOrdinal++);
+      return transformParallelGroup(entry, gitRoot, counter, groupOrdinal++, anchor);
     }
-    return transformSequentialStep(entry, gitRoot, counter);
+    return transformSequentialStep(entry, gitRoot, counter, anchor);
   });
+}
+
+/** Best step-scoped location: the step's captured call-site, else the job anchor. */
+function stepEntryLocation(entry: unknown, jobLocation: SourceLocation): SourceLocation {
+  return (entry as { _sourceLocation?: SourceLocation })._sourceLocation ?? jobLocation;
 }
 
 /** Validate and transform a `ParallelGroup` into a `LockParallelStep`. */
@@ -1064,18 +1152,32 @@ function transformParallelGroup(
   gitRoot: string,
   counter: StepCounter,
   groupOrdinal: number,
+  jobLocation: SourceLocation,
 ): LockParallelStep {
   if (group.steps.length === 0) {
-    throw new Error('job step: empty parallel group not allowed');
+    throw compilerError('E115', 'job step: empty parallel group not allowed', {
+      location: jobLocation,
+      suggestion: 'Add at least one step to the parallel group, or remove the group.',
+    });
   }
   const seen = new Set<string>();
   const children = group.steps.map((child) => {
     if (isParallelGroup(child)) {
-      throw new Error('job step: nested parallel groups are not supported');
+      throw compilerError('E116', 'job step: nested parallel groups are not supported', {
+        location: stepEntryLocation(child, jobLocation),
+        suggestion: 'Flatten the nested group — a parallel group may only contain steps.',
+      });
     }
-    const lockChild = transformSequentialStep(child, gitRoot, counter);
+    const lockChild = transformSequentialStep(child, gitRoot, counter, jobLocation);
     if (seen.has(lockChild.name)) {
-      throw new Error(`job step: duplicate step name '${lockChild.name}' in parallel group`);
+      throw compilerError(
+        'E117',
+        `job step: duplicate step name '${lockChild.name}' in parallel group`,
+        {
+          location: stepEntryLocation(child, jobLocation),
+          suggestion: 'Give each step in a parallel group a unique name.',
+        },
+      );
     }
     seen.add(lockChild.name);
     return lockChild;
@@ -1099,6 +1201,7 @@ function transformSequentialStep(
   stepOrFn: StepInput,
   gitRoot: string,
   counter: StepCounter,
+  jobLocation: SourceLocation,
 ): LockStep {
   if (typeof stepOrFn === 'function') {
     // Bare function step -- auto-named with counter
@@ -1142,7 +1245,7 @@ function transformSequentialStep(
     ...(step.check !== undefined && { hasCheck: true }),
     ...(step.whenInSync !== undefined && { hasWhenInSync: true }),
     ...(step.approval !== undefined && {
-      approval: (assertStepApprovalCheckFacet(step), toLockApproval(step.approval)),
+      approval: (assertStepApprovalCheckFacet(step, jobLocation), toLockApproval(step.approval)),
     }),
   };
 }

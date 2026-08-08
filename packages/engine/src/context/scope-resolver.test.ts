@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { matchScopePattern, resolveSecretsForContext } from './scope-resolver.js';
+import {
+  matchScopePattern,
+  resolveSecretsForContext,
+  resolveSecretsWithProvenance,
+} from './scope-resolver.js';
+import { hostSpecificity } from './host-match.js';
 import type { ContextBinding, ScopedSecret } from './types.js';
 
 describe('matchScopePattern', () => {
@@ -318,5 +323,110 @@ describe('resolveSecretsForContext — per-host scoping', () => {
     expect(resolveSecretsForContext(bindings, secrets, id, f2)).toEqual({});
     const withRack = { ...f2, labels: ['rack:r12'] };
     expect(resolveSecretsForContext(bindings, secrets, id, withRack).K).toBe('v');
+  });
+});
+
+describe('resolveSecretsWithProvenance', () => {
+  const makeBinding = (
+    id: string,
+    envId: string,
+    scopePattern: string,
+    hostPattern = '**',
+  ): ContextBinding => ({
+    id,
+    orgId: 'org1',
+    contextId: envId,
+    scopePattern,
+    hostPattern,
+    createdAt: '2026-01-01',
+  });
+
+  const makeSecret = (
+    id: string,
+    scope: string,
+    key: string,
+    encryptedValue: string,
+  ): ScopedSecret => ({
+    id,
+    orgId: 'org1',
+    scope,
+    key,
+    encryptedValue,
+    backendType: 'pg',
+    keyVersion: 1,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+  });
+
+  const decryptFn = (s: ScopedSecret): string => `decrypted:${s.encryptedValue}`;
+
+  it('returns the winning secret with its scopeDepth and hostSpec', () => {
+    const bindings = [makeBinding('b1', 'env1', 'aws/**')];
+    const secrets = [makeSecret('s1', 'aws/prod/db', 'DB_PASSWORD', 'enc1')];
+    const winners = resolveSecretsWithProvenance(bindings, secrets);
+    const winner = winners.get('DB_PASSWORD');
+    expect(winner?.secret.id).toBe('s1');
+    expect(winner?.scopeDepth).toBe(3); // aws/prod/db → 3 segments after prefix strip
+    expect(winner?.hostSpec).toBe(hostSpecificity('**'));
+  });
+
+  it('longest scope path wins the provenance winner', () => {
+    const bindings = [
+      makeBinding('b1', 'env1', 'aws/**'),
+      makeBinding('b2', 'env1', 'aws/prod/**'),
+    ];
+    const secrets = [
+      makeSecret('s1', 'aws', 'DB_PASSWORD', 'general'),
+      makeSecret('s2', 'aws/prod', 'DB_PASSWORD', 'specific'),
+    ];
+    const winners = resolveSecretsWithProvenance(bindings, secrets);
+    expect(winners.get('DB_PASSWORD')?.secret.id).toBe('s2');
+  });
+
+  it('per-host binding beats a fleet-wide one on hostSpec', () => {
+    const bindings = [
+      makeBinding('b1', 'env1', 'aws/**', '**'),
+      makeBinding('b2', 'env1', 'aws/**', 'agent-1'),
+    ];
+    const secrets = [makeSecret('s1', 'aws/prod', 'DB_PASSWORD', 'enc1')];
+    const hostFacts = { agentId: 'agent-1', host: 'h1', labels: [] };
+    const winners = resolveSecretsWithProvenance(bindings, secrets, hostFacts);
+    const winner = winners.get('DB_PASSWORD');
+    expect(winner?.secret.id).toBe('s1');
+    expect(winner?.hostSpec).toBe(hostSpecificity('agent-1'));
+  });
+
+  it('skips a binding whose host_pattern does not match the host facts', () => {
+    const bindings = [makeBinding('b1', 'env1', 'aws/**', 'agent-2')];
+    const secrets = [makeSecret('s1', 'aws/prod', 'DB_PASSWORD', 'enc1')];
+    const hostFacts = { agentId: 'agent-1', host: 'h1', labels: [] };
+    const winners = resolveSecretsWithProvenance(bindings, secrets, hostFacts);
+    expect(winners.has('DB_PASSWORD')).toBe(false);
+  });
+
+  it('skips a templated scope pattern when no host facts are supplied', () => {
+    const bindings = [makeBinding('b1', 'env1', 'aws/${agentId}/**', '**')];
+    const secrets = [makeSecret('s1', 'aws/agent-1', 'DB_PASSWORD', 'enc1')];
+    const winners = resolveSecretsWithProvenance(bindings, secrets);
+    expect(winners.has('DB_PASSWORD')).toBe(false);
+  });
+
+  it('is the single source of truth: resolveSecretsForContext value equals decryptFn of the provenance winner', () => {
+    const bindings = [
+      makeBinding('b1', 'env1', 'aws/**', '**'),
+      makeBinding('b2', 'env1', 'aws/prod/**', '**'),
+      makeBinding('b3', 'env1', 'gcp/**', '**'),
+    ];
+    const secrets = [
+      makeSecret('s1', 'aws', 'DB_PASSWORD', 'general'),
+      makeSecret('s2', 'aws/prod', 'DB_PASSWORD', 'specific'),
+      makeSecret('s3', 'gcp/staging', 'API_KEY', 'gcpkey'),
+    ];
+    const flat = resolveSecretsForContext(bindings, secrets, decryptFn);
+    const winners = resolveSecretsWithProvenance(bindings, secrets);
+    expect(new Set(Object.keys(flat))).toEqual(new Set(winners.keys()));
+    for (const [key, winner] of winners) {
+      expect(flat[key]).toBe(decryptFn(winner.secret));
+    }
   });
 });

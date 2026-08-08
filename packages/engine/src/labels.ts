@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 /**
  * Structured auto-labels with category prefixes.
  *
@@ -59,6 +61,140 @@ export function deriveOsArchLabels(platform: string, arch: string): string[] {
   }
 
   return labels;
+}
+
+/**
+ * Plain OS/arch labels that gate a bare-metal scaler as a mandatory taint.
+ * A pool whose declared labels include one of these only accepts jobs that
+ * explicitly request that platform. Linux and x64/amd64 are the defaults and
+ * are absent on purpose — an unqualified `runsOn: 'bare-metal'` job must still
+ * land on a Linux-x64 scaler.
+ */
+export const PLATFORM_TAINT_LABELS = new Set<string>([
+  'windows',
+  'win32',
+  'macos',
+  'darwin',
+  'arm64',
+  'aarch64',
+  'arm',
+]);
+
+/**
+ * Intersect a pool's declared labels with {@link PLATFORM_TAINT_LABELS},
+ * returning the de-duplicated plain platform-taint labels (lowercased) in
+ * input order.
+ */
+export function derivePlatformTaints(declaredLabels: string[]): string[] {
+  const seen = new Set<string>();
+  for (const raw of declaredLabels) {
+    const label = raw.toLowerCase();
+    if (PLATFORM_TAINT_LABELS.has(label)) seen.add(label);
+  }
+  return [...seen];
+}
+
+/**
+ * Operating systems a scaler pool can declare via the structured `platform`
+ * field. `linux` is the default and carries no taint; `macos` / `windows` are
+ * non-default and taint the pool.
+ */
+export const ScalerOs = z.enum(['linux', 'macos', 'windows']);
+export type ScalerOs = z.infer<typeof ScalerOs>;
+
+/**
+ * CPU architectures a scaler pool can declare via the structured `platform`
+ * field. `x64` is the default and carries no taint; `arm64` taints the pool.
+ */
+export const ScalerArch = z.enum(['x64', 'arm64']);
+export type ScalerArch = z.infer<typeof ScalerArch>;
+
+/**
+ * Structured platform of a scaler pool: the single source of truth for both the
+ * auto-injected `kici:os:*` / `kici:arch:*` labels and the mandatory platform
+ * taint. Declaring it once removes the ambiguity of matching plain string
+ * labels against a denylist.
+ */
+export const scalerPlatformSchema = z.object({ os: ScalerOs, arch: ScalerArch }).strict();
+export type ScalerPlatform = z.infer<typeof scalerPlatformSchema>;
+
+/** Map a structured `ScalerOs` back to the `os.platform()` string it represents. */
+function scalerOsToNodePlatform(os: ScalerOs): string {
+  switch (os) {
+    case 'linux':
+      return 'linux';
+    case 'macos':
+      return 'darwin';
+    case 'windows':
+      return 'win32';
+  }
+}
+
+/**
+ * Derive the `kici:os:*` / `kici:arch:*` labels for a declared structured
+ * platform. Reuses {@link deriveOsArchLabels} so the label shape is identical to
+ * the host-reported form (e.g. `windows` yields both `kici:os:windows` and
+ * `kici:os:win32`).
+ */
+export function platformToOsArchLabels(platform: ScalerPlatform): string[] {
+  return deriveOsArchLabels(scalerOsToNodePlatform(platform.os), platform.arch);
+}
+
+/**
+ * Derive the plain platform-taint labels for a declared structured platform.
+ * Returns the canonical tokens (`macos`, `windows`, `arm64`) that a job's
+ * `runsOn` must include to allocate on the pool. The linux/x64 default carries
+ * no taint. Unlike {@link derivePlatformTaints} (which intersects declared
+ * labels against a denylist), this derives from the structured field, so a pool
+ * labeled `windows-2022` still taints correctly.
+ */
+export function platformToTaints(platform: ScalerPlatform): string[] {
+  const taints: string[] = [];
+  if (platform.os === 'macos') taints.push('macos');
+  else if (platform.os === 'windows') taints.push('windows');
+  if (platform.arch === 'arm64') taints.push('arm64');
+  return taints;
+}
+
+/** Map an `os.platform()` string to a `ScalerOs`, or null when unrecognised. */
+export function nodePlatformToScalerOs(nodePlatform: string): ScalerOs | null {
+  switch (nodePlatform) {
+    case 'linux':
+      return 'linux';
+    case 'darwin':
+      return 'macos';
+    case 'win32':
+      return 'windows';
+    default:
+      return null;
+  }
+}
+
+/** Map an `os.arch()` string to a `ScalerArch`, or null when unrecognised. */
+export function nodeArchToScalerArch(nodeArch: string): ScalerArch | null {
+  switch (nodeArch) {
+    case 'x64':
+      return 'x64';
+    case 'arm64':
+      return 'arm64';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Build a structured platform from the host's `os.platform()` / `os.arch()`.
+ * Returns null when either component is not one of the supported enum values,
+ * so a caller can fall back to the legacy host-label derivation for exotic
+ * hosts.
+ */
+export function hostToScalerPlatform(
+  nodePlatform: string,
+  nodeArch: string,
+): ScalerPlatform | null {
+  const os = nodePlatformToScalerOs(nodePlatform);
+  const arch = nodeArchToScalerArch(nodeArch);
+  return os && arch ? { os, arch } : null;
 }
 
 /** Prefix for the agent self-reported hostname label. */

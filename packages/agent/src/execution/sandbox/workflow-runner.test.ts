@@ -18,7 +18,18 @@ import {
   createSandboxStepContext,
   buildStepNeedsContext,
   deriveFanout,
+  coerceStep,
+  resolveChangedFilesForRules,
+  buildJobRuleCompletion,
+  sanitizeTempLabel,
+  drainJobTempScope,
+  buildSandboxShell,
+  type CoerceState,
 } from './workflow-runner.js';
+import { createTempScope } from '@kici-dev/core/tmp';
+import { existsSync } from 'node:fs';
+import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
+import type { RuleEvaluationResult } from '../rule-evaluator.js';
 import type { JobExecutionRequest } from './ipc-protocol.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -567,6 +578,43 @@ function collectIpc(): {
   return { messages, send: (msg) => messages.push(msg) };
 }
 
+describe('buildJobRuleCompletion (job-level rule outcome)', () => {
+  const steps: Step[] = [makeStep('a', vi.fn()), makeStep('b', vi.fn())];
+
+  it('all rules passed → null (proceed to step execution)', () => {
+    const result: RuleEvaluationResult = { allPassed: true, results: [] };
+    expect(buildJobRuleCompletion(result, steps)).toBeNull();
+  });
+
+  it('a rule cleanly returned false → job.complete{success} with steps skipped', () => {
+    const result: RuleEvaluationResult = {
+      allPassed: false,
+      results: [{ label: 'gate', passed: false, durationMs: 1 }],
+    };
+    const completion = buildJobRuleCompletion(result, steps);
+    expect(completion?.status).toBe(ExecutionJobStatus.enum.success);
+    expect(completion?.error).toBeUndefined();
+    expect(completion?.stepResults).toHaveLength(2);
+    expect(
+      completion?.stepResults?.every((s) => s.status === ExecutionStepStatus.enum.skipped),
+    ).toBe(true);
+  });
+
+  it('a rule check() threw → job.complete{failed} with the error surfaced (NOT success-skip)', () => {
+    const result: RuleEvaluationResult = {
+      allPassed: false,
+      results: [{ label: 'main only', passed: false, durationMs: 1, error: 'kaboom' }],
+      evaluationError: { label: 'main only', message: 'kaboom' },
+    };
+    const completion = buildJobRuleCompletion(result, steps);
+    expect(completion?.status).toBe(ExecutionJobStatus.enum.failed);
+    expect(completion?.error).toContain('kaboom');
+    expect(completion?.error).toContain('main only');
+    // Steps still reported (skipped) so the run timeline shows them.
+    expect(completion?.stepResults).toHaveLength(2);
+  });
+});
+
 describe('step-level rule evaluation', () => {
   it('step with a skip rule reports skipped status via IPC and loop continues to next step', async () => {
     const step1Run = vi.fn();
@@ -617,6 +665,51 @@ describe('step-level rule evaluation', () => {
 
     expect(stepRun).toHaveBeenCalledOnce();
     expect(result.stepResults[0].status).toBe('success');
+  });
+
+  it('step whose rule check() THROWS fails the step (not skip) and does not run later steps', async () => {
+    const step1Run = vi.fn();
+    const step2Run = vi.fn().mockResolvedValue(undefined);
+    const steps: Step[] = [
+      makeStep('crashes', step1Run, {
+        rules: [
+          {
+            _tag: 'Rule',
+            label: 'main only',
+            check: () => {
+              throw new TypeError('cannot read endsWith of undefined');
+            },
+          },
+        ],
+      }),
+      makeStep('later', step2Run),
+    ];
+    const { messages, send } = collectIpc();
+
+    const result = await executeStepLoop({
+      steps,
+      createStepContext: () => stubCtx(),
+      sendIpc: send,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+    });
+
+    // The crashing step FAILS (not skipped); the loop breaks so `later` never runs.
+    expect(step1Run).not.toHaveBeenCalled();
+    expect(step2Run).not.toHaveBeenCalled();
+    expect(result.stepResults[0].status).toBe(ExecutionStepStatus.enum.failed);
+    expect(result.stepResults[0].error?.message).toContain('cannot read endsWith');
+    expect(result.stepResults[0].error?.message).toContain('main only');
+    // The failure is surfaced in the logs, and the completion IPC reports failed.
+    const completeMsg = messages.find((m) => m.type === 'step.complete' && m.stepIndex === 0) as
+      (RunnerToAgentMessage & { type: 'step.complete' }) | undefined;
+    expect(completeMsg?.status).toBe(ExecutionStepStatus.enum.failed);
+    expect(completeMsg?.error?.message).toContain('cannot read endsWith');
+    expect(
+      messages.some((m) => m.type === 'log.line' && m.line.includes("Step 'crashes' failed")),
+    ).toBe(true);
   });
 });
 
@@ -1193,6 +1286,8 @@ describe('createSandboxStepContext - matrix threading', () => {
       new Map(),
       secrets.secrets,
       new LogMasker(),
+      new AbortController().signal,
+      createTempScope(),
     );
   }
 
@@ -1241,6 +1336,117 @@ describe('createSandboxStepContext - matrix threading', () => {
   it('defaults ctx.dispatchInputs to {} when none on the request', () => {
     const ctx = buildCtx(baseRequest());
     expect(ctx.dispatchInputs).toEqual({});
+  });
+});
+
+describe('createSandboxStepContext - temp scope', () => {
+  function req(): JobExecutionRequest {
+    return {
+      runId: 'run-1',
+      jobId: 'job-1',
+      workDir: '/workspace',
+      repoUrl: 'https://example.com/repo.git',
+      ref: 'main',
+      sha: 'abc',
+      workflowName: 'ci',
+      jobName: 'test',
+      runsOn: 'ubuntu',
+    } as JobExecutionRequest;
+  }
+
+  function buildCtx(scope: ReturnType<typeof createTempScope>, signal?: AbortSignal): StepContext {
+    const secrets = createStepSecrets({}, {});
+    return createSandboxStepContext(
+      '/workspace',
+      0,
+      'my step!',
+      req(),
+      () => {},
+      new Map(),
+      new Map(),
+      new Set<string>(),
+      new Map<string, string>(),
+      new Map(),
+      secrets.secrets,
+      new LogMasker(),
+      signal ?? new AbortController().signal,
+      scope,
+    );
+  }
+
+  it('drains the job temp scope on success', async () => {
+    const scope = createTempScope();
+    const ctx = buildCtx(scope);
+    const handle = await ctx.mktemp('t');
+    expect(existsSync(handle.path)).toBe(true);
+
+    // The single job-end drain reclaims every ctx allocation.
+    await drainJobTempScope(scope, () => {});
+    expect(existsSync(handle.path)).toBe(false);
+  });
+
+  it('drains the job temp scope on failure', async () => {
+    // Failure converges on the same drain point as success — a step that threw
+    // still allocated via the same job scope, so the drain reclaims it.
+    const scope = createTempScope();
+    const ctx = buildCtx(scope);
+    const handle = await ctx.mktempFile('t', { suffix: '.txt' });
+    expect(existsSync(handle.path)).toBe(true);
+
+    await drainJobTempScope(scope, () => {});
+    expect(existsSync(handle.path)).toBe(false);
+  });
+
+  it('drains the job temp scope on cancel', async () => {
+    // Cancel/timeout aborts ctx.signal, then converges on the same drain.
+    const ac = new AbortController();
+    const scope = createTempScope();
+    const ctx = buildCtx(scope, ac.signal);
+    const handle = await ctx.mktemp('t');
+    ac.abort();
+    expect(existsSync(handle.path)).toBe(true);
+
+    await drainJobTempScope(scope, () => {});
+    expect(existsSync(handle.path)).toBe(false);
+  });
+
+  it('defaults an omitted label to the sanitized step id', async () => {
+    const scope = createTempScope();
+    const ctx = buildCtx(scope);
+    // Step name 'my step!' sanitizes to 'my-step-' (fallback for irregulars).
+    const handle = await ctx.mktemp();
+    expect(handle.path).toContain('kici-my-step-');
+    await drainJobTempScope(scope, () => {});
+    expect(existsSync(handle.path)).toBe(false);
+  });
+
+  it('drainJobTempScope swallows a disposeAll failure into warn, never throws', async () => {
+    const warnings: string[] = [];
+    const failingScope = {
+      mktemp: async () => {
+        throw new Error('unused');
+      },
+      mktempFile: async () => {
+        throw new Error('unused');
+      },
+      disposeAll: async () => {
+        throw new Error('boom');
+      },
+    };
+    await expect(drainJobTempScope(failingScope, (m) => warnings.push(m))).resolves.toBeUndefined();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('boom');
+  });
+});
+
+describe('sanitizeTempLabel', () => {
+  it('lowercases and replaces non [a-z0-9-] chars with -', () => {
+    expect(sanitizeTempLabel('My Step/1')).toBe('my-step-1');
+  });
+
+  it('falls back to "step" for an all-irregular input', () => {
+    expect(sanitizeTempLabel('!!!')).toBe('---'); // dashes are valid, kept
+    expect(sanitizeTempLabel('')).toBe('step');
   });
 });
 
@@ -1309,5 +1515,90 @@ describe('deriveFanout', () => {
       first: true,
       last: true,
     });
+  });
+});
+
+const freshCoerceState = (): CoerceState => ({
+  counter: 0,
+  refMap: new WeakMap(),
+  autoNamed: new WeakSet(),
+});
+
+describe('coerceStep name write-back', () => {
+  it('mutates the original unnamed step so its .result proxy can resolve', () => {
+    const s: any = { _tag: 'Step', name: '', run: async () => ({ v: 1 }) };
+    const state = freshCoerceState();
+    const out = coerceStep(s, state);
+    expect(out).toBe(s); // same object, not a clone
+    expect(s.name).toBe('step-1');
+  });
+
+  it('assigns a fresh clone name when the same object appears twice (lock parity)', () => {
+    const s: any = { _tag: 'Step', name: '', run: async () => ({ v: 1 }) };
+    const state = freshCoerceState();
+    const first = coerceStep(s, state);
+    const second = coerceStep(s, state);
+    expect(first.name).toBe('step-1');
+    expect(second.name).toBe('step-2');
+    expect(second).not.toBe(s); // repeat encounter clones, as today
+    expect(s.name).toBe('step-1'); // original keeps its first binding
+  });
+
+  it('leaves user-named steps untouched and does not consume the counter', () => {
+    const named: any = { _tag: 'Step', name: 'build', run: async () => {} };
+    const anon: any = { _tag: 'Step', name: '', run: async () => {} };
+    const state = freshCoerceState();
+    expect(coerceStep(named, state)).toBe(named);
+    coerceStep(anon, state);
+    expect(anon.name).toBe('step-1');
+  });
+
+  it('still wraps bare functions into counter-named steps', () => {
+    const fn = async () => {};
+    const state = freshCoerceState();
+    const out = coerceStep(fn, state);
+    expect(out.name).toBe('step-1');
+    expect(state.refMap.get(fn)).toBe('step-1');
+  });
+});
+
+describe('resolveChangedFilesForRules', () => {
+  it('keeps the orchestrator fast-path list when status is fetched', async () => {
+    const request = {
+      event: { type: 'push', changedFiles: ['a.ts'], changedFilesStatus: 'fetched' },
+    } as unknown as JobExecutionRequest;
+    await resolveChangedFilesForRules(request, '/nonexistent', true);
+    expect((request.event as any).changedFiles).toEqual(['a.ts']);
+    expect((request.event as any).changedFilesStatus).toBe('fetched');
+  });
+
+  it('no-ops when there are no rules', async () => {
+    const request = { event: { type: 'push' } } as unknown as JobExecutionRequest;
+    await resolveChangedFilesForRules(request, '/nonexistent', false);
+    expect((request.event as any).changedFilesStatus).toBeUndefined();
+  });
+
+  it('marks unavailable for a diff-less event when a rule exists', async () => {
+    const request = { event: { type: 'schedule' } } as unknown as JobExecutionRequest;
+    await resolveChangedFilesForRules(request, '/nonexistent', true);
+    expect((request.event as any).changedFilesStatus).toBe('unavailable');
+  });
+});
+
+describe('buildSandboxShell same-step env visibility', () => {
+  afterEach(() => {
+    delete process.env.KICI_SAMESTEP_TEST;
+  });
+
+  it('a subprocess sees a process.env mutation made AFTER the shell was built (live env, not a snapshot)', async () => {
+    delete process.env.KICI_SAMESTEP_TEST;
+    const shell = buildSandboxShell(process.cwd(), 0, () => {});
+    // Mutate process.env after the shell is constructed — this mirrors
+    // ctx.setEnv running inside the step, after the step context (and its
+    // shell) were created. With a frozen { ...process.env } copy the
+    // subprocess would echo an empty line; with a live reference it sees the value.
+    process.env.KICI_SAMESTEP_TEST = 'live-value';
+    const out = await shell`echo "$KICI_SAMESTEP_TEST"`;
+    expect(out.stdout.trim()).toBe('live-value');
   });
 });

@@ -160,4 +160,65 @@ describe('createGithubWebhookRoutes', () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ duplicate: true });
   });
+
+  it('returns 429 + Retry-After when the pipeline sheds (admission control)', async () => {
+    const onWebhook = vi.fn(async () => WebhookIngestOutcome.enum.shed);
+    const { deps } = makeDeps({ onWebhook });
+    const app = createGithubWebhookRoutes(deps);
+    const res = await post(app, {
+      body,
+      headers: {
+        'x-hub-signature-256': sign(body),
+        'x-github-delivery': 'd-7',
+        'x-github-event': 'push',
+      },
+    });
+    expect(res.status).toBe(429);
+    expect(res.headers.get('retry-after')).toBe('5');
+    expect(await res.json()).toMatchObject({ rejected: true });
+  });
+
+  describe('cluster_settings max_github_payload_bytes', () => {
+    it('rejects a body over the cluster cap with 413 (never reaches the handler)', async () => {
+      const clusterSettings = {
+        getNumber: async (_col: string, _fallback: number) => 10, // 10-byte cap
+      } as never;
+      const { deps, onWebhook } = makeDeps({
+        clusterSettings,
+        maxGithubPayloadBytes: 25 * 1024 * 1024,
+      });
+      const app = createGithubWebhookRoutes(deps);
+      const res = await post(app, {
+        body, // > 10 bytes
+        headers: {
+          'x-hub-signature-256': sign(body),
+          'x-github-delivery': 'd',
+          'x-github-event': 'push',
+        },
+      });
+      expect(res.status).toBe(413);
+      expect(onWebhook).not.toHaveBeenCalled();
+    });
+
+    it('accepts a body under the cluster cap (reaches the pipeline)', async () => {
+      const clusterSettings = {
+        getNumber: async (_col: string, fallback: number) => fallback, // null override → config default
+      } as never;
+      const { deps, onWebhook } = makeDeps({
+        clusterSettings,
+        maxGithubPayloadBytes: 25 * 1024 * 1024,
+      });
+      const app = createGithubWebhookRoutes(deps);
+      const res = await post(app, {
+        body,
+        headers: {
+          'x-hub-signature-256': sign(body),
+          'x-github-delivery': 'd2',
+          'x-github-event': 'push',
+        },
+      });
+      expect(res.status).toBe(202);
+      expect(onWebhook).toHaveBeenCalledOnce();
+    });
+  });
 });

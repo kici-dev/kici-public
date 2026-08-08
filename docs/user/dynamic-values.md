@@ -11,9 +11,7 @@ job('deploy', {
   context: (event) => event.targetBranch,
   env: (event) => ({ BRANCH: event.targetBranch }),
   concurrencyGroup: (event) => `deploy-${event.targetBranch}`,
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 ```
 
@@ -22,9 +20,7 @@ job('deploy', {
   runsOn: 'default',
   // One shape everywhere: branch on the normalized event type.
   context: (event) => (event.type === 'pull_request' ? 'preview' : 'production'),
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 ```
 
@@ -69,7 +65,7 @@ context: (event) => {
 
 ### Impure functions (init-job evaluation)
 
-If the compiler determines a function is impure, it emits a warning during compilation and falls back to the two-phase init model. This means:
+If the compiler determines a function is impure, it prints a `warning [W101]` naming the affected field (`context`, `env`, or `concurrencyGroup`), the reason the function was judged impure, and the ~5-10 second init-job cost — and compilation still succeeds. The function falls back to the two-phase init model. This means:
 
 1. The orchestrator dispatches a special `__init__` job to a builder agent
 2. The builder agent clones the repository and evaluates the function
@@ -77,6 +73,8 @@ If the compiler determines a function is impure, it emits a warning during compi
 4. The orchestrator dispatches the real execution job with the resolved values
 
 This adds approximately 5-10 seconds of overhead for cloning and evaluation.
+
+`kici preview` lists the injected `__init__` job under each affected job, so you can spot the init-job cost before the first run.
 
 **Examples of impure functions (will use init job):**
 
@@ -111,6 +109,7 @@ env: async (event) => {
 ## Tips
 
 - **Write pure functions whenever possible** to avoid the init-job delay. Most context and env computations only need the event payload data.
-- **Check compiler warnings** -- the compiler tells you when a function is classified as impure and explains why.
+- **Check compiler warnings** -- the compiler prints a `warning [W101]` when a function is classified as impure, naming the reason and the ~5-10s init-job cost. Run `kici preview` to see the injected `__init__` job listed under each affected job before your first run.
 - **Runtime errors in inline expressions cause immediate job failure.** There is no fallback to the init-job path. If your pure function throws at runtime (e.g., accessing a property on `undefined`), the job fails immediately.
+- **See [how your workflow code executes](./execution-model.md)** for the full picture of where pure vs. impure functions run relative to rules, hooks, and step bodies.
 - **The event parameter is the normalized event envelope** — the same shape rules receive as `ctx.event`: `{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }` (see the [event payload reference](./sdk/event-payloads.md) for the complete schema). Narrow on `event.type` (`'push'`, `'pull_request'`, `'tag'`, …) to branch per trigger kind. The raw provider webhook body is nested at `event.payload` (for GitHub pushes: `payload.ref`, `payload.after`, `payload.repository`, …).

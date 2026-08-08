@@ -16,9 +16,9 @@ The KiCI orchestrator runs in your infrastructure, giving you full control over 
 - Routes jobs to agents using label-based matching (e.g., `linux`, `docker`, `x64`)
 - Reports execution events back to KiCI Platform for observability (in connected modes)
 
-## Three deployment modes
+## Four deployment modes
 
-The orchestrator supports three operating modes. Set the mode via the `KICI_MODE` environment variable (read at startup by `server.ts` / `standalone.ts`) or via `KICI_INSTANCE_MODE` / `instance.mode:` in a YAML config file (the resolver-based path documented in [configuration.md](configuration.md)). Both paths accept the same three values. **Mode is optional and defaults to `platform`** — but the orchestrator will refuse to boot if the credentials the chosen mode requires (see "Requirements" column below) aren't present.
+The orchestrator supports four operating modes. Set the mode via the `KICI_MODE` environment variable (read at startup by `server.ts` / `standalone.ts`) or via `KICI_INSTANCE_MODE` / `instance.mode:` in a YAML config file (the resolver-based path documented in [configuration.md](configuration.md)). Both paths accept the same four values. **Mode is optional and defaults to `platform`** — but the orchestrator will refuse to boot if the credentials the chosen mode requires (see "Requirements" column below) aren't present.
 
 ```
 Mode: platform (default)
@@ -36,6 +36,17 @@ Mode: hybrid
   for direct ingestion live in the orchestrator DB
   (kici-admin source add ... → orchestrator-side sources table rows).
 
+Mode: observed
+  GitHub  -->  (direct webhook) -->  Orchestrator  --WS-->  Agents
+                                     |    (your infra)      (your infra)
+                                     +--WS--> Platform (observability only)
+  Webhooks arrive exclusively via direct HTTP endpoints — nothing transits KiCI.
+  The Platform connection carries runs/jobs/steps/logs/events so the hosted
+  dashboard still works, and sources register as observe-only (never routed).
+  Requires KICI_PLATFORM_URL, KICI_PLATFORM_TOKEN, and KICI_WEBHOOK_PUBLIC_URL.
+  GitHub-App sources are unsupported here (they are relay-ingested) — use a
+  generic or local source, or pick hybrid.
+
 Mode: independent
   GitHub  -->  Orchestrator  --WS-->  Agents
                (your infra)          (your infra)
@@ -46,11 +57,12 @@ Mode: independent
 
 ### When to use which mode
 
-| Mode          | Best For                                   | Platform Dashboard | Direct Webhooks | Requirements                          |
-| ------------- | ------------------------------------------ | ------------------ | --------------- | ------------------------------------- |
-| `platform`    | Standard deployment                        | Yes                | No              | Platform API key                      |
-| `hybrid`      | Resilience, self-hosted webhook ingress    | Yes                | Yes             | Platform API key + per-source secrets |
-| `independent` | Full independence, air-gapped environments | No                 | Yes             | Per-source secrets in DB              |
+| Mode          | Best For                                   | Platform Dashboard | Direct Webhooks | Requirements                                                      |
+| ------------- | ------------------------------------------ | ------------------ | --------------- | ----------------------------------------------------------------- |
+| `platform`    | Standard deployment                        | Yes                | No              | Platform API key                                                  |
+| `hybrid`      | Resilience, self-hosted webhook ingress    | Yes                | Yes             | Platform API key + per-source secrets                             |
+| `observed`    | Data residency with the hosted dashboard   | Yes                | Yes (only)      | Platform API key + `KICI_WEBHOOK_PUBLIC_URL` + per-source secrets |
+| `independent` | Full independence, air-gapped environments | No                 | Yes             | Per-source secrets in DB                                          |
 
 ### Webhook secrets are per-source
 
@@ -103,7 +115,7 @@ docker run -d \
   --name kici-orchestrator \
   -p 4000:4000 \
   -e KICI_MODE=platform \
-  -e KICI_PLATFORM_URL=wss://platform.kici.dev/ws \
+  -e KICI_PLATFORM_URL=wss://api.kici.dev/ws \
   -e KICI_PLATFORM_TOKEN=your-api-key \
   -e KICI_DATABASE_URL=postgresql://kici:password@postgres:5432/kici \
   -e KICI_SECRET_KEY=your-64-char-hex-master-key \
@@ -142,7 +154,7 @@ docker run -d \
   --name kici-orchestrator \
   -p 4000:4000 \
   -e KICI_MODE=hybrid \
-  -e KICI_PLATFORM_URL=wss://platform.kici.dev/ws \
+  -e KICI_PLATFORM_URL=wss://api.kici.dev/ws \
   -e KICI_PLATFORM_TOKEN=your-api-key \
   -e KICI_DATABASE_URL=postgresql://kici:password@postgres:5432/kici \
   -e KICI_SECRET_KEY=your-64-char-hex-master-key \
@@ -291,15 +303,15 @@ curl http://localhost:4000/metrics
 
 Returns Prometheus text format with `kici_*` prefixed metrics including:
 
-- `kici_webhooks_received_total` -- Total webhooks received
-- `kici_webhooks_processed_total` -- Total webhooks processed (with decision)
-- `kici_trigger_match_duration_seconds` -- Trigger matching latency
-- `kici_lockfile_cache_hits_total` / `kici_lockfile_cache_misses_total` -- Cache performance
-- `kici_agents_active` -- Connected agent count
-- `kici_dispatch_queue_depth` -- Pending jobs in dispatch queue
-- `kici_jobs_dispatched_total` -- Total jobs dispatched to agents
-- `kici_platform_connection_status` -- Platform relay connection state
-- `kici_dedup_hits_total` -- Deduplicated webhook count
+- `kici_orch_webhooks_received_total` -- Total webhooks received
+- `kici_orch_webhooks_processed_total` -- Total webhooks processed (with outcome)
+- `kici_orch_trigger_match_duration_seconds` -- Trigger matching latency
+- `kici_orch_source_cache_hits_total` / `kici_orch_source_cache_misses_total` -- Compiled-source cache performance
+- `kici_orch_dep_cache_hits_total` / `kici_orch_dep_cache_misses_total` -- Dependency cache performance
+- `kici_orch_agents_active` -- Connected agent count
+- `kici_orch_dispatch_queue_depth` -- Pending jobs in dispatch queue
+- `kici_orch_executions_total` -- Total workflow executions by status
+- `kici_orch_dedup_hits_total` -- Deduplicated webhook count
 
 ## Building the image
 

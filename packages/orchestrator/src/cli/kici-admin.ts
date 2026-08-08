@@ -29,6 +29,8 @@ import { registerRemoteSourceCommands } from './commands/remote-source.js';
 import { registerWorkflowCommands } from './commands/workflow.js';
 import { registerRunsCommands } from './commands/runs.js';
 import { registerAttestationsCommands } from './commands/attestations.js';
+import { registerSigningKeyCommands } from './commands/signing-key.js';
+import { registerDashboardEncryptionKeyCommands } from './commands/dashboard-encryption-key.js';
 import { registerEventLogCommands } from './commands/event-log.js';
 import { registerAccessLogCommands } from './commands/access-log.js';
 import { registerBackendCommands } from './commands/backend.js';
@@ -37,9 +39,12 @@ import { registerDebugBundleCommand } from './commands/debug-bundle.js';
 import { registerInspectBundleCommand } from './commands/inspect-bundle.js';
 import { registerOrchestratorServiceCommands } from './commands/orchestrator-service/index.js';
 import { registerAgentServiceCommands } from './commands/agent-service/index.js';
+import { registerAgentPackage } from './commands/agent-package.js';
 import { registerPeerCommands } from './commands/peer.js';
 import { registerHostCommands } from './commands/host.js';
 import { registerOrgSettingsCommands } from './commands/org-settings.js';
+import { registerClusterSettingsCommands } from './commands/cluster-settings.js';
+import { registerTrustPolicyCommands } from './commands/trust-policy.js';
 import { registerClusterNameCommands } from './commands/cluster-name.js';
 import { registerClusterCommands } from './commands/cluster.js';
 import { registerMaintenanceCommands } from './commands/maintenance.js';
@@ -47,6 +52,7 @@ import { registerContextCommands } from './commands/context.js';
 import { registerVariableCommands } from './commands/variable.js';
 import { registerQueueCommands } from './commands/queue.js';
 import { registerExecutionCommands } from './commands/execution.js';
+import { registerCheckRunCommands } from './commands/check-run.js';
 import { registerRegistrationCommands } from './commands/registration.js';
 import { registerEventCommands } from './commands/event.js';
 import { registerEventDlqCommands } from './commands/event-dlq.js';
@@ -103,13 +109,15 @@ export function buildProgram(): Command {
   registerWorkflowCommands(program, getClient);
   registerRunsCommands(program, getClient);
   registerAttestationsCommands(program, getClient);
+  registerSigningKeyCommands(program);
+  registerDashboardEncryptionKeyCommands(program);
   registerEventLogCommands(program, getClient);
   registerAccessLogCommands(program, getClient);
   registerBackendCommands(program, getClient);
   registerDiagnoseCommand(program, getClient);
   registerDebugBundleCommand(program, getClient);
   registerInspectBundleCommand(program);
-  registerOrchestratorServiceCommands(program);
+  registerOrchestratorServiceCommands(program, getClient);
   // Firecracker host-networking ops (provision/verify/teardown bridges) run
   // locally on the orchestrator host — no admin HTTP client.
   registerFirecrackerCommands(program);
@@ -119,11 +127,15 @@ export function buildProgram(): Command {
   // Agent service commands are added to the existing 'agent' command group
   // (registered above by registerAgentCommands), so this must come after it.
   registerAgentServiceCommands(program);
+  // Agent payload producer (`agent package`) — also added to the 'agent' group.
+  registerAgentPackage(program);
   // Peer commands use direct DB access (not AdminApiClient)
   registerPeerCommands(program, getClient);
   // Host roster commands use direct DB access (not AdminApiClient)
   registerHostCommands(program);
   registerOrgSettingsCommands(program, getClient);
+  registerClusterSettingsCommands(program, getClient);
+  registerTrustPolicyCommands(program, getClient);
   registerClusterNameCommands(program, getClient);
   // Cluster identity recovery (reconcile-identity) is DB + S3 direct — no admin
   // HTTP client — so it works while the orchestrator is crash-looping on a
@@ -142,6 +154,9 @@ export function buildProgram(): Command {
   // run after it.
   registerQueueCommands(program, getClient);
   registerExecutionCommands(program, getClient);
+  // Check-run tracking reads: direct-DB only (no admin HTTP route), so this
+  // takes the program-only registration form.
+  registerCheckRunCommands(program);
   // Registration CLI is a new top-level namespace (alongside the existing
   // `workflow list` — they cover different concerns).
   registerRegistrationCommands(program, getClient);

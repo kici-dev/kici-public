@@ -1,6 +1,10 @@
 import type { $ as Shell } from 'zx';
+import type { z } from 'zod';
+import type { TempHandle } from '@kici-dev/core/tmp';
+import type { Job } from './types.js';
 import type { MatrixValues } from './matrix/types.js';
 import type { EventEmitOptions } from './events/types.js';
+import type { EventDefinition } from './events/define-event.js';
 import type { StepSecrets } from './secrets.js';
 import type { KiciApi } from './api-types.js';
 import type { FanoutPosition } from './fanout-context.js';
@@ -52,15 +56,15 @@ export interface MatrixJobOutputs<T = Record<string, unknown>> {
 }
 
 /** Runtime discriminator: true when `ctx.jobOutputs(ref)` returned a matrix envelope. */
-export function isMatrixJobOutputs(
-  value: Record<string, unknown> | MatrixJobOutputs | HostJobOutputs,
-): value is MatrixJobOutputs {
+export function isMatrixJobOutputs<T = Record<string, unknown>>(
+  value: T | MatrixJobOutputs<T> | HostJobOutputs<T>,
+): value is MatrixJobOutputs<T> {
   return (
     typeof value === 'object' &&
     value !== null &&
     'byMatrix' in value &&
     'merged' in value &&
-    typeof (value as MatrixJobOutputs).byMatrix === 'object'
+    typeof (value as MatrixJobOutputs<T>).byMatrix === 'object'
   );
 }
 
@@ -83,15 +87,15 @@ export interface HostJobOutputs<T = Record<string, unknown>> {
 }
 
 /** Runtime discriminator: true when `ctx.jobOutputs(ref)` returned a host envelope. */
-export function isHostJobOutputs(
-  value: Record<string, unknown> | MatrixJobOutputs | HostJobOutputs,
-): value is HostJobOutputs {
+export function isHostJobOutputs<T = Record<string, unknown>>(
+  value: T | MatrixJobOutputs<T> | HostJobOutputs<T>,
+): value is HostJobOutputs<T> {
   return (
     typeof value === 'object' &&
     value !== null &&
     'byHost' in value &&
     'summary' in value &&
-    typeof (value as HostJobOutputs).byHost === 'object'
+    typeof (value as HostJobOutputs<T>).byHost === 'object'
   );
 }
 
@@ -112,18 +116,26 @@ type IsAugmented<T> = [keyof T] extends [never] ? false : true;
  * Step secrets with async get/expose accessors.
  * Use ctx.secrets.get('KEY') to retrieve a value, ctx.secrets.expose('KEY') to inject into env.
  *
- * When KnownSecretKeys is augmented (via .d.ts generation), narrows get/expose key parameter.
- * When empty (no augmentation), falls back to StepSecrets with string keys.
+ * When KnownSecretKeys is augmented (via .d.ts generation), only the `get`/`expose`
+ * key parameter is narrowed to the known keys — every other accessor
+ * (`has`, `getMeta`, `list`, `mountFile`, `exposeFile`) is preserved verbatim
+ * from StepSecrets. When empty (no augmentation), the whole StepSecrets surface
+ * accepts any string key.
  */
+/**
+ * The augmented secrets surface: narrows `get`/`expose` to the provided key set
+ * while preserving every other StepSecrets accessor (`has`, `getMeta`, `list`,
+ * `mountFile`, `exposeFile`) verbatim. Deriving from StepSecrets via `Omit`
+ * keeps the file-mount accessors from silently dropping off whenever the
+ * StepSecrets surface grows a new method.
+ */
+export type AugmentedStepSecrets<TKeys> = Omit<StepSecrets, 'get' | 'expose'> & {
+  get(key: keyof TKeys): Promise<string>;
+  expose(key: keyof TKeys): Promise<void>;
+};
+
 export type StepSecretsTyped =
-  IsAugmented<KnownSecretKeys> extends true
-    ? {
-        get(key: keyof KnownSecretKeys): Promise<string>;
-        expose(key: keyof KnownSecretKeys): Promise<void>;
-        has(key: string): boolean;
-        getMeta(key: string): import('./secrets.js').SecretMeta | undefined;
-      }
-    : StepSecrets;
+  IsAugmented<KnownSecretKeys> extends true ? AugmentedStepSecrets<KnownSecretKeys> : StepSecrets;
 
 /** Repository metadata for global workflow context */
 export interface RepoInfo {
@@ -243,12 +255,20 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    * Events are delivered immediately (mid-workflow, not queued until completion).
    *
    * @example
-   * // Emit a simple event
+   * // Typed via a defineEvent() definition — payload is schema-checked
+   * await ctx.emit(deployComplete, { env: 'prod', version: '1.2.3' });
+   *
+   * // Or by ad-hoc name (payload typed as Record<string, unknown>)
    * await ctx.emit('deploy-complete', { env: 'prod', version: '1.2.3' });
    *
    * // Emit with cross-repo targeting
    * await ctx.emit('deploy-complete', { env: 'prod' }, { target: { repos: ['org/other-repo'] } });
    */
+  emit<T extends z.ZodTypeAny>(
+    definition: EventDefinition<T>,
+    payload: z.infer<T>,
+    options?: EventEmitOptions,
+  ): Promise<{ deliveryId: string }>;
   emit(
     eventName: string,
     payload?: Record<string, unknown>,
@@ -282,6 +302,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    * const m = ctx.jobOutputs(buildMatrixJob);
    * if (isMatrixJobOutputs(m)) console.log(m.byMatrix['linux, arm64']);
    */
+  jobOutputs<T>(ref: Job<T>): T | MatrixJobOutputs<T> | HostJobOutputs<T>;
   jobOutputs(ref: { name: string }): Record<string, unknown> | MatrixJobOutputs | HostJobOutputs;
   /**
    * Publish a secret output value from this job.
@@ -306,15 +327,43 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   cache: import('./cache-types.js').CacheApi;
   /**
+   * Imperative artifacts API for named, durable build deliverables.
+   *
+   * `ctx.artifacts.upload(name, paths)` packs the paths and uploads them under
+   * `name` (immutable per run — first upload wins, a duplicate name fails).
+   * `ctx.artifacts.download(name, destDir?)` retrieves an artifact uploaded by
+   * an earlier job of the same run. Artifacts are surfaced in the dashboard run
+   * detail and downloadable from there. Distinct from `cache` (content-keyed
+   * speedup) and job outputs (small JSON via `needs`).
+   */
+  artifacts: import('./artifacts-types.js').ArtifactsApi;
+  /**
    * Build, sign, and persist a KiCI build-provenance attestation for a produced
-   * artifact. The in-toto statement's identity is derived from a Platform-minted
-   * identity token (unforgeable); the bundle is signed with an ephemeral key and
-   * is offline-verifiable. Pass the artifact via a precomputed digest or a path
-   * the agent digests with SHA-256.
+   * artifact. The in-toto statement's identity is derived from an
+   * orchestrator-minted identity token (unforgeable); the bundle is signed with
+   * an ephemeral key and is offline-verifiable. Pass the artifact via a
+   * precomputed digest or a path the agent digests with SHA-256.
    */
   attestProvenance(
     opts: import('./provenance-types.js').AttestProvenanceOptions,
   ): Promise<import('./provenance-types.js').AttestProvenanceResult>;
+  /**
+   * Allocate a scratch directory for this job. The directory is removed
+   * automatically when the job ends (success, failure, or cancel); the returned
+   * `cleanup()` may also be called manually at any time and is idempotent.
+   *
+   * When `label` is omitted it defaults to a sanitized step id. Use the returned
+   * handle's `path` for scratch work, or `await using h = await ctx.mktemp()` to
+   * tie the directory's lifetime to the enclosing scope.
+   */
+  mktemp(label?: string): Promise<TempHandle>;
+  /**
+   * Allocate a scratch file for this job. Like {@link mktemp}, the file (and its
+   * holder) is removed automatically when the job ends, and the returned
+   * `cleanup()` is idempotent and manually callable. `opts.suffix` appends a file
+   * extension to the generated name.
+   */
+  mktempFile(label?: string, opts?: { suffix?: string }): Promise<TempHandle>;
   /**
    * Upstream needs resolved for this job, keyed by upstream job or group name.
    * `ctx.needs.<job>.result` is the upstream's outputs proxy and

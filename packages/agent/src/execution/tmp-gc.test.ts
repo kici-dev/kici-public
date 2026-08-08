@@ -34,7 +34,6 @@ describe('gcStaleAgentTmpDirs', () => {
     const staleWork = await seed(base, 'kici-Ab3xZ9', 2 * DAY_MS);
     const staleStore = await seed(base, 'kici-pnpm-store-XyZ123', 2 * DAY_MS);
     const freshWork = await seed(base, 'kici-Qw9rT2', 0.5 * DAY_MS);
-    const runDir = await seed(base, 'kici-run-ab12cd', 30 * DAY_MS); // compiler's family, not ours
     const cache = await seed(base, 'kici-e2e-cache', 30 * DAY_MS);
 
     const removed = await gcStaleAgentTmpDirs(base);
@@ -43,7 +42,60 @@ describe('gcStaleAgentTmpDirs', () => {
     expect(await exists(staleWork)).toBe(false);
     expect(await exists(staleStore)).toBe(false);
     expect(await exists(freshWork)).toBe(true);
-    expect(await exists(runDir)).toBe(true);
     expect(await exists(cache)).toBe(true);
+  });
+
+  it('collects any stale labeled allocator dir (kici-<label>-XXXXXX)', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'agent-gc-test-'));
+    bases.push(base);
+    const stale = await seed(base, 'kici-somelabel-ABC123', 2 * DAY_MS);
+
+    const removed = await gcStaleAgentTmpDirs(base);
+
+    expect(removed).toEqual([stale]);
+    expect(await exists(stale)).toBe(false);
+  });
+
+  it('collects a stale bare workdir (kici-XXXXXX)', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'agent-gc-test-'));
+    bases.push(base);
+    const stale = await seed(base, 'kici-abc123', 2 * DAY_MS);
+
+    const removed = await gcStaleAgentTmpDirs(base);
+
+    expect(removed).toEqual([stale]);
+    expect(await exists(stale)).toBe(false);
+  });
+
+  it('defaults its scan base to kiciTmpBase() (follows KICI_TMPDIR)', async () => {
+    const savedTmpdir = process.env.KICI_TMPDIR;
+    const base = await mkdtemp(join(tmpdir(), 'agent-gc-kicitmpdir-'));
+    bases.push(base);
+    process.env.KICI_TMPDIR = base;
+    try {
+      const stale = await seed(base, 'kici-abc123', 2 * DAY_MS);
+      // No explicit base arg — the default must resolve to KICI_TMPDIR.
+      const removed = await gcStaleAgentTmpDirs();
+      expect(removed).toEqual([stale]);
+      expect(await exists(stale)).toBe(false);
+    } finally {
+      if (savedTmpdir === undefined) delete process.env.KICI_TMPDIR;
+      else process.env.KICI_TMPDIR = savedTmpdir;
+    }
+  });
+
+  it('spares the deterministic persistent caches even when stale', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'agent-gc-test-'));
+    bases.push(base);
+    const payloads = await seed(base, 'kici-agent-payloads', 30 * DAY_MS);
+    const data = await seed(base, 'kici-data', 30 * DAY_MS);
+    const ledger = await seed(base, 'kici-scaler-ledger', 30 * DAY_MS);
+
+    const removed = await gcStaleAgentTmpDirs(base);
+
+    expect(removed).toEqual([]);
+    expect(await exists(payloads)).toBe(true);
+    expect(await exists(data)).toBe(true);
+    expect(await exists(ledger)).toBe(true);
   });
 });

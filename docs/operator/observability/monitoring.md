@@ -190,8 +190,9 @@ in the **DLQ** — `kici_events.dlq_at IS NOT NULL` — and is surfaced via:
 
 ### Triage steps
 
-1. **Confirm the alert.** Check the `kici_orch_event_dlq_depth` gauge (e.g. on a
-   Grafana dashboard if you've imported KiCI's, or via your own Prometheus). If
+1. **Confirm the alert.** Check the `kici_orch_event_dlq_depth` gauge — on the
+   [orchestrator monitoring pack](./monitoring-pack.md) dashboard once imported,
+   or via your own Prometheus. If
    the ingress rate is 0 and only depth > 0, the events are old — no urgent
    pager-class issue, but still triage them so the depth doesn't accumulate
    forever (DLQ rows are NOT cleaned up by TTL, by design).

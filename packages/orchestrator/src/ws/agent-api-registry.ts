@@ -29,6 +29,36 @@ interface ApiMethodEntry {
 }
 
 /**
+ * The caller named a method the registry does not know.
+ *
+ * A deliberate, bounded rejection: its message names only the method the caller
+ * itself sent, so the agent WS handler may forward it verbatim to the workflow
+ * author instead of replacing it with a safe fixed string.
+ */
+export class UnknownApiMethodError extends Error {
+  constructor(method: string) {
+    super(`Unknown API method '${method}'`);
+    this.name = 'UnknownApiMethodError';
+  }
+}
+
+/**
+ * The caller is not authorized for the role the requested method requires.
+ *
+ * A deliberate, bounded rejection: its message names only the caller's own
+ * method and roles, so the agent WS handler may forward it verbatim to the
+ * workflow author instead of replacing it with a safe fixed string.
+ */
+export class ApiRoleDeniedError extends Error {
+  constructor(method: string, requiredRole: ApiRole, allowedRoles: ApiRole[]) {
+    super(
+      `Method '${method}' requires '${requiredRole}' role, caller only has [${allowedRoles.join(', ')}]`,
+    );
+    this.name = 'ApiRoleDeniedError';
+  }
+}
+
+/**
  * Registry for agent private API methods.
  *
  * Methods are dot-namespaced (e.g., 'infrastructure.list') and each has an
@@ -71,13 +101,11 @@ export class AgentApiRegistry {
   ): Promise<unknown> {
     const entry = this.methods.get(method);
     if (!entry) {
-      throw new Error(`Unknown API method '${method}'`);
+      throw new UnknownApiMethodError(method);
     }
 
     if (!allowedRoles.includes(entry.role)) {
-      throw new Error(
-        `Method '${method}' requires '${entry.role}' role, caller only has [${allowedRoles.join(', ')}]`,
-      );
+      throw new ApiRoleDeniedError(method, entry.role, allowedRoles);
     }
 
     return entry.handler(agentId, params);

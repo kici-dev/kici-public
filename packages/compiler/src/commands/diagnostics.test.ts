@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { logger } from '@kici-dev/core';
+import { INFRA_ALERT_TYPES, InfraAlertSeverity } from '@kici-dev/engine';
 import { diagnosticsCommand } from './diagnostics.js';
 import * as clientMod from '../remote/dashboard-client.js';
 
@@ -76,6 +77,51 @@ describe('diagnosticsCommand', () => {
     expect(printed).toContain('cluster-a');
     expect(printed).toContain('s1');
     expect(printed).toContain('linux');
+  });
+
+  // The hosted Platform always runs a newer build than a pinned CLI, so an
+  // alert vocabulary this build has never seen must still render rather than
+  // abort the command.
+  it('renders an alert whose type and severity this build does not know', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue(
+      fakeClient({
+        getDiagnosticsSummary: async () => summary as never,
+        getInfrastructure: async () =>
+          ({
+            orchestrators: [],
+            alerts: [
+              { type: 'quorum-degraded', message: 'A future alert type', severity: 'emergency' },
+            ],
+          }) as never,
+      }),
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const ok = await diagnosticsCommand({});
+    expect(ok).toBe(true);
+    const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('quorum-degraded');
+    expect(printed).toContain('A future alert type');
+  });
+
+  it('renders every alert the Platform mints today', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue(
+      fakeClient({
+        getDiagnosticsSummary: async () => summary as never,
+        getInfrastructure: async () =>
+          ({
+            orchestrators: [],
+            alerts: INFRA_ALERT_TYPES.map((type) => ({
+              type,
+              message: `alert for ${type}`,
+              severity: InfraAlertSeverity.enum.critical,
+            })),
+          }) as never,
+      }),
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await diagnosticsCommand({})).toBe(true);
+    const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
+    for (const type of INFRA_ALERT_TYPES) expect(printed).toContain(`alert for ${type}`);
   });
 
   it('emits raw JSON with --json', async () => {

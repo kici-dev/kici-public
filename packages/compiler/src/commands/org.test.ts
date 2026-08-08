@@ -31,11 +31,17 @@ describe('kici org', () => {
     vi.clearAllMocks();
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-org-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
+    // The homedir mock alone does not isolate this suite: getConfigDir()
+    // refuses the ambient config under the KiCI test-isolation marker before
+    // it consults homedir(). Name the same directory the mock produces
+    // explicitly.
+    process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
   afterEach(async () => {
+    delete process.env.KICI_CONFIG_DIR;
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
   });

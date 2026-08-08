@@ -16,6 +16,7 @@ export type {
   ScalerConfig,
   ScalerEntry,
   ScalerEvent,
+  ScalerRedispatchTrigger,
   WarmPoolConfig,
   FirecrackerNetworkConfig,
 } from './types.js';

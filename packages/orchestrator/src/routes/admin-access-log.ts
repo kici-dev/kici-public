@@ -30,6 +30,7 @@ import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
 import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-access-log' });
 
@@ -50,21 +51,10 @@ type AdminEnv = {
 export function createAdminAccessLogRoutes(deps: AdminAccessLogRoutesDeps): Hono<AdminEnv> {
   const app = new Hono<AdminEnv>();
 
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin-access-log',
+  });
   app.use('/api/v1/admin/access-log', authMiddleware);
   app.use('/api/v1/admin/access-log/*', authMiddleware);
 

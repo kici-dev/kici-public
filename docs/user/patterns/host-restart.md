@@ -18,9 +18,7 @@ post-restart job until the host completes a reboot cycle, then dispatches it.
 import { workflow, job, step, restartHost, waitForHostAlive } from '@kici-dev/sdk';
 
 export default workflow('patch-and-verify', {
-  on: [
-    /* ... */
-  ],
+  on: [/* ... */],
   jobs: [
     // Restart job: apply updates, then reboot. restartHost() MUST be the last step.
     job('patch', {

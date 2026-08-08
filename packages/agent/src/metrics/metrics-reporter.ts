@@ -9,12 +9,11 @@
 import { randomUUID } from 'node:crypto';
 import { getPrometheusExporter } from '@kici-dev/shared';
 import type { AgentMetrics } from '@kici-dev/engine';
-
-/**
- * OTel DataPointType enum values (from @opentelemetry/sdk-metrics).
- * We duplicate them here to avoid a direct runtime dependency on sdk-metrics.
- */
-const DataPointType = { HISTOGRAM: 0, GAUGE: 2, SUM: 3 } as const;
+import {
+  OTEL_DATA_POINT_TYPE,
+  mapDataPointTypeToWireKind,
+  type WireMetricKind,
+} from '@kici-dev/engine/metrics/metric-kind-compat';
 
 export class MetricsReporter {
   private timer?: ReturnType<typeof setInterval>;
@@ -84,7 +83,7 @@ export class MetricsReporter {
         for (const dp of metricData.dataPoints) {
           const labels = this.extractLabels(dp.attributes);
 
-          if (metricData.dataPointType === DataPointType.HISTOGRAM) {
+          if (metricData.dataPointType === OTEL_DATA_POINT_TYPE.HISTOGRAM) {
             const histValue = dp.value as {
               buckets: { boundaries: number[]; counts: number[] };
               count: number;
@@ -126,20 +125,8 @@ export class MetricsReporter {
   }
 
   /** Map OTel DataPointType to wire format type string. */
-  private mapDataPointType(
-    dataPointType: number,
-    isMonotonic?: boolean,
-  ): 'counter' | 'histogram' | 'gauge' | 'upDownCounter' {
-    switch (dataPointType) {
-      case DataPointType.HISTOGRAM:
-        return 'histogram';
-      case DataPointType.GAUGE:
-        return 'gauge';
-      case DataPointType.SUM:
-        return isMonotonic === false ? 'upDownCounter' : 'counter';
-      default:
-        return 'gauge';
-    }
+  private mapDataPointType(dataPointType: number, isMonotonic?: boolean): WireMetricKind {
+    return mapDataPointTypeToWireKind(dataPointType, isMonotonic);
   }
 
   /** Extract string labels from OTel Attributes. */

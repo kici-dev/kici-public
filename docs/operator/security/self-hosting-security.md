@@ -7,7 +7,7 @@ GitHub's own documentation recommends self-hosted runners only for private repos
 
 ## The short answer
 
-> Self-hosted CI runners carry real risks — fork-PR code execution and lateral movement are the classic ones. KiCI's answer is ephemeral, isolated agents — container or Firecracker microVM sandboxes destroyed after every job — combined with fail-closed defaults: fork PRs are held for approval, egress to private network ranges is blocked, and secrets never enter the job environment unless a workflow explicitly exposes them. Self-hosting is not risk-free, but with these defaults it is a defensible posture — and in exchange, your code, secrets, and logs never leave your infrastructure.
+> Self-hosted CI runners carry real risks — fork-PR code execution and lateral movement are the classic ones. KiCI's answer is ephemeral, isolated agents — container or Firecracker microVM sandboxes destroyed after every job — combined with fail-closed defaults: fork PRs are held for approval, egress to private network ranges is blocked, and secrets never enter the job environment unless a workflow explicitly exposes them. Self-hosting is not risk-free, but with these defaults it is a defensible posture — and in exchange, your code and secrets never leave your infrastructure, and logs are never stored outside it (see [Data residency](../data-residency.md) for the field-level breakdown).
 
 ## The risks, stated honestly
 
@@ -45,7 +45,7 @@ Secrets are delivered to workflow code over an internal channel (`ctx.secrets`) 
 
 ### The hosted relay never sees your code
 
-The same property that makes you self-host also protects you: KiCI's hosted Platform is a thin webhook relay. Your source, secrets, build logs, and artifacts stay on your orchestrator and agents — they never transit KiCI's infrastructure. The relay handles webhook routing and run metadata only.
+The same property that makes you self-host also protects you: KiCI's hosted Platform is a thin webhook relay. Your source, secrets, and artifacts stay on your orchestrator and agents. Run metadata (names, statuses, timings) is relayed for the hosted dashboard, and log lines transit the relay only while you stream them — the Platform never stores log content. The full field-level breakdown is in [Data residency](../data-residency.md).
 
 ## What you still own
 
@@ -63,3 +63,4 @@ KiCI's defaults make self-hosting defensible, not risk-free. The honest division
 - [Execution isolation architecture](../../architecture/execution/execution-isolation.md) — how the sandbox boundary is built.
 - [Auto-scaler: Firecracker backend](../orchestrator/auto-scaler/firecracker.md) — microVM networking, jailer, and rootfs setup.
 - [Secrets management](./secrets.md) — secret storage, scoping, and delivery.
+- [Data residency](../data-residency.md) — field-level reference of what reaches the hosted Platform.

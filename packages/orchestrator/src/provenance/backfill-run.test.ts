@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { backfillRunToPlatform } from './backfill-run.js';
+import { backfillRunToPlatform, type BackfillRunRow } from './backfill-run.js';
 
 describe('backfillRunToPlatform', () => {
   it('sends execution.status then a job.status.forward per job from local rows', async () => {
@@ -8,6 +8,7 @@ describe('backfillRunToPlatform', () => {
       run_id: 'r1',
       workflow_name: 'ci',
       status: 'success',
+      routing_key: 'github:42',
       repo_identifier: 'acme/app',
       provider: 'github',
       local_working_tree: false,
@@ -49,5 +50,53 @@ describe('backfillRunToPlatform', () => {
         'missing',
       ),
     ).rejects.toThrow(/not found in local execution_runs/);
+  });
+
+  it('forwards the run routing_key as execution.status.routingKey', async () => {
+    const send = vi.fn();
+    const loadRun = async (): Promise<BackfillRunRow> => ({
+      run_id: 'r1',
+      workflow_name: 'wf',
+      status: 'success',
+      routing_key: 'generic:org:src',
+      repo_identifier: null,
+      provider: null,
+      local_working_tree: null,
+      sha: null,
+      ref: null,
+      job_count: 1,
+      started_at: new Date(1000),
+      completed_at: new Date(2000),
+      duration_ms: 1000,
+    });
+    await backfillRunToPlatform({ send, loadRun, loadJobs: async () => [] }, 'r1');
+    const status = send.mock.calls
+      .map((c) => c[0] as Record<string, unknown>)
+      .find((m) => m.type === 'execution.status');
+    expect(status?.routingKey).toBe('generic:org:src');
+  });
+
+  it('omits routingKey when the run has none', async () => {
+    const send = vi.fn();
+    const loadRun = async (): Promise<BackfillRunRow> => ({
+      run_id: 'r1',
+      workflow_name: 'wf',
+      status: 'success',
+      routing_key: null,
+      repo_identifier: null,
+      provider: null,
+      local_working_tree: null,
+      sha: null,
+      ref: null,
+      job_count: 1,
+      started_at: new Date(1000),
+      completed_at: new Date(2000),
+      duration_ms: 1000,
+    });
+    await backfillRunToPlatform({ send, loadRun, loadJobs: async () => [] }, 'r1');
+    const status = send.mock.calls
+      .map((c) => c[0] as Record<string, unknown>)
+      .find((m) => m.type === 'execution.status');
+    expect(status?.routingKey).toBeUndefined();
   });
 });

@@ -81,22 +81,27 @@ describe('DashboardClient.fromConfig', () => {
 
 describe('DashboardClient typed methods', () => {
   it('listRuns builds a query string from filters and validates the response', async () => {
-    const fetchMock = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(
-        new Response(
-          JSON.stringify({ runs: [], total: 0, page: 1, pageSize: 20, hasMore: false }),
-          { status: 200 },
-        ),
-      );
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          runs: [],
+          nextCursor: null,
+          prevCursor: null,
+          hasMore: false,
+          approxTotal: 0,
+          pageSize: 20,
+        }),
+        { status: 200 },
+      ),
+    );
     const client = DashboardClient.fromConfig(baseConfig);
-    const page = await client.listRuns({ status: 'running', workflow: 'ci', page: 2 });
+    const page = await client.listRuns({ status: 'running', workflow: 'ci', cursor: 'abc123' });
     expect(page.pageSize).toBe(20);
     const calledUrl = fetchMock.mock.calls[0][0] as string;
     expect(calledUrl).toContain('/orgs/org-1/runs?');
     expect(calledUrl).toContain('status=running');
     expect(calledUrl).toContain('workflow=ci');
-    expect(calledUrl).toContain('page=2');
+    expect(calledUrl).toContain('cursor=abc123');
   });
 
   it('getInfrastructure validates the tree response', async () => {
@@ -201,5 +206,67 @@ describe('DashboardClient typed methods', () => {
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ name: 'prod', secretKeys: ['API_KEY'] });
     expect(fetchMock.mock.calls[0][0]).toContain('/orgs/org-1/contexts?includeSecrets=true');
+  });
+});
+
+describe('DashboardClient.listArtifacts', () => {
+  it('GETs the run artifacts path and parses the response', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          artifacts: [
+            {
+              name: 'app',
+              jobId: 'build',
+              sizeBytes: 42,
+              sha256: 'abc',
+              createdAt: '2026-07-24T00:00:00.000Z',
+              downloadUrl: 'https://s3.example/app.tar.gz?sig=1',
+            },
+          ],
+          downloadUrlExpiresInSeconds: 900,
+        }),
+        { status: 200 },
+      ),
+    );
+    const client = DashboardClient.fromConfig(baseConfig);
+    const res = await client.listArtifacts('run-9');
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://platform.example/api/v1/orgs/org-1/runs/run-9/artifacts',
+    );
+    expect(res.artifacts[0].name).toBe('app');
+    expect(res.artifacts[0].downloadUrl).toBe('https://s3.example/app.tar.gz?sig=1');
+    expect(res.downloadUrlExpiresInSeconds).toBe(900);
+  });
+
+  it('tolerates an entry without a downloadUrl and an absent expiry', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          artifacts: [
+            {
+              name: 'gone',
+              jobId: 'build',
+              sizeBytes: 0,
+              sha256: 'x',
+              createdAt: '2026-07-24T00:00:00.000Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    const client = DashboardClient.fromConfig(baseConfig);
+    const res = await client.listArtifacts('run-9');
+    expect(res.artifacts[0].downloadUrl).toBeUndefined();
+    expect(res.downloadUrlExpiresInSeconds).toBeUndefined();
+  });
+
+  it('maps a 404 to a not_found DashboardClientError', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ error: 'Run not found' }), { status: 404 }),
+    );
+    const client = DashboardClient.fromConfig(baseConfig);
+    await expect(client.listArtifacts('nope')).rejects.toThrow(DashboardClientError);
   });
 });

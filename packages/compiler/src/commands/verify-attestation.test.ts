@@ -26,14 +26,20 @@ vi.mock('@kici-dev/engine/provenance/verify', () => ({
   verifyKiciBundle: vi.fn(),
 }));
 
+vi.mock('../remote/config.js', () => ({
+  loadGlobalConfig: vi.fn().mockResolvedValue({}),
+}));
+
 import { sha256File } from '@kici-dev/core';
 import { resolveTrustRoot } from '../provenance-trust-root.js';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
+import { loadGlobalConfig } from '../remote/config.js';
 import { verifyAttestationCommand } from './verify-attestation.js';
 
 const mockVerify = verifyKiciBundle as unknown as ReturnType<typeof vi.fn>;
 const mockResolve = resolveTrustRoot as unknown as ReturnType<typeof vi.fn>;
 const mockSha = sha256File as unknown as ReturnType<typeof vi.fn>;
+const mockLoadConfig = loadGlobalConfig as unknown as ReturnType<typeof vi.fn>;
 
 describe('kici verify-attestation', () => {
   beforeEach(() => {
@@ -42,6 +48,7 @@ describe('kici verify-attestation', () => {
     consoleOutput.length = 0;
     mockResolve.mockResolvedValue({ issuer: 'https://i', jwks: { keys: [] } });
     mockSha.mockResolvedValue('a'.repeat(64));
+    mockLoadConfig.mockResolvedValue({}); // no configured orchestrator by default
     vi.spyOn(console, 'log').mockImplementation((msg: string) => consoleOutput.push(msg));
   });
 
@@ -218,7 +225,7 @@ describe('kici verify-attestation', () => {
     expect(mockVerify).not.toHaveBeenCalled();
   });
 
-  it('defaults --trust-root to the hosted prod issuer when omitted', async () => {
+  it('defaults --trust-root to the hosted prod issuer when omitted and no orchestrator is configured', async () => {
     mockVerify.mockResolvedValue({
       verified: true,
       mode: 'kici',
@@ -230,6 +237,23 @@ describe('kici verify-attestation', () => {
     expect(ok).toBe(true);
     expect(mockResolve).toHaveBeenCalledWith('https://api.kici.dev');
     expect(logOutput.join('\n')).toContain('Using default trust root https://api.kici.dev');
+    expect(logOutput.join('\n')).toContain('hosted KiCI platform');
+  });
+
+  it('defaults --trust-root to the CONFIGURED ORCHESTRATOR when one is set (the new root of trust)', async () => {
+    mockLoadConfig.mockResolvedValue({ endpoint: 'https://orch.example' });
+    mockVerify.mockResolvedValue({
+      verified: true,
+      mode: 'kici',
+      checks: {},
+      claims: {},
+      failures: [],
+    });
+    const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
+    expect(ok).toBe(true);
+    expect(mockResolve).toHaveBeenCalledWith('https://orch.example');
+    expect(mockResolve).not.toHaveBeenCalledWith('https://api.kici.dev');
+    expect(logOutput.join('\n')).toContain('configured orchestrator');
   });
 
   it('gives a provenance-not-enabled message when the default issuer returns 503', async () => {
@@ -239,7 +263,9 @@ describe('kici verify-attestation', () => {
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
     expect(ok).toBe(false);
     expect(mockVerify).not.toHaveBeenCalled();
-    expect(logOutput.join('\n')).toContain('not enabled on the hosted KiCI platform yet');
+    expect(logOutput.join('\n')).toContain(
+      'build provenance signing is not enabled on the hosted KiCI platform',
+    );
   });
 
   it('uses the provided --audience over the default', async () => {

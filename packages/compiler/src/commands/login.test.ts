@@ -25,7 +25,7 @@ vi.mock('../remote/oauth.js', () => ({
 
 // Mock the headless-detect module
 vi.mock('../auth/headless-detect.js', () => ({
-  isHeadless: vi.fn().mockReturnValue(false),
+  isHeadless: vi.fn().mockResolvedValue(false),
 }));
 
 // Mock the local dev plane (attach prompt).
@@ -61,9 +61,15 @@ describe('kici login', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-login-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
+    // The homedir mock alone does not isolate this suite: getConfigDir()
+    // refuses the ambient config under the KiCI test-isolation marker before
+    // it consults homedir(). Name the same directory the mock produces
+    // explicitly.
+    process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
   });
 
   afterEach(async () => {
+    delete process.env.KICI_CONFIG_DIR;
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
@@ -196,7 +202,7 @@ describe('kici login', () => {
     });
 
     it('runs PKCE flow on desktop environment', async () => {
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('mock-oidc-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-123',
@@ -225,7 +231,7 @@ describe('kici login', () => {
     });
 
     it('runs device flow on headless environment', async () => {
-      vi.mocked(isHeadless).mockReturnValue(true);
+      vi.mocked(isHeadless).mockResolvedValue(true);
       vi.mocked(deviceFlow).mockResolvedValue('mock-device-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-456',
@@ -244,7 +250,7 @@ describe('kici login', () => {
     });
 
     it('forces device flow with --device flag', async () => {
-      vi.mocked(isHeadless).mockReturnValue(false); // desktop, but --device forces device flow
+      vi.mocked(isHeadless).mockResolvedValue(false); // desktop, but --device forces device flow
       vi.mocked(deviceFlow).mockResolvedValue('mock-forced-device-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-789',
@@ -260,7 +266,7 @@ describe('kici login', () => {
     });
 
     it('saves PAT fields to GlobalConfig', async () => {
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('oidc-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-saved',
@@ -280,7 +286,7 @@ describe('kici login', () => {
       const consoleSpy = vi.spyOn(console, 'log');
       const nearExpiry = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(); // 5 days from now
 
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('oidc-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-expiring',
@@ -295,7 +301,7 @@ describe('kici login', () => {
     });
 
     it('returns false on OAuth flow error', async () => {
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockRejectedValue(new Error('Browser could not be opened'));
 
       const result = await loginCommand({});
@@ -309,7 +315,7 @@ describe('kici login', () => {
       vi.clearAllMocks();
       vi.mocked(os.homedir).mockReturnValue(tempDir);
       vi.mocked(os.hostname).mockReturnValue('test-machine');
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('mock-oidc-token');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-test',
@@ -338,7 +344,7 @@ describe('kici login', () => {
     });
 
     it('passes overridden issuer and clientId to device flow', async () => {
-      vi.mocked(isHeadless).mockReturnValue(true);
+      vi.mocked(isHeadless).mockResolvedValue(true);
       vi.mocked(deviceFlow).mockResolvedValue('mock-device-token');
       process.env.KICI_OIDC_ISSUER = 'https://custom-issuer.example.com';
       process.env.KICI_OIDC_CLIENT_ID = 'custom-client-id';
@@ -358,7 +364,7 @@ describe('kici login', () => {
       vi.clearAllMocks();
       vi.mocked(os.homedir).mockReturnValue(tempDir);
       vi.mocked(os.hostname).mockReturnValue('test-machine');
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('tok');
       vi.mocked(deviceFlow).mockResolvedValue('tok');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
@@ -461,7 +467,7 @@ describe('kici login', () => {
       delete process.env.KICI_PLATFORM_URL;
       delete process.env.KICI_OIDC_ISSUER;
       delete process.env.KICI_OIDC_CLIENT_ID;
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('tok');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-r',
@@ -601,7 +607,7 @@ describe('kici login', () => {
       vi.clearAllMocks();
       vi.mocked(os.homedir).mockReturnValue(tempDir);
       vi.mocked(os.hostname).mockReturnValue('test-machine');
-      vi.mocked(isHeadless).mockReturnValue(false);
+      vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('oidc');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
         id: 'pat-1',

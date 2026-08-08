@@ -16,6 +16,20 @@ describe('runsCancelCommand', () => {
     expect(cancelRun).toHaveBeenCalledWith('r1', true);
   });
 
+  it('reports an already-finished run as untouched, not as cancelled', async () => {
+    // The orchestrator leaves a finished run alone, so claiming a cancellation
+    // would be false.
+    const cancelRun = vi.fn(async () => ({ cancelledJobs: 0, alreadyTerminal: true }));
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({ cancelRun } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    const ok = await runsCancelCommand('r1', {});
+    expect(ok).toBe(true);
+    const printed = String(log.mock.calls[0]?.[0]);
+    expect(printed).toContain('had already finished');
+    expect(printed).not.toContain('cancelled (');
+  });
+
   it('cancels by branch when --branch is given', async () => {
     const cancelByBranch = vi.fn(async () => ({ cancelledRuns: 2 }));
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({ cancelByBranch } as never);

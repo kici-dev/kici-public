@@ -5,6 +5,7 @@
  * held element at dispatch time (for `when: 'always'`) or the agent turns it
  * into a mid-step drift gate (for `when: 'drift'`).
  */
+import { approvalTimeoutSecondsSchema } from '@kici-dev/engine';
 
 /** A single approver clause: any member of a team, or a specific user. */
 export type ApproverClause = { team: string } | { user: string };
@@ -25,7 +26,9 @@ export type ApprovalWhen = 'always' | 'drift';
  * - `true` — pause for ANY org member with the approval permission.
  * - `ApproverClause[]` — a flat AND list (all clauses must be satisfied).
  * - object form — clauses plus an optional `when`, a human `reason`, and a
- *   per-gate `timeout` (seconds) that overrides the org-default expiry.
+ *   per-gate `timeout` that overrides the org-default expiry. The `timeout`
+ *   must be a positive integer number of seconds; a non-positive or non-finite
+ *   value is rejected at compile time.
  */
 export type ApprovalConfig =
   | true
@@ -47,6 +50,11 @@ export interface NormalizedApproval {
 export function normalizeApproval(c: ApprovalConfig): NormalizedApproval {
   if (c === true) return { clauses: [], when: 'always' };
   if (Array.isArray(c)) return { clauses: c, when: 'always' };
+  if (c.timeout !== undefined && !approvalTimeoutSecondsSchema.safeParse(c.timeout).success) {
+    throw new Error(
+      `approval.timeout must be a positive integer number of seconds, got ${c.timeout}`,
+    );
+  }
   return {
     clauses: c.approvers ?? [],
     ...(c.reason !== undefined && { reason: c.reason }),

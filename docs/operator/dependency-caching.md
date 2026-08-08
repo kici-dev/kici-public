@@ -19,7 +19,7 @@ Cache miss flow:
 
   Webhook -> Trigger match -> Cache check (source: MISS, deps: MISS)
     -> Build job dispatch (kici:role:builder agent)
-    -> Build agent: clone -> install deps (npm/pnpm) -> pack .kici/ source -> pack node_modules
+    -> Build agent: clone -> install deps (npm/pnpm/yarn) -> pack .kici/ source -> pack node_modules
        -> upload both tarballs to cache -> report hashes
     -> Execution job dispatch (with sourceTarUrl + depsUrl)
     -> Execution agent: extract source tarball into workDir/.kici/
@@ -46,7 +46,7 @@ The tarball is **platform-agnostic** — raw `.kici/` source files are identical
 
 **Dependency tarball** is keyed by:
 
-- **Lockfile hash**: SHA-256 of the workflow's lock file — `.kici/package-lock.json` for an npm project, or the repo-root `pnpm-lock.yaml` for a pnpm workspace
+- **Lockfile hash**: SHA-256 of the workflow's lock file — `.kici/package-lock.json` for an npm project, or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm/yarn workspace. The hash input is prefixed with the detected manager name, so switching managers is a guaranteed cache miss
 - **Platform**: detected from the target agent (e.g., `linux`, `darwin`, `win32`; defaults to `linux` when no agents are registered)
 - **Arch**: detected from the target agent (e.g., `x64`, `arm64`; defaults to `x64` when no agents are registered)
 
@@ -61,9 +61,9 @@ KiCI maintains two caches that share the same storage backend:
 | Cache        | Key Format                                     | Contents                                                                                              | Invalidation                                                                                  | Platform scope             |
 | ------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------- |
 | Source cache | `source/{contentHash}.tar.gz`                  | Raw `.kici/` directory minus `node_modules/` (deterministic gzip tar)                                 | Workflow `.ts` or any `hashFiles` asset changes; `COMPILE_SCHEMA_VERSION` bump                | Shared (platform-agnostic) |
-| Dep cache    | `deps/{platform}-{arch}/{lockfileHash}.tar.gz` | `.kici/node_modules/` packed by the detected manager's install — npm or pnpm (deterministic gzip tar) | Lock file changes (`package-lock.json` or `pnpm-lock.yaml`); separate entry per platform/arch | Platform-specific          |
+| Dep cache    | `deps/{platform}-{arch}/{lockfileHash}.tar.gz` | `.kici/node_modules/` packed by the detected manager's install — npm, pnpm, or yarn (deterministic gzip tar) | Lock file changes (`package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`); separate entry per platform/arch | Platform-specific          |
 
-Both use the same `KICI_STORAGE_*` configuration. A single build job handles both caches when both miss — the build agent clones, installs dependencies with the detected manager (npm or pnpm), then packs `.kici/` source and `node_modules/` in parallel and uploads each via its own pre-signed `PUT` URL.
+Both use the same `KICI_STORAGE_*` configuration. A single build job handles both caches when both miss — the build agent clones, installs dependencies with the detected manager (npm, pnpm, or yarn), then packs `.kici/` source and `node_modules/` in parallel and uploads each via its own pre-signed `PUT` URL.
 
 ### Determinism
 
@@ -203,6 +203,7 @@ Build agents need the following tools installed:
 - **Node.js 24+** (same as execution agents)
 - **npm** (included with Node.js -- the default dependency installer)
 - **pnpm** -- required only when building workflows that live in a pnpm workspace; the agent shells out to `pnpm install` for those
+- **yarn** -- required only when building workflows in a yarn workspace (classic v1 or berry v2+); the agent shells out to `yarn install` for those. Corepack (bundled with Node.js) provisions the repo-pinned yarn version automatically
 
 ## Monitoring
 

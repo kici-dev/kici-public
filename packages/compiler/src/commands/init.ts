@@ -7,22 +7,28 @@
 
 import { readFile, writeFile, mkdir, access, rm } from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import { $ } from 'zx';
 import pc from 'picocolors';
 import { checkbox, confirm, select } from '@inquirer/prompts';
 import { initZx, logger, toErrorMessage } from '@kici-dev/core';
+import { isCiEnvironment } from '@kici-dev/core/ci-env';
 import {
   workflowPaths,
   generatePackageJson,
+  sdkDependencyRange,
   tsconfigTemplate,
   agentsMdTemplate,
 } from '../templates/index.js';
 import { getTypeScriptPaths } from '../execution/sdk-alias.js';
 import { detectHookTools, installHook, findGitDir } from '../hooks/index.js';
 import type { HookToolName } from '../hooks/index.js';
+import { rewriteRunsOnForHost, shouldOfferFirstRun } from './init-host-os.js';
 import {
   PackageManager,
+  WorkspaceKind,
   detectPackageManager,
+  detectWorkspaceRoot,
   installBuildPolicyArgs,
   installCommand,
   parsePackageManager,
@@ -53,6 +59,10 @@ export interface InitOptions {
   privateRegistrySecret?: string;
   /** Skip writing the .kici/AGENTS.md LLM-authoring context file. Default: write it. */
   noAgentsMd?: boolean;
+  /** Force integrate mode: join .kici/ to the detected workspace (skip the prompt). */
+  workspace?: boolean;
+  /** Force standalone mode even inside a workspace (skip the prompt). */
+  standalone?: boolean;
 }
 
 /**
@@ -104,6 +114,9 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
           `targeting the ${defaultBranch} branch`,
         );
       }
+      // Rewrite the template runsOn to the host's own kici:os:* so the first
+      // `kici run push --local` dispatches on this machine (no-op on Linux).
+      content = rewriteRunsOnForHost(content, os.platform(), os.arch());
       await writeFile(path.join(kiciDir, 'workflows', `${workflow}.ts`), content, 'utf-8');
     }
 
@@ -122,45 +135,23 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
       await writeFile(kiciIgnorePath, kiciIgnoreTemplate, 'utf-8');
     }
 
-    // Always generate package.json (required for dependency caching)
+    // Standalone (self-contained .kici/) vs integrate (join the detected
+    // workspace so workflows can import sibling packages). Flags win; a
+    // detected workspace prompts interactively and defaults to standalone in
+    // CI / non-TTY.
     const devMode = options.useVerdaccioLocal || (await detectDevelopmentMode());
-    logger.info(pc.gray('Writing .kici/package.json'));
-    const pkgContent = generatePackageJson(devMode);
-    await writeFile(path.join(kiciDir, 'package.json'), pkgContent, 'utf-8');
-
-    // Write .npmrc to point @kici-dev scope to local Verdaccio
+    const mode = await resolveScaffoldMode(options);
     const useVerdaccio = devMode;
-    if (useVerdaccio) {
-      logger.info(pc.yellow('Pointing @kici-dev to local Verdaccio registry.'));
-      const npmrc = '@kici-dev:registry=http://verdaccio.local:4873\n';
-      await writeFile(path.join(kiciDir, '.npmrc'), npmrc, 'utf-8');
-      // Root .npmrc so npm install in .kici/ resolves the scope
-      const rootNpmrc = path.resolve('.npmrc');
-      if (!(await checkExists(rootNpmrc))) {
-        logger.info(pc.gray('Writing .npmrc (Verdaccio scope)'));
-        await writeFile(rootNpmrc, npmrc, 'utf-8');
-      }
-    }
 
-    // TypeScript mode: tsconfig.json, npm install
-    if (!options.mjs) {
-      logger.info(pc.gray('Writing .kici/tsconfig.json'));
-      const tsconfigContent = await generateTsConfig();
-      await writeFile(path.join(kiciDir, 'tsconfig.json'), tsconfigContent, 'utf-8');
-
-      // Create types directory for kici types output
-      const typesDir = path.join(kiciDir, 'types');
-      await mkdir(typesDir, { recursive: true });
-      logger.info(pc.gray('Created .kici/types/ for generated type declarations'));
-
-      if (!options.skipInstall) {
-        const pm = await resolvePackageManager(options.packageManager);
-        const [bin, action] = installCommand(pm);
-        const buildPolicyArgs = installBuildPolicyArgs(pm);
-        logger.info(pc.gray(`Running ${bin} ${action}...`));
-        // Run the detected package manager's install in .kici/ directory.
-        await $`cd ${kiciDir} && ${bin} ${action} ${buildPolicyArgs}`;
-      }
+    if (mode.kind === 'integrate') {
+      logger.info(
+        pc.cyan(
+          `Integrating .kici/ into the ${mode.workspaceKind} workspace at ${mode.workspaceRoot}`,
+        ),
+      );
+      await wireIntegrateDeps(kiciDir, mode.workspaceRoot, devMode, options);
+    } else {
+      await wireStandaloneDeps(kiciDir, devMode, options);
     }
 
     // Private registry scaffolding (option A workflow snippet + option C .npmrc.example)
@@ -182,7 +173,7 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
     await updateGitignore(useVerdaccio);
 
     // Offer hook installation (only in interactive mode and git repos)
-    if (process.stdout.isTTY && process.env.CI !== 'true') {
+    if (process.stdout.isTTY && !isCiEnvironment()) {
       const gitDir = await findGitDir();
       if (gitDir) {
         await offerHookInstallation(useVerdaccio);
@@ -192,7 +183,15 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
     logger.info(pc.green('\n✓ kici initialized successfully!\n'));
     logger.info(pc.gray('Next steps:'));
     logger.info(pc.gray('  1. Edit workflows in .kici/workflows/'));
-    if (options.mjs || options.skipInstall) {
+    if (mode.kind === 'integrate') {
+      logger.info(
+        pc.gray(
+          '  2. Import your workspace packages from .kici/workflows/ (e.g. @your-scope/utils)',
+        ),
+      );
+      logger.info(pc.gray('  3. Compile: kici compile'));
+      logger.info(pc.gray('  4. Commit .kici/ to your repository\n'));
+    } else if (options.mjs || options.skipInstall) {
       logger.info(
         pc.gray('  2. Run your package manager install in .kici/ to generate a lockfile'),
       );
@@ -201,6 +200,27 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
     } else {
       logger.info(pc.gray('  2. Preview matching: kici preview push'));
       logger.info(pc.gray('  3. Commit .kici/ to your repository\n'));
+    }
+
+    // Offer an immediate first local run (interactive, deps installed). Default
+    // No — spinning up the warm plane is opt-in, not automatic, and skipped in
+    // CI / non-TTY / --mjs / --skip-install where it cannot compile the workflow.
+    if (
+      shouldOfferFirstRun({
+        isTTY: Boolean(process.stdout.isTTY),
+        ci: isCiEnvironment(),
+        mjs: Boolean(options.mjs),
+        skipInstall: Boolean(options.skipInstall),
+      })
+    ) {
+      const runNow = await confirm({
+        message: 'Run it now? (kici run push --local)',
+        default: false,
+      });
+      if (runNow) {
+        const { runRoutedCommand } = await import('./run-routed.js');
+        await runRoutedCommand({ event: 'push', local: true });
+      }
     }
 
     return true;
@@ -240,7 +260,7 @@ async function checkExists(targetPath: string): Promise<boolean> {
  */
 async function selectWorkflows(): Promise<string[]> {
   // Non-interactive: CI or non-TTY
-  if (!process.stdout.isTTY || process.env.CI === 'true') {
+  if (!process.stdout.isTTY || isCiEnvironment()) {
     return ['hello-world', 'pr-checks'];
   }
 
@@ -337,7 +357,10 @@ async function detectDevelopmentMode(): Promise<boolean> {
  *
  * @param override - The raw `--package-manager` flag value, if provided.
  */
-async function resolvePackageManager(override?: string): Promise<PackageManager> {
+async function resolvePackageManager(
+  override?: string,
+  dir: string = process.cwd(),
+): Promise<PackageManager> {
   if (override) {
     const parsed = parsePackageManager(override);
     if (!parsed) {
@@ -347,7 +370,174 @@ async function resolvePackageManager(override?: string): Promise<PackageManager>
     }
     return parsed;
   }
-  return detectPackageManager(process.cwd());
+  return detectPackageManager(dir);
+}
+
+/** The @kici-dev scope → local Verdaccio registry line written in dev mode. */
+const VERDACCIO_NPMRC = '@kici-dev:registry=http://verdaccio.local:4873\n';
+
+/** Write .kici/tsconfig.json + the empty types/ dir (TypeScript mode only). */
+async function writeTsConfigAndTypesDir(kiciDir: string): Promise<void> {
+  logger.info(pc.gray('Writing .kici/tsconfig.json'));
+  await writeFile(path.join(kiciDir, 'tsconfig.json'), await generateTsConfig(), 'utf-8');
+  const typesDir = path.join(kiciDir, 'types');
+  await mkdir(typesDir, { recursive: true });
+  logger.info(pc.gray('Created .kici/types/ for generated type declarations'));
+}
+
+/** Run the given package manager's install in `dir`, with pnpm's build-gate flag. */
+async function runInstall(pm: PackageManager, dir: string): Promise<void> {
+  const [bin, action] = installCommand(pm);
+  const buildPolicyArgs = installBuildPolicyArgs(pm);
+  logger.info(pc.gray(`Running ${bin} ${action}...`));
+  await $`cd ${dir} && ${bin} ${action} ${buildPolicyArgs}`;
+}
+
+/**
+ * Standalone dep wiring: write .kici/package.json (+ .kici/.npmrc and root
+ * .npmrc in dev mode), then tsconfig + isolated install in TypeScript mode.
+ */
+async function wireStandaloneDeps(
+  kiciDir: string,
+  devMode: boolean,
+  options: InitOptions,
+): Promise<void> {
+  logger.info(pc.gray('Writing .kici/package.json'));
+  await writeFile(path.join(kiciDir, 'package.json'), generatePackageJson(devMode), 'utf-8');
+
+  if (devMode) {
+    logger.info(pc.yellow('Pointing @kici-dev to local Verdaccio registry.'));
+    await writeFile(path.join(kiciDir, '.npmrc'), VERDACCIO_NPMRC, 'utf-8');
+    const rootNpmrc = path.resolve('.npmrc');
+    if (!(await checkExists(rootNpmrc))) {
+      logger.info(pc.gray('Writing .npmrc (Verdaccio scope)'));
+      await writeFile(rootNpmrc, VERDACCIO_NPMRC, 'utf-8');
+    }
+  }
+
+  if (!options.mjs) {
+    await writeTsConfigAndTypesDir(kiciDir);
+    if (!options.skipInstall) {
+      const pm = await resolvePackageManager(options.packageManager);
+      await runInstall(pm, kiciDir);
+    }
+  }
+}
+
+/**
+ * Integrate dep wiring: NO .kici/package.json (its absence is the
+ * externally-managed signal the compiler honors). Add @kici-dev/sdk to the
+ * workspace-root manifest, write a root .npmrc in dev mode, write .kici/tsconfig
+ * in TypeScript mode, and run a root install.
+ */
+async function wireIntegrateDeps(
+  kiciDir: string,
+  workspaceRoot: string,
+  devMode: boolean,
+  options: InitOptions,
+): Promise<void> {
+  await addSdkToRootManifest(workspaceRoot, devMode);
+
+  if (devMode) {
+    const rootNpmrc = path.join(workspaceRoot, '.npmrc');
+    if (!(await checkExists(rootNpmrc))) {
+      logger.info(pc.gray('Writing workspace-root .npmrc (Verdaccio scope)'));
+      await writeFile(rootNpmrc, VERDACCIO_NPMRC, 'utf-8');
+    }
+  }
+
+  if (!options.mjs) {
+    await writeTsConfigAndTypesDir(kiciDir);
+  }
+
+  if (!options.skipInstall) {
+    const pm = await resolvePackageManager(options.packageManager, workspaceRoot);
+    await runInstall(pm, workspaceRoot);
+  }
+}
+
+/**
+ * Add @kici-dev/sdk to the workspace-root package.json devDependencies.
+ * Never clobbers an existing @kici-dev/sdk declaration (dev or prod dep).
+ */
+async function addSdkToRootManifest(workspaceRoot: string, devMode: boolean): Promise<void> {
+  const manifestPath = path.join(workspaceRoot, 'package.json');
+  let raw: string;
+  try {
+    raw = await readFile(manifestPath, 'utf-8');
+  } catch {
+    throw new Error(`Cannot integrate: no package.json at workspace root ${workspaceRoot}`);
+  }
+  const pkg = JSON.parse(raw) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  const existing = pkg.devDependencies?.['@kici-dev/sdk'] ?? pkg.dependencies?.['@kici-dev/sdk'];
+  if (existing) {
+    logger.info(
+      pc.gray(`@kici-dev/sdk already declared in ${manifestPath} (${existing}) — leaving as-is`),
+    );
+    return;
+  }
+  const range = sdkDependencyRange(devMode);
+  pkg.devDependencies = { ...(pkg.devDependencies ?? {}), '@kici-dev/sdk': range };
+  await writeFile(manifestPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
+  logger.info(pc.gray(`Added @kici-dev/sdk (${range}) to ${manifestPath}`));
+}
+
+/** How `kici init` scaffolds the .kici/ dependency graph. */
+type ScaffoldMode =
+  | { kind: 'standalone' }
+  | { kind: 'integrate'; workspaceRoot: string; workspaceKind: WorkspaceKind };
+
+/**
+ * Decide standalone vs integrate. Flags win; otherwise, when a workspace is
+ * detected, prompt in interactive mode and default to standalone in CI/non-TTY.
+ * With no workspace and no --workspace, always standalone (unchanged behavior).
+ */
+async function resolveScaffoldMode(options: InitOptions): Promise<ScaffoldMode> {
+  if (options.workspace && options.standalone) {
+    throw new Error('Cannot combine --workspace and --standalone.');
+  }
+  if (options.standalone) return { kind: 'standalone' };
+
+  const ws = await detectWorkspaceRoot(process.cwd());
+
+  if (options.workspace) {
+    if (!ws) {
+      throw new Error(
+        'Cannot integrate: no pnpm/npm/yarn workspace found at or above the current directory. ' +
+          'Run from a workspace root, or omit --workspace for a standalone .kici/.',
+      );
+    }
+    return { kind: 'integrate', workspaceRoot: ws.root, workspaceKind: ws.kind };
+  }
+
+  if (!ws) return { kind: 'standalone' };
+  // Workspace present but no flag: prompt interactively, default standalone in CI/non-TTY.
+  if (!process.stdout.isTTY || isCiEnvironment()) return { kind: 'standalone' };
+  const choice = await promptScaffoldMode(ws.kind);
+  return choice === 'integrate'
+    ? { kind: 'integrate', workspaceRoot: ws.root, workspaceKind: ws.kind }
+    : { kind: 'standalone' };
+}
+
+/** Interactive standalone-vs-integrate select. Defaults to standalone. */
+async function promptScaffoldMode(kind: WorkspaceKind): Promise<'standalone' | 'integrate'> {
+  return await select<'standalone' | 'integrate'>({
+    message: `A ${kind} workspace was detected. How should the workflows be set up?`,
+    choices: [
+      {
+        name: 'Standalone — self-contained .kici/ with its own package.json',
+        value: 'standalone',
+      },
+      {
+        name: 'Integrate — join the workspace; workflows can import your other packages',
+        value: 'integrate',
+      },
+    ],
+    default: 'standalone',
+  });
 }
 
 /**
@@ -532,7 +722,7 @@ coverage/
  */
 async function shouldWriteAgentsMd(options: InitOptions): Promise<boolean> {
   if (options.noAgentsMd) return false;
-  if (!process.stdout.isTTY || process.env.CI === 'true') return true;
+  if (!process.stdout.isTTY || isCiEnvironment()) return true;
   return await confirm({
     message: 'Add LLM authoring context (.kici/AGENTS.md)?',
     default: true,

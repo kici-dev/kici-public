@@ -147,7 +147,7 @@ export const testSuite = workflow('test-suite', {
           await $`pnpm test`;
         }),
         step('emit-results', async (ctx) => {
-          await ctx.emit(testsPassedEvent.name, {
+          await ctx.emit(testsPassedEvent, {
             branch: 'main',
             commit: 'abc123',
             testCount: 142,

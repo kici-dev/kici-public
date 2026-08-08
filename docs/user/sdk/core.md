@@ -43,7 +43,7 @@ export default workflow('ci', {
 });
 ```
 
-Secret scoping happens at the job level via `environment` (see [job options](#jobname-options--joboptions) and [Secrets](../secrets.md)) — the workflow itself does not declare which secret environments it can read.
+Secret scoping happens at the job level via `context` (see [job options](#jobname-options--joboptions) and [Secrets](../secrets.md)) — the workflow itself does not declare which secret contexts it can read.
 
 ### job(name, options) / job(options)
 
@@ -56,33 +56,34 @@ function job(options: JobOptions): Job;
 
 **Parameters:**
 
-| Parameter                  | Type                                                            | Required             | Description                                                                                                                                                                                              |
-| -------------------------- | --------------------------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                     | `string`                                                        | no                   | Job name (auto-generated UUID if omitted)                                                                                                                                                                |
-| `options.runsOn`           | `RunsOn`                                                        | yes                  | Runner label(s) and optional exclusions (see below)                                                                                                                                                      |
-| `options.steps`            | `StepInput[]`                                                   | yes (or use `run`)   | Steps to execute in order. Mutually exclusive with `run`.                                                                                                                                                |
-| `options.run`              | `(ctx) => Promise<unknown>`                                     | yes (or use `steps`) | Single-step shorthand -- see [Single-step job shorthand](#single-step-job-shorthand). Mutually exclusive with `steps`.                                                                                   |
-| `options.needs`            | `NeedsEntry[]`                                                  | no                   | Job dependencies (must complete first) -- see [Job dependencies (`needs`)](#job-dependencies-needs)                                                                                                      |
-| `options.rules`            | `Rule[]`                                                        | no                   | Conditions for conditional execution                                                                                                                                                                     |
-| `options.description`      | `string`                                                        | no                   | Human-readable description                                                                                                                                                                               |
-| `options.matrix`           | `Matrix`                                                        | no                   | Matrix configuration for job expansion                                                                                                                                                                   |
-| `options.include`          | `MatrixInclude[]`                                               | no                   | Additional matrix combinations                                                                                                                                                                           |
-| `options.exclude`          | `MatrixExclude[]`                                               | no                   | Matrix combinations to remove                                                                                                                                                                            |
-| `options.checkout`         | `boolean`                                                       | no (default: `true`) | When `false`, agent skips git clone. Useful for deploy/notify jobs.                                                                                                                                      |
-| `options.container`        | `string \| ContainerConfig`                                     | no                   | Docker image for job execution. String form is the image name; object form adds `env`. All steps run inside the container.                                                                               |
-| `options.environment`      | `string \| ((event) => string \| Promise<string>)`              | no                   | Deployment environment for this job. Static string or async/dynamic function -- see [Dynamic values](../dynamic-values.md).                                                                              |
-| `options.env`              | `Record<string, string> \| ((event) => Record<string, string>)` | no                   | Environment variables. Static object or async/dynamic function -- see [Dynamic values](../dynamic-values.md).                                                                                            |
-| `options.concurrencyGroup` | `string \| ((event) => string \| Promise<string>)`              | no                   | Concurrency group name (defaults to environment name) -- see [Concurrency](../concurrency.md).                                                                                                           |
-| `options.onCancel`         | `HookInput`                                                     | no                   | Hook that runs when the job is cancelled                                                                                                                                                                 |
-| `options.cleanup`          | `HookInput`                                                     | no                   | Hook that always runs after completion                                                                                                                                                                   |
-| `options.onSuccess`        | `HookInput`                                                     | no                   | Hook that runs when the job succeeds                                                                                                                                                                     |
-| `options.onFailure`        | `HookInput`                                                     | no                   | Hook that runs when the job fails                                                                                                                                                                        |
-| `options.beforeStep`       | `HookInput`                                                     | no                   | Hook that runs before each step                                                                                                                                                                          |
-| `options.afterStep`        | `HookInput`                                                     | no                   | Hook that runs after each step                                                                                                                                                                           |
-| `options.gracePeriod`      | `number`                                                        | no                   | Seconds before SIGKILL after SIGTERM during cancellation -- see [Hooks](../hooks.md#hook-timeout).                                                                                                       |
-| `options.timeout`          | `number`                                                        | no                   | Total job wall-clock timeout in milliseconds (init + all steps + hooks). On breach the job is aborted and reported timed out. See [Timeouts](#timeouts).                                                 |
-| `options.resources`        | `ResourceRequest`                                               | no                   | Per-job CPU / memory request and limit. See [Per-job resources](#per-job-resources) below.                                                                                                               |
-| `options.init`             | `InitConfig`                                                    | no                   | Per-job initialization run after clone, before steps -- provisions a toolchain. A generic config, a typed preset (`'mise'` / `{ mise }`), `'auto'`, or `false`. See [Per-job init](#per-job-init) below. |
+| Parameter                  | Type                                                                   | Required             | Description                                                                                                                                                                                                  |
+| -------------------------- | ---------------------------------------------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                     | `string`                                                               | no                   | Job name (auto-generated UUID if omitted)                                                                                                                                                                    |
+| `options.runsOn`           | `RunsOn`                                                               | yes                  | Runner label(s) and optional exclusions (see below)                                                                                                                                                          |
+| `options.steps`            | `StepInput[]`                                                          | yes (or use `run`)   | Steps to execute in order. Mutually exclusive with `run`.                                                                                                                                                    |
+| `options.run`              | `(ctx) => Promise<unknown>`                                            | yes (or use `steps`) | Single-step shorthand -- see [Single-step job shorthand](#single-step-job-shorthand). Mutually exclusive with `steps`.                                                                                       |
+| `options.needs`            | `NeedsEntry[]`                                                         | no                   | Job dependencies (must complete first) -- see [Job dependencies (`needs`)](#job-dependencies-needs)                                                                                                          |
+| `options.rules`            | `Rule[]`                                                               | no                   | Conditions for conditional execution                                                                                                                                                                         |
+| `options.description`      | `string`                                                               | no                   | Human-readable description                                                                                                                                                                                   |
+| `options.matrix`           | `Matrix`                                                               | no                   | Matrix configuration for job expansion                                                                                                                                                                       |
+| `options.include`          | `MatrixInclude[]`                                                      | no                   | Additional matrix combinations                                                                                                                                                                               |
+| `options.exclude`          | `MatrixExclude[]`                                                      | no                   | Matrix combinations to remove                                                                                                                                                                                |
+| `options.checkout`         | `boolean`                                                              | no (default: `true`) | When `false`, agent skips git clone. Useful for deploy/notify jobs.                                                                                                                                          |
+| `options.container`        | `string \| ContainerConfig`                                            | no                   | Docker image for job execution. String form is the image name; object form adds `env`. All steps run inside the container.                                                                                   |
+| `options.sandbox`          | `{ capabilities?: string[]; network?: 'default' \| 'none' \| 'host' }` | no                   | Per-job container sandbox escape hatch (container jobs only). Request extra Linux capabilities / host networking; granted only within your operator's allow-list, else the run fails at dispatch. See below. |
+| `options.environment`      | `string \| ((event) => string \| Promise<string>)`                     | no                   | Deployment environment for this job. Static string or async/dynamic function -- see [Dynamic values](../dynamic-values.md).                                                                                  |
+| `options.env`              | `Record<string, string> \| ((event) => Record<string, string>)`        | no                   | Environment variables. Static object or async/dynamic function -- see [Dynamic values](../dynamic-values.md).                                                                                                |
+| `options.concurrencyGroup` | `string \| ((event) => string \| Promise<string>)`                     | no                   | Concurrency group name (defaults to environment name) -- see [Concurrency](../concurrency.md).                                                                                                               |
+| `options.onCancel`         | `HookInput`                                                            | no                   | Hook that runs when the job is cancelled                                                                                                                                                                     |
+| `options.cleanup`          | `HookInput`                                                            | no                   | Hook that always runs after completion                                                                                                                                                                       |
+| `options.onSuccess`        | `HookInput`                                                            | no                   | Hook that runs when the job succeeds                                                                                                                                                                         |
+| `options.onFailure`        | `HookInput`                                                            | no                   | Hook that runs when the job fails                                                                                                                                                                            |
+| `options.beforeStep`       | `HookInput`                                                            | no                   | Hook that runs before each step                                                                                                                                                                              |
+| `options.afterStep`        | `HookInput`                                                            | no                   | Hook that runs after each step                                                                                                                                                                               |
+| `options.gracePeriod`      | `number`                                                               | no                   | Seconds before SIGKILL after SIGTERM during cancellation -- see [Hooks](../hooks.md#hook-timeout).                                                                                                           |
+| `options.timeout`          | `number`                                                               | no                   | Total job wall-clock timeout in milliseconds (init + all steps + hooks). On breach the job is aborted and reported timed out. See [Timeouts](#timeouts).                                                     |
+| `options.resources`        | `ResourceRequest`                                                      | no                   | Per-job CPU / memory request and limit. See [Per-job resources](#per-job-resources) below.                                                                                                                   |
+| `options.init`             | `InitConfig`                                                           | no                   | Per-job initialization run after clone, before steps -- provisions a toolchain. A generic config, a typed preset (`'mise'` / `{ mise }`), `'auto'`, or `false`. See [Per-job init](#per-job-init) below.     |
 
 **Returns:** `Job` -- an immutable job definition.
 
@@ -316,6 +317,29 @@ Per-backend kernel enforcement of `limits`:
 - **Container backend** (Docker / Podman): always enforced via cgroup.
 - **Firecracker backend:** always enforced. Fractional CPU rounds up to the nearest integer vCPU.
 - **Bare-metal backend:** advisory by default — the scaler caps still apply, but no cgroup is created. Operators can opt in to kernel enforcement via `enforceCgroups: true` on the scaler entry.
+
+### Per-job sandbox escape hatch
+
+Container-sandbox jobs (a job with a `container:` image) run with all Linux capabilities dropped by default. When a job genuinely needs one extra capability or the host network namespace, request it with `sandbox:`:
+
+```ts
+job('probe', {
+  runsOn: 'kici:os:linux',
+  container: 'node:20',
+  sandbox: {
+    capabilities: ['NET_ADMIN'], // added back on top of the dropped-all default
+    network: 'host', // share the host network namespace
+  },
+  steps: [/* ... */],
+});
+```
+
+Two levers are exposed, and only these two are ever grantable:
+
+- **`capabilities`** — extra Linux capabilities (bare or `CAP_`-prefixed; both accepted). An unknown capability name is rejected when you compile.
+- **`network`** — `'default'` (bridge, the default), `'none'` (loopback only), or `'host'`.
+
+Every request is checked at dispatch against an allow-list your orchestrator operator controls. A capability or `network: 'host'` that the operator has not allow-listed **fails the whole run** with a reason naming what was blocked — the request is never silently ignored. `'none'` and the default bridge never need approval. Ask your operator to allow-list a capability (`kici-admin org-settings sandbox-allowlist`) before relying on it. A job with no `sandbox:` field keeps the fully hardened default.
 
 ### Per-job init
 
@@ -611,6 +635,25 @@ const pipeline = job('pipeline', {
 });
 ```
 
+The `.result` proxy works for id-less steps too. An id-less step (`step(fn)` or `step({ run, outputs })` without a name) receives a deterministic `step-N` name when the job's steps are enumerated at execution start — before any step runs — and its `.result` resolves under that assigned name from any later step's `run` function:
+
+```typescript
+const build = step({ outputs: { version: z.string() }, run: async () => ({ version: '2.0.0' }) });
+
+const pipeline = job('pipeline', {
+  runsOn: 'default',
+  steps: [
+    build,
+    step(async () => {
+      const version = build.result.version; // resolves under the assigned step-N name
+      console.log(version); // '2.0.0'
+    }),
+  ],
+});
+```
+
+Reference `.result` only from inside another step's `run` function. Accessing it outside execution (for example at module top level, before names are assigned) raises "this step has no name yet".
+
 **Cross-job output chaining:**
 
 ```typescript
@@ -625,8 +668,13 @@ const build = job('build', {
   runsOn: 'default',
   needs: [setup],
   steps: [
-    step('compile', async (ctx) => {
-      return { version: '2.0.0' };
+    // The options form `step(name, { run })` carries the return type through, so
+    // `build.result.compile.version` is typed `string`. A bare `step(name, fn)`
+    // is a void step and contributes no typed key.
+    step('compile', {
+      run: async (ctx) => {
+        return { version: '2.0.0' };
+      },
     }),
   ],
 });
@@ -636,18 +684,42 @@ const deploy = job('deploy', {
   needs: [build],
   steps: [
     step(async (ctx) => {
-      // Multi-step job: jobRef.result.stepName.field
+      // Multi-step job: jobRef.result.stepName.field — typed `string`, a typo on
+      // `.version` or `.compile` is a compile error.
       const version = build.result.compile.version;
 
-      // Single-step job (run shorthand): jobRef.result.field
+      // Single-step job (run shorthand): jobRef.result.field — typed `string`.
       const env = setup.result.env;
 
-      // Explicit context method
+      // Explicit context method — typed to the job's output shape for a Job ref.
       const buildOutputs = ctx.jobOutputs(build);
     }),
   ],
 });
 ```
+
+**Cross-job outputs are typed.** When you pass a **job reference** (not a string)
+in `needs` and read `jobRef.result.…` or `ctx.jobOutputs(jobRef)`, the output
+types thread across the job boundary — a typo on an output field or a renamed
+step is a compile error, the same guarantee you get within a job. Two authoring
+rules unlock it:
+
+- **Name your steps and use the options form** — `step('name', { run })` carries
+  the return type into `jobRef.result.name.field` (nested by step name for
+  multi-step jobs; flat `jobRef.result.field` for the `run:` shorthand). A bare
+  `step('name', fn)` or an id-less `step(fn)` is a void step and contributes no
+  typed key.
+- **Pass references, not strings** — reading `buildJob.result.…` on the job
+  reference is typed from any job. In a `run:` shorthand job, a referenced
+  `needs: [buildJob]` also types `ctx.needs.buildJob.result.…` (the run
+  function's `ctx` derives from the job's `needs` tuple). A string
+  `needs: ['build']` still works but stays loosely typed
+  (`Record<string, unknown>`).
+
+For a dynamically-shaped job whose outputs the inference can't reproduce, supply
+the shape explicitly: `job<{ url: string }>('deploy', { … })`. A **matrix** or
+`runsOnAll` upstream returns a typed envelope — discriminate it with
+`isMatrixJobOutputs` / `isHostJobOutputs`.
 
 **Access patterns summary:**
 
@@ -689,14 +761,20 @@ const deploy = job('deploy', {
 
 **Run condition (`when`):** controls when a downstream edge is satisfied, based on the upstream's terminal status. `when` is keyword sugar (or a raw status-set) that resolves at compile time to the set of upstream terminal statuses that satisfy the edge. The downstream edge is satisfied when the upstream's terminal status is a member of that set.
 
-| Keyword                  | Satisfied when the upstream is… | Use for                                     |
-| ------------------------ | ------------------------------- | ------------------------------------------- |
-| `'on-success'` (default) | `success`                       | normal dependencies                         |
-| `'always'`               | any terminal status             | cleanup / notification / teardown jobs      |
-| `'on-skip'`              | `success` or `skipped`          | continue when an upstream was narrowed out  |
-| `'on-failure'`           | `failed` or `timed_out_stale`   | error-handler jobs that run only on failure |
+| Keyword                  | Satisfied when the upstream is…                               | Use for                                     |
+| ------------------------ | ------------------------------------------------------------- | ------------------------------------------- |
+| `'on-success'` (default) | `success`                                                     | normal dependencies                         |
+| `'always'`               | any terminal status                                           | cleanup / notification / teardown jobs      |
+| `'on-skip'`              | `success` or `skipped`                                        | continue when an upstream was narrowed out  |
+| `'on-failure'`           | `failed`, `timed_out_stale`, `drift_dropped`, or `unroutable` | error-handler jobs that run only on failure |
 
-For full control, pass a raw status-set instead of a keyword: `when: ['skipped', 'failed', 'timed_out_stale']`. The valid members are the terminal job statuses: `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`.
+`'on-failure'` covers every terminal status that means the job did not do what
+the workflow declared, which includes a job dropped by determinism drift and a
+job whose `runsOn` matched no agent. It
+does **not** cover `cancelled` (deliberately stopped) or `skipped` (never ran) —
+use a raw status set if you need those.
+
+For full control, pass a raw status-set instead of a keyword: `when: ['skipped', 'failed', 'timed_out_stale']`. The valid members are the terminal job statuses: `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`.
 
 String and `Job`-reference entries default to `when: 'on-success'`. To override, use the object form (`{ name, when }` for static upstreams, `{ group, when }` for dynamic groups -- `dynamicGroup(name, { when: 'always' })` produces the latter).
 
@@ -738,10 +816,11 @@ function dynamicGroup(
 Use when a static downstream must wait for every generated job tagged with a given group name to complete. If the dynamic group produces zero jobs, the downstream dispatches immediately (empty group satisfies all upstreams).
 
 ```typescript
-const shardedTests = dynamicJob('test-shards', async (ctx) => {
-  return ctx.shardIndices.map((i) =>
-    job(`test-shard-${i}`, { runsOn: 'linux', run: async () => {} }),
-  );
+const shardedTests = dynamicJob('test-shards', async () => {
+  // Decide the shard set however you like — a constant, the event payload, or
+  // an upstream job's outputs via the result-aware `{ needs, generate }` form.
+  const shards = [0, 1, 2, 3];
+  return shards.map((i) => job(`test-shard-${i}`, { runsOn: 'linux', run: async () => {} }));
 });
 
 const deploy = job('deploy', {
@@ -753,13 +832,18 @@ const deploy = job('deploy', {
 });
 ```
 
-### dynamicJob(groupName, fn)
+### dynamicJob(groupName, fnOrConfig)
 
-Tag a dynamic job generator function with a group name so other jobs can reference it via `dynamicGroup()`.
+Tag a dynamic job generator with a group name so other jobs can reference it via `dynamicGroup()`.
 
 ```typescript
-function dynamicJob(groupName: string, fn: DynamicJobFn): DynamicJobFn;
+function dynamicJob(
+  groupName: string,
+  fnOrConfig: DynamicJobFn | { needs: DynamicJobNeed[]; generate: DynamicJobFn },
+): TaggedDynamicJobFn;
 ```
+
+The second argument is either a plain generator (event-only, evaluated at webhook time) or a result-aware `{ needs, generate }` config, which defers the generator until its declared upstreams complete and exposes their frozen outputs as `ctx.needs`. See [Rules, matrix, dynamic jobs](./rules-matrix-dynamic.md#dynamicjob--result-aware-generation) for the result-aware form.
 
 The generator runs twice: once in the init phase (to register expected job names) and once inside the executing agent (to produce the actual jobs). Mismatches between the two evaluations are detected as determinism drift -- see [dynamic-jobs](../../architecture/execution/dynamic-jobs.md).
 

@@ -13,12 +13,15 @@ import picomatch from 'picomatch';
 import pc from 'picocolors';
 import { formatDuration } from '@kici-dev/core';
 import { getConfigDir } from './config.js';
+import {
+  ExecutionJobStatus,
+  ExecutionRunStatus,
+  toCanonicalStatus,
+  type CanonicalStatus,
+} from '@kici-dev/engine';
 
 /** Maximum number of entries to keep in history */
 const MAX_ENTRIES = 200;
-
-/** Status of a test run */
-type RunStatus = 'queued' | 'running' | 'success' | 'failed' | 'cancelled';
 
 /** A single run history entry */
 export interface HistoryEntry {
@@ -27,7 +30,7 @@ export interface HistoryEntry {
   /** Fixture that was run */
   fixtureId: string;
   /** Current status of the run */
-  status: RunStatus;
+  status: CanonicalStatus;
   /** ISO timestamp when the run started */
   startedAt: string;
   /** ISO timestamp when the run completed (if finished) */
@@ -165,7 +168,11 @@ export class RunHistory {
     for (const entry of entries) {
       const id = entry.runId.padEnd(idWidth);
       const fixture = entry.fixtureId.padEnd(fixtureWidth);
-      const status = formatStatus(entry.status).padEnd(12);
+      // Pad by the plain label's width, not the rendered cell's: with colour
+      // enabled the ANSI escapes alone exceed the column width, so padding the
+      // coloured string is a no-op and the column collapses.
+      const statusPad = Math.max(0, 12 - statusLabelWidth(entry.status));
+      const status = formatStatus(entry.status) + ' '.repeat(statusPad);
       const duration = entry.durationMs
         ? formatDuration(entry.durationMs).padEnd(12)
         : '-'.padEnd(12);
@@ -212,20 +219,47 @@ export class RunHistory {
   }
 }
 
+type StatusDisplay = { label: string; color: (text: string) => string };
+
 /**
- * Format a run status with appropriate color and symbol.
+ * Short label and colour for every canonical status in the run-history table.
+ *
+ * Exhaustive by type, so a new engine status breaks this file's typecheck
+ * rather than making the history table print the literal string `undefined`.
+ *
+ * `label` and `color` are stored separately so the table's column width can be
+ * measured on the plain label: padding a colour-wrapped string measures the
+ * ANSI escape bytes too, which silently collapses the column.
  */
-function formatStatus(status: RunStatus): string {
-  switch (status) {
-    case 'success':
-      return pc.green('pass');
-    case 'failed':
-      return pc.red('fail');
-    case 'cancelled':
-      return pc.yellow('cancel');
-    case 'running':
-      return pc.blue('running');
-    case 'queued':
-      return pc.gray('queued');
-  }
+const STATUS_DISPLAY: Readonly<Record<CanonicalStatus, StatusDisplay>> = Object.freeze({
+  [ExecutionRunStatus.enum.success]: { label: 'pass', color: pc.green },
+  [ExecutionRunStatus.enum.failed]: { label: 'fail', color: pc.red },
+  [ExecutionJobStatus.enum.timed_out_stale]: { label: 'timeout', color: pc.red },
+  [ExecutionJobStatus.enum.drift_dropped]: { label: 'dropped', color: pc.red },
+  [ExecutionJobStatus.enum.unroutable]: { label: 'unroutable', color: pc.red },
+  [ExecutionRunStatus.enum.cancelled]: { label: 'cancel', color: pc.yellow },
+  [ExecutionRunStatus.enum.cancelling]: { label: 'cancelling', color: pc.yellow },
+  [ExecutionJobStatus.enum.recovering]: { label: 'recovering', color: pc.yellow },
+  [ExecutionRunStatus.enum.held]: { label: 'held', color: pc.yellow },
+  [ExecutionRunStatus.enum.running]: { label: 'running', color: pc.blue },
+  [ExecutionJobStatus.enum.queued]: { label: 'queued', color: pc.dim },
+  [ExecutionRunStatus.enum.pending]: { label: 'pending', color: pc.dim },
+  [ExecutionJobStatus.enum.skipped]: { label: 'skipped', color: pc.dim },
+});
+
+/** The plain (uncoloured) width of a status cell, for column padding. */
+export function statusLabelWidth(status: string): number {
+  const canonical = toCanonicalStatus(status.toLowerCase());
+  return canonical === undefined ? status.length : STATUS_DISPLAY[canonical].label.length;
+}
+
+/**
+ * Format a run status with its colour and short label. A status this CLI does
+ * not recognise — a history file written by a newer version — renders verbatim.
+ */
+export function formatStatus(status: string): string {
+  const canonical = toCanonicalStatus(status.toLowerCase());
+  if (canonical === undefined) return pc.gray(status);
+  const { label, color } = STATUS_DISPLAY[canonical];
+  return color(label);
 }

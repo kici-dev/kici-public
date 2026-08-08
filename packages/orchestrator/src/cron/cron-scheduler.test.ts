@@ -6,8 +6,9 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import type { LockWorkflow, LockScheduleTrigger } from '@kici-dev/engine';
+import { scheduleTriggerKey, type LockWorkflow, type LockScheduleTrigger } from '@kici-dev/engine';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
+import { cronCacheKey } from './cron-store.js';
 
 // Replace the shared logger with a stable spy so tests can assert that
 // `logger.error` is NOT invoked when an impossible cron is evaluated
@@ -38,36 +39,39 @@ import { CronScheduler } from './cron-scheduler.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
 
+/** Default single-schedule identity key: cron '*\/5 * * * *' in UTC. */
+const DEFAULT_KEY = scheduleTriggerKey('*/5 * * * *', 'UTC');
+
 function makeScheduleRegistration(
   overrides: Partial<{
+    id: string;
     workflowName: string;
     cronExpression: string;
     timezone: string;
     repoIdentifier: string;
     commitSha: string | null;
     sourceFile: string | null;
+    triggers: Array<{ cronExpression: string; timezone: string }>;
   }> = {},
 ): RegisteredWorkflow {
   const cronExpression = overrides.cronExpression ?? '*/5 * * * *';
   const timezone = overrides.timezone ?? 'UTC';
   const workflowName = overrides.workflowName ?? 'scheduled-deploy';
 
-  const scheduleTrigger: LockScheduleTrigger = {
-    _type: 'schedule',
-    cronExpression,
-    timezone,
-  };
+  const scheduleTriggers: LockScheduleTrigger[] = (
+    overrides.triggers ?? [{ cronExpression, timezone }]
+  ).map((t) => ({ _type: 'schedule', cronExpression: t.cronExpression, timezone: t.timezone }));
 
   const lockEntry: LockWorkflow = {
     name: workflowName,
     contentHash: 'sha256-test',
     compileSchemaVersion: 1,
-    triggers: [scheduleTrigger],
+    triggers: scheduleTriggers,
     jobs: [],
   };
 
   return {
-    id: `reg-${workflowName}`,
+    id: overrides.id ?? `reg-${workflowName}`,
     repoIdentifier: overrides.repoIdentifier ?? 'owner/repo',
     workflowName,
     lockEntry,
@@ -163,7 +167,9 @@ describe('CronScheduler', () => {
 
       // Last fired at 9:55 -- missed the 10:00 and 10:05 fires
       const oldFiredAt = new Date('2026-02-25T09:55:00Z');
-      cronStore.getAll.mockResolvedValue(new Map([['reg-nightly-build', oldFiredAt]]));
+      cronStore.getAll.mockResolvedValue(
+        new Map([[cronCacheKey('reg-nightly-build', DEFAULT_KEY), oldFiredAt]]),
+      );
 
       const scheduler = new CronScheduler({
         db,
@@ -189,10 +195,11 @@ describe('CronScheduler', () => {
         expect.anything(),
       );
 
-      // Should have claimed the fire atomically via DB
-      // tryClaimFire now also receives the active tx as the 3rd arg.
+      // Should have claimed the fire atomically via DB, keyed per-schedule.
+      // tryClaimFire receives (registrationId, scheduleKey, firedAt, tx).
       expect(cronStore.tryClaimFire).toHaveBeenCalledWith(
         'reg-nightly-build',
+        DEFAULT_KEY,
         new Date('2026-02-25T10:05:00.000Z'),
         expect.anything(),
       );
@@ -257,6 +264,7 @@ describe('CronScheduler', () => {
       );
       expect(cronStore.tryClaimFire).toHaveBeenCalledWith(
         'reg-scheduled-deploy',
+        DEFAULT_KEY,
         new Date('2026-02-25T10:10:00.000Z'),
         expect.anything(),
       );
@@ -272,7 +280,9 @@ describe('CronScheduler', () => {
 
       // Already fired at 10:05 (current previous scheduled time)
       cronStore.getAll.mockResolvedValue(
-        new Map([['reg-scheduled-deploy', new Date('2026-02-25T10:05:00.000Z')]]),
+        new Map([
+          [cronCacheKey('reg-scheduled-deploy', DEFAULT_KEY), new Date('2026-02-25T10:05:00.000Z')],
+        ]),
       );
 
       const scheduler = new CronScheduler({
@@ -287,6 +297,89 @@ describe('CronScheduler', () => {
 
       // Should NOT fire -- already fired at 10:05 which equals the previous scheduled time
       expect(eventRouter.emitInTx).not.toHaveBeenCalled();
+
+      scheduler.stop();
+    });
+
+    it('should fire EVERY schedule trigger of a registration, not just the first', async () => {
+      const reg = makeScheduleRegistration({
+        id: 'reg-multi',
+        workflowName: 'multi',
+        triggers: [
+          { cronExpression: '* * * * *', timezone: 'UTC' },
+          { cronExpression: '*/2 * * * *', timezone: 'UTC' },
+        ],
+      });
+      const { db, registrationIndex, cronStore, eventRouter } = createMockDeps({
+        schedules: [reg],
+      });
+
+      const scheduler = new CronScheduler({
+        db,
+        registrationIndex,
+        cronStore,
+        eventRouter,
+        evaluationIntervalMs: 30_000,
+      });
+
+      await scheduler.onBecomeLeader();
+
+      // Both schedules claim independently under distinct schedule keys.
+      const claimedKeys = cronStore.tryClaimFire.mock.calls.map((c: unknown[]) => c[1]);
+      expect(new Set(claimedKeys)).toEqual(
+        new Set([scheduleTriggerKey('* * * * *', 'UTC'), scheduleTriggerKey('*/2 * * * *', 'UTC')]),
+      );
+
+      // Two __schedule_fire emits, one per cron expression.
+      const emittedCrons = eventRouter.emitInTx.mock.calls.map(
+        (c: any[]) => c[0].payload.cronExpression,
+      );
+      expect(new Set(emittedCrons)).toEqual(new Set(['* * * * *', '*/2 * * * *']));
+
+      scheduler.stop();
+    });
+
+    it('dedups per-schedule: a fired schedule does not suppress a sibling', async () => {
+      const reg = makeScheduleRegistration({
+        id: 'reg-multi',
+        workflowName: 'multi',
+        triggers: [
+          { cronExpression: '* * * * *', timezone: 'UTC' },
+          { cronExpression: '*/2 * * * *', timezone: 'UTC' },
+        ],
+      });
+      const { db, registrationIndex, cronStore, eventRouter } = createMockDeps({
+        schedules: [reg],
+      });
+
+      // The every-minute schedule already fired for the current minute (10:07);
+      // the every-2-minutes schedule (prev run 10:06) has NOT fired yet.
+      cronStore.getAll.mockResolvedValue(
+        new Map([
+          [
+            cronCacheKey('reg-multi', scheduleTriggerKey('* * * * *', 'UTC')),
+            new Date('2026-02-25T10:07:00.000Z'),
+          ],
+        ]),
+      );
+
+      const scheduler = new CronScheduler({
+        db,
+        registrationIndex,
+        cronStore,
+        eventRouter,
+        evaluationIntervalMs: 30_000,
+      });
+
+      await scheduler.onBecomeLeader();
+
+      // Only the un-fired sibling schedule fires.
+      expect(eventRouter.emitInTx).toHaveBeenCalledTimes(1);
+      expect(eventRouter.emitInTx.mock.calls[0][0].payload.cronExpression).toBe('*/2 * * * *');
+      expect(cronStore.tryClaimFire).toHaveBeenCalledTimes(1);
+      expect(cronStore.tryClaimFire.mock.calls[0][1]).toBe(
+        scheduleTriggerKey('*/2 * * * *', 'UTC'),
+      );
 
       scheduler.stop();
     });
@@ -336,7 +429,7 @@ describe('CronScheduler', () => {
 
     // Regression: croner@10's `previousRuns(1)` (plural) THROWS for impossible
     // crons such as '0 0 31 2 *' (Feb 31 doesn't exist), which the outer
-    // try/catch in evaluateRegistration() then logged as `error` once per
+    // try/catch in evaluateScheduleTrigger() then logged as `error` once per
     // 30s tick -- log spam. The fix replaced it with `previousRun()`
     // (singular), which returns null and is handled by the existing guard.
     it('should silently skip impossible cron expressions without logging an error', async () => {
@@ -370,6 +463,83 @@ describe('CronScheduler', () => {
       // Critically: NO `logger.error` from the outer catch block. Before the
       // fix this was called every 30s with the croner exception message.
       expect(mockLogger.error).not.toHaveBeenCalled();
+
+      scheduler.stop();
+    });
+  });
+
+  describe('resilience: transient cache-load failure at leader election', () => {
+    it('starts evaluation despite a getAll() failure and fires due schedules on a later tick', async () => {
+      const schedule = makeScheduleRegistration();
+      const { db, registrationIndex, cronStore, eventRouter } = createMockDeps({
+        schedules: [schedule],
+      });
+
+      // The leader-election load throws (transient DB error); the reload on the
+      // next tick succeeds with an empty cache.
+      cronStore.getAll
+        .mockRejectedValueOnce(new Error('transient DB error'))
+        .mockResolvedValue(new Map<string, Date>());
+
+      const scheduler = new CronScheduler({
+        db,
+        registrationIndex,
+        cronStore,
+        eventRouter,
+        evaluationIntervalMs: 30_000,
+      });
+
+      // Must NOT throw — the evaluation timer has to start even though the load
+      // failed (otherwise cron is disabled for the whole leadership tenure).
+      await expect(scheduler.onBecomeLeader()).resolves.toBeUndefined();
+
+      // The failure was logged and recovery did not fire (the load threw first).
+      expect(mockLogger.error).toHaveBeenCalled();
+      expect(eventRouter.emitInTx).not.toHaveBeenCalled();
+
+      // On the next tick, evaluate() reloads the cache and fires the due schedule.
+      await scheduler.evaluate();
+
+      // getAll called twice: the failed election load + the successful reload.
+      expect(cronStore.getAll).toHaveBeenCalledTimes(2);
+      expect(cronStore.tryClaimFire).toHaveBeenCalledWith(
+        'reg-scheduled-deploy',
+        DEFAULT_KEY,
+        new Date('2026-02-25T10:05:00.000Z'),
+        expect.anything(),
+      );
+      expect(eventRouter.emitInTx).toHaveBeenCalledTimes(1);
+
+      scheduler.stop();
+    });
+
+    it('keeps firing due schedules with a cold cache when the reload also fails (dedup via tryClaimFire)', async () => {
+      const schedule = makeScheduleRegistration();
+      const { db, registrationIndex, cronStore, eventRouter } = createMockDeps({
+        schedules: [schedule],
+      });
+
+      // The DB stays down for both the election load and the reload.
+      cronStore.getAll.mockRejectedValue(new Error('DB still down'));
+      // Another node already recorded this fire; the DB-side guard refuses our claim.
+      cronStore.tryClaimFire.mockResolvedValue(false);
+
+      const scheduler = new CronScheduler({
+        db,
+        registrationIndex,
+        cronStore,
+        eventRouter,
+        evaluationIntervalMs: 30_000,
+      });
+
+      await expect(scheduler.onBecomeLeader()).resolves.toBeUndefined();
+
+      await scheduler.evaluate();
+
+      // Evaluation still ran and attempted a claim despite the persistent load failure...
+      expect(cronStore.tryClaimFire).toHaveBeenCalledTimes(1);
+      // ...but the claim was refused, so no event was emitted — no double-fire.
+      expect(eventRouter.emitInTx).not.toHaveBeenCalled();
 
       scheduler.stop();
     });
@@ -626,7 +796,9 @@ describe('CronScheduler', () => {
       cronStore.getAll.mockClear();
 
       // Refresh cache with new data
-      const refreshedCache = new Map([['reg-deploy', new Date('2026-02-25T10:05:00.000Z')]]);
+      const refreshedCache = new Map([
+        [cronCacheKey('reg-deploy', DEFAULT_KEY), new Date('2026-02-25T10:05:00.000Z')],
+      ]);
       cronStore.getAll.mockResolvedValue(refreshedCache);
 
       await scheduler.refreshCache();
@@ -657,7 +829,9 @@ describe('CronScheduler', () => {
       cronStore.tryClaimFire.mockClear();
 
       // Now simulate a registration replace: refreshCache loads the last-fired data
-      const refreshedCache = new Map([['reg-deploy', new Date('2026-02-25T10:05:00.000Z')]]);
+      const refreshedCache = new Map([
+        [cronCacheKey('reg-deploy', DEFAULT_KEY), new Date('2026-02-25T10:05:00.000Z')],
+      ]);
       cronStore.getAll.mockResolvedValue(refreshedCache);
       await scheduler.refreshCache();
 

@@ -19,6 +19,20 @@ The split matters:
 
 `access_log` is explicitly best-effort: insert failures are logged and swallowed so a broken audit table never takes down dashboard reads. `secret_audit_log` stays as the source of truth for secret mutations because those must commit inside the same transaction as the DB change.
 
+### Access-log origins (`source`)
+
+Every `access_log` row carries a `source` naming how the action reached the orchestrator. The audit trail is transport-independent — the same mutation is recorded whether an operator drove it over HTTP or straight against the database:
+
+- **`platform_proxy`** — a dashboard action relayed through the hosted Platform (e.g. the fleet host declare/remove buttons).
+- **`admin_http`** — a call to the orchestrator's Bearer-authed `/api/v1/admin/*` surface.
+- **`admin_cli`** — the direct-DB `kici-admin` subcommands that act straight against Postgres, bypassing the admin HTTP API. These are attributed to a `service_account` actor keyed on the operator's OS identity (`<user>@<host>`) since there is no dashboard login on the box. The recording subcommands are:
+  - `host declare`, `host remove` — emit `fleet.host.declare` / `fleet.host.remove` (the same action values as the dashboard fleet-write path, so the two transports are audit-parity).
+  - `db fresh`, `db ensure`, `db create-role`, `db create-readonly-user`, `db reindex`, `db refresh-collation-version` — provisioning and maintenance DDL, emitting the matching `db.*` action against a `database` target.
+
+  The bootstrap-provisioning subcommands (`ensure`, `create-role`) connect to an admin database with no `access_log` table, so their row is recorded best-effort to the orchestrator's own database (`KICI_DATABASE_URL`); during pure bootstrap, before that database exists, the subcommand's stderr banner is the audit floor. The subcommands that operate on the orchestrator's own schema-bearing database (`fresh`, `reindex`, `refresh-collation-version`, `create-readonly-user`) record straight into that database's `access_log`. Read-only subcommands (`db check-schema`, `db collation-check`, `host list`, `host get`, `remote-source show`) emit no row.
+
+- **`agent`** — actions attributed to an agent credential.
+
 ## Sampling and rate-limit policy
 
 Both `access_log` and `secret_audit_log` apply a per-action policy at write time so that high-volume but low-forensic-value events do not bury the rows that actually matter. The policy is the single source of truth at `packages/engine/src/audit/access-log-policy.ts` and is exhaustive over the action enums — adding a new action without a verdict is a TypeScript error.
@@ -72,6 +86,10 @@ Filters live entirely in the URL. Bookmarking or sharing a URL replays the filte
 ```
 /orgs/acme/activity?source=access_log&outcome=denied&runId=run_abc123&q=permission&from=2026-04-01
 ```
+
+### Exporting the feed as JSONL
+
+The Activity page's **Export JSONL** button streams the currently-filtered view to a newline-delimited JSON file (`application/x-ndjson`, one row per line) for retention, compliance evidence, or offline analysis. It honors the exact filter bar and always includes archived (cold-store) rows for that window, so the download is the complete record for the filter — not just the visible page. The export requires `audit:read` and writes an `activity.export` audit row (recording the applied filters, the row count, and whether it completed) so the export is itself auditable. A federated export that cannot assemble a complete page (the orchestrator is unreachable, so the `access_log` half is missing) fails the download rather than shipping a silently-truncated file.
 
 ### Run-id correlation
 

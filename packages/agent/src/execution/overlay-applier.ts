@@ -13,7 +13,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import { Readable } from 'node:stream';
 import { x as tarExtract } from 'tar';
 import { createLogger, toErrorMessage, sha256File, deriveSharedSecret } from '@kici-dev/shared';
@@ -107,7 +107,7 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
   const { tarballUrl, cliPublicKey, orchestratorPrivateKey, repoDir } = config;
 
   // Create temp directory for extraction
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-overlay-'));
+  const { path: tmpDir, cleanup } = await makeTempDir('overlay');
 
   try {
     // Step 1: Download encrypted tarball
@@ -219,6 +219,6 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
     return { filesApplied, filesDeleted, verified: true };
   } finally {
     // Clean up temp directory
-    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    await cleanup().catch(() => {});
   }
 }

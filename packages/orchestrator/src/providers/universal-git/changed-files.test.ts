@@ -24,11 +24,12 @@ function config(preset: UniversalGitConfig['preset']): UniversalGitConfig {
 }
 
 describe('UniversalGitChangedFilesFetcher', () => {
-  it('forgejo push: returns union of added + modified + removed', async () => {
+  it('forgejo push: returns union of added + modified + removed (fetched)', async () => {
     const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
     const push = loadFixture('forgejo-push.json');
-    const files = await fetcher.getChangedFiles('kici-dev/sample-repo', 'push', push, {});
-    expect(files.sort()).toEqual(
+    const result = await fetcher.getChangedFiles('kici-dev/sample-repo', 'push', push, {});
+    expect(result.status).toBe('fetched');
+    expect(result.files.sort()).toEqual(
       ['.kici/kici.lock.json', 'docs/old.md', 'src/existing.ts', 'src/new.ts'].sort(),
     );
   });
@@ -36,8 +37,9 @@ describe('UniversalGitChangedFilesFetcher', () => {
   it('gitlab push: reads project payload via mapped "Push Hook" header', async () => {
     const fetcher = new UniversalGitChangedFilesFetcher({ config: config('gitlab-repo') });
     const push = loadFixture('gitlab-repo-push.json');
-    const files = await fetcher.getChangedFiles('group/subgroup/svc', 'Push Hook', push, {});
-    expect(files.sort()).toEqual(['docs/readme.md', 'src/x.ts'].sort());
+    const result = await fetcher.getChangedFiles('group/subgroup/svc', 'Push Hook', push, {});
+    expect(result.status).toBe('fetched');
+    expect(result.files.sort()).toEqual(['docs/readme.md', 'src/x.ts'].sort());
   });
 
   it('dedupes paths that appear in multiple commit arrays', async () => {
@@ -48,25 +50,25 @@ describe('UniversalGitChangedFilesFetcher', () => {
         { added: [], modified: ['a.ts'], removed: ['a.ts'] },
       ],
     };
-    const files = await fetcher.getChangedFiles('x/y', 'push', dup, {});
-    expect(files).toEqual(['a.ts']);
+    const result = await fetcher.getChangedFiles('x/y', 'push', dup, {});
+    expect(result).toEqual({ files: ['a.ts'], status: 'fetched' });
   });
 
-  it('returns empty array for pull_request events (no diff available)', async () => {
+  it('reports unavailable for pull_request events (no diff in webhook body → conservative match)', async () => {
     const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
-    const files = await fetcher.getChangedFiles('x/y', 'pull_request', {}, {});
-    expect(files).toEqual([]);
+    const result = await fetcher.getChangedFiles('x/y', 'pull_request', {}, {});
+    expect(result).toEqual({ files: [], status: 'unavailable' });
   });
 
-  it('returns empty array for unknown event types', async () => {
+  it('reports unavailable for unknown event types', async () => {
     const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
-    const files = await fetcher.getChangedFiles('x/y', 'issue_comment', {}, {});
-    expect(files).toEqual([]);
+    const result = await fetcher.getChangedFiles('x/y', 'issue_comment', {}, {});
+    expect(result).toEqual({ files: [], status: 'unavailable' });
   });
 
-  it('tolerates missing commits[] array', async () => {
+  it('tolerates missing commits[] array (push stays fetched + [])', async () => {
     const fetcher = new UniversalGitChangedFilesFetcher({ config: config('forgejo') });
-    const files = await fetcher.getChangedFiles('x/y', 'push', {}, {});
-    expect(files).toEqual([]);
+    const result = await fetcher.getChangedFiles('x/y', 'push', {}, {});
+    expect(result).toEqual({ files: [], status: 'fetched' });
   });
 });

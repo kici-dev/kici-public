@@ -55,29 +55,26 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     await mkdir(zodStore, { recursive: true });
     await writeFile(join(zodStore, 'index.js'), 'zod');
 
-    // Two in-repo workspace siblings with built output; action-github depends
-    // on action-core via a workspace symlink (transitive closure).
-    const ghDir = join(src, 'actions', 'github');
-    const coreDir = join(src, 'actions', 'core');
-    await mkdir(join(ghDir, 'dist'), { recursive: true });
+    // Two in-repo workspace siblings with built output; sdk depends
+    // on core via a workspace symlink (transitive closure).
+    const sdkDir = join(src, 'packages', 'sdk');
+    const coreDir = join(src, 'packages', 'core');
+    await mkdir(join(sdkDir, 'dist'), { recursive: true });
     await mkdir(join(coreDir, 'dist'), { recursive: true });
-    await writeFile(join(ghDir, 'dist', 'index.js'), 'github');
-    await writeFile(join(ghDir, 'package.json'), '{"name":"@kici-dev/action-github"}');
+    await writeFile(join(sdkDir, 'dist', 'index.js'), 'sdk');
+    await writeFile(join(sdkDir, 'package.json'), '{"name":"@kici-dev/sdk"}');
     await writeFile(join(coreDir, 'dist', 'index.js'), 'core');
-    await writeFile(join(coreDir, 'package.json'), '{"name":"@kici-dev/action-core"}');
-    await mkdir(join(ghDir, 'node_modules', '@kici-dev'), { recursive: true });
-    await symlink('../../../core', join(ghDir, 'node_modules', '@kici-dev', 'action-core'));
+    await writeFile(join(coreDir, 'package.json'), '{"name":"@kici-dev/core"}');
+    await mkdir(join(sdkDir, 'node_modules', '@kici-dev'), { recursive: true });
+    await symlink('../../../core', join(sdkDir, 'node_modules', '@kici-dev', 'core'));
 
-    // .kici depends on action-github via a workspace symlink.
+    // .kici depends on sdk via a workspace symlink.
     await mkdir(join(kiciDir, 'node_modules', '@kici-dev'), { recursive: true });
     await writeFile(
       join(kiciDir, 'package.json'),
-      '{"name":"k","dependencies":{"@kici-dev/action-github":"workspace:*"}}',
+      '{"name":"k","dependencies":{"@kici-dev/sdk":"workspace:*"}}',
     );
-    await symlink(
-      '../../../actions/github',
-      join(kiciDir, 'node_modules', '@kici-dev', 'action-github'),
-    );
+    await symlink('../../../packages/sdk', join(kiciDir, 'node_modules', '@kici-dev', 'sdk'));
 
     const { tarball } = await packNodeModules(kiciDir);
 
@@ -93,18 +90,16 @@ describe('packNodeModules + restoreDeps round-trip', () => {
         'utf-8',
       ),
     ).toBe('zod');
-    // The .kici → action-github symlink resolves to the restored sibling dir.
-    const ghLink = join(dst, '.kici', 'node_modules', '@kici-dev', 'action-github');
-    expect((await stat(ghLink)).isDirectory()).toBe(true); // resolves through the symlink
-    expect(await realpath(ghLink)).toBe(await realpath(join(dst, 'actions', 'github')));
-    expect(await readFile(join(dst, 'actions', 'github', 'dist', 'index.js'), 'utf-8')).toBe(
-      'github',
+    // The .kici → sdk symlink resolves to the restored sibling dir.
+    const sdkLink = join(dst, '.kici', 'node_modules', '@kici-dev', 'sdk');
+    expect((await stat(sdkLink)).isDirectory()).toBe(true); // resolves through the symlink
+    expect(await realpath(sdkLink)).toBe(await realpath(join(dst, 'packages', 'sdk')));
+    expect(await readFile(join(dst, 'packages', 'sdk', 'dist', 'index.js'), 'utf-8')).toBe('sdk');
+    // The transitive sibling (core) and its build output came along.
+    expect(await readFile(join(dst, 'packages', 'core', 'dist', 'index.js'), 'utf-8')).toBe('core');
+    expect(await realpath(join(dst, 'packages', 'sdk', 'node_modules', '@kici-dev', 'core'))).toBe(
+      await realpath(join(dst, 'packages', 'core')),
     );
-    // The transitive sibling (action-core) and its build output came along.
-    expect(await readFile(join(dst, 'actions', 'core', 'dist', 'index.js'), 'utf-8')).toBe('core');
-    expect(
-      await realpath(join(dst, 'actions', 'github', 'node_modules', '@kici-dev', 'action-core')),
-    ).toBe(await realpath(join(dst, 'actions', 'core')));
   });
 
   it('yarn standalone: packs .kici/node_modules + in-repo sibling and restores', async () => {

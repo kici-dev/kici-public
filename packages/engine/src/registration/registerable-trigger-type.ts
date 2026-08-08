@@ -29,6 +29,7 @@ export const RegisterableTriggerType = z.enum([
   // Non-Git-provider triggers
   'kici_event',
   'workflow_complete',
+  'workflows_failed_batch',
   'job_complete',
   'generic_webhook',
   'schedule',

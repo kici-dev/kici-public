@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { randomUUID } from 'node:crypto';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './056_execution_jobs_environments.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -39,10 +39,7 @@ describeDb('migration 056_execution_jobs_environments', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -68,10 +65,12 @@ describeDb('migration 056_execution_jobs_environments', () => {
   });
 
   it('accepts a JSON array and NULL', async () => {
-    const runId = `run-${Date.now()}`;
-    const jobId = `job-${Date.now()}`;
-    await sql`INSERT INTO public.execution_runs (run_id, workflow_name, provider, repo_identifier, status)
-      VALUES (${runId}, 'wf', 'github', 'org/repo', 'pending')`.execute(db);
+    const runId = randomUUID();
+    const jobId = randomUUID();
+    await sql`INSERT INTO public.execution_runs (run_id, workflow_name, provider, repo_identifier, ref, sha, status)
+      VALUES (${runId}, 'wf', 'github', 'org/repo', 'refs/heads/main', 'deadbeef', 'pending')`.execute(
+      db,
+    );
     await sql`INSERT INTO public.execution_jobs (run_id, job_id, job_name, environments)
       VALUES (${runId}, ${jobId}, 'deploy', ${JSON.stringify(['staging', 'my-testing'])})`.execute(
       db,
@@ -80,7 +79,7 @@ describeDb('migration 056_execution_jobs_environments', () => {
       SELECT environments FROM public.execution_jobs WHERE job_id=${jobId}`.execute(db);
     expect(JSON.parse(row.rows[0].environments!)).toEqual(['staging', 'my-testing']);
 
-    const jobId2 = `job2-${Date.now()}`;
+    const jobId2 = randomUUID();
     await sql`INSERT INTO public.execution_jobs (run_id, job_id, job_name, environments)
       VALUES (${runId}, ${jobId2}, 'noenv', NULL)`.execute(db);
     const row2 = await sql<{ environments: string | null }>`

@@ -1,4 +1,5 @@
 import { createMeter } from '@kici-dev/shared';
+import type { ScalerRedispatchTrigger } from '../scaler/types.js';
 
 // ── Lazy meter + instrument resolution ────────────────────────────
 //
@@ -114,6 +115,19 @@ defineObservableGauge(
   'kici_orch_config_version',
   { description: 'Current shared config version number' },
   (result) => result.observe(_configVersionValue),
+);
+
+let _drainingValue = 0;
+
+/** Set whether this coordinator is draining (1) or accepting new jobs (0). */
+export function setDraining(value: boolean): void {
+  _drainingValue = value ? 1 : 0;
+}
+
+defineObservableGauge(
+  'kici_orchestrator_draining',
+  { description: 'Whether this coordinator is draining (1) or accepting new jobs (0)' },
+  (result) => result.observe(_drainingValue),
 );
 
 let _declaredHostsUnreachableValue = 0;
@@ -309,6 +323,28 @@ defineObservableGauge(
   (result) => result.observe(_scalerSpawnRefusalsValue),
 );
 
+/**
+ * Cumulative count of pending jobs re-offered to the scaler when capacity
+ * freed (the capacity-freed hook) or on the leader-gated backstop sweep.
+ * Labeled by trigger so operators can see how much re-dispatch activity comes
+ * from the near-zero-latency hook vs the periodic safety net.
+ * Labels:
+ * - trigger: hook (near-zero-latency capacity-freed callback) | sweep (leader-gated backstop)
+ */
+const scalerRedispatchTotal = lazyCounter('kici_orch_scaler_redispatch_total', {
+  description:
+    'Cumulative count of pending jobs re-offered to the scaler after capacity freed, labeled by trigger (hook | sweep).',
+});
+
+/**
+ * Record `count` pending jobs re-driven through the scaler by `trigger`
+ * (`hook` = capacity-freed callback, `sweep` = leader-gated backstop).
+ * Called by the dispatcher's metrics facade.
+ */
+export function incScalerRedispatch(trigger: ScalerRedispatchTrigger, count: number): void {
+  if (count > 0) scalerRedispatchTotal.add(count, { trigger });
+}
+
 // ── Dispatch queue depth (observable gauges with labels) ──────────
 //
 // These two gauges expose the current dispatch_queue depth so operators can
@@ -429,6 +465,208 @@ defineObservableGauge(
   },
 );
 
+// ── Webhook ingest admission control ──────────────────────────────
+//
+// State gauges are fed by the IngestAdmissionController's onStateChange hook via
+// setIngestAdmissionState; limit gauges are config-sourced (setIngestAdmissionLimits)
+// so their value reflects the deployed cap and never drifts like a hardcoded
+// dashboard threshold. The controller stays OTel-free — it calls the injected
+// counter/state hooks, and this module owns the instruments.
+
+interface IngestMetricState {
+  inflight: number;
+  queueDepth: number;
+  sheddingActive: boolean;
+  loopDelayP99Ms: number;
+  loopDelayMaxMs: number;
+}
+const EMPTY_INGEST_STATE: IngestMetricState = {
+  inflight: 0,
+  queueDepth: 0,
+  sheddingActive: false,
+  loopDelayP99Ms: 0,
+  loopDelayMaxMs: 0,
+};
+let _ingest: IngestMetricState = { ...EMPTY_INGEST_STATE };
+
+export function setIngestAdmissionState(s: IngestMetricState): void {
+  _ingest = s;
+}
+export function getIngestMetricState(): IngestMetricState {
+  return _ingest;
+}
+
+interface IngestLimitState {
+  maxConcurrency: number;
+  maxQueueDepth: number;
+  orgMaxConcurrency: number;
+  loopLagShedMs: number;
+  loopLagResumeMs: number;
+  overflowMax: number;
+}
+let _ingestLimits: IngestLimitState = {
+  maxConcurrency: 0,
+  maxQueueDepth: 0,
+  orgMaxConcurrency: 0,
+  loopLagShedMs: 0,
+  loopLagResumeMs: 0,
+  overflowMax: 0,
+};
+export function setIngestAdmissionLimits(l: IngestLimitState): void {
+  _ingestLimits = l;
+}
+
+/** Reset ingest metric state (test helper). */
+export function resetIngestMetricState(): void {
+  _ingest = { ...EMPTY_INGEST_STATE };
+  _ingestLimits = {
+    maxConcurrency: 0,
+    maxQueueDepth: 0,
+    orgMaxConcurrency: 0,
+    loopLagShedMs: 0,
+    loopLagResumeMs: 0,
+    overflowMax: 0,
+  };
+}
+
+/**
+ * Total webhook-ingest admissions shed by the admission controller.
+ * Labels:
+ * - reason: loop_overload | codel_drop | queue_full | max_sojourn
+ */
+export const ingestShedTotal = lazyCounter('kici_orch_ingest_shed_total', {
+  description:
+    'Webhook ingest admissions shed by the admission controller. Labels: reason (loop_overload|codel_drop|queue_full|max_sojourn)',
+});
+
+/** Total times the state.replay circuit breaker opened, skipping replay on connect. */
+export const stateReplayBreakerTripsTotal = lazyCounter(
+  'kici_orch_state_replay_breaker_trips_total',
+  {
+    description:
+      'Times the state.replay circuit breaker opened after consecutive replay-attributed disconnects, causing the orchestrator to connect without a replay (Platform run mirror knowingly stale)',
+  },
+);
+
+/** Total webhook-ingest admissions granted. */
+export const ingestAdmittedTotal = lazyCounter('kici_orch_ingest_admitted_total', {
+  description: 'Total webhook ingest admissions granted by the admission controller',
+});
+
+defineObservableGauge(
+  'kici_orch_ingest_inflight',
+  { description: 'Current in-flight webhook ingest pipelines' },
+  (r) => r.observe(_ingest.inflight),
+);
+defineObservableGauge(
+  'kici_orch_ingest_queue_depth',
+  { description: 'Current webhook ingest admission queue depth (HTTP direct ingress)' },
+  (r) => r.observe(_ingest.queueDepth),
+);
+defineObservableGauge(
+  'kici_orch_ingest_shedding_active',
+  {
+    description: 'Delay circuit breaker engaged (1) — loop-lag gate open or CoDel dropping',
+  },
+  (r) => r.observe(_ingest.sheddingActive ? 1 : 0),
+);
+defineObservableGauge(
+  'kici_orch_ingest_event_loop_delay_p99_ms',
+  { description: 'Event-loop delay p99 (ms) observed by the ingest admission sampler' },
+  (r) => r.observe(_ingest.loopDelayP99Ms),
+);
+defineObservableGauge(
+  'kici_orch_ingest_event_loop_delay_max_ms',
+  { description: 'Event-loop delay max (ms) observed by the ingest admission sampler' },
+  (r) => r.observe(_ingest.loopDelayMaxMs),
+);
+
+// Config-sourced limit gauges (current-vs-limit overlays + ratio alerts).
+defineObservableGauge(
+  'kici_orch_ingest_max_concurrency',
+  { description: 'Configured global in-flight concurrency cap G (KICI_INGEST_MAX_CONCURRENCY)' },
+  (r) => r.observe(_ingestLimits.maxConcurrency),
+);
+defineObservableGauge(
+  'kici_orch_ingest_max_queue_depth',
+  { description: 'Configured CoDel queue depth cap Q (KICI_INGEST_MAX_QUEUE_DEPTH)' },
+  (r) => r.observe(_ingestLimits.maxQueueDepth),
+);
+defineObservableGauge(
+  'kici_orch_ingest_org_max_concurrency',
+  {
+    description:
+      'Configured per-org fairness cap cluster default P (KICI_INGEST_ORG_MAX_CONCURRENCY)',
+  },
+  (r) => r.observe(_ingestLimits.orgMaxConcurrency),
+);
+defineObservableGauge(
+  'kici_orch_ingest_loop_lag_shed_ms',
+  { description: 'Configured loop-lag shed threshold L_shed (KICI_INGEST_LOOP_LAG_SHED_MS)' },
+  (r) => r.observe(_ingestLimits.loopLagShedMs),
+);
+defineObservableGauge(
+  'kici_orch_ingest_loop_lag_resume_ms',
+  {
+    description:
+      'Configured loop-lag hysteresis resume threshold L_resume (KICI_INGEST_LOOP_LAG_RESUME_MS)',
+  },
+  (r) => r.observe(_ingestLimits.loopLagResumeMs),
+);
+
+// ── Webhook ingest overflow buffer ────────────────────────────────
+//
+// Durable buffer for shed deliveries (migration 075). Counters are lazy;
+// the buffered-depth gauge reads a module-level value the buffer + replayer
+// update via setIngestOverflowBuffered().
+
+let _overflowBuffered = 0;
+
+/** Set the current buffered-row depth (called by the buffer + replayer). */
+export function setIngestOverflowBuffered(value: number): void {
+  _overflowBuffered = value;
+}
+
+/** Current buffered-row depth (test helper). */
+export function getIngestOverflowBuffered(): number {
+  return _overflowBuffered;
+}
+
+/** Reset overflow metric state (test helper). */
+export function resetIngestOverflowMetricState(): void {
+  _overflowBuffered = 0;
+}
+
+defineObservableGauge(
+  'kici_orch_ingest_overflow_buffered',
+  { description: 'Current webhook-ingest overflow buffer depth (buffered rows awaiting replay)' },
+  (r) => r.observe(_overflowBuffered),
+);
+// Config-sourced cap for the buffered-depth gauge above: the dashboard overlays
+// current-vs-limit (buffered / max) and the fullness ratio alert tracks the
+// deployed cap rather than a hardcoded threshold.
+defineObservableGauge(
+  'kici_orch_ingest_overflow_max',
+  { description: 'Configured overflow buffer row cap (KICI_INGEST_OVERFLOW_MAX)' },
+  (r) => r.observe(_ingestLimits.overflowMax),
+);
+
+/** Deliveries captured into the durable overflow buffer. */
+export const ingestOverflowCapturedTotal = lazyCounter('kici_orch_ingest_overflow_captured_total', {
+  description: 'Total shed webhook-ingest deliveries captured into the durable overflow buffer',
+});
+
+/** Buffered deliveries successfully replayed through normal ingest. */
+export const ingestOverflowReplayedTotal = lazyCounter('kici_orch_ingest_overflow_replayed_total', {
+  description: 'Total overflow-buffered deliveries successfully replayed through normal ingest',
+});
+
+/** Buffered deliveries permanently dropped. Labels: reason (cap_full|max_attempts). */
+export const ingestOverflowDroppedTotal = lazyCounter('kici_orch_ingest_overflow_dropped_total', {
+  description:
+    'Total overflow-buffered deliveries permanently dropped. Labels: reason (cap_full|max_attempts)',
+});
+
 // ── Webhook reception ─────────────────────────────────────────────
 
 /**
@@ -448,6 +686,19 @@ export const webhooksReceivedTotal = lazyCounter('kici_orch_webhooks_received_to
  */
 export const webhooksProcessedTotal = lazyCounter('kici_orch_webhooks_processed_total', {
   description: 'Total number of webhooks processed',
+});
+
+/**
+ * Org trust-policy gate decisions.
+ * Labels:
+ * - arm: which policy arm decided — workflow_modification | fork_pr | unknown_contributor | none (the PR passed)
+ * - action: pass | hold | reject
+ *
+ * Incremented once per evaluated PR event, including passes, so the ratio of
+ * gated to ungated PRs is visible rather than only the gated ones.
+ */
+export const trustPolicyDecisionsTotal = lazyCounter('kici_orch_trust_policy_decisions_total', {
+  description: 'Total org trust-policy gate decisions by arm and action',
 });
 
 // ── Trigger matching ──────────────────────────────────────────────
@@ -568,6 +819,8 @@ export const githubCheckRunTotal = lazyCounter('kici_orch_github_check_run_total
 
 /**
  * Total log chunks received from agents.
+ * Labels:
+ * - source: local (directly-connected agent) | peer (relayed by a worker orchestrator)
  */
 export const logChunksReceivedTotal = lazyCounter('kici_orch_log_chunks_received_total', {
   description: 'Total number of log chunks received from agents',
@@ -575,6 +828,8 @@ export const logChunksReceivedTotal = lazyCounter('kici_orch_log_chunks_received
 
 /**
  * Total log bytes written to storage backend.
+ * Labels:
+ * - source: local (directly-connected agent) | peer (relayed by a worker orchestrator)
  */
 export const logBytesStoredTotal = lazyCounter('kici_orch_log_bytes_stored_total', {
   description: 'Total bytes of log data written to storage',
@@ -675,7 +930,7 @@ export const crossSourceFanoutSize = lazyHistogram('kici_cross_source_fanout_siz
  *   provider bundle not found in registry)
  *
  * NOTE: dashboard panel for `kici_cross_source_errors_total` not yet added —
- * follow-up per .claude/rules/monitoring.md (out of scope for plan 28.4-02).
+ * follow-up per the dashboards 1:1 invariant in the monitoring rule.
  */
 export const crossSourceErrorsTotal = lazyCounter('kici_cross_source_errors_total', {
   description: 'Errors encountered during cross-source webhook dispatch',
@@ -904,6 +1159,70 @@ export const installSecretsTokenResolutionDurationSeconds = lazyHistogram(
   {
     description: 'Duration of per-environment secret resolution during install-secrets evaluation',
     advice: { explicitBucketBoundaries: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5] },
+  },
+);
+
+// ── Retention sweeps ─────────────────────────────────────────────
+
+/**
+ * Terminal dispatch_queue rows deleted by the retention sweep (the cleanup
+ * tick's `pruneTerminalDispatchRows`).
+ */
+export const dispatchQueueRowsPrunedTotal = lazyCounter(
+  'kici_orch_dispatch_queue_rows_pruned_total',
+  { description: 'Terminal dispatch_queue rows deleted by the retention sweep' },
+);
+
+/**
+ * Step-log objects deleted by the retention sweep (the cleanup tick's
+ * `pruneExpiredLogs`, S3 backend only).
+ */
+export const stepLogsPrunedTotal = lazyCounter('kici_orch_step_logs_pruned_total', {
+  description: 'Step-log objects deleted by the retention sweep',
+});
+
+/**
+ * `check_run_tracking` rows deleted by the retention sweep (the cleanup tick's
+ * `pruneStale`).
+ */
+export const checkRunTrackingRowsPrunedTotal = lazyCounter(
+  'kici_orch_check_run_tracking_rows_pruned_total',
+  { description: 'check_run_tracking rows deleted by the retention sweep' },
+);
+
+// ── Protocol version-skew diagnosability ──────────────────────────
+
+/**
+ * Unsupported-message NACKs the orchestrator SENT back to the Platform — an
+ * inbound frame whose type this orchestrator build does not understand
+ * (Platform is ahead). Labelled by `received_type`.
+ */
+export const wsUnsupportedMessageSentTotal = lazyCounter(
+  'kici_orch_ws_unsupported_message_sent_total',
+  {
+    description:
+      'NACKs sent to the Platform for an unrecognized inbound message type (version skew)',
+  },
+);
+
+/**
+ * NACKs the orchestrator RECEIVED from the Platform — the Platform could not
+ * process a frame we sent (this orchestrator is ahead). Labelled by
+ * `received_type`.
+ */
+export const wsNackReceivedTotal = lazyCounter('kici_orch_ws_nack_received_total', {
+  description: 'NACKs received from the Platform for a message it could not process (version skew)',
+});
+
+/**
+ * Feature-gated sends the orchestrator SUPPRESSED because the Platform advertised
+ * a capability set that lacks the required flag. Labelled by `capability` + `type`.
+ */
+export const wsPlatformCapabilityGapTotal = lazyCounter(
+  'kici_orch_ws_platform_capability_gap_total',
+  {
+    description:
+      'Feature-gated sends suppressed because the Platform does not advertise the capability',
   },
 );
 

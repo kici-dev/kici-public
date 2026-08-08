@@ -22,7 +22,16 @@ import {
   initTelemetry,
   toErrorMessage,
 } from '@kici-dev/shared';
-import { OrchRole, githubWebhookPath, type ActorPrincipal } from '@kici-dev/engine';
+import {
+  OrchRole,
+  githubWebhookPath,
+  PLATFORM_CONNECTED_MODES,
+  RELAY_INGRESS_MODES,
+  type ActorPrincipal,
+  type ExecutionJobStatus,
+} from '@kici-dev/engine';
+import { observedRelayVerify, observedRelayReject } from './webhook/observed-relay-guard.js';
+import { createDashboardCancelHandler } from './cancel/dashboard-cancel-handler.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // The six workspace dep fingerprints power the SDK drift diagnostic — compare
@@ -82,6 +91,7 @@ const {
   handleFleetPreviewRequest,
   handleFleetWorkflowsForHostRequest,
 } = await import('./ws/dashboard-fleet-handler.js');
+const { handleRunState } = await import('./ws/dashboard-run-state-handler.js');
 const { resolveWorkflowRunsOnAll } = await import('./ws/fleet-runs-on-all.js');
 const { ContextStore } = await import('./contexts/context-store.js');
 const { VariableStore } = await import('./contexts/variable-store.js');
@@ -93,6 +103,7 @@ const { PeerClient, PeerAuthCoordinator } = await import('./cluster/index.js');
 const { TrustResolver } = await import('./security/trust-resolver.js');
 const { ContributorCache } = await import('./security/contributor-cache.js');
 const { HeldRunStore } = await import('./contexts/held-runs.js');
+const { TrustPolicyStore } = await import('./security/trust-policy-store.js');
 const { StepApprovalBridge } = await import('./approvals/step-approval-bridge.js');
 const { GlobalWorkflowPolicy } = await import('./security/global-workflow-policy.js');
 const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
@@ -120,9 +131,26 @@ import { dispatchTestRelay } from './ws/test-relay-handlers.js';
 import type { ReleaseSignal } from './contexts/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import type { PeerClient as PeerClientT } from './cluster/peer-client.js';
+import {
+  tryResolveVerifiedIssuer,
+  verifiedIssuerCapabilityUpdate,
+} from './cluster/verified-issuer.js';
+import { startVerifiedIssuerPoller } from './cluster/verified-issuer-poller.js';
 import { verifyInboundWebhook } from './webhook/verify-inbound.js';
+import { deliveryFromRelay } from './webhook/ingest-overflow-types.js';
+import { buildRelayReinject } from './webhook/relay-reinject.js';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
+import {
+  createUnavailableSecretStore,
+  loadRoutableStores,
+  type ScopedSecretStore,
+} from './secrets/scope-routing.js';
+import type { AuditLogger } from './secrets/audit-logger.js';
 import type { DashboardWritePolicyMap } from '@kici-dev/engine/protocol/dashboard-write-operations';
+import {
+  dashboardEncryptionJwkSchema,
+  type DashboardEncryptionJwk,
+} from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 
 setServiceName('orchestrator');
 const logger = createLogger({ prefix: 'server' });
@@ -169,18 +197,28 @@ await guardStartup(logger, async () => {
   const config = loadConfig();
 
   // Worker mode: branch to worker bootstrap (separate lifecycle, no DB/Platform/Raft)
-  // Works from any entry point — workers don't care about KICI_MODE (platform/hybrid/independent)
+  // Works from any entry point — workers don't care about KICI_MODE
   if (config.cluster.role === 'worker') {
     const { bootstrapWorker } = await import('./worker-core.js');
     await bootstrapWorker(config, { otelSdk });
     return;
   }
 
-  if (config.mode !== 'platform' && config.mode !== 'hybrid') {
-    logger.error('server.ts requires KICI_MODE=platform or KICI_MODE=hybrid', {
+  if (!PLATFORM_CONNECTED_MODES.includes(config.mode)) {
+    logger.error(`server.ts requires KICI_MODE=${PLATFORM_CONNECTED_MODES.join('/')}`, {
       mode: config.mode,
     });
     process.exit(1);
+  }
+
+  // `observed` keeps the Platform WebSocket purely for observability + its
+  // observe-only source registration: it ingests only its OWN webhooks, so the
+  // relay callbacks below are wired to a refusing guard instead of the pipeline.
+  const relayEnabled = RELAY_INGRESS_MODES.includes(config.mode);
+  if (!relayEnabled) {
+    logger.info('Observed mode: serving own webhook ingress only, Platform relays are refused', {
+      mode: config.mode,
+    });
   }
 
   // Platform-specific state (closures captured by hooks)
@@ -191,6 +229,21 @@ await guardStartup(logger, async () => {
 
   const hooks: OrchestratorHooks = {
     logPrefix: 'server',
+
+    // Browser fan-out for step logs the coordinator persisted on behalf of a
+    // worker. The local-agent path forwards its own chunks from `app.ts`.
+    forwardLogChunk: (chunk) => {
+      platformClient.send({
+        type: 'log.chunk',
+        messageId: crypto.randomUUID(),
+        runId: chunk.runId,
+        jobId: chunk.jobId,
+        stepIndex: chunk.stepIndex,
+        lines: chunk.lines,
+        timestamp: chunk.timestamp,
+        ...(chunk.stream !== undefined && { stream: chunk.stream }),
+      });
+    },
 
     executionTrackerExtras: () => ({
       onExecutionStatusChange: (
@@ -212,6 +265,7 @@ await guardStartup(logger, async () => {
             runId,
             workflowName: context.workflowName,
             status,
+            ...(context.routingKey && { routingKey: context.routingKey }),
             repoIdentifier: context.repoIdentifier,
             ...(context.provider && { repoProvider: context.provider }),
             ...(context.localWorkingTree && { localWorkingTree: true }),
@@ -241,6 +295,7 @@ await guardStartup(logger, async () => {
             ...(failureReason !== undefined && { failureReason }),
             ...(logBytes !== undefined && { logBytes }),
             ...(initFailure && { initFailure }),
+            ...(context.failureClass && { failureClass: context.failureClass }),
           });
         } catch (err) {
           logger.warn('Failed to forward execution status to Platform', {
@@ -273,14 +328,10 @@ await guardStartup(logger, async () => {
             runId,
             jobId,
             jobName,
-            status: status as
-              | 'pending'
-              | 'running'
-              | 'success'
-              | 'failed'
-              | 'cancelled'
-              | 'skipped'
-              | 'timed_out_stale',
+            // Cast to the shared enum, never to a hand-listed union: the wire
+            // schema's field IS `ExecutionJobStatus`, so a literal list here
+            // silently goes stale every time a status joins the enum.
+            status: status as ExecutionJobStatus,
             timestamp,
             ...(startedAt !== undefined && { startedAt }),
             ...(completedAt !== undefined && { completedAt }),
@@ -317,10 +368,7 @@ await guardStartup(logger, async () => {
           // Extract top-level forward fields from data (merged there by app.ts).
           const secretsAccessed = data?.secretsAccessed as string[] | undefined;
           const concurrencyKind = data?.concurrencyKind as
-            | 'sequential'
-            | 'parallel-child'
-            | 'parallel-group'
-            | undefined;
+            'sequential' | 'parallel-child' | 'parallel-group' | undefined;
           const groupId = data?.groupId as string | undefined;
           const { secretsAccessed: _s, concurrencyKind: _c, groupId: _g, ...restData } = data ?? {};
           const hasRestData = Object.keys(restData).length > 0;
@@ -361,6 +409,23 @@ await guardStartup(logger, async () => {
           });
         }
       },
+      onOrchLog: (chunk) => {
+        // Best-effort live forward of orch/provisioning log lines to Platform,
+        // which fans them out to run-detail browser subscribers. A push failure
+        // must never break dispatch — persistence stays authoritative.
+        try {
+          platformClient.send({
+            type: 'orch-log.chunk',
+            ...chunk,
+          } as any);
+        } catch (err) {
+          logger.warn('Failed to forward orch log to Platform', {
+            runId: chunk.runId,
+            jobId: chunk.jobId,
+            error: toErrorMessage(err),
+          });
+        }
+      },
     }),
 
     onSecretsInitialized: ({ pgSecretStore, backendStores, db, auditLogger }) =>
@@ -368,7 +433,10 @@ await guardStartup(logger, async () => {
 
     onSubsystemsReady: async (sub) => {
       // Trust resolution state (updated by Platform push)
-      const contributorCache = new ContributorCache();
+      const contributorCache = new ContributorCache({
+        ttlMs: sub.config.contributorCacheTtlMs,
+        clusterSettings: sub.clusterSettings,
+      });
       const trustResolver = new TrustResolver(contributorCache);
       let identityLinks: IdentityLink[] = [];
       let orgMemberPermissions = new Map<string, PermissionLevel>();
@@ -382,6 +450,7 @@ await guardStartup(logger, async () => {
         },
       };
       const heldRunStore = new HeldRunStore(sub.db);
+      const trustPolicyStore = new TrustPolicyStore(sub.db);
 
       // Provider sources advertised to the Platform: GitHub-app sources
       // (SourceManager, DB-first) + servable generic-webhook sources. The same
@@ -437,8 +506,11 @@ await guardStartup(logger, async () => {
       // resolutions. The handler rebroadcasts `orch.capabilities.update`
       // to Platform via the WebSocket client.
       let policyChangeSubscriber:
-        | ((evt: { customerId: string; policy: DashboardWritePolicyMap }) => void)
-        | null = null;
+        ((evt: { customerId: string; policy: DashboardWritePolicyMap }) => void) | null = null;
+
+      // Installed once and lives for the process lifetime, like the policy
+      // subscriber above — the orchestrator is single-tenant.
+      let stopVerifiedIssuerPoller: (() => void) | null = null;
 
       // The inbound webhook delivery log writer is constructed by
       // orchestrator-core (so the cleanup scheduler can share it). The relay
@@ -450,7 +522,11 @@ await guardStartup(logger, async () => {
       const dashboardHandler = new DashboardHandler({
         db: sub.db,
         logStorage: sub.logStorage,
+        // Orchestrator-owned provenance issuer (when signing is configured) so
+        // the Platform surfaces it as `trustedIssuer` on attestations reads.
+        provenanceSigningIssuer: config.provenanceSigningIssuer ?? null,
         provenanceStorage: sub.cacheStorage,
+        artifactStore: sub.artifactStore,
         coldStore: sub.coldStore,
         eventStore: sub.eventStore,
         // Drains the deferred-attestation outbox in this process (owns the
@@ -520,55 +596,13 @@ await guardStartup(logger, async () => {
             requestId,
           );
         },
-        onCancel: async (runId, cancelledBy, cancelledByAgentLabel, force) => {
-          const jobIds = await sub.queue.getDispatchedJobIdsByRunId(runId);
-          let sent = 0;
-          const reason = cancelledBy
-            ? `run cancelled by ${cancelledBy}`
-            : 'run cancelled via dashboard';
-          for (const jobId of jobIds) {
-            const agentId = sub.dispatcher.getAgentIdForJob(jobId);
-            if (agentId) {
-              const entry = sub.agentRegistry.get(agentId);
-              if (entry?.ws) {
-                entry.ws.send(
-                  JSON.stringify({
-                    type: 'job.cancel',
-                    messageId: crypto.randomUUID(),
-                    runId,
-                    jobId,
-                    reason,
-                    ...(force && { force: true }),
-                  }),
-                );
-                sent++;
-              }
-            }
-          }
-
-          // Record cancelled_by in the DB
-          if (cancelledBy) {
-            try {
-              await sub.db
-                .updateTable('execution_runs')
-                .set({
-                  cancelled_by: cancelledBy,
-                  ...(cancelledByAgentLabel != null && {
-                    cancelled_by_agent_label: cancelledByAgentLabel,
-                  }),
-                })
-                .where('run_id', '=', runId)
-                .execute();
-            } catch (err) {
-              logger.warn('Failed to record cancelled_by', {
-                runId,
-                error: toErrorMessage(err),
-              });
-            }
-          }
-
-          return { cancelledJobs: sent };
-        },
+        onCancel: createDashboardCancelHandler({
+          db: sub.db,
+          jobQueue: sub.queue,
+          dispatcher: sub.dispatcher,
+          registry: sub.agentRegistry,
+          executionTracker: sub.executionTracker,
+        }),
       });
 
       // Create global workflow policy for org-level permission enforcement
@@ -598,6 +632,7 @@ await guardStartup(logger, async () => {
         executionTracker: sub.executionTracker,
         coordinator: sub.coordinator,
         secretResolver: sub.secretResolver ?? undefined,
+        sandboxAllowListReader: sub.sandboxAllowListReader,
         onSourceLocationsExtracted: (workflowName, jobName, locations) =>
           sub.sourceLocationStore.set(workflowName, jobName, locations),
         eventRouter: sub.eventRouter,
@@ -611,6 +646,8 @@ await guardStartup(logger, async () => {
         orgMemberPermissions,
         teamMembershipLookup,
         heldRunStore,
+        trustPolicyStore,
+        orchestratorMode: config.mode,
         contextStore,
         variableStore,
         globalWorkflowPolicy,
@@ -621,33 +658,33 @@ await guardStartup(logger, async () => {
         instanceId: config.instanceId,
         rosterGraceMs: config.rosterGraceMs,
         maxFanoutHosts: config.maxFanoutHosts,
+        clusterSettings: sub.clusterSettings,
       });
       let dashboardEnvSendFn: ((msg: unknown) => void) | null = null;
+      // The configured default-backend store. Falls back to the degraded store
+      // only when the orchestrator runs without a pg secret store at all (reads
+      // report no secrets, writes refuse), never to the registry's own
+      // synthesized PgSecretStore — see `loadRoutableStores`.
+      const dashboardSecretStore: ScopedSecretStore =
+        sub.pgSecretStore ?? createUnavailableSecretStore();
       const dashboardEnvHandler = new DashboardContextHandler({
         orgId: '__default__',
         send: (msg) => dashboardEnvSendFn?.(msg),
         contextStore,
         variableStore,
         bindingStore,
-        secretStore: sub.pgSecretStore ?? {
-          listScopes: async () => [],
-          listKeys: async () => [],
-          setSecret: async () => {},
-          deleteSecret: async () => {},
-        },
+        secretStore: dashboardSecretStore,
         loadBackendStores: sub.adminDeps?.backendRegistry
-          ? async () => {
-              const stores = await sub.adminDeps!.backendRegistry!.loadAllStores(
+          ? () =>
+              loadRoutableStores<ScopedSecretStore, AuditLogger>(
+                sub.adminDeps!.backendRegistry,
                 sub.adminDeps!.auditLogger,
-              );
-              if (!stores.has('pg') && sub.pgSecretStore) {
-                stores.set('pg', sub.pgSecretStore);
-              }
-              return stores;
-            }
+                dashboardSecretStore,
+              )
           : undefined,
         db: sub.db,
         accessLog: sub.accessLogWriter,
+        dashboardEncryption: sub.dashboardEncryption,
         approvals: {
           store: heldRunStore,
           teamMembershipLookup: (team: string) => teamMembershipLookup.getTeamMembers(team),
@@ -790,7 +827,8 @@ await guardStartup(logger, async () => {
               reason: result.reason,
             });
           },
-          onJobProgress: (msg, reply) => sub.coordinator.onPeerJobProgress(msg, reply),
+          onJobProgress: (msg, fromPeerId, reply) =>
+            sub.coordinator.onPeerJobProgress(msg, fromPeerId, reply),
           onJobCancel: (msg) => {
             if (!msg.jobId) return;
             const agentId = sub.dispatcher.getAgentIdForJob(msg.jobId);
@@ -911,6 +949,22 @@ await guardStartup(logger, async () => {
         s3LogAccess: !!sub.cacheStorage,
         queueTimeoutMs: config.queueTimeoutMs,
         orchCapabilities: { orchRole: OrchRole.enum.coordinator },
+        testMode: config.testMode,
+        testOmitDashboardRequestTypes: config.testOmitDashboardRequestTypes,
+        onAdmit: async (routingKey) => {
+          // Webhook-ingest admission for the WS relay path. Non-queueing
+          // (allowQueue:false) — Platform awaits this ack synchronously, so a
+          // queued admission risks the 5s ack timeout + spurious pool failover;
+          // shed instead and let the sender redeliver.
+          const { key, orgCap } = await sub.ingestCapReader.resolve(routingKey);
+          return sub.ingestController.admit(key, orgCap, { allowQueue: false });
+        },
+        onShedCapture:
+          config.ingestOverflowEnabled && sub.ingestOverflowBuffer
+            ? async (meta, body) => {
+                await sub.ingestOverflowBuffer.capture(deliveryFromRelay(meta, body));
+              }
+            : undefined,
         onOrgIdentified: ({ orgId, clusterId: cid }) => {
           // Auto-provision the `remote_sources` anchor (`remote:<orgId>`) so a
           // Platform-relayed `kici run remote` resolves the real tenant through
@@ -986,6 +1040,7 @@ await guardStartup(logger, async () => {
         onDashboardAttestationsListAll: (msg) => dashboardHandler.handleAttestationsListAll(msg),
         onDashboardAttestationGet: (msg) => dashboardHandler.handleAttestationGet(msg),
         onDashboardAttestationRetry: (msg) => dashboardHandler.handleAttestationRetry(msg),
+        onDashboardArtifactsList: (msg) => dashboardHandler.handleArtifactsList(msg),
         onRunRerun: (msg) => dashboardHandler.handleRerunRequest(msg),
         onManualSchedule: (msg) => dashboardHandler.handleManualScheduleRequest(msg),
         onRunCancel: (msg) => dashboardHandler.handleCancelRequest(msg),
@@ -1036,6 +1091,13 @@ await guardStartup(logger, async () => {
             });
             throw err;
           }
+        },
+        onDashboardRunState: async (msg) => {
+          // System reconciliation read for the Platform RunMirrorReconciler:
+          // project the current run state and reply. Deliberately NOT
+          // access-logged (a system read, not user data access).
+          const response = await handleRunState({ db: sub.db }, msg);
+          platformClient!.sendRaw(response);
         },
         onFleetHosts: async (msg) => {
           await runFleetRead(msg.requestId, msg.actor, 'hosts', () =>
@@ -1166,6 +1228,10 @@ await guardStartup(logger, async () => {
                   await dashboardHandler.handleEventLogList(dm);
                   return true;
                 }
+                if (dm.type === 'dashboard.event-log.activity') {
+                  await dashboardHandler.handleEventLogActivity(dm);
+                  return true;
+                }
                 if (dm.type === 'dashboard.event-log.detail') {
                   await dashboardHandler.handleEventLogDetail(dm);
                   return true;
@@ -1206,6 +1272,15 @@ await guardStartup(logger, async () => {
             msg as { type: string; requestId: string },
           ),
         onTrustPolicyUpdate: (msg) => {
+          // Fire-and-forget with an error log: the callback is synchronous and
+          // the in-memory identity state must still refresh even if the DB write
+          // fails. A stale policy row beats dropping the identity-link refresh.
+          void trustPolicyStore.upsertFromPlatform(msg.orgId, msg.policy).catch((err: unknown) =>
+            logger.error('Failed to persist pushed trust policy', {
+              orgId: msg.orgId,
+              error: toErrorMessage(err),
+            }),
+          );
           identityLinks = msg.identityLinks;
           orgMemberPermissions = new Map(Object.entries(msg.memberCiTrustLevels));
           teamMemberships = new Map(
@@ -1380,29 +1455,91 @@ await guardStartup(logger, async () => {
             }
           }
 
+          // Broadcast the browser-sealed-write trust anchors. Both are
+          // cluster-global (one orchestrator identity, one `.well-known`), so
+          // this is outside the per-org block above. The public encryption key
+          // is what feeds the Convenient tier — the dashboard reads it back
+          // from the control plane when no verified issuer is configured; the
+          // verified issuer, when set, tells the dashboard to fetch the key
+          // straight from the customer's own origin instead.
+          void (async () => {
+            let lastVerifiedIssuer: string | null = null;
+            const resolveKey = async () =>
+              dashboardEncryptionJwkSchema.safeParse(
+                (await sub.dashboardEncryption?.resolve())?.publicJwk,
+              );
+            const broadcast = async (key: { success: boolean; data?: unknown }) => {
+              // An unreadable knob OMITS the field: broadcastCapabilities merges,
+              // so the last known issuer survives a DB blip during a reconnect
+              // instead of being cleared back to the Convenient tier.
+              // `lastVerifiedIssuer` only advances on a real read, so an
+              // unreadable first read seeds the poller with null — which is
+              // exactly what the control plane sees at that point (this process
+              // has advertised no issuer yet), so the first readable tick still
+              // reports a configured issuer as a change and the tier heals
+              // within one poll interval. Holding cannot cover that window: a
+              // freshly started process has no last known issuer to hold, so a
+              // cold boot whose first read fails leaves the dashboard on the
+              // Convenient tier until that first readable tick.
+              const read = await tryResolveVerifiedIssuer(sub.clusterSettings);
+              if (read.ok) lastVerifiedIssuer = read.issuer;
+              platformClient.broadcastCapabilities({
+                ...(key.success
+                  ? { dashboardEncryptionKey: key.data as DashboardEncryptionJwk }
+                  : {}),
+                ...verifiedIssuerCapabilityUpdate(read),
+              });
+            };
+            try {
+              let key = await resolveKey();
+              await broadcast(key);
+              if (!stopVerifiedIssuerPoller) {
+                stopVerifiedIssuerPoller = startVerifiedIssuerPoller({
+                  reader: sub.clusterSettings,
+                  initial: lastVerifiedIssuer,
+                  // The WS heartbeat cadence: fast enough that an operator's
+                  // change lands in seconds, cheap enough to run forever.
+                  intervalMs: 30_000,
+                  onChange: (issuer) => {
+                    platformClient.broadcastCapabilities({ dashboardVerifiedIssuer: issuer });
+                  },
+                });
+              }
+              // Key generation is leader-gated, so on a cold boot it can land
+              // AFTER this connection is already up. Re-broadcast once it does:
+              // the upstream capability cache is otherwise only refreshed on the
+              // next reconnect, which would leave every `encrypted`-posture
+              // dashboard write fail-closed in the meantime.
+              for (
+                let attempt = 0;
+                !key.success && sub.dashboardEncryption && attempt < 120;
+                attempt++
+              ) {
+                await new Promise((res) => setTimeout(res, 500));
+                key = await resolveKey();
+                if (key.success) await broadcast(key);
+              }
+            } catch (err) {
+              logger.warn('Failed to broadcast dashboard encryption capabilities', {
+                error: toErrorMessage(err),
+              });
+            }
+          })();
+
           // Send state replay so Platform can reconcile execution_runs and execution_jobs.
           // The DB-backed variant adds terminal runs that completed before an orchestrator
           // crash/restart and so are no longer in memory — without this, Platform's
           // mirror table (and the kici_org_executions_count operator-aggregate gauge)
           // permanently undercounts after a crash. Bounded window (env override)
           // keeps the payload size reasonable after long downtime.
-          const replayWindowHoursRaw = Number(
-            process.env['KICI_ORCH_RECONNECT_REPLAY_WINDOW_HOURS'] ?? '24',
-          );
-          const replayWindowHours =
-            Number.isFinite(replayWindowHoursRaw) && replayWindowHoursRaw > 0
-              ? replayWindowHoursRaw
-              : 24;
+          const replayWindowHours = config.reconnectReplayWindowHours;
           try {
             const replayData = await sub.executionTracker.getReplayDataWithDb(replayWindowHours);
             if (replayData.length > 0) {
-              platformClient.send({
-                type: 'state.replay',
-                messageId: crypto.randomUUID(),
-                runs: replayData,
-                timestamp: Date.now(),
-              });
-              logger.info('Sent state replay to Platform', { runCount: replayData.length });
+              // Chunked, validated and paced by the client: the wire schema caps
+              // a frame at 500 runs, and an oversized frame is rejected with a
+              // 4003 close that reconnecting cannot clear.
+              await platformClient.sendStateReplay(replayData);
             }
           } catch (err) {
             logger.warn('Failed to send state replay to Platform', {
@@ -1415,6 +1552,7 @@ await guardStartup(logger, async () => {
           attestationRetrier?.triggerNow();
         },
         onVerifyInbound: async (meta, body) => {
+          if (!relayEnabled) return observedRelayVerify();
           if (!sub.pgSecretStore) {
             return {
               result: 'rejected_misconfigured',
@@ -1438,6 +1576,7 @@ await guardStartup(logger, async () => {
           );
         },
         onWebhookRelay: async (relay) => {
+          if (!relayEnabled) return observedRelayReject(logger, relay);
           const payload = relay.payload as Record<string, unknown>;
           const routingKey = relay.routingKey;
           // Look up the bundle FIRST; its normalizer.provider is authoritative.
@@ -1449,12 +1588,8 @@ await guardStartup(logger, async () => {
           const relayBundle = sub.providerRegistry.getByRoutingKey(routingKey);
           const provider =
             (relayBundle?.normalizer.provider as
-              | 'github'
-              | 'gitlab'
-              | 'bitbucket'
-              | 'generic'
-              | 'local'
-              | undefined) ?? (routingKey.split(':')[0] as 'github' | 'gitlab' | 'bitbucket');
+              'github' | 'gitlab' | 'bitbucket' | 'generic' | 'local' | undefined) ??
+            (routingKey.split(':')[0] as 'github' | 'gitlab' | 'bitbucket');
           const action = relay.action ?? null;
 
           const info = {
@@ -1492,6 +1627,41 @@ await guardStartup(logger, async () => {
           }
         },
       });
+
+      // Relay-origin overflow replay: re-verify each captured raw body against
+      // its stored headers, then re-inject through the admission-gated relay
+      // pipeline. Wired only when the overflow buffer + a secret store exist
+      // (verify needs the secret store); otherwise relay rows are not replayable
+      // and the replayer reverts them (a no-op fallback).
+      if (relayEnabled && config.ingestOverflowEnabled && sub.pgSecretStore) {
+        const secretStore = sub.pgSecretStore;
+        sub.ingestOverflowReplayer.setReinjectRelay(
+          buildRelayReinject({
+            admit: async (routingKey) => {
+              const { key, orgCap } = await sub.ingestCapReader.resolve(routingKey);
+              return sub.ingestController.admit(key, orgCap, { allowQueue: false });
+            },
+            verify: (d, body) =>
+              verifyInboundWebhook(
+                { db: sub.db, secretStore, genericSourceManager: sub.genericSourceManager },
+                {
+                  routingKey: d.routingKey,
+                  body,
+                  headers: d.meta.headers,
+                  signatureHeaderName: d.meta.signatureHeaderName,
+                  signatureHeader: d.meta.signatureHeader,
+                  clientIp: d.meta.clientIp,
+                },
+              ),
+            resolveProvider: (routingKey) => {
+              const bundle = sub.providerRegistry.getByRoutingKey(routingKey);
+              return bundle?.normalizer.provider ?? routingKey.split(':')[0]!;
+            },
+            process: (info) =>
+              processWebhook(info, { ...buildProcessingDeps(), eventLogSource: 'relay' }),
+          }),
+        );
+      }
 
       // Late-bind the public-alias resolver on the check-run emitter.
       // The reporter was constructed in orchestrator-core (before
@@ -1548,7 +1718,12 @@ await guardStartup(logger, async () => {
       // aggregator is built once in orchestrator-core (subsystems) and
       // shared with the HTTP /metrics scrape path via createApp deps.
       const metricsReporter = new MetricsReporter({
-        send: (msg) => platformClient.send(msg),
+        // Feature-gated: the periodic telemetry push rides the Platform→orchestrator
+        // capability pre-flight (`orchMetrics`). Backward-safe — a Platform that
+        // never advertises capabilities is treated as "supports it" and metrics
+        // still flow; only an advertised set that explicitly drops `orchMetrics`
+        // suppresses the push with a diagnosable capability-gap warning.
+        send: (msg) => platformClient.sendIfPlatformSupports('orchMetrics', msg),
         intervalMs: 30_000,
         agentMetricsAggregator: sub.agentMetricsAggregator,
       });
@@ -1650,6 +1825,7 @@ await guardStartup(logger, async () => {
                     'run_id',
                     'workflow_name',
                     'status',
+                    'routing_key',
                     'repo_identifier',
                     'provider',
                     'local_working_tree',
@@ -1666,6 +1842,7 @@ await guardStartup(logger, async () => {
                       run_id: row.run_id,
                       workflow_name: row.workflow_name,
                       status: row.status,
+                      routing_key: row.routing_key,
                       repo_identifier: row.repo_identifier,
                       provider: row.provider,
                       local_working_tree: row.local_working_tree,
@@ -1850,6 +2027,12 @@ await guardStartup(logger, async () => {
             label: 'Stopping attestation retrier',
             fn: () => {
               attestationRetrier?.stop();
+            },
+          },
+          {
+            label: 'Stopping verified-issuer poller',
+            fn: () => {
+              stopVerifiedIssuerPoller?.();
             },
           },
           {

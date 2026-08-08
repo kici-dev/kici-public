@@ -78,6 +78,31 @@ function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
   };
 }
 
+/**
+ * Split a generated unit file into `{ sectionName: directiveLines }`.
+ *
+ * systemd assigns each directive to the section header above it and drops
+ * directives that are not valid for that section, so an assertion that only
+ * checks whether a line appears *somewhere* in the file cannot tell a working
+ * unit from one systemd will silently ignore.
+ */
+function parseUnitSections(unit: string): Record<string, string[]> {
+  const sections: Record<string, string[]> = {};
+  let current: string | null = null;
+  for (const raw of unit.split('\n')) {
+    const line = raw.trim();
+    const header = /^\[([A-Za-z]+)\]$/.exec(line);
+    if (header) {
+      current = header[1]!;
+      sections[current] ??= [];
+      continue;
+    }
+    if (current === null || line === '' || line.startsWith('#')) continue;
+    sections[current]!.push(line);
+  }
+  return sections;
+}
+
 describe('systemd service manager', () => {
   let manager: SystemdServiceManager;
 
@@ -162,14 +187,44 @@ describe('systemd service manager', () => {
       expect(unit).not.toContain('Environment=PATH=/home/op/kici/service:');
     });
 
-    it('includes restart policy settings', () => {
+    it('puts the StartLimit* rate limit in [Unit] and Restart*/RestartSec in [Service]', () => {
       const config = makeConfig();
-      const unit = manager.generateUnitFile(config);
+      const sections = parseUnitSections(manager.generateUnitFile(config));
 
-      expect(unit).toContain('Restart=on-failure');
-      expect(unit).toContain('RestartSec=1s');
-      expect(unit).toContain('StartLimitBurst=5');
-      expect(unit).toContain('StartLimitIntervalSec=300');
+      // StartLimitIntervalSec= and StartLimitBurst= are [Unit] directives.
+      // systemd has no [Service].StartLimitIntervalSec key at all — it logs
+      // "Unknown key 'StartLimitIntervalSec' in section [Service], ignoring"
+      // and falls back to the manager-wide DefaultStartLimitIntervalSec (10s),
+      // so the configured window only takes effect from [Unit].
+      expect(sections.Unit).toContain('StartLimitBurst=5');
+      expect(sections.Unit).toContain('StartLimitIntervalSec=300');
+
+      // Restart= and RestartSec= are [Service] directives.
+      expect(sections.Service).toContain('Restart=on-failure');
+      expect(sections.Service).toContain('RestartSec=1s');
+
+      // No StartLimit* key may appear outside [Unit] — this is exactly the
+      // misplacement a section-agnostic `toContain` assertion cannot catch.
+      expect(sections.Service!.filter((l) => l.startsWith('StartLimit'))).toEqual([]);
+      expect(sections.Install!.filter((l) => l.startsWith('StartLimit'))).toEqual([]);
+
+      // ...and no Restart* key may leak into [Unit].
+      expect(sections.Unit!.filter((l) => /^Restart(Sec)?=/.test(l))).toEqual([]);
+    });
+
+    it('omits every restart-policy directive when the policy is disabled', () => {
+      const disabled: RestartPolicy = {
+        enabled: false,
+        delays: [1, 5, 15, 30],
+        maxRetries: 5,
+        windowSeconds: 300,
+      };
+      const sections = parseUnitSections(
+        manager.generateUnitFile(makeConfig({ restartPolicy: disabled })),
+      );
+
+      expect(sections.Unit!.filter((l) => l.startsWith('StartLimit'))).toEqual([]);
+      expect(sections.Service!.filter((l) => /^Restart(Sec)?=/.test(l))).toEqual([]);
     });
 
     it('includes security hardening directives', () => {

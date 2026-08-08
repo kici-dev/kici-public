@@ -7,7 +7,11 @@ With [direct GitHub webhook ingress](./github-ingress.md) enabled, webhook
 ingestion and full job processing are independent of the hosted KiCI Platform.
 A push triggers a build, the build runs, and logs stream back — all without the
 Platform in the path. This page states exactly which capabilities keep working
-when the Platform is offline, and names the one capability that does not.
+when the Platform is offline, and names the one capability that does not. That is
+the reliability reason to enable direct ingress even when you run the hosted
+Platform (hybrid mode): a Platform outage cannot stop a push from triggering a
+build. For the complementary view — everything the hosted Platform provides — see
+[What requires the hosted Platform](./platform-capabilities.md).
 
 ## What keeps working when the hosted Platform is offline
 
@@ -22,77 +26,35 @@ letting GitHub deliver straight to the orchestrator.
 The outcomes below are for "the hosted Platform is fully offline, direct GitHub
 ingress enabled":
 
-| Capability                                              | Platform-down with direct ingress                                                                                        |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Webhook ingestion (GitHub direct)                       | Works — GitHub delivers straight to the orchestrator                                                                     |
-| Signature verification                                  | Works — verified locally against the orchestrator's secret store                                                         |
-| Deduplication                                           | Works — atomic claim on the orchestrator's shared database                                                               |
-| Trigger matching / lock file                            | Works — evaluated locally against the compiled lock file                                                                 |
-| Job dispatch                                            | Works — the shared dispatch queue                                                                                        |
-| Agent execution + log streaming                         | Works — agent-to-orchestrator, no Platform hop                                                                           |
-| Cross-instance fan-out (clustered)                      | Works — shared queue + peer mesh; needs every instance to serve the ingress behind a load balancer                       |
-| Provenance / attestation minting                        | Deferred — the job completes green; the attestation is captured to a durable outbox and minted when the Platform returns |
-| Hosted dashboard / source registration via the Platform | Unavailable — use the local `kici-admin` CLI instead                                                                     |
-| Billing / quota                                         | Not applicable — direct-ingress events are quota-free                                                                    |
+| Capability                                   | Platform-down with direct ingress                                                                  |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Webhook ingestion (GitHub direct)            | Works — GitHub delivers straight to the orchestrator                                               |
+| Signature verification                       | Works — verified locally against the orchestrator's secret store                                   |
+| Deduplication                                | Works — atomic claim on the orchestrator's shared database                                         |
+| Trigger matching / lock file                 | Works — evaluated locally against the compiled lock file                                           |
+| Job dispatch                                 | Works — the shared dispatch queue                                                                  |
+| Agent execution + log streaming              | Works — agent-to-orchestrator, no Platform hop                                                     |
+| Cross-instance fan-out (clustered)           | Works — shared queue + peer mesh; needs every instance to serve the ingress behind a load balancer |
+| Provenance / attestation signing             | Works — the orchestrator mints + signs attestations with its own key (no Platform hop)             |
+| Hosted dashboard (run/source/settings views) | Unavailable — inspect runs, logs, and sources with the local `kici-admin` CLI instead              |
+| Billing / quota                              | Not applicable — direct-ingress events are quota-free                                              |
 
 ## The independence boundary
 
-The boundary is a single capability: **provenance attestation minting**.
+**Build provenance is not part of the boundary — it works with the Platform
+offline.** The orchestrator owns the provenance signing key: it mints and signs
+each attestation's identity token locally from its own run records, so a workflow
+that attests artifacts runs fully end-to-end — ingest, dispatch, execution, log
+streaming, and attestation signing — with the hosted Platform unreachable. There
+is no Platform hop in the build hot path. See [signing keys](./signing-keys.md)
+for how the orchestrator provisions and rotates its key, and the
+[provenance architecture](../../architecture/security/provenance.md) for the full
+lifecycle.
 
-- A workflow that does **not** mint provenance attestations runs fully
-  end-to-end with the Platform offline. Ingest, dispatch, execution, and log
-  streaming all complete locally.
-- A workflow that **does** mint attestations runs to completion — the job
-  executes and produces its outputs — and the attestation is **deferred**, not
-  lost. The one Platform-specific part of an attestation is the identity token
-  the hosted Platform's provenance issuer signs; everything the attestation
-  asserts is sealed on the agent at build time. When the mint fails because the
-  Platform is unreachable, the agent freezes and signs the statement, the
-  orchestrator captures it into a durable outbox, and the job stays green.
-
-The deferred attestation is minted automatically when the Platform returns — on
-the orchestrator's next retry sweep and immediately when its Platform connection
-re-authenticates — with no operator action. The later token binds to the frozen
-statement by its hash, so the identity cannot be re-bound to a different
-artifact, and the bundle is marked `deferred` so the temporal gap is disclosed.
-An operator can also drain the outbox on demand with
-`kici-admin attestations retry` (optionally scoped with `--run-id`). A run that
-was ingested while the Platform was fully down has its run and job records
-backfilled to the Platform before the mint, and its attestation is marked
-`offline-backfill`. Both markers still verify — `kici verify-attestation`
-surfaces them on a PASS. See the [provenance
-architecture](../../architecture/security/provenance.md) for the full lifecycle.
-
-### When a deferred attestation can never be minted
-
-A deferred mint fails **transiently** while the hosted Platform is unreachable —
-the row stays in the outbox with a bumped attempt count and its last error, and
-the next sweep retries it. But the Platform can also return a **definitive**
-rejection: it processed the mint request and found the run or job genuinely
-absent (for example, a run that was pruned before its attestation was ever
-minted). That is not a blip that a later retry will fix, so the row is marked
-**terminally rejected** — it stops being retried, drops out of the
-`kici_orch_pending_attestations_current` gauge, and keeps its row (with the
-rejection reason recorded as its last error) for audit.
-
-Terminally-rejected rows are counted by a separate gauge,
-`kici_orch_rejected_attestations_current`. A sustained non-zero value means one
-or more runs/jobs the hosted Platform can no longer find — investigate the
-Platform-side cause, and once it is fixed, re-arm the affected rows.
-
-To re-arm, pass `--include-rejected` to the drain command:
-
-```bash
-kici-admin attestations retry --include-rejected
-```
-
-This clears the terminal marker on previously-rejected rows and re-attempts them
-in the same drain (combine with `--run-id` to scope the re-arm to a single run).
-The command's summary line reports all three outcomes:
-
-```
-Minted 2 deferred attestation(s); 1 still pending; 0 rejected.
-```
+The remaining boundary is the **control plane**: the hosted dashboard, user
+identity and login, organizations / teams / roles, billing and quotas, and the
+webhook relay. Those are unavailable when the Platform is down; the execution
+core (including provenance signing) is not affected.
 
 ## Why direct ingestion does not change attestation trust
 

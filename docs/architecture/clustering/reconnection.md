@@ -165,7 +165,7 @@ Both layers use periodic heartbeats to detect stale connections. The client send
 
 ### Orchestrator upstream heartbeats
 
-The orchestrator sends a 30-second heartbeat upstream to KiCI; if the upstream side stops seeing heartbeats it marks the connection unhealthy at 90 seconds and closes it with code 4004 (HEARTBEAT_TIMEOUT) at 180 seconds.
+The orchestrator sends a 30-second heartbeat upstream to KiCI; if the upstream side stops seeing heartbeats it marks the connection unhealthy at 90 seconds and closes it with code 4004 (HEARTBEAT_TIMEOUT) at 180 seconds. A heartbeat that arrives before the close clears the unhealthy mark, so a connection that recovers from a transient stall is treated as connected again without reconnecting. These teardown thresholds are wider than the ones the health badges render against, because marking a connection unhealthy also removes it from routing while a badge only informs a reader.
 
 ### Orchestrator-Agent Heartbeats
 
@@ -224,7 +224,7 @@ When a connection is re-established after a disconnection:
 | Reconnect        | Automatic via exponential backoff                                                                                                                                                      |
 | In-progress jobs | Enter `recovering` state with per-job recovery timers (grace period = 2x max reconnect delay). Agent reconnects with in-flight job list, orchestrator reconciles and restores tracking |
 | Status updates   | Buffered with gap markers. On reconnect, gap marker inserted showing outage duration and buffered message counts, then buffer flushed                                                  |
-| Recovery timeout | If agent does not reconnect within grace period (default 120s), jobs permanently failed with error: "Job failed: agent lost during orchestrator restart (recovery timeout exceeded)"   |
+| Recovery timeout | If agent does not reconnect within grace period (default 120s), jobs permanently failed with error: "Job failed: agent disconnected and did not reconnect within the recovery window"  |
 | Upstream impact  | The orchestrator drops its upstream connection during the restart and re-authenticates on startup.                                                                                     |
 
 ### Network partition (temporary)
@@ -238,13 +238,13 @@ When a connection is re-established after a disconnection:
 
 ### Agent disconnect during job execution
 
-| Aspect           | Behavior                                                                                                                                                                             |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Detection        | Orchestrator receives WebSocket `close` event for the agent                                                                                                                          |
-| Job fate         | Jobs enter `recovering` state with per-job recovery timers. If agent reconnects within grace period (2x max reconnect delay), jobs resume. If not, jobs fail with timeout error      |
-| Recovery         | Agent reports in-flight jobs via `inFlightJobs` on `agent.register`. Orchestrator reconciles against DB state, cancels timers, restores tracking                                     |
-| Timeout behavior | Grace period expiry permanently fails jobs with: "Job failed: agent lost during orchestrator restart (recovery timeout exceeded)". Scaler notified to avoid spinning up replacements |
-| Log continuity   | Buffered logs replayed with gap marker showing outage duration and buffer stats. Original timestamps preserved                                                                       |
+| Aspect           | Behavior                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Detection        | Orchestrator receives WebSocket `close` event for the agent                                                                                                                           |
+| Job fate         | Jobs enter `recovering` state with per-job recovery timers. If agent reconnects within grace period (2x max reconnect delay), jobs resume. If not, jobs fail with timeout error       |
+| Recovery         | Agent reports in-flight jobs via `inFlightJobs` on `agent.register`. Orchestrator reconciles against DB state, cancels timers, restores tracking                                      |
+| Timeout behavior | Grace period expiry permanently fails jobs with: "Job failed: agent disconnected and did not reconnect within the recovery window". Scaler notified to avoid spinning up replacements |
+| Log continuity   | Buffered logs replayed with gap marker showing outage duration and buffer stats. Original timestamps preserved                                                                        |
 
 > See `packages/orchestrator/src/agent/dispatcher.ts` (`onAgentDisconnect`, `reconcileRecovery`) for the recovery timer behavior and [Agent Reconnection and Job Recovery](agent-reconnection.md) for the full protocol.
 
@@ -260,7 +260,7 @@ When a connection is re-established after a disconnection:
 
 ## See also
 
-- [Agent Reconnection and Job Recovery](agent-reconnection.md) -- full recovery protocol, state machine extension, gap markers, failure modes
+- [Agent Reconnection and Job Recovery](agent-reconnection.md) -- full recovery protocol, job recovery, gap markers, failure modes
 - [Job Execution Lifecycle](../execution/job-execution.md) -- how agents execute jobs (status reporting, log streaming)
 - [Protocol Messages](../protocol-messages.md) -- message schemas for auth, heartbeat, and relay
 - [Webhook Delivery Flow](../webhooks/webhook-delivery.md) -- end-to-end webhook trace including relay

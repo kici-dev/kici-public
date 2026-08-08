@@ -20,9 +20,31 @@
 import { build, RolldownMagicString } from 'rolldown';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { readFileSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import {
+  stageDir,
+  publishStagedDist,
+  pruneStaleArtifacts,
+  assertPublished,
+  pruneOrphanDeclarations,
+} from './lib/atomic-dist.mjs';
+import { builtinModules } from 'node:module';
 import { execSync } from 'node:child_process';
+
+/**
+ * The container-sandbox runner is delivered to the customer job container as a
+ * single file, so it must be self-contained: `zx` + `@kici-dev/*` (all pure JS)
+ * are inlined, and only `node:` built-ins stay external (present in any Node
+ * image). Every other entry keeps the default "all bare imports external"
+ * behavior because it runs where node_modules / the pnpm workspace is present.
+ */
+const BUNDLE_ENTRIES = new Set(['workflow-runner-bundle.js', 'container-ts-loader-hook.js']);
+const nodeBuiltinExternal = [
+  /^node:/,
+  ...builtinModules,
+  ...builtinModules.map((m) => `node:${m}`),
+];
 
 /**
  * Whether the bundled code references the CJS-style filename/dirname globals.
@@ -130,8 +152,9 @@ async function main() {
   const sharedMeta = readDepMeta('shared', { repoRoot, selfName: pkg.name });
   const engineMeta = readDepMeta('engine', { repoRoot, selfName: pkg.name });
 
-  // Clean dist/ before building (remove stale library-mode artifacts)
-  rmSync(path.join(cwd, 'dist'), { recursive: true, force: true });
+  // Build into a staging directory and move each entry onto its destination
+  // with an atomic rename, so a concurrent reader never sees a missing module.
+  const stage = stageDir(cwd);
 
   // ESM shim for modules that reference __filename/__dirname (e.g. peer cluster
   // code). It pulls in node:url + node:path, so it is prepended ONLY to entries
@@ -166,13 +189,23 @@ const __dirname = __cjs_dirname(__filename);
 
   for (const [outputFile, srcFile] of Object.entries(entries)) {
     const inputPath = path.join(cwd, srcFile);
-    const outputPath = path.join(cwd, 'dist', outputFile);
+    const outputPath = path.join(stage, outputFile);
+
+    // The self-contained container-sandbox bundles keep only node built-ins
+    // external; every other entry keeps all bare imports external.
+    const isBundleEntry = BUNDLE_ENTRIES.has(outputFile);
+    const externalForEntry = isBundleEntry ? nodeBuiltinExternal : [/^[^./]/];
 
     await build({
       input: inputPath,
       platform: 'node',
-      external: [/^[^./]/], // All bare imports external (npm deps + workspace packages)
-      treeshake: false,
+      external: externalForEntry, // Bundle entry: node builtins only; others: all bare imports
+      // Tree-shake ONLY the self-contained bundle: inlining `@kici-dev/*` +
+      // `zx` pulls in their barrels, so without shaking, unreached transitive
+      // deps (winston file-rotator, pg-native, aws-sdk) bloat the bundle and
+      // leave dynamic `require()`s that a bare job container cannot resolve.
+      // Every other entry keeps its bare imports external and stays unshaken.
+      treeshake: isBundleEntry,
       plugins: [conditionalCjsShimPlugin],
       transform: {
         define: {
@@ -205,6 +238,11 @@ const __dirname = __cjs_dirname(__filename);
     const sizeKB = (size / 1024).toFixed(1);
     console.log(`  ${outputFile} (${sizeKB} KB)`);
   }
+
+  const published = publishStagedDist(cwd);
+  assertPublished(cwd, published);
+  pruneStaleArtifacts(cwd, published);
+  pruneOrphanDeclarations(cwd);
 
   console.log(`Built ${Object.keys(entries).length} entry points to dist/`);
   // Emit baked workspace dep metadata so local builds make drift visible in one line.

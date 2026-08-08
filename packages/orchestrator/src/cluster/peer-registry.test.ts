@@ -510,6 +510,76 @@ describe('PeerRegistry', () => {
     });
   });
 
+  // ── clusterSettingsVersion tracking ─────────────────────────────────
+  describe('clusterSettingsVersion', () => {
+    const heartbeat = (clusterSettingsVersion?: number) => ({
+      type: 'peer.heartbeat' as const,
+      instanceId: 'orch-1',
+      term: 1,
+      leaderId: null,
+      draining: false,
+      agents: [],
+      capabilities: { s3LogAccess: false },
+      ...(clusterSettingsVersion !== undefined ? { clusterSettingsVersion } : {}),
+      timestamp: Date.now(),
+    });
+
+    it('should initialize clusterSettingsVersion to 0', () => {
+      registry.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      expect(registry.getPeer('orch-1')!.clusterSettingsVersion).toBe(0);
+    });
+
+    it('should update clusterSettingsVersion from heartbeat', () => {
+      registry.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      registry.updateHeartbeat('orch-1', heartbeat(5));
+      expect(registry.getPeer('orch-1')!.clusterSettingsVersion).toBe(5);
+    });
+
+    it('should treat missing clusterSettingsVersion as 0 (backward compat)', () => {
+      registry.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      registry.updateHeartbeat('orch-1', heartbeat());
+      expect(registry.getPeer('orch-1')!.clusterSettingsVersion).toBe(0);
+    });
+
+    it('fires onClusterSettingsVersionBehind when a peer is ahead, even from local 0', () => {
+      const callback = vi.fn();
+      const reg = new PeerRegistry({ onClusterSettingsVersionBehind: callback });
+      // localClusterSettingsVersion defaults to 0 — a worker must still pull.
+      reg.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      reg.updateHeartbeat('orch-1', heartbeat(5));
+      expect(callback).toHaveBeenCalledWith(5);
+    });
+
+    it('does NOT fire when the peer version equals local', () => {
+      const callback = vi.fn();
+      const reg = new PeerRegistry({ onClusterSettingsVersionBehind: callback });
+      reg.setLocalClusterSettingsVersion(3);
+      reg.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      reg.updateHeartbeat('orch-1', heartbeat(3));
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('does NOT fire when the peer version is 0 (legacy peer)', () => {
+      const callback = vi.fn();
+      const reg = new PeerRegistry({ onClusterSettingsVersionBehind: callback });
+      reg.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      reg.updateHeartbeat('orch-1', heartbeat(0));
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('stops firing after the local version catches up', () => {
+      const callback = vi.fn();
+      const reg = new PeerRegistry({ onClusterSettingsVersionBehind: callback });
+      reg.addPeer({ instanceId: 'orch-1', connectionId: 'c', address: null, routingKeys: [] });
+      reg.updateHeartbeat('orch-1', heartbeat(5));
+      expect(callback).toHaveBeenCalledTimes(1);
+      // Simulate a completed pull that advanced the local version.
+      reg.setLocalClusterSettingsVersion(5);
+      reg.updateHeartbeat('orch-1', heartbeat(5));
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ── registryVersion tracking ────────────────────────────────────────
 
   describe('registryVersion', () => {
@@ -1088,6 +1158,79 @@ describe('PeerRegistry', () => {
       // Empty required labels: a gated scaler cannot match.
       const matches = registry.findPeersWithCapacity([[]]);
       expect(matches).toHaveLength(0);
+    });
+
+    it('rejects an unqualified bare-metal job against a windows-tainted scaler', () => {
+      registry.addPeer({
+        instanceId: 'orch-win',
+        connectionId: 'conn-win',
+        address: null,
+        routingKeys: [],
+      });
+      registry.updateHeartbeat('orch-win', {
+        type: 'peer.heartbeat',
+        instanceId: 'orch-win',
+        term: 1,
+        leaderId: null,
+        draining: false,
+        agents: [],
+        capabilities: { s3LogAccess: false },
+        scalerCapacity: [
+          {
+            labelSets: [['windows', 'bare-metal']],
+            maxAgents: 2,
+            activeCount: 0,
+            mandatoryLabels: ['windows'],
+          },
+        ],
+        timestamp: Date.now(),
+      });
+
+      // An OS-agnostic bare-metal job must not land on the windows pool.
+      expect(registry.findPeersWithCapacity([['bare-metal']])).toHaveLength(0);
+      // An OS-qualified windows job is accepted.
+      const qualified = registry.findPeersWithCapacity([['windows', 'bare-metal']]);
+      expect(qualified).toHaveLength(1);
+      expect(qualified[0].instanceId).toBe('orch-win');
+    });
+
+    it('gates a structured-field windows pool whose plain label escapes the denylist', () => {
+      registry.addPeer({
+        instanceId: 'orch-win2022',
+        connectionId: 'conn-win2022',
+        address: null,
+        routingKeys: [],
+      });
+      // The pool's plain label is `windows-2022` (NOT in PLATFORM_TAINT_LABELS),
+      // but the orchestrator derived the taint from the structured `platform`
+      // field and advertises `mandatoryLabels: ['windows']` plus the matchable
+      // `windows` token injected into the labelSet. The peer registry reads the
+      // advertised gate verbatim, so the cross-peer gate is provenance-agnostic.
+      registry.updateHeartbeat('orch-win2022', {
+        type: 'peer.heartbeat',
+        instanceId: 'orch-win2022',
+        term: 1,
+        leaderId: null,
+        draining: false,
+        agents: [],
+        capabilities: { s3LogAccess: false },
+        scalerCapacity: [
+          {
+            labelSets: [['windows-2022', 'bare-metal', 'windows']],
+            maxAgents: 2,
+            activeCount: 0,
+            mandatoryLabels: ['windows'],
+          },
+        ],
+        timestamp: Date.now(),
+      });
+
+      // An unqualified bare-metal job must not land on the structured windows pool.
+      expect(registry.findPeersWithCapacity([['bare-metal']])).toHaveLength(0);
+      // An OS-qualified windows job is accepted via the advertised taint + token.
+      const qualified = registry.findPeersWithCapacity([['windows', 'bare-metal']]);
+      expect(qualified).toHaveLength(1);
+      expect(qualified[0].instanceId).toBe('orch-win2022');
     });
   });
 

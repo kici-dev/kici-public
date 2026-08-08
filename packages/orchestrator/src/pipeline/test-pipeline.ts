@@ -142,8 +142,7 @@ export function repoIdentityFromInlineInput(input: TestTriggerInput): {
   provider: string;
 } {
   const repository = input.event.payload?.repository as
-    | { full_name?: string; provider?: string }
-    | undefined;
+    { full_name?: string; provider?: string } | undefined;
   return {
     repoIdentifier: repository?.full_name ?? 'local/unknown',
     provider: repository?.provider ?? 'local',
@@ -188,8 +187,7 @@ async function resolveLockFileForTest(
   // For GitHub provider, full_name is 'owner/repo' used for API calls.
   // Falls back to routing key if payload doesn't include repository info.
   const repository = input.event.payload?.repository as
-    | { full_name?: string; owner?: { login?: string }; name?: string }
-    | undefined;
+    { full_name?: string; owner?: { login?: string }; name?: string } | undefined;
   const repoIdentifier =
     repository?.full_name ??
     (repository?.owner?.login && repository?.name
@@ -467,6 +465,13 @@ function buildTestDispatchContext(
     lockFileSource: undefined,
     localWorkingTree: shared.input.inlineLockFile != null,
     crossSource: false,
+    // `kici run` is operator-initiated against a synthetic event, so there is
+    // no pull-request provenance for the org trust policy to evaluate: no
+    // external contributor, no fork, no base-vs-head workflow diff. The
+    // centralized evaluator returns `pass` for exactly this shape (it
+    // short-circuits on a non-PR event), so stating it here is the same
+    // verdict, not a bypass.
+    securityDecision: { action: 'pass' },
     extraJobConfig: shared.extraJobConfig,
     testRun: { fixtureId: shared.input.fixtureId },
     ...(shared.input.target && { target: shared.input.target }),

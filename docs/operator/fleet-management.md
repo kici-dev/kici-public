@@ -3,16 +3,11 @@ title: Fleet management
 description: View and manage your organization's declared host fleet from the dashboard
 ---
 
-Fleet management lets an organization view and manage its declared host fleet from the dashboard: a roster of every declared host, per-host detail, and controls to declare or remove hosts. It is turned on per organization from organization settings.
-
-## The activation toggle
-
-
-The activation toggle lives in the organization's settings under **Fleet management**. Turning it on makes the **Fleet** section available; turning it off hides it again.
+Fleet management lets an organization view and manage its declared host fleet from the dashboard: a roster of every declared host, per-host detail, and controls to declare or remove hosts. It is always available; who can see and manage the fleet is governed by the `fleet` permission.
 
 ## The fleet view
 
-Once fleet management is enabled for an organization, a **Fleet** section appears in the dashboard for members who hold the `fleet:read` permission (Owners by default). It surfaces the declared host fleet read-only — viewing the fleet never changes it.
+A **Fleet** section appears in the dashboard for members who hold the `fleet:read` permission (Owners by default). It surfaces the declared host fleet read-only — viewing the fleet never changes it.
 
 ### Roster
 

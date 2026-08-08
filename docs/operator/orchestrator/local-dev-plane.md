@@ -14,15 +14,38 @@ use and stays warm for subsequent runs.
 
 ## Commands
 
-| Command                        | What it does                                                                                                                          |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `kici local up`                | Start the plane, or return the already-running one (idempotent). Prints the orchestrator URL and control commands.                    |
-| `kici local status`            | Report whether the plane is running, its port, pid, and Postgres backend.                                                             |
-| `kici local down`              | Stop the orchestrator and Postgres, and clear the plane's pidfile and stamp.                                                          |
-| `kici local logs`              | Print the path of the plane orchestrator's log file.                                                                                  |
-| `kici local attach`            | Attach the plane to the hosted Platform (hybrid), so `kici run --local` uses real Platform-minted OIDC and attestation.               |
-| `kici local detach`            | Detach the plane from the Platform and return it to offline (independent) mode.                                                       |
-| `kici local trust-root <file>` | Export the plane's dev-signed identity trust root (`{ issuer, jwks }`) to a file, for offline `kici verify-attestation --trust-root`. |
+| Command                        | What it does                                                                                                                                                                                                                                        |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kici local up`                | Start the plane, or return the already-running one (idempotent). Prints the orchestrator URL and control commands. Fails with the reason the port could not be freed, rather than booting over a still-held port and reporting a readiness timeout. |
+| `kici local status`            | Report whether the plane is serving, its port, pid, and Postgres backend. A plane that is running but not ready is reported as such, with its readiness checks, rather than as stopped.                                                             |
+| `kici local down`              | Stop the orchestrator and Postgres and confirm the port was released before reporting success. Exits non-zero, naming the process still holding the port, when it cannot free it.                                                                   |
+| `kici local logs`              | Print the path of the plane orchestrator's log file.                                                                                                                                                                                                |
+| `kici local attach`            | Attach the plane to the hosted Platform (hybrid), so `kici run --local` uses real Platform-minted OIDC and attestation.                                                                                                                             |
+| `kici local detach`            | Detach the plane from the Platform and return it to offline (independent) mode.                                                                                                                                                                     |
+| `kici local trust-root <file>` | Export the plane's dev-signed identity trust root (`{ issuer, jwks }`) to a file, for offline `kici verify-attestation --trust-root`.                                                                                                               |
+
+### Machine-readable status
+
+`kici local status --json` prints one object and exits 0 for every state, so a
+consumer reads the state from the payload rather than from the exit code:
+
+```bash
+$ kici local status --json
+{"state":"ready","running":true,"pid":3768093,"port":4319,
+ "url":"http://127.0.0.1:4319","pgKind":"embedded","stampVersion":3,
+ "mode":"independent"}
+```
+
+`state` is one of `stopped`, `ready`, `unready`, `foreign-kici`,
+`foreign-unknown`. This is the supported way for host tooling to ask whether a
+plane is alive — prefer it over reading the state directory's stamp file, whose
+layout is internal and changes with the stamp version. The key set is a fixed
+allow-list that excludes the plane's admin token, so the output is safe to log.
+
+Every key is always present, but only `state`, `running` and `mode` always carry
+a value. The rest are `null` whenever the plane cannot supply them: for
+`stopped` that is all of them, and `stampVersion` is populated only for `ready`.
+Read them defensively (`jq -r '.pid // empty'`), not as guaranteed values.
 
 ## PostgreSQL: embedded, with a Podman fallback
 
@@ -45,14 +68,14 @@ deployment.
 The plane persists its state under `~/.kici/local/` (or `$KICI_CONFIG_DIR/local` when
 `KICI_CONFIG_DIR` is set):
 
-| Path                             | Contents                                                                      |
-| -------------------------------- | ----------------------------------------------------------------------------- |
-| `~/.kici/local/pgdata/`          | Embedded PostgreSQL data directory (persistent across restarts).              |
-| `~/.kici/local/plane.pid`        | Orchestrator process id.                                                      |
-| `~/.kici/local/stamp.json`       | Boot record: pid, port, Postgres backend, `kici` version, layout version.     |
-| `~/.kici/local/orchestrator.log` | Orchestrator log (printed by `kici local logs`).                              |
-| `~/.kici/local/dev-identity/`    | Dev-signed identity keypair (private JWK at mode 0600, published public JWK). |
-| `~/.kici/local/cache/`           | Filesystem cache + provenance bundle store for offline runs.                  |
+| Path                             | Contents                                                                                |
+| -------------------------------- | --------------------------------------------------------------------------------------- |
+| `~/.kici/local/pgdata/`          | Embedded PostgreSQL data directory (persistent across restarts).                        |
+| `~/.kici/local/plane.pid`        | Orchestrator process id.                                                                |
+| `~/.kici/local/stamp.json`       | Boot record: pid, port, Postgres backend, `kici` version, build commit, layout version. |
+| `~/.kici/local/orchestrator.log` | Orchestrator log (printed by `kici local logs`).                                        |
+| `~/.kici/local/dev-identity/`    | Dev-signed identity keypair (private JWK at mode 0600, published public JWK).           |
+| `~/.kici/local/cache/`           | Filesystem cache + provenance bundle store for offline runs.                            |
 
 Default ports are `4319` for the orchestrator (HTTP + WebSocket) and `45432` for Postgres,
 overridable via `KICI_LOCAL_ORCH_PORT` and `KICI_LOCAL_PG_PORT`.
@@ -130,10 +153,19 @@ for the full trust model.
 
 ## Staleness on upgrade
 
-The plane stamps the `kici` version and an on-disk layout version each time it boots. On the
-next `kici local up` after a `kici` upgrade:
+The plane stamps the `kici` build identity — its version **and** its git build commit — plus
+an on-disk layout version each time it boots. On the next `kici local up` **or**
+`kici run --local`, a running plane whose stamped build identity differs from the current
+`kici` build is self-healing:
 
-- **Compatible layout, newer `kici` version** — the data directory is kept and the
-  orchestrator runs any pending schema migrations on boot.
+- **Different build identity, compatible layout** — a running plane booted from a different
+  `kici` build (a version bump, or a different build commit at the same version) is torn down
+  and rebooted from the current build, **keeping** its data directory; the orchestrator runs
+  any pending schema migrations on boot. This is what stops a plane left over from an earlier
+  build from serving runs at a stale version.
 - **Incompatible layout version** — the plane is torn down, its data directory is wiped, and
   a fresh plane is booted, so the plane never runs against a schema it cannot understand.
+- **Same build identity** — the running plane is reused as-is.
+
+Running `kici` from an unbuilt source tree (no concrete build identity) never triggers a
+reboot, so a source-context run reuses whatever plane is healthy.

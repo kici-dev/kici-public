@@ -116,7 +116,7 @@ With a single-dimension matrix, the current value is available as `matrix.value`
 
 ### Multi-dimensional matrix
 
-Use an object to define multiple dimensions. KiCI expands all combinations (capped at 256):
+Use an object to define multiple dimensions. KiCI expands all combinations (capped at 256, and each combination must be unique — a repeated value fails the job rather than running it twice):
 
 ```typescript
 const test = job('test', {
@@ -167,7 +167,9 @@ const test = job('test', {
 });
 ```
 
-Exclude is applied first (removes matching combinations), then include adds additional entries.
+Exclude is applied first (removes matching combinations), then include adds additional entries. An
+include entry's values appear in the child job name ordered by dimension name, whichever order you
+write the keys in — see [Include and exclude](../sdk/rules-matrix-dynamic.md#include-and-exclude).
 
 ### Dynamic matrix
 

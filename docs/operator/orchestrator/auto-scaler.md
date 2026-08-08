@@ -55,7 +55,7 @@ For multi-file configurations, also set `KICI_SCALER_CONFIG_DIR=/etc/kici/scaler
 ## See also
 
 - [Agent execution security](../security/agent-security.md) — how each backend confines customer workflow code; read this before exposing a scaler to untrusted workloads.
-- [Firecracker setup guide](firecracker-setup.md) — Firecracker host setup, rootfs building, networking, troubleshooting.
+- [Firecracker host setup](firecracker/host-setup.md) — Firecracker host provisioning, networking, jailer, IP allocation, troubleshooting.
 - [Configuration reference](configuration.md) — orchestrator environment variables including `KICI_SCALER_CONFIG_PATH` and `KICI_SCALER_CONFIG_DIR`.
 - [Architecture overview](../../architecture/overview.md) — three-tier relay model and component responsibilities.
 - [Agent configuration](../agent/configuration.md) — environment variables for agents connecting to the orchestrator.

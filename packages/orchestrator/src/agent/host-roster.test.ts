@@ -8,6 +8,7 @@ import {
   HostRosterStore,
   HostStatus,
   parseHostProperties,
+  stripReservedProperties,
 } from './host-roster.js';
 import type { LabelMatcher } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
@@ -165,7 +166,7 @@ describeDb('HostRosterStore', () => {
     expect(JSON.parse(row!.labels)).toEqual(['role:web']);
   });
 
-  it('declareStatic persists reach metadata and getReach reads it back', async () => {
+  it('declareStatic persists reach metadata (incl. s3Reachable) and getReach reads it back', async () => {
     await store.declareStatic({
       agentId: 'box-00007',
       labels: ['role:fresh'],
@@ -173,6 +174,7 @@ describeDb('HostRosterStore', () => {
       sshUser: 'root',
       sshPort: 2222,
       sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: true,
     });
     expect(await store.getReach('box-00007')).toEqual({
       agentId: 'box-00007',
@@ -180,6 +182,7 @@ describeDb('HostRosterStore', () => {
       sshUser: 'root',
       sshPort: 2222,
       sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: true,
     });
   });
 
@@ -191,6 +194,7 @@ describeDb('HostRosterStore', () => {
       sshUser: null,
       sshPort: null,
       sshKeySecret: null,
+      s3Reachable: null,
     });
   });
 
@@ -264,6 +268,7 @@ describeDb('HostRosterStore', () => {
       sshUser: 'root',
       sshPort: 2222,
       sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: null,
     });
   });
 
@@ -453,6 +458,29 @@ describeDb('HostRosterStore', () => {
       expect(row?.host_properties).toEqual({ region: 'eu', cores: 8, gpu: true });
     });
 
+    it('SECURITY: an agent register cannot forge orchestrator-reserved kici: keys', async () => {
+      // Orchestrator records the staged version + a restart command.
+      await store.upsert(baseUpsert({ properties: { region: 'eu' } }));
+      await store.recordStagedVersion('h1', '1.0.0');
+      // A malicious agent re-registers trying to forge the reserved keys.
+      await store.upsert(
+        baseUpsert({
+          properties: {
+            region: 'us',
+            'kici:staged-agent-version': '2.0.0',
+            'kici:agent-restart-start': 'rm -rf /',
+          },
+        }),
+      );
+      const row = await store.get('h1');
+      // Reserved keys are untouched by the agent; only the non-reserved key merged.
+      expect(row?.host_properties).toEqual({
+        region: 'us',
+        'kici:staged-agent-version': '1.0.0',
+      });
+      expect(await store.getStagedVersion('h1')).toBe('1.0.0');
+    });
+
     it('declareStatic sets properties to the provided bag (default {})', async () => {
       await store.declareStatic({
         agentId: 'd1',
@@ -499,6 +527,24 @@ describeDb('HostRosterStore', () => {
       expect(entry?.properties).toEqual({ gpu: true });
       expect(await store.getInventory('missing', grace)).toBeNull();
     });
+  });
+});
+
+// stripReservedProperties is a pure function — test it without a DB.
+describe('stripReservedProperties', () => {
+  it('drops every kici:-namespaced key, keeps the rest', () => {
+    expect(
+      stripReservedProperties({
+        region: 'eu',
+        cores: 8,
+        'kici:staged-agent-version': '2.0.0',
+        'kici:agent-restart-start': 'rm -rf /',
+        'kici:agent-service': 'evil',
+      }),
+    ).toEqual({ region: 'eu', cores: 8 });
+  });
+  it('is a no-op on a bag with no reserved keys', () => {
+    expect(stripReservedProperties({ region: 'us' })).toEqual({ region: 'us' });
   });
 });
 

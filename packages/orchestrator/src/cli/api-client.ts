@@ -192,11 +192,17 @@ export class AdminApiClient {
 
   // --- Scoped secret management ---
 
-  async listScopes(orgId: string): Promise<{ scopes: string[] }> {
-    return this.request<{ scopes: string[] }>(
-      'GET',
-      `/api/v1/admin/secrets/scopes?orgId=${encodeURIComponent(orgId)}`,
-    );
+  /**
+   * List secret scopes for an org.
+   *
+   * @param allBackends - Aggregate every registered backend and return scopes
+   *   in qualified `<backend>:<path>` form. Default (false) returns the bare,
+   *   pg-only listing; that default flips at v1.0.0.
+   */
+  async listScopes(orgId: string, allBackends = false): Promise<{ scopes: string[] }> {
+    const params = new URLSearchParams({ orgId });
+    if (allBackends) params.set('allBackends', 'true');
+    return this.request<{ scopes: string[] }>('GET', `/api/v1/admin/secrets/scopes?${params}`);
   }
 
   async listKeys(orgId: string, scope: string): Promise<{ keys: string[] }> {
@@ -308,11 +314,15 @@ export class AdminApiClient {
     reEncrypted: number;
     reEncryptedConfigs: number;
     skippedConfigs: number;
+    reEncryptedBackends: number;
+    skippedBackends: number;
   }> {
     return this.request<{
       reEncrypted: number;
       reEncryptedConfigs: number;
       skippedConfigs: number;
+      reEncryptedBackends: number;
+      skippedBackends: number;
     }>('POST', '/api/v1/admin/rotate-key');
   }
 
@@ -454,6 +464,8 @@ export class AdminApiClient {
     label: string;
     role: string;
     routingKey?: string;
+    /** Optional absolute expiry as an ISO datetime string. */
+    expiresAt?: string;
   }): Promise<{ token: string; id: string }> {
     return this.request<{ token: string; id: string }>('POST', '/api/v1/admin/tokens', data);
   }
@@ -568,6 +580,25 @@ export class AdminApiClient {
       'POST',
       '/admin/config/reload',
       opts,
+    );
+  }
+
+  // --- Coordinator drain (pre-upgrade quiescing) ---
+
+  /** Flip the coordinator drain flag on ('drain') or off ('resume'). */
+  async drain(action: 'drain' | 'resume'): Promise<{ draining: boolean; jobsRunning: number }> {
+    return this.request<{ draining: boolean; jobsRunning: number }>(
+      'POST',
+      '/api/v1/admin/orchestrator/drain',
+      { action },
+    );
+  }
+
+  /** Report the coordinator's current drain state without changing it. */
+  async drainStatus(): Promise<{ draining: boolean; jobsRunning: number }> {
+    return this.request<{ draining: boolean; jobsRunning: number }>(
+      'GET',
+      '/api/v1/admin/orchestrator/drain',
     );
   }
 

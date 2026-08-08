@@ -19,7 +19,12 @@
  * handler's `ws.send` is skipped (the socket is gone) and the hold is left for
  * the stale detector / a manual decision.
  */
-import { HoldScope, TriggerSource, type ApprovalRequirement } from '@kici-dev/engine';
+import {
+  HoldScope,
+  TriggerSource,
+  approvalTimeoutSecondsSchema,
+  type ApprovalRequirement,
+} from '@kici-dev/engine';
 
 import type { HeldRunStore } from '../contexts/held-runs.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
@@ -86,6 +91,15 @@ export class StepApprovalBridge {
   async request(
     req: StepApprovalRequest,
   ): Promise<{ outcome: StepApprovalOutcome; reason?: string }> {
+    if (
+      req.timeoutSeconds !== undefined &&
+      !approvalTimeoutSecondsSchema.safeParse(req.timeoutSeconds).success
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: `approval timeout must be a positive integer number of seconds, got ${req.timeoutSeconds}`,
+      };
+    }
     const orgId = this.deps.resolveOrgId();
     const expirySeconds = req.timeoutSeconds ?? (await this.deps.resolveExpirySeconds(orgId));
     const expiresAt = new Date(Date.now() + expirySeconds * 1000).toISOString();

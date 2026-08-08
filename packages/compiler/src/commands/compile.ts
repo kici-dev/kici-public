@@ -6,15 +6,44 @@ import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import { PackageManager, detectPackageManagerSync } from '@kici-dev/core/package-manager';
 import { discoverWorkflows, resolveKiciDir } from '../execution/index.js';
-import { validateConfig } from '../validation/index.js';
+import { validateConfig, runTypecheck } from '../validation/index.js';
 import {
   generateLockFile,
   serializeLockFile,
   detectGitRoot,
   computeLockfileHash,
+  collectWorkflowPurityWarnings,
+  schemaWindowWarning,
+  type JobPurityWarning,
 } from '../lockfile/index.js';
-import { formatError, isCompilerError } from '../errors/index.js';
-import type { LockFile } from '../types.js';
+import {
+  formatError,
+  isCompilerError,
+  compilerError,
+  DiagnosticSeverity,
+  PURITY_FALLBACK_CODE,
+} from '../errors/index.js';
+import { SCHEMA_VERSION, BREAKING_FLOOR, type LockFile } from '../types.js';
+
+/**
+ * Render an impure dynamic-value function as a `W101` compile warning naming the
+ * job, the field, the impurity reason, and the ~5-10s agent-side init-job cost.
+ */
+function formatPurityWarning(w: JobPurityWarning): string {
+  return formatError(
+    compilerError(
+      PURITY_FALLBACK_CODE,
+      `job "${w.jobName}": ${w.field} function is not pure (${w.reason}). ` +
+        'An init job will be required, adding ~5-10s delay.',
+      {
+        severity: DiagnosticSeverity.Warning,
+        suggestion:
+          `Make the ${w.field} function pure (synchronous, referencing only its parameters) ` +
+          'to inline it and skip the init job. See https://docs.kici.dev — dynamic values.',
+      },
+    ),
+  );
+}
 
 /** Options for the compile command */
 export interface CompileOptions {
@@ -110,11 +139,8 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       logger.debug(pc.dim(`Found ${workflowsWithSource.length} workflow(s) in ${workflowDir}`));
     }
 
-    // Extract just workflows for validation (source info not needed)
-    const workflows = workflowsWithSource.map((w) => w.workflow);
-
-    // 2. Validate the workflows
-    const validation = validateConfig(workflows, workflowDir);
+    // 2. Validate the workflows (source-carrying, for real error locations)
+    const validation = validateConfig(workflowsWithSource);
 
     if (!validation.valid) {
       // Print all errors
@@ -131,6 +157,21 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     // 3. Generate lock file (with source tracking for better references)
     const lockFile = generateLockFile(workflowsWithSource);
     const lockJson = serializeLockFile(lockFile);
+
+    // Surface impure dynamic-value functions that force an agent-side __init__ job.
+    // Rendered via logger.warn (with a coloured `warn` level prefix) regardless of
+    // --quiet, since the init-job cost is important enough for the author to always see.
+    for (const warning of collectWorkflowPurityWarnings(workflowsWithSource)) {
+      logger.warn(formatPurityWarning(warning));
+    }
+
+    // Informational: when the current schema version is itself breaking, warn
+    // that orchestrators older than it cannot read this lock. Silent otherwise
+    // (older orchestrators down to the breaking floor still read it).
+    const windowWarning = schemaWindowWarning(BREAKING_FLOOR, SCHEMA_VERSION);
+    if (windowWarning) {
+      logger.warn(pc.yellow(windowWarning));
+    }
 
     // 4. Write lock file (unless --check)
     if (!options.check) {
@@ -165,14 +206,26 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
           pc.yellow('Could not refresh types (Platform unreachable). Compilation succeeded.'),
         );
       }
-    } else if (!options.quiet) {
-      logger.info(
-        pc.green('✓') +
-          ` Workflows are valid` +
-          pc.dim(
-            ` (${workflowsWithSource.length} workflow${workflowsWithSource.length !== 1 ? 's' : ''})`,
-          ),
-      );
+    } else {
+      // --check: additionally run a tsc --noEmit type-check over the workflow
+      // sources so type-broken workflows surface their errors at compile time.
+      const tc = await runTypecheck(absoluteKiciDir);
+      if (tc.errors.length > 0) {
+        for (const error of tc.errors) logger.error(formatError(error));
+        return false;
+      }
+      if (!tc.ran && !options.quiet) {
+        logger.info(pc.dim('Type-check skipped (no tsconfig.json — JavaScript mode)'));
+      }
+      if (!options.quiet) {
+        logger.info(
+          pc.green('✓') +
+            ` Workflows are valid` +
+            pc.dim(
+              ` (${workflowsWithSource.length} workflow${workflowsWithSource.length !== 1 ? 's' : ''})`,
+            ),
+        );
+      }
     }
 
     return true;

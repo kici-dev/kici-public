@@ -20,6 +20,7 @@ import type {
   AgentApiRequestIpc,
   CacheRequestIpc,
   ProvenanceRequestIpc,
+  ArtifactRequestIpc,
   StepApprovalRequestIpc,
   JobExecutionRequest,
 } from './ipc-protocol.js';
@@ -123,8 +124,7 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
     matrixValues: jobConfig.matrixValues as Record<string, unknown> | undefined,
     host: jobConfig.host as string | undefined,
     agent: jobConfig.agent as
-      | { host: string; labels: string[]; platform?: string; arch?: string }
-      | undefined,
+      { host: string; labels: string[]; platform?: string; arch?: string } | undefined,
     dispatchInputs: jobConfig.dispatchInputs as Record<string, unknown> | undefined,
     fanoutIndex: jobConfig.fanoutIndex as number | undefined,
     fanoutTotal: jobConfig.fanoutTotal as number | undefined,
@@ -166,17 +166,16 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
 
     hasConcurrencyGroup: (jobConfig.hasConcurrencyGroup as boolean | undefined) ?? false,
     concurrencyEvaluationTimeoutMs: jobConfig.concurrencyEvaluationTimeoutMs as number | undefined,
+    concurrencyWaitTimeoutMs: dispatch.concurrencyWaitTimeoutMs,
     branch: dispatch.ref,
 
     // Plain outputs from upstream jobs for ctx.jobOutputs()
     upstreamJobOutputs: dispatch.upstreamJobOutputs as
-      | Record<string, Record<string, unknown>>
-      | undefined,
+      Record<string, Record<string, unknown>> | undefined,
 
     // Terminal statuses + declared needs that shape ctx.needs for steps.
     upstreamJobStatuses: dispatch.upstreamJobStatuses as
-      | Record<string, import('@kici-dev/engine').ExecutionJobStatus>
-      | undefined,
+      Record<string, import('@kici-dev/engine').ExecutionJobStatus> | undefined,
     jobNeeds: jobConfig.needs as readonly unknown[] | undefined,
 
     // Private-registry install auth (Phase 4 of private-registry plan).
@@ -186,8 +185,7 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
 
     // DynamicJobFn source (for re-evaluating the function to extract step functions)
     dynamicSource: jobConfig.dynamicSource as
-      | { index: number; event: Record<string, unknown>; expectedJobNames?: string[] }
-      | undefined,
+      { index: number; event: Record<string, unknown>; expectedJobNames?: string[] } | undefined,
   };
 }
 
@@ -270,6 +268,21 @@ export function buildBwrapArgs(
     const libIdx = args.indexOf('/lib', args.indexOf('--ro-bind') + 1);
     if (libIdx !== -1) {
       args.splice(libIdx + 2, 0, '--ro-bind', '/lib64', '/lib64');
+    }
+  }
+
+  // Bind the host's name-resolution files read-only so sandboxed workflows can
+  // resolve hostnames the same way the host does. bwrap auto-creates /etc with
+  // ONLY the explicitly-bound files, so without these an /etc/hosts-only name
+  // (e.g. verdaccio.local -> 127.0.0.1, used by `npm install` in
+  // KICI_SANDBOX_NETWORK=host mode) is invisible to glibc's `files` source and
+  // the name silently resolves via mDNS/DNS to a different host — pointing the
+  // install at the wrong registry and failing the run. /etc/nsswitch.conf pins
+  // the files-first lookup order. Each is guarded because a minimal host may
+  // lack nsswitch.
+  for (const nssFile of ['/etc/hosts', '/etc/nsswitch.conf']) {
+    if (existsSync(nssFile)) {
+      args.push('--ro-bind', nssFile, nssFile);
     }
   }
 
@@ -405,6 +418,31 @@ export function buildBwrapArgs(
   }
 
   return args;
+}
+
+/**
+ * Derive the read-only bind path(s) for a `file://` clone source. The workflow
+ * runner clones the repo from inside the sandbox, so a local `file://` URL's
+ * source directory must be exposed read-only or `git clone` fails with
+ * `does not appear to be a git repository`. Returns `[]` for non-`file://`
+ * remotes (https/ssh need no host bind) and for a malformed `file://` URL (the
+ * clone then surfaces the real error rather than being masked here).
+ *
+ * Shared by both sandboxes that clone a local source: the bare-metal (bwrap)
+ * backend threads the result into `buildBwrapArgs`'s `extraReadOnlyBinds`, and
+ * the container backend binds each `<dir>:<dir>:ro` into the job container —
+ * the same clone-source affordance across both isolation models.
+ */
+export function fileCloneSourceBinds(repoUrl: string | undefined): string[] {
+  if (typeof repoUrl !== 'string' || !repoUrl.startsWith('file://')) return [];
+  try {
+    const url = new URL(repoUrl);
+    // Reject an empty or root-only path (a malformed `file://` with no repo
+    // path): binding `/` would expose the entire host root into the sandbox.
+    return url.pathname && url.pathname !== '/' ? [url.pathname] : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -612,6 +650,29 @@ function relayProvenanceRequest(msg: ProvenanceRequestIpc, ctx: ForkRunnerCtx): 
   );
 }
 
+/** Relay `artifacts.request` and pipe the orchestrator response (or an error
+ *  response, or a "not configured" response when the callback isn't wired) back
+ *  into the sandbox runner. */
+function relayArtifactRequest(msg: ArtifactRequestIpc, ctx: ForkRunnerCtx): void {
+  if (!ctx.execOptions.onArtifactRequest) {
+    safeSendToChild(ctx.child, {
+      type: 'artifacts.response',
+      requestId: msg.requestId,
+      error: 'Artifacts not available in this agent configuration',
+    });
+    return;
+  }
+  ctx.execOptions.onArtifactRequest(msg).then(
+    (response) => safeSendToChild(ctx.child, response),
+    (err) =>
+      safeSendToChild(ctx.child, {
+        type: 'artifacts.response',
+        requestId: msg.requestId,
+        error: toErrorMessage(err),
+      }),
+  );
+}
+
 /** Relay `approval.request` and pipe the orchestrator's resolution (or a
  *  fail-closed reject when the callback isn't wired or the relay throws) back
  *  into the sandbox runner. */
@@ -646,8 +707,7 @@ function handleJobComplete(
   ctx.state.jobCompleted = true;
 
   let encryptedSecretOutputs:
-    | Record<string, { agentPublicKey: string; encrypted: string }>
-    | undefined;
+    Record<string, { agentPublicKey: string; encrypted: string }> | undefined;
   if (msg.secretOutputs && dispatch.runPublicKey) {
     try {
       encryptedSecretOutputs = encryptSecretOutputs(msg.secretOutputs, dispatch.runPublicKey);
@@ -697,7 +757,7 @@ function relayChildIpcMessage(
       });
       return;
     case 'log.line':
-      ctx.execOptions.onLogLine(msg.stepIndex, msg.line);
+      ctx.execOptions.onLogLine(msg.stepIndex, msg.line, msg.stream);
       return;
     case 'step.start': {
       ctx.stepNames.set(msg.stepIndex, msg.stepName);
@@ -755,6 +815,9 @@ function relayChildIpcMessage(
       return;
     case 'cache.request':
       relayCacheRequest(msg as CacheRequestIpc, ctx);
+      return;
+    case 'artifacts.request':
+      relayArtifactRequest(msg as ArtifactRequestIpc, ctx);
       return;
     case 'provenance.request':
       relayProvenanceRequest(msg as ProvenanceRequestIpc, ctx);

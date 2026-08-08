@@ -1,5 +1,6 @@
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
+import type { RuleResult } from '@kici-dev/sdk';
 
 const JOB_COLORS = [pc.cyan, pc.green, pc.yellow, pc.magenta, pc.blue] as const;
 
@@ -91,12 +92,18 @@ class OutputFormatter {
   }
 
   /**
-   * Log rule evaluation.
+   * Log rule evaluation. A rule whose `check()` threw carries an `error`; it
+   * prints `✗ errored: <message>` so the author sees the crash reason instead of
+   * a bare `✗ failed`. A clean pass/false prints `✓ passed` / `✗ failed`.
    */
-  logRuleResult(jobName: string, ruleLabel: string, passed: boolean): void {
+  logRuleResult(jobName: string, result: RuleResult): void {
     const color = this.getJobColor(jobName);
-    const status = passed ? pc.green('✓ passed') : pc.red('✗ failed');
-    logger.info(color(`[${jobName}]`) + pc.gray(` rule "${ruleLabel}": `) + status);
+    const status = result.error
+      ? pc.red(`✗ errored: ${result.error}`)
+      : result.passed
+        ? pc.green('✓ passed')
+        : pc.red('✗ failed');
+    logger.info(color(`[${jobName}]`) + pc.gray(` rule "${result.label}": `) + status);
   }
 }
 

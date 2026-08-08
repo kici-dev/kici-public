@@ -9,6 +9,7 @@ import {
   statusOptionsForLevel,
   StepConcurrencyKind,
   InitFailureCategory,
+  RunFailureClass,
   TERMINAL_JOB_STATES,
   TERMINAL_RUN_STATES,
   TimeoutReason,
@@ -326,6 +327,31 @@ describe('stateReplaySchema', () => {
   });
 });
 
+describe('terminal state sets (single source of truth)', () => {
+  it('pins the run terminal set', () => {
+    expect([...TERMINAL_RUN_STATES].sort()).toEqual(['cancelled', 'failed', 'success']);
+  });
+
+  it('pins the job terminal set', () => {
+    expect([...TERMINAL_JOB_STATES].sort()).toEqual([
+      'cancelled',
+      'drift_dropped',
+      'failed',
+      'skipped',
+      'success',
+      'timed_out_stale',
+      'unroutable',
+    ]);
+  });
+
+  it('documents the intended difference: skipped/timed_out_stale/drift_dropped are job-only', () => {
+    for (const s of ['skipped', 'timed_out_stale', 'drift_dropped']) {
+      expect(TERMINAL_JOB_STATES.has(s)).toBe(true);
+      expect(TERMINAL_RUN_STATES.has(s)).toBe(false);
+    }
+  });
+});
+
 describe('ExecutionRunStatus held', () => {
   it('includes held for workflow-level install holds', () => {
     expect(ExecutionRunStatus.options).toContain('held');
@@ -378,6 +404,62 @@ describe('ExecutionJobStatus drift_dropped', () => {
     };
     const parsed = jobStatusForwardSchema.parse(msg);
     expect(parsed.status).toBe('drift_dropped');
+  });
+});
+
+describe('RunFailureClass', () => {
+  it('exposes exactly the five failure classes', () => {
+    expect(RunFailureClass.options).toEqual([
+      'never_started',
+      'timed_out',
+      'dead_orchestrator',
+      'step_failure',
+      'cancelled',
+    ]);
+  });
+
+  it('executionStatusSchema carries an optional failureClass', () => {
+    const msg = {
+      type: 'execution.status',
+      messageId: 'msg-fc',
+      runId: 'run-fc',
+      workflowName: 'wf',
+      status: 'failed',
+      jobCount: 1,
+      startedAt: 1,
+      timestamp: 2,
+      failureClass: RunFailureClass.enum.timed_out,
+    };
+    expect(executionStatusSchema.parse(msg).failureClass).toBe('timed_out');
+  });
+
+  it('executionStatusSchema.failureClass is optional (absent → undefined)', () => {
+    const msg = {
+      type: 'execution.status',
+      messageId: 'msg-fc2',
+      runId: 'run-fc2',
+      workflowName: 'wf',
+      status: 'success',
+      jobCount: 1,
+      startedAt: 1,
+      timestamp: 2,
+    };
+    expect(executionStatusSchema.parse(msg).failureClass).toBeUndefined();
+  });
+
+  it('rejects an unknown failure class', () => {
+    const msg = {
+      type: 'execution.status',
+      messageId: 'msg-fc3',
+      runId: 'run-fc3',
+      workflowName: 'wf',
+      status: 'failed',
+      jobCount: 1,
+      startedAt: 1,
+      timestamp: 2,
+      failureClass: 'exploded',
+    };
+    expect(executionStatusSchema.safeParse(msg).success).toBe(false);
   });
 });
 
@@ -435,9 +517,10 @@ describe('initFailureSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('exposes all eight categories on the enum', () => {
+  it('exposes all eleven categories on the enum', () => {
     expect(Object.values(InitFailureCategory.enum).sort()).toEqual(
       [
+        'approval_misconfig',
         'build_coordination',
         'dynamic_eval',
         'context_rules',
@@ -445,9 +528,21 @@ describe('initFailureSchema', () => {
         'lock_resolution',
         'matrix_expansion',
         'no_agent',
+        'sandbox_denied',
         'secret_resolution',
+        'trust_policy',
       ].sort(),
     );
+  });
+
+  it('treats trust_policy as a run-scoped category', () => {
+    expect(InitFailureCategory.options).toContain('trust_policy');
+    const result = initFailureSchema.safeParse({
+      scope: 'run',
+      category: InitFailureCategory.enum.trust_policy,
+      message: 'Fork PR rejected by org trust policy',
+    });
+    expect(result.success).toBe(true);
   });
 });
 
@@ -751,5 +846,27 @@ describe('statusOptionsForLevel', () => {
   it('keeps the run-only held status out of the job set', () => {
     expect(statusOptionsForLevel('run')).toContain('held');
     expect(statusOptionsForLevel('job')).not.toContain('held');
+  });
+});
+
+describe('executionStatusSchema routingKey (per-run source attribution)', () => {
+  const base = {
+    type: 'execution.status' as const,
+    messageId: 'm1',
+    runId: 'r1',
+    workflowName: 'wf',
+    status: 'running' as const,
+    startedAt: 1,
+    timestamp: 2,
+  };
+
+  it('accepts an optional per-run routingKey', () => {
+    const parsed = executionStatusSchema.parse({ ...base, routingKey: 'generic:org:src' });
+    expect(parsed.routingKey).toBe('generic:org:src');
+  });
+
+  it('remains valid when routingKey is omitted (old orchestrator)', () => {
+    const parsed = executionStatusSchema.parse(base);
+    expect(parsed.routingKey).toBeUndefined();
   });
 });

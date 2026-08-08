@@ -12,6 +12,7 @@ import type { Command } from 'commander';
 import {
   createServiceManager,
   detectPlatform,
+  InstanceNotFoundError,
   kiciConfigRoot,
   resolveInstance,
   resolveUserLevel,
@@ -68,6 +69,12 @@ export function registerOrchestratorStop(orchestrator: Command): void {
         await manager.stop(config);
         console.log(`Orchestrator service "${config.name}" stopped.`);
       } catch (err) {
+        if (err instanceof InstanceNotFoundError) {
+          console.log(
+            `Orchestrator service "${err.instanceName}" is not installed — nothing to stop.`,
+          );
+          return;
+        }
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }

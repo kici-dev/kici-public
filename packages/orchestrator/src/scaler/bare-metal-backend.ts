@@ -30,6 +30,7 @@ import type {
   ScalerEventCallback,
   ValidationResult,
   EffectiveLimits,
+  SpawnContext,
 } from './types.js';
 
 /** Extended ManagedAgent that includes the ChildProcess reference */
@@ -50,6 +51,12 @@ export interface BareMetalScalerBackendOptions {
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
+  /**
+   * Live resolver for the ephemeral agent-token TTL (ms). When set, called per
+   * spawn so the leader can serve the fleet-wide
+   * `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
+   */
+  tokenTtlProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   roles?: string[];
   /**
@@ -78,6 +85,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
   private readonly defaultResources?: ResourceRequest;
   private readonly tokenStore?: AgentTokenStore;
   private readonly tokenTtlMs: number;
+  private readonly tokenTtlProvider?: () => Promise<number>;
   private readonly roles: string[] | undefined;
   private readonly enforceCgroups: boolean;
 
@@ -93,6 +101,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     this.defaultResources = options.defaultResources;
     this.tokenStore = options.tokenStore;
     this.tokenTtlMs = options.tokenTtlMs ?? 3_600_000; // 1 hour default
+    this.tokenTtlProvider = options.tokenTtlProvider;
     this.roles = options.roles;
     this.enforceCgroups = options.enforceCgroups ?? false;
 
@@ -208,6 +217,11 @@ export class BareMetalScalerBackend implements ScalerBackend {
     orchestratorUrl: string,
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
+    _spawnContext?: SpawnContext,
+    // The bare-metal backend spawns a local process quickly; the abort signal is
+    // accepted for interface parity but not threaded — the ScalerManager
+    // deadline race still releases the semaphore slot if the spawn ever hangs.
+    _signal?: AbortSignal,
   ): Promise<ManagedAgent> {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
@@ -275,11 +289,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     // 2.5. Create ephemeral agent token if token store is available
     if (this.tokenStore) {
-      env.KICI_AGENT_TOKEN = await this.tokenStore.createEphemeral(
-        agentId,
-        fullLabels,
-        this.tokenTtlMs,
-      );
+      const tokenTtlMs = this.tokenTtlProvider ? await this.tokenTtlProvider() : this.tokenTtlMs;
+      env.KICI_AGENT_TOKEN = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
     }
 
     // 3. Required agent KICI_* vars (explicit values, not from process.env)

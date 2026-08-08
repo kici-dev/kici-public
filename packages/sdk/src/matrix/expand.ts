@@ -1,6 +1,1 @@
-export {
-  expandSingleDimension,
-  expandMultiDimension,
-  expandMatrix,
-  applyIncludeExclude,
-} from '@kici-dev/engine';
+export { expandMatrix, applyIncludeExclude } from '@kici-dev/engine';

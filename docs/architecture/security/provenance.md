@@ -11,43 +11,47 @@ whole chain. The workflow-author view is in the
 
 ## Signing flow
 
-When a step calls `ctx.attestProvenance`, the agent obtains a platform-issued
-identity token, builds and signs the statement locally, and persists the
-resulting bundle:
+When a step calls `ctx.attestProvenance`, the agent obtains an
+orchestrator-issued identity token, builds and signs the statement locally, and
+persists the resulting bundle. The orchestrator is the root of trust: it mints and
+signs the token itself, with no hosted-platform dependency in the build hot path:
 
 ```mermaid
 sequenceDiagram
     participant Step as Workflow step
     participant Agent
-    participant Orchestrator
-    participant Platform as Platform (issuer + signing key)
+    participant Orchestrator as Orchestrator (issuer + signing key)
     Step->>Agent: ctx.attestProvenance({ subject })
     Agent->>Orchestrator: request ID token (audience)
-    Orchestrator->>Platform: mint token for run/job
-    Platform-->>Orchestrator: short-lived ID token (server-truth identity)
-    Orchestrator-->>Agent: ID token
+    Note over Orchestrator: mint + sign token for run/job<br/>from its own records
+    Orchestrator-->>Agent: short-lived ID token (server-truth identity)
     Note over Agent: build the in-toto statement,<br/>DSSE-sign with an ephemeral key
     Agent->>Orchestrator: store bundle (DSSE + ephemeral key + token)
 ```
 
 The identity claims — `repository`, `ref`, `sha`, run and job identifiers — are
-**derived by the platform from its own record of the run and job**, not from
-anything the agent or step asserts. The orchestrator only relays the request,
-scoped to a job the requesting agent actually owns; it never lets a step name its
-own repository or ref. This is what makes the identity claims trustworthy: the
-build cannot lie about where it came from.
+**derived by the orchestrator from its own record of the run and job**, not from
+anything the agent or step asserts. The orchestrator resolves the request against
+a job the requesting agent actually owns; it never lets a step name its own
+repository or ref. This is what makes the identity claims trustworthy: the build
+cannot lie about where it came from.
 
 ## Trust root
 
-Each environment has one **ECDSA P-256 (ES256) signing key**, held in a hardware
-security module. The private half is generated inside the module and never
-leaves it — signing is a remote call, so a credential compromise grants signing
-only while the credential is valid and can never exfiltrate the key.
+The orchestrator owns a long-lived **ECDSA P-256 (ES256) signing key**. Custody is
+pluggable: by default the private key is encrypted at rest in the orchestrator's
+database, wrapped with the orchestrator's master key (the master key lives in the
+environment or a KMS, never in the database, so a database backup alone cannot
+sign); it can also be held in AWS KMS or any external KMS/HSM via a signing
+command, where the private key never exists inside KiCI at all. The private key is
+non-exportable by design.
 
-The key's public half is published as a JSON Web Key Set (JWKS) at the platform's
-well-known OIDC discovery endpoint. **Verifiers trust the published key set, not
-the signing provider.** Swapping the underlying signing technology is therefore a
-transparent key rotation — the only durable external contract is the JWKS.
+The key's public half is published as a JSON Web Key Set (JWKS) at the
+orchestrator's well-known OIDC discovery endpoint. **Verifiers trust the published
+key set, not the signing provider.** Swapping the underlying signing technology is
+therefore a transparent key rotation — the only durable external contract is the
+JWKS. For provisioning, custody, and rotation, see
+[provenance signing keys](../../operator/orchestrator/signing-keys.md).
 
 ## Bundle construction
 
@@ -99,10 +103,14 @@ only build-supplied input.
   attestation it ever signed — there is no per-attestation trusted timestamp to
   scope revocation to "before time T". Time-scoped revocation requires a
   transparency log and is a future capability.
-- **The trust root is pinned over HTTPS.** Verifiers fetch the published key set
-  from the platform's provenance issuer and pin the token's issuer to it, rather
-  than following the issuer named in the token. There is a single KiCI platform,
-  so there is a single provenance issuer; `--trust-root` always names it.
+- **The trust root is pinned out-of-band.** Verifiers fetch the published key set
+  from the orchestrator's provenance issuer and pin the token's issuer to it,
+  rather than following the issuer named in the token. `kici verify-attestation`
+  defaults its trust root to the configured orchestrator; it can also verify
+  offline against an exported `{ issuer, jwks }` file (air-gap) or against the
+  orchestrator's native `POST /v1/verify-attestation` endpoint. Bundles signed by
+  the hosted platform before the orchestrator owned signing keep verifying against
+  the platform's still-published JWKS.
 - **The bundle format is forward-compatible.** Verification dispatches on the
   bundle's media type, so additional bundle formats can be added without
   changing the verifier's existing path.
@@ -134,13 +142,13 @@ attestation-detail page offers a live re-verification against the current
 signing keys, and operators backfill or refresh stored verdicts with
 `kici-admin attestations reverify`.
 
-**Trust-root propagation.** To verify at ingest, the orchestrator needs the
-provenance trust root — the OIDC issuer the platform mints provenance tokens
-under. The platform pushes the issuer to the orchestrator on the
-connection-accepted handshake; the orchestrator derives the key-set discovery
-URL from it (`<issuer>/.well-known/jwks.json`), fetches the keys, and caches
-them. When the issuer is absent (provenance not configured), every verdict is
-recorded as `unverifiable` rather than silently `verified`. The orchestrator
+**Trust root at ingest.** When orchestrator-owned signing is configured, the
+orchestrator verifies at ingest against its **own** key set — read directly from
+its signing-keys store, so fresh rotations and revocations are reflected
+immediately. Bundles signed by the hosted platform before the orchestrator owned
+signing are verified against the platform's provenance issuer instead. When no
+provenance trust root is configured, every verdict is recorded as `unverifiable`
+rather than silently `verified`. The orchestrator
 never mints tokens or holds signing material — it only consumes the public
 issuer + key set to check bundles.
 

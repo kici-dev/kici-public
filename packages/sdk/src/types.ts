@@ -9,6 +9,7 @@ import type {
   ExecutionJobStatus,
 } from '@kici-dev/engine';
 import type { StepContext, Logger } from './context.js';
+import type { SingleNeedEntry, NeedsContext } from './needs-context.js';
 import type { TriggerConfig } from './triggers/types.js';
 import type { Rule } from './rules/types.js';
 import type { Matrix, MatrixInclude, MatrixExclude } from './matrix/types.js';
@@ -50,6 +51,111 @@ export type OutputProxy<T> = {
   readonly [K in keyof T]: T[K];
 };
 
+/** Collapse a union of object types into their intersection (`{a} | {b}` -> `{a} & {b}`). */
+type UnionToIntersection<U> = (U extends unknown ? (k: U) => void : never) extends (
+  k: infer I,
+) => void
+  ? I
+  : never;
+
+/**
+ * A single step's contribution to its job's merged output map. A named,
+ * non-void step contributes `{ [name]: result }`; an id-less step (empty name)
+ * or a void step contributes nothing; a bare function / parallel group in the
+ * steps array contributes nothing. Used by {@link InferJobOutputsFromSteps}.
+ */
+type StepOutputEntry<TStep> =
+  TStep extends Step<infer TResult, infer TName>
+    ? TName extends ''
+      ? object
+      : [TResult] extends [void]
+        ? object
+        : { readonly [K in TName]: TResult }
+    : object;
+
+/**
+ * Merge every named, non-void step's outputs into the job's nested output map,
+ * keyed by step name — reproducing the runtime shape `jobRef.result.<step>.<field>`
+ * for a multi-step job. When no step contributes a name (all id-less or void),
+ * falls back to the loose `Record<string, unknown>` so untyped code keeps
+ * compiling. The `run:` shorthand does NOT go through this helper: it infers a
+ * flat shape from the run function's return type at the `job()` overload.
+ */
+export type InferJobOutputsFromSteps<TSteps extends readonly unknown[]> =
+  UnionToIntersection<{ [I in keyof TSteps]: StepOutputEntry<TSteps[I]> }[number]> extends infer M
+    ? keyof M extends never
+      ? Record<string, unknown>
+      : { readonly [K in keyof M]: M[K] }
+    : never;
+
+/**
+ * One `needs` tuple element's contribution to the typed `ctx.needs` map. A job
+ * reference with a literal name, or a `'name'` string / `{ name }` object,
+ * contributes `{ [name]: SingleNeedEntry<T> }` (outputs typed for a job ref,
+ * loose for a string/name); a name-less job, a group ref, or a `{ group }`
+ * entry contributes nothing typed (they fall back to the loose map).
+ */
+type NeedFromTupleEntry<E> =
+  E extends Job<infer TOut, infer TName>
+    ? string extends TName
+      ? object
+      : TName extends ''
+        ? object
+        : { readonly [K in TName]: SingleNeedEntry<TOut> }
+    : E extends string
+      ? string extends E
+        ? object
+        : { readonly [K in E]: SingleNeedEntry<Record<string, unknown>> }
+      : E extends { name: infer N }
+        ? N extends string
+          ? string extends N
+            ? object
+            : { readonly [K in N]: SingleNeedEntry<Record<string, unknown>> }
+          : object
+        : object;
+
+/**
+ * True when at least one `needs` tuple element cannot be keyed (a group ref, a
+ * `{ group }` entry, or a name-less job) — i.e. its {@link NeedFromTupleEntry}
+ * contributes no key. Such an element would be silently dropped from a strict
+ * closed map, so its presence forces the loose fallback.
+ */
+type HasUnkeyableNeed<TNeeds extends readonly unknown[]> = true extends {
+  [I in keyof TNeeds]: keyof NeedFromTupleEntry<TNeeds[I]> extends never ? true : false;
+}[number]
+  ? true
+  : false;
+
+/**
+ * Derive the typed `ctx.needs` map from a job's `needs` tuple. The strict, closed
+ * map (keyed by upstream name — job references carry their inferred outputs,
+ * string / `{ name }` entries key loose) is produced ONLY when every entry is
+ * keyable, so reading an undeclared need is a compile error. If any entry cannot
+ * be keyed (a group reference, a `{ group }` entry, or a name-less job), the whole
+ * map falls back to the loose {@link NeedsContext} — the group's key stays
+ * accessible and no valid read regresses to a type error.
+ */
+export type NeedsFromTuple<TNeeds extends readonly unknown[]> =
+  HasUnkeyableNeed<TNeeds> extends true
+    ? NeedsContext
+    : UnionToIntersection<
+          { [I in keyof TNeeds]: NeedFromTupleEntry<TNeeds[I]> }[number]
+        > extends infer M
+      ? keyof M extends never
+        ? NeedsContext
+        : { readonly [K in keyof M]: M[K] }
+      : never;
+
+/**
+ * The step/run context with its `needs` narrowed to the typed map derived from
+ * the enclosing job's `needs` tuple. Used as the contextual type of the `run:`
+ * shorthand so `ctx.needs.<job>.result.<field>` is checked. `needs` is required
+ * here (a job with declared needs always has them at runtime).
+ */
+export type StepContextWithNeeds<TNeeds extends readonly unknown[]> = Omit<StepContext, 'needs'> & {
+  needs: NeedsFromTuple<TNeeds>;
+};
+
 /** Output schema type - record of Zod types */
 export type OutputSchema = Record<string, z.ZodTypeAny>;
 
@@ -62,10 +168,15 @@ export type InferOutputs<T extends OutputSchema> = z.infer<z.ZodObject<T>>;
  * TResult is the inferred return type of the run function (defaults to void for backward compat).
  * The optional `outputs` field holds a Zod schema for runtime validation but does NOT drive the generic.
  */
-export interface Step<TResult = void> {
+export interface Step<TResult = void, TName extends string = string> {
   readonly _tag: 'Step';
-  /** Step name. Empty string for id-less steps (compiler assigns counter IDs). */
-  readonly name: string;
+  /**
+   * Step name, carried as a literal type. Empty string (`''`) for id-less steps
+   * (the compiler assigns counter IDs at lock generation). The literal name is
+   * what lets a named step contribute a typed key to its job's merged output map
+   * (see {@link InferJobOutputsFromSteps}).
+   */
+  readonly name: TName;
   /** Optional Zod schema for runtime output validation. */
   readonly outputs?: OutputSchema;
   readonly run: (ctx: StepContext, drift?: any) => Promise<TResult>;
@@ -213,8 +324,7 @@ export interface StepOptionsWithCheck<TResult = void, TDrift = unknown> extends 
  * Either the plain shape (`run(ctx)`) or the idempotent shape (`check` + `run(ctx, drift)`).
  */
 export type StepOptions<TResult = void, TDrift = unknown> =
-  | StepOptionsPlain<TResult>
-  | StepOptionsWithCheck<TResult, TDrift>;
+  StepOptionsPlain<TResult> | StepOptionsWithCheck<TResult, TDrift>;
 
 /** Trigger type (config objects returned by pr()/push() factory functions) */
 export type Trigger = TriggerConfig;
@@ -401,6 +511,30 @@ export interface ContainerConfig {
 }
 
 /**
+ * Per-job sandbox escape hatch for container-sandbox jobs (a job with a
+ * `container:` image). Requests are granted only within the operator's
+ * allow-list (`sandboxAllowedCapabilities` / `sandboxAllowHostNetwork`); a
+ * request for anything not allow-listed FAILS the run at dispatch with a reason
+ * naming the offending capability or knob — never a silent downgrade.
+ */
+export interface SandboxOptions {
+  /**
+   * Extra Linux capabilities to add back over the hardened `CapDrop:['ALL']`
+   * baseline (e.g. `['NET_ADMIN']`). Each requested capability must be
+   * allow-listed by the operator via `sandboxAllowedCapabilities`. Unknown
+   * capability names are rejected at author time.
+   */
+  capabilities?: string[];
+  /**
+   * Container network posture. `'host'` shares the host network namespace and
+   * is the escalation — it requires the operator to enable
+   * `sandboxAllowHostNetwork`. `'none'` (loopback-only) and `'default'` (bridge)
+   * are always allowed (they do not escalate).
+   */
+  network?: 'default' | 'none' | 'host';
+}
+
+/**
  * Generic per-job initialization config. Runs a hand-written command after the
  * repo is cloned and before the job's steps execute, so a repo-declared
  * toolchain (mise, a custom setup script, …) is provisioned and put on the
@@ -506,10 +640,25 @@ export type RunsOnPick = 'deterministic' | 'any';
  */
 export type RunsOn = string | RegExp | (string | RegExp)[] | RunsOnSelector;
 
-/** Job definition returned by job() factory */
-export interface Job {
+/**
+ * Job definition returned by job() factory.
+ *
+ * `TOutputs` is the job's inferred output shape, threaded onto `result` so
+ * cross-job reads (`jobRef.result.<step>.<field>`) are type-checked. It is
+ * inferred by {@link InferJobOutputsFromSteps} for a `steps:` job (nested by
+ * step name) or from the run function's return type for a `run:` shorthand job
+ * (flat), with an explicit override available (`job<T>(...)`). Defaults to the
+ * loose `Record<string, unknown>` so a bare `Job` and untyped code keep
+ * compiling.
+ *
+ * `TName` is the job's name carried as a literal (from the `job('name', …)`
+ * argument), which lets a typed `needs: [jobRef]` key the reference under its
+ * name in `ctx.needs`. Name-less jobs (auto-generated id) keep the loose
+ * `string` default.
+ */
+export interface Job<TOutputs = Record<string, unknown>, TName extends string = string> {
   readonly _tag: 'Job';
-  readonly name: string;
+  readonly name: TName;
   /** Single-agent targeting. Mutually exclusive with `runsOnAll`. */
   readonly runsOn?: RunsOn;
   /**
@@ -553,6 +702,8 @@ export interface Job {
   readonly checkout?: boolean;
   /** Docker image for job execution. All steps run inside the container. */
   readonly container?: string | ContainerConfig;
+  /** Per-job sandbox escape hatch (container jobs only); granted within the operator allow-list. */
+  readonly sandbox?: SandboxOptions;
   /** Bound context for this job. String for static, or a function of the normalized event envelope for dynamic (resolved at orchestrator two-phase eval). */
   readonly context?: string | ((event: EventPayload) => string | Promise<string>);
   /**
@@ -614,9 +765,18 @@ export interface Job {
    * Type-safe proxy for accessing this job's outputs.
    * For multi-step jobs: jobRef.result.stepName.field
    * For single-step (run shorthand) jobs: jobRef.result.field
-   * At runtime, resolves against the shared job outputs map populated by the workflow runner.
+   * At runtime, resolves against the shared job outputs map populated by the
+   * workflow runner.
+   *
+   * The `[TOutputs] extends [void]` guard mirrors `Step.result` so a void
+   * run-shorthand job resolves `result` to `never` — which keeps `Job<void>`
+   * assignable to `JobOrFactory` (`never` is assignable to
+   * `OutputProxy<Record<string, unknown>>`). The tuple wrap is deliberate and
+   * non-distributive: it must not distribute over a union output map. Do not
+   * "align" this with `Step.result`'s naked form — that would reintroduce
+   * distribution over unions.
    */
-  readonly result: OutputProxy<any>;
+  readonly result: [TOutputs] extends [void] ? never : OutputProxy<TOutputs>;
 }
 
 /** Options for job() factory */
@@ -704,6 +864,12 @@ export interface JobOptions {
    * When set, all steps run inside the container.
    */
   container?: string | ContainerConfig;
+  /**
+   * Per-job sandbox escape hatch (container jobs only). Request extra Linux
+   * capabilities / host networking; granted only within the operator's
+   * `org_settings` allow-list, else the run fails loudly at dispatch.
+   */
+  sandbox?: SandboxOptions;
   /** Bound context for this job. String for static, or a function of the normalized event envelope for dynamic (resolved at orchestrator two-phase eval). */
   context?: string | ((event: EventPayload) => string | Promise<string>);
   /**

@@ -25,6 +25,12 @@ export interface GcStaleTmpDirsOptions {
   pattern: RegExp;
   /** Children with mtime older than this are removed. */
   maxAgeMs: number;
+  /**
+   * Basenames that are NEVER removed even when they match `pattern` and exceed
+   * `maxAgeMs`. Lets a broad pattern coexist with deterministic persistent
+   * caches whose names structurally collide with the pattern.
+   */
+  exclude?: ReadonlySet<string>;
   /** Optional per-removal / per-failure logger. */
   log?: (message: string) => void;
 }
@@ -35,7 +41,7 @@ export interface GcStaleTmpDirsOptions {
  * must never break the caller's actual work. Returns the removed paths.
  */
 export async function gcStaleTmpDirs(opts: GcStaleTmpDirsOptions): Promise<string[]> {
-  const { base, pattern, maxAgeMs, log } = opts;
+  const { base, pattern, maxAgeMs, exclude, log } = opts;
   const cutoff = Date.now() - maxAgeMs;
   const removed: string[] = [];
   let entries;
@@ -46,6 +52,7 @@ export async function gcStaleTmpDirs(opts: GcStaleTmpDirsOptions): Promise<strin
   }
   for (const entry of entries) {
     if (!entry.isDirectory() || !pattern.test(entry.name)) continue;
+    if (exclude?.has(entry.name)) continue;
     const dir = path.join(base, entry.name);
     try {
       const s = await stat(dir);

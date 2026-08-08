@@ -14,7 +14,7 @@ If you've only ever used per-repo workflows so far, start with the mental model 
 | Workflow repo  | The repo whose `.kici/workflows/*.ts` file **declares** the global workflow. Holds the steps. Also known as the _authoring_ repo.                      |
 | Source repo    | The repo that **emits** the event (push / PR / tag / ...) that causes the global workflow to fire. The agent checks out this repo as the working copy. |
 | Global         | A workflow whose trigger carries one or more `repos:` glob patterns. The presence of `repos:` is what classifies a workflow as global.                 |
-| Authoring axis | Policy that answers "which repos may **author** global workflows?" Controlled by the allow-list in the dashboard's _Workflow authors_ setting.         |
+| Authoring axis | Policy that answers "which repos may **author** global workflows?" Controlled by the allow-list in the dashboard's _Allowed author repos_ setting.     |
 | Source axis    | Policy that answers "which **source** repos' events are allowed to trigger global workflows?" Controlled by the deny-list in _Blocked source repos_.   |
 
 The two axes are independent. A global workflow fires only if it passes **both** — its authoring repo is allowed AND the source repo is not denied.
@@ -69,7 +69,7 @@ Global workflows are **opt-in per org**. In a fresh org, `repos:`-bearing workfl
 
 | Setting              | What it controls                                                                                                                                                                                     | Typical use                                                                                  |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Workflow authors     | Restricts which repos can **author** (register) global workflows. Globs matched against the authoring repo identifier. When OFF, any repo in the org may author globals.                             | Lock authoring to `myorg/ci-*` so random product repos can't ship org-wide automation.       |
+| Allowed author repos | Restricts which repos can **author** (register) global workflows. Globs matched against the authoring repo identifier. When OFF, any repo in the org may author globals.                             | Lock authoring to `myorg/ci-*` so random product repos can't ship org-wide automation.       |
 | Blocked source repos | Blocks dispatch for events emitted from these **source** repos, regardless of authoring. Globs matched against the event source repo identifier. When OFF, events from any repo may trigger globals. | Protect against fork spam — e.g. `!myorg/*` via `myorg/fork-*`.                              |
 | Elevated access      | Authoring repos listed here get **read access to source-repo secrets** during execution. Globs matched against the authoring repo identifier.                                                        | A `myorg/ci-deploy` repo that needs to read a source repo's `NPM_TOKEN` to publish releases. |
 
@@ -85,7 +85,7 @@ The page is a two-state editor — changes are local until you click **Save chan
 
 A global workflow fires only if:
 
-1. **The authoring repo is allowed.** If _Workflow authors_ is ON, the workflow's authoring repo must match at least one allow-list glob. If OFF, any repo may author. Enforced at two points:
+1. **The authoring repo is allowed.** If _Allowed author repos_ is ON, the workflow's authoring repo must match at least one allow-list glob. If OFF, any repo may author. Enforced at two points:
    - At registration time (extraction from the lock file — non-matching globals are dropped with a warning).
    - At dispatch time (defense-in-depth — policy changes after registration still take effect).
 2. **The source repo is not denied.** If the event's source repo matches any glob in _Blocked source repos_, the global workflow is skipped. Enforced at dispatch time.

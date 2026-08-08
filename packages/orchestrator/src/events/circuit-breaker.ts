@@ -1,5 +1,6 @@
 import { SlidingWindowRateLimiter } from '../helpers/rate-limiter.js';
 import type { EventRouterConfig } from './types.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 /**
  * Circuit breaker for event loop detection and user-event rate limiting.
@@ -12,7 +13,10 @@ import type { EventRouterConfig } from './types.js';
 export class EventCircuitBreaker {
   private rateLimiter: SlidingWindowRateLimiter;
 
-  constructor(private readonly config: EventRouterConfig) {
+  constructor(
+    private readonly config: EventRouterConfig,
+    private readonly clusterSettings?: ClusterSettingsReader,
+  ) {
     this.rateLimiter = new SlidingWindowRateLimiter(config.rateLimitPerWorkflowPerMinute);
   }
 
@@ -34,9 +38,18 @@ export class EventCircuitBreaker {
    * sliding 60-second window. Callers key user events by
    * `<sourceRoutingKey>:<eventName>`; system events (`__`-prefixed) are exempt
    * upstream and never reach here.
+   *
+   * The per-(source routing key + event) limit is the fleet-wide cluster
+   * tunable `event_router_rate_limit_per_workflow_per_minute` (live override
+   * wins), falling back to the configured default.
    */
-  checkRateLimit(rateKey: string): { allowed: boolean; retryAfterMs?: number } {
-    return this.rateLimiter.check(rateKey);
+  async checkRateLimit(rateKey: string): Promise<{ allowed: boolean; retryAfterMs?: number }> {
+    const maxPerWindow =
+      (await this.clusterSettings?.getNumber(
+        'event_router_rate_limit_per_workflow_per_minute',
+        this.config.rateLimitPerWorkflowPerMinute,
+      )) ?? this.config.rateLimitPerWorkflowPerMinute;
+    return this.rateLimiter.check(rateKey, maxPerWindow);
   }
 
   /**

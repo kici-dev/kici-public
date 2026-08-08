@@ -1,13 +1,14 @@
 /**
  * Shared LoggerEnv schema.
  *
- * The logger (packages/shared/src/logger.ts) reads these env vars *before*
- * the per-service config loads, so we can't include them in the service
- * schemas the normal way. We still want them in `docs/operator/env-reference.md`
- * and in `validateUnknownKiciVars()`'s known-var set, so this schema documents
- * them in one place. Each service includes the keys here when computing its
- * "known KICI_* vars" list, and the docs generator emits a "Logger / shared"
- * section from this schema.
+ * The logger (packages/core/src/logger.ts) reads these env vars *before*
+ * the per-service config loads — as does `kiciTmpBase()`
+ * (packages/core/src/tmp.ts) for the `KICI_TMPDIR` entry below — so we can't
+ * include them in the service schemas the normal way. We still want them in
+ * `docs/operator/env-reference.md` and in `validateUnknownKiciVars()`'s
+ * known-var set, so this schema documents them in one place. Each service
+ * includes the keys here when computing its "known KICI_* vars" list, and the
+ * docs generator emits a "Logger / shared" section from this schema.
  *
  * IMPORTANT: do not change the runtime behaviour of `logger.ts` from this
  * schema — the schema is documentation + the unknown-var allowlist, not the
@@ -34,6 +35,12 @@ export const LoggerEnvSchema = z.object({
   KICI_AGENT_ID: z.string().optional(),
   /** Set by the platform process; used as a filename suffix. */
   KICI_PLATFORM_INSTANCE_ID: z.string().optional(),
+  /**
+   * Base directory for KiCI-created temp files (repo clones, build scratch,
+   * deploy render dirs). Read by `kiciTmpBase()` before any service config
+   * loads; defaults to the OS temp dir when unset.
+   */
+  KICI_TMPDIR: z.string().optional(),
 });
 
 /** All env vars the logger reads, for the unknown-KICI-var scanner. */
@@ -45,6 +52,7 @@ export const LOGGER_ENV_VARS = [
   'KICI_CLUSTER_INSTANCE_ID',
   'KICI_AGENT_ID',
   'KICI_PLATFORM_INSTANCE_ID',
+  'KICI_TMPDIR',
 ] as const;
 
 /** Doc-friendly description map (consumed by the env-reference generator). */
@@ -113,5 +121,14 @@ export const LOGGER_ENV_FIELD_SPECS: EnvFieldSpec[] = [
     type: 'string',
     description:
       'Stable Platform identifier; appended to the platform log filename so multiple instances can share one KICI_LOG_DIR.',
+  },
+  {
+    envVar: 'KICI_TMPDIR',
+    aliases: [],
+    fieldPath: 'KICI_TMPDIR',
+    required: false,
+    type: 'string',
+    description:
+      'Base directory for KiCI-created temporary files (repo clones, build scratch, deploy render dirs). Defaults to the operating system temp directory. Set it to a path on a volume with free space when the default temp filesystem is small.',
   },
 ];

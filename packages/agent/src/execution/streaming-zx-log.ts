@@ -1,3 +1,5 @@
+import { LogStream } from '@kici-dev/engine';
+
 /**
  * Shared factory for the zx `log` callback that streams a subprocess's
  * stdout/stderr into the captured/streamed run log, line by line, via `emit`.
@@ -23,11 +25,23 @@
  * `verbose: false` (suppressed). A `verbose: false` base would flag ordinary
  * output `verbose: false` too, and this gate would then drop every line.
  *
- * The returned callback owns a per-shell line buffer, so partial chunks are
- * coalesced into whole lines before `emit` is called.
+ * The returned callback owns one line buffer PER STREAM, so partial chunks are
+ * coalesced into whole lines before `emit` is called. The buffers are separate
+ * because the two streams are independent pipes: a stdout chunk ending mid-line
+ * and a stderr chunk arriving next would otherwise concatenate into a single
+ * spliced line attributed to whichever kind completed it.
+ *
+ * `emit` receives the originating stream alongside the line so a diagnostic
+ * written to stderr stays distinguishable from ordinary progress output all the
+ * way to the persisted run log.
  */
-export function makeStreamingZxLog(emit: (line: string) => void): (entry: unknown) => void {
-  let lineBuf = '';
+export function makeStreamingZxLog(
+  emit: (line: string, stream: LogStream) => void,
+): (entry: unknown) => void {
+  const lineBufs: Record<LogStream, string> = {
+    [LogStream.enum.stdout]: '',
+    [LogStream.enum.stderr]: '',
+  };
   return (entry: unknown) => {
     const e = entry as { kind?: string; data?: unknown; verbose?: boolean };
     if (e.kind !== 'stdout' && e.kind !== 'stderr') return;
@@ -35,12 +49,12 @@ export function makeStreamingZxLog(emit: (line: string) => void): (entry: unknow
     // explicit `{ verbose: false }`) marks the entry `verbose: false` — the
     // signal to keep this line out of the captured run log.
     if (!e.verbose) return;
+    const stream = e.kind === 'stderr' ? LogStream.enum.stderr : LogStream.enum.stdout;
     const text = typeof e.data === 'string' ? e.data : String(e.data ?? '');
-    lineBuf += text;
-    const lines = lineBuf.split('\n');
-    lineBuf = lines.pop()!;
+    const lines = (lineBufs[stream] + text).split('\n');
+    lineBufs[stream] = lines.pop()!;
     for (const line of lines) {
-      if (line) emit(line);
+      if (line) emit(line, stream);
     }
   };
 }

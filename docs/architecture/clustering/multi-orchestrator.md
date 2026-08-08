@@ -57,7 +57,7 @@ The KiCI Platform is primarily a **webhook router and peer matchmaker**, not a g
 
 Peers discover each other through two mechanisms:
 
-1. **Platform matchmaker (Platform/hybrid modes):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. The Platform also sends `peer.discover` messages when new orchestrators connect.
+1. **Platform matchmaker (every Platform-connected mode -- `platform`, `hybrid`, `observed`):** When an orchestrator sends `source.register`, the Platform responds with `source.register.ack` that includes a `peers` array listing all other orchestrators registered with overlapping routing keys. The Platform also sends `peer.discover` messages when new orchestrators connect. Peer matchmaking is independent of relay eligibility -- an `observed` orchestrator never receives a relayed webhook, but it still discovers and is discovered by its peers.
 
 2. **Static configuration (independent mode):** Operators configure `KICI_CLUSTER_PEERS` with comma-separated peer addresses. Each orchestrator creates `PeerClient` instances for all configured peers at startup.
 
@@ -180,6 +180,15 @@ Two mechanisms prevent routing loops:
 
 When a run is cancelled (via API or fail-fast), the coordinator sends `peer.job.cancel` to all peers with rerouted jobs for that run. Cancels are grouped by peer for efficient messaging.
 
+### Post-accept spawn resilience
+
+A positive `job.reroute.ack` only means the peer **queued** the job — the agent spawn happens afterwards and can still fail (transient scaler error, image-pull failure, peer crash, OOM). Without a backstop, a spawn that fails after the ACK produces no progress, so the run would sit `pending` until the stale detector force-fails it minutes later. Two complementary layers make a reroute resilient to a post-accept failure:
+
+- **Bounded-window re-dispatch (correctness backstop).** When a peer ACKs a reroute, the coordinator arms a per-job **spawn window**. The first `job.progress` (job or step) disarms it. If the window elapses with no progress, the coordinator best-effort cancels the original peer's job (a double-execution guard against a slow-but-healthy spawn), then re-runs the routing decision under the same `jobId` — trying another peer, then a local dispatch, and finally marking the job failed if no backend can run it. This also covers a peer that dies right after the ACK.
+- **Spawn-failure fast path.** A worker relays a scaler spawn failure for a rerouted-in job back to the owning coordinator over the existing scaler-event channel. On that signal the coordinator runs the same cancel-then-re-dispatch immediately, without waiting the window out. The two layers are idempotent: whichever fires first removes the tracking entry, so the other is a no-op. The re-dispatch appends the failed peer to `triedConnections` so routing never re-selects it.
+
+The spawn window, the reroute ACK timeout, and the max-hop limit are per-org tunables (`reroute_spawn_window_ms`, `reroute_ack_timeout_ms`, `reroute_max_hops`) with cluster-wide defaults; operators change them with `kici-admin org-settings reroute`.
+
 ## Raft consensus
 
 ### Purpose
@@ -266,8 +275,9 @@ When a coordinator crashes mid-run, its jobs may be stuck. The Raft leader runs 
 
 1. **Scan:** Find `execution_runs` in "running" state with stale timestamps (> 5 minutes)
 2. **Check coordinator:** Look up the run's `routing_key` in the peer registry. If a connected peer shares the routing key, the coordinator may still be alive -- skip.
-3. **Check jobs:** For each non-terminal job, check the heartbeat timestamp. Mark jobs with stale heartbeats (> 3 minutes) as failed.
-4. **Finalize:** When all jobs are terminal, compute overall run status (failed if any failed, cancelled if any cancelled, success otherwise).
+3. **Check progress:** Look at the run's jobs for any heartbeat, start, or completion inside the stale window. A run that is still moving is not orphaned, whatever the peer registry says -- skip. This is what keeps a healthy long run alive on a single-node orchestrator, where step 2 can never vouch for the coordinator because there are no peers. A genuinely crashed coordinator stops producing all three signals, so a real orphan becomes eligible within one window.
+4. **Check jobs:** For each non-terminal job, check the heartbeat timestamp. Mark jobs with stale heartbeats (> 3 minutes) as failed.
+5. **Finalize:** When all jobs are terminal, compute overall run status (failed if any failed, cancelled if any cancelled, success otherwise).
 
 The Raft leader guard (`if (!raft.isLeader()) return`) prevents multiple orchestrators from racing to recover the same run.
 
@@ -427,3 +437,4 @@ sequenceDiagram
 ## See also
 
 - [Multi-orchestrator clustering (operator guide)](../../operator/orchestrator/clustering.md) — deployment recipes, configuration reference, join tokens, and troubleshooting for running a cluster.
+- [Scaling ceilings](./scaling-ceilings.md) — the peer-heartbeat and Platform-routing tripwires, and the growth conditions that should trigger reworking them.

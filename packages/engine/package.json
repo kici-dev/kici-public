@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.1.27",
+  "version": "0.2.0",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -89,6 +89,10 @@
       "import": "./dist/protocol/messages/oidc-token-relay.js",
       "types": "./dist/protocol/messages/oidc-token-relay.d.ts"
     },
+    "./protocol/messages/dashboard-sealed-write": {
+      "import": "./dist/protocol/messages/dashboard-sealed-write.js",
+      "types": "./dist/protocol/messages/dashboard-sealed-write.d.ts"
+    },
     "./protocol/messages/oidc-mint": {
       "import": "./dist/protocol/messages/oidc-mint.js",
       "types": "./dist/protocol/messages/oidc-mint.d.ts"
@@ -120,18 +124,22 @@
     "./metrics/catalog-policy": {
       "import": "./dist/metrics/catalog-policy.js",
       "types": "./dist/metrics/catalog-policy.d.ts"
+    },
+    "./metrics/metric-kind-compat": {
+      "import": "./dist/metrics/metric-kind-compat.js",
+      "types": "./dist/metrics/metric-kind-compat.d.ts"
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
-    "typecheck": "tsc --noEmit",
+    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
+    "typecheck": "tsgo --noEmit",
     "test": "vitest run",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/engine --name @kici-dev/engine"
   },
   "dependencies": {
     "jose": "^6.1.0",
     "jsonpath-plus": "^10.4.0",
-    "picomatch": "^4.0.4",
+    "picomatch": "^4.0.5",
     "safe-regex": "^2.1.1",
     "zod": "^4.4.3"
   },

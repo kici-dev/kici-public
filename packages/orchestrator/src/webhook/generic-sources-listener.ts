@@ -41,6 +41,7 @@ import type { GenericSourceManager } from './generic-sources.js';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type { AppConfig } from '../config.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import { registerProviderBundleForSource } from './register-source-bundle.js';
 
 const logger = createLogger({ prefix: 'generic-sources-listener' });
@@ -57,6 +58,9 @@ export interface GenericSourcesChangeListenerOptions {
   /** Required for universal-git source rows; null is acceptable on
    *  peers that cannot serve them. */
   secretResolver: SecretResolver | null;
+  /** Fleet-wide settings reader; threads the live lock-file cap into warm-path
+   *  universal-git fetcher registration. */
+  clusterSettings?: ClusterSettingsReader;
   /** Active scaler backend on this peer. Threaded into the warm-path
    *  registration so a local source added at runtime on a container /
    *  firecracker scaler emits the same reachability warning as a cold-boot one. */
@@ -167,6 +171,7 @@ export class GenericSourcesChangeListener {
           providerRegistry: this.opts.providerRegistry,
           config: this.opts.config,
           secretResolver: this.opts.secretResolver,
+          clusterSettings: this.opts.clusterSettings,
           scalerBackendType: this.opts.scalerBackendType,
         });
         appliedChange = true;

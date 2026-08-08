@@ -9,12 +9,83 @@
 
 import fsPromises from 'node:fs/promises';
 import path from 'node:path';
-import { register } from 'node:module';
+import { register, createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 import { normalizeLineEndings, sha256 } from '@kici-dev/shared';
-import type { Workflow, Job, StepInput, DynamicJobFn, EventPayload } from '@kici-dev/sdk';
-import { isDynamicJobFn } from '@kici-dev/sdk';
+import type {
+  Workflow,
+  Job,
+  StepInput,
+  DynamicJobFn,
+  EventPayload,
+  OutputsMap,
+  StepRefMap,
+} from '@kici-dev/sdk';
+import {
+  isDynamicJobFn,
+  setStepOutputsMap as setStepOutputsMapBundled,
+  setStepRefMap as setStepRefMapBundled,
+  setJobOutputsMap as setJobOutputsMapBundled,
+} from '@kici-dev/sdk';
+
+/**
+ * SDK output-map setters resolved from a specific `@kici-dev/sdk` instance.
+ * The agent uses these to wire the workflow module's OWN SDK copy (a different
+ * physical module than the agent's bundled SDK) to the same output maps the
+ * step loop mutates, so within-job `.result` proxies — which read that copy's
+ * module-global `_stepOutputsMap` — resolve at access time.
+ */
+export interface SdkOutputSetters {
+  setStepOutputsMap: (map: OutputsMap) => void;
+  setStepRefMap: (map: StepRefMap) => void;
+  setJobOutputsMap: (map: OutputsMap) => void;
+}
+
+/**
+ * Resolve the `@kici-dev/sdk` instance the workflow module itself imports.
+ *
+ * The workflow's `.result` proxies read the module-global step-outputs map of
+ * whichever SDK copy the workflow file resolves — which is generally a
+ * different physical module than the agent's bundled SDK (the workflow is
+ * imported from the cloned source tree and resolves its deps against that
+ * tree's `node_modules`). Resolving via `createRequire(workflowFilePath)` walks
+ * `node_modules` from the workflow file exactly the way the workflow's own
+ * `import '@kici-dev/sdk'` does — including any hoisted copy — so the returned
+ * setters mutate the SAME module-global map object the proxies read. Node caches
+ * ESM modules by resolved URL, so importing that path yields the workflow's live
+ * singleton, not a fresh copy.
+ *
+ * Falls back to the agent's bundled setters when resolution fails (mirrors
+ * `resolveSdkSetters` in the compiler's test runner).
+ */
+export async function resolveWorkflowSdkSetters(
+  workflowFilePath: string,
+): Promise<SdkOutputSetters> {
+  try {
+    const req = createRequire(workflowFilePath);
+    const sdkEntry = req.resolve('@kici-dev/sdk');
+    const sdk = (await import(pathToFileURL(sdkEntry).href)) as Partial<SdkOutputSetters>;
+    if (
+      typeof sdk.setStepOutputsMap === 'function' &&
+      typeof sdk.setStepRefMap === 'function' &&
+      typeof sdk.setJobOutputsMap === 'function'
+    ) {
+      return {
+        setStepOutputsMap: sdk.setStepOutputsMap,
+        setStepRefMap: sdk.setStepRefMap,
+        setJobOutputsMap: sdk.setJobOutputsMap,
+      };
+    }
+  } catch {
+    // Fall through to the agent's bundled setters.
+  }
+  return {
+    setStepOutputsMap: setStepOutputsMapBundled,
+    setStepRefMap: setStepRefMapBundled,
+    setJobOutputsMap: setJobOutputsMapBundled,
+  };
+}
 
 // Build-time constants injected by the agent bundler (scripts/build-service.mjs).
 // The agent's baked SDK fingerprint is included in the lock-file drift error
@@ -38,16 +109,33 @@ const AGENT_SDK_BUNDLE_HASH =
 export const COMPILE_SCHEMA_VERSION = 5;
 
 /**
- * Register the `@kici-dev/core/ts-loader-hook` oxc-transform ESM loader hook so
- * subsequent dynamic `import()` calls for `.ts` / `.tsx` files transform on the
- * fly. Idempotent at our level via the `hookRegistered` flag; Node also
- * tolerates repeated `register()` calls by stacking layers, but we avoid the
- * noise.
+ * Register the ESM loader hook that transforms `.ts` / `.tsx` files on the fly
+ * for subsequent dynamic `import()` calls. Idempotent at our level via the
+ * `hookRegistered` flag; Node also tolerates repeated `register()` calls by
+ * stacking layers, but we avoid the noise.
+ *
+ * Two registration branches:
+ *
+ * - **Container path** — when `KICI_TS_LOADER_HOOK_PATH` is set (only
+ *   `ContainerSandbox` sets it, pointing at a pure-JS hook bundle mounted into
+ *   the job container), register that on-disk hook by absolute `file://` URL.
+ *   `module.register` resolves the specifier on disk in a worker thread, so a
+ *   bare package specifier would need a `node_modules` tree next to the runner
+ *   bundle — which does not exist in a bare customer container. An absolute
+ *   `file://` URL sidesteps resolution entirely.
+ * - **Fork / firecracker path** — when the env var is unset, register the
+ *   `@kici-dev/core/ts-loader-hook` oxc-transform hook by bare specifier,
+ *   resolved via the workspace `node_modules` those sandboxes bind read-only.
  */
 let hookRegistered = false;
 export function ensureLoaderHookRegistered(): void {
   if (hookRegistered) return;
-  register('@kici-dev/core/ts-loader-hook', import.meta.url);
+  const hookPath = process.env.KICI_TS_LOADER_HOOK_PATH;
+  if (hookPath) {
+    register(pathToFileURL(hookPath).href, import.meta.url);
+  } else {
+    register('@kici-dev/core/ts-loader-hook', import.meta.url);
+  }
   hookRegistered = true;
 }
 
@@ -105,7 +193,7 @@ export async function loadWorkflowSource(
   sourceFile: string,
   expectedContentHash?: string,
   resolvedHashFiles?: string[],
-): Promise<{ module: Record<string, unknown> }> {
+): Promise<{ module: Record<string, unknown>; sdkSetters: SdkOutputSetters }> {
   ensureLoaderHookRegistered();
 
   const filePath = path.join(workDir, sourceFile);
@@ -131,7 +219,9 @@ export async function loadWorkflowSource(
   const cacheBuster = `?t=${Date.now()}`;
   const module = await import(moduleUrl + cacheBuster);
 
-  return { module: module as Record<string, unknown> };
+  const sdkSetters = await resolveWorkflowSdkSetters(filePath);
+
+  return { module: module as Record<string, unknown>, sdkSetters };
 }
 
 /**

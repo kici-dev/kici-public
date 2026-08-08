@@ -1,15 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m024 from './024_dispatch_queue_provisioning_error.js';
 
 /**
  * Real-Postgres test for migration 024.
  *
  * Creates a uniquely-named throwaway database inside the admin Postgres
- * server, runs every migration up to 024 via the production migration
+ * server, applies migrations 001..024 via the production migration
  * provider, and asserts the resulting schema with information_schema. The
  * throwaway database is dropped in teardown, so the test never mutates any
  * shared schema or data.
@@ -75,10 +74,9 @@ describeDb('migration 024_dispatch_queue_provisioning_error', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    // Apply every migration (001..024) via the production provider so the
+    // Apply migrations 001..024 via the production provider so the
     // dispatch_queue table the column attaches to actually exists.
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -107,7 +105,7 @@ describeDb('migration 024_dispatch_queue_provisioning_error', () => {
   });
 
   it('up() is idempotent (re-running is a no-op)', async () => {
-    // The column already exists after migrateToLatest; running up() again
+    // The column already exists after the beforeAll migration; running up() again
     // must not throw.
     await m024.up(db);
     await m024.up(db);

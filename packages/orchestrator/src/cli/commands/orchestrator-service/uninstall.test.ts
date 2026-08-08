@@ -55,7 +55,12 @@ vi.mock('../../service/index.js', async () => {
 
 // Import after mocks so the action picks up the mocked module.
 import { registerOrchestratorUninstall } from './uninstall.js';
-import { readIndex, writeIndex, writeManifest } from '../../service/index.js';
+import {
+  InstanceNotFoundError,
+  readIndex,
+  writeIndex,
+  writeManifest,
+} from '../../service/index.js';
 import type { InstanceManifest } from '../../service/index.js';
 
 function mkTmp(prefix: string): string {
@@ -155,6 +160,24 @@ describe('orchestrator uninstall — folder-anchored', () => {
       process.chdir(savedCwd);
       exitSpy.mockRestore();
       fs.rmSync(emptyCwd, { recursive: true, force: true });
+    }
+  });
+
+  it('exits 0 as a no-op when --name matches no installed instance', async () => {
+    mockListResult = []; // empty scan → InstanceNotFoundError for the name
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+
+    try {
+      await program.parseAsync(['node', 'orchestrator', 'uninstall', '--name', 'kici-absent']);
+      expect(mockUninstall).not.toHaveBeenCalled();
+      expect(exitSpy).not.toHaveBeenCalled();
+      const logs = consoleLogSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      expect(logs).toContain('not installed');
+      expect(new InstanceNotFoundError('orchestrator', 'x', 'm')).toBeInstanceOf(Error);
+    } finally {
+      exitSpy.mockRestore();
     }
   });
 

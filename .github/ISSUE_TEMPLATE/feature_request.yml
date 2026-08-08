@@ -1,6 +1,6 @@
 name: Feature request
 description: Propose a concrete enhancement to a public KiCI package
-labels: ["enhancement"]
+labels: ['enhancement']
 body:
   - type: markdown
     attributes:
@@ -33,8 +33,8 @@ body:
     attributes:
       label: Would you be willing to contribute this?
       options:
-        - "Maybe, with guidance"
-        - "Yes"
-        - "No"
+        - 'Maybe, with guidance'
+        - 'Yes'
+        - 'No'
     validations:
       required: false

@@ -14,7 +14,54 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-const { registerSecretCommands } = await import('./secret.js');
+// ── fix-prefixed-scopes direct-DB harness ────────────────────────────────────
+// The command opens its own pool and builds its own PgSecretStore, so the DB
+// client, the store factory and the master-key loader are stubbed. Everything
+// else in the module (notably SecretScopeExistsError, whose identity the
+// command's `instanceof` check depends on) stays real.
+
+const mockListScopes = vi.fn();
+const mockRenameScope = vi.fn();
+const mockDbDestroy = vi.fn();
+/** Rows `listRegisteredBackendNames` reads out of `secret_backends`. */
+let registeredBackendRows: Array<{ name: string }> = [];
+
+const mockDb = {
+  destroy: (...args: unknown[]) => mockDbDestroy(...args),
+  selectFrom: () => ({
+    select: () => ({ execute: async () => registeredBackendRows }),
+  }),
+};
+
+vi.mock('../../db/client.js', () => ({
+  createPool: () => ({}),
+  createDb: () => mockDb,
+}));
+
+vi.mock('../../secrets/config.js', async (importOriginal) => {
+  const original = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...original,
+    loadSecretStoreConfig: () => ({
+      masterKey: Buffer.alloc(32),
+      oldMasterKey: undefined,
+      keyVersion: 1,
+    }),
+  };
+});
+
+vi.mock('../../secrets/pg-secret-store.js', async (importOriginal) => {
+  const original = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...original,
+    PgSecretStore: {
+      create: async () => ({ listScopes: mockListScopes, renameScope: mockRenameScope }),
+    },
+  };
+});
+
+const { SecretScopeExistsError } = await import('../../secrets/pg-secret-store.js');
+const { registerSecretCommands, planPrefixedScopeFixes } = await import('./secret.js');
 
 interface MockClient {
   listScopes: ReturnType<typeof vi.fn>;
@@ -232,9 +279,21 @@ describe('kici-admin secret CLI', () => {
       client.listScopes.mockResolvedValue({ scopes: ['staging', 'production'] });
       const { stdout, exitCode } = await runCommand(['secret', 'scopes', 'org-1'], client);
       expect(exitCode).toBeNull();
-      expect(client.listScopes).toHaveBeenCalledWith('org-1');
+      expect(client.listScopes).toHaveBeenCalledWith('org-1', false);
       expect(stdout).toContain('staging');
       expect(stdout).toContain('production');
+    });
+
+    it('scopes --all-backends asks for the cross-backend listing', async () => {
+      const client = makeMockClient();
+      client.listScopes.mockResolvedValue({ scopes: ['pg:staging', 'vault:aws/prod'] });
+      const { stdout, exitCode } = await runCommand(
+        ['secret', 'scopes', 'org-1', '--all-backends'],
+        client,
+      );
+      expect(exitCode).toBeNull();
+      expect(client.listScopes).toHaveBeenCalledWith('org-1', true);
+      expect(stdout).toContain('vault:aws/prod');
     });
 
     it('list prints each key', async () => {
@@ -398,5 +457,130 @@ describe('kici-admin secret CLI', () => {
       expect(stderr).toMatch(/--confirm-fingerprint mismatch/);
       expect(client.setSecret).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── fix-prefixed-scopes planner ────────────────────────────────────────────
+describe('planPrefixedScopeFixes', () => {
+  const backends = ['pg', 'vault'];
+
+  it('plans a rename for a scope stored with a registered qualifier', () => {
+    const plan = planPrefixedScopeFixes(['pg:production'], backends);
+    expect(plan.renames).toEqual([{ from: 'pg:production', to: 'production', backendName: 'pg' }]);
+    expect(plan.skips).toEqual([]);
+  });
+
+  it('leaves an already-bare scope alone', () => {
+    const plan = planPrefixedScopeFixes(['production', 'aws/prod'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toEqual([]);
+  });
+
+  it('leaves an UNREGISTERED head alone — it is a path, not a stale qualifier', () => {
+    const plan = planPrefixedScopeFixes(['github:42'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toEqual([]);
+  });
+
+  it('SKIPS rather than merges when the bare target already exists', () => {
+    const plan = planPrefixedScopeFixes(['pg:production', 'production'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toHaveLength(1);
+    expect(plan.skips[0].scope).toBe('pg:production');
+    expect(plan.skips[0].reason).toMatch(/already exists/);
+  });
+
+  it('SKIPS a non-pg qualifier rather than moving the secret into PG', () => {
+    // These scopes come out of the PG store, so 'vault:foo' is a PG row
+    // wearing another backend's name. Renaming it to 'foo' would make it a
+    // real PG secret — the cross-backend move the rename route refuses.
+    const plan = planPrefixedScopeFixes(['vault:foo'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toHaveLength(1);
+    expect(plan.skips[0].scope).toBe('vault:foo');
+    expect(plan.skips[0].reason).toMatch(/would move the secret into PG/);
+  });
+
+  it('SKIPS a bare qualifier with an empty path', () => {
+    const plan = planPrefixedScopeFixes(['pg:'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips[0].reason).toMatch(/empty path/);
+  });
+
+  it('treats a leading colon as a path, never an empty backend name', () => {
+    const plan = planPrefixedScopeFixes([':orphan'], backends);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toEqual([]);
+  });
+
+  it('splits on the first colon only', () => {
+    const plan = planPrefixedScopeFixes(['pg:a:b'], backends);
+    expect(plan.renames).toEqual([{ from: 'pg:a:b', to: 'a:b', backendName: 'pg' }]);
+  });
+
+  it('plans nothing when no backend is registered', () => {
+    const plan = planPrefixedScopeFixes(['pg:production'], []);
+    expect(plan.renames).toEqual([]);
+    expect(plan.skips).toEqual([]);
+  });
+});
+
+describe('kici-admin secret fix-prefixed-scopes — a refused rename must not abort the repair', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    registeredBackendRows = [{ name: 'pg' }];
+    mockDbDestroy.mockResolvedValue(undefined);
+  });
+
+  async function runFix() {
+    return runCommand(['secret', 'fix-prefixed-scopes', 'org-1', '--database-url', 'postgres://x']);
+  }
+
+  it('skips a destination the store refuses as occupied and still repairs the scopes behind it', async () => {
+    // The planner's occupancy check reads listScopes, which only sees scopes
+    // that hold secret rows — a destination existing solely as a context
+    // binding is invisible to it, so the store is the one that refuses. Two
+    // scopes are queued; the FIRST is refused.
+    mockListScopes.mockResolvedValue(['pg:alpha', 'pg:beta']);
+    mockRenameScope
+      .mockRejectedValueOnce(new SecretScopeExistsError('alpha'))
+      .mockResolvedValueOnce(undefined);
+
+    const { stdout, stderr, exitCode } = await runFix();
+
+    // The second rename was attempted at all only because the first did not
+    // abort the loop — this assertion cannot hold if the error propagates.
+    expect(mockRenameScope).toHaveBeenCalledTimes(2);
+    expect(mockRenameScope).toHaveBeenNthCalledWith(1, 'org-1', 'pg:alpha', 'alpha');
+    expect(mockRenameScope).toHaveBeenNthCalledWith(2, 'org-1', 'pg:beta', 'beta');
+
+    expect(stderr).toContain("SKIPPED 'pg:alpha'");
+    expect(stderr).toMatch(/already exists/);
+    expect(stdout).toContain('1 scope(s) repaired, 1 skipped.');
+    // 2 = "some scopes still need a human", not 1 = hard failure.
+    expect(exitCode).toBe(2);
+  });
+
+  it('still fails hard on a rename error that is not an occupancy conflict', async () => {
+    mockListScopes.mockResolvedValue(['pg:alpha', 'pg:beta']);
+    mockRenameScope.mockRejectedValue(new Error('connection reset'));
+
+    const { stderr, exitCode } = await runFix();
+
+    expect(stderr).toContain('Error: connection reset');
+    expect(exitCode).toBe(1);
+    // Aborted on the first rename — an unknown fault must not be swallowed and
+    // the remaining scopes must not be touched.
+    expect(mockRenameScope).toHaveBeenCalledTimes(1);
+  });
+
+  it('exits 0 and repairs everything when no destination is occupied', async () => {
+    mockListScopes.mockResolvedValue(['pg:alpha']);
+    mockRenameScope.mockResolvedValue(undefined);
+
+    const { stdout, exitCode } = await runFix();
+
+    expect(stdout).toContain('1 scope(s) repaired, 0 skipped.');
+    expect(exitCode).toBeNull();
   });
 });

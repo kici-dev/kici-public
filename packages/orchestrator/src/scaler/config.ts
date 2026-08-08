@@ -12,8 +12,17 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { KNOWN_ROLES, ScalerBackendType } from '@kici-dev/engine';
+import { KNOWN_ROLES, ScalerBackendType, scalerPlatformSchema } from '@kici-dev/engine';
+import { ImagePullPolicy } from './types.js';
 import type { ScalerConfig } from './types.js';
+
+/**
+ * Default cap on concurrent `backend.spawn` operations per backend when a
+ * scaler entry does not set `maxConcurrentSpawns`. Bounds the provisioning rate
+ * (image pull + create + start) so a burst of queued jobs cannot storm the
+ * container socket / registry.
+ */
+export const DEFAULT_MAX_CONCURRENT_SPAWNS = 8;
 
 /**
  * Zod schema for a single resource spec (cpus + memory).
@@ -133,7 +142,10 @@ export const labelSetConfigSchema = z
         message: "Labels with 'kici:' prefix are reserved and cannot be used in scaler labelSets",
       }),
     image: z.string().optional(),
-    imagePullPolicy: z.enum(['Always', 'IfNotPresent', 'Never']).default('Always'),
+    // Default IfNotPresent: KiCI agent images are pinned + immutable, so
+    // re-pulling on every spawn only storms the registry/socket. A label set on
+    // a moving tag opts into `Always` explicitly.
+    imagePullPolicy: ImagePullPolicy.default(ImagePullPolicy.enum.IfNotPresent),
     binaryPath: z.string().optional(),
     /**
      * Per-label-set resource request and limit. Accepts either the nested
@@ -171,6 +183,11 @@ const scalerEntrySchema = z
     name: z.string(),
     type: ScalerBackendType.exclude(['kubernetes']),
     maxAgents: z.number().int().positive(),
+    // Provisioning-rate throttle: at most this many `backend.spawn` operations
+    // (image pull + create + start) run concurrently per backend. Orthogonal to
+    // `maxAgents` (the population cap) — a burst of in-cap jobs still spawns all
+    // of them, just this many at a time, so it does not storm the socket.
+    maxConcurrentSpawns: z.number().int().positive().default(DEFAULT_MAX_CONCURRENT_SPAWNS),
     labelSets: z.array(labelSetConfigSchema).min(1),
     host: z.string().optional(),
     socketPath: z.string().optional(),
@@ -201,6 +218,16 @@ const scalerEntrySchema = z
       .refine((labels) => !labels.some((l) => l.toLowerCase().startsWith('kici:')), {
         message: "Labels with 'kici:' prefix are reserved and cannot be used in mandatoryLabels",
       }),
+
+    /**
+     * Structured platform of this pool's agents. When set, the auto-injected
+     * `kici:os:*` / `kici:arch:*` labels AND the mandatory platform taint both
+     * derive from this single field — a non-default `os` (`macos`, `windows`)
+     * or `arch` (`arm64`) taints the pool so only jobs that request it are
+     * routed here. Optional: when omitted, bare-metal pools derive the platform
+     * from the host OS/arch, and container / firecracker pools default to linux.
+     */
+    platform: scalerPlatformSchema.optional(),
 
     roles: z
       .array(z.enum([...KNOWN_ROLES, 'all']))
@@ -338,6 +365,13 @@ export const firecrackerNetworkSchema = z.object({
   netmask: z.string().default('255.255.255.0'),
   /** nft table name for this coordinator's host bridge (disjoint per bridge). */
   table: z.string().default('kici'),
+  /**
+   * When true (default), the orchestrator verifies and provisions this host
+   * bridge on startup (self-heal), so a fresh Firecracker host needs no manual
+   * `kici-admin firecracker provision`. Set false to keep explicit operator
+   * control of the host network (the CLI provision flow stays available).
+   */
+  autoProvisionHost: z.boolean().default(true),
 });
 
 /**

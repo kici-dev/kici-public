@@ -3,6 +3,7 @@ import { SSH_TRANSPORT_CAPABILITY } from '@kici-dev/engine';
 import {
   createEnsureInitRunnerHandler,
   createPreBootSendHandler,
+  createPresignAgentPackageHandler,
   CapabilityDeniedError,
   type BringupApiDeps,
 } from './bringup-api.js';
@@ -40,7 +41,9 @@ function makeDeps(over: Partial<BringupApiDeps> = {}): {
       sshUser: 'root',
       sshPort: 22,
       sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: null,
     })),
+    recordStagedVersion: vi.fn(async () => undefined),
   };
 
   const deps = {
@@ -52,6 +55,7 @@ function makeDeps(over: Partial<BringupApiDeps> = {}): {
     graceMs: 300_000,
     resolveOrgId: () => '__default__',
     resolveOrchestratorUrl: () => 'ws://10.0.0.1:4000/ws',
+    resolveVersion: () => '9.9.9',
     ...over,
   } satisfies BringupApiDeps;
 
@@ -128,6 +132,7 @@ describe('createEnsureInitRunnerHandler', () => {
       bootstrapToken: 'kat_boottoken',
       targetAgentId: FRESH,
       orchestratorUrl: 'ws://10.0.0.1:4000/ws',
+      version: '9.9.9',
       reach: { agentId: FRESH, address: '10.0.0.7', sshUser: 'root', sshPort: 22 },
     });
     // Reach returned to the agent never carries the secret ref.
@@ -145,9 +150,101 @@ describe('createEnsureInitRunnerHandler', () => {
       sshUser: null,
       sshPort: null,
       sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: null,
     });
     const handler = createEnsureInitRunnerHandler(deps);
     await expect(handler(OPS, { targetAgentId: FRESH })).rejects.toThrow(/no SSH reach address/);
+  });
+
+  it('defaults deliveryMode to ssh-push when the host is not S3-reachable', async () => {
+    const { deps } = makeDeps({ agentPackages: {} as BringupApiDeps['agentPackages'] });
+    const result = await createEnsureInitRunnerHandler(deps)(OPS, { targetAgentId: FRESH });
+    expect(result.deliveryMode).toBe('ssh-push');
+  });
+
+  it('picks s3-direct only when the host is S3-reachable AND a cache store is present', async () => {
+    const { deps } = makeDeps({ agentPackages: {} as BringupApiDeps['agentPackages'] });
+    (deps.rosterStore.getReach as ReturnType<typeof vi.fn>).mockResolvedValue({
+      agentId: FRESH,
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 22,
+      sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: true,
+    });
+    const result = await createEnsureInitRunnerHandler(deps)(OPS, { targetAgentId: FRESH });
+    expect(result.deliveryMode).toBe('s3-direct');
+  });
+
+  it('falls back to ssh-push even when S3-reachable if no cache store is configured', async () => {
+    const { deps } = makeDeps(); // no agentPackages
+    (deps.rosterStore.getReach as ReturnType<typeof vi.fn>).mockResolvedValue({
+      agentId: FRESH,
+      address: '10.0.0.7',
+      sshUser: 'root',
+      sshPort: 22,
+      sshKeySecret: 'prod/bootstrap/ssh',
+      s3Reachable: true,
+    });
+    const result = await createEnsureInitRunnerHandler(deps)(OPS, { targetAgentId: FRESH });
+    expect(result.deliveryMode).toBe('ssh-push');
+  });
+});
+
+describe('createPresignAgentPackageHandler', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function withStore(over: Partial<BringupApiDeps> = {}) {
+    const getUrl = vi.fn(async () => 'https://cache/presigned?sig=x');
+    const get = vi.fn(async () => Buffer.from(`${'a'.repeat(64)}  kici-agent-linux-x64.tar.gz\n`));
+    const has = vi.fn(async () => true);
+    return {
+      ...makeDeps({ agentPackages: { getUrl, get, has }, ...over }),
+      getUrl,
+      get,
+    };
+  }
+
+  it('refuses a caller without ssh-transport (denied + access-logged)', async () => {
+    const { deps, records } = withStore();
+    await expect(
+      createPresignAgentPackageHandler(deps)('not-ops', {
+        targetAgentId: FRESH,
+        platform: 'linux-x64',
+      }),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(records).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'denied' }));
+  });
+
+  it('mints a presigned URL + sha256 for the probed platform and audits allowed', async () => {
+    const { deps, getUrl, records } = withStore();
+    const res = await createPresignAgentPackageHandler(deps)(OPS, {
+      targetAgentId: FRESH,
+      platform: 'linux-x64',
+    });
+    expect(res).toEqual({ url: 'https://cache/presigned?sig=x', sha256: 'a'.repeat(64) });
+    expect(getUrl).toHaveBeenCalledWith('agent-packages/9.9.9/kici-agent-linux-x64.tar.gz');
+    expect(records).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'allowed' }));
+  });
+
+  it('throws when no payload object exists for the version (no silent stale stage)', async () => {
+    const getUrl = vi.fn(async () => null);
+    const { deps } = makeDeps({
+      agentPackages: { getUrl, get: vi.fn(), has: vi.fn() },
+    });
+    await expect(
+      createPresignAgentPackageHandler(deps)(OPS, {
+        targetAgentId: FRESH,
+        platform: 'linux-arm64',
+      }),
+    ).rejects.toThrow(/no agent payload for version 9\.9\.9/);
+  });
+
+  it('refuses when no cache store is configured', async () => {
+    const { deps } = makeDeps(); // no agentPackages
+    await expect(
+      createPresignAgentPackageHandler(deps)(OPS, { targetAgentId: FRESH, platform: 'linux-x64' }),
+    ).rejects.toThrow(/object storage is not configured/);
   });
 });
 

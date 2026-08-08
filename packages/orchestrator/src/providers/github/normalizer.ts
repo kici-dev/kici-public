@@ -100,8 +100,7 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   extractRepoIdentifier(payload: unknown): string | null {
     const p = payload as Record<string, unknown>;
     const repository = p.repository as
-      | { full_name?: string; owner?: { login?: string }; name?: string }
-      | undefined;
+      { full_name?: string; owner?: { login?: string }; name?: string } | undefined;
 
     return (
       repository?.full_name ??
@@ -276,6 +275,7 @@ type EventHandler = (
  * `pull_request_review` / `pull_request_review_comment` handlers.
  */
 type PullRequestShape = {
+  number?: number;
   base?: { ref?: string; repo?: { full_name?: string } };
   head?: { ref?: string; repo?: { full_name?: string } };
 };
@@ -299,6 +299,7 @@ const handlePullRequest: EventHandler = (p, action, sender) => {
     sourceBranch: sourceBranch ?? undefined,
     baseBranch: targetBranch,
     isForkPR: isForkPullRequest(pr),
+    prNumber: pr?.number,
     senderUsername: sender.username,
     senderUserId: sender.userId,
     payload: p,
@@ -354,6 +355,7 @@ const handlePullRequestReview: EventHandler = (p, action, sender) => {
     sourceBranch: pr?.head?.ref ?? undefined,
     baseBranch: prBaseBranch,
     isForkPR: isForkPullRequest(pr),
+    prNumber: pr?.number,
     senderUsername: sender.username,
     senderUserId: sender.userId,
     payload: p,
@@ -371,6 +373,7 @@ const handlePullRequestReviewComment: EventHandler = (p, action, sender) => {
     sourceBranch: pr?.head?.ref ?? undefined,
     baseBranch: prBaseBranch,
     isForkPR: isForkPullRequest(pr),
+    prNumber: pr?.number,
     senderUsername: sender.username,
     senderUserId: sender.userId,
     payload: p,

@@ -7,6 +7,8 @@ description: rule(), skip(), matrix builds (static + dynamic), and dynamicJob / 
 
 Rules control conditional execution of workflows and jobs. A rule that returns `false` (or whose check function returns `false`) prevents execution.
 
+A rule's check function that **returns `false`** cleanly skips the job or step. A check function that **throws** is treated as an evaluation failure, not a skip: the job or step **fails** with the error surfaced (both on a remote run and when running locally with `kici run --local`), so a broken rule can never silently pass as a green run. For example, `rule('main only', (ctx) => ctx.event.ref.endsWith('main'))` throws on an event whose `ref` is undefined — that run fails with the error instead of quietly skipping every step. Fix the thrown error (guard the access) rather than relying on the skip.
+
 ### rule(label) / rule(label, check)
 
 Create a rule.
@@ -56,12 +58,22 @@ type RuleCheckFn = (ctx: RuleContext) => Promise<boolean> | boolean;
 
 Can be sync or async. Receives a `RuleContext`:
 
-| Property       | Type                                | Description                                                           |
-| -------------- | ----------------------------------- | --------------------------------------------------------------------- |
-| `event`        | `EventPayload`                      | The triggering event payload (discriminated union — narrow on `type`) |
-| `changedFiles` | `string[]`                          | Files changed in this event                                           |
-| `env`          | `Record<string, string\|undefined>` | Environment variables                                                 |
-| `$`            | zx shell                            | Shell executor for running commands                                   |
+| Property             | Type                                      | Description                                                           |
+| -------------------- | ----------------------------------------- | --------------------------------------------------------------------- |
+| `event`              | `EventPayload`                            | The triggering event payload (discriminated union — narrow on `type`) |
+| `changedFiles`       | `string[]`                                | Files changed in this event (see availability note below)             |
+| `changedFilesStatus` | `'fetched' \| 'unavailable' \| 'skipped'` | Whether `changedFiles` is available                                   |
+| `env`                | `Record<string, string\|undefined>`       | Environment variables                                                 |
+| `$`                  | zx shell                                  | Shell executor for running commands                                   |
+
+`changedFiles` is available on `push` and `pull_request` events — the agent computes the diff from its checkout, so no `paths:` trigger is required. It is `unavailable` for events with no diff (`schedule`, `tag`, `manual_schedule`), and in the rare case where the diff cannot be computed (e.g. a history deeper than the agent's bounded fetch). Reading `changedFiles` when it is unavailable throws and fails the job, so guard with `changedFilesStatus` first when a rule can run on such events:
+
+```typescript
+rule('has source changes', (ctx) => {
+  if (ctx.changedFilesStatus !== 'fetched') return true; // no diff — don't gate on files
+  return ctx.changedFiles.some((f) => f.startsWith('src/'));
+});
+```
 
 ### evaluateRules(rules, context, label, onRuleResult?)
 
@@ -132,6 +144,8 @@ Every variant carries the shared `EventBase` fields — `type`, `action`, `targe
 
 Matrix configurations expand a single job into multiple instances, one per parameter combination. Maximum 256 combinations.
 
+Combinations must be **unique**. Two combinations that would produce the same instance name — most simply, the same value listed twice — fail the job instead of quietly running it twice.
+
 Expansion happens at **dispatch time**: the orchestrator materializes the matrix into N execution jobs — one per combination, each dispatched to its own agent — before any job runs. Each instance receives its combination as `ctx.matrix`. This is identical whether the workflow runs via `kici run <event> --local` or remotely through a webhook trigger, and the dashboard groups the N instances under one parent node.
 
 ### Static array (single dimension)
@@ -188,6 +202,19 @@ The function receives a `DynamicMatrixContext`:
 
 Must return `string[]` (single dimension) or `Record<string, string[]>` (multi-dimensional).
 
+The contract is enforced at runtime. A function that returns anything else — `undefined` (a
+missing `return`), a bare string, or an object whose values are not arrays — fails the job with
+an error naming the job and the expected shape. Numbers and booleans are accepted and converted
+to strings, since matrix values appear in job names as text.
+
+Values must also be unique. A matrix containing the same value twice would produce two children
+with the same name, so it fails the job instead — de-duplicate the values your function returns
+(for example, `[...new Set(values)]`). The same rule applies to a static matrix.
+
+A dynamic matrix that would expand to an unreasonable number of raw combinations is refused
+before it is built, so a runaway discovery command fails the job with an error rather than
+exhausting the agent.
+
 A dynamic matrix is resolved at runtime, then materialized into N instances exactly like a static matrix. Because the combinations are not known until the function runs, the 256-combination cap (and the "zero combinations" guard) is enforced at that point: a dynamic matrix that resolves to more than 256 combinations, or to none, fails the job with a matrix-expansion error rather than dispatching.
 
 ### Include and exclude
@@ -209,6 +236,14 @@ include: [
 
 **Exclude** removes combinations matching all specified keys. Applied first.
 **Include** adds exact combinations. Applied after exclude.
+
+Values appear in the expanded job name ordered by their dimension name, alphabetically, whichever
+order you write the keys in. The include entry above therefore becomes `test (23, linux)` — the
+`node` value then the `os` value, the same order as its expanded siblings `test (18, linux)` and
+`test (20, linux)`. That order is also the `byMatrix` key a downstream job reads its outputs under
+(see [Consuming matrix outputs downstream](#consuming-matrix-outputs-downstream)), so an include
+entry whose keys you wrote out of
+alphabetical order is keyed alphabetically too.
 
 Types:
 
@@ -264,7 +299,7 @@ interface MatrixJobOutputs<T = Record<string, unknown>> {
 }
 ```
 
-The suffix key matches the child job's display name: `byMatrix['a']` for a single-dimension `['a', 'b']` matrix, `byMatrix['linux, arm64']` for a multi-dimension combination. Use `isMatrixJobOutputs` (or `'byMatrix' in result`) to discriminate:
+The suffix key matches the child job's display name: `byMatrix['a']` for a single-dimension `['a', 'b']` matrix, and for a multi-dimension combination the values ordered by dimension name — `byMatrix['arm64, linux']` for `{ arch: 'arm64', os: 'linux' }`. Use `isMatrixJobOutputs` (or `'byMatrix' in result`) to discriminate:
 
 ```typescript
 import { isMatrixJobOutputs } from '@kici-dev/sdk';
@@ -296,9 +331,9 @@ isDynamicFunction(matrix); // true if async function
 import { expandMatrix, applyIncludeExclude } from '@kici-dev/sdk';
 ```
 
-`expandMatrix(matrix)` takes a `StaticMatrixArray` or `StaticMatrixObject` and returns all combinations as `MatrixValues[]`. For a single-dimension array, each value becomes `{ value: '...' }`. For multi-dimensional objects, it produces the Cartesian product.
+`expandMatrix(matrix)` takes a string array or an object of string arrays and returns all combinations as `MatrixValues[]`. For a single-dimension array, each value becomes `{ value: '...' }`. For multi-dimensional objects, it produces the Cartesian product. Anything else throws a `MatrixShapeError` naming the expected shape; numbers and booleans inside the values are accepted and converted to strings.
 
-`applyIncludeExclude(values, include?, exclude?)` filters an expanded matrix: removes combinations matching any exclude entry, then appends include entries. Returns the filtered `MatrixValues[]`.
+`applyIncludeExclude(values, include?, exclude?)` filters an expanded matrix: removes combinations matching any exclude entry, then appends a key-sorted copy of each include entry that is not already present. Returns the filtered `MatrixValues[]`.
 
 ## Dynamic jobs
 

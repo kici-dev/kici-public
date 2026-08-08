@@ -13,7 +13,7 @@ export const misePreset = workflow('mise-preset', {
   on: [push()],
   jobs: [
     job('build', {
-      runsOn: 'linux',
+      runsOn: 'kici:os:linux',
       // 'mise' is the zero-config preset; { mise: { timeout, cache, env, shell } }
       // tunes the same fields a hand-written generic init exposes (minus run).
       init: 'mise',

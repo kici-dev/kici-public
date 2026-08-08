@@ -18,7 +18,7 @@ import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import type { CacheMetadata, CacheStorage } from './types.js';
-import { signToken } from './sign-url.js';
+import { signToken, DEFAULT_SIGN_URL_TTL_MS } from './sign-url.js';
 
 export interface FilesystemCacheStorageOptions {
   /** Absolute path to the cache root directory. Created on first write if missing. */
@@ -167,6 +167,11 @@ export class FilesystemCacheStorage implements CacheStorage {
     return this.signedUrl('GET', key);
   }
 
+  presignedGetTtlSeconds(): number {
+    // `signedUrl('GET', …)` mints via `signToken` with the default sign TTL.
+    return Math.floor(DEFAULT_SIGN_URL_TTL_MS / 1000);
+  }
+
   async getUploadUrl(key: string): Promise<string> {
     return this.signedUrl('PUT', key);
   }
@@ -180,21 +185,52 @@ export class FilesystemCacheStorage implements CacheStorage {
     await this.writeMeta(key, { createdAt: now, lastAccessedAt: now });
   }
 
+  /**
+   * List cache keys under a prefix.
+   *
+   * The prefix is a **key prefix**, not necessarily a directory — `UserCache`'s
+   * `restoreKeys` fallback lists on `${prefix}${seg(restoreKey)}`, a partial
+   * object name. Two shapes, and both must work the way the S3 backend does:
+   *
+   * - trailing `/` — a directory. Walk it directly; this is the hot path.
+   * - no trailing `/` — a partial name. Walk the parent directory and filter by
+   *   the prefix, since the prefix itself may name a file (or nothing at all).
+   *
+   * Reading the prefix as a directory in the second case is what made the
+   * `restoreKeys` fallback silently never hit here (`ENOENT` → `[]`) or throw
+   * (`ENOTDIR`, when a real object carried that exact name).
+   */
   async list(subPrefix: string): Promise<string[]> {
-    const root = this.resolvePath(subPrefix.replace(/\/$/, ''));
+    const isDirPrefix = subPrefix.endsWith('/');
+    const trimmed = subPrefix.replace(/\/$/, '');
+    // For a partial name, walk the parent and filter; `''` means the store root.
+    const walkKey = isDirPrefix ? trimmed : trimmed.slice(0, trimmed.lastIndexOf('/') + 1);
+    const walkRoot = walkKey === '' ? this.basePath : this.resolvePath(walkKey.replace(/\/$/, ''));
+
     let entries: { key: string; mtime: number }[];
     try {
-      entries = await this.walkDataFiles(root, subPrefix.replace(/\/$/, ''));
+      entries = await this.walkDataFiles(walkRoot, walkKey.replace(/\/$/, ''));
     } catch (err: unknown) {
       if (isNotFoundFsError(err)) return [];
       throw err;
     }
+    if (!isDirPrefix) entries = entries.filter((e) => e.key.startsWith(trimmed));
     entries.sort((a, b) => b.mtime - a.mtime); // newest first
     return entries.map((e) => e.key);
   }
 
   async getMetadata(key: string): Promise<CacheMetadata | null> {
     return this.readMeta(key);
+  }
+
+  async getObjectSize(key: string): Promise<number | null> {
+    try {
+      const st = await fs.stat(this.resolvePath(key));
+      return st.size;
+    } catch (err: unknown) {
+      if (isNotFoundFsError(err)) return null;
+      throw err;
+    }
   }
 
   async copy(srcKey: string, destKey: string): Promise<void> {
@@ -250,7 +286,13 @@ export class FilesystemCacheStorage implements CacheStorage {
 }
 
 function isNotFoundFsError(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && (err as { code?: string }).code === 'ENOENT';
+  if (typeof err !== 'object' || err === null) return false;
+  const code = (err as { code?: string }).code;
+  // ENOTDIR counts as "not found": it means a path component we expected to be
+  // a directory is actually a file, which for a lookup is the same answer as
+  // the object not being there. Without it, listing a key prefix that collides
+  // with a real object name throws instead of reporting a miss.
+  return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 /**

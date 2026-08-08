@@ -112,16 +112,16 @@ export async function gitClone(options: CloneOptions): Promise<void> {
   // write a temp gitconfig file and point `GIT_CONFIG_GLOBAL` at it — that
   // path is re-read by every git process that inherits the env.
   if (repoUrl.startsWith('file://')) {
-    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
-    const { tmpdir } = await import('node:os');
+    const { writeFile } = await import('node:fs/promises');
     const path = await import('node:path');
-    const dir = await mkdtemp(path.join(tmpdir(), 'kici-gitcfg-'));
+    const { makeTempDir } = await import('@kici-dev/core/tmp');
+    const { path: dir, cleanup } = await makeTempDir('gitcfg');
     const cfgPath = path.join(dir, 'config');
     await writeFile(cfgPath, '[safe]\n\tdirectory = *\n', { mode: 0o600 });
     envEntries.GIT_CONFIG_GLOBAL = cfgPath;
     needsCustomEnv = true;
     safeDirCleanup = async () => {
-      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await cleanup().catch(() => {});
     };
   }
 

@@ -5,6 +5,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
+import { DEFAULT_HOLD_EXPIRY_SECONDS } from '@kici-dev/engine';
 import { ContextDeleteBlockedError, ContextStore, toContext } from './context-store.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
@@ -155,6 +156,68 @@ describe('ContextStore', () => {
 
       expect(result).toBeNull();
     });
+
+    // `undefined` = leave alone, `null` = clear. Both halves are asserted here
+    // because the pair is the whole contract: without the first the operator
+    // cannot turn a protection rule off, and without the second a partial
+    // update would wipe every field it did not mention.
+    describe('clearing a field with an explicit null', () => {
+      /** Run an update against a mock db and return the SET object it built. */
+      async function capturedSet(updates: Parameters<ContextStore['update']>[2]) {
+        const { db, mocks } = createMockDb({ updatedRow: makeEnvRow() });
+        const store = new ContextStore(db);
+        await store.update('org-abc', 'env-001', updates);
+        return mocks.updateSet.mock.calls[0]![0] as Record<string, unknown>;
+      }
+
+      it('writes NULL for required reviewers', async () => {
+        // The headline bug: the reviewer approval gate could not be removed.
+        const set = await capturedSet({ requiredReviewers: null });
+
+        expect(set.required_reviewers).toBeNull();
+      });
+
+      it('writes NULL for hold expiry', async () => {
+        const set = await capturedSet({ holdExpirySeconds: null });
+
+        expect(set.hold_expiry_seconds).toBeNull();
+      });
+
+      it('writes NULL for the concurrency strategy', async () => {
+        const set = await capturedSet({ concurrencyStrategy: null });
+
+        expect(set.concurrency_strategy).toBeNull();
+      });
+
+      it('writes the empty array for cleared branch restrictions', async () => {
+        // The column is `jsonb NOT NULL DEFAULT '[]'`, so "no restrictions" is
+        // the empty array. A SQL NULL is rejected by the constraint and takes
+        // the whole update down with it; the four-character string "null" that
+        // JSON.stringify(null) yields would sit in the column looking like a
+        // value.
+        const set = await capturedSet({ branchRestrictions: null });
+
+        expect(set.branch_restrictions).toBe('[]');
+        expect(set.branch_restrictions).not.toBe('null');
+        expect(set.branch_restrictions).not.toBeNull();
+      });
+
+      it('still serializes a non-null branch-restrictions array', async () => {
+        const set = await capturedSet({ branchRestrictions: ['main'] });
+
+        expect(set.branch_restrictions).toBe('["main"]');
+      });
+
+      it('leaves every field alone when the key is absent', async () => {
+        const set = await capturedSet({ name: 'renamed' });
+
+        expect(set.name).toBe('renamed');
+        expect(set).not.toHaveProperty('required_reviewers');
+        expect(set).not.toHaveProperty('hold_expiry_seconds');
+        expect(set).not.toHaveProperty('concurrency_strategy');
+        expect(set).not.toHaveProperty('branch_restrictions');
+      });
+    });
   });
 
   describe('delete', () => {
@@ -264,6 +327,24 @@ describe('ContextStore', () => {
       expect(env.requiredReviewers).toBeNull();
     });
 
+    it('should fall back to the default hold window when the column is null', () => {
+      // A cleared hold expiry means "unset", not "expire instantly": the
+      // reviewer gate multiplies this value by 1000 to build `holdUntil`, so a
+      // null reaching it would create every hold already overdue.
+      const row = makeEnvRow({ hold_expiry_seconds: null }) as any;
+      const env = toContext(row);
+
+      expect(env.holdExpirySeconds).toBe(DEFAULT_HOLD_EXPIRY_SECONDS);
+      expect(env.holdExpirySeconds).toBeGreaterThan(0);
+    });
+
+    it('should fall back to the queue strategy when the column is null', () => {
+      const row = makeEnvRow({ concurrency_strategy: null }) as any;
+      const env = toContext(row);
+
+      expect(env.concurrencyStrategy).toBe('queue');
+    });
+
     it('should map minimum_trust to minimumTrust', () => {
       const row = makeEnvRow({ minimum_trust: 'trusted' }) as any;
       const env = toContext(row);
@@ -346,6 +427,40 @@ describe('ContextStore', () => {
       const result = await store.matchContext('org-abc', 'nonexistent');
 
       expect(result).toBeNull();
+    });
+
+    it('should return the most-specific glob when several match, regardless of row order', async () => {
+      const broad = makeEnvRow({
+        id: 'env-broad',
+        name: 'broad',
+        type: 'glob',
+        glob_pattern: 'review/*',
+      });
+      const tight = makeEnvRow({
+        id: 'env-tight',
+        name: 'tight',
+        type: 'glob',
+        glob_pattern: 'review/PR-*',
+      });
+
+      // getByName misses (selectFirstRow undefined); the glob scan returns both.
+      const forward = createMockDb({ selectFirstRow: undefined, selectRows: [broad, tight] });
+      const reversed = createMockDb({ selectFirstRow: undefined, selectRows: [tight, broad] });
+
+      const fromForward = await new ContextStore(forward.db).matchContext(
+        'org-abc',
+        'review/PR-42',
+      );
+      const fromReversed = await new ContextStore(reversed.db).matchContext(
+        'org-abc',
+        'review/PR-42',
+      );
+
+      // review/PR-* has more literal characters, so it wins in both orderings.
+      expect(fromForward).toEqual(tight);
+      expect(fromReversed).toEqual(tight);
+      // The scan is ordered by name for a stable input before ranking.
+      expect(forward.mocks.selectOrderBy).toHaveBeenCalledWith('name', 'asc');
     });
   });
 });

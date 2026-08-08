@@ -34,6 +34,44 @@ describe('repoIdentityFromInlineInput', () => {
 
 // --- Mock helpers ---
 
+/**
+ * Kysely-like `updateTable` builder mock.
+ *
+ * In Kysely every `.where()` returns a builder that itself exposes `.where()`
+ * and `.execute()`, so predicates chain. `insertEdgesForRun` marks a run's root
+ * jobs with `.where('run_id', ...).where('job_name', ...).execute()` and
+ * `recomputeNeedsSatisfied` chains three, so a `.where()` that resolves to a
+ * bare `{ execute }` makes those updates throw — and their callers catch and
+ * log the throw, which leaves the mocked run's root jobs silently unmarked and
+ * hides the real update from any assertion.
+ *
+ * The mock reproduces the chaining only: `.where()` discards its predicate
+ * arguments, so a test can observe WHAT an update set, not WHICH rows it
+ * targeted.
+ *
+ * @param onSet observer for the `.set()` payload, called as soon as `.set()` is
+ *   applied — even if the chain never reaches `.execute()`.
+ * @param onExecute observer for the same payload, called only when the built
+ *   update actually reaches `.execute()` — i.e. the whole chain resolved.
+ */
+function makeUpdateTableMock(
+  onSet?: (payload: Record<string, unknown>) => void,
+  onExecute?: (payload: Record<string, unknown>) => void,
+) {
+  return vi.fn(() => ({
+    set: vi.fn((payload: Record<string, unknown>) => {
+      onSet?.(payload);
+      const chain: any = {
+        where: vi.fn(() => chain),
+        execute: vi.fn(async () => {
+          onExecute?.(payload);
+        }),
+      };
+      return chain;
+    }),
+  }));
+}
+
 function createMockLockFile(workflows: any[] = []) {
   return {
     schemaVersion: 4 as const,
@@ -138,18 +176,13 @@ describe('processTestTrigger', () => {
           execute: vi.fn().mockResolvedValue(undefined),
         })),
       })),
-      updateTable: vi.fn().mockReturnValue({
-        set: vi.fn().mockImplementation((payload: Record<string, unknown>) => {
-          setCalls.push(payload);
-          return {
-            where: vi.fn().mockReturnValue({ execute: vi.fn().mockResolvedValue(undefined) }),
-          };
-        }),
-      }),
+      updateTable: makeUpdateTableMock((payload) => setCalls.push(payload)),
     };
 
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       markTestRun: vi.fn(),
     };
 
@@ -368,13 +401,11 @@ describe('processTestTrigger', () => {
     const markTestRun = vi.fn();
     deps.executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       markTestRun,
       db: {
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       },
     } as any;
 
@@ -805,11 +836,7 @@ describe('processTestTrigger', () => {
             execute: vi.fn().mockResolvedValue(undefined),
           })),
         })),
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       };
     }
 
@@ -1082,11 +1109,7 @@ describe('processTestTrigger', () => {
             execute: vi.fn().mockResolvedValue(undefined),
           })),
         })),
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       };
     }
 
@@ -1266,11 +1289,7 @@ describe('processTestTrigger', () => {
             execute: vi.fn().mockResolvedValue(undefined),
           })),
         })),
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       };
     }
 
@@ -1378,9 +1397,36 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       expect(result.status).toBe('accepted');
-      expect(resolveForJob).toHaveBeenCalledWith(INLINE_ORG, 'test-db');
+      // The third argument is the host context, absent for an inline test run.
+      expect(resolveForJob).toHaveBeenCalledWith(INLINE_ORG, 'test-db', undefined);
       const jobConfig = dispatch.mock.calls[0][0].jobConfig;
       expect(jobConfig.secrets.DB_URL).toBe('x');
+    });
+
+    it('marks the run root jobs needs_satisfied through the chained update', async () => {
+      const lockFile = createMockLockFile([inlineEnvWorkflow()]);
+      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+      const executed: Array<Record<string, unknown>> = [];
+      const db = makeInlineDb({ 'test-db': { allow_local_execution: true } });
+      db.updateTable = makeUpdateTableMock(undefined, (payload) => executed.push(payload));
+      deps.db = db as any;
+      deps.contextStore = makeInlineEnvStore('test-db');
+      deps.secretResolver = { resolveForJob: vi.fn(async () => ({ DB_URL: 'x' })) } as any;
+
+      const input = createMockInput({
+        routingKey: 'github:42',
+        workflowName: 'ci',
+        event: { type: 'push', targetBranch: 'master', payload: {} },
+      });
+
+      const result = await processTestTrigger(input, deps);
+
+      expect(result.status).toBe('accepted');
+      // insertEdgesForRun marks the run's root jobs with a chained
+      // `.where().where().execute()` update. A mock whose `.where()` is not
+      // itself chainable makes that update throw into the caller's catch, so
+      // asserting the execute landed is what keeps the mock honest.
+      expect(executed.some((payload) => payload.needs_satisfied === true)).toBe(true);
     });
 
     it('skips impure dynamic contexts (marker set, no inline value)', async () => {
@@ -1416,11 +1462,7 @@ describe('processTestTrigger', () => {
             return chain;
           }),
         })),
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       };
       deps.db = mockDb as any;
 
@@ -1512,11 +1554,7 @@ describe('processTestTrigger', () => {
             execute: vi.fn().mockResolvedValue(undefined),
           })),
         })),
-        updateTable: vi.fn(() => ({
-          set: vi.fn(() => ({
-            where: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-          })),
-        })),
+        updateTable: makeUpdateTableMock(),
       };
     }
 

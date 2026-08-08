@@ -2,7 +2,7 @@
  * Trigger matching engine for evaluating workflow triggers against webhook events.
  * Single source of truth -- replaces duplicate logic in compiler and orchestrator.
  */
-import picomatch from 'picomatch';
+import { getCompiledRegex, getGlobMatcher } from './compiled-matchers.js';
 import type {
   LockTrigger,
   LockPrTrigger,
@@ -23,6 +23,7 @@ import type {
   LockWebhookTrigger,
   LockKiciEventTrigger,
   LockWorkflowCompleteTrigger,
+  LockWorkflowsFailedBatchTrigger,
   LockJobCompleteTrigger,
   LockGenericWebhookTrigger,
   LockScheduleTrigger,
@@ -30,6 +31,7 @@ import type {
   LockWorkflow,
   LockBranchPattern,
   SimulatedEvent,
+  ChangedFilesStatus,
 } from './types.js';
 import {
   createTraceEntry,
@@ -80,10 +82,9 @@ function splitBranchPatterns(
  */
 export function matchBranchPattern(pattern: LockBranchPattern, branch: string): boolean {
   if (pattern.type === 'glob') {
-    return picomatch.isMatch(branch, pattern.pattern);
+    return getGlobMatcher(pattern.pattern)(branch);
   } else {
-    const regex = new RegExp(pattern.pattern, pattern.flags);
-    return regex.test(branch);
+    return getCompiledRegex(pattern.pattern, pattern.flags).test(branch);
   }
 }
 
@@ -101,9 +102,20 @@ function matchAnyBranch(patterns: readonly LockBranchPattern[], branch: string):
  * Patterns prefixed with ! are exclusions. Remaining patterns are inclusions.
  * An all-negation array has implicit match-all semantics for non-excluded files.
  */
-export function matchPathPatterns(paths: readonly string[], changedFiles: string[]): boolean {
+export function matchPathPatterns(
+  paths: readonly string[],
+  changedFiles: string[],
+  status?: ChangedFilesStatus,
+): boolean {
   // No path filters = match
   if (paths.length === 0) return true;
+
+  // Diff unavailable (a provider capability gap such as universal-git PR
+  // events, or upstream degradation): conservative match — running a workflow
+  // spuriously beats silently dropping a real one. This is NEVER inferred from
+  // an empty list; only an explicit `unavailable` status triggers it, so a
+  // genuine empty diff (`fetched` + []) still correctly no-matches below.
+  if (status === 'unavailable') return true;
 
   // If no changed files provided, can't filter by path
   if (changedFiles.length === 0) return false;
@@ -114,7 +126,7 @@ export function matchPathPatterns(paths: readonly string[], changedFiles: string
   let relevantFiles = changedFiles;
   if (exclude.length > 0) {
     relevantFiles = changedFiles.filter(
-      (file) => !exclude.some((pattern) => picomatch.isMatch(file, pattern)),
+      (file) => !exclude.some((pattern) => getGlobMatcher(pattern)(file)),
     );
     // If all files are excluded, no match
     if (relevantFiles.length === 0) return false;
@@ -124,7 +136,7 @@ export function matchPathPatterns(paths: readonly string[], changedFiles: string
   if (include.length === 0) return true;
 
   // Check include patterns against remaining files
-  return relevantFiles.some((file) => include.some((pattern) => picomatch.isMatch(file, pattern)));
+  return relevantFiles.some((file) => include.some((pattern) => getGlobMatcher(pattern)(file)));
 }
 
 /**
@@ -249,12 +261,14 @@ function matchPrTrigger(
   if (trigger.paths.length > 0) {
     const changedFiles = event.changedFiles ?? [];
     const { include, exclude } = splitStringPatterns(trigger.paths);
-    const matches = matchPathPatterns(trigger.paths, changedFiles);
+    const matches = matchPathPatterns(trigger.paths, changedFiles, event.changedFilesStatus);
     traces.push(
       createTraceEntry(
         'paths',
         `include: [${include.join(', ')}] exclude: [${exclude.join(', ')}]`,
-        `[${changedFiles.join(', ')}]`,
+        event.changedFilesStatus === 'unavailable'
+          ? '[unavailable — matched conservatively]'
+          : `[${changedFiles.join(', ')}]`,
         matches,
       ),
     );
@@ -300,12 +314,14 @@ function matchPushTrigger(
   if (trigger.paths.length > 0) {
     const changedFiles = event.changedFiles ?? [];
     const { include, exclude } = splitStringPatterns(trigger.paths);
-    const matches = matchPathPatterns(trigger.paths, changedFiles);
+    const matches = matchPathPatterns(trigger.paths, changedFiles, event.changedFilesStatus);
     traces.push(
       createTraceEntry(
         'paths',
         `include: [${include.join(', ')}] exclude: [${exclude.join(', ')}]`,
-        `[${changedFiles.join(', ')}]`,
+        event.changedFilesStatus === 'unavailable'
+          ? '[unavailable — matched conservatively]'
+          : `[${changedFiles.join(', ')}]`,
         matches,
       ),
     );
@@ -400,11 +416,11 @@ function matchCommentTrigger(
     const body = (comment?.body as string) ?? '';
 
     if (trigger.bodyMatch.type === 'glob') {
-      const matches = picomatch.isMatch(body, trigger.bodyMatch.pattern);
+      const matches = getGlobMatcher(trigger.bodyMatch.pattern)(body);
       traces.push(createTraceEntry('bodyMatch (glob)', trigger.bodyMatch.pattern, body, matches));
       if (!matches) return false;
     } else {
-      const regex = new RegExp(trigger.bodyMatch.pattern, trigger.bodyMatch.flags);
+      const regex = getCompiledRegex(trigger.bodyMatch.pattern, trigger.bodyMatch.flags);
       const matches = regex.test(body);
       traces.push(createTraceEntry('bodyMatch (regex)', trigger.bodyMatch.pattern, body, matches));
       if (!matches) return false;
@@ -632,7 +648,7 @@ function matchDeleteTrigger(
 
 /**
  * Match a status trigger against a simulated event.
- * Checks context via picomatch and state filter.
+ * Checks context via glob matching and state filter.
  */
 function matchStatusTrigger(
   trigger: LockStatusTrigger,
@@ -645,10 +661,10 @@ function matchStatusTrigger(
   }
   traces.push(createTraceEntry('event type', 'status', event.type, true));
 
-  // Check context patterns via picomatch
+  // Check context patterns via glob matching
   if (trigger.contexts.length > 0) {
     const context = (event.payload.context as string) ?? '';
-    const matches = trigger.contexts.some((pattern) => picomatch.isMatch(context, pattern));
+    const matches = trigger.contexts.some((pattern) => getGlobMatcher(pattern)(context));
     traces.push(createTraceEntry('context', trigger.contexts.join('|'), context, matches));
     if (!matches) return false;
   }
@@ -914,6 +930,55 @@ function matchWorkflowCompleteTrigger(
 }
 
 /**
+ * Match a workflows_failed_batch trigger against a simulated event.
+ *
+ * The trigger participates in two phases:
+ *  - A failed `workflow_complete` event is an accumulation input — it matches
+ *    (respecting optional name/source filters) so the orchestrator buffers the
+ *    run into the batch window instead of dispatching now.
+ *  - A synthetic `workflows_failed_batch` event is the dispatch trigger — the
+ *    orchestrator emits it once per window and it matches to dispatch the
+ *    subscribing workflow a single time.
+ */
+function matchWorkflowsFailedBatchTrigger(
+  trigger: LockWorkflowsFailedBatchTrigger,
+  event: SimulatedEvent,
+  traces: TraceEntry[],
+): boolean {
+  if (event.type === 'workflow_complete') {
+    // Accumulation input: only failed completions feed the batch.
+    const status = (event.payload.status as string) ?? '';
+    const isFailed = status === 'failed';
+    traces.push(createTraceEntry('status', 'failed', status, isFailed));
+    if (!isFailed) return false;
+  } else if (event.type !== 'workflows_failed_batch') {
+    traces.push(
+      createTraceEntry('event type', 'workflow_complete|workflows_failed_batch', event.type, false),
+    );
+    return false;
+  }
+  traces.push(createTraceEntry('event type', 'workflows_failed_batch', event.type, true));
+
+  // Check workflow name if specified
+  if (trigger.name) {
+    const workflowName = (event.payload.workflowName as string) ?? '';
+    const matches = workflowName === trigger.name;
+    traces.push(createTraceEntry('workflow name', trigger.name, workflowName, matches));
+    if (!matches) return false;
+  }
+
+  // Check source filter
+  if (trigger.source) {
+    const sourceRepo = (event.payload.sourceRepo as string) ?? '';
+    const matches = sourceRepo === trigger.source;
+    traces.push(createTraceEntry('source', trigger.source, sourceRepo, matches));
+    if (!matches) return false;
+  }
+
+  return true;
+}
+
+/**
  * Match a job_complete trigger against a simulated event.
  * Checks workflow name, job name, status array, and source filter.
  */
@@ -1075,7 +1140,11 @@ function matchLifecycleTrigger(
 /**
  * Match a trigger against a simulated event.
  */
-function matchTrigger(trigger: LockTrigger, event: SimulatedEvent, traces: TraceEntry[]): boolean {
+export function matchTrigger(
+  trigger: LockTrigger,
+  event: SimulatedEvent,
+  traces: TraceEntry[],
+): boolean {
   switch (trigger._type) {
     case 'pr':
       return matchPrTrigger(trigger, event, traces);
@@ -1113,6 +1182,8 @@ function matchTrigger(trigger: LockTrigger, event: SimulatedEvent, traces: Trace
       return matchKiciEventTrigger(trigger, event, traces);
     case 'workflow_complete':
       return matchWorkflowCompleteTrigger(trigger, event, traces);
+    case 'workflows_failed_batch':
+      return matchWorkflowsFailedBatchTrigger(trigger, event, traces);
     case 'job_complete':
       return matchJobCompleteTrigger(trigger, event, traces);
     case 'generic_webhook':

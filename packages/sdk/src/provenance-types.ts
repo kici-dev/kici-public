@@ -9,8 +9,7 @@
  * (relative to the step working directory) the agent will digest with SHA-256.
  */
 export type ProvenanceSubjectInput =
-  | { name: string; digest: { sha256?: string; sha512?: string } }
-  | { name: string; path: string };
+  { name: string; digest: { sha256?: string; sha512?: string } } | { name: string; path: string };
 
 export interface AttestProvenanceOptions {
   subject: ProvenanceSubjectInput;
@@ -31,9 +30,9 @@ export type AttestProvenanceResult =
     }
   | {
       /**
-       * The Platform mint failed transiently, so only the identity token is
-       * deferred: the statement was frozen + signed at build time and is minted
-       * later (automatically on Platform recovery, or via
+       * The identity-token mint failed transiently, so only the identity token
+       * is deferred: the statement was frozen + signed at build time and the
+       * token is minted later (automatically when the mint recovers, or via
        * `kici-admin attestations retry`). The job still completes successfully.
        */
       deferred: true;

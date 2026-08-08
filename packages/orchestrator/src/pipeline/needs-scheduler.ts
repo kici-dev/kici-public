@@ -330,15 +330,28 @@ export async function evaluateDownstreams(
         reason: check.reason,
       });
     } else {
-      // All upstreams satisfied — mark needs_satisfied and dispatch
+      // All upstreams satisfied — claim the job, then dispatch.
+      //
+      // The `needs_satisfied = false` predicate is the CLAIM: when several
+      // upstreams of the same fan-in job reach terminal at nearly the same
+      // moment, each terminal runs its own evaluateDownstreams concurrently and
+      // every one of them sees all upstreams satisfied. Exactly one UPDATE
+      // flips the row; the losers update zero rows and MUST NOT dispatch, or the
+      // job runs twice (two agents executing the same steps against the same
+      // shared state).
       const now = new Date();
-      await db
+      const claim = await db
         .updateTable('execution_jobs')
         .set({ needs_satisfied: true, ready_at: now })
         .where('run_id', '=', runId)
         .where('job_name', '=', edge.job_name)
         .where('needs_satisfied', '=', false)
-        .execute();
+        .executeTakeFirst();
+
+      if ((claim?.numUpdatedRows ?? 0n) === 0n) {
+        // Lost the claim — a concurrent evaluation owns this job's dispatch.
+        continue;
+      }
 
       results.push({
         jobName: edge.job_name,

@@ -31,6 +31,7 @@ import type {
   LockWebhookTrigger,
   LockKiciEventTrigger,
   LockWorkflowCompleteTrigger,
+  LockWorkflowsFailedBatchTrigger,
   LockJobCompleteTrigger,
   LockGenericWebhookTrigger,
   LockScheduleTrigger,
@@ -156,6 +157,38 @@ describe('matchPathPatterns', () => {
 
   it('all-negation array with all files excluded returns false', () => {
     expect(matchPathPatterns(['!src/generated/**'], ['src/generated/foo.ts'])).toBe(false);
+  });
+});
+
+describe('matchPathPatterns with changedFilesStatus', () => {
+  it('unavailable + path filters → conservative match (true)', () => {
+    expect(matchPathPatterns(['src/**'], [], 'unavailable')).toBe(true);
+  });
+
+  it('unavailable + no path filters → true (unchanged trivial case)', () => {
+    expect(matchPathPatterns([], [], 'unavailable')).toBe(true);
+  });
+
+  it('fetched + empty → false (genuine empty diff stays no-match)', () => {
+    expect(matchPathPatterns(['src/**'], [], 'fetched')).toBe(false);
+  });
+
+  it('skipped + empty → false (matcher does not special-case skipped; the pipeline gates the fetch)', () => {
+    expect(matchPathPatterns(['src/**'], [], 'skipped')).toBe(false);
+  });
+
+  it('undefined status preserves legacy behavior (empty → false)', () => {
+    expect(matchPathPatterns(['src/**'], [])).toBe(false);
+  });
+
+  it('unavailable never masquerades as fetched-empty: even an all-exclusion filter matches', () => {
+    // Conservative match ignores the file list entirely.
+    expect(matchPathPatterns(['!docs/**'], [], 'unavailable')).toBe(true);
+  });
+
+  it('fetched + populated list still evaluates patterns normally', () => {
+    expect(matchPathPatterns(['src/**'], ['src/app.ts'], 'fetched')).toBe(true);
+    expect(matchPathPatterns(['src/**'], ['docs/x.md'], 'fetched')).toBe(false);
   });
 });
 
@@ -420,6 +453,38 @@ describe('matchWorkflowTriggers - PR triggers', () => {
     expect(matchWorkflowTriggers(workflow, srcEvent).matched).toBe(true);
     expect(matchWorkflowTriggers(workflow, docsEvent).matched).toBe(false);
     expect(matchWorkflowTriggers(workflow, mixedEvent).matched).toBe(false);
+  });
+
+  it('PR trigger with paths matches when changedFilesStatus is unavailable (conservative match)', () => {
+    const workflow: LockWorkflow = {
+      name: 'test',
+      contentHash: '',
+      compileSchemaVersion: 0,
+      triggers: [
+        {
+          _type: 'pr',
+          events: [],
+          targetBranches: [],
+          sourceBranches: [],
+          paths: ['src/**'],
+        } as LockPrTrigger,
+      ],
+      jobs: [],
+    };
+
+    const unavailableEvent: SimulatedEvent = {
+      type: 'pull_request',
+      payload: {},
+      targetBranch: 'main',
+      changedFiles: [],
+      changedFilesStatus: 'unavailable',
+    };
+
+    const decision = matchWorkflowTriggers(workflow, unavailableEvent);
+    expect(decision.matched).toBe(true);
+    const pathsTrace = decision.checks.find((t) => t.check === 'paths');
+    expect(pathsTrace?.value).toContain('unavailable');
+    expect(pathsTrace?.passed).toBe(true);
   });
 });
 
@@ -1825,6 +1890,76 @@ describe('matchWorkflowTriggers - Workflow complete triggers', () => {
     expect(matchWorkflowTriggers(wf(trigger), match).matched).toBe(true);
     expect(matchWorkflowTriggers(wf(trigger), wrongName).matched).toBe(false);
     expect(matchWorkflowTriggers(wf(trigger), wrongStatus).matched).toBe(false);
+  });
+});
+
+describe('matchWorkflowTriggers - Workflows failed batch triggers', () => {
+  it('matches a failed workflow_complete event (accumulation input)', () => {
+    const trigger: LockWorkflowsFailedBatchTrigger = {
+      _type: 'workflows_failed_batch',
+      accumulateFor: 10000,
+    };
+    const event: SimulatedEvent = {
+      type: 'workflow_complete',
+      payload: { workflowName: 'CI', status: 'failed', sourceRepo: 'org/repo' },
+      targetBranch: '',
+    };
+    expect(matchWorkflowTriggers(wf(trigger), event).matched).toBe(true);
+  });
+
+  it('rejects a non-failed workflow_complete event', () => {
+    const trigger: LockWorkflowsFailedBatchTrigger = {
+      _type: 'workflows_failed_batch',
+      accumulateFor: 10000,
+    };
+    const event: SimulatedEvent = {
+      type: 'workflow_complete',
+      payload: { workflowName: 'CI', status: 'success' },
+      targetBranch: '',
+    };
+    expect(matchWorkflowTriggers(wf(trigger), event).matched).toBe(false);
+  });
+
+  it('matches the synthetic workflows_failed_batch event (dispatch)', () => {
+    const trigger: LockWorkflowsFailedBatchTrigger = {
+      _type: 'workflows_failed_batch',
+      accumulateFor: 10000,
+    };
+    const event: SimulatedEvent = {
+      type: 'workflows_failed_batch',
+      payload: { total: 3, runs: [], sourceRepo: 'org/repo' },
+      targetBranch: '',
+    };
+    expect(matchWorkflowTriggers(wf(trigger), event).matched).toBe(true);
+  });
+
+  it('rejects unrelated event types', () => {
+    const trigger: LockWorkflowsFailedBatchTrigger = {
+      _type: 'workflows_failed_batch',
+      accumulateFor: 10000,
+    };
+    const event: SimulatedEvent = { type: 'push', payload: {}, targetBranch: 'main' };
+    expect(matchWorkflowTriggers(wf(trigger), event).matched).toBe(false);
+  });
+
+  it('respects the optional source filter', () => {
+    const trigger: LockWorkflowsFailedBatchTrigger = {
+      _type: 'workflows_failed_batch',
+      accumulateFor: 10000,
+      source: 'org/backend',
+    };
+    const match: SimulatedEvent = {
+      type: 'workflow_complete',
+      payload: { workflowName: 'CI', status: 'failed', sourceRepo: 'org/backend' },
+      targetBranch: '',
+    };
+    const noMatch: SimulatedEvent = {
+      type: 'workflow_complete',
+      payload: { workflowName: 'CI', status: 'failed', sourceRepo: 'org/frontend' },
+      targetBranch: '',
+    };
+    expect(matchWorkflowTriggers(wf(trigger), match).matched).toBe(true);
+    expect(matchWorkflowTriggers(wf(trigger), noMatch).matched).toBe(false);
   });
 });
 

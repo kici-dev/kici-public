@@ -18,6 +18,7 @@
  */
 
 import os from 'node:os';
+import { stat } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -41,6 +42,21 @@ import {
 import { createDb } from '../../db/client.js';
 import { createMigrationProvider } from '../../db/migration-provider.js';
 import { runMigrations } from '../../db/migrator.js';
+import { recordAdminCliAccess, recordAdminCliAccessOnDb } from './shared/admin-cli-access-log.js';
+import {
+  assertToolVersionCompatible,
+  buildBackupManifest,
+  defaultDumpPath,
+  pgToolVersion,
+  readManifest,
+  readServerAndKeyMeta,
+  recordBackupRun,
+  restoreKeyWarning,
+  runPgDump,
+  runPgRestore,
+  serverVersionMajor,
+  writeManifest,
+} from './db-backup.js';
 
 function resolveDatabaseUrl(explicit?: string): string {
   const url = explicit ?? process.env.KICI_DATABASE_URL;
@@ -131,6 +147,12 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         try {
           const results = await runMigrations({ db: kdb, pool });
           const applied = results.filter((r) => r.status === 'Success').length;
+          await recordAdminCliAccessOnDb(kdb, {
+            action: 'db.fresh',
+            target: { type: 'database', id: dbName },
+            outcome: 'allowed',
+            meta: { applied },
+          });
           // runMigrations records the content hash; recompute only for display.
           const hash = await computeMigrationsHash(createMigrationProvider());
           console.log(
@@ -140,6 +162,143 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           await kdb.destroy();
           await pool.end().catch(() => undefined);
         }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  db.command('backup')
+    .description('Dump the orchestrator DB to a local file (pg_dump custom format)')
+    .option('--database-url <url>', 'Source DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--output <path>', 'Dump output path (default ./kici-orchestrator-backup-<ts>.dump)')
+    .action(async (opts: { databaseUrl?: string; output?: string }) => {
+      try {
+        const url = resolveDatabaseUrl(opts.databaseUrl);
+        const now = new Date();
+        const outputPath = opts.output ?? defaultDumpPath(now);
+        logInvocation('backup', url);
+
+        const pool = createPool(url);
+        const kdb = createDb(pool);
+        try {
+          const meta = await readServerAndKeyMeta(pool);
+          const toolMajor = await pgToolVersion('pg_dump');
+          assertToolVersionCompatible(
+            toolMajor,
+            serverVersionMajor(meta.serverVersionNum),
+            'pg_dump',
+          );
+
+          await runPgDump(url, outputPath);
+          const byteSize = (await stat(outputPath)).size;
+          const migrationsHash = await computeMigrationsHash(createMigrationProvider());
+          const hostname = os.hostname();
+
+          const manifest = buildBackupManifest({
+            now,
+            byteSize,
+            serverVersionNum: meta.serverVersionNum,
+            secretKeyVersion: meta.secretKeyVersion,
+            clusterId: meta.clusterId,
+            migrationsHash,
+            hostname,
+          });
+          await writeManifest(outputPath, manifest);
+          await recordBackupRun(kdb, {
+            dump_path: outputPath,
+            byte_size: String(byteSize),
+            secret_key_version: meta.secretKeyVersion,
+            pg_server_version: meta.serverVersionNum,
+            migrations_hash: migrationsHash,
+            hostname,
+          });
+
+          console.log(
+            `db backup: wrote ${outputPath} (${byteSize} bytes) + ${outputPath}.manifest.json`,
+          );
+          console.error(
+            '\n  IMPORTANT: this dump contains ENCRYPTED secret ciphertext only.\n' +
+              '  It is useless without the separately-held KICI_SECRET_KEY, which is NOT in the dump.\n' +
+              `  Back up KICI_SECRET_KEY separately (this dump is under key generation ${meta.secretKeyVersion ?? 'n/a'}).\n`,
+          );
+        } finally {
+          await kdb.destroy();
+          await pool.end().catch(() => undefined);
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  db.command('restore')
+    .description('Restore the orchestrator DB from a pg_dump file (DESTRUCTIVE)')
+    .requiredOption('--input <path>', 'Path to a .dump file produced by `db backup`')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--yes', 'Skip interactive confirmation (for scripted use)')
+    .action(async (opts: { input: string; databaseUrl?: string; yes?: boolean }) => {
+      try {
+        const url = resolveDatabaseUrl(opts.databaseUrl);
+        const { dbName } = parseDatabaseUrl(url);
+        if (!opts.yes) {
+          const ok = await confirmInteractive(
+            `About to RESTORE (--clean) into database "${dbName}", overwriting its contents. ` +
+              `Type "${dbName}" to confirm: `,
+            dbName,
+          );
+          if (!ok) {
+            console.error('Aborted.');
+            process.exit(1);
+          }
+        }
+        logInvocation('restore', url);
+
+        const manifest = await readManifest(opts.input);
+        if (manifest) {
+          const toolMajor = await pgToolVersion('pg_restore');
+          assertToolVersionCompatible(
+            toolMajor,
+            serverVersionMajor(manifest.pgServerVersion),
+            'pg_restore',
+          );
+        } else {
+          console.error('  note: no sidecar manifest found; skipping pre-flight version check.');
+        }
+
+        await ensureDatabase(url, {});
+        await runPgRestore(url, opts.input);
+
+        const pool = createPool(url);
+        try {
+          const status = await isSchemaCurrent(pool, createMigrationProvider());
+          if (!status.current) {
+            console.error(
+              `  WARNING: schema drift after restore: ${status.reason}. Run "kici-admin db migrate".`,
+            );
+          }
+          const keyVersion =
+            manifest?.secretKeyVersion ??
+            (
+              await pool.query<{ max: number | null }>(
+                'SELECT MAX(key_version)::int AS max FROM config_versions',
+              )
+            ).rows[0]?.max ??
+            null;
+          const warn = restoreKeyWarning({
+            secretKeyVersion: keyVersion,
+            keyEnvPresent: !!process.env.KICI_SECRET_KEY,
+          });
+          if (warn) console.error(`  ${warn}`);
+        } finally {
+          await pool.end().catch(() => undefined);
+        }
+
+        console.log(`db restore: restored "${dbName}" from ${opts.input}`);
+        console.error(
+          '\n  Next: run "kici-admin cluster reconcile-identity" to reconcile the ' +
+            'cluster_id with the S3 sentinel, then restart the orchestrator.\n',
+        );
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
@@ -184,6 +343,12 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
             revokeConnectFromPublic: !!opts.revokeConnectPublic,
             grantConnectToRoles: opts.grantConnectRole,
           });
+          await recordAdminCliAccess({
+            action: 'db.ensure',
+            target: { type: 'database', id: name },
+            outcome: 'allowed',
+            meta: { result: outcome },
+          });
           const suffix =
             (opts.owner ? ` (owner=${opts.owner})` : '') +
             (opts.revokeConnectPublic ? ' [revoked CONNECT from PUBLIC]' : '') +
@@ -220,6 +385,12 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
             password: opts.password,
             createDb: !!opts.createdb,
           });
+          await recordAdminCliAccess({
+            action: 'db.create_role',
+            target: { type: 'database', id: opts.user },
+            outcome: 'allowed',
+            meta: { result: outcome, createdb: !!opts.createdb },
+          });
           console.log(`db create-role: ${opts.user} — ${outcome}`);
         } catch (err) {
           console.error(`Error: ${toErrorMessage(err)}`);
@@ -242,6 +413,18 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           username: opts.user,
           password: opts.password,
         });
+        // create-readonly-user connects to the target DB itself (which owns the
+        // access_log table), so record there — not the KICI_DATABASE_URL
+        // fallback used by the bootstrap-DB provisioning subcommands.
+        await recordAdminCliAccess(
+          {
+            action: 'db.create_readonly_user',
+            target: { type: 'database', id: opts.user },
+            outcome: 'allowed',
+            meta: { result: outcome, db: dbName },
+          },
+          url,
+        );
         console.log(`db create-readonly-user: ${opts.user} — ${outcome} (db=${dbName})`);
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
@@ -335,6 +518,15 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         const pool = createPool(url);
         try {
           await reindexDatabaseConcurrently(pool, dbName);
+          await recordAdminCliAccess(
+            {
+              action: 'db.reindex',
+              target: { type: 'database', id: dbName },
+              outcome: 'allowed',
+              meta: { reason: opts.reason },
+            },
+            url,
+          );
           console.log(`db reindex: ${dbName} — REINDEX DATABASE CONCURRENTLY completed`);
         } finally {
           await pool.end().catch(() => undefined);
@@ -359,6 +551,15 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
         const pool = createPool(url);
         try {
           await refreshDatabaseCollationVersion(pool, dbName);
+          await recordAdminCliAccess(
+            {
+              action: 'db.refresh_collation_version',
+              target: { type: 'database', id: dbName },
+              outcome: 'allowed',
+              meta: { reason: opts.reason },
+            },
+            url,
+          );
           console.log(
             `db refresh-collation-version: ${dbName} — ALTER DATABASE REFRESH COLLATION VERSION completed`,
           );

@@ -27,7 +27,19 @@ A team member must also be a member of the org. Membership changes propagate to 
 
 ### Who may approve
 
-Releasing any held element requires the `contexts:write` or `ci_trust:write` permission **and** eligibility for at least one unsatisfied clause (membership in a named team, or being a named user). The coarse permission is the gate to act on approvals at all; the per-clause eligibility is the fine-grained check on top. Naming a team in a workflow does not grant anyone approval rights — it only restricts which already-permitted users can release that specific gate.
+Releasing a held element requires the permission that matches its hold type — `ci_trust:write` for a **security** hold, `contexts:admin` for a **wait-timer** hold, `contexts:write` for every other hold — **and** eligibility for at least one unsatisfied clause (membership in a named team, or being a named user). The permission is the gate to act on approvals at all; the per-clause eligibility is the fine-grained check on top. Naming a team in a workflow does not grant anyone approval rights — it only restricts which already-permitted users can release that specific gate.
+
+`ci_trust:write` is deliberately narrower than `contexts:write`: it is the grant that says a person may vouch for untrusted code. Granting broad context write access does not confer it. Skipping a wait timer takes `contexts:admin` because it cuts short a delay somebody configured on purpose.
+
+The check runs on the server, so one policy covers every surface: the dashboard, the `kici` CLI, any direct caller of the held-run approve and reject routes, and the developer MCP's `approve_run` / `reject_run` tools. The MCP tools require their own `runs:write` **in addition to** the hold's permission, never instead of it — so an agent credential cannot release a hold that a person with the same grants could not.
+
+The `/kici approve` PR-comment channel acts only on **security** holds, and releasing one that way requires the same `ci_trust:write`. A reviewer, wait-timer, or concurrency hold is not resolvable by comment — use the dashboard or `kici approve`.
+
+A per-member CI trust override (Members tab) sets the trust level a member's security-hold decisions are judged at, on every surface including the dashboard — which reads the same override-resolved level the server decides with, so an override that lowers a member hides the controls rather than offering ones the API refuses.
+
+An override adjusts an existing approver's level; it does not create an approver. A member still has to hold `contexts:write` or `ci_trust:write` from a role to reach the approve and reject routes at all, because that check reads role-derived permissions and the override is deliberately kept out of them — folding it in would let an `admin` override confer the power to edit trust policy and set other members' overrides. So raise a member with an override only on top of a role that already grants one of those two; to make someone an approver from nothing, grant the permission.
+
+An org API key is its own principal with its own permission matrix and does not inherit its owner's override.
 
 ## Org settings
 
@@ -51,7 +63,9 @@ kici-admin org-settings approval set-self-approval true|false --customer-id <id>
 
 ### Expiry
 
-A held element waits up to its expiry — the per-gate `timeout` if the workflow set one, otherwise `approval_expiry_seconds`. When the deadline passes without all clauses satisfied, the element is rejected and the run fails. The stale run detector sweeps overdue holds on each scan cycle; a step-level hold that expires also signals the waiting agent to fail the job. Set `approval_expiry_seconds` to a value that matches how long your reviewers realistically take — long enough to avoid spurious failures, short enough that a forgotten gate does not tie up resources indefinitely (see [agent occupancy](#agent-occupancy-during-step-level-holds)).
+A held element waits up to its expiry. An **explicit** gate (an `approval` block in workflow code) uses the per-gate `timeout` if the workflow set one, otherwise `approval_expiry_seconds`. A **mandatory** gate attached to an environment's required-reviewer policy instead uses that environment's own `hold_expiry_seconds` (default one hour), so tighten the environment rather than the org setting when you want a shorter reviewer window on one environment. When the deadline passes without all clauses satisfied, the element is rejected and the run fails. The stale run detector sweeps overdue holds on each scan cycle; a step-level hold that expires also signals the waiting agent to fail the job. Set `approval_expiry_seconds` to a value that matches how long your reviewers realistically take — long enough to avoid spurious failures, short enough that a forgotten gate does not tie up resources indefinitely (see [agent occupancy](#agent-occupancy-during-step-level-holds)).
+
+`approval_expiry_seconds` governs this queue only. The **security** approval queue is a separate queue with its own deadline: a hold raised by the org trust policy uses that policy's own approval expiry (default 72 hours), configured under **Settings > CI trust**. See [CI security](security/security.md#expiry).
 
 ### Self-approval
 

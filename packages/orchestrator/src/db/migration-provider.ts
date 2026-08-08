@@ -73,6 +73,45 @@ import * as m065 from './migrations/065_pending_attestations.js';
 import * as m066 from './migrations/066_pending_attestations_rejected.js';
 import * as m067 from './migrations/067_environments_to_contexts.js';
 import * as m068 from './migrations/068_request_idempotency.js';
+import * as m069 from './migrations/069_reroute_tunables.js';
+import * as m070 from './migrations/070_execution_runs_failure_class.js';
+import * as m071 from './migrations/071_batch_accumulation.js';
+import * as m072 from './migrations/072_dispatch_queue_run_id_index.js';
+import * as m073 from './migrations/073_org_settings_ingest_concurrency.js';
+import * as m074 from './migrations/074_normalize_zero_concurrency_limit.js';
+import * as m075 from './migrations/075_ingest_overflow_buffer.js';
+import * as m076 from './migrations/076_artifacts.js';
+import * as m077 from './migrations/077_backup_runs.js';
+import * as m078 from './migrations/078_org_settings_backup_staleness.js';
+import * as m079 from './migrations/079_org_settings_scaler_spawn_timeout.js';
+import * as m080 from './migrations/080_cluster_settings.js';
+import * as m081 from './migrations/081_org_settings_queue_timeout.js';
+import * as m082 from './migrations/082_host_s3_reachable.js';
+import * as m083 from './migrations/083_org_settings_artifact_caps.js';
+import * as m084 from './migrations/084_orchestrator_signing_keys.js';
+import * as m085 from './migrations/085_cluster_settings_reroute_flap_grace_ms.js';
+import * as m086 from './migrations/086_cluster_settings_max_fanout_hosts.js';
+import * as m087 from './migrations/087_cluster_settings_event_router_rate_limit.js';
+import * as m088 from './migrations/088_cluster_settings_cache_max_tarball_bytes.js';
+import * as m089 from './migrations/089_cluster_settings_cache_ttl_days.js';
+import * as m090 from './migrations/090_cluster_settings_concurrency_wait_timeout_ms.js';
+import * as m091 from './migrations/091_cluster_settings_agent_token_ttl_ms.js';
+import * as m092 from './migrations/092_cluster_settings_version.js';
+import * as m093 from './migrations/093_org_settings_sandbox_allowlist.js';
+import * as m094 from './migrations/094_dashboard_encryption_keys.js';
+import * as m095 from './migrations/095_dashboard_write_policy_tristate.js';
+import * as m096 from './migrations/096_multi_schedule_cron_last_fired.js';
+import * as m097 from './migrations/097_execution_runs_pr_number.js';
+import * as m098 from './migrations/098_execution_runs_customer_id.js';
+import * as m099 from './migrations/099_cluster_settings_dashboard_verified_issuer.js';
+import * as m100 from './migrations/100_held_runs_hold_type_vocabulary.js';
+import * as m101 from './migrations/101_contexts_hold_expiry_drop_default.js';
+import * as m102 from './migrations/102_dispatch_queue_agent_id.js';
+import * as m103 from './migrations/103_cluster_settings_ownership_db_check_timeout_ms.js';
+import * as m104 from './migrations/104_check_run_terminal_sent.js';
+import * as m105 from './migrations/105_org_trust_policy.js';
+import * as m106 from './migrations/106_cluster_settings_check_run_tracking_ttl_days.js';
+import * as m107 from './migrations/107_check_run_tracking_updated_at_index.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -146,6 +185,45 @@ export function createMigrationProvider(): MigrationProvider {
         '066_pending_attestations_rejected': m066,
         '067_environments_to_contexts': m067,
         '068_request_idempotency': m068,
+        '069_reroute_tunables': m069,
+        '070_execution_runs_failure_class': m070,
+        '071_batch_accumulation': m071,
+        '072_dispatch_queue_run_id_index': m072,
+        '073_org_settings_ingest_concurrency': m073,
+        '074_normalize_zero_concurrency_limit': m074,
+        '075_ingest_overflow_buffer': m075,
+        '076_artifacts': m076,
+        '077_backup_runs': m077,
+        '078_org_settings_backup_staleness': m078,
+        '079_org_settings_scaler_spawn_timeout': m079,
+        '080_cluster_settings': m080,
+        '081_org_settings_queue_timeout': m081,
+        '082_host_s3_reachable': m082,
+        '083_org_settings_artifact_caps': m083,
+        '084_orchestrator_signing_keys': m084,
+        '085_cluster_settings_reroute_flap_grace_ms': m085,
+        '086_cluster_settings_max_fanout_hosts': m086,
+        '087_cluster_settings_event_router_rate_limit': m087,
+        '088_cluster_settings_cache_max_tarball_bytes': m088,
+        '089_cluster_settings_cache_ttl_days': m089,
+        '090_cluster_settings_concurrency_wait_timeout_ms': m090,
+        '091_cluster_settings_agent_token_ttl_ms': m091,
+        '092_cluster_settings_version': m092,
+        '093_org_settings_sandbox_allowlist': m093,
+        '094_dashboard_encryption_keys': m094,
+        '095_dashboard_write_policy_tristate': m095,
+        '096_multi_schedule_cron_last_fired': m096,
+        '097_execution_runs_pr_number': m097,
+        '098_execution_runs_customer_id': m098,
+        '099_cluster_settings_dashboard_verified_issuer': m099,
+        '100_held_runs_hold_type_vocabulary': m100,
+        '101_contexts_hold_expiry_drop_default': m101,
+        '102_dispatch_queue_agent_id': m102,
+        '103_cluster_settings_ownership_db_check_timeout_ms': m103,
+        '104_check_run_terminal_sent': m104,
+        '105_org_trust_policy': m105,
+        '106_cluster_settings_check_run_tracking_ttl_days': m106,
+        '107_check_run_tracking_updated_at_index': m107,
       };
     },
   };

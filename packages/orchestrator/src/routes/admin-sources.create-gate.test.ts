@@ -28,7 +28,7 @@
  *   For attacker model A1 (external, unauthenticated) and A10 (stolen
  *   admin token), the source-create handler's pre-DB validate call is
  *   the cryptographic gate that requires proof of GitHub App
- *   ownership. The webhook-routing layer (§2.4 + §2.5) layers on top
+ *   ownership. The webhook-routing layer sits on top
  *   of this — but if the source-create gate were bypassed, an attacker
  *   could register the victim App's ID with their own private key and
  *   later... well, they couldn't, because validateGitHubSource calls
@@ -43,6 +43,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createSourceRoutes } from './admin-sources.js';
 import type { SourceStore } from '../sources/source-store.js';
 import * as sourceValidator from '../sources/source-validator.js';
+import { OrchestratorMode } from '@kici-dev/engine';
+import { OBSERVED_GITHUB_APP_SOURCE_ERROR } from '../sources/source-manager.js';
 
 vi.mock('../sources/source-validator.js', () => ({
   validateGitHubSource: vi.fn(),
@@ -60,7 +62,7 @@ function createMockSourceStore(overrides?: Partial<SourceStore>): SourceStore {
   } as unknown as SourceStore;
 }
 
-describe('§4.4 source-create gate invariants', () => {
+describe('source-create gate invariants', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -210,5 +212,64 @@ describe('§4.4 source-create gate invariants', () => {
       // store will use to derive the routing key.
       expect(callArg.appId).toBe('42');
     });
+  });
+});
+
+describe('observed-mode GitHub-App source refusal', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('rejects GitHub-App source creation and never validates or persists', async () => {
+    const addSource = vi.fn();
+    const sourceStore = createMockSourceStore({ addSource });
+    const app = createSourceRoutes({ sourceStore, mode: OrchestratorMode.enum.observed });
+
+    const res = await app.request('/sources', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'github',
+        name: 'relay-source',
+        appId: '42',
+        privateKey: '-----BEGIN RSA PRIVATE KEY-----\nLEGIT\n-----END RSA PRIVATE KEY-----',
+        webhookSecret: 'wh-secret',
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe(OBSERVED_GITHUB_APP_SOURCE_ERROR);
+    expect(sourceValidator.validateGitHubSource).not.toHaveBeenCalled();
+    expect(addSource).not.toHaveBeenCalled();
+  });
+
+  it('still accepts GitHub-App source creation in hybrid mode', async () => {
+    vi.mocked(sourceValidator.validateGitHubSource).mockResolvedValueOnce({
+      valid: true,
+      appName: 'Legitimate App',
+    });
+    const addSource = vi.fn().mockResolvedValue({
+      id: 's1',
+      routing_key: 'github:42',
+      name: 'legit-source',
+    });
+    const sourceStore = createMockSourceStore({ addSource });
+    const app = createSourceRoutes({ sourceStore, mode: OrchestratorMode.enum.hybrid });
+
+    const res = await app.request('/sources', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'github',
+        name: 'legit-source',
+        appId: '42',
+        privateKey: '-----BEGIN RSA PRIVATE KEY-----\nLEGIT\n-----END RSA PRIVATE KEY-----',
+        webhookSecret: 'wh-secret',
+      }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(addSource).toHaveBeenCalledTimes(1);
   });
 });

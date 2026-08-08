@@ -17,6 +17,8 @@ import {
   attachPlane,
   detachPlane,
 } from '../local-plane/plane-manager.js';
+import type { PlaneStatus, PlaneMode } from '../local-plane/plane-manager.js';
+import type { PlaneState } from '../local-plane/plane-liveness.js';
 import { resolvePlaneForRun } from '../local-plane/resolve-plane.js';
 import { loadGlobalConfig } from '../remote/config.js';
 
@@ -73,14 +75,123 @@ export async function localUpCommand(
   return true;
 }
 
+/**
+ * Render the branch for a plane port held by a process that is not a KiCI plane
+ * orchestrator. Kept apart from the not-serving branch because `kici local down`
+ * deliberately refuses to signal such a holder, so pointing at it here would
+ * send the operator to a command that cannot act.
+ */
+function printForeignHolder(status: Awaited<ReturnType<typeof planeStatus>>): void {
+  console.log(
+    pc.yellow('⚠') +
+      ` Port ${pc.bold(String(status.port))} is held by a process that is not a KiCI plane orchestrator.`,
+  );
+  console.log(pc.dim(`  pid:      ${status.pid ?? 'unknown'}`));
+  console.log('The local dev plane cannot start while that process holds the port.');
+  console.log(
+    `Stop it yourself, or point the plane elsewhere with ${pc.cyan('KICI_LOCAL_ORCH_PORT')}.`,
+  );
+}
+
+/**
+ * Render the branch for a plane port held by a KiCI plane orchestrator that is
+ * not serving this config dir: our own stamped orchestrator failing its
+ * readiness probe, or a plane no stamp here accounts for. Split out of
+ * `localStatusCommand` so each branch stays readable.
+ *
+ * The two get different headlines because only one of them has been probed:
+ * readiness is checked for a plane we stamped, so `unready` is a measurement,
+ * while a plane we did not stamp is only known to be holding the port.
+ */
+function printNotServing(status: Awaited<ReturnType<typeof planeStatus>>): void {
+  if (status.state === 'foreign-kici') {
+    console.log(
+      pc.yellow('⚠') +
+        ` Port ${pc.bold(String(status.port))} is held by a KiCI plane orchestrator this config dir did not start.`,
+    );
+    console.log(pc.dim(`  pid:      ${status.pid ?? 'unknown'}`));
+    console.log(pc.dim('  owner:    another KiCI plane — no stamp in this config dir'));
+    console.log(`Stop it with ${pc.cyan('kici local down')}.`);
+    return;
+  }
+
+  console.log(
+    pc.yellow('⚠') + ` Local dev plane is running but NOT ready at ${pc.bold(status.url ?? '')}`,
+  );
+  console.log(pc.dim(`  port:     ${status.port}`));
+  console.log(pc.dim(`  pid:      ${status.pid ?? 'unknown'}`));
+  if (status.checks && Object.keys(status.checks).length > 0) {
+    const rendered = Object.entries(status.checks)
+      .map(([name, ok]) => `${name}=${ok}`)
+      .join(' ');
+    console.log(pc.dim(`  checks:   ${rendered}`));
+  }
+  console.log(`Stop it with ${pc.cyan('kici local down')}.`);
+}
+
+/**
+ * The machine-readable projection of a plane status.
+ *
+ * An explicit allow-list, NOT `JSON.stringify(status)`. `PlaneStatus` carries
+ * `adminToken` — the bootstrap admin token the CLI presents to the plane's
+ * admin API — so serializing the whole object would publish it on stdout, and
+ * from there into any consumer's logs. `attachment` is omitted for the same
+ * reason in miniature: no consumer needs it, and a field that is never emitted
+ * cannot leak a field added to it later.
+ */
+export interface LocalStatusJson {
+  state: PlaneState;
+  running: boolean;
+  pid: number | null;
+  port: number | null;
+  url: string | null;
+  pgKind: 'embedded' | 'podman' | null;
+  stampVersion: number | null;
+  mode: PlaneMode | null;
+}
+
+/** Project a PlaneStatus onto the published JSON shape, absent fields as null. */
+export function toLocalStatusJson(status: PlaneStatus): LocalStatusJson {
+  return {
+    state: status.state,
+    running: status.running,
+    pid: status.pid ?? null,
+    port: status.port ?? null,
+    url: status.url ?? null,
+    pgKind: status.pgKind ?? null,
+    stampVersion: status.stampVersion ?? null,
+    mode: status.mode ?? null,
+  };
+}
+
 /** Show the local dev plane status and its control commands. */
-export async function localStatusCommand(): Promise<boolean> {
+export async function localStatusCommand(options?: { json?: boolean }): Promise<boolean> {
   const status = await planeStatus();
-  if (!status.running) {
+
+  // Every state exits 0 in JSON mode: the state belongs in the payload, and a
+  // non-zero exit would be indistinguishable from the failure modes a consumer
+  // must treat as "liveness undeterminable".
+  if (options?.json) {
+    console.log(JSON.stringify(toLocalStatusJson(status)));
+    return true;
+  }
+
+  if (status.state === 'stopped') {
     console.log(pc.yellow('Local dev plane is not running.'));
     console.log(`Start it with ${pc.cyan('kici local up')}.`);
     return true;
   }
+
+  if (status.state === 'foreign-unknown') {
+    printForeignHolder(status);
+    return true;
+  }
+
+  if (status.state !== 'ready') {
+    printNotServing(status);
+    return true;
+  }
+
   console.log(pc.green('✓') + ` Local dev plane running at ${pc.bold(status.url ?? '')}`);
   console.log(pc.dim(`  port:     ${status.port}`));
   console.log(pc.dim(`  pid:      ${status.pid ?? 'unknown'}`));
@@ -94,10 +205,17 @@ export async function localStatusCommand(): Promise<boolean> {
   return true;
 }
 
-/** Stop the local dev plane. */
+/** Stop the local dev plane, reporting success only once the port is released. */
 export async function localDownCommand(): Promise<boolean> {
   console.log(pc.dim('Stopping the local dev plane…'));
-  await planeDown();
+  const result = await planeDown();
+  if (!result.stopped) {
+    console.error(pc.red(`✗ Local dev plane NOT stopped: ${result.reason ?? 'port still held'}`));
+    if (result.holderPid !== undefined) {
+      console.error(pc.dim(`  holder pid: ${result.holderPid}   port: ${result.port}`));
+    }
+    return false;
+  }
   console.log(pc.green('✓') + ' Local dev plane stopped.');
   return true;
 }

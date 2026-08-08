@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { LogStream } from '@kici-dev/engine';
 import { LogWriter } from './log-writer.js';
 import type { LogStorage } from './log-storage.js';
 
@@ -6,17 +7,22 @@ import type { LogStorage } from './log-storage.js';
 
 function createMockLogStorage() {
   const appended: Array<{ path: string; data: string }> = [];
+  const finalized: string[] = [];
 
   const storage: LogStorage = {
-    append: vi.fn(async (path: string, data: string) => {
+    append: vi.fn(async () => {}),
+    appendStreaming: vi.fn(async (path: string, data: string) => {
       appended.push({ path, data });
+    }),
+    finalize: vi.fn(async (path: string) => {
+      finalized.push(path);
     }),
     read: vi.fn(async () => ({ data: '', cursor: 0, complete: true })),
     exists: vi.fn(async () => false),
     list: vi.fn(async () => []),
   };
 
-  return { storage, appended };
+  return { storage, appended, finalized };
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -79,7 +85,7 @@ describe('LogWriter', () => {
     it('skips empty lines array', async () => {
       await writer.appendChunk('run-1', 'test', 0, [], Date.now());
 
-      expect(mockStorage.storage.append).not.toHaveBeenCalled();
+      expect(mockStorage.storage.appendStreaming).not.toHaveBeenCalled();
     });
 
     it('handles special characters in log lines', async () => {
@@ -112,7 +118,7 @@ describe('LogWriter', () => {
     });
 
     it('does not throw when storage fails', async () => {
-      (mockStorage.storage.append as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      (mockStorage.storage.appendStreaming as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
         new Error('disk full'),
       );
 
@@ -130,7 +136,7 @@ describe('LogWriter', () => {
       // calls it — so its storage write is still pending when drain() runs.
       let releaseAppend: (() => void) | undefined;
       let appendCompleted = false;
-      (mockStorage.storage.append as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      (mockStorage.storage.appendStreaming as ReturnType<typeof vi.fn>).mockImplementationOnce(
         () =>
           new Promise<void>((resolve) => {
             releaseAppend = () => {
@@ -173,12 +179,91 @@ describe('LogWriter', () => {
     });
 
     it('still drains when an append rejected (ordering, not error propagation)', async () => {
-      (mockStorage.storage.append as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      (mockStorage.storage.appendStreaming as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
         new Error('disk full'),
       );
       void writer.appendChunk('run-1', 'test', 0, ['line'], Date.now());
       await Promise.resolve();
       await expect(writer.drain('run-1')).resolves.toBeUndefined();
     });
+
+    it('awaits pending appends then finalizes every path written in the run', async () => {
+      const order: string[] = [];
+      (mockStorage.storage.appendStreaming as ReturnType<typeof vi.fn>).mockImplementation(
+        async (p: string) => {
+          order.push(`append:${p}`);
+        },
+      );
+      (mockStorage.storage.finalize as ReturnType<typeof vi.fn>).mockImplementation(
+        async (p: string) => {
+          order.push(`finalize:${p}`);
+        },
+      );
+
+      await writer.appendChunk('run-1', 'job-a', 0, ['l1'], Date.now());
+      await writer.appendChunk('run-1', 'job-a', 1, ['l2'], Date.now());
+      await writer.drain('run-1');
+
+      const step0 = 'executions/run-1/job-job-a/step-0.log';
+      const step1 = 'executions/run-1/job-job-a/step-1.log';
+      expect(mockStorage.storage.appendStreaming).toHaveBeenCalledWith(step0, expect.any(String));
+      expect(mockStorage.storage.finalize).toHaveBeenCalledWith(step0);
+      expect(mockStorage.storage.finalize).toHaveBeenCalledWith(step1);
+
+      // Every append precedes every finalize (await-pending-then-finalize).
+      const firstFinalize = order.findIndex((o) => o.startsWith('finalize:'));
+      expect(firstFinalize).toBeGreaterThan(-1);
+      expect(order.slice(0, firstFinalize).every((o) => o.startsWith('append:'))).toBe(true);
+    });
+
+    it('forgets a run path set after drain (no double finalize on re-drain)', async () => {
+      await writer.appendChunk('run-1', 'job-a', 0, ['l1'], Date.now());
+      await writer.drain('run-1');
+      const callsAfterFirst = (mockStorage.storage.finalize as ReturnType<typeof vi.fn>).mock.calls
+        .length;
+      await writer.drain('run-1');
+      // A second drain finds no tracked paths → no further finalize calls.
+      expect((mockStorage.storage.finalize as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+        callsAfterFirst,
+      );
+    });
+  });
+});
+
+describe('LogWriter stream level', () => {
+  let mockStorage: ReturnType<typeof createMockLogStorage>;
+  let writer: LogWriter;
+
+  beforeEach(() => {
+    mockStorage = createMockLogStorage();
+    writer = new LogWriter({ logStorage: mockStorage.storage });
+  });
+
+  function levelsOf(data: string): string[] {
+    return data
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l).level);
+  }
+
+  it('stamps the record level from the chunk stream', async () => {
+    await writer.appendChunk(
+      'run-1',
+      'test',
+      0,
+      ['nft: Could not process rule'],
+      Date.now(),
+      'job-1',
+      undefined,
+      LogStream.enum.stderr,
+    );
+
+    expect(levelsOf(mockStorage.appended[0].data)).toEqual([LogStream.enum.stderr]);
+  });
+
+  it('defaults the record level to stdout when the chunk carries no stream', async () => {
+    await writer.appendChunk('run-1', 'test', 0, ['ordinary progress'], Date.now());
+
+    expect(levelsOf(mockStorage.appended[0].data)).toEqual([LogStream.enum.stdout]);
   });
 });

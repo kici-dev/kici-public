@@ -94,18 +94,23 @@ If a `dynamicJob()` returns `[]`, zero edges are inserted. The static downstream
 
 ## Failure propagation
 
-Default behavior: each edge's `run_on` set defaults to `["success"]`, so when an upstream reaches a non-success terminal status (`failed`, `drift_dropped`, `cancelled`, `skipped`, `timed_out_stale`), the downstream transitions to `skipped`.
+Default behavior: each edge's `run_on` set defaults to `["success"]`, so when an upstream reaches a non-success terminal status (`failed`, `drift_dropped`, `unroutable`, `cancelled`, `skipped`, `timed_out_stale`), the downstream transitions to `skipped`.
 
 Per-edge override: a wider `run_on` set (authored via the SDK `when` keyword, e.g. `'always'`, `'on-skip'`, `'on-failure'`, or a raw status array) allows dispatch on the listed upstream statuses. Use `'always'` for cleanup or notification jobs, `'on-failure'` for error-handler jobs.
 
 The keyword → `run_on` mapping is:
 
-| `when`       | `run_on` set                    |
-| ------------ | ------------------------------- |
-| `on-success` | `["success"]`                   |
-| `always`     | every terminal status           |
-| `on-skip`    | `["success", "skipped"]`        |
-| `on-failure` | `["failed", "timed_out_stale"]` |
+| `when`       | `run_on` set                                                   |
+| ------------ | -------------------------------------------------------------- |
+| `on-success` | `["success"]`                                                  |
+| `always`     | every terminal status                                          |
+| `on-skip`    | `["success", "skipped"]`                                       |
+| `on-failure` | `["failed", "timed_out_stale", "drift_dropped", "unroutable"]` |
+
+`on-failure` is derived rather than listed: it is every terminal status classified
+as a failure, so an error handler fires for a job dropped by determinism drift
+exactly as it does for one that failed or timed out. `cancelled` (deliberately
+stopped) and `skipped` (never ran) are not failures and stay out.
 
 `getFailurePropagationTargets` performs a BFS traversal following edges whose `run_on` set does **not** admit the propagating upstream's terminal status, finding all transitive downstreams that should be skipped.
 

@@ -1,11 +1,12 @@
 /**
  * Raft-leader-only fulfilment of deferred attestations. For each pending row
- * (oldest-first) it optionally backfills the run/job rows the Platform's mint
- * needs (offline-backfill), mints the deferred token bound to the frozen
- * statement hash, attaches it to the frozen DSSE envelope, uploads the bundle,
- * records one `attestations` row (idempotent across the cluster), and drains the
- * pending row. A transiently-failing mint leaves the row with a bumped attempt
- * count and a `last_error` — never silently dropped. A definitive Platform
+ * (oldest-first) it optionally backfills the run/job rows the mint needs
+ * (offline-backfill, for the Platform-relay mint path), mints the deferred
+ * token bound to the frozen statement hash, attaches it to the frozen DSSE
+ * envelope, uploads the bundle, records one `attestations` row (idempotent
+ * across the cluster), and drains the pending row. A transiently-failing mint
+ * leaves the row with a bumped attempt count and a `last_error` — never
+ * silently dropped. A definitive mint
  * rejection (run/job absent) is terminal: the row is stamped `rejected_at`,
  * skipped by future drains, and re-armed only via
  * `kici-admin attestations retry --include-rejected`.

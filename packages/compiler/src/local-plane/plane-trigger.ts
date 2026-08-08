@@ -76,21 +76,35 @@ export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTrigger
   };
 }
 
-/** POST the trigger request to the plane. Returns the HTTP status. */
+/** Structured result of posting a local trigger to the plane. */
+export interface LocalTriggerResponse {
+  status: number;
+  /** Routing-key-scoped delivery id echoed by the plane, or null if absent. */
+  deliveryId: string | null;
+}
+
+/** POST the trigger request to the plane. Returns the status + delivery id. */
 export async function sendLocalTrigger(
   planeUrl: string,
   req: LocalTriggerRequest,
-): Promise<number> {
+): Promise<LocalTriggerResponse> {
   const res = await fetch(`${planeUrl.replace(/\/$/, '')}${req.path}`, {
     method: 'POST',
     headers: req.headers,
     body: req.body,
   });
-  return res.status;
+  let deliveryId: string | null = null;
+  try {
+    const parsed = (await res.json()) as { deliveryId?: unknown };
+    if (typeof parsed.deliveryId === 'string') deliveryId = parsed.deliveryId;
+  } catch {
+    // Non-JSON / bodyless response (e.g. a pre-registration 404) — no delivery id.
+  }
+  return { status: res.status, deliveryId };
 }
 
 interface RunsListResponse {
-  runs: Array<{ runId: string; createdAt: string }>;
+  runs: Array<{ runId: string }>;
 }
 
 export interface TriggerRunOptions {
@@ -102,8 +116,11 @@ export interface TriggerRunOptions {
 
 /**
  * Trigger the run and resolve its runId. Sends the synthetic push, then polls
- * the admin runs list (`created_at > since`) for the newest run, resending the
- * webhook past a grace window to absorb source hot-reload latency.
+ * the admin runs list filtered by this webhook's routing-key-scoped delivery id
+ * (`?deliveryId=`), resending the webhook past a grace window to absorb source
+ * hot-reload latency. Correlating on the exact delivery id — rather than the
+ * newest run in a time window — guarantees the follower attaches to the run
+ * THIS invocation created, even when another local run lands concurrently.
  */
 export async function triggerRun(
   planeUrl: string,
@@ -116,17 +133,24 @@ export async function triggerRun(
   const resendAfterMs = opts.resendAfterMs ?? 8_000;
   const timeoutMs = opts.timeoutMs ?? 60_000;
 
-  const since = new Date(Date.now() - 3_000);
   const req = buildLocalTriggerRequest(input);
-  await sendLocalTrigger(planeUrl, req);
+  // The delivery id correlates the created run to THIS webhook. It is stable
+  // across resends (same x-delivery-id) and routing-key-scoped by the plane, so
+  // the client learns it only from the response body. Poll by it exactly — no
+  // "newest since" window, which would re-introduce the clock-skew collision.
+  let deliveryId = (await sendLocalTrigger(planeUrl, req)).deliveryId;
 
   let lastSend = Date.now();
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const runId = await findLatestRunSince(client, since);
-    if (runId) return runId;
+    if (deliveryId) {
+      const runId = await findRunByDelivery(client, deliveryId);
+      if (runId) return runId;
+    }
     if (Date.now() - lastSend > resendAfterMs) {
-      await sendLocalTrigger(planeUrl, req);
+      // Resend absorbs the source hot-reload debounce; capture the delivery id
+      // if the first send happened before the source was registered.
+      deliveryId ??= (await sendLocalTrigger(planeUrl, req)).deliveryId;
       lastSend = Date.now();
     }
     await sleep(pollIntervalMs);
@@ -134,14 +158,13 @@ export async function triggerRun(
   throw new Error('offline run: no run appeared after triggering the local plane');
 }
 
-/** Return the newest run created after `since`, or null when none yet. */
-async function findLatestRunSince(
+/** Return the run created by this webhook delivery, or null when none yet. */
+async function findRunByDelivery(
   client: RunDiscoveryClient,
-  since: Date,
+  deliveryId: string,
 ): Promise<string | null> {
-  const qs = new URLSearchParams({ since: since.toISOString(), limit: '5' });
+  const qs = new URLSearchParams({ deliveryId, limit: '1' });
   const { runs } = await client.get<RunsListResponse>(`/api/v1/admin/runs?${qs}`);
-  // The list is ordered created_at desc, so runs[0] is the newest match.
   return runs[0]?.runId ?? null;
 }
 

@@ -69,7 +69,72 @@ export class BackendRegistry {
     private readonly db: Kysely<any>,
     private readonly masterKey: Buffer,
     private readonly logger?: Logger,
+    private readonly oldMasterKey?: Buffer,
   ) {}
+
+  /**
+   * Decrypt a backend config with the current master key, falling back to the
+   * old key during a rotation grace window. Same dual-key pattern as
+   * PgSecretStore.decryptWithFallback / ephemeral-keys.decryptPrivateKey. The
+   * AAD stays `row.name` — ciphertext remains bound to its logical backend.
+   * Never called for sentinel rows (config_encrypted = '').
+   */
+  private decryptConfigWithFallback(row: SecretBackendRow): {
+    json: string;
+    usedOldKey: boolean;
+  } {
+    const encrypted: EncryptedValue = {
+      data: row.config_encrypted,
+      keyVersion: row.config_key_version,
+    };
+    try {
+      return { json: decrypt(encrypted, this.masterKey, row.name), usedOldKey: false };
+    } catch {
+      // Fall through to the old key (if configured) before failing loud.
+      if (!this.oldMasterKey) throw this.strandedError(row.name);
+    }
+    try {
+      return { json: decrypt(encrypted, this.oldMasterKey, row.name), usedOldKey: true };
+    } catch {
+      throw this.strandedError(row.name);
+    }
+  }
+
+  /** Loud, recovery-pointing error for a backend stranded by key rotation. */
+  private strandedError(name: string): Error {
+    return new Error(
+      `secret backend '${name}' cannot be decrypted with the configured master key(s). ` +
+        `This usually means master-key rotation ran before backend configs were included in the sweep. ` +
+        `Recovery: set KICI_SECRET_KEY_OLD (or secretKeyFileOld) to the previous key and restart — ` +
+        `the backend will be re-encrypted automatically; as a last resort, ` +
+        `'kici-admin backend purge-stale' deletes the stranded config so it can be re-added.`,
+    );
+  }
+
+  /**
+   * Re-seal a backend config that decrypted only under the old key back under
+   * the current master key. Runs at load time while KICI_SECRET_KEY_OLD is
+   * still configured, healing deployments that rotated before backend configs
+   * were part of the rotation sweep. The concurrent-rotation guard
+   * (`config_key_version` match) keeps a racing rotation from being clobbered.
+   */
+  private async selfHealStrandedRow(row: SecretBackendRow, json: string): Promise<void> {
+    const resealed = encrypt(json, this.masterKey, row.config_key_version + 1, row.name);
+    await this.db
+      .updateTable('secret_backends')
+      .set({
+        config_encrypted: resealed.data,
+        config_key_version: resealed.keyVersion,
+        updated_at: sql`now()`,
+      })
+      .where('id', '=', row.id)
+      .where('config_key_version', '=', row.config_key_version)
+      .execute();
+    this.logger?.warn(
+      'secret backend config was sealed under the old master key — re-encrypted under the current key (self-heal)',
+      { backend: row.name },
+    );
+  }
 
   /**
    * Register a new backend. Encrypts config and stores in DB.
@@ -166,11 +231,7 @@ export class BackendRegistry {
 
     if (!row.config_encrypted) return {};
 
-    const encrypted: EncryptedValue = {
-      data: row.config_encrypted,
-      keyVersion: row.config_key_version,
-    };
-    const json = decrypt(encrypted, this.masterKey, row.name);
+    const { json } = this.decryptConfigWithFallback(row);
     return JSON.parse(json) as Record<string, unknown>;
   }
 
@@ -193,11 +254,11 @@ export class BackendRegistry {
       // PG backends reuse the orchestrator's own DB — no encrypted config needed.
       // The migration seeds them with config_encrypted = '' as a sentinel.
       if (row.config_encrypted) {
-        const encrypted: EncryptedValue = {
-          data: row.config_encrypted,
-          keyVersion: row.config_key_version,
-        };
-        config = JSON.parse(decrypt(encrypted, this.masterKey, row.name));
+        const { json, usedOldKey } = this.decryptConfigWithFallback(row);
+        config = JSON.parse(json);
+        if (usedOldKey) {
+          await this.selfHealStrandedRow(row, json);
+        }
       }
 
       const store = this.createStoreForBackend(
@@ -277,5 +338,54 @@ export class BackendRegistry {
       })
       .where('name', '=', name)
       .execute();
+  }
+
+  /**
+   * Re-encrypt every non-sentinel backend config under the current master key
+   * at max(config_key_version)+1. Same transactional skip-and-count shape as
+   * SharedConfigStore.rotateKey — an undecryptable row is counted and left in
+   * place (never aborts the sweep); recovery guidance lives in strandedError.
+   * Sentinel rows (config_encrypted = '') are excluded from the candidate set
+   * and never counted.
+   */
+  async rotateKey(): Promise<{ reEncrypted: number; skipped: number }> {
+    let reEncrypted = 0;
+    let skipped = 0;
+    await this.db.transaction().execute(async (trx) => {
+      const rows = (await trx
+        .selectFrom('secret_backends')
+        .selectAll()
+        .where('config_encrypted', '!=', '')
+        .execute()) as SecretBackendRow[];
+      const newVersion = rows.reduce((m, r) => Math.max(m, r.config_key_version), 0) + 1;
+      for (const row of rows) {
+        // Defensive: a sentinel that slips past the SQL filter is never a
+        // rotation candidate and must not be counted as skipped.
+        if (!row.config_encrypted) continue;
+        let json: string;
+        try {
+          json = this.decryptConfigWithFallback(row).json;
+        } catch {
+          skipped++;
+          this.logger?.warn(
+            'secret backend config undecryptable under both keys — skipped during rotation',
+            { backend: row.name },
+          );
+          continue;
+        }
+        const resealed = encrypt(json, this.masterKey, newVersion, row.name);
+        await trx
+          .updateTable('secret_backends')
+          .set({
+            config_encrypted: resealed.data,
+            config_key_version: newVersion,
+            updated_at: sql`now()`,
+          })
+          .where('id', '=', row.id)
+          .execute();
+        reEncrypted++;
+      }
+    });
+    return { reEncrypted, skipped };
   }
 }

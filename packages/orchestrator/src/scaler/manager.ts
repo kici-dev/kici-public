@@ -12,11 +12,16 @@ import os from 'node:os';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {
   deriveOsArchLabels,
+  derivePlatformTaints,
+  platformToOsArchLabels,
+  platformToTaints,
+  hostToScalerPlatform,
+  PLATFORM_TAINT_LABELS,
   agentTypeLabel,
   scalerLabel,
   resolveRoleLabels,
 } from '@kici-dev/engine';
-import type { ResourceRequest } from '@kici-dev/engine';
+import type { ResourceRequest, ScalerPlatform } from '@kici-dev/engine';
 import {
   normalizeLabelSet,
   findBackendForLabels,
@@ -24,7 +29,7 @@ import {
 } from './label-matcher.js';
 import { AgentLogForwarder } from './log-forwarder.js';
 import { WarmPoolManager } from './warm-pool.js';
-import { parseMemoryString } from './config.js';
+import { parseMemoryString, DEFAULT_MAX_CONCURRENT_SPAWNS } from './config.js';
 import { MachineLedger } from './machine-ledger.js';
 import {
   setScalerUsageBreakdown,
@@ -43,10 +48,61 @@ import type {
   ScalerEvent,
   ResourceCap,
   ValidationResult,
+  ManagedAgent,
 } from './types.js';
 import type { ScalerStateStore, ScalerStateRecovery } from './scaler-state-store.js';
 
 const logger = createLogger({ prefix: 'scaler' });
+
+/**
+ * Counting semaphore that throttles the number of concurrent async operations.
+ *
+ * Used to bound how many `backend.spawn` provisioning operations (image pull +
+ * container create + start) run at once per backend, so a burst of in-cap jobs
+ * cannot storm the container socket / registry.
+ *
+ * Slots are handed directly to the next waiter on release (rather than bumping a
+ * counter the woken task re-decrements), so a task arriving in the microtask gap
+ * between a release and a woken waiter cannot jump the queue and transiently
+ * exceed the cap. The slot is always released in `run`'s `finally`, so a failed
+ * or throwing operation never leaks a slot and wedges the queue.
+ */
+export class SpawnSemaphore {
+  private available: number;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(max: number) {
+    this.available = Math.max(1, Math.floor(max));
+  }
+
+  private async acquire(): Promise<void> {
+    if (this.available > 0) {
+      this.available -= 1;
+      return;
+    }
+    // No slot free: queue and wait for release() to hand one over directly.
+    await new Promise<void>((resolve) => this.waiters.push(resolve));
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      // Hand the slot straight to the waiter; `available` stays decremented.
+      next();
+    } else {
+      this.available += 1;
+    }
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+}
 
 /**
  * Resolved per-job resource amounts (cpus + bytes) for both `requests` and
@@ -180,7 +236,16 @@ export interface ScalerStatus {
 interface SpawningEntry {
   labelSet: string[];
   backendName: string;
+  /** When this entry was enqueued (created + reserved). Persisted for recovery. */
   spawnedAt: number;
+  /**
+   * When the throttled `backend.spawn` actually started (semaphore admitted it).
+   * Undefined while the spawn is still queued behind the per-backend spawn
+   * semaphore. The stale-prune measures the "spawned but never registered"
+   * window from here, NOT from `spawnedAt` — a spawn waiting in the semaphore
+   * queue has not started yet and must not be reaped as a crashed startup.
+   */
+  spawnStartedAt?: number;
   /**
    * Queue jobId this agent was spawned for. When the agent registers, the
    * orchestrator dispatches this job eagerly instead of going through the
@@ -211,6 +276,10 @@ export class ScalerManager {
   private readonly globalUsage: UsageCounter = { cpus: 0, memBytes: 0 };
   /** Per-scaler machine-pool name (set when scalers reference a pool). */
   private readonly scalerMachinePools = new Map<string, string | undefined>();
+  /** Per-scaler cap on concurrent `backend.spawn` operations (provisioning-rate throttle). */
+  private readonly maxConcurrentSpawns = new Map<string, number>();
+  /** Per-scaler spawn throttles, created lazily from `maxConcurrentSpawns`. */
+  private readonly spawnSemaphores = new Map<string, SpawnSemaphore>();
   /** Outstanding reservations keyed by agentId; used to release on disconnect. */
   private readonly reservations = new Map<string, ReservationEntry>();
   /**
@@ -265,6 +334,27 @@ export class ScalerManager {
    */
   private readonly onScalerEvent?: (runId: string, jobId: string, event: ScalerEvent) => void;
 
+  /** Coordinator drain predicate; when true, requestScale() no-ops (no fresh
+   *  agents spawned for the held Pending backlog). Defaults to never-draining. */
+  private readonly isDraining: () => boolean;
+
+  /**
+   * Optional callback fired (debounced) whenever scaler capacity frees — an
+   * ephemeral agent released its reservation on disconnect, a spawn failed, or a
+   * managed agent completed its job. Wired by the composition roots to the
+   * dispatcher's capacity-freed re-drive so jobs that got an `at-capacity`
+   * verdict get re-offered to the scaler the moment a slot opens, instead of
+   * sitting pending until they time out. Assigned after construction because it
+   * references the dispatcher, which is built after the manager.
+   */
+  onCapacityFreed?: () => void;
+
+  /** Trailing-debounce timer coalescing a burst of releases into one re-drive. */
+  private capacityFreedTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Trailing debounce window for {@link notifyCapacityFreed}. */
+  private static readonly CAPACITY_FREED_DEBOUNCE_MS = 250;
+
   private readonly warmPool: WarmPoolManager;
 
   /**
@@ -275,6 +365,11 @@ export class ScalerManager {
    * Unit tests can omit the store and operate from in-memory Maps only.
    */
   private readonly stateStore?: ScalerStateStore;
+
+  /** Cluster-wide default deadline (ms) for a single `backend.spawn`. */
+  private readonly spawnTimeoutMs: number;
+  /** Optional per-org spawn-deadline resolver (production path; DB-backed). */
+  private readonly resolveSpawnTimeoutMs?: (orgId: string | undefined) => Promise<number>;
 
   constructor(deps: {
     config: ScalerConfig;
@@ -298,10 +393,30 @@ export class ScalerManager {
       /** Orchestrator instance id (used in ledger rows for ownership). */
       instanceId: string;
     };
+    /** Coordinator drain predicate. When true, requestScale() declines to spawn
+     *  fresh capacity for the held Pending backlog. Defaults to never-draining. */
+    isDraining?: () => boolean;
+    /**
+     * Cluster-wide default deadline (ms) for a single `backend.spawn`. Always
+     * supplied (from config.scalerSpawnTimeoutMs); the per-org resolver, when
+     * present, overrides it per tenant.
+     */
+    spawnTimeoutMs: number;
+    /**
+     * Optional per-org resolver for the spawn deadline: given the job's org
+     * (jobConfig.cacheOrgId, undefined for warm-pool spawns), returns the
+     * effective timeout, falling back to the cluster default internally. Wired
+     * in orchestrator-core (has DB); omitted by the worker + unit tests → the
+     * cluster default spawnTimeoutMs is used.
+     */
+    resolveSpawnTimeoutMs?: (orgId: string | undefined) => Promise<number>;
   }) {
     this.stateStore = deps.stateStore;
+    this.spawnTimeoutMs = deps.spawnTimeoutMs;
+    this.resolveSpawnTimeoutMs = deps.resolveSpawnTimeoutMs;
     this.globalMaxAgents = deps.config.globalMaxAgents;
     this.onScalerEvent = deps.onScalerEvent;
+    this.isDraining = deps.isDraining ?? (() => false);
     this.globalResourceCap = deps.config.globalResourceCap;
 
     // Initialize the file-backed cross-process ledger when any pools are configured.
@@ -329,9 +444,12 @@ export class ScalerManager {
       this.backendRoles.set(entry.name, entry.roles);
       if (entry.resourceCap) this.resourceCaps.set(entry.name, entry.resourceCap);
       this.scalerMachinePools.set(entry.name, entry.machinePool);
+      this.maxConcurrentSpawns.set(entry.name, entry.maxConcurrentSpawns);
       this.scalerDefaults.set(entry.name, this.resolveScalerDefaults(deps.config, entry));
       this.perScalerUsage.set(entry.name, { cpus: 0, memBytes: 0 });
       this.scalerMandatoryLabels.set(entry.name, entry.mandatoryLabels ?? []);
+      this.scalerPlatform.set(entry.name, entry.platform);
+      this.warnOnUnstructuredPlatformLabels(entry);
     }
 
     // Index backends by name
@@ -355,7 +473,26 @@ export class ScalerManager {
 
         try {
           const onEvent = this.createEventEmitter(agentId);
-          await backend.spawn(labelSet, agentId, this.getOrchestratorUrl(backendName), onEvent);
+          // Warm-pool spawns hit the same backend socket as on-demand spawns, so
+          // they go through the same per-backend throttle — a cold pool fill must
+          // not storm the socket either.
+          await this.spawnSemaphoreFor(backendName).run(() => {
+            const entry = this.spawningAgents.get(agentId);
+            if (entry) entry.spawnStartedAt = Date.now();
+            // Warm-pool replenishment has no bound job/org, so the cluster
+            // default spawn deadline applies (orgId undefined).
+            return this.runSpawnWithTimeout(undefined, (signal) =>
+              backend.spawn(
+                labelSet,
+                agentId,
+                this.getOrchestratorUrl(backendName),
+                onEvent,
+                undefined,
+                undefined,
+                signal,
+              ),
+            );
+          });
           this.spawningAgents.delete(agentId);
           this.deleteSpawningAgentFromStore(agentId);
           this.startLogForwarding(backend, agentId);
@@ -397,24 +534,102 @@ export class ScalerManager {
   /** Per-scaler mandatoryLabels (taint-style opt-in gate). */
   private readonly scalerMandatoryLabels = new Map<string, string[]>();
 
+  /** Declared structured platform per scaler (undefined = host-derive / linux default). */
+  private readonly scalerPlatform = new Map<string, ScalerPlatform | undefined>();
+
+  /**
+   * Warn when a pool declares a plain platform-ish label (matched by the legacy
+   * denylist) but omits the structured `platform` field. The denylist is a
+   * migration shim; declaring `platform` is the canonical way to taint a pool.
+   */
+  private warnOnUnstructuredPlatformLabels(entry: {
+    name: string;
+    platform?: ScalerPlatform;
+    labelSets: { labels: string[] }[];
+  }): void {
+    if (entry.platform) return;
+    const plain = entry.labelSets
+      .flatMap((ls) => ls.labels)
+      .filter((l) => PLATFORM_TAINT_LABELS.has(l.toLowerCase()));
+    if (plain.length > 0) {
+      logger.warn(
+        `Scaler '${entry.name}' declares platform label(s) ${plain.join(', ')} without a structured 'platform' field. ` +
+          `Add 'platform: { os, arch }' to make the taint explicit; the plain-label denylist is a migration shim.`,
+      );
+    }
+  }
+
+  /**
+   * Resolve the pool's platform for label + taint derivation. Precedence:
+   *   1. A declared `platform` field always wins (even on a linux host).
+   *   2. Otherwise a bare-metal pool derives its platform from the host OS/arch.
+   *   3. Otherwise (container / firecracker, undeclared) returns null — those
+   *      pools run linux agents and are not auto-tainted; only an explicit
+   *      declared platform or a legacy denylist label taints them.
+   * Returns null when a bare-metal host's OS/arch is not a supported enum value
+   * (the caller falls back to the raw host-label derivation for labels).
+   */
+  private resolveScalerPlatform(name: string, backendType: string): ScalerPlatform | null {
+    const declared = this.scalerPlatform.get(name);
+    if (declared) return declared;
+    if (backendType === 'bare-metal') return hostToScalerPlatform(os.platform(), os.arch());
+    return null;
+  }
+
+  /**
+   * Effective taint gate for a scaler: its configured mandatoryLabels plus the
+   * platform-taint labels derived from the pool's resolved structured platform,
+   * unioned with the legacy plain-label denylist shim. A pool declaring a
+   * non-default platform (`windows`, `macos`, `arm64`, …) only accepts jobs that
+   * request that platform. Container / firecracker pools resolve to linux and
+   * carry no taint; calling it uniformly is safe.
+   */
+  private effectiveMandatoryLabels(
+    name: string,
+    backend: { type: string; labelSets: { labels: string[] }[] },
+  ): string[] {
+    const config = this.scalerMandatoryLabels.get(name) ?? [];
+    const declared = backend.labelSets.flatMap((ls) => ls.labels);
+    const resolved = this.resolveScalerPlatform(name, backend.type);
+    const structuredTaints = resolved ? platformToTaints(resolved) : [];
+    // Legacy denylist shim: keep tainting un-migrated pools that still declare a
+    // plain platform label without the structured field.
+    const legacyTaints = derivePlatformTaints(declared);
+    return [...new Set([...config, ...structuredTaints, ...legacyTaints])];
+  }
+
   /**
    * Build enriched scaler entries with auto-labels injected into each label set.
    * This ensures label matching accounts for auto-injected labels (kici:role:*,
    * kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*) that agents receive
    * at spawn time.
    *
-   * Mandatory labels are surfaced unchanged from the per-scaler config so the
-   * label matcher can apply the gate alongside subset matching.
+   * The os/arch labels derive from the pool's resolved structured platform
+   * (declared field wins, else host-derive for bare-metal, else linux), and the
+   * mandatory labels combine the per-scaler config gate with the platform taint,
+   * so the label matcher applies the gate alongside subset matching.
    */
   private getEnrichedScalerEntries() {
-    const hostOsArchLabels = deriveOsArchLabels(os.platform(), os.arch());
-    const linuxOsArchLabels = deriveOsArchLabels('linux', os.arch());
-
     return [...this.backends.entries()].map(([name, backend]) => {
-      const osArchLabels = backend.type === 'bare-metal' ? hostOsArchLabels : linuxOsArchLabels;
+      const resolved = this.resolveScalerPlatform(name, backend.type);
+      const osArchLabels = resolved
+        ? platformToOsArchLabels(resolved)
+        : backend.type === 'bare-metal'
+          ? // Bare-metal host whose OS/arch is not a supported enum value: fall
+            // back to the raw host labels so exotic hosts still self-report.
+            deriveOsArchLabels(os.platform(), os.arch())
+          : // Container / firecracker always run linux agents.
+            deriveOsArchLabels('linux', os.arch());
       const roleLabels = resolveRoleLabels(this.backendRoles.get(name));
+      // The plain platform-taint tokens (`windows`, `macos`, `arm64`) derived
+      // from the structured field are injected as matchable labels so a job that
+      // requests the platform can route here without the operator also declaring
+      // a plain platform label — the structured field is the single source for
+      // the taint gate AND the label that satisfies it.
+      const platformTokens = resolved ? platformToTaints(resolved) : [];
       const autoLabels = [
         ...osArchLabels,
+        ...platformTokens,
         agentTypeLabel(backend.type),
         scalerLabel(name),
         ...roleLabels,
@@ -426,7 +641,7 @@ export class ScalerManager {
           ...ls,
           labels: [...new Set([...ls.labels, ...autoLabels])],
         })),
-        mandatoryLabels: this.scalerMandatoryLabels.get(name) ?? [],
+        mandatoryLabels: this.effectiveMandatoryLabels(name, backend),
       };
     });
   }
@@ -438,13 +653,60 @@ export class ScalerManager {
    * back to scaler defaults). Used by per-scaler / per-orchestrator / per-machine
    * resource caps; the cap math is wired up by ScalerManager itself.
    */
+  /**
+   * Run a single backend spawn under the resolved spawn deadline. Returns the
+   * ManagedAgent on success. On deadline: aborts the signal (so the backend's
+   * threaded container-runtime/HTTP calls cancel and its own catch cleans up)
+   * AND rejects, so the caller's semaphore `run()` finally releases the slot
+   * even if the backend's unwind stalls in a non-abortable spot. The backing
+   * spawn promise gets a no-op catch attached so a late abort-rejection doesn't
+   * surface as an unhandled rejection.
+   */
+  private async runSpawnWithTimeout(
+    orgId: string | undefined,
+    spawn: (signal: AbortSignal) => Promise<ManagedAgent>,
+  ): Promise<ManagedAgent> {
+    const timeoutMs = this.resolveSpawnTimeoutMs
+      ? await this.resolveSpawnTimeoutMs(orgId)
+      : this.spawnTimeoutMs;
+
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`scaler spawn timed out after ${timeoutMs}ms`);
+        controller.abort(err);
+        reject(err);
+      }, timeoutMs);
+    });
+
+    const spawnPromise = spawn(controller.signal);
+    // Prevent an unhandled rejection when the deadline wins the race but the
+    // backing spawn later rejects (via the abort) or resolves.
+    spawnPromise.catch(() => {});
+
+    try {
+      return await Promise.race([spawnPromise, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async requestScale(
     labels: string[],
     jobId: string,
     runId: string,
     excludeLabels: string[] = [],
     resources?: ResourceRequest,
+    orgId?: string,
   ): Promise<ScaleResult> {
+    // Coordinator draining: do not spawn fresh capacity for the held Pending
+    // backlog. In-flight jobs on existing agents finish; scale-down / idle
+    // reaping is untouched.
+    if (this.isDraining()) {
+      return { action: 'skipped', reason: 'draining' };
+    }
+
     // 0. Prune stale spawning entries (agents that crashed before WS registration).
     this.pruneStaleSpawningEntries();
 
@@ -538,7 +800,11 @@ export class ScalerManager {
     this.persistSpawningAgent(agentId, spawnLabelSet, backendName, jobId);
     this.persistReservation(agentId, backendName, effective.requests);
 
-    // 6. Spawn asynchronously (fire-and-forget). On failure, release reservations.
+    // 6. Spawn asynchronously (fire-and-forget), throttled by the per-backend
+    // spawn semaphore. The reservation (steps 4-5a) is already taken, so the
+    // agent stays reserved while queued in the semaphore — cap accounting is
+    // unchanged; the semaphore only bounds the concurrent provisioning rate.
+    // On failure, release reservations.
     const orchestratorUrl = this.getOrchestratorUrl(backendName);
     const onEvent = this.createEventEmitter(agentId);
     const effectiveLimits =
@@ -549,8 +815,24 @@ export class ScalerManager {
           }
         : undefined;
     const spawnContext = { boundJobId: jobId, runId };
-    backend
-      .spawn(spawnLabelSet, agentId, orchestratorUrl, onEvent, effectiveLimits, spawnContext)
+    this.spawnSemaphoreFor(backendName)
+      .run(() => {
+        // The spawn has been admitted past the throttle: start the "never
+        // registered" staleness clock now, not at enqueue time.
+        const entry = this.spawningAgents.get(agentId);
+        if (entry) entry.spawnStartedAt = Date.now();
+        return this.runSpawnWithTimeout(orgId, (signal) =>
+          backend.spawn(
+            spawnLabelSet,
+            agentId,
+            orchestratorUrl,
+            onEvent,
+            effectiveLimits,
+            spawnContext,
+            signal,
+          ),
+        );
+      })
       .then(
         () => {
           logger.info(`Agent ${agentId} spawned successfully via ${backendName}`);
@@ -583,6 +865,21 @@ export class ScalerManager {
     } finally {
       release();
     }
+  }
+
+  /**
+   * Lazily resolve the per-backend spawn throttle, sized by the scaler's
+   * `maxConcurrentSpawns` (falling back to the cluster default). One semaphore
+   * per backend name, since each backend has its own container socket.
+   */
+  private spawnSemaphoreFor(backendName: string): SpawnSemaphore {
+    let semaphore = this.spawnSemaphores.get(backendName);
+    if (!semaphore) {
+      const max = this.maxConcurrentSpawns.get(backendName) ?? DEFAULT_MAX_CONCURRENT_SPAWNS;
+      semaphore = new SpawnSemaphore(max);
+      this.spawnSemaphores.set(backendName, semaphore);
+    }
+    return semaphore;
   }
 
   /**
@@ -732,6 +1029,35 @@ export class ScalerManager {
         });
       });
     }
+
+    // Capacity just freed: signal the dispatcher to re-drive pending jobs. This
+    // single site covers the spawn-failure release and every onAgentDisconnected
+    // release (both route through releaseAll).
+    this.notifyCapacityFreed();
+  }
+
+  /**
+   * Signal that scaler capacity freed. Trailing-debounced by
+   * {@link CAPACITY_FREED_DEBOUNCE_MS} so a burst of simultaneous releases (and
+   * the onJobComplete → onAgentDisconnect pair for a single-use agent) coalesces
+   * into one re-drive pass that runs after the last release settles. No-op when
+   * no callback is wired. The timer is `unref`'d so it never keeps the process
+   * alive, and cleared on shutdown.
+   */
+  private notifyCapacityFreed(): void {
+    if (!this.onCapacityFreed) return;
+    if (this.capacityFreedTimer) clearTimeout(this.capacityFreedTimer);
+    this.capacityFreedTimer = setTimeout(() => {
+      this.capacityFreedTimer = null;
+      const cb = this.onCapacityFreed;
+      if (!cb) return;
+      try {
+        cb();
+      } catch (err) {
+        logger.warn('onCapacityFreed callback threw', { error: toErrorMessage(err) });
+      }
+    }, ScalerManager.CAPACITY_FREED_DEBOUNCE_MS);
+    this.capacityFreedTimer.unref();
   }
 
   /**
@@ -775,7 +1101,9 @@ export class ScalerManager {
    *   Used by the caller to eagerly dispatch the bound job before the
    *   agent's idle timer fires, skipping the generic queue drain race.
    * - `mandatoryLabels` (always populated for scaler-managed agents): the
-   *   spawning scaler's `mandatoryLabels` gate. Threaded into the
+   *   spawning scaler's effective `mandatoryLabels` gate — its configured
+   *   labels plus the platform taint derived from the pool's declared OS/arch.
+   *   Threaded into the
    *   AgentRegistry so the queue-drain path (`onAgentAvailable` →
    *   `dequeueForLabels`) and the eager-dispatch path
    *   (`dispatchBoundJob` → `dequeueById`) both reject queued jobs whose
@@ -801,7 +1129,14 @@ export class ScalerManager {
     // Store in managed index
     this.managedAgentIndex.set(agentId, spawning.backendName);
 
-    const mandatoryLabels = this.scalerMandatoryLabels.get(spawning.backendName) ?? [];
+    // Use the same effective gate the local matcher and cross-peer advertisement
+    // use, so a platform-tainted pool (windows/macos/arm64) stamps that taint onto
+    // the registered agent — the queue-drain and eager-dispatch paths then reject
+    // an unqualified job that would otherwise land on a wrong-OS scaler agent.
+    const backend = this.backends.get(spawning.backendName);
+    const mandatoryLabels = backend
+      ? this.effectiveMandatoryLabels(spawning.backendName, backend)
+      : (this.scalerMandatoryLabels.get(spawning.backendName) ?? []);
 
     logger.info(`Spawned agent ${agentId} registered, backend ${spawning.backendName}`, {
       boundJobId: spawning.boundJobId,
@@ -909,8 +1244,12 @@ export class ScalerManager {
     const backend = this.backends.get(backendName);
     if (!backend) return;
 
-    // Single-job model: agent should disconnect on its own after job completion.
-    // If it doesn't within 30s, the heartbeat monitor will handle it.
+    // Single-job model: the agent disconnects on its own after completion, which
+    // frees its reservation via releaseAll. Signal capacity-freed early to shave
+    // re-dispatch latency; the trailing debounce coalesces this with the
+    // subsequent disconnect release so the re-drive still runs after the slot
+    // actually opens.
+    this.notifyCapacityFreed();
   }
 
   /**
@@ -951,6 +1290,10 @@ export class ScalerManager {
    * Stop warm pool, shutdown all backends, clear tracking maps.
    */
   async shutdownAll(): Promise<void> {
+    if (this.capacityFreedTimer) {
+      clearTimeout(this.capacityFreedTimer);
+      this.capacityFreedTimer = null;
+    }
     this.warmPool.stop();
     if (this.machineLedger) {
       this.machineLedger.stop();
@@ -1016,6 +1359,7 @@ export class ScalerManager {
     this.scalerMachinePools.clear();
     this.scalerDefaults.clear();
     this.scalerMandatoryLabels.clear();
+    this.scalerPlatform.clear();
     for (const entry of newConfig.scalers) {
       this.scalerUrls.set(entry.name, entry.orchestratorUrl);
       this.backendRoles.set(entry.name, entry.roles);
@@ -1023,6 +1367,8 @@ export class ScalerManager {
       this.scalerMachinePools.set(entry.name, entry.machinePool);
       this.scalerDefaults.set(entry.name, this.resolveScalerDefaults(newConfig, entry));
       this.scalerMandatoryLabels.set(entry.name, entry.mandatoryLabels ?? []);
+      this.scalerPlatform.set(entry.name, entry.platform);
+      this.warnOnUnstructuredPlatformLabels(entry);
       // Preserve existing usage counters; only initialize for new scalers.
       if (!this.perScalerUsage.has(entry.name)) {
         this.perScalerUsage.set(entry.name, { cpus: 0, memBytes: 0 });
@@ -1081,7 +1427,7 @@ export class ScalerManager {
         usage: { cpus: usage.cpus, memBytes: usage.memBytes },
         resourceCap: this.resourceCaps.get(name),
         machinePool: this.scalerMachinePools.get(name),
-        mandatoryLabels: this.scalerMandatoryLabels.get(name) ?? [],
+        mandatoryLabels: enriched?.mandatoryLabels ?? this.scalerMandatoryLabels.get(name) ?? [],
       });
     }
 
@@ -1114,6 +1460,32 @@ export class ScalerManager {
   }
 
   /**
+   * Whether some configured backend could spawn capacity for this label set —
+   * the same `findBackendForLabels` match `requestScale` makes, asked without
+   * spawning anything.
+   *
+   * Read by the queue-expiry sweep to tell a fleet/label problem apart from a
+   * capacity one: a job whose labels no agent AND no backend can serve could
+   * never have run (`unroutable`), while a job whose backend matched but whose
+   * spawn kept failing is a provisioning/capacity problem (`timed_out_stale`),
+   * and mislabelling the latter would tell an operator to fix a `runsOn` that
+   * is perfectly correct.
+   *
+   * Exact labels only — the scaler's own routing (`requestScale`) matches on
+   * exact labels, so a regex `runsOn` matcher is not expressible here. On a
+   * scaler-configured orchestrator that makes the answer conservative for a
+   * pattern-only `runsOn`: a backend whose labelSets carry no mandatory labels
+   * matches the empty exact set, so such a job is reported routable and settles
+   * `timed_out_stale` rather than `unroutable`. That loses precision, never
+   * safety — the job is still terminal and the run still fails, which is the
+   * invariant that matters. Tightening it means teaching scaler routing about
+   * patterns, which would change where jobs actually spawn.
+   */
+  hasBackendForLabels(labels: string[], excludeLabels: string[] = []): boolean {
+    return findBackendForLabels(labels, this.getEnrichedScalerEntries(), excludeLabels) !== null;
+  }
+
+  /**
    * Get scaler-specific configuration metadata for a managed agent.
    * Returns undefined for non-scaler-managed (static) agents.
    * Used to enrich job.context before forwarding to Platform.
@@ -1138,22 +1510,51 @@ export class ScalerManager {
     }
   }
 
+  /**
+   * Provision/heal every backend's host prerequisites before spawning starts.
+   * Awaits each backend's optional ensureHostReady, catching per-backend so one
+   * scaler's host-prep failure degrades only that scaler (its spawns will fail
+   * with clear errors + the firecracker-network diagnostic reports it) rather
+   * than aborting orchestrator startup.
+   */
+  async ensureHostsReady(): Promise<void> {
+    for (const [name, backend] of this.backends.entries()) {
+      if (!backend.ensureHostReady) continue;
+      try {
+        await backend.ensureHostReady();
+      } catch (err) {
+        logger.error(
+          `host self-provision failed for scaler "${name}": ${toErrorMessage(err)}; scaler will be degraded`,
+        );
+      }
+    }
+  }
+
   // ── Internal ──────────────────────────────────────────────────────
 
   /**
-   * Remove spawning entries older than 5 minutes.
-   * These represent agents that were spawned but never registered via WS
-   * (e.g., process/container crashed on startup). Without cleanup, these
-   * entries would leak in spawningAgents forever.
+   * Remove spawning entries whose `backend.spawn` started more than 5 minutes
+   * ago but never registered via WS (e.g., process/container crashed on
+   * startup). Without cleanup, these entries would leak in spawningAgents
+   * forever.
+   *
+   * The window is measured from `spawnStartedAt` (when the throttled spawn
+   * actually began), NOT from `spawnedAt` (enqueue time): a spawn still waiting
+   * behind the per-backend spawn semaphore has not started and must not be
+   * reaped mid-queue during a large burst. Recovered orphan entries carry
+   * `spawnStartedAt` set to their persisted enqueue time, so they are subject to
+   * the normal window.
    */
   private pruneStaleSpawningEntries(): void {
     const staleThreshold = Date.now() - 300_000; // 5 minutes
     for (const [id, entry] of this.spawningAgents) {
-      if (entry.spawnedAt < staleThreshold) {
+      // Skip spawns still queued in the semaphore (not yet started).
+      if (entry.spawnStartedAt === undefined) continue;
+      if (entry.spawnStartedAt < staleThreshold) {
         this.spawningAgents.delete(id);
         this.deleteSpawningAgentFromStore(id);
         logger.warn(
-          `Pruned stale spawning entry for agent ${id} (spawned ${Math.round((Date.now() - entry.spawnedAt) / 1000)}s ago)`,
+          `Pruned stale spawning entry for agent ${id} (spawn started ${Math.round((Date.now() - entry.spawnStartedAt) / 1000)}s ago)`,
         );
       }
     }
@@ -1282,10 +1683,15 @@ export class ScalerManager {
     try {
       const spawning = await this.stateStore.listSpawningAgents();
       for (const entry of spawning) {
+        // A recovered entry is orphaned from a dead coord: no live spawn backs
+        // it, so treat it as already-started (staleness measured from its
+        // persisted enqueue time) rather than a still-queued spawn we'd never
+        // reap.
         this.spawningAgents.set(entry.agentId, {
           labelSet: entry.labelSet,
           backendName: entry.scalerName,
           spawnedAt: entry.spawnedAt.getTime(),
+          spawnStartedAt: entry.spawnedAt.getTime(),
           ...(entry.boundJobId !== undefined && { boundJobId: entry.boundJobId }),
         });
       }

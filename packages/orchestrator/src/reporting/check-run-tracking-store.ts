@@ -33,7 +33,16 @@ export interface CheckRunTrackingState {
   stepProgress: StepProgressEntry[];
   /** Timestamp the first running-step transition was sent to GitHub. */
   inProgressSentAt?: Date;
-  /** KiCI run this check-run belongs to. Used by `cleanupRun`. */
+  /**
+   * Timestamp the terminal (`completed`) update was accepted by the provider.
+   * Undefined means we have no record of sending it — not proof it failed.
+   */
+  terminalSentAt?: Date;
+  /**
+   * KiCI run this check-run belongs to. Written at create time so the row
+   * records its owning run; it is an attribution/lookup key, not a retention
+   * key — the sweep prunes on `updated_at` age alone.
+   */
   runId?: string;
   /** Last persisted update time; powers debounce-after-failover recovery. */
   updatedAt?: Date;
@@ -69,9 +78,17 @@ export class CheckRunTrackingStore {
    * Performed as an upsert so a re-issued setPending after a coord
    * failover replaces the prior ID rather than silently leaving a row
    * mismatched with the GitHub-side state.
+   *
+   * `runId` is written alongside so the row records which run owns it from
+   * the moment it is created. A row created without it carries a NULL
+   * `run_id`, which makes `listKeysByRunId` under-report and leaves the
+   * column useless to an operator asking which run posted a given check.
    */
-  async setCheckRunId(key: CheckRunTrackingKey, checkRunId: number): Promise<void> {
-    await this.upsertRow(key, { check_run_id: checkRunId });
+  async setCheckRunId(key: CheckRunTrackingKey, checkRunId: number, runId?: string): Promise<void> {
+    await this.upsertRow(key, {
+      check_run_id: checkRunId,
+      ...(runId !== undefined && { run_id: runId }),
+    });
   }
 
   /**
@@ -134,6 +151,20 @@ export class CheckRunTrackingStore {
   }
 
   /**
+   * Stamp that the terminal (`completed`) provider update was sent.
+   *
+   * Mirrors `markInProgressSent`. Best-effort like every write on this table —
+   * the caller swallows failures, because a tracking write must never break
+   * check-run reporting — so a null column is "no record", not "never sent".
+   */
+  async markTerminalSent(key: CheckRunTrackingKey, runId?: string): Promise<void> {
+    await this.upsertRow(key, {
+      terminal_sent_at: new Date(),
+      ...(runId !== undefined && { run_id: runId }),
+    });
+  }
+
+  /**
    * Get the full state snapshot for a key. Used by the L1 cache to
    * hydrate on miss and by tests to verify the on-disk layout. Returns
    * undefined when no row exists.
@@ -160,9 +191,14 @@ export class CheckRunTrackingStore {
   }
 
   /**
-   * List every key currently tracked for a runId. Used by `cleanupRun`
-   * to reproduce the runId → keys reverse index that the in-memory map
-   * provided. Index `idx_check_run_tracking_run_id` keeps this O(matches).
+   * List every key currently tracked for a runId — the runId → keys reverse
+   * index that `CheckRunReporter` otherwise holds only in memory, so a
+   * replacement coord that never saw the run can still recover it. Index
+   * `idx_check_run_tracking_run_id` keeps this O(matches).
+   *
+   * No caller in tree: run-prune stopped consulting the store once row
+   * lifetime moved to {@link pruneStale}. Kept as the read half of the
+   * `run_id` column, beside {@link deleteByRunId}.
    */
   async listKeysByRunId(runId: string): Promise<CheckRunTrackingKey[]> {
     const rows = await this.db
@@ -180,14 +216,56 @@ export class CheckRunTrackingStore {
   }
 
   /**
-   * Delete every row for a runId. Mirrors the bulk-cleanup semantics of
-   * `cleanupRun` so a single call from execution-tracker prune releases
-   * all rows for the run.
+   * Delete every row for a runId.
+   *
+   * Not on the run-prune path: `cleanupRun` evicts only its in-memory state,
+   * because a row deleted at prune time strands a late terminal PATCH that
+   * still has to resolve its check-run ID. Routine reclamation is
+   * {@link pruneStale}. This remains as the targeted escape hatch for
+   * discarding one run's rows deliberately.
    */
   async deleteByRunId(runId: string): Promise<number> {
     const result = await this.db
       .deleteFrom('check_run_tracking')
       .where('run_id', '=', runId)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows ?? 0n);
+  }
+
+  /**
+   * Delete every row untouched for longer than `retentionDays`, and return
+   * how many were removed. `retentionDays <= 0` disables the sweep, matching
+   * the `JobQueue.pruneTerminalDispatchRows` convention.
+   *
+   * `updated_at` is the staleness signal because the table carries no status
+   * column, and the rows that most need reaping are precisely the ones with no
+   * `run_id` to join on — so the predicate is age alone, deliberately
+   * unfiltered by `run_id`. Every upsert bumps `updated_at`, so a run that is
+   * still emitting check-run traffic keeps its rows fresh; a workflow-level
+   * row, written once at create, ages from creation.
+   *
+   * Inactivity age rather than run completion is what keeps a reader safe: a
+   * row a diagnostic is polling for cannot disappear underneath it, because
+   * the window is days and the row is only removed once nothing has touched
+   * it for that long.
+   *
+   * The bound this trades for that safety: age is measured on check-run
+   * writes, not on run liveness, so a run that stays live while emitting no
+   * check-run traffic for longer than the window — a run parked on a manual
+   * approval gate, whose hold statuses go through `CheckStatusPoster` and
+   * never touch this table — has its rows swept while it is still running.
+   * The reporter's L1 cache still holds the ID, so its terminal update lands
+   * anyway on a coord that stayed up; it takes a restart or failover across
+   * that window to leave the update with no row to load through and no
+   * check-run ID to resolve.
+   *
+   * Called from the hourly cleanup tick.
+   */
+  async pruneStale(retentionDays: number): Promise<number> {
+    if (retentionDays <= 0) return 0;
+    const result = await this.db
+      .deleteFrom('check_run_tracking')
+      .where('updated_at', '<', sql<Date>`now() - make_interval(days => ${retentionDays})`)
       .executeTakeFirst();
     return Number(result.numDeletedRows ?? 0n);
   }
@@ -200,6 +278,7 @@ export class CheckRunTrackingStore {
         build_creation_state: string | null;
         step_progress_json: unknown;
         in_progress_sent_at: Date | null;
+        terminal_sent_at: Date | null;
         run_id: string | null;
         updated_at: Date;
       }
@@ -212,6 +291,7 @@ export class CheckRunTrackingStore {
         'build_creation_state',
         'step_progress_json',
         'in_progress_sent_at',
+        'terminal_sent_at',
         'run_id',
         'updated_at',
       ])
@@ -231,6 +311,7 @@ export class CheckRunTrackingStore {
       build_creation_state: string;
       step_progress_json: string;
       in_progress_sent_at: Date;
+      terminal_sent_at: Date;
       run_id: string;
     }>,
   ): Promise<void> {
@@ -252,6 +333,9 @@ export class CheckRunTrackingStore {
         ...(updates.in_progress_sent_at !== undefined && {
           in_progress_sent_at: updates.in_progress_sent_at,
         }),
+        ...(updates.terminal_sent_at !== undefined && {
+          terminal_sent_at: updates.terminal_sent_at,
+        }),
         ...(updates.run_id !== undefined && { run_id: updates.run_id }),
       })
       .onConflict((oc) =>
@@ -265,6 +349,9 @@ export class CheckRunTrackingStore {
           }),
           ...(updates.in_progress_sent_at !== undefined && {
             in_progress_sent_at: updates.in_progress_sent_at,
+          }),
+          ...(updates.terminal_sent_at !== undefined && {
+            terminal_sent_at: updates.terminal_sent_at,
           }),
           ...(updates.run_id !== undefined && { run_id: updates.run_id }),
           updated_at: sql`NOW()`,
@@ -283,6 +370,7 @@ export function rowToState(row: {
   build_creation_state: string | null;
   step_progress_json: unknown;
   in_progress_sent_at: Date | null;
+  terminal_sent_at: Date | null;
   run_id: string | null;
   updated_at: Date;
 }): CheckRunTrackingState {
@@ -309,6 +397,9 @@ export function rowToState(row: {
   }
   if (row.in_progress_sent_at != null) {
     state.inProgressSentAt = row.in_progress_sent_at;
+  }
+  if (row.terminal_sent_at != null) {
+    state.terminalSentAt = row.terminal_sent_at;
   }
   if (row.run_id != null) {
     state.runId = row.run_id;

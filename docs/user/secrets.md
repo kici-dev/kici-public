@@ -22,7 +22,7 @@ Secret values are written either through the dashboard or through `kici-admin` r
 A fresh orchestrator starts in **permissive** mode: both surfaces are available.
 
 - **Dashboard:** Settings → Secrets → pick a scope → enter the secret name and value.
-- **CLI:** `kici-admin secret set --scope <scope> <KEY>` against the orchestrator's HTTP admin API.
+- **CLI:** `kici-admin secret set <orgId> <scope> <KEY>` against the orchestrator's HTTP admin API.
 
 Use whichever fits the workflow — most small teams stay on the dashboard; ops engineers and CI scripts use the CLI.
 
@@ -30,7 +30,7 @@ Use whichever fits the workflow — most small teams stay on the dashboard; ops 
 
 The orchestrator operator can flip `secrets.set` (and `variables.set`) to **CLI-only** as part of the [dashboard-write policy](/operator/security/dashboard-write-policy). When that flip is on:
 
-- The dashboard's "Add secret" / "Edit value" controls render with a lock icon. Clicking them shows a tooltip with the exact `kici-admin secret set` invocation needed.
+- The dashboard's "Add secret" / "Edit value" controls render with a lock icon. Hovering or keyboard-focusing the lock shows a tooltip with the exact `kici-admin secret set` invocation needed. The control itself is inert, so there is nothing to click.
 - The dashboard's secrets page still lists secret **names**, scopes, and bindings — only the value-entry path moves to the CLI.
 - `kici-admin secret set` becomes the single entry point for new and updated secret values.
 
@@ -38,25 +38,29 @@ This configuration is common for SOC2-prep and regulated workloads, where the cu
 
 ### CLI input modes
 
-`kici-admin secret set` accepts five input modes — pick the one that fits your workflow:
+`kici-admin secret set` takes the target as three positional arguments — `<orgId> <scope> <key>` — and accepts five input modes; pick the one that fits your workflow:
 
 ```bash
 # Interactive prompt (default when stdin is a TTY). No echo, no shell history.
-kici-admin secret set --scope production DB_PASSWORD --prompt
+kici-admin secret set my-org production DB_PASSWORD --prompt
 
 # Pipe from another tool (default when stdin is not a TTY).
-pass show prod/db | kici-admin secret set --scope production DB_PASSWORD --from-stdin
+pass show prod/db | kici-admin secret set my-org production DB_PASSWORD --from-stdin
 
 # Read from a file (handy after `sops -d` to a tmpfile).
-kici-admin secret set --scope production DB_PASSWORD --from-file ./db.pass
+kici-admin secret set my-org production DB_PASSWORD --from-file ./db.pass
 
 # Read from a named environment variable (CI-friendly).
 KICI_SECRET_VALUE=$(my-secrets-fetcher prod db) \
-  kici-admin secret set --scope production DB_PASSWORD --from-env KICI_SECRET_VALUE
+  kici-admin secret set my-org production DB_PASSWORD --from-env KICI_SECRET_VALUE
 
 # Direct argv — discouraged. Prints a stderr warning ("visible in shell history").
-kici-admin secret set --scope production DB_PASSWORD --value "<plaintext>"
+kici-admin secret set my-org production DB_PASSWORD --value "<plaintext>"
 ```
+
+When the scope is a deployment context, a flag-based sugar form is also accepted:
+`kici-admin secret set --org my-org --context production --key DB_PASSWORD --prompt`.
+The two forms are mutually exclusive — mixing them is refused.
 
 Two cross-cutting flags help every mode:
 

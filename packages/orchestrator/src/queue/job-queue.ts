@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { type Kysely, type SqlBool, sql } from 'kysely';
 import { type LabelMatcher, matcherSatisfiedBy, type ResourceRequest } from '@kici-dev/engine';
+import { createLogger } from '@kici-dev/shared';
 import type { Database, DispatchQueueItem } from '../db/types.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
+
+const logger = createLogger({ prefix: 'job-queue' });
 
 /** Info about an expired dispatch_queue entry, returned by markExpired(). */
 export interface ExpiredJobInfo {
@@ -11,6 +15,16 @@ export interface ExpiredJobInfo {
   jobName: string;
   /** Most recent scaler spawn-failure detail, if any was recorded. */
   lastProvisioningError: string | null;
+  /**
+   * The job's routing selectors, carried so the expiry sweep can ask whether
+   * any agent could ever have run it. A job that expires with NO matching agent
+   * is `unroutable` (a fleet/label problem); one whose agent existed but never
+   * freed up is `timed_out_stale` (a capacity problem).
+   */
+  runsOnLabels: string[];
+  runsOnPatterns: LabelMatcher[];
+  excludeLabels: string[];
+  excludePatterns: LabelMatcher[];
 }
 
 /**
@@ -175,8 +189,14 @@ export interface QueuedJob {
  */
 export class JobQueue {
   private readonly db: Kysely<Database>;
-  private readonly maxDepth: number;
+  /** Cluster-wide fallback for queue_max_depth when cluster_settings is null. */
+  private readonly defaultMaxDepth: number;
   private readonly defaultTimeoutMs: number;
+  private readonly clusterSettings?: ClusterSettingsReader;
+  /** Per-job (per-org) queue-timeout resolver; falls back to defaultTimeoutMs. */
+  private readonly getQueueTimeoutMs?: (job: {
+    jobConfig?: Record<string, unknown>;
+  }) => Promise<number>;
   /** 1-second TTL cache for pending depth count to avoid extra SELECT COUNT per enqueue. */
   private depthCache: { count: number; expiresAt: number } | null = null;
   /**
@@ -190,27 +210,50 @@ export class JobQueue {
     expiresAt: number;
   } | null = null;
 
-  constructor(db: Kysely<Database>, options: { maxDepth: number; defaultTimeoutMs: number }) {
+  constructor(
+    db: Kysely<Database>,
+    options: {
+      maxDepth: number;
+      defaultTimeoutMs: number;
+      clusterSettings?: ClusterSettingsReader;
+      getQueueTimeoutMs?: (job: { jobConfig?: Record<string, unknown> }) => Promise<number>;
+    },
+  ) {
     this.db = db;
-    this.maxDepth = options.maxDepth;
+    this.defaultMaxDepth = options.maxDepth;
     this.defaultTimeoutMs = options.defaultTimeoutMs;
+    this.clusterSettings = options.clusterSettings;
+    this.getQueueTimeoutMs = options.getQueueTimeoutMs;
   }
 
   /**
-   * Enqueue a job. Checks depth first, rejects with 'queue full' if >= maxDepth.
+   * Enqueue a job. Checks depth first, rejects with 'queue full' if >= the
+   * fleet-wide `queue_max_depth` (cluster_settings, falling back to the config
+   * default). The per-job timeout resolves through the per-org
+   * `queue_timeout_ms` override.
    * @returns The generated job ID.
    */
   async enqueue(job: QueuedJobInput): Promise<string> {
+    const maxDepth =
+      (await this.clusterSettings?.getNumber('queue_max_depth', this.defaultMaxDepth)) ??
+      this.defaultMaxDepth;
     const depth = await this.getDepth();
-    if (depth >= this.maxDepth) {
+    if (depth >= maxDepth) {
       throw new Error('queue full');
     }
 
     const id = job.jobId ?? randomUUID();
     const now = new Date().toISOString();
-    const timeoutMs = job.timeoutMs ?? this.defaultTimeoutMs;
+    const clusterTimeout = this.getQueueTimeoutMs
+      ? await this.getQueueTimeoutMs(job)
+      : this.defaultTimeoutMs;
+    const timeoutMs = job.timeoutMs ?? clusterTimeout;
     const expiresAt = timeoutMs > 0 ? new Date(Date.now() + timeoutMs).toISOString() : null;
 
+    // ON CONFLICT (id) DO NOTHING: a reroute re-enqueue reuses a preassigned
+    // jobId, so a duplicate from a sibling coordinator is a benign no-op rather
+    // than a dispatch_queue_pkey error. Queuing is naturally idempotent — the
+    // existing row already represents the pending job.
     await this.db
       .insertInto('dispatch_queue')
       .values({
@@ -241,6 +284,7 @@ export class JobQueue {
         routing_key: job.routingKey,
         pinned_agent_id: job.pinnedAgentId ?? null,
       })
+      .onConflict((oc) => oc.column('id').doNothing())
       .execute();
 
     // Invalidate both caches so the next enqueue / gauge scrape sees the updated counts
@@ -468,13 +512,33 @@ export class JobQueue {
   /**
    * Insert a job directly with status='dispatched' (bypasses the queue).
    * Used when an agent is immediately available and the job doesn't need to wait.
-   * @returns The generated job ID.
+   *
+   * `agentId` is the durable owner, written here for the same reason
+   * {@link markDispatched} writes it on the queue-drain path: this row is
+   * dispatched the moment it is inserted, so it never passes through
+   * `markDispatched` and would otherwise carry a NULL owner for its whole life.
+   * A coordinator that never saw the dispatch resolves ownership from this
+   * column alone, so omitting it here would make {@link hasAgentOwnedJob} answer
+   * "not owned" for every directly-dispatched job after a failover.
+   *
+   * Idempotent on the primary key: a reroute re-dispatch reuses a preassigned
+   * jobId, so a concurrent reroute from a sibling coordinator (or a duplicate
+   * delivery) may target a row this instance already wrote. ON CONFLICT (id) DO
+   * NOTHING makes that a no-op instead of a dispatch_queue_pkey error; the
+   * returned `inserted` flag tells the caller whether a fresh row was created so
+   * it can avoid double-dispatching an already-present job. The conflicting row
+   * keeps the owner the winning writer recorded.
+   *
+   * @returns The job ID and whether a new row was inserted (false = row already existed).
    */
-  async insertDispatched(job: QueuedJobInput): Promise<string> {
+  async insertDispatched(
+    job: QueuedJobInput,
+    agentId: string,
+  ): Promise<{ id: string; inserted: boolean }> {
     const id = job.jobId ?? randomUUID();
     const now = new Date().toISOString();
 
-    await this.db
+    const inserted = await this.db
       .insertInto('dispatch_queue')
       .values({
         id,
@@ -502,23 +566,31 @@ export class JobQueue {
         exclude_patterns: JSON.stringify(job.excludePatterns ?? []),
         routing_key: job.routingKey,
         pinned_agent_id: job.pinnedAgentId ?? null,
+        agent_id: agentId,
       })
-      .execute();
+      .onConflict((oc) => oc.column('id').doNothing())
+      .returning('id')
+      .executeTakeFirst();
 
-    return id;
+    return { id, inserted: inserted !== undefined };
   }
 
   /**
-   * Mark a job as dispatched.
+   * Mark a job as dispatched and record the agent it went to.
    *
-   * Note: agentId is not persisted in the dispatch_queue table.
-   * The dispatcher tracks agent-to-job mappings in memory (agentJobs Map).
-   * The dispatch_queue is a transient routing table, not the execution record.
+   * `agent_id` is the durable owner: the dispatcher also tracks agent-to-job
+   * mappings in memory (agentJobs Map), but that map is per-coordinator, so a
+   * coordinator that never saw the dispatch has to read the owner back from the
+   * row to answer an ownership question.
    */
-  async markDispatched(jobId: string, _agentId: string): Promise<void> {
+  async markDispatched(jobId: string, agentId: string): Promise<void> {
     await this.db
       .updateTable('dispatch_queue')
-      .set({ status: DispatchQueueStatus.Dispatched, last_provisioning_error: null })
+      .set({
+        status: DispatchQueueStatus.Dispatched,
+        last_provisioning_error: null,
+        agent_id: agentId,
+      })
       .where('id', '=', jobId)
       .execute();
   }
@@ -568,7 +640,16 @@ export class JobQueue {
     // 1. SELECT the about-to-expire rows
     const rows = await this.db
       .selectFrom('dispatch_queue')
-      .select(['id', 'run_id', 'job_name', 'last_provisioning_error'])
+      .select([
+        'id',
+        'run_id',
+        'job_name',
+        'last_provisioning_error',
+        'runs_on_labels',
+        'runs_on_patterns',
+        'exclude_labels',
+        'exclude_patterns',
+      ])
       .where('status', '=', DispatchQueueStatus.Pending)
       .where('expires_at', 'is not', null)
       .where('expires_at', '<', now as unknown as Date)
@@ -592,6 +673,16 @@ export class JobQueue {
       runId: r.run_id,
       jobName: r.job_name,
       lastProvisioningError: r.last_provisioning_error ?? null,
+      runsOnLabels: parseSelectorColumnForExpiry<string>(r.runs_on_labels, 'runs_on_labels'),
+      runsOnPatterns: parseSelectorColumnForExpiry<LabelMatcher>(
+        r.runs_on_patterns,
+        'runs_on_patterns',
+      ),
+      excludeLabels: parseSelectorColumnForExpiry<string>(r.exclude_labels, 'exclude_labels'),
+      excludePatterns: parseSelectorColumnForExpiry<LabelMatcher>(
+        r.exclude_patterns,
+        'exclude_patterns',
+      ),
     }));
   }
 
@@ -641,6 +732,36 @@ export class JobQueue {
       .executeTakeFirst();
 
     return Number(result.numUpdatedRows);
+  }
+
+  /**
+   * Delete terminal dispatch_queue rows older than `retentionDays`.
+   *
+   * `dispatch_queue` is operational dispatch state; the durable run history
+   * lives in the cold-stored execution_runs/jobs/steps tables, so a terminal
+   * ({@link DispatchQueueStatus.Completed}/{@link DispatchQueueStatus.Failed}/
+   * {@link DispatchQueueStatus.Expired}) row has no archival value once it ages
+   * out. Non-terminal rows ({@link DispatchQueueStatus.Pending}/
+   * {@link DispatchQueueStatus.Dispatched}/{@link DispatchQueueStatus.Recovering})
+   * are never pruned — a still-active run keeps every one of its rows. Both the
+   * terminal-status filter and the age cutoff must hold for a row to be deleted.
+   *
+   * `retentionDays <= 0` disables pruning (returns 0 without a query).
+   *
+   * @returns Number of rows deleted.
+   */
+  async pruneTerminalDispatchRows(retentionDays: number): Promise<number> {
+    if (retentionDays <= 0) return 0;
+    const result = await this.db
+      .deleteFrom('dispatch_queue')
+      .where('status', 'in', [
+        DispatchQueueStatus.Completed,
+        DispatchQueueStatus.Failed,
+        DispatchQueueStatus.Expired,
+      ])
+      .where('created_at', '<', sql<Date>`now() - make_interval(days => ${retentionDays})`)
+      .executeTakeFirst();
+    return Number(result.numDeletedRows);
   }
 
   /**
@@ -931,6 +1052,7 @@ export class JobQueue {
         dispatch_attempts: sql<number>`dispatch_attempts + 1`,
         ack_deadline: null,
         ack_agent_id: null,
+        agent_id: null,
       })
       .where('id', '=', jobId)
       .where('status', '=', DispatchQueueStatus.Dispatched)
@@ -956,11 +1078,12 @@ export class JobQueue {
   }
 
   /**
-   * Mark a job as dispatched only if it is still in 'recovering' state.
+   * Mark a job as dispatched only if it is still in 'recovering' state, and
+   * record `agentId` as the durable owner of the reclaimed job.
    * Used when an agent reconnects and claims a recovering job.
    * @returns true if the update affected a row (job was still recovering).
    */
-  async markDispatchedIfRecovering(jobId: string): Promise<boolean> {
+  async markDispatchedIfRecovering(jobId: string, agentId: string): Promise<boolean> {
     const result = await this.db
       .updateTable('dispatch_queue')
       .set({
@@ -969,6 +1092,7 @@ export class JobQueue {
         recovery_agent_id: null,
         ack_deadline: null,
         ack_agent_id: null,
+        agent_id: agentId,
       })
       .where('id', '=', jobId)
       .where('status', '=', DispatchQueueStatus.Recovering)
@@ -995,10 +1119,11 @@ export class JobQueue {
 
   /**
    * HA-safe ownership check. Returns true if the DB shows that
-   * `agentId` previously held `jobId` according to any of:
+   * `agentId` holds or previously held `jobId` according to any of:
    *
-   *   - `status='dispatched'` AND the registry-managed bookkeeping
-   *     records the agent assignment (caller-side `agentJobs` map),
+   *   - `status='dispatched'` AND `agent_id = <agent>` — the live
+   *     owner of an in-flight job, readable by any coordinator
+   *     including one that never saw the dispatch,
    *   - `status='recovering'` AND `recovery_agent_id = <agent>` (so a
    *     replacement coord still recognises in-flight chunks), OR
    *   - the row is already terminal (`completed` / `failed` /
@@ -1013,11 +1138,17 @@ export class JobQueue {
   async hasAgentOwnedJob(agentId: string, jobId: string): Promise<boolean> {
     const row = await this.db
       .selectFrom('dispatch_queue')
-      .select(['status', 'recovery_agent_id'])
+      .select(['status', 'recovery_agent_id', 'agent_id'])
       .where('id', '=', jobId)
       .executeTakeFirst();
     if (!row) return false;
     const status = row.status as DispatchQueueStatus;
+    // A live dispatched row names its owner. A NULL owner (a row dispatched
+    // before the column existed) never equals an agent id, so it resolves to
+    // false without an explicit guard.
+    if (status === DispatchQueueStatus.Dispatched && row.agent_id === agentId) {
+      return true;
+    }
     if (
       status === DispatchQueueStatus.Recovering &&
       row.recovery_agent_id != null &&
@@ -1044,31 +1175,56 @@ export class JobQueue {
    */
   async getJobsByStatus(
     status: DispatchQueueStatus,
-  ): Promise<Array<{ id: string; runId: string; status: DispatchQueueStatus }>> {
+  ): Promise<
+    Array<{ id: string; runId: string; status: DispatchQueueStatus; agentId: string | null }>
+  > {
     const rows = await this.db
       .selectFrom('dispatch_queue')
-      .select(['id', 'run_id', 'status'])
+      .select(['id', 'run_id', 'status', 'agent_id'])
       .where('status', '=', status)
       .execute();
     return rows.map((r) => ({
       id: r.id,
       runId: r.run_id,
       status: r.status as DispatchQueueStatus,
+      agentId: r.agent_id ?? null,
     }));
+  }
+
+  /**
+   * Shared builder for the non-expired pending rows, oldest-first
+   * (`created_at ASC` — the same FIFO ordering as `dequeueForLabels` /
+   * `markExpired`). Read-only: no `FOR UPDATE`, no claim. Used by both the
+   * unbounded `getPendingJobs` drain and the capped `listPending` re-drive.
+   */
+  private pendingOldestFirstQuery() {
+    return this.db
+      .selectFrom('dispatch_queue')
+      .selectAll()
+      .where('status', '=', DispatchQueueStatus.Pending)
+      .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
+      .orderBy('created_at', 'asc');
   }
 
   /**
    * Get all pending jobs in FIFO order (for queue drain on agent connect).
    */
   async getPendingJobs(): Promise<QueuedJob[]> {
-    const rows = await this.db
-      .selectFrom('dispatch_queue')
-      .selectAll()
-      .where('status', '=', DispatchQueueStatus.Pending)
-      .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
-      .orderBy('created_at', 'asc')
-      .execute();
+    const rows = await this.pendingOldestFirstQuery().execute();
+    return rows.map((row) => this.rowToQueuedJob(row));
+  }
 
+  /**
+   * Read-only oldest-first listing of pending jobs, capped at `limit`.
+   *
+   * Powers the scaler capacity-freed re-drive (`Dispatcher.retryPendingScaleRequests`):
+   * when a scaler agent frees capacity, the oldest jobs that previously got an
+   * `at-capacity` verdict are the ones re-offered to `requestScale`. Unlike
+   * `dequeueForLabels`, this neither claims nor locks rows — it is a pure read;
+   * the re-drive re-runs the normal scale path, which reserves capacity itself.
+   */
+  async listPending(limit: number): Promise<QueuedJob[]> {
+    const rows = await this.pendingOldestFirstQuery().limit(limit).execute();
     return rows.map((row) => this.rowToQueuedJob(row));
   }
 
@@ -1128,11 +1284,41 @@ export class JobQueue {
 /**
  * Parse a `dispatch_queue` jsonb pattern column into a `LabelMatcher[]`. Handles
  * both the auto-parsed array form (from the pg driver) and the JSON string form
- * (from tests / a non-parsing driver). A missing / malformed value yields `[]`.
+ * (from tests / a non-parsing driver). A missing value yields `[]`.
+ *
+ * Strict on purpose: this feeds the dispatch path, where an `excludePatterns`
+ * that silently degraded to `[]` would let a job run on an agent its `runsOn`
+ * excluded. A malformed value must fail the dispatch, not widen it. The expiry
+ * sweep uses {@link parseSelectorColumnForExpiry} instead.
  */
 function parseMatcherColumn(v: unknown): LabelMatcher[] {
   if (Array.isArray(v)) return v as LabelMatcher[];
   if (typeof v === 'string') return JSON.parse(v) as LabelMatcher[];
+  return [];
+}
+
+/**
+ * Parse a `dispatch_queue` selector column for the **expiry sweep only**, where
+ * a malformed value degrades to `[]` rather than throwing.
+ *
+ * `markExpired` reads these columns *after* it has already flipped the rows to
+ * `Expired`, so a throw would strand every job in the batch: their
+ * `execution_jobs` rows never settle and the runs never complete — the same
+ * false-not-done the `unroutable` status exists to prevent. Nothing is
+ * dispatched off this value; the only cost of degrading is that the job settles
+ * `timed_out_stale` instead of `unroutable`.
+ */
+function parseSelectorColumnForExpiry<T>(v: unknown, column: string): T[] {
+  if (Array.isArray(v)) return v as T[];
+  if (typeof v === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(v);
+      if (Array.isArray(parsed)) return parsed as T[];
+      logger.warn('dispatch_queue selector column is not a JSON array', { column });
+    } catch {
+      logger.warn('dispatch_queue selector column holds malformed JSON', { column });
+    }
+  }
   return [];
 }
 

@@ -89,6 +89,34 @@ describe('defineEnv', () => {
     expect(cfg.coordinatorUrl).toBe('http://x');
   });
 
+  it('runs a per-call parser override when supplied', () => {
+    const inner = z.object({
+      role: z.enum(['coordinator', 'worker']).default('coordinator'),
+      coordinatorUrl: z.string().optional(),
+    });
+    const strict = inner.superRefine((data, ctx) => {
+      if (data.role === 'worker' && !data.coordinatorUrl) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'coordinatorUrl required for workers',
+          path: ['coordinatorUrl'],
+        });
+      }
+    });
+    const envDef = defineEnv({
+      service: 'test',
+      schema: inner,
+      parser: strict,
+      envMap: { role: 'KICI_ROLE', coordinatorUrl: 'KICI_COORD' },
+    });
+    // Default parser (strict) rejects a worker with no coordinator URL.
+    expect(() => envDef.parse({ KICI_ROLE: 'worker' })).toThrow(/coordinatorUrl required/);
+    // The override parser omits that cross-field rule, so the same env passes.
+    const cfg = envDef.parse({ KICI_ROLE: 'worker' }, inner);
+    expect(cfg.role).toBe('worker');
+    expect(cfg.coordinatorUrl).toBeUndefined();
+  });
+
   it('lists known KICI_ env vars including aliases and nested fields', () => {
     const schema = z.object({
       heartbeat: z.coerce.number().default(60000),
@@ -282,6 +310,19 @@ describe('validateUnknownKiciVars', () => {
         ['KICI_SECRET_KEY'],
         {},
         { KICI_SECRET_KEY: 'x', KICI_CACHE: 'C:\\kici\\node-binaries\\v24.14.0' },
+      ),
+    ).not.toThrow();
+  });
+
+  it('allowlists KICI_TEST_ISOLATION (the vitest config-isolation marker)', () => {
+    // Every vitest config in this repo sets KICI_TEST_ISOLATION at config-eval
+    // time (hack/lib/vitest-isolation.ts), and every service a test spawns
+    // inherits it. It is not a config typo — it must not trip the scanner.
+    expect(() =>
+      validateUnknownKiciVars(
+        ['KICI_SECRET_KEY'],
+        {},
+        { KICI_SECRET_KEY: 'x', KICI_TEST_ISOLATION: '1' },
       ),
     ).not.toThrow();
   });

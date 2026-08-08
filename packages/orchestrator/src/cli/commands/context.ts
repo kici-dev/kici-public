@@ -65,6 +65,20 @@ function parseIntOption(raw: string | undefined, label: string): number | undefi
   return n;
 }
 
+/**
+ * Parse an integer option that also accepts an empty string meaning "clear".
+ *
+ * `Number('') === 0`, so routing an empty value through `parseIntOption` yields
+ * a valid-looking `0` rather than a clear — and for a hold expiry a stored `0`
+ * puts every hold's deadline at the current instant. The empty string is mapped
+ * to `null` before any numeric parse can see it.
+ */
+function parseIntOrClearOption(raw: string | undefined, label: string): number | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === '') return null;
+  return parseIntOption(raw, label);
+}
+
 /** Stringify policy fields for table output. */
 function summarizePolicy(env: ContextRow): string {
   const parts: string[] = [];
@@ -250,7 +264,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--branch-restrictions <json>', 'JSON array of allowed branches')
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs (empty to clear)')
     .option('--wait-timer <seconds>', 'Wait timer before release (seconds)')
-    .option('--hold-expiry <seconds>', 'Hold expiry TTL (seconds)')
+    .option('--hold-expiry <seconds>', 'Hold expiry TTL in seconds (empty to clear)')
     .option('--minimum-trust <level>', 'Minimum trust (known|trusted, or "null" to clear)')
     .option('--enabled <bool>', 'Enabled flag (true|false)')
     .option(
@@ -278,7 +292,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           payload.waitTimerSeconds = parseIntOption(opts.waitTimer, '--wait-timer');
         }
         if (opts.holdExpiry !== undefined) {
-          payload.holdExpirySeconds = parseIntOption(opts.holdExpiry, '--hold-expiry');
+          payload.holdExpirySeconds = parseIntOrClearOption(opts.holdExpiry, '--hold-expiry');
         }
         if (opts.minimumTrust !== undefined) {
           payload.minimumTrust = opts.minimumTrust === 'null' ? null : opts.minimumTrust;
@@ -455,8 +469,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
         const waitTimerSeconds = parseIntOption(opts.waitTimer, '--wait-timer');
         const holdExpirySeconds = parseIntOption(opts.holdExpiry, '--hold-expiry');
         const variables = parseJsonOption(opts.variables, '--variables') as
-          | Record<string, string>
-          | undefined;
+          Record<string, string> | undefined;
         if (
           variables !== undefined &&
           (typeof variables !== 'object' || Array.isArray(variables))

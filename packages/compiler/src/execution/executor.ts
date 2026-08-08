@@ -3,9 +3,28 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Workflow } from '@kici-dev/sdk';
-import { compilerError } from '../errors/index.js';
+import { compilerError, type SourceLocation } from '../errors/index.js';
 import type { WorkflowWithSource } from '../types.js';
 import { ensureTsLoaderHook } from './ts-loader.js';
+
+/**
+ * Map a caught runtime error's stack to a `SourceLocation` in the entry file.
+ * Scans for the first stack frame referencing `entryPoint` (ignoring the
+ * `?t=` cache-buster and the `file://` scheme) and returns its line/column;
+ * falls back to `entryPoint` at line 1 when no frame matches.
+ */
+function locateInEntry(stack: string | undefined, entryPoint: string): SourceLocation {
+  const fallback: SourceLocation = { file: entryPoint, line: 1, column: 1 };
+  if (!stack) return fallback;
+  const needle = entryPoint.split('?')[0];
+  for (const raw of stack.split('\n')) {
+    const m = raw.match(/(.+?):(\d+):(\d+)\)?$/);
+    if (m && m[1].includes(needle)) {
+      return { file: entryPoint, line: parseInt(m[2], 10), column: parseInt(m[3], 10) };
+    }
+  }
+  return fallback;
+}
 
 /** Result of executing a config file */
 export interface ExecutionResult {
@@ -76,7 +95,7 @@ async function loadModule(
   } catch (err) {
     const message = (err as Error).message ?? 'Failed to load module';
     throw compilerError('E003', `Failed to load ${errorContext.fileLabel} module: ${message}`, {
-      location: { file: errorContext.filePath, line: 1, column: 1 },
+      location: locateInEntry((err as Error).stack, errorContext.filePath),
       suggestion: `Check for TypeScript or runtime errors in your ${errorContext.fileLabel}. Make sure you invoke the workflow via the kici CLI (the bin shim registers the oxc-transform loader hook that handles TS files).`,
     });
   }

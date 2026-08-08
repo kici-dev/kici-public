@@ -138,7 +138,7 @@ describe('getDashboardWritePolicy', () => {
       { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
     ]);
     const policy = await getDashboardWritePolicy(db, 'customer-1');
-    expect(policy).toEqual({ 'secrets.set': false });
+    expect(policy).toEqual({ 'secrets.set': 'disabled' });
   });
 
   it('treats unparseable policy column as empty', async () => {
@@ -211,8 +211,8 @@ describe('assertDashboardWriteAllowed', () => {
 describe('setDashboardWritePolicy', () => {
   it('persists a disable change', async () => {
     const { db, handle } = makeFakeDb();
-    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': false }, { actor });
-    expect(handle.get('customer-1')).toEqual({ 'secrets.set': false });
+    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': 'disabled' }, { actor });
+    expect(handle.get('customer-1')).toEqual({ 'secrets.set': 'disabled' });
   });
 
   it('normalizes "true" away — permissive is the absence of a key', async () => {
@@ -222,8 +222,8 @@ describe('setDashboardWritePolicy', () => {
         dashboard_write_policy: { 'secrets.set': false, 'variables.set': false },
       },
     ]);
-    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': true }, { actor });
-    expect(handle.get('customer-1')).toEqual({ 'variables.set': false });
+    await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': 'permissive' }, { actor });
+    expect(handle.get('customer-1')).toEqual({ 'variables.set': 'disabled' });
   });
 
   it('rejects unknown operation keys via the engine schema', async () => {
@@ -271,8 +271,8 @@ describe('setDashboardWritePolicy', () => {
     for (const ev of events) {
       expect(ev.actor).toEqual(actor);
       expect(ev.customerId).toBe('customer-1');
-      expect(ev.prior).toBe(true);
-      expect(ev.next).toBe(false);
+      expect(ev.prior).toBe('permissive');
+      expect(ev.next).toBe('disabled');
     }
   });
 
@@ -284,14 +284,14 @@ describe('setDashboardWritePolicy', () => {
     expect(eventSpy).toHaveBeenCalledOnce();
     const arg = eventSpy.mock.calls[0]?.[0] as { customerId: string; policy: unknown };
     expect(arg.customerId).toBe('customer-1');
-    expect(arg.policy).toEqual({ 'secrets.set': false });
+    expect(arg.policy).toEqual({ 'secrets.set': 'disabled' });
   });
 
   it('invalidates the cache so subsequent reads pick up the change', async () => {
     const { db } = makeFakeDb();
     await getDashboardWritePolicy(db, 'customer-1');
     await setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': false }, { actor });
-    expect(await getDashboardWritePolicy(db, 'customer-1')).toEqual({ 'secrets.set': false });
+    expect(await getDashboardWritePolicy(db, 'customer-1')).toEqual({ 'secrets.set': 'disabled' });
   });
 });
 
@@ -329,7 +329,7 @@ describe('resolveFullPolicyView', () => {
   });
 
   it('reflects disabled operations', () => {
-    const view = resolveFullPolicyView({ 'secrets.set': false, 'variables.set': false });
+    const view = resolveFullPolicyView({ 'secrets.set': 'disabled', 'variables.set': 'disabled' });
     expect(view['secrets.set']).toBe(false);
     expect(view['variables.set']).toBe(false);
     expect(view['secrets.delete']).toBe(true);
@@ -359,6 +359,6 @@ describe('cache invalidation', () => {
     await getDashboardWritePolicy(db, 'c-a');
     invalidateDashboardWritePolicyCache('c-a');
     const refreshed = await getDashboardWritePolicy(db, 'c-a');
-    expect(refreshed).toEqual({ 'secrets.set': false });
+    expect(refreshed).toEqual({ 'secrets.set': 'disabled' });
   });
 });

@@ -13,24 +13,28 @@ import os from 'node:os';
 import path from 'node:path';
 import { createWriteStream } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { select } from '@inquirer/prompts';
 import {
   createServiceManager,
+  DEFAULT_RESTART_POLICY,
   detectPlatform,
   isRoot,
   kiciConfigRoot,
   readKiciVersion,
   resolveInstance,
+  resolveNpmInstallTarget,
   resolveVersionFromLaunchSpec,
   writeManifest,
+  type NpmInstallTarget,
   type ResolvedInstance,
   type ServiceManager,
   type ServicePlatform,
 } from '../../service/index.js';
-import type { ServiceConfig } from '../../service/types.js';
+import type { LaunchSpec, ServiceConfig } from '../../service/types.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import { makeTempDir } from '@kici-dev/shared/tmp';
 
 /** Component types that can be upgraded. */
 type UpgradeComponent = 'orchestrator' | 'agent';
@@ -53,6 +57,11 @@ interface VersionedUpgradeOptions {
   rollback?: boolean;
   pick?: boolean;
   force?: boolean;
+  /**
+   * Opt-in escape hatch: restart the already-installed package without
+   * self-driving the npm install (the pre-staged / air-gapped path).
+   */
+  restartOnly?: boolean;
 }
 
 /**
@@ -104,12 +113,10 @@ export async function resolveUpgradeTarget(args: {
     envFilePath: resolved.manifest.envFilePath,
     workingDirectory: resolved.manifest.configDir,
     isUserLevel: resolved.manifest.isUserLevel,
-    restartPolicy: {
-      enabled: true,
-      delays: [1, 5, 15, 30],
-      maxRetries: 5,
-      windowSeconds: 300,
-    },
+    // Share the one restart-policy constant every other lifecycle command uses.
+    // A re-spelled copy here would drift the moment the policy changes, and on
+    // Windows this config is what `upgrade` re-registers the service from.
+    restartPolicy: DEFAULT_RESTART_POLICY,
     component,
     // Re-embed the deploy-folder marker so an upgraded unit keeps recovery
     // working even if the instance index is later lost.
@@ -405,8 +412,7 @@ export function resolveNpmSourceVersion(opts: {
 
 /** Verdict from {@link verifyNpmSourceLaunch}. */
 export type NpmSourceLaunchVerdict =
-  | { ok: true; version: string; manifestVersion: string | null }
-  | { ok: false; reason: string };
+  { ok: true; version: string; manifestVersion: string | null } | { ok: false; reason: string };
 
 /**
  * Decide whether an npm-source upgrade may proceed, given the version the
@@ -446,6 +452,114 @@ export function verifyNpmSourceLaunch(opts: {
     };
   }
   return { ok: true, version: launched, manifestVersion: launched };
+}
+
+/**
+ * An npm-source upgrade proceeds one of three ways: restart the already-installed
+ * package (`restart-only`, carrying a {@link NpmSourceLaunchVerdict}), self-drive
+ * the install of a resolved target under the unit's own runtime (`self-drive`),
+ * or refuse with an operator-facing message (`error`).
+ */
+export type NpmSourceUpgradeAction =
+  | { kind: 'restart-only'; verdict: NpmSourceLaunchVerdict }
+  | { kind: 'self-drive'; target: NpmInstallTarget; version: string }
+  | { kind: 'error'; reason: string };
+
+/**
+ * Decide how an npm-source upgrade proceeds. `restart-only` re-verifies and
+ * restarts the already-installed package (the pre-staged / air-gapped path).
+ * The default self-drives: it resolves the global package + pinned node from
+ * the unit's launch spec so the CLI can install the target itself. Returns an
+ * `error` action (not a throw) for the two operator-facing refusals.
+ */
+export function planNpmSourceUpgrade(opts: {
+  component: UpgradeComponent;
+  spec: LaunchSpec | null;
+  invoked: string;
+  requestedVersion: string | undefined;
+  restartOnly: boolean;
+  force: boolean;
+  windows: boolean;
+}): NpmSourceUpgradeAction {
+  const { component, spec, invoked, requestedVersion, restartOnly, force, windows } = opts;
+
+  if (restartOnly) {
+    const launched = spec ? resolveVersionFromLaunchSpec(spec, component) : null;
+    const verdict = verifyNpmSourceLaunch({
+      component,
+      invoked,
+      launched,
+      launchedPath: spec?.execPath ?? null,
+      force,
+    });
+    return { kind: 'restart-only', verdict };
+  }
+
+  if (!requestedVersion) {
+    return {
+      kind: 'error',
+      reason:
+        'self-driving upgrade requires --version <target> (the version to install). ' +
+        'Pass --restart-only to restart the already-installed package without installing.',
+    };
+  }
+
+  const target = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
+  if (!target) {
+    return {
+      kind: 'error',
+      reason:
+        "npm-source upgrade cannot self-install: the unit's launch target is a custom " +
+        '--binary install or a non-node_modules path, so there is no global package to update. ' +
+        'Use an archive upgrade (--from <archive> / --url <url> + --version), or pre-install the ' +
+        'package and re-run with --restart-only.',
+    };
+  }
+  return { kind: 'self-drive', target, version: requestedVersion };
+}
+
+/** Injected process runner seam for {@link installGlobalPackage}. */
+type SpawnRunner = (
+  cmd: string,
+  args: string[],
+  opts?: { env?: NodeJS.ProcessEnv },
+) => { status: number | null; stderr: string };
+
+const defaultSpawnRunner: SpawnRunner = (cmd, args, opts) => {
+  const r = spawnSync(cmd, args, {
+    encoding: 'utf-8',
+    shell: process.platform === 'win32',
+    env: opts?.env ?? process.env,
+  });
+  return { status: r.status, stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
+};
+
+/**
+ * Install `<owningPackage>@<version>` globally under the unit's own pinned node,
+ * so it lands in exactly the global prefix the unit's ExecStart resolves from.
+ *
+ * npm derives its global prefix from the node that *runs* npm-cli.js, not from
+ * the location of the npm script — and the unit's `<pinned>/bin/npm` is a
+ * `#!/usr/bin/env node` shebang (or a version-manager bash wrapper invoking a
+ * bare `node`), both of which resolve `node` off PATH. So invoking that npm
+ * bare would inherit whatever node the shell has active — exactly the
+ * version-manager (mise/nvm/asdf) drift this upgrade exists to fix. We prepend
+ * the pinned node's bin dir to PATH so npm always runs under the unit's node
+ * and computes the unit's prefix, regardless of the caller's active node. The
+ * `run` seam is injected in tests.
+ */
+export function installGlobalPackage(
+  target: NpmInstallTarget,
+  version: string,
+  run: SpawnRunner = defaultSpawnRunner,
+): { ok: boolean; stderr: string } {
+  const pinnedBinDir = path.dirname(target.nodeExecPath);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
+  };
+  const res = run(target.npmPath, ['install', '-g', `${target.owningPackage}@${version}`], { env });
+  return { ok: res.status === 0, stderr: res.stderr };
 }
 
 export async function performVersionedUpgrade(
@@ -505,9 +619,9 @@ export async function performVersionedUpgrade(
       return;
     }
 
-    // No archive source: npm-source (restart-only) upgrade.
+    // No archive source: npm-source upgrade (self-driving by default).
     if (!opts.from && !opts.url) {
-      await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts);
+      await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform);
       return;
     }
 
@@ -542,8 +656,7 @@ export async function performVersionedUpgrade(
 
     // Resolve archive path
     let archivePath: string;
-    const tmpDir = path.join(os.tmpdir(), `kici-upgrade-${Date.now()}`);
-    fs.mkdirSync(tmpDir, { recursive: true });
+    const { path: tmpDir, cleanup: cleanupTmpDir } = await makeTempDir('upgrade');
 
     if (opts.from) {
       archivePath = path.resolve(opts.from);
@@ -650,7 +763,7 @@ export async function performVersionedUpgrade(
     });
 
     // Clean up temp directory
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    await cleanupTmpDir();
 
     console.log('');
     if (currentVersion) {
@@ -668,11 +781,14 @@ export async function performVersionedUpgrade(
 }
 
 /**
- * npm-source upgrade (no --from/--url): the operator has already run
- * `npm install -g @kici-dev/<pkg>@<version>`, replacing the global package
- * in place. The systemd/launchd/Windows unit's ExecStart points at that global
- * package (see install.ts → import.meta.resolve), so a stop+start re-executes
- * the freshly-installed code. No archive, no versioned dir, no symlink.
+ * npm-source upgrade (no --from/--url). By default the CLI self-drives: it reads
+ * the unit's launch spec to recover the pinned node runtime and the global
+ * package its ExecStart resolves (kici-admin when the component is loaded through
+ * kici-admin's nested node_modules, or the standalone `@kici-dev/<component>`),
+ * installs `<pkg>@<version>` under that runtime with the co-located npm, restarts,
+ * and verifies the launched version. `--restart-only` skips the install and just
+ * restarts an already-installed package (the pre-staged / air-gapped path). No
+ * archive, no versioned dir, no symlink.
  */
 async function performNpmSourceUpgrade(
   component: UpgradeComponent,
@@ -680,29 +796,58 @@ async function performNpmSourceUpgrade(
   resolvedInstance: ResolvedInstance,
   manager: ServiceManager,
   opts: VersionedUpgradeOptions,
+  platform: ServicePlatform,
 ): Promise<void> {
-  const invoked = readKiciVersion();
-  // Validate an explicit --version against the invoking CLI (unchanged check).
-  resolveNpmSourceVersion({ requested: opts.version, running: invoked });
-
   const installed = await manager.isInstalled(config);
   if (!installed) {
     console.error(`Error: service "${config.name}" is not installed`);
     process.exit(1);
   }
 
-  // Ground truth: the version the installed unit will actually launch, read
-  // back from the init system (not from this CLI, which may be a different
-  // install than the unit is pinned to).
+  const invoked = readKiciVersion();
   const spec = await manager.readLaunchSpec(config);
-  const launched = spec ? resolveVersionFromLaunchSpec(spec, component) : null;
-  const verdict = verifyNpmSourceLaunch({
+
+  // In restart-only mode, keep the existing invoking-CLI-vs-requested guard.
+  if (opts.restartOnly) {
+    resolveNpmSourceVersion({ requested: opts.version, running: invoked });
+  }
+
+  const action = planNpmSourceUpgrade({
     component,
+    spec,
     invoked,
-    launched,
-    launchedPath: spec?.execPath ?? null,
+    requestedVersion: opts.version,
+    restartOnly: opts.restartOnly ?? false,
     force: opts.force ?? false,
+    windows: isWindows(platform),
   });
+
+  if (action.kind === 'error') {
+    console.error(`Error: ${action.reason}`);
+    process.exit(1);
+  }
+
+  if (action.kind === 'restart-only') {
+    await restartOnlyUpgrade(component, config, resolvedInstance, manager, action.verdict, opts);
+    return;
+  }
+
+  await performSelfDrivingInstall(component, config, resolvedInstance, manager, action, opts);
+}
+
+/**
+ * Restart-only path: the operator pre-installed `@kici-dev/<pkg>@<version>` (or
+ * kici-admin) themselves. Verify the unit will launch the invoking CLI's version,
+ * restart onto it, and persist the manifest version.
+ */
+async function restartOnlyUpgrade(
+  component: UpgradeComponent,
+  config: ServiceConfig,
+  resolvedInstance: ResolvedInstance,
+  manager: ServiceManager,
+  verdict: NpmSourceLaunchVerdict,
+  opts: VersionedUpgradeOptions,
+): Promise<void> {
   if (!verdict.ok) {
     console.error(`Error: ${verdict.reason}`);
     process.exit(1);
@@ -740,6 +885,67 @@ async function performNpmSourceUpgrade(
   console.log(
     `Upgrade complete: service "${config.name}" is now running version ${verdict.version}.`,
   );
+}
+
+/**
+ * Self-driving path: install the resolved global package under the unit's own
+ * pinned node/npm, restart, and verify the unit now launches the requested
+ * version.
+ */
+async function performSelfDrivingInstall(
+  component: UpgradeComponent,
+  config: ServiceConfig,
+  resolvedInstance: ResolvedInstance,
+  manager: ServiceManager,
+  action: { target: NpmInstallTarget; version: string },
+  opts: VersionedUpgradeOptions,
+): Promise<void> {
+  const { target, version } = action;
+
+  if (!opts.yes) {
+    console.log(`This will install ${target.owningPackage}@${version} using ${target.npmPath}`);
+    console.log(`  (node runtime: ${target.nodeExecPath}), then restart "${config.name}".`);
+    console.log('');
+    const ok = await confirm('Proceed with upgrade?');
+    if (!ok) {
+      console.log('Upgrade cancelled.');
+      return;
+    }
+  }
+
+  console.log(`Installing ${target.owningPackage}@${version} under the unit's runtime...`);
+  const result = installGlobalPackage(target, version);
+  if (!result.ok) {
+    const hint = /EACCES|permission denied|EPERM/i.test(result.stderr)
+      ? " The unit's global prefix is not writable — re-run with privileges matching the unit's runtime."
+      : '';
+    console.error(`Error: npm install failed for ${target.owningPackage}@${version}.${hint}`);
+    if (result.stderr.trim()) console.error(result.stderr.trim());
+    process.exit(1);
+  }
+
+  console.log('Restarting service onto the freshly-installed package...');
+  const status = await manager.status(config);
+  if (status.state === 'running') await manager.stop(config);
+  await manager.start(config);
+
+  // Verify the unit now launches the requested version.
+  const newSpec = await manager.readLaunchSpec(config);
+  const launched = newSpec ? resolveVersionFromLaunchSpec(newSpec, component) : null;
+  if (launched !== version) {
+    console.error(
+      `Error: install + restart completed but the unit launches ` +
+        `${launched ?? 'an unresolvable version'}, expected ${version}. The pinned runtime may ` +
+        `resolve a different install than the one just updated.`,
+    );
+    process.exit(1);
+  }
+
+  writeManifest(resolvedInstance.instanceDir, {
+    ...resolvedInstance.manifest,
+    kiciVersion: version,
+  });
+  console.log(`Upgrade complete: service "${config.name}" is now running version ${version}.`);
 }
 
 /**

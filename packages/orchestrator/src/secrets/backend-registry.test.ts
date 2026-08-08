@@ -12,9 +12,43 @@ import { createMockDb } from '../__test-helpers__/mock-db.js';
 // ── Test fixtures ──────────────────────────────────────────────
 
 const testKey = deriveKey('a'.repeat(64));
+const oldKey = deriveKey('b'.repeat(64));
+const otherKey = deriveKey('c'.repeat(64));
 
 function makeAuditLogger() {
   return { log: vi.fn(), query: vi.fn() } as any;
+}
+
+/**
+ * Seed a backend row whose config is encrypted under `key` at `keyVersion`.
+ * Defaults to `backend_type: 'pg'` so loadAllStores' store factory does not
+ * eagerly connect to an external service (pg reuses the orchestrator DB).
+ */
+function makeEncryptedRow(
+  key: Buffer,
+  config: Record<string, unknown>,
+  overrides: Partial<Record<string, unknown>> = {},
+) {
+  const name = (overrides.name as string) ?? 'pg-extra';
+  const keyVersion = (overrides.config_key_version as number) ?? 1;
+  return {
+    id: 'backend-uuid-2',
+    name,
+    backend_type: 'pg',
+    config_encrypted: encrypt(JSON.stringify(config), key, keyVersion, name).data,
+    config_key_version: keyVersion,
+    scope_filter: '**',
+    sync_interval_ms: 300000,
+    enabled: true,
+    last_sync_at: null,
+    last_sync_error: null,
+    last_health_check_at: null,
+    health_status: 'unknown',
+    scope_count: 0,
+    created_at: now,
+    updated_at: now,
+    ...overrides,
+  };
 }
 
 const now = new Date('2026-03-28T10:00:00Z');
@@ -259,5 +293,175 @@ describe('BackendRegistry', () => {
       await registry.updateSyncStatus('my-vault', 42);
       expect(mocks.updateTable).toHaveBeenCalledWith('secret_backends');
     });
+  });
+});
+
+describe('BackendRegistry dual-key decrypt', () => {
+  it('decrypts a row sealed under the old key when oldMasterKey is provided', async () => {
+    const config = { url: 'https://vault.example' };
+    const row = makeEncryptedRow(oldKey, config, { name: 'vault-a' });
+    const { db } = createMockDb({ selectFirstRow: row });
+    // Current key is testKey; the row is sealed under oldKey.
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    const result = await registry.getBackendConfig('vault-a');
+    expect(result).toEqual(config);
+  });
+
+  it('decrypts a current-key row without any fallback', async () => {
+    const config = { url: 'https://vault.example' };
+    const row = makeEncryptedRow(testKey, config, { name: 'vault-a' });
+    const { db } = createMockDb({ selectFirstRow: row });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    const result = await registry.getBackendConfig('vault-a');
+    expect(result).toEqual(config);
+  });
+
+  it('throws a recovery-pointing error when BOTH keys fail', async () => {
+    // Row sealed under oldKey, but the registry only knows testKey + otherKey.
+    const row = makeEncryptedRow(oldKey, { url: 'https://vault.example' }, { name: 'vault-a' });
+    const { db } = createMockDb({ selectFirstRow: row });
+    const registry = new BackendRegistry(db, testKey, undefined, otherKey);
+
+    await expect(registry.getBackendConfig('vault-a')).rejects.toThrow(
+      /secret backend 'vault-a'.*master-key rotation.*KICI_SECRET_KEY_OLD/s,
+    );
+  });
+
+  it('throws a recovery-pointing error when no old key is configured', async () => {
+    const row = makeEncryptedRow(oldKey, { url: 'https://vault.example' }, { name: 'vault-a' });
+    const { db } = createMockDb({ selectFirstRow: row });
+    // No oldMasterKey provided at all.
+    const registry = new BackendRegistry(db, testKey);
+
+    await expect(registry.getBackendConfig('vault-a')).rejects.toThrow(
+      /secret backend 'vault-a'.*purge-stale/s,
+    );
+  });
+
+  it('self-heals a stranded row during loadAllStores (re-seals under current key)', async () => {
+    const config = { url: 'https://vault.example' };
+    // Row sealed under oldKey at version 1; enabled so loadAllStores picks it up.
+    const row = makeEncryptedRow(oldKey, config, { name: 'vault-a', config_key_version: 1 });
+    const { db, mocks } = createMockDb({ selectRows: [row] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    await registry.loadAllStores(makeAuditLogger());
+
+    // Self-heal must re-seal the config under the CURRENT key at a bumped version.
+    expect(mocks.updateTable).toHaveBeenCalledWith('secret_backends');
+    const setArg = mocks.updateSet.mock.calls[0][0] as {
+      config_encrypted: string;
+      config_key_version: number;
+    };
+    expect(setArg.config_key_version).toBe(2); // 1 + 1
+    // The resealed ciphertext must decrypt under the current key alone.
+    const healed = decrypt(
+      { data: setArg.config_encrypted, keyVersion: setArg.config_key_version },
+      testKey,
+      'vault-a',
+    );
+    expect(JSON.parse(healed)).toEqual(config);
+    // The concurrent-rotation guard pins the update to the observed version.
+    expect(mocks.updateWhere).toHaveBeenCalledWith('config_key_version', '=', 1);
+  });
+
+  it('does not self-heal a current-key row during loadAllStores', async () => {
+    const row = makeEncryptedRow(testKey, { url: 'https://vault.example' }, { name: 'vault-a' });
+    const { db, mocks } = createMockDb({ selectRows: [row] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    await registry.loadAllStores(makeAuditLogger());
+    // Already under the current key — no write-back.
+    expect(mocks.updateTable).not.toHaveBeenCalled();
+  });
+
+  it('never touches sentinel rows (config_encrypted = "") during loadAllStores', async () => {
+    const sentinel = makeEncryptedRow(testKey, {}, { name: 'pg', config_encrypted: '' });
+    const { db, mocks } = createMockDb({ selectRows: [sentinel] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    await expect(registry.loadAllStores(makeAuditLogger())).resolves.toBeDefined();
+    // Sentinel is never decrypted and never re-sealed.
+    expect(mocks.updateTable).not.toHaveBeenCalled();
+  });
+});
+
+describe('BackendRegistry.rotateKey', () => {
+  it('re-encrypts current-key and old-key rows at max(config_key_version)+1', async () => {
+    const cfgA = { url: 'https://a.example' };
+    const cfgB = { url: 'https://b.example' };
+    // rowA under the CURRENT key at v1; rowB under the OLD key at v3.
+    const rowA = makeEncryptedRow(testKey, cfgA, {
+      id: 'a',
+      name: 'vault-a',
+      config_key_version: 1,
+    });
+    const rowB = makeEncryptedRow(oldKey, cfgB, {
+      id: 'b',
+      name: 'vault-b',
+      config_key_version: 3,
+    });
+    const { db, mocks } = createMockDb({ selectRows: [rowA, rowB] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    const result = await registry.rotateKey();
+
+    expect(result).toEqual({ reEncrypted: 2, skipped: 0 });
+    expect(mocks.transaction).toHaveBeenCalled();
+    // Both rows re-sealed at max(3)+1 = 4, decryptable under the current key alone.
+    const calls = mocks.updateSet.mock.calls.map((c) => c[0]) as Array<{
+      config_encrypted: string;
+      config_key_version: number;
+    }>;
+    expect(calls).toHaveLength(2);
+    for (const set of calls) {
+      expect(set.config_key_version).toBe(4);
+    }
+    // Verify the actual plaintext survives under the new key with the right AAD.
+    const nameByVersionOrder = ['vault-a', 'vault-b'];
+    const expectedByName: Record<string, unknown> = { 'vault-a': cfgA, 'vault-b': cfgB };
+    calls.forEach((set, i) => {
+      const name = nameByVersionOrder[i];
+      const plain = decrypt(
+        { data: set.config_encrypted, keyVersion: set.config_key_version },
+        testKey,
+        name,
+      );
+      expect(JSON.parse(plain)).toEqual(expectedByName[name]);
+    });
+  });
+
+  it('skips (never aborts on) a row undecryptable under both keys; sentinels are not candidates', async () => {
+    const cfgA = { url: 'https://a.example' };
+    // rowA decryptable (current key), rowB sealed under a key neither current nor old.
+    const rowA = makeEncryptedRow(testKey, cfgA, { id: 'a', name: 'vault-a' });
+    const rowB = makeEncryptedRow(
+      otherKey,
+      { url: 'https://b.example' },
+      {
+        id: 'b',
+        name: 'vault-b',
+      },
+    );
+    // Sentinel row: the SQL filter excludes it, but seed it to prove the
+    // in-loop guard never counts it as skipped even if it slips through.
+    const sentinel = makeEncryptedRow(testKey, {}, { id: 'pg', name: 'pg', config_encrypted: '' });
+    const { db } = createMockDb({ selectRows: [rowA, rowB, sentinel] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    const result = await registry.rotateKey();
+
+    expect(result.reEncrypted).toBe(1); // only rowA
+    expect(result.skipped).toBe(1); // rowB; sentinel not counted
+  });
+
+  it('returns zero counts when there are no non-sentinel backends', async () => {
+    const { db } = createMockDb({ selectRows: [] });
+    const registry = new BackendRegistry(db, testKey, undefined, oldKey);
+
+    const result = await registry.rotateKey();
+    expect(result).toEqual({ reEncrypted: 0, skipped: 0 });
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/compiler",
-  "version": "0.1.27",
+  "version": "0.2.0",
   "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
   "keywords": [
     "ci",
@@ -46,9 +46,9 @@
     "./cli": "./dist/cli.js"
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
     "postbuild": "zx hack/postbuild.mjs",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsgo --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "postinstall": "node hack/postinstall.mjs",
@@ -67,19 +67,16 @@
     "fast-glob": "^3.3.3",
     "open": "^11.0.0",
     "picocolors": "^1.1.1",
-    "picomatch": "^4.0.4",
-    "proper-lockfile": "^4.1.2",
-    "tar": "^7.5.16",
+    "picomatch": "^4.0.5",
+    "tar": "^7.5.20",
     "typescript": "^6.0.3",
-    "ws": "^8.21.0",
+    "ws": "^8.21.1",
+    "wsl-utils": "^0.3.0",
     "yaml": "^2.9.0",
     "zod": "^4.4.3",
     "zx": "^8.8.5"
   },
   "peerDependencies": {
     "@kici-dev/sdk": "workspace:*"
-  },
-  "devDependencies": {
-    "@types/proper-lockfile": "^4.1.4"
   }
 }

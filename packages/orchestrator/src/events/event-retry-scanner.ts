@@ -2,8 +2,11 @@ import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 
 import type { Database } from '../db/types.js';
+import { LeaderGatedScheduler } from '../cluster/leader-gated-scheduler.js';
 import type { EventStore } from './event-store.js';
+import type { EventEmitter } from './event-emitter.js';
 import type { EventRouterConfig } from './types.js';
+import { sweepExpiredBatchWindows } from './batch-accumulator.js';
 import { eventLeaseExpirationsTotal, setEventDlqDepth } from '../metrics/prometheus.js';
 
 const logger = createLogger({ prefix: 'event-retry-scanner' });
@@ -11,10 +14,14 @@ const logger = createLogger({ prefix: 'event-retry-scanner' });
 interface EventRetryScannerOptions {
   db: Kysely<Database>;
   eventStore: EventStore;
+  eventEmitter: EventEmitter;
   config: EventRouterConfig;
 }
 
 const DEFAULT_BATCH_LIMIT = 200;
+
+/** Max failed runs enumerated in a single workflows_failed_batch payload. */
+const BATCH_MAX_RUNS = 200;
 
 /**
  * Leader-only periodic scanner that closes two gaps in event delivery:
@@ -41,61 +48,79 @@ const DEFAULT_BATCH_LIMIT = 200;
 export class EventRetryScanner {
   private readonly db: Kysely<Database>;
   private readonly eventStore: EventStore;
+  private readonly eventEmitter: EventEmitter;
   private readonly config: EventRouterConfig;
 
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private isLeader = false;
+  private readonly scheduler: LeaderGatedScheduler;
 
   constructor(options: EventRetryScannerOptions) {
     this.db = options.db;
     this.eventStore = options.eventStore;
+    this.eventEmitter = options.eventEmitter;
     this.config = options.config;
+    this.scheduler = new LeaderGatedScheduler({
+      name: 'event retry scanner',
+      intervalMs: this.config.retryScanIntervalMs,
+      logger,
+      tick: () => this.tick(),
+    });
   }
 
   onBecomeLeader(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.isLeader = true;
-    logger.info('Became leader, starting event retry scanner', {
-      retryScanIntervalMs: this.config.retryScanIntervalMs,
-      leaseDurationMs: this.config.leaseDurationMs,
-    });
-    this.timer = setInterval(() => {
-      this.tick().catch((err) => {
-        logger.error('Event retry scanner tick failed', { error: toErrorMessage(err) });
-      });
-    }, this.config.retryScanIntervalMs);
-    this.timer.unref?.();
+    void this.scheduler.onBecomeLeader();
   }
 
   onLoseLeadership(): void {
-    this.isLeader = false;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    logger.info('Lost leadership, stopped event retry scanner');
+    this.scheduler.onLoseLeadership();
   }
 
   stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.isLeader = false;
+    this.scheduler.stop();
   }
 
   /**
    * One scanner tick. Public for tests; not on the hot path otherwise.
    */
   async tick(): Promise<void> {
-    if (!this.isLeader) return;
+    if (!this.scheduler.isLeader) return;
 
     await this.processExpiredLeases();
     await this.processDueRetries();
+    await this.processBatchWindows();
     await this.refreshDlqDepth();
+  }
+
+  /**
+   * Sweep expired workflows_failed_batch accumulation windows and emit one
+   * `__workflows_failed_batch` event per window that accumulated at least one
+   * run. The emitted event flows back through the router and dispatches the
+   * subscribing workflow exactly once. The run list is capped at
+   * `BATCH_MAX_RUNS`; `total` carries the true count.
+   */
+  private async processBatchWindows(): Promise<void> {
+    const swept = await sweepExpiredBatchWindows(this.db, new Date());
+    for (const win of swept) {
+      if (win.runs.length === 0) continue; // window opened but all runs excluded
+      const runs = win.runs.slice(0, BATCH_MAX_RUNS).map((r) => ({
+        runId: r.runId,
+        repo: r.repoIdentifier,
+        workflowName: r.workflowName,
+        ...(r.failureClass && { failureClass: r.failureClass }),
+        ...(r.senderUsername && { senderUsername: r.senderUsername }),
+      }));
+      await this.eventEmitter.emitWorkflowsFailedBatch({
+        routingKey: win.routingKey,
+        repo: win.repoIdentifier,
+        registrationId: win.registrationId,
+        total: win.runs.length,
+        runs,
+      });
+      logger.info('Emitted workflows_failed_batch for swept window', {
+        registrationId: win.registrationId,
+        total: win.runs.length,
+        emitted: runs.length,
+      });
+    }
   }
 
   private async processExpiredLeases(): Promise<void> {

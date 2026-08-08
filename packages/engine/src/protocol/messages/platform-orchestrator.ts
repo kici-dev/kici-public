@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { authRequestSchema, authSuccessSchema, authFailureSchema } from './auth.js';
-import { orchCapabilitiesSchema } from './capabilities.js';
-import { heartbeatSchema } from './common.js';
+import { OrchRole, orchCapabilitiesSchema, platformCapabilitiesSchema } from './capabilities.js';
+import { heartbeatSchema, nackSchema } from './common.js';
+import { LogStream } from './log-stream.js';
 import {
   executionStatusSchema,
   stepStatusForwardSchema,
@@ -20,16 +21,40 @@ import { oidcMintRequestSchema, oidcMintResponseSchema } from './oidc-mint.js';
 
 // --- Platform -> Orchestrator messages ---
 
+/**
+ * Org trust policy — Platform-owned tenant policy pushed to the orchestrator.
+ * The orchestrator caches and enforces it; it never owns it. Named separately
+ * from the enclosing message so the orchestrator's evaluator and cache can type
+ * against the policy alone.
+ */
+/**
+ * Documented default hours a security hold stays open.
+ *
+ * The single owner of the value: the fail-closed policy, the orchestrator's
+ * stored-policy default, and the hold-sizing fallback all read it, so the
+ * number cannot drift between the two packages that enforce it.
+ */
+export const DEFAULT_APPROVAL_EXPIRY_HOURS = 72;
+
+export const trustPolicySchema = z.object({
+  forkPolicy: z.enum(['hold', 'reject', 'allow']),
+  unknownContributorPolicy: z.enum(['hold', 'reject']),
+  workflowChangePolicy: z.enum(['hold', 'reject', 'allow']),
+  /**
+   * Hours a security hold stays open. Integer and positive: the column is
+   * INTEGER NOT NULL, so a fractional value throws inside the fire-and-forget
+   * persist and the policy is then silently never stored, and a zero or
+   * negative value mints an already-expired hold.
+   */
+  approvalExpiryHours: z.number().int().min(1),
+});
+export type TrustPolicy = z.infer<typeof trustPolicySchema>;
+
 /** Trust policy update pushed from Platform to orchestrator when policy or identity links change. */
 export const trustPolicyUpdateSchema = z.object({
   type: z.literal('trust_policy.update'),
   orgId: z.string(),
-  policy: z.object({
-    forkPolicy: z.enum(['hold', 'reject', 'allow']),
-    unknownContributorPolicy: z.enum(['hold', 'reject']),
-    workflowChangePolicy: z.enum(['hold', 'reject', 'allow']),
-    approvalExpiryHours: z.number(),
-  }),
+  policy: trustPolicySchema,
   identityLinks: z.array(
     z.object({
       userId: z.string(),
@@ -108,12 +133,18 @@ export const webhookRelaySchema = z.object({
  *   is malformed (e.g. invalid JSON in generic_webhook_sources.verification_config) or
  *   the chunked stream itself was malformed (out-of-order, oversize, base64 decode fail,
  *   missing chunks at finalization, TTL expiry). Maps to HTTP 500.
+ * - `shed_retry_later`: the orchestrator's ingest admission controller is
+ *   saturated and shed this delivery (event-loop overload or per-org/global
+ *   cap). Maps to HTTP 429 + Retry-After — a terminal, RETRYABLE result: the
+ *   caller redelivers, the delivery is not lost, and Platform does NOT fail
+ *   over to a pool peer (peers share the same overloaded orchestrator DB).
  */
 export const WebhookRelayResult = z.enum([
   'accepted',
   'rejected_signature',
   'rejected_unknown_source',
   'rejected_misconfigured',
+  'shed_retry_later',
 ]);
 export type WebhookRelayResult = z.infer<typeof WebhookRelayResult>;
 
@@ -210,7 +241,7 @@ export const peerUpdateSchema = z.object({
       instanceId: z.string().optional(),
       address: z.string().nullable(),
       routingKeys: z.array(z.string()),
-      orchRole: z.enum(['coordinator', 'worker']).optional(),
+      orchRole: OrchRole.optional(),
     }),
   ),
 });
@@ -236,6 +267,21 @@ export const staleCheckrunCleanupSchema = z.object({
   ),
 });
 export type StaleCheckrunCleanup = z.infer<typeof staleCheckrunCleanupSchema>;
+
+/**
+ * Platform capability advertisement, sent once by the Platform after the
+ * orchestrator authenticates. The orchestrator caches it per connection and
+ * pre-flight-checks its own feature-gated sends against it, so a self-hosted
+ * orchestrator running ahead of the hosted Platform surfaces a diagnosable
+ * capability gap instead of firing a frame the Platform would silently drop.
+ * Payload is `platformCapabilitiesSchema` (`.passthrough()`, absent =
+ * unsupported).
+ */
+export const platformCapabilitiesMessageSchema = z.object({
+  type: z.literal('platform.capabilities'),
+  capabilities: platformCapabilitiesSchema,
+});
+export type PlatformCapabilitiesMessage = z.infer<typeof platformCapabilitiesMessageSchema>;
 
 // --- Orchestrator -> Platform messages ---
 
@@ -325,7 +371,44 @@ export const logChunkSchema = z.object({
   stepIndex: z.number(),
   lines: z.array(z.string()),
   timestamp: z.number(),
+  /**
+   * Which stream these lines came from. Optional for backward compatibility
+   * with orchestrators that do not send it; absent is read as `stdout`.
+   */
+  stream: LogStream.optional(),
 });
+
+/**
+ * Phase of an orchestration/provisioning log line. Mirrors the phases the
+ * orchestrator writes into its per-job orchestration/provisioning JSONL files
+ * and that the dashboard splits the run-detail orch-log viewer by. `unknown`
+ * is the fallback for a line whose stored phase is missing/unrecognized.
+ */
+export const OrchLogPhase = z.enum(['dispatch', 'setup', 'provisioning', 'teardown', 'unknown']);
+export type OrchLogPhase = z.infer<typeof OrchLogPhase>;
+
+/**
+ * Live orchestration/provisioning log line(s) pushed orchestrator -> Platform.
+ *
+ * Emitted at the orchestrator's `writeOrchLog` / provisioning-write tap points
+ * (in addition to persisting to LogStorage, which stays the authoritative
+ * backfill source). Platform fans this out to browser subscribers keyed by
+ * `(runId, jobId)` as an `orch-log.lines` message. `lines` carries the raw
+ * message strings for this phase; `ts` is the write timestamp (ms).
+ *
+ * Best-effort: a push failure never breaks dispatch (fire-and-forget at the
+ * write site). Not correlated/acked, so — unlike step `log.chunk` — it is not
+ * fast-pathed and carries no `messageId`.
+ */
+export const orchLogChunkSchema = z.object({
+  type: z.literal('orch-log.chunk'),
+  runId: z.string(),
+  jobId: z.string(),
+  phase: OrchLogPhase,
+  lines: z.array(z.string()),
+  ts: z.number(),
+});
+export type OrchLogChunk = z.infer<typeof orchLogChunkSchema>;
 
 /** Cache lookup statistics forwarded from orchestrator to Platform for centralized metrics. */
 export const cacheStatsSchema = z.object({
@@ -375,6 +458,12 @@ export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', 
   peerUpdateSchema,
   staleCheckrunCleanupSchema,
   oidcMintResponseSchema,
+  // Platform capability advertisement (Platform → orchestrator direction).
+  platformCapabilitiesMessageSchema,
+  // Negative acknowledgment: the Platform's diagnosable reply when it receives
+  // an orchestrator frame whose type it does not understand (version skew).
+  // A member of BOTH direction unions since either side can NACK the other.
+  nackSchema,
   // Every dashboard request the Platform can proxy to the orchestrator.
   // Derived from the dashboard-direction union so the two can never drift:
   // a dashboard request type absent from this wire union is silently
@@ -394,6 +483,7 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   webhookAckSchema,
   executionEventSchema,
   logChunkSchema,
+  orchLogChunkSchema,
   executionStatusSchema,
   stepStatusForwardSchema,
   jobStatusForwardSchema,
@@ -408,7 +498,52 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   jobContextMessageSchema,
   orchMetricsSchema,
   oidcMintRequestSchema,
+  // Negative acknowledgment: the orchestrator's diagnosable reply when it
+  // receives a Platform frame whose type it does not understand (version skew).
+  nackSchema,
 ]);
+
+// --- Recognized-type sets (single source of truth for the NACK classifier) ---
+
+/** Minimal structural shape of a Zod object schema carrying a `type` literal. */
+type TypeLiteralObjectSchema = { shape: { type: { value: string } } };
+
+/**
+ * Extract the discriminator `type` values a schema recognizes: every option of a
+ * discriminated union, or the single `type` literal of an object schema. Reuses
+ * the `schema.options.map((o) => o.shape.type.value)` idiom already used for
+ * `DASHBOARD_REQUEST_TYPES`, so a recognized-type set derived through this helper
+ * can never drift from the schema it is built from.
+ */
+export function collectDiscriminatorTypes(
+  schema: { options: readonly TypeLiteralObjectSchema[] } | TypeLiteralObjectSchema,
+): string[] {
+  if ('options' in schema) {
+    return schema.options.map((option) => option.shape.type.value);
+  }
+  return [schema.shape.type.value];
+}
+
+/**
+ * Every message `type` the orchestrator→Platform mainline union recognizes.
+ * The Platform WS handler unions this with its extra recognition-chain schemas
+ * (log-pull, dashboard responses, cluster join) to decide whether a frame that
+ * failed validation is a known-but-invalid type (close the connection) or a
+ * genuinely-unknown one (version-skew NACK + keep alive).
+ */
+export const ORCH_TO_PLATFORM_RECOGNIZED_TYPES: ReadonlySet<string> = new Set(
+  collectDiscriminatorTypes(orchestratorToPlatformMessageSchema),
+);
+
+/**
+ * Every message `type` the Platform→orchestrator mainline union recognizes
+ * (dashboard request types included — they are members of this union). The
+ * orchestrator's platform client unions this with its extra recognition-chain
+ * schemas to make the same known-but-invalid vs unknown decision.
+ */
+export const PLATFORM_TO_ORCH_RECOGNIZED_TYPES: ReadonlySet<string> = new Set(
+  collectDiscriminatorTypes(platformToOrchestratorMessageSchema),
+);
 
 // --- Inferred types ---
 

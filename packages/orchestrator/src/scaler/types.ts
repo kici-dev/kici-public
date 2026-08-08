@@ -7,7 +7,12 @@
 
 import { z } from 'zod';
 import { ScalerEventType } from '@kici-dev/engine';
-import type { ResourceRequest, ResourceSpec, ScalerBackendType } from '@kici-dev/engine';
+import type {
+  ResourceRequest,
+  ResourceSpec,
+  ScalerBackendType,
+  ScalerPlatform,
+} from '@kici-dev/engine';
 
 export type { ResourceRequest, ResourceSpec } from '@kici-dev/engine';
 export { ScalerEventType } from '@kici-dev/engine';
@@ -83,6 +88,19 @@ export interface NetworkPolicy {
 }
 
 /**
+ * Image pull policy for container-backend agent images.
+ *
+ * - `IfNotPresent` (default): pull only when the image is not already local.
+ *   KiCI agent images are pinned + immutable, so re-pulling on every spawn only
+ *   storms the registry/socket.
+ * - `Always`: re-pull on every spawn. Set this on a label set that tracks a
+ *   moving tag (e.g. `:latest`) or otherwise needs a fresh image each spawn.
+ * - `Never`: never pull; fail if the image is absent.
+ */
+export const ImagePullPolicy = z.enum(['Always', 'IfNotPresent', 'Never']);
+export type ImagePullPolicy = z.infer<typeof ImagePullPolicy>;
+
+/**
  * Configuration for a single label-set mapping within a scaler backend.
  * Maps an exact set of labels to the agent provisioning details.
  */
@@ -91,8 +109,8 @@ export interface LabelSetConfig {
   labels: string[];
   /** Container image (Docker backend) */
   image?: string;
-  /** Image pull policy: Always (default), IfNotPresent, or Never */
-  imagePullPolicy?: 'Always' | 'IfNotPresent' | 'Never';
+  /** Image pull policy: IfNotPresent (default), Always, or Never */
+  imagePullPolicy?: ImagePullPolicy;
   /** Path to agent binary (bare-metal backend) */
   binaryPath?: string;
   /**
@@ -161,7 +179,18 @@ export type ScaleResult =
   | { action: 'spawning'; backendType: string }
   | { action: 'at-capacity' }
   | { action: 'no-backend'; labels: string[] }
-  | { action: 'failed'; error: string };
+  | { action: 'failed'; error: string }
+  /** Scale-up declined without attempting a spawn (e.g. coordinator draining). */
+  | { action: 'skipped'; reason: string };
+
+/**
+ * What triggered a pending-scale re-drive (`Dispatcher.retryPendingScaleRequests`):
+ * the near-zero-latency capacity-freed `hook` fired from `ScalerManager`, or the
+ * leader-gated periodic `sweep` backstop. Used as the `trigger` label on the
+ * `kici_orch_scaler_redispatch_total` counter.
+ */
+export const ScalerRedispatchTrigger = z.enum(['hook', 'sweep']);
+export type ScalerRedispatchTrigger = z.infer<typeof ScalerRedispatchTrigger>;
 
 /**
  * Result of a configuration validation or reload operation.
@@ -192,7 +221,8 @@ export interface ScalerBackend {
    * True for bare-metal and Firecracker (local processes / local VMs) and for
    * container backends using a local runtime socket; false when the backend
    * provisions elsewhere (remote container runtime, future cloud backends).
-   * Drives the static spawning-host display on the diagnostics page.
+   * Drives the static spawning-host display on the dashboard Infrastructure
+   * page.
    */
   readonly spawnsOnLocalHost: boolean;
 
@@ -222,6 +252,13 @@ export interface ScalerBackend {
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
     spawnContext?: SpawnContext,
+    /**
+     * Optional abort signal from the ScalerManager spawn-timeout wrapper. When
+     * aborted, backends thread it into any long-running provisioning I/O
+     * (container-runtime requests, HTTP calls) so a hung provision cancels
+     * instead of pinning the per-backend spawn-semaphore slot.
+     */
+    signal?: AbortSignal,
   ): Promise<ManagedAgent>;
 
   /**
@@ -245,6 +282,15 @@ export interface ScalerBackend {
    * Used by the orchestrator to enrich job.context before forwarding to Platform.
    */
   getScalerContext?(agentId: string): Record<string, unknown> | undefined;
+
+  /**
+   * Provision or heal this backend's host prerequisites before it spawns.
+   * Called once by ScalerManager during startup. Optional — only backends with
+   * host-side setup (Firecracker's bridge) implement it; container/bare-metal
+   * omit it. May throw; the manager catches per-backend and degrades that
+   * scaler rather than aborting orchestrator startup.
+   */
+  ensureHostReady?(): Promise<void>;
 
   /**
    * Reload configuration (called on SIGHUP).
@@ -273,6 +319,12 @@ export interface FirecrackerNetworkConfig {
   netmask?: string;
   /** nft table name for this coordinator's host bridge @default 'kici' */
   table?: string;
+  /**
+   * When true (default), the orchestrator verifies and provisions this host
+   * bridge on startup (self-heal), so a fresh Firecracker host needs no manual
+   * `kici-admin firecracker provision`. @default true
+   */
+  autoProvisionHost?: boolean;
 }
 
 /**
@@ -318,8 +370,15 @@ export interface ScalerEntry {
   name: string;
   /** Backend type */
   type: Exclude<ScalerBackendType, 'kubernetes'>;
-  /** Maximum concurrent agents for this scaler */
+  /** Maximum concurrent agents for this scaler (population cap) */
   maxAgents: number;
+  /**
+   * Maximum concurrent `backend.spawn` operations for this scaler
+   * (provisioning-rate throttle). Orthogonal to `maxAgents`: excess in-cap
+   * spawns queue and drain at this rate rather than storming the socket.
+   * Defaults to `DEFAULT_MAX_CONCURRENT_SPAWNS` at config-load.
+   */
+  maxConcurrentSpawns: number;
   /** Label-set to image/binary mappings */
   labelSets: LabelSetConfig[];
   /** Container runtime host (e.g. 'tcp://192.168.1.10:2376'). Works for both Docker and Podman remote. */
@@ -345,6 +404,15 @@ export interface ScalerEntry {
    * `labelSets`. Default: `[]` (no gating).
    */
   mandatoryLabels?: string[];
+
+  /**
+   * Structured platform of this pool's agents. When set, the auto-injected
+   * `kici:os:*` / `kici:arch:*` labels AND the mandatory platform taint both
+   * derive from this single field. Optional: when omitted, bare-metal pools
+   * derive the platform from the host OS/arch, and container / firecracker
+   * pools default to linux.
+   */
+  readonly platform?: ScalerPlatform;
 
   /**
    * Agent roles this scaler handles. scaler-entry level, not per-label-set.

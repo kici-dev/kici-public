@@ -221,7 +221,7 @@ npx kici compile           # regenerate .kici/kici.lock.json
 npx kici run dispatch --local
 ```
 
-`kici run dispatch --local` compiles the workflow, matches triggers against a simulated `dispatch` event, and executes the matched jobs on this machine — which joins as an ephemeral agent through the warm local dev plane — with DAG-based scheduling. No webhook, no GitHub, no deployed orchestrator involved. See [`kici run <event> --local`](../cli-reference.md#kici-run-event---local) for options like `--env`, `--in-place`, and `--offline`.
+`kici run dispatch --local` compiles the workflow, matches triggers against a simulated `dispatch` event, and executes the matched jobs on this machine — which joins as an ephemeral agent through the warm local dev plane — with DAG-based scheduling. No webhook, no GitHub, no deployed orchestrator involved. See [`kici run <event> --local`](../cli/runs-and-approvals.md#kici-run-event---local) for options like `--env`, `--in-place`, and `--offline`.
 
 ### Unfiltered vs typed `dispatch()`
 

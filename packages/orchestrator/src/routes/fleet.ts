@@ -14,6 +14,7 @@ import type { MiddlewareHandler } from 'hono';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { FleetRoutesDeps } from '../app.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'fleet-routes' });
 
@@ -31,17 +32,10 @@ export function createFleetRoutes(deps: FleetAdminRouteDeps): Hono {
   // every orchestrator route (including /health, /cluster/health, and the
   // webhook ingress) and 401 them. Mirror the path-scoped pattern used by
   // the main admin router (routes/admin.ts).
-  const authMiddleware: MiddlewareHandler = async (c, next) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const tokenInfo = await deps.tokenManager.validate(authHeader.slice(7));
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    await next();
-  };
+  const authMiddleware: MiddlewareHandler = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'fleet',
+  });
   app.use('/admin/fleet-topology', authMiddleware);
   app.use('/admin/fleet-bundle', authMiddleware);
 

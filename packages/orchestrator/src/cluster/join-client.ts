@@ -26,7 +26,7 @@ const logger = createLogger({ prefix: 'join-client' });
 
 interface JoinClientOptions {
   token: string;
-  /** Platform WebSocket URL for relay mode (e.g., wss://platform.kici.dev/ws) */
+  /** Platform WebSocket URL for relay mode (e.g., wss://api.kici.dev/ws) */
   platformUrl?: string;
   /** Peer HTTP URL for direct mode (e.g., https://orch-1:8080) */
   peerUrl?: string;

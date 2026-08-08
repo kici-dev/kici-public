@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './039_host_roster.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -42,10 +41,7 @@ describeDb('migration 039_host_roster', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -65,11 +61,10 @@ describeDb('migration 039_host_roster', () => {
   }, 60_000);
 
   it('creates host_roster with the base columns migration 039 establishes', async () => {
-    // The harness applies the full migration chain (migrateToLatest), so later
-    // migrations add further columns (host_properties, reach metadata,
-    // reboot_pending_until). Assert that migration 039's base columns are all
-    // present rather than freezing the exact set — that keeps this test stable
-    // as later migrations extend the table.
+    // The harness applies migrations 001..039, so the table carries exactly the
+    // columns migration 039 establishes. Assert those base columns are present
+    // rather than freezing the exact set, so the test stays stable if 039 is
+    // ever amended alongside a superseding migration.
     expect(await tableExists('host_roster')).toBe(true);
     expect(await columns()).toEqual(
       expect.arrayContaining(

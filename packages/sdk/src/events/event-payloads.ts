@@ -123,6 +123,10 @@ export interface EventBase {
   sourceRepo?: string;
   /** Files changed in this event (for path filtering). */
   changedFiles?: string[];
+  /**
+   * Availability of `changedFiles` — `fetched` (real diff), `unavailable` (no diff / could not compute), or `skipped` (orchestrator did not fetch; the agent recomputes from its clone).
+   */
+  changedFilesStatus?: import('@kici-dev/engine').ChangedFilesStatus;
   /** Raw webhook payload from the provider. May be absent in flattened event forms. */
   payload?: Record<string, unknown>;
   /** Index signature for backward compatibility — untyped fields resolve to unknown. */

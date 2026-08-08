@@ -1,15 +1,29 @@
 import {
   expandMatrix,
   applyIncludeExclude,
+  matrixCombinationCount,
+  findDuplicateCombination,
+  MatrixShapeError,
   type MatrixValues,
-  type StaticMatrixArray,
-  type StaticMatrixObject,
 } from '../matrix/expand.js';
 import { formatExpandedJobName } from '../matrix/format.js';
 import type { LockJob } from '../trigger/types.js';
 
 /** Hard cap on children per fanned job — mirrors the compiler's MAX_STATIC_MATRIX_JOBS. */
 export const MAX_FANOUT_JOBS = 256;
+
+/**
+ * Hard ceiling on the raw combination product a matrix may materialize.
+ *
+ * Distinct from {@link MAX_FANOUT_JOBS} on purpose. `MAX_FANOUT_JOBS` bounds
+ * the FINAL children after include/exclude and is checked after expansion;
+ * this bounds what may be allocated in the first place, and is checked before.
+ * They cannot be collapsed into one check: excludes only ever reduce the count,
+ * so a matrix whose raw product is 300 but which excludes down to 200 is legal
+ * and must keep working. The ceiling is deliberately far above any realistic
+ * matrix — its only job is to turn an out-of-memory kill into a typed error.
+ */
+export const MAX_MATRIX_MATERIALIZATION = 100_000;
 
 /**
  * The kind of fan-out a materialized child belongs to. `matrix` children come
@@ -205,6 +219,10 @@ export function fanoutEnvelopeFields(mat: MaterializedJob): {
  * (produced by the agent eval flow). Mirrors the static-matrix branch of
  * {@link materializeFanout} but takes the already-resolved combinations and
  * enforces the same cap / zero-combination guards.
+ *
+ * Duplicate combinations are refused here rather than on the agent, so the
+ * failure surfaces beside the zero-combination and cap errors for the same
+ * path.
  */
 export function materializeResolvedMatrix(
   lockJob: LockJob,
@@ -216,10 +234,23 @@ export function materializeResolvedMatrix(
       `dynamic matrix for job '${lockJob.name}' resolved to zero combinations`,
     );
   }
+  // Cap first: it is O(1) and names the more fundamental problem, so an
+  // oversized matrix is not re-reported as whichever duplicate it happens to
+  // contain — and the O(n) duplicate scan never runs on an unbounded list.
   if (combos.length > MAX_FANOUT_JOBS) {
     throw new FanoutError(
       lockJob.name,
       `dynamic matrix for job '${lockJob.name}' resolved to ${combos.length} combinations (max ${MAX_FANOUT_JOBS})`,
+    );
+  }
+  const duplicate = findDuplicateCombination(combos, (c) => formatExpandedJobName(lockJob.name, c));
+  if (duplicate) {
+    throw new FanoutError(
+      lockJob.name,
+      `dynamic matrix for job '${lockJob.name}' produced duplicate combination ` +
+        `${JSON.stringify(duplicate)} — two children would share the expanded name ` +
+        `'${formatExpandedJobName(lockJob.name, duplicate)}'; de-duplicate the values ` +
+        `your matrix function returns`,
     );
   }
   const jobs: MaterializedJob[] = [];
@@ -334,13 +365,32 @@ export function materializeFanout(staticJobs: readonly LockJob[]): FanoutResult 
       continue;
     }
 
-    // Static matrix: expand → include/exclude → suffix naming identical to the
-    // local executor so the dashboard's matrix grouping works unchanged.
+    // Static matrix: expand → include/exclude → suffix naming via
+    // `formatExpandedJobName`, the single renderer every fan-out path shares so
+    // the dashboard's matrix grouping and the `byMatrix` outputs key agree.
     const values = matrix.values;
     if (!values) {
       throw new FanoutError(lockJob.name, `static matrix for job '${lockJob.name}' has no values`);
     }
-    const expanded = expandMatrix(values as StaticMatrixArray | StaticMatrixObject);
+    let expanded: MatrixValues[];
+    try {
+      // Count first: a lock file we did not generate (hand-edited, or produced
+      // by another tool) can carry a product large enough to exhaust memory
+      // before the post-expansion cap below is ever consulted.
+      const rawCount = matrixCombinationCount(values);
+      if (rawCount > MAX_MATRIX_MATERIALIZATION) {
+        throw new FanoutError(
+          lockJob.name,
+          `matrix for job '${lockJob.name}' is too large to expand: ${rawCount} raw combinations (max ${MAX_MATRIX_MATERIALIZATION})`,
+        );
+      }
+      expanded = expandMatrix(values);
+    } catch (err) {
+      if (err instanceof MatrixShapeError) {
+        throw new FanoutError(lockJob.name, `job '${lockJob.name}': ${err.message}`);
+      }
+      throw err;
+    }
     const combos = applyIncludeExclude(
       expanded,
       lockJob.include as Record<string, string>[] | undefined,
@@ -353,10 +403,23 @@ export function materializeFanout(staticJobs: readonly LockJob[]): FanoutResult 
         `matrix for job '${lockJob.name}' expands to zero combinations`,
       );
     }
+    // Cap before the duplicate scan: O(1), and it names the more fundamental
+    // problem rather than whichever duplicate an oversized matrix contains.
     if (combos.length > MAX_FANOUT_JOBS) {
       throw new FanoutError(
         lockJob.name,
         `matrix for job '${lockJob.name}' expands to ${combos.length} combinations (max ${MAX_FANOUT_JOBS})`,
+      );
+    }
+    const duplicate = findDuplicateCombination(combos, (c) =>
+      formatExpandedJobName(lockJob.name, c),
+    );
+    if (duplicate) {
+      throw new FanoutError(
+        lockJob.name,
+        `matrix for job '${lockJob.name}' produced duplicate combination ` +
+          `${JSON.stringify(duplicate)} — two children would share the expanded name ` +
+          `'${formatExpandedJobName(lockJob.name, duplicate)}'; de-duplicate the matrix values`,
       );
     }
 

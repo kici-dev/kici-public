@@ -1,6 +1,8 @@
-import { $ } from 'zx';
-import type { Rule, RuleContext, EventPayload } from '@kici-dev/sdk';
-import { evaluateRules as evaluateRulesCore } from '@kici-dev/sdk';
+import type { Rule, RuleContext, CreateRuleContextInput } from '@kici-dev/sdk';
+import {
+  createRuleContext as createSdkRuleContext,
+  evaluateRules as evaluateRulesCore,
+} from '@kici-dev/sdk';
 import type { RuleEvaluationResult } from '@kici-dev/sdk';
 import { initZx } from '@kici-dev/core';
 import { formatter } from './output-formatter.js';
@@ -9,20 +11,18 @@ import { formatter } from './output-formatter.js';
 initZx();
 
 /**
- * Create RuleContext for rule evaluation.
+ * Create a RuleContext for `kici test` rule evaluation. Delegates to the shared
+ * SDK factory (single source of truth), defaulting `env` to the process
+ * environment — the test-runner exposes the developer's real env to rules — and
+ * `changedFilesStatus` to `'fetched'` so an author-supplied (or empty) test
+ * changeset is a genuine diff and `ctx.changedFiles` never throws.
  */
-export function createRuleContext(
-  event: EventPayload,
-  changedFiles: string[] = [],
-  dispatchInputs: Readonly<Record<string, string | number | boolean | null>> = {},
-): RuleContext {
-  return {
-    event,
-    changedFiles,
-    env: { ...process.env } as Record<string, string | undefined>,
-    dispatchInputs,
-    $,
-  };
+export function createRuleContext(input: CreateRuleContextInput): RuleContext {
+  return createSdkRuleContext({
+    ...input,
+    env: input.env ?? ({ ...process.env } as Record<string, string | undefined>),
+    changedFilesStatus: input.changedFilesStatus ?? 'fetched',
+  });
 }
 
 /**
@@ -35,7 +35,7 @@ async function evaluateRulesWithFormatting(
   jobName: string,
 ): Promise<RuleEvaluationResult> {
   return evaluateRulesCore(rules, context, jobName, (result) => {
-    formatter.logRuleResult(jobName, result.label, result.passed);
+    formatter.logRuleResult(jobName, result);
   });
 }
 

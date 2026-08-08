@@ -24,9 +24,11 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { createGunzip } from 'node:zlib';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { isAbsolute, dirname, join, relative, resolve, sep } from 'node:path';
-import { cp, mkdir, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
+import { cp, mkdir, readdir, rename, rm } from 'node:fs/promises';
+import { makeTempDir } from '@kici-dev/core/tmp';
+import { REPO_ANCHOR, HOME_ANCHOR } from '@kici-dev/core';
 import { c as tarCreate, x as tarExtract } from 'tar';
 import { createLogger, sha256 } from '@kici-dev/shared';
 import type { CacheSpec, CacheRestoreResult } from '@kici-dev/sdk';
@@ -35,11 +37,6 @@ const logger = createLogger({ prefix: 'cache-engine' });
 
 /** Download timeout for a presigned cache GET: 5 minutes. */
 const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
-
-/** Anchor prefix for repo-root-relative cache entries inside the tar. */
-const REPO_ANCHOR = '__repo__';
-/** Anchor prefix for home-relative (`~`) cache entries inside the tar. */
-const HOME_ANCHOR = '__home__';
 
 /** Override roots — exposed for tests so the home destination is sandboxable. */
 export interface CacheRoots {
@@ -101,7 +98,7 @@ export async function packCachePaths(
   roots?: CacheRoots,
 ): Promise<{ tarball: Buffer; hash: string }> {
   const entries = anchorEntries(workDir, paths, roots);
-  const staging = await mkdtemp(join(tmpdir(), 'kici-cache-pack-'));
+  const { path: staging, cleanup } = await makeTempDir('cache-pack');
   try {
     const topLevel = new Set<string>();
     for (const e of entries) {
@@ -122,7 +119,7 @@ export async function packCachePaths(
     logger.info('packed user cache', { sizeBytes: tarball.length, hash: hash.slice(0, 12), paths });
     return { tarball, hash };
   } finally {
-    await rm(staging, { recursive: true, force: true });
+    await cleanup();
   }
 }
 
@@ -163,7 +160,7 @@ export async function extractCacheTarball(
   }
   const home = roots?.home ?? homedir();
   await mkdir(workDir, { recursive: true });
-  const scratch = await mkdtemp(join(tmpdir(), 'kici-cache-extract-'));
+  const { path: scratch, cleanup } = await makeTempDir('cache-extract');
   try {
     await new Promise<void>((res, rej) => {
       Readable.from(tarball)
@@ -173,7 +170,7 @@ export async function extractCacheTarball(
     });
     await moveAnchoredGroups(scratch, workDir, home);
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    await cleanup();
   }
 }
 
@@ -200,7 +197,7 @@ export async function downloadAndExtractCache(
     },
   });
   await mkdir(workDir, { recursive: true });
-  const scratch = await mkdtemp(join(tmpdir(), 'kici-cache-extract-'));
+  const { path: scratch, cleanup } = await makeTempDir('cache-extract');
   try {
     // Cast: fetch() returns a DOM ReadableStream; Readable.fromWeb expects the
     // Node web-stream type. Structurally identical at runtime (same as dep-restore).
@@ -218,7 +215,7 @@ export async function downloadAndExtractCache(
     }
     await moveAnchoredGroups(scratch, workDir, home);
   } finally {
-    await rm(scratch, { recursive: true, force: true });
+    await cleanup();
   }
 }
 

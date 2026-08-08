@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import type { AgentLogChunk } from '@kici-dev/engine';
+import { LogStream, type AgentLogChunk } from '@kici-dev/engine';
 import { LogStreamer, BACKPRESSURE_THRESHOLD } from './log-streamer.js';
 import {
   logBackpressureActive,
@@ -670,6 +670,105 @@ describe('LogStreamer Prometheus backpressure counters', () => {
       [1, { mode: 'pause' }],
       [-1, { mode: 'pause' }],
     ]);
+
+    streamer.destroy();
+  });
+});
+
+describe('LogStreamer stream tagging', () => {
+  let send: ReturnType<typeof vi.fn<(msg: AgentLogChunk) => void>>;
+  let streamer: LogStreamer;
+
+  const baseOptions = {
+    runId: 'run-1',
+    jobId: 'job-1',
+    stepIndex: 0,
+    flushIntervalMs: 100,
+    flushLineThreshold: 50,
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    send = vi.fn<(msg: AgentLogChunk) => void>();
+    streamer = new LogStreamer({ ...baseOptions, send });
+  });
+
+  afterEach(() => {
+    streamer.destroy();
+    vi.useRealTimers();
+  });
+
+  it('tags a flushed chunk with the stream its lines came from', () => {
+    streamer.addLine('boom', LogStream.enum.stderr);
+    streamer.flush();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].stream).toBe(LogStream.enum.stderr);
+    expect(send.mock.calls[0][0].lines).toEqual(['boom']);
+  });
+
+  it('flushes the pending buffer when the stream kind flips, preserving order', () => {
+    streamer.addLine('progress', LogStream.enum.stdout);
+    streamer.addLine('boom', LogStream.enum.stderr);
+    streamer.flush();
+
+    expect(send.mock.calls.map((c) => [c[0].stream, c[0].lines])).toEqual([
+      [LogStream.enum.stdout, ['progress']],
+      [LogStream.enum.stderr, ['boom']],
+    ]);
+  });
+
+  it('defaults to stdout when no stream is given', () => {
+    streamer.addLine('plain');
+    streamer.flush();
+
+    expect(send.mock.calls[0][0].stream).toBe(LogStream.enum.stdout);
+  });
+
+  it('tags the end-of-step forced flush with the buffered stream', () => {
+    streamer.addLine('late failure', LogStream.enum.stderr);
+    streamer.destroy();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].stream).toBe(LogStream.enum.stderr);
+  });
+});
+
+describe('LogStreamer stream tagging under backpressure', () => {
+  it('never relabels lines the paused buffer is still holding', () => {
+    const send = vi.fn<(msg: AgentLogChunk) => void>();
+    let buffered = BACKPRESSURE_THRESHOLD + 1;
+    let drain: (() => void) | undefined;
+    const streamer = new LogStreamer({
+      runId: 'run-1',
+      jobId: 'job-1',
+      stepIndex: 0,
+      flushIntervalMs: 100,
+      flushLineThreshold: 50,
+      send,
+      getBufferedAmount: () => buffered,
+      backpressureMode: 'pause',
+      onWsDrain: (cb) => {
+        drain = cb;
+      },
+    });
+
+    // Backpressured: the stdout line is buffered, not sent.
+    streamer.addLine('progress', LogStream.enum.stdout);
+    streamer.flush();
+    expect(send).not.toHaveBeenCalled();
+
+    // A stderr line arrives while the buffer is still stuck.
+    streamer.addLine('boom', LogStream.enum.stderr);
+
+    // Socket drains — the held lines go out under the stream they started as,
+    // rather than the whole batch being retagged stderr.
+    buffered = 0;
+    drain?.();
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0].lines).toEqual(['progress', 'boom']);
+    expect(send.mock.calls[0][0].stream).toBe(LogStream.enum.stdout);
 
     streamer.destroy();
   });

@@ -3,13 +3,7 @@ import { describe, it, expect, vi, beforeEach, beforeAll, type Mock } from 'vite
 // Mock external dependencies to avoid starting real servers/connections
 vi.mock('@hono/node-server', () => ({
   serve: vi.fn(() => ({ close: vi.fn() })),
-}));
-
-vi.mock('@hono/node-ws', () => ({
-  createNodeWebSocket: vi.fn(() => ({
-    injectWebSocket: vi.fn(),
-    upgradeWebSocket: vi.fn(() => vi.fn()),
-  })),
+  upgradeWebSocket: vi.fn(() => vi.fn()),
 }));
 
 const mockPeerClientConnect = vi.fn();
@@ -187,6 +181,44 @@ describe('bootstrapWorker', () => {
     expect(handlerDeps.agentAuthMode).toBe('none');
   });
 
+  it('onJobReroute acks a duplicate re-dispatch as accepted (idempotent no-op)', async () => {
+    // A rerouted job reuses a preassigned jobId; a concurrent reroute (or a
+    // replayed job.reroute) can make dispatch report the dispatch_queue row
+    // already exists ('duplicate'). The worker must ack accepted:true — reporting
+    // accepted:false would wrongly drive the owning coordinator to reroute an
+    // already-handled job. Locks in the correct mapping for the duplicate status.
+    const config = createWorkerConfig();
+    const { bootstrapWorker } = await import('./worker-core.js');
+    const subsystems = await bootstrapWorker(config);
+
+    const peerClient = subsystems.peerClient as unknown as MockPeerClient;
+    const onJobReroute = peerClient.options.onJobReroute as (msg: unknown) => Promise<void>;
+
+    vi.spyOn(subsystems.dispatcher, 'dispatch').mockResolvedValue({
+      status: 'duplicate',
+      jobId: 'reroute-job-1',
+    });
+
+    mockPeerClientSend.mockClear();
+    await onJobReroute({
+      type: 'job.reroute',
+      messageId: 'm-1',
+      jobId: 'reroute-job-1',
+      runId: 'run-1',
+      workflowName: 'ci',
+      jobName: 'build',
+      runsOnLabels: [['linux']],
+      deliveryId: 'd-1',
+      routingKey: 'github:42',
+    });
+
+    expect(mockPeerClientSend).toHaveBeenCalledWith({
+      type: 'job.reroute.ack',
+      messageId: 'm-1',
+      accepted: true,
+    });
+  });
+
   it('throws when role is not worker', async () => {
     const config = createWorkerConfig({
       cluster: {
@@ -219,5 +251,19 @@ describe('bootstrapWorker', () => {
 
     // PeerClient.connect() should have been called
     expect(mockPeerClientConnect).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('resolveWorkerAgentTokenTtlMs', () => {
+  it('returns the pulled agent_token_ttl_ms once a snapshot has landed', async () => {
+    const { resolveWorkerAgentTokenTtlMs } = await import('./worker-core.js');
+    expect(resolveWorkerAgentTokenTtlMs({ settings: { agentTokenTtlMs: 33_000 } }, 3_600_000)).toBe(
+      33_000,
+    );
+  });
+
+  it('falls back to the config default until the first pull lands (null snapshot)', async () => {
+    const { resolveWorkerAgentTokenTtlMs } = await import('./worker-core.js');
+    expect(resolveWorkerAgentTokenTtlMs(null, 3_600_000)).toBe(3_600_000);
   });
 });

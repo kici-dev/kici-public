@@ -96,13 +96,34 @@ export function validateDag(nodes: DagNode[]): DagValidationResult {
 
   // Check for cycle
   if (sortedOrder.length !== nodes.length) {
-    const cycleNodes: string[] = [];
+    // The residual set (in-degree > 0 after Kahn's sort) is the cycle PLUS every
+    // node reachable only through it — downstream dependents never reach in-degree
+    // 0 either. Refine it down to the true cycle members by peeling "sink" nodes
+    // (no successor still in the residual set) until fixpoint. Kahn's already
+    // drained everything upstream, so the survivors are exactly the nodes on a
+    // real cycle: each keeps an out-edge back into the residual and is never a sink.
+    const residual = new Set<string>();
     for (const [id, degree] of inDegree) {
       if (degree > 0) {
-        cycleNodes.push(id);
+        residual.add(id);
       }
     }
-    return { valid: false, error: 'cycle', nodesInCycle: cycleNodes };
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const id of residual) {
+        const hasSuccessorInResidual = (adjacencyList.get(id) ?? []).some((target) =>
+          residual.has(target),
+        );
+        if (!hasSuccessorInResidual) {
+          residual.delete(id);
+          changed = true;
+        }
+      }
+    }
+
+    return { valid: false, error: 'cycle', nodesInCycle: [...residual] };
   }
 
   return { valid: true, sortedOrder };

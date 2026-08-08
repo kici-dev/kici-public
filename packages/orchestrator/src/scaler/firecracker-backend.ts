@@ -32,6 +32,13 @@ import { forwardLine } from './log-forwarder.js';
 import { ScalerEventType } from './types.js';
 import type { IpAllocator, IpAllocationResult } from './ip-allocator.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
+import {
+  provisionBridge as defaultProvisionBridge,
+  verifyBridge as defaultVerifyBridge,
+  type FirecrackerBridgeConfig,
+  type BridgeHealth,
+  type ExecOptions,
+} from '../firecracker/host-network.js';
 
 /** Hardlink src to dest; fall back to copy if on different filesystems (EXDEV). */
 async function linkOrCopy(src: string, dest: string): Promise<void> {
@@ -53,6 +60,7 @@ import type {
   ScalerEventCallback,
   ValidationResult,
   EffectiveLimits,
+  SpawnContext,
 } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -149,6 +157,12 @@ export interface FirecrackerScalerBackendOptions {
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
+  /**
+   * Live resolver for the ephemeral agent-token TTL (ms). When set, called per
+   * spawn so the leader can serve the fleet-wide
+   * `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
+   */
+  tokenTtlProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   roles?: string[];
   /**
@@ -159,6 +173,16 @@ export interface FirecrackerScalerBackendOptions {
    * @default false
    */
   requireSudo?: boolean;
+  /**
+   * When true, `ensureHostReady()` verifies and provisions this host bridge on
+   * startup (self-heal). Threaded from `firecracker.autoProvisionHost`. When
+   * false the method is a no-op. @default false (cores pass the real value)
+   */
+  autoProvisionHost?: boolean;
+  /** Injectable bridge verifier (tests). @default host-network verifyBridge */
+  verifyBridgeFn?: (cfg: FirecrackerBridgeConfig, opts: ExecOptions) => Promise<BridgeHealth>;
+  /** Injectable bridge provisioner (tests). @default host-network provisionBridge */
+  provisionBridgeFn?: (cfg: FirecrackerBridgeConfig, opts: ExecOptions) => Promise<void>;
 }
 
 export class FirecrackerScalerBackend implements ScalerBackend {
@@ -192,8 +216,18 @@ export class FirecrackerScalerBackend implements ScalerBackend {
   private readonly table: string;
   private readonly tokenStore?: AgentTokenStore;
   private readonly tokenTtlMs: number;
+  private readonly tokenTtlProvider?: () => Promise<number>;
   private readonly roles: string[] | undefined;
   private readonly requireSudo: boolean;
+  private readonly autoProvisionHost: boolean;
+  private readonly verifyBridgeFn: (
+    cfg: FirecrackerBridgeConfig,
+    opts: ExecOptions,
+  ) => Promise<BridgeHealth>;
+  private readonly provisionBridgeFn: (
+    cfg: FirecrackerBridgeConfig,
+    opts: ExecOptions,
+  ) => Promise<void>;
 
   /** Tracks all managed VM agents by ManagedAgent.id */
   private readonly agents = new Map<string, FirecrackerManagedAgent>();
@@ -224,8 +258,12 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     this.table = options.table ?? 'kici';
     this.tokenStore = options.tokenStore;
     this.tokenTtlMs = options.tokenTtlMs ?? 3_600_000; // 1 hour default
+    this.tokenTtlProvider = options.tokenTtlProvider;
     this.roles = options.roles;
     this.requireSudo = options.requireSudo ?? false;
+    this.autoProvisionHost = options.autoProvisionHost ?? false;
+    this.verifyBridgeFn = options.verifyBridgeFn ?? defaultVerifyBridge;
+    this.provisionBridgeFn = options.provisionBridgeFn ?? defaultProvisionBridge;
   }
 
   /**
@@ -297,6 +335,11 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     orchestratorUrl: string,
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
+    _spawnContext?: SpawnContext,
+    // The abort signal is accepted for interface parity but not threaded into
+    // the VM-provisioning HTTP calls; the ScalerManager deadline race still
+    // releases the semaphore slot if a boot hangs.
+    _signal?: AbortSignal,
   ): Promise<ManagedAgent> {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
@@ -522,7 +565,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       // 13. Create ephemeral agent token if token store is available
       let agentToken: string | undefined;
       if (this.tokenStore) {
-        agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, this.tokenTtlMs);
+        const tokenTtlMs = this.tokenTtlProvider ? await this.tokenTtlProvider() : this.tokenTtlMs;
+        agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
       }
 
       // 13b. Build forwarded env map for the agent (matches bare-metal/container precedence:
@@ -608,6 +652,26 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       bridgeCidr: `${this.gateway}/${prefix}`,
       table: this.table,
     };
+  }
+
+  /**
+   * Verify and (if needed) provision this backend's host bridge on startup.
+   * No-op unless autoProvisionHost is set. Throws on a real provision failure;
+   * ScalerManager.ensureHostsReady catches per-backend and degrades this scaler.
+   */
+  async ensureHostReady(): Promise<void> {
+    if (!this.autoProvisionHost) return;
+    const cfg = this.getBridgeConfig();
+    const opts: ExecOptions = { requireSudo: this.requireSudo };
+    const health = await this.verifyBridgeFn(cfg, opts);
+    if (health.healthy) {
+      logger.info(
+        `bridge ${cfg.bridgeName} already healthy (${cfg.bridgeCidr}); skipping self-provision`,
+      );
+      return;
+    }
+    logger.info(`self-provisioning bridge ${cfg.bridgeName} (${cfg.bridgeCidr}): ${health.detail}`);
+    await this.provisionBridgeFn(cfg, opts);
   }
 
   async destroy(managedId: string): Promise<void> {

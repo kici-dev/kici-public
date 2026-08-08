@@ -7,7 +7,12 @@ function makeRule(label: string, check: Rule['check']): Rule {
 }
 
 function makeContext(): RuleContext {
-  return createRuleContext({ type: 'push' }, ['src/index.ts'], { NODE_ENV: 'test' });
+  return createRuleContext({
+    event: { type: 'push' },
+    changedFiles: ['src/index.ts'],
+    changedFilesStatus: 'fetched',
+    env: { NODE_ENV: 'test' },
+  });
 }
 
 describe('evaluateRules', () => {
@@ -133,7 +138,12 @@ describe('evaluateRules', () => {
 
 describe('createRuleContext', () => {
   it('creates context with event, changedFiles, and env', () => {
-    const ctx = createRuleContext({ type: 'pr:open', pr: 42 }, ['file.ts'], { CI: 'true' });
+    const ctx = createRuleContext({
+      event: { type: 'pr:open', pr: 42 },
+      changedFiles: ['file.ts'],
+      changedFilesStatus: 'fetched',
+      env: { CI: 'true' },
+    });
 
     expect(ctx.event).toEqual({ type: 'pr:open', pr: 42 });
     expect(ctx.changedFiles).toEqual(['file.ts']);
@@ -142,7 +152,7 @@ describe('createRuleContext', () => {
   });
 
   it('defaults changedFiles and env when not provided', () => {
-    const ctx = createRuleContext({ type: 'push' });
+    const ctx = createRuleContext({ event: { type: 'push' } });
 
     expect(ctx.changedFiles).toEqual([]);
     expect(ctx.env).toEqual({});

@@ -1,13 +1,27 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, it, expect, afterAll } from 'vitest';
+import { rmSync } from 'node:fs';
+import { kiciMkdtemp } from '@kici-dev/shared';
 import {
   buildPlatformProviderSources,
   type GenericRoutingKeyRow,
 } from './build-platform-sources.js';
 import type { SourceManager } from './source-manager.js';
 import type { ProviderSource } from '../entry-helpers.js';
+
+/**
+ * Temp repo dirs for the local-provider cases. Allocated under the KiCI temp
+ * base so the shared GC sweeps any survivor, and removed here so a normal run
+ * leaves nothing behind.
+ */
+const tmpDirs: string[] = [];
+function tmpRepoDir(): string {
+  const dir = kiciMkdtemp('kici-local-platform-sources-');
+  tmpDirs.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 const githubSource: ProviderSource = {
   provider: 'github',
@@ -42,7 +56,7 @@ describe('buildPlatformProviderSources', () => {
   });
 
   it('advertises a local source whose repoBasePath exists on this peer', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const rows: GenericRoutingKeyRow[] = [
       {
         routing_key: 'generic:local-ok',

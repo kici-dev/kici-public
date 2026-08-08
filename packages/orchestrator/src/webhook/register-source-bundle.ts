@@ -40,6 +40,7 @@ import type { ProviderRegistry } from '../provider-registry.js';
 import { universalGitRegistrationErrorsTotal } from '../metrics/prometheus.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { GenericWebhookSource } from '../db/types.js';
 
 const logger = createLogger({ prefix: 'register-source-bundle' });
@@ -55,6 +56,8 @@ export interface RegisterSourceBundleDeps {
   /** Required for universal-git source rows. Null is allowed; rows that
    *  carry `git_config` will be skipped with a metric bump. */
   secretResolver: SecretResolver | null;
+  /** Fleet-wide settings reader; threads the live lock-file cap into universal-git fetchers. */
+  clusterSettings?: ClusterSettingsReader;
   /** Active scaler backend on this peer. When 'container' or 'firecracker', a
    *  local source registration emits a one-time reachability warning (the repo
    *  must exist inside the agent filesystem, not just on the orchestrator host). */
@@ -98,7 +101,10 @@ export function registerProviderBundleForSource(
       return;
     }
     try {
-      const bundle = createUniversalGitProviderBundle(row, deps.secretResolver);
+      const bundle = createUniversalGitProviderBundle(row, deps.secretResolver, {
+        clusterSettings: deps.clusterSettings,
+        lockFileMaxBytes: deps.config.lockFileMaxBytes,
+      });
       if (!bundle) {
         universalGitRegistrationErrorsTotal.add(1, { reason: 'invalid_config' });
         logger.warn('Universal-git source missing git_config at registration', {

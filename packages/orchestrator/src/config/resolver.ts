@@ -12,6 +12,7 @@
 
 import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import type { OrchestratorMode } from '@kici-dev/engine';
 import { loadLocalConfig } from './loader.js';
 import { appConfigSchema } from './schema.js';
 import { applyEnvOverrides, deepMerge } from './env-overlay.js';
@@ -30,7 +31,7 @@ export interface LocalPhaseResult {
   /** Resolved server port */
   port: number;
   /** Resolved instance mode */
-  mode: 'platform' | 'hybrid' | 'independent';
+  mode: OrchestratorMode;
 }
 
 /**
@@ -54,7 +55,7 @@ export async function resolveLocalConfig(configPath?: string): Promise<LocalPhas
 
   const instance = localWithEnv.instance as Record<string, unknown> | undefined;
   const instanceId = (instance?.id as string) || `${hostname()}-${randomUUID().slice(0, 8)}`;
-  const mode = ((instance?.mode as string) || 'platform') as 'platform' | 'hybrid' | 'independent';
+  const mode = ((instance?.mode as string) || 'platform') as OrchestratorMode;
 
   const server = localWithEnv.server as Record<string, unknown> | undefined;
   const port = (server?.port as number) || 4000;

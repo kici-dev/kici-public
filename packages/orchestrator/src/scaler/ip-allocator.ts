@@ -21,8 +21,20 @@
  * per-orch by design. No two orchs share an IP space.
  */
 
+import { createLogger, isPgUniqueViolation } from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
+
+const logger = createLogger({ prefix: 'ip-allocator' });
+
+/**
+ * Bound on consecutive `ip_allocations_pkey` conflict retries in
+ * `DbIpAllocator.allocate()`. Above any realistic concurrent-spawn fan-out —
+ * hitting it signals pathological contention, so it throws loudly rather than
+ * retrying unbounded. Internal robustness constant, not an operator-tunable
+ * setting.
+ */
+const MAX_ALLOC_CONFLICT_RETRIES = 16;
 
 /**
  * Result of a successful IP allocation.
@@ -233,25 +245,52 @@ export class DbIpAllocator implements IpAllocator {
   }
 
   async allocate(vmId: string, scalerName: string): Promise<IpAllocationResult> {
-    const allocations = await this.db.selectFrom('ip_allocations').select('ip').execute();
-    const allocatedSet = new Set(allocations.map((a) => a.ip));
-
-    const candidateIp = findFirstFreeIp(this.range, this.gatewayNum, (ip) => allocatedSet.has(ip));
-    const mac = generateMac(candidateIp);
+    // Loop-invariant: the TAP name derives only from vmId, so it's stable
+    // across retries (unlike the IP-derived MAC, which is re-picked per attempt).
     const tapDevice = generateTapName(vmId);
 
-    await this.db
-      .insertInto('ip_allocations')
-      .values({
-        ip: candidateIp,
-        vm_id: vmId,
-        scaler_name: scalerName,
-        tap_device: tapDevice,
-        mac_address: mac,
-      })
-      .execute();
+    for (let attempt = 1; attempt <= MAX_ALLOC_CONFLICT_RETRIES; attempt++) {
+      // Re-read every attempt: on a retry the winner's IP is now in the set,
+      // so findFirstFreeIp picks the next genuinely-free address.
+      const allocations = await this.db.selectFrom('ip_allocations').select('ip').execute();
+      const allocatedSet = new Set(allocations.map((a) => a.ip));
 
-    return { ip: candidateIp, gateway: this.gateway, netmask: this.netmask, mac, tapDevice };
+      const candidateIp = findFirstFreeIp(this.range, this.gatewayNum, (ip) =>
+        allocatedSet.has(ip),
+      );
+      const mac = generateMac(candidateIp);
+
+      try {
+        await this.db
+          .insertInto('ip_allocations')
+          .values({
+            ip: candidateIp,
+            vm_id: vmId,
+            scaler_name: scalerName,
+            tap_device: tapDevice,
+            mac_address: mac,
+          })
+          .execute();
+
+        return { ip: candidateIp, gateway: this.gateway, netmask: this.netmask, mac, tapDevice };
+      } catch (err) {
+        // A concurrent spawn won this IP between our SELECT and INSERT. Re-pick
+        // instead of surfacing a failed spawn. Any other error is real — rethrow.
+        if (isPgUniqueViolation(err, 'ip_allocations_pkey')) {
+          logger.debug(
+            `IP ${candidateIp} lost concurrent-allocation race ` +
+              `(attempt ${attempt}/${MAX_ALLOC_CONFLICT_RETRIES}); re-picking`,
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    throw new Error(
+      `IP allocation failed: ${MAX_ALLOC_CONFLICT_RETRIES} consecutive ip_allocations_pkey ` +
+        `conflicts (heavy concurrent allocation contention)`,
+    );
   }
 
   async release(vmId: string): Promise<void> {

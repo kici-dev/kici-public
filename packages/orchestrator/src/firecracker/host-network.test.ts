@@ -4,6 +4,7 @@ import {
   buildBridgeCommands,
   NM_CONF_PATH,
   NM_CONF_CONTENT,
+  FIRECRACKER_NET_INTERFACES,
   provisionBridge,
   verifyBridge,
   teardownBridge,
@@ -93,6 +94,15 @@ describe('buildBridgeCommands', () => {
     expect(flat.some((l) => l.includes('ip daddr 169.254.0.0/16 drop'))).toBe(true);
   });
 
+  it('accepts the FC subnet in DOCKER-USER (docker coexistence), idempotently', () => {
+    const flat = buildBridgeCommands(cfgA).map((c) => [c.bin, ...c.args].join(' '));
+    // Delete-then-insert, both directions, so a re-run does not stack duplicates.
+    expect(flat).toContain('iptables -D DOCKER-USER -s 10.0.0.0/24 -j ACCEPT');
+    expect(flat).toContain('iptables -I DOCKER-USER -s 10.0.0.0/24 -j ACCEPT');
+    expect(flat).toContain('iptables -D DOCKER-USER -d 10.0.0.0/24 -j ACCEPT');
+    expect(flat).toContain('iptables -I DOCKER-USER -d 10.0.0.0/24 -j ACCEPT');
+  });
+
   it('masquerades outbound on the host interface, source-scoped', () => {
     const flat = buildBridgeCommands(cfgA).map((c) => c.args.join(' '));
     expect(
@@ -111,7 +121,21 @@ describe('buildBridgeCommands', () => {
 describe('NetworkManager unmanaged conf', () => {
   it('targets the host-scoped kici-* interface pattern', () => {
     expect(NM_CONF_PATH).toBe('/etc/NetworkManager/conf.d/90-kici-unmanaged.conf');
-    expect(NM_CONF_CONTENT).toContain('unmanaged-devices=interface-name:kici-*');
+    // The += append operator is mandatory so this drop-in doesn't collide with
+    // other conf.d unmanaged-devices lines under NM's last-wins merge. See
+    // .claude/rules/networkmanager-unmanaged.md.
+    expect(NM_CONF_CONTENT).toContain('unmanaged-devices+=interface-name:kici-*');
+  });
+
+  it('renders every FIRECRACKER_NET_INTERFACES pattern with the += operator', () => {
+    // The watchdog derives its expected-pattern set from this constant, so every
+    // pattern it advertises must actually reach the rendered drop-in. Assert the
+    // constant is non-empty first: an empty list would make the loop below
+    // vacuously green while the drop-in silently rendered no unmanaged rule.
+    expect(FIRECRACKER_NET_INTERFACES.length).toBeGreaterThan(0);
+    for (const pattern of FIRECRACKER_NET_INTERFACES) {
+      expect(NM_CONF_CONTENT).toContain(`unmanaged-devices+=interface-name:${pattern}`);
+    }
   });
 });
 
@@ -259,7 +283,7 @@ describe('renderBootScript', () => {
     // onto a single comment line that NetworkManager ignores, leaving kici-*
     // interfaces NM-managed on reboot. Assert the real-newline structure and
     // that no literal backslash-n leaks into the conf body.
-    expect(script).toContain('[keyfile]\nunmanaged-devices=interface-name:kici-*');
+    expect(script).toContain('[keyfile]\nunmanaged-devices+=interface-name:kici-*');
     expect(script).not.toContain('[keyfile]\\nunmanaged-devices');
     // The whole NM_CONF_CONTENT lands verbatim somewhere in the script.
     expect(script).toContain(NM_CONF_CONTENT.replace(/\n$/, ''));

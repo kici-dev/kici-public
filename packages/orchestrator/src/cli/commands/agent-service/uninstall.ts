@@ -13,6 +13,7 @@ import type { Command } from 'commander';
 import {
   createServiceManager,
   detectPlatform,
+  InstanceNotFoundError,
   kiciConfigRoot,
   removeIndexEntry,
   resolveInstance,
@@ -91,6 +92,12 @@ export function registerAgentUninstall(agent: Command): void {
           `Manifest preserved at ${resolved.manifestPath} — delete manually if no longer needed.`,
         );
       } catch (err) {
+        if (err instanceof InstanceNotFoundError) {
+          console.log(
+            `Agent service "${err.instanceName}" is not installed — nothing to uninstall.`,
+          );
+          return;
+        }
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }

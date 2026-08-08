@@ -232,6 +232,21 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
         // atomic claim, a second claim would falsely mark the delivery a dupe.
         const outcome = await deps.onWebhook(info);
 
+        // Shed (admission control saturated): 429 + Retry-After, and crucially do
+        // NOT mark the idempotency key — the caller must be able to redeliver the
+        // same webhook and have it processed, not deduped away as a lost delivery.
+        if (outcome === WebhookIngestOutcome.enum.shed) {
+          c.header('Retry-After', '5');
+          return c.json(
+            {
+              rejected: true,
+              reason: 'Orchestrator busy, retry later',
+              deliveryId: info.deliveryId,
+            },
+            429,
+          );
+        }
+
         // 12. Record idempotency marker for the source-specific dedup window
         // (only meaningful for an actually-processed delivery).
         if (idempotencyKey && outcome !== WebhookIngestOutcome.enum.duplicate) {

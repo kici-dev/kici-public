@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { CheckMode, CheckStepOutcome } from '../../check-mode.js';
 import { actorPrincipalSchema } from './actor.js';
+import { dashboardSealedEnvelopeSchema } from './dashboard-sealed-write.js';
 import { agentRunResultSchema } from './agent-run-result.js';
 import { kiciBundleSchema } from '../../provenance/bundle.js';
 import {
@@ -9,7 +10,11 @@ import {
 } from './access-log.js';
 import { dashboardOrchLogsRequestSchema, dashboardOrchLogsResponseSchema } from './run-events.js';
 import { EventLogStatus, PayloadOmittedReason, EventLogSource } from './event-log.js';
-import { initFailureSchema, StepConcurrencyKind } from './execution-status.js';
+import {
+  initFailureSchema,
+  StepConcurrencyKind,
+  stateReplayRunSchema,
+} from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
 import { SourceOrigin } from '../source-origin.js';
 import { AttestationOrigin } from '../../provenance/attestation-origin.js';
@@ -18,6 +23,8 @@ import { ScalerBackendType } from '../../scaler/scaler-backend-type.js';
 import { HoldScope, ApprovalDecision, approverClauseSchema } from '../../approval/types.js';
 import { NeedsRunOn, OnUnreachableMode } from '../../trigger/types.js';
 import { HostTargetSelector } from '../../labels-match.js';
+import { ConcurrencyStrategy } from '../../context/concurrency-strategy.js';
+import { HeldRunStatus } from '../../context/held-run-status.js';
 import { HostInventoryEntry } from '../../inventory.js';
 import {
   globalWorkflowsGetRequestSchema,
@@ -64,6 +71,35 @@ export const dashboardRunStructuredResponseSchema = z.object({
   error: z.string().optional(),
 });
 export type DashboardRunStructuredResponse = z.infer<typeof dashboardRunStructuredResponseSchema>;
+
+/**
+ * Request the current mirror-projection state of a single run from the
+ * orchestrator. Unlike `dashboard.run.detail` (a user-plane read that
+ * access-logs), this is a **system reconciliation read**: the Platform's
+ * `RunMirrorReconciler` issues it for a run stuck non-terminal in the mirror to
+ * recover a terminal frame dropped on a live connection. The `actor` is always a
+ * `system` principal, and the orchestrator does NOT write an access-log row.
+ */
+export const dashboardRunStateRequestSchema = z.object({
+  type: z.literal('dashboard.run.state'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  runId: z.string(),
+});
+export type DashboardRunStateRequest = z.infer<typeof dashboardRunStateRequestSchema>;
+
+/**
+ * Response carrying the run's current `StateReplayRun` mirror-projection shape
+ * (the same shape `state.replay` carries), or `run: null` when the orchestrator
+ * has no such run. Consumed by `upsertRunMirror` on the Platform side.
+ */
+export const dashboardRunStateResponseSchema = z.object({
+  type: z.literal('dashboard.run.state.response'),
+  requestId: z.string(),
+  run: stateReplayRunSchema.nullable(),
+  error: z.string().optional(),
+});
+export type DashboardRunStateResponse = z.infer<typeof dashboardRunStateResponseSchema>;
 
 /** Request step logs from orchestrator. */
 export const dashboardStepLogsRequestSchema = z.object({
@@ -286,11 +322,69 @@ export const dashboardAttestationsListResponseSchema = z.object({
   type: z.literal('dashboard.attestations.list.response'),
   requestId: z.string(),
   attestations: z.array(attestationListItemSchema),
+  /**
+   * The provenance issuer that signs this orchestrator's attestations, when it
+   * owns signing (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`). The Platform surfaces
+   * it as `trustedIssuer` so the dashboard / CLI verify against the orchestrator
+   * that actually signed the bundles; absent → the Platform falls back to its own
+   * issuer (for historical Platform-signed bundles). Optional for backward
+   * compatibility with older orchestrators.
+   */
+  trustedIssuer: z.string().nullable().optional(),
   error: z.string().optional(),
 });
 export type DashboardAttestationsListResponse = z.infer<
   typeof dashboardAttestationsListResponseSchema
 >;
+
+// --- Artifacts list request/response (REST-over-WS proxy) ---
+//
+// Named, durable build artifacts uploaded by a run's jobs (`ctx.artifacts`).
+// Like the per-run attestations read, this is served by the customer
+// orchestrator and access-logged there; Platform proxies the request. Each item
+// carries a presigned GET URL (`downloadUrl`) the dashboard links directly, so
+// the artifact bytes never transit Platform.
+
+/** Request the named artifacts uploaded by a run. */
+export const dashboardArtifactsListRequestSchema = z.object({
+  type: z.literal('dashboard.artifacts.list'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  runId: z.string(),
+});
+export type DashboardArtifactsListRequest = z.infer<typeof dashboardArtifactsListRequestSchema>;
+
+/**
+ * Single artifact in the list response. `downloadUrl` is a presigned GET the
+ * dashboard links directly; it is omitted when the backing object could not be
+ * resolved (expired / missing), in which case the row still lists the metadata.
+ */
+export const artifactListItemSchema = z.object({
+  name: z.string(),
+  jobId: z.string(),
+  sizeBytes: z.number(),
+  sha256: z.string(),
+  createdAt: z.string(),
+  downloadUrl: z.string().optional(),
+});
+export type ArtifactListItem = z.infer<typeof artifactListItemSchema>;
+
+/** Response with the run's artifacts (correlates to dashboard.artifacts.list). */
+export const dashboardArtifactsListResponseSchema = z.object({
+  type: z.literal('dashboard.artifacts.list.response'),
+  requestId: z.string(),
+  artifacts: z.array(artifactListItemSchema),
+  /**
+   * Signature-validity window (seconds) of the presigned `downloadUrl`s in this
+   * response, from the storage backend's presigned-GET expiry; the dashboard
+   * refreshes the list on a fraction of it so a displayed link is never stale.
+   * Optional for backward compatibility with older orchestrators (mirrors
+   * `trustedIssuer`).
+   */
+  downloadUrlExpiresInSeconds: z.number().int().positive().optional(),
+  error: z.string().optional(),
+});
+export type DashboardArtifactsListResponse = z.infer<typeof dashboardArtifactsListResponseSchema>;
 
 // --- Org-wide attestations browser (search + browse) ---
 //
@@ -368,6 +462,8 @@ export const dashboardAttestationsListAllResponseSchema = z.object({
   page: z.number().int(),
   pageSize: z.number().int(),
   total: z.number().int(),
+  /** See `dashboardAttestationsListResponseSchema.trustedIssuer`. */
+  trustedIssuer: z.string().nullable().optional(),
   error: z.string().optional(),
 });
 export type DashboardAttestationsListAllResponse = z.infer<
@@ -624,6 +720,12 @@ const runCancelResponseSchema = z.object({
   type: z.literal('run.cancel.response'),
   requestId: z.string(),
   cancelledJobs: z.number().optional(),
+  /**
+   * True when the run was already terminal, so the cancel wrote nothing. Optional
+   * so an orchestrator that predates the field still parses: an absent value
+   * means "not reported", not "false".
+   */
+  alreadyTerminal: z.boolean().optional(),
   error: z.string().optional(),
 });
 
@@ -751,6 +853,39 @@ const dashboardEventLogDetailResponseSchema = z.object({
   type: z.literal('dashboard.event-log.detail.response'),
   requestId: z.string(),
   item: eventLogListItemSchema.optional(),
+  error: z.string().optional(),
+});
+
+/** Aggregate webhook-activity counts for a time window (org-scoped).
+ *  Powers the Runs-page misconfig strip + the `kici runs` hint. No payloads,
+ *  no repo identifiers — safe for all org members. */
+export const dashboardEventLogActivityRequestSchema = z.object({
+  type: z.literal('dashboard.event-log.activity'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  orgId: z.string(),
+  /** ISO timestamp lower bound (inclusive). */
+  fromTimestamp: z.string(),
+  /** ISO timestamp upper bound (exclusive). */
+  toTimestamp: z.string(),
+});
+
+/** Orchestrator-only bucketed counts over the window. `matched`/`unmatched`
+ *  distinguish a trigger-no-match delivery from one that produced a run — a
+ *  fact the Platform relay cannot compute (see the two-table architecture). */
+export const eventLogActivityCountsSchema = z.object({
+  total: z.number(),
+  matched: z.number(),
+  unmatched: z.number(),
+  lockfileMissing: z.number(),
+  lockfileCorrupt: z.number(),
+  failed: z.number(),
+});
+
+export const dashboardEventLogActivityResponseSchema = z.object({
+  type: z.literal('dashboard.event-log.activity.response'),
+  requestId: z.string(),
+  counts: eventLogActivityCountsSchema.optional(),
   error: z.string().optional(),
 });
 
@@ -959,7 +1094,6 @@ const dashboardEventDlqDiscardResponseSchema = z.object({
 // --- Context CRUD request/response (REST-over-WS proxy) ---
 
 const contextTypeSchema = z.enum(['fixed', 'glob']);
-const concurrencyStrategySchema = z.enum(['queue', 'cancel-pending']);
 
 // -- Contexts --
 
@@ -1031,7 +1165,7 @@ const contextGetResponseSchema = z.object({
       globPattern: z.string().nullable(),
       branchRestrictions: z.array(z.string()).nullable(),
       concurrencyLimit: z.number().nullable(),
-      concurrencyStrategy: concurrencyStrategySchema.nullable(),
+      concurrencyStrategy: ConcurrencyStrategy.nullable(),
       requiredReviewers: z.number().nullable(),
       waitTimerSeconds: z.number().nullable(),
       holdExpirySeconds: z.number().nullable(),
@@ -1053,11 +1187,19 @@ export const contextCreateRequestSchema = z.object({
   contextType: contextTypeSchema,
   globPattern: z.string().optional(),
   branchRestrictions: z.array(z.string()).optional(),
-  concurrencyLimit: z.number().optional(),
-  concurrencyStrategy: concurrencyStrategySchema.optional(),
+  // A concurrency limit must be a positive integer; `null`/omitted means
+  // unlimited. `0` (or a negative / fractional value) is rejected here because
+  // it wedges the workflow-install concurrency gate into an unreleasable hold.
+  concurrencyLimit: z.number().int().positive().optional(),
+  concurrencyStrategy: ConcurrencyStrategy.optional(),
   requiredReviewers: z.number().optional(),
   waitTimerSeconds: z.number().optional(),
-  holdExpirySeconds: z.number().optional(),
+  // A hold expiry must be a positive integer; `null`/omitted means "no explicit
+  // expiry" and resolves to `DEFAULT_HOLD_EXPIRY_SECONDS` on read. `0` (or a
+  // negative / fractional value) is rejected because it puts the hold's
+  // deadline at the instant the hold is created, so the stale detector expires
+  // it before a reviewer can act — cancelling the job the hold existed to gate.
+  holdExpirySeconds: z.number().int().positive().optional(),
   enabled: z.boolean().optional(),
 });
 
@@ -1079,11 +1221,17 @@ export const contextUpdateRequestSchema = z.object({
     contextType: contextTypeSchema.optional(),
     globPattern: z.string().nullable().optional(),
     branchRestrictions: z.array(z.string()).nullable().optional(),
-    concurrencyLimit: z.number().nullable().optional(),
-    concurrencyStrategy: concurrencyStrategySchema.nullable().optional(),
+    // Positive integer, or `null` for unlimited. `0`/negative/fractional is
+    // rejected — see the create-request schema above for why.
+    concurrencyLimit: z.number().int().positive().nullable().optional(),
+    concurrencyStrategy: ConcurrencyStrategy.nullable().optional(),
     requiredReviewers: z.number().nullable().optional(),
     waitTimerSeconds: z.number().nullable().optional(),
-    holdExpirySeconds: z.number().nullable().optional(),
+    // Positive integer, or `null` to clear the explicit expiry.
+    // `0`/negative/fractional is rejected — see the create-request schema above
+    // for why. Clearing is how the dashboard's emptied field is expressed, so
+    // `null` stays valid.
+    holdExpirySeconds: z.number().int().positive().nullable().optional(),
     enabled: z.boolean().optional(),
   }),
 });
@@ -1162,16 +1310,29 @@ const contextVarsListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Set (create or update) a variable on an context. */
-export const contextVarSetRequestSchema = z.object({
-  type: z.literal('dashboard.contexts.variables.set'),
-  requestId: z.string(),
-  actor: actorPrincipalSchema,
-  contextId: z.string(),
-  key: z.string(),
-  value: z.string(),
-  locked: z.boolean().optional(),
-});
+/**
+ * Set (create or update) a variable on an context.
+ *
+ * Under the `permissive` posture the browser sends the plaintext `value`.
+ * Under the `encrypted` posture it sends a `sealed` envelope instead (the value
+ * sealed to the orchestrator's X25519 key in the browser). Exactly one of
+ * `value` / `sealed` is present; `value` stays optional for backward
+ * compatibility with older dashboards that only ever send plaintext.
+ */
+export const contextVarSetRequestSchema = z
+  .object({
+    type: z.literal('dashboard.contexts.variables.set'),
+    requestId: z.string(),
+    actor: actorPrincipalSchema,
+    contextId: z.string(),
+    key: z.string(),
+    value: z.string().optional(),
+    sealed: dashboardSealedEnvelopeSchema.optional(),
+    locked: z.boolean().optional(),
+  })
+  .refine((m) => (m.value === undefined) !== (m.sealed === undefined), {
+    message: 'exactly one of value / sealed must be present',
+  });
 
 const contextVarSetResponseSchema = z.object({
   type: z.literal('dashboard.contexts.variables.set.response'),
@@ -1320,15 +1481,28 @@ const contextSecretsListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Set (create or update) a scoped secret. */
-export const contextSecretSetRequestSchema = z.object({
-  type: z.literal('dashboard.contexts.secrets.set'),
-  requestId: z.string(),
-  actor: actorPrincipalSchema,
-  scope: z.string(),
-  key: z.string(),
-  value: z.string(),
-});
+/**
+ * Set (create or update) a scoped secret.
+ *
+ * Under the `permissive` posture the browser sends the plaintext `value`.
+ * Under the `encrypted` posture it sends a `sealed` envelope instead (the value
+ * sealed to the orchestrator's X25519 key in the browser). Exactly one of
+ * `value` / `sealed` is present; `value` stays optional for backward
+ * compatibility with older dashboards that only ever send plaintext.
+ */
+export const contextSecretSetRequestSchema = z
+  .object({
+    type: z.literal('dashboard.contexts.secrets.set'),
+    requestId: z.string(),
+    actor: actorPrincipalSchema,
+    scope: z.string(),
+    key: z.string(),
+    value: z.string().optional(),
+    sealed: dashboardSealedEnvelopeSchema.optional(),
+  })
+  .refine((m) => (m.value === undefined) !== (m.sealed === undefined), {
+    message: 'exactly one of value / sealed must be present',
+  });
 
 const contextSecretSetResponseSchema = z.object({
   type: z.literal('dashboard.contexts.secrets.set.response'),
@@ -1408,7 +1582,7 @@ export const contextHistoryRequestSchema = z.object({
   offset: z.number().optional(),
 });
 
-const contextHistoryResponseSchema = z.object({
+export const contextHistoryResponseSchema = z.object({
   type: z.literal('dashboard.contexts.history.response'),
   requestId: z.string(),
   runs: z
@@ -1426,14 +1600,25 @@ const contextHistoryResponseSchema = z.object({
       }),
     )
     .optional(),
+  hasMore: z.boolean().optional(),
   error: z.string().optional(),
 });
 
 // -- Held runs --
 
-/** Status values for held runs (approval queue). */
-export const HeldRunStatus = z.enum(['pending', 'approved', 'rejected', 'expired']);
-export type HeldRunStatus = z.infer<typeof HeldRunStatus>;
+/**
+ * Known held-run statuses — the vocabulary the dashboard renders a labelled
+ * badge and a queue tab for, and the vocabulary a client may filter the list
+ * by. Defined in `context/held-run-status.ts` and re-exported here so the
+ * domain types and the wire schema cannot carry divergent copies; a parity test
+ * in the orchestrator asserts these options match every status it persists.
+ *
+ * This is deliberately NOT the wire type of the response field:
+ * `held_runs.status` is a plain-text column owned by a customer-deployed
+ * orchestrator, so the response carries `z.string()` (see
+ * `heldRunsListResponseSchema`) and this enum is what the UI switches on.
+ */
+export { HeldRunStatus } from '../../context/held-run-status.js';
 
 /** Queue type for held runs. */
 export const HeldRunQueueType = z.enum(['context', 'security']);
@@ -1447,6 +1632,14 @@ export const heldRunsListRequestSchema = z.object({
   status: HeldRunStatus.optional(),
   queueType: HeldRunQueueType.optional(),
   runId: z.string().optional(),
+  /**
+   * Narrow to a single hold by its `held_runs.id`. The Platform's held-run
+   * approval gate uses this to resolve one hold's `holdType` before deciding
+   * which permission the caller needs. Optional so an orchestrator that does
+   * not know the field still answers the request — the Platform then narrows
+   * client-side from the response.
+   */
+  heldRunId: z.string().optional(),
   /**
    * Target org the read must be scoped to, carried per-request by the Platform
    * (the validated `:orgId` path param). The orchestrator honors this over its
@@ -1471,9 +1664,40 @@ const heldRunsListResponseSchema = z.object({
         // FK ON DELETE SET NULL): terminal hold history outlives its env.
         contextId: z.string().nullable(),
         contextName: z.string().nullable(),
+        // Carries the gate vocabulary — `HoldType` in @kici-dev/engine, which
+        // the dashboard compares against. Two normalizations put it there, and
+        // both are needed: an orchestrator on a current version maps the
+        // persisted `held_runs.hold_type` through `normalizePersistedHoldType`
+        // before sending, which covers a row an older orchestrator wrote under
+        // a legacy spelling; and the dashboard normalizes again on receipt,
+        // which covers an orchestrator that is itself older than the mapping
+        // and therefore sends a legacy spelling verbatim.
+        //
+        // Kept `z.string()` for forward-compatibility with orchestrators that
+        // introduce new hold types: a strict enum would reject the entire
+        // relayed held-runs message on one unknown value. An unrecognised value
+        // renders as a neutral badge carrying the raw string.
         holdType: z.string(),
-        queueType: HeldRunQueueType,
-        status: HeldRunStatus,
+        // Kept `z.string()` for the same reason as `holdType` above: both
+        // mirror plain-text columns (`held_runs.queue_type` /
+        // `held_runs.status`, each `Generated<string>`) whose vocabulary a
+        // customer-deployed orchestrator owns and can extend ahead of us.
+        //
+        // A strict enum here does NOT degrade one row — it fails the whole
+        // relayed message, and because `dashboard.held-runs.list.response` is a
+        // type the Platform recognizes, the relay treats that failure as
+        // malformed rather than version skew and CLOSES the orchestrator's
+        // WebSocket (`packages/platform/src/ws/handler.ts`). That is exactly
+        // what `released` did: one released wait-timer hold dropped the whole
+        // control-plane connection, in a reconnect loop.
+        //
+        // The known vocabularies are `HeldRunQueueType` and `HeldRunStatus`,
+        // which the dashboard compares against; any other value renders as a
+        // neutral badge carrying the raw string. The REQUEST-side filters stay
+        // strict enums — a client-supplied filter with a typo should be
+        // rejected, not silently matched against nothing.
+        queueType: z.string(),
+        status: z.string(),
         requestedAt: z.coerce.string(),
         resolvedAt: z.coerce.string().nullable(),
         resolvedBy: z.string().nullable(),
@@ -2302,11 +2526,13 @@ export type TestRelayRequest =
 export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   dashboardRunDetailRequestSchema,
   dashboardRunStructuredRequestSchema,
+  dashboardRunStateRequestSchema,
   dashboardStepLogsRequestSchema,
   dashboardAttestationsListRequestSchema,
   dashboardAttestationsListAllRequestSchema,
   dashboardAttestationGetRequestSchema,
   dashboardAttestationRetryRequestSchema,
+  dashboardArtifactsListRequestSchema,
   dashboardRunsListRequestSchema,
   dashboardRunsFiltersRequestSchema,
   dashboardSourcesListRequestSchema,
@@ -2373,6 +2599,7 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   backendTestRequestSchema,
   // Inbound webhook delivery log
   dashboardEventLogListRequestSchema,
+  dashboardEventLogActivityRequestSchema,
   dashboardEventLogDetailRequestSchema,
   dashboardEventLogPayloadStreamRequestSchema,
   // Event DLQ (per-org)
@@ -2397,11 +2624,13 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
 export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   dashboardRunDetailResponseSchema,
   dashboardRunStructuredResponseSchema,
+  dashboardRunStateResponseSchema,
   dashboardStepLogsResponseSchema,
   dashboardAttestationsListResponseSchema,
   dashboardAttestationsListAllResponseSchema,
   dashboardAttestationGetResponseSchema,
   dashboardAttestationRetryResponseSchema,
+  dashboardArtifactsListResponseSchema,
   dashboardRunsListResponseSchema,
   dashboardRunsFiltersResponseSchema,
   dashboardSourcesListResponseSchema,
@@ -2468,6 +2697,7 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   backendTestResponseSchema,
   // Inbound webhook delivery log
   dashboardEventLogListResponseSchema,
+  dashboardEventLogActivityResponseSchema,
   dashboardEventLogDetailResponseSchema,
   dashboardEventLogPayloadChunkSchema,
   // Event DLQ (per-org)
@@ -2502,6 +2732,13 @@ export type DashboardPlatformToOrchMessage = z.infer<typeof dashboardPlatformToO
 export type EventLogListItem = z.infer<typeof eventLogListItemSchema>;
 export type DashboardEventLogListRequest = z.infer<typeof dashboardEventLogListRequestSchema>;
 export type DashboardEventLogListResponse = z.infer<typeof dashboardEventLogListResponseSchema>;
+export type EventLogActivityCounts = z.infer<typeof eventLogActivityCountsSchema>;
+export type DashboardEventLogActivityRequest = z.infer<
+  typeof dashboardEventLogActivityRequestSchema
+>;
+export type DashboardEventLogActivityResponse = z.infer<
+  typeof dashboardEventLogActivityResponseSchema
+>;
 export type DashboardEventLogDetailRequest = z.infer<typeof dashboardEventLogDetailRequestSchema>;
 export type DashboardEventLogDetailResponse = z.infer<typeof dashboardEventLogDetailResponseSchema>;
 export type DashboardEventLogPayloadStreamRequest = z.infer<
@@ -2686,13 +2923,21 @@ export const runListItemSchema = z.object({
 });
 export type RunListItem = z.infer<typeof runListItemSchema>;
 
-/** Paginated run list response envelope. */
+/**
+ * Cursor-paginated run list response envelope.
+ *
+ * Keyset (cursor) pagination: `nextCursor` fetches the next (older) page,
+ * `prevCursor` the previous (newer) page — both opaque, `null` when there is no
+ * such page. `hasMore` is true when an older page exists. `approxTotal` is a
+ * cached, approximate match count for the "~N runs" label (not an exact total).
+ */
 export const runListResponseSchema = z.object({
   runs: z.array(runListItemSchema),
-  total: z.number(),
-  page: z.number(),
-  pageSize: z.number(),
+  nextCursor: z.string().nullable(),
+  prevCursor: z.string().nullable(),
   hasMore: z.boolean(),
+  approxTotal: z.number(),
+  pageSize: z.number(),
 });
 export type RunListResponse = z.infer<typeof runListResponseSchema>;
 
@@ -2750,11 +2995,25 @@ const diagnosticsInfraOrchestratorSchema = z.object({
    * Self-reported deployment shape, used by the dashboard to build the correct
    * per-orchestrator kici-admin invocation. Orchestrators that never reported
    * it serialize as `mode: 'unknown'` with null container fields.
+   *
+   * `adminInvocation` is a shell command, not a pair of raw paths: either half
+   * is single-quoted when its path holds whitespace, so it is rendered verbatim
+   * and a reader that wants the shim path back has to split it as shell words
+   * rather than on the last space.
+   *
+   * `adminPath` is the `windows` counterpart: the RAW, unquoted path of the
+   * `kici-admin.cmd` launcher, null for every other mode and whenever it could
+   * not be located. It is deliberately not a command — cmd.exe runs a
+   * double-quoted path in command position while PowerShell only prints it, so
+   * the renderer has to quote it per shell and a pre-quoted value would take
+   * that choice away.
    */
   deployment: z.object({
     mode: DeploymentModeSchema,
     containerName: z.string().nullable(),
     containerRuntime: DeploymentContainerRuntimeSchema.nullable(),
+    adminInvocation: z.string().nullable(),
+    adminPath: z.string().nullable(),
   }),
   s3LogAccess: z.boolean().nullable().optional(),
   agentCount: z.number(),
@@ -2788,11 +3047,22 @@ const diagnosticsInfraOrchestratorSchema = z.object({
     .optional(),
   error: z.string().optional(),
 });
-const diagnosticsInfraAlertSchema = z.object({
+/**
+ * A single infrastructure health alert.
+ *
+ * Both vocabulary fields are `z.string()` on purpose. `InfraAlertType` and
+ * `InfraAlertSeverity` (`diagnostics/infra-alert.ts`) name the *known*
+ * vocabulary the producer mints from and the read-side consumers colour by; the
+ * wire stays permissive because the `kici` CLI hard-parses this response while
+ * pinned to an older version than the hosted Platform it is talking to. A
+ * strict enum would fail the whole response rather than degrade one row.
+ */
+export const diagnosticsInfraAlertSchema = z.object({
   type: z.string(),
   message: z.string(),
   severity: z.string(),
 });
+export type DiagnosticsInfraAlert = z.infer<typeof diagnosticsInfraAlertSchema>;
 export const diagnosticsInfrastructureResponseSchema = z.object({
   orchestrators: z.array(diagnosticsInfraOrchestratorSchema),
   alerts: z.array(diagnosticsInfraAlertSchema),

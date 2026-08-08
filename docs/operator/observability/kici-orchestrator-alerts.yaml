@@ -1,0 +1,153 @@
+# KiCI orchestrator starter alert rules.
+#
+# Drop-in Prometheus / Grafana-Mimir ruler rules for a self-hosted KiCI
+# orchestrator. Every expression references a metric the orchestrator already
+# exports (prefix kici_orch_), so this file works against a Prometheus that
+# scrapes your orchestrator's /metrics endpoint with no extra wiring.
+#
+# Thresholds are deployment-size-dependent starting points — tune
+# QueueDepthSaturated and JobConsecutiveFailures to your workload. Wire this
+# file into your Prometheus `rule_files:` (or your Grafana / Mimir ruler) and
+# point the alerts at your notification channel.
+#
+# Threshold rationale is documented per rule below and, in table form, in the
+# "Orchestrator monitoring pack" operator doc.
+groups:
+  - name: kici-orchestrator
+    interval: 30s
+    rules:
+      # Pending dispatch should drain as agents pick jobs up. A sustained
+      # backlog means the scaler is starved or stuck. 50 is a starting point —
+      # tune it to your fleet size.
+      - alert: QueueDepthSaturated
+        expr: kici_orch_dispatch_queue_depth{status="pending"} > 50
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Dispatch queue pending depth above 50 for 10m'
+          description: >-
+            Pending jobs have exceeded 50 for over 10 minutes. Agents may not be
+            spawning (check scaler caps and spawn failures) or are stuck.
+
+      # No agents while work is queued is a hard stall — jobs cannot run. This
+      # also covers a lost connection to the hosted Platform: if the relay is
+      # down and the fleet drains, queued work sits with nothing to run it.
+      - alert: AgentsAllGoneWithBacklog
+        expr: (sum(kici_orch_agents_active) == 0) and (sum(kici_orch_dispatch_queue_depth{status="pending"}) > 0)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'No active agents while jobs are queued (10m+)'
+          description: >-
+            Zero agents are connected but pending jobs exist. The scaler is not
+            producing agents, or the orchestrator has lost its connection to the
+            hosted Platform. Check scaler spawn failures and backend health.
+
+      # Any stale run is a signal; 15m avoids flapping on transient detection.
+      - alert: StaleRunsPresent
+        expr: kici_orch_stale_runs_current > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Stale runs detected (15m+)'
+          description: >-
+            The stale-run detector is reporting runs whose agent stopped
+            heartbeating. Investigate agent and network health.
+
+      # DLQ rows never TTL-clean, so growth (not standing depth) is the pager.
+      - alert: EventDLQGrowing
+        expr: increase(kici_orch_event_dlq_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Events moved to the DLQ in the last hour'
+          description: >-
+            One or more internal events exhausted their retry budget and landed
+            in the DLQ. Triage them with the kici-admin event-dlq list command.
+
+      # Standing DLQ depth is a todo, not a pager — info severity.
+      - alert: EventDLQBacklog
+        expr: kici_orch_event_dlq_depth > 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: 'DLQ has standing entries (30m+)'
+          description: >-
+            The DLQ depth has been non-zero for over 30 minutes. DLQ rows are not
+            cleaned by TTL — retry or discard them with the kici-admin event-dlq
+            command.
+
+      # Any spawn failure means some jobs cannot get an agent.
+      - alert: ScalerSpawnFailing
+        expr: increase(kici_orch_scaler_spawn_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Scaler agent spawn failures in the last 15m'
+          description: >-
+            The scaler failed to spawn one or more agents. Check the backend
+            (container runtime, bare-metal host, or Firecracker) and resource
+            caps.
+
+      # A handler failing 3+ times in a row is a stuck job, not a blip.
+      - alert: JobConsecutiveFailures
+        expr: kici_orch_job_consecutive_failures > 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'A scheduled job has failed 3+ times consecutively'
+          description: >-
+            A scheduled orchestrator job is failing repeatedly. Inspect the job
+            and its last error.
+
+      # A declared (static roster) host that is unreachable cannot take work.
+      - alert: DeclaredHostUnreachable
+        expr: kici_orch_declared_hosts_unreachable > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Declared roster host unreachable (10m+)'
+          description: >-
+            One or more statically-declared agent hosts are unreachable. Check
+            host power, network, and the agent process.
+
+      # Collation drift can silently hide present rows from text-index lookups.
+      - alert: DbCollationDrift
+        expr: kici_orch_db_collation_drift > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Orchestrator database collation drift detected'
+          description: >-
+            The orchestrator database stamped collation version differs from the
+            running libc. Text b-tree indexes may miss present rows. Reindex
+            after aligning the collation version.
+
+      # The orchestrator gave up replaying its run state to the Platform after
+      # repeated rejections. It is connected, but the Platform's run mirror for
+      # this org is knowingly stale — and that mirror is what usage counting
+      # reads. `increase(...[15m])` stays true for a full 15m after a trip, so
+      # the alert survives Alertmanager's group_wait rather than resolving
+      # before the first flush.
+      - alert: StateReplayBreakerOpen
+        expr: increase(kici_orch_state_replay_breaker_trips_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'State replay breaker opened — run mirror is knowingly stale'
+          description: >-
+            The orchestrator stopped sending its reconnect state replay after 3
+            consecutive replay-attributed disconnects and connected without it.
+            The Platform run mirror for this org is stale and usage counts may
+            undercount until a replay succeeds. Check orchestrator logs for
+            'state replay' validation errors.

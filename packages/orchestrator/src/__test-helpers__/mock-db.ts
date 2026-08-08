@@ -36,6 +36,9 @@ export interface MockDbOptions {
   /** Row returned by update chains ending in .returningAll().executeTakeFirstOrThrow() or executeTakeFirst(). Default: undefined */
   updatedRow?: unknown;
 
+  /** Rows returned by update chains ending in .returningAll().execute(). Default: [] */
+  updatedRows?: unknown[];
+
   /** Row returned by update chains ending in .returning(...).executeTakeFirst(). Default: undefined */
   updateReturning?: unknown;
 
@@ -109,6 +112,76 @@ export interface MockDbMocks {
 
 // ── Builder ──────────────────────────────────────────────────────
 
+/** Default row a `.returning(...)` / `.returningAll()` insert chain resolves to. */
+const DEFAULT_INSERT_ROW = { id: 'mock-id' };
+
+/**
+ * Resolve the `insertReturning` option, honoring an explicit `undefined` (models
+ * a RETURNING chain yielding zero rows — e.g. ON CONFLICT DO NOTHING skipped the
+ * insert). A destructuring default would collapse explicit undefined back to the
+ * default row, hiding the no-row case.
+ */
+function resolveInsertReturning(options: MockDbOptions): unknown {
+  return 'insertReturning' in options ? options.insertReturning : DEFAULT_INSERT_ROW;
+}
+
+/** The `createMockDb` options the update chain reads. */
+interface UpdateChainOptions {
+  updatedRow: unknown;
+  updatedRows: unknown[];
+  updateReturning: unknown;
+  updateResult: { numUpdatedRows: bigint };
+}
+
+/**
+ * Build the `updateTable().set().where()…` chain.
+ *
+ * Split out of `createMockDb` so the builder stays inside the function-length
+ * cap; the returned handles are wired into the `mocks` bag unchanged.
+ */
+function buildUpdateChain(opts: UpdateChainOptions): Record<string, any> {
+  const updateExecute = vi.fn().mockResolvedValue(opts.updateResult);
+  const updateExecuteTakeFirst = vi.fn().mockResolvedValue(opts.updateResult);
+  const updateExecuteTakeFirstOrThrow = vi
+    .fn()
+    .mockResolvedValue(opts.updatedRow ?? opts.updateResult);
+
+  const updateReturningAll = vi.fn().mockReturnValue({
+    executeTakeFirstOrThrow: updateExecuteTakeFirstOrThrow,
+    executeTakeFirst: vi.fn().mockResolvedValue(opts.updatedRow),
+    execute: vi.fn().mockResolvedValue(opts.updatedRows),
+  });
+
+  const updateReturningFn = vi.fn().mockReturnValue({
+    executeTakeFirst: vi.fn().mockResolvedValue(opts.updateReturning),
+    execute: vi
+      .fn()
+      .mockResolvedValue(opts.updateReturning === undefined ? [] : [opts.updateReturning]),
+  });
+
+  const updateTerminal: Record<string, any> = {
+    execute: updateExecute,
+    executeTakeFirst: updateExecuteTakeFirst,
+    returningAll: updateReturningAll,
+    returning: updateReturningFn,
+    where: vi.fn(),
+  };
+  updateTerminal.where = vi.fn().mockReturnValue(updateTerminal);
+
+  const updateSet = vi.fn().mockReturnValue(updateTerminal);
+  const updateTable = vi.fn().mockReturnValue({ set: updateSet });
+
+  return {
+    updateTable,
+    updateSet,
+    updateTerminal,
+    updateReturningAll,
+    updateExecute,
+    updateExecuteTakeFirst,
+    updateExecuteTakeFirstOrThrow,
+  };
+}
+
 /**
  * Create a mock Kysely DB instance for orchestrator unit tests.
  *
@@ -127,15 +200,16 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   const {
     selectRows = [],
     selectFirstRow = undefined,
-    insertedRow = { id: 'mock-id' },
-    insertReturning = { id: 'mock-id' },
+    insertedRow = DEFAULT_INSERT_ROW,
     updatedRow = undefined,
+    updatedRows = [],
     updateReturning = undefined,
     updateResult = { numUpdatedRows: 0n },
     deleteResult = { numDeletedRows: 0n },
     countResult = { count: 0 },
     insertResult = undefined,
   } = options;
+  const insertReturning = resolveInsertReturning(options);
 
   // ── Select chain ─────────────────────────────────────────────
   const selectExecute = vi.fn().mockResolvedValue(selectRows);
@@ -267,32 +341,15 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   const insertInto = vi.fn().mockReturnValue({ values: insertValues });
 
   // ── Update chain ─────────────────────────────────────────────
-  const updateExecute = vi.fn().mockResolvedValue(updateResult);
-  const updateExecuteTakeFirst = vi.fn().mockResolvedValue(updateResult);
-  const updateExecuteTakeFirstOrThrow = vi.fn().mockResolvedValue(updatedRow ?? updateResult);
-
-  const updateReturningAll = vi.fn().mockReturnValue({
-    executeTakeFirstOrThrow: updateExecuteTakeFirstOrThrow,
-    executeTakeFirst: vi.fn().mockResolvedValue(updatedRow),
-  });
-
-  const updateReturningExecuteTakeFirst = vi.fn().mockResolvedValue(updateReturning);
-  const updateReturningFn = vi.fn().mockReturnValue({
-    executeTakeFirst: updateReturningExecuteTakeFirst,
-    execute: vi.fn().mockResolvedValue(updateReturning === undefined ? [] : [updateReturning]),
-  });
-
-  const updateTerminal: Record<string, any> = {
-    execute: updateExecute,
-    executeTakeFirst: updateExecuteTakeFirst,
-    returningAll: updateReturningAll,
-    returning: updateReturningFn,
-    where: vi.fn(),
-  };
-  updateTerminal.where = vi.fn().mockReturnValue(updateTerminal);
-
-  const updateSet = vi.fn().mockReturnValue(updateTerminal);
-  const updateTable = vi.fn().mockReturnValue({ set: updateSet });
+  const {
+    updateTable,
+    updateSet,
+    updateTerminal,
+    updateReturningAll,
+    updateExecute,
+    updateExecuteTakeFirst,
+    updateExecuteTakeFirstOrThrow,
+  } = buildUpdateChain({ updatedRow, updatedRows, updateReturning, updateResult });
 
   // ── Delete chain ─────────────────────────────────────────────
   const deleteExecute = vi.fn().mockResolvedValue([deleteResult]);

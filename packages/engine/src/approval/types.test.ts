@@ -2,10 +2,23 @@ import { describe, it, expect } from 'vitest';
 import {
   approverClauseSchema,
   approvalRequirementSchema,
+  approvalTimeoutSecondsSchema,
   ApprovalDecision,
   HoldScope,
   TriggerSource,
 } from './types.js';
+
+describe('approvalTimeoutSecondsSchema', () => {
+  it('accepts a positive integer', () => {
+    expect(approvalTimeoutSecondsSchema.safeParse(3600).success).toBe(true);
+    expect(approvalTimeoutSecondsSchema.safeParse(1).success).toBe(true);
+  });
+  it('rejects zero, negatives, non-integers, and non-finite', () => {
+    for (const bad of [0, -1, -3600, 1.5, Infinity, -Infinity, NaN]) {
+      expect(approvalTimeoutSecondsSchema.safeParse(bad).success).toBe(false);
+    }
+  });
+});
 
 describe('approval types', () => {
   it('approverClauseSchema accepts team and user clauses', () => {

@@ -93,6 +93,14 @@ Workflow steps can emit custom events via `ctx.emit()`. Emitted events are deliv
 ### ctx.emit(eventName, payload?, options?)
 
 ```typescript
+// Typed — a defineEvent() definition drives payload type-checking
+emit<T extends z.ZodTypeAny>(
+  definition: EventDefinition<T>,
+  payload: z.infer<T>,
+  options?: EventEmitOptions,
+): Promise<{ deliveryId: string }>;
+
+// Ad-hoc — event name string, payload typed as Record<string, unknown>
 emit(
   eventName: string,
   payload?: Record<string, unknown>,
@@ -102,17 +110,30 @@ emit(
 
 **Parameters:**
 
-| Parameter        | Type                      | Required | Description                                   |
-| ---------------- | ------------------------- | -------- | --------------------------------------------- |
-| `eventName`      | `string`                  | yes      | Name of the event to emit                     |
-| `payload`        | `Record<string, unknown>` | no       | Event payload data                            |
-| `options.target` | `{ repos?: string[] }`    | no       | Target specific repos for cross-repo delivery |
+| Parameter        | Type                      | Required | Description                                                                  |
+| ---------------- | ------------------------- | -------- | ---------------------------------------------------------------------------- |
+| `definition`     | `EventDefinition<T>`      | —        | A `defineEvent()` definition; its Zod schema types `payload` as `z.infer<T>` |
+| `eventName`      | `string`                  | yes      | Name of the event to emit                                                    |
+| `payload`        | `Record<string, unknown>` | no       | Event payload data                                                           |
+| `options.target` | `{ repos?: string[] }`    | no       | Target specific repos for cross-repo delivery                                |
 
 **Returns:** `Promise<{ deliveryId: string }>` -- a delivery receipt after the event is persisted and routed.
 
 **Examples:**
 
 ```typescript
+// Typed emit — payload is checked against the deploy-complete schema
+import { defineEvent, z } from '@kici-dev/sdk';
+
+const deployComplete = defineEvent(
+  'deploy-complete',
+  z.object({ env: z.string(), version: z.string() }),
+);
+
+step('notify-typed', async (ctx) => {
+  await ctx.emit(deployComplete, { env: 'prod', version: '1.2.3' });
+});
+
 // Emit a simple event
 step('notify', async (ctx) => {
   await ctx.emit('deploy-complete', { env: 'prod', version: '1.2.3' });

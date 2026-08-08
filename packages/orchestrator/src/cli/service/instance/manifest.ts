@@ -136,3 +136,61 @@ export function resolveVersionFromLaunchSpec(
   }
   return null;
 }
+
+/**
+ * The global npm package + node runtime an npm-source upgrade must install
+ * into, derived from a unit's launch spec. `owningPackage` is the top-level
+ * global package whose ExecStart the unit runs — `kici-admin` when the
+ * component is loaded through its nested node_modules, or `@kici-dev/<component>`
+ * for a standalone install. `npmPath` is the npm co-located with the unit's
+ * pinned node, so `npm install -g` with it lands in exactly the prefix
+ * ExecStart resolves from, regardless of the shell's active node.
+ */
+export interface NpmInstallTarget {
+  nodeExecPath: string;
+  npmPath: string;
+  owningPackage: string;
+}
+
+export function resolveNpmInstallTarget(
+  spec: LaunchSpec,
+  component: Component,
+  opts: { windows: boolean },
+): NpmInstallTarget | null {
+  const entryRe = new RegExp(
+    `[/\\\\]@kici-dev[/\\\\]${component}[/\\\\]dist[/\\\\](?:server|standalone)\\.js$`,
+  );
+  const entry = [spec.execPath, ...spec.args].find((a) => entryRe.test(a));
+  if (!entry) return null;
+
+  const owningPackage = firstGlobalPackage(entry);
+  if (!owningPackage) return null;
+
+  // Resolve npm next to the pinned node using the target platform's path
+  // semantics — a posix host must still produce `C:\node\npm.cmd` for a
+  // Windows unit (and vice versa), so pick the path flavor from `opts.windows`
+  // rather than the host's default `path`.
+  const p = opts.windows ? path.win32 : path.posix;
+  const npmBin = opts.windows ? 'npm.cmd' : 'npm';
+  const npmPath = p.join(p.dirname(spec.execPath), npmBin);
+  return { nodeExecPath: spec.execPath, npmPath, owningPackage };
+}
+
+/**
+ * Given an entry-script path inside a global install, return the package
+ * directly under the FIRST `node_modules` segment (the global root's
+ * node_modules) — the package `npm install -g <pkg>` must target. Scoped
+ * packages (`@scope/name`) are returned as two segments. Null when the path
+ * has no `node_modules` segment.
+ */
+function firstGlobalPackage(entry: string): string | null {
+  const segments = entry.split(/[/\\]/);
+  const idx = segments.indexOf('node_modules');
+  if (idx === -1 || idx + 1 >= segments.length) return null;
+  const first = segments[idx + 1]!;
+  if (first.startsWith('@')) {
+    if (idx + 2 >= segments.length) return null;
+    return `${first}/${segments[idx + 2]}`;
+  }
+  return first;
+}

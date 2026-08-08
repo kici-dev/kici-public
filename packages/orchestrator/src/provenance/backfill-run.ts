@@ -17,6 +17,7 @@ export interface BackfillRunRow {
   run_id: string;
   workflow_name: string;
   status: string;
+  routing_key: string | null;
   repo_identifier: string | null;
   provider: string | null;
   local_working_tree: boolean | null;
@@ -67,6 +68,7 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
     runId: run.run_id,
     workflowName: run.workflow_name,
     status: run.status,
+    ...(run.routing_key ? { routingKey: run.routing_key } : {}),
     ...(run.repo_identifier ? { repoIdentifier: run.repo_identifier } : {}),
     ...(run.provider ? { repoProvider: run.provider } : {}),
     ...(run.local_working_tree != null ? { localWorkingTree: run.local_working_tree } : {}),

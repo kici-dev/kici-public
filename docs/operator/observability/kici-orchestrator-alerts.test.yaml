@@ -1,0 +1,97 @@
+rule_files:
+  - kici-orchestrator-alerts.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # QueueDepthSaturated fires when pending depth stays above 50 for 10m.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_dispatch_queue_depth{status="pending"}'
+        values: '60x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: QueueDepthSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              status: pending
+            exp_annotations:
+              summary: 'Dispatch queue pending depth above 50 for 10m'
+              description: 'Pending jobs have exceeded 50 for over 10 minutes. Agents may not be spawning (check scaler caps and spawn failures) or are stuck.'
+
+  # AgentsAllGoneWithBacklog fires when there are zero agents but pending work.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_agents_active'
+        values: '0x15'
+      - series: 'kici_orch_dispatch_queue_depth{status="pending"}'
+        values: '3x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: AgentsAllGoneWithBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: 'No active agents while jobs are queued (10m+)'
+              description: 'Zero agents are connected but pending jobs exist. The scaler is not producing agents, or the orchestrator has lost its connection to the hosted Platform. Check scaler spawn failures and backend health.'
+
+  # StaleRunsPresent does NOT fire while the gauge sits at 0 (negative test).
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_stale_runs_current'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: StaleRunsPresent
+        exp_alerts: []
+
+  # EventDLQGrowing fires the moment the DLQ counter increases within the hour.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_event_dlq_total'
+        values: '0 0 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: EventDLQGrowing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Events moved to the DLQ in the last hour'
+              description: 'One or more internal events exhausted their retry budget and landed in the DLQ. Triage them with the kici-admin event-dlq list command.'
+
+  # ScalerSpawnFailing fires on any spawn-failure increase in the last 15m.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_spawn_failures_total'
+        values: '0 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: ScalerSpawnFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Scaler agent spawn failures in the last 15m'
+              description: 'The scaler failed to spawn one or more agents. Check the backend (container runtime, bare-metal host, or Firecracker) and resource caps.'
+
+  # StateReplayBreakerOpen fires when the trip counter increments, and stops
+  # once the counter has been flat for the whole 15m window.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_state_replay_breaker_trips_total'
+        values: '0x5 1x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: StateReplayBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'State replay breaker opened — run mirror is knowingly stale'
+              description: "The orchestrator stopped sending its reconnect state replay after 3 consecutive replay-attributed disconnects and connected without it. The Platform run mirror for this org is stale and usage counts may undercount until a replay succeeds. Check orchestrator logs for 'state replay' validation errors."
+      - eval_time: 30m
+        alertname: StateReplayBreakerOpen
+        exp_alerts: []

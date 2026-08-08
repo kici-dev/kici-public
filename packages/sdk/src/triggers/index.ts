@@ -21,6 +21,7 @@ export { watch } from './watch.js';
 export { webhook } from './webhook.js';
 export { kiciEvent } from './kici-event.js';
 export { workflowComplete } from './workflow-complete.js';
+export { workflowsFailedBatch } from './workflows-failed-batch.js';
 export { jobComplete } from './job-complete.js';
 export { genericWebhook } from './generic-webhook.js';
 export { schedule } from './schedule.js';
@@ -84,6 +85,8 @@ export type {
   WorkflowCompleteConfigInput,
   WorkflowCompleteTriggerConfig,
   WorkflowCompleteStatus,
+  WorkflowsFailedBatchConfigInput,
+  WorkflowsFailedBatchTriggerConfig,
   JobCompleteConfigInput,
   JobCompleteTriggerConfig,
   JobCompleteStatus,

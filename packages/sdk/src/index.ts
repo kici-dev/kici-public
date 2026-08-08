@@ -34,6 +34,7 @@ export {
   webhook,
   kiciEvent,
   workflowComplete,
+  workflowsFailedBatch,
   jobComplete,
   genericWebhook,
   schedule,
@@ -97,6 +98,8 @@ export type {
   WorkflowCompleteConfigInput,
   WorkflowCompleteTriggerConfig,
   WorkflowCompleteStatus,
+  WorkflowsFailedBatchConfigInput,
+  WorkflowsFailedBatchTriggerConfig,
   JobCompleteConfigInput,
   JobCompleteTriggerConfig,
   JobCompleteStatus,
@@ -120,6 +123,8 @@ export type { HookConfig, HookFn, HookInput, HookContext, OutcomeMetadata } from
 // Rule factories
 export { rule, skip, onlyOnFirstHost, onlyOnLastHost, onlyOnFanoutIndex } from './rules/index.js';
 export { evaluateRules } from './rules/index.js';
+export { createRuleContext, ChangedFilesUnavailableError } from './rules/index.js';
+export type { CreateRuleContextInput } from './rules/index.js';
 export { isEventType } from './rules/index.js';
 export type {
   Rule,
@@ -225,6 +230,8 @@ export type { UpstreamSnapshot, NeedsContext, NeedEntry, GroupNeedEntry } from '
 export { CacheSpecSchema, normalizeCacheSpecs } from './cache-types.js';
 export type { CacheSpec, CacheInput } from './cache-types.js';
 export type { CacheRestoreResult, CacheApi } from './cache-types.js';
+export { ArtifactNameSchema, ARTIFACT_NAME_MAX_LENGTH } from './artifacts-types.js';
+export type { ArtifactsApi, ArtifactResult } from './artifacts-types.js';
 export { provenanceSubjectIsPath } from './provenance-types.js';
 export type {
   AttestProvenanceOptions,
@@ -318,7 +325,7 @@ export { isStaticArray, isStaticObject, isDynamicFunction } from './matrix/index
 export { expandMatrix, applyIncludeExclude } from './matrix/index.js';
 
 // Event definitions
-export { defineEvent } from './events/index.js';
+export { defineEvent, isEventDefinition } from './events/index.js';
 export type { EventDefinition } from './events/index.js';
 export type { EventEmitOptions } from './events/index.js';
 
@@ -337,6 +344,11 @@ export type { WaitForOptions, WaitForResult } from './wait-for.js';
 // Host-restart steps
 export { waitForHostAlive, restartHost } from './host-restart.js';
 export type { WaitForHostAliveOptions, RestartHostOptions } from './host-restart.js';
+export { agentVersionConverge } from './fleet/agent-version-converge.js';
+export type {
+  AgentVersionConvergeOptions,
+  AgentVersionDrift,
+} from './fleet/agent-version-converge.js';
 
 // Zod re-export for event schema authoring
 export { z } from 'zod';

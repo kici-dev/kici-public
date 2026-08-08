@@ -10,11 +10,17 @@
 
 import { createLogger, sha256 } from '@kici-dev/shared';
 import type { CacheStorage } from '../storage/types.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 const logger = createLogger({ prefix: 'dep-cache' });
 
 /** Default max tarball size: 500MB */
 const DEFAULT_MAX_TARBALL_BYTES = 524_288_000;
+
+/** Default dependency-cache entry TTL: 30 days. */
+const DEFAULT_CACHE_TTL_DAYS = 30;
+
+const MS_PER_DAY = 86_400_000;
 
 /** Build cache key for dependency tarball: deps/{platform}-{arch}/{lockfileHash}.tar.gz */
 function depKey(lockfileHash: string, platform: string, arch: string): string {
@@ -24,16 +30,40 @@ function depKey(lockfileHash: string, platform: string, arch: string): string {
 export class DepCache {
   private readonly storage: CacheStorage;
   private readonly maxTarballBytes: number;
+  private readonly cacheTtlDaysFallback: number;
+  private readonly clusterSettings?: ClusterSettingsReader;
 
-  constructor(options: { storage: CacheStorage; maxTarballBytes?: number }) {
+  constructor(options: {
+    storage: CacheStorage;
+    maxTarballBytes?: number;
+    /** Cluster default for the dependency-cache entry TTL, in days. */
+    cacheTtlDaysFallback?: number;
+    /** Reader for the fleet-wide `cache_max_tarball_bytes` / `cache_ttl_days` overrides. */
+    clusterSettings?: ClusterSettingsReader;
+  }) {
     this.storage = options.storage;
     this.maxTarballBytes = options.maxTarballBytes ?? DEFAULT_MAX_TARBALL_BYTES;
+    this.cacheTtlDaysFallback = options.cacheTtlDaysFallback ?? DEFAULT_CACHE_TTL_DAYS;
+    this.clusterSettings = options.clusterSettings;
+  }
+
+  /**
+   * Resolve the live dependency-cache entry TTL as a per-operation override
+   * (ms) from `cluster_settings.cache_ttl_days`, falling back to the cluster
+   * default. `undefined` when no reader is wired, so the storage backend uses
+   * its own configured TTL. Passed to read/expiry operations so an operator's
+   * `cache_ttl_days` change takes effect on the next lookup.
+   */
+  private async resolveTtlMsOverride(): Promise<number | undefined> {
+    if (!this.clusterSettings) return undefined;
+    const days = await this.clusterSettings.getNumber('cache_ttl_days', this.cacheTtlDaysFallback);
+    return days * MS_PER_DAY;
   }
 
   /** Check if a dep tarball exists in cache. */
   async has(lockfileHash: string, platform: string, arch: string): Promise<boolean> {
     const key = depKey(lockfileHash, platform, arch);
-    const exists = await this.storage.has(key);
+    const exists = await this.storage.has(key, await this.resolveTtlMsOverride());
     logger.debug(`has(${lockfileHash}): ${exists}`, { platform, arch });
     return exists;
   }
@@ -44,7 +74,7 @@ export class DepCache {
    */
   async getUrl(lockfileHash: string, platform: string, arch: string): Promise<string | null> {
     const key = depKey(lockfileHash, platform, arch);
-    const url = await this.storage.getUrl(key);
+    const url = await this.storage.getUrl(key, await this.resolveTtlMsOverride());
     if (url) {
       await this.storage.touch(key);
       logger.debug(`getUrl(${lockfileHash}): hit`, { platform, arch });
@@ -65,7 +95,7 @@ export class DepCache {
     arch: string,
   ): Promise<{ url: string; hash?: string } | null> {
     const key = depKey(lockfileHash, platform, arch);
-    const url = await this.storage.getUrl(key);
+    const url = await this.storage.getUrl(key, await this.resolveTtlMsOverride());
     if (!url) {
       logger.debug(`getUrlAndHash(${lockfileHash}): miss`, { platform, arch });
       return null;
@@ -97,9 +127,12 @@ export class DepCache {
     arch: string,
     tarballData: Buffer,
   ): Promise<void> {
-    if (tarballData.length > this.maxTarballBytes) {
+    const maxTarballBytes = this.clusterSettings
+      ? await this.clusterSettings.getNumber('cache_max_tarball_bytes', this.maxTarballBytes)
+      : this.maxTarballBytes;
+    if (tarballData.length > maxTarballBytes) {
       throw new Error(
-        `Dep tarball exceeds max size: ${tarballData.length} bytes > ${this.maxTarballBytes} bytes limit`,
+        `Dep tarball exceeds max size: ${tarballData.length} bytes > ${maxTarballBytes} bytes limit`,
       );
     }
     const key = depKey(lockfileHash, platform, arch);

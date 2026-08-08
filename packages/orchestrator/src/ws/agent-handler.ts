@@ -18,7 +18,7 @@
 
 import type { WSContext, WSEvents, WSMessageReceive } from 'hono/ws';
 import { randomUUID } from 'node:crypto';
-import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { createLogger, toErrorMessage, computeBackoffDelay } from '@kici-dev/shared';
 import {
   agentToOrchestratorMessageSchema,
   agentAuthRequestSchema,
@@ -31,6 +31,11 @@ import {
   ExecutionJobStatus,
   isSelfReportedLabel,
   PRIVILEGED_ROOT_LABEL,
+  ORCH_AGENT_CAPABILITIES,
+  ArtifactCompleteAckOutcome,
+  ArtifactDownloadOutcome,
+  ArtifactUploadOutcome,
+  LogStream,
 } from '@kici-dev/engine';
 import type { RateLimiterConfig, AttestationVerifyStatus } from '@kici-dev/engine';
 import { provenanceStorageKey } from '@kici-dev/engine/provenance/bundle';
@@ -38,11 +43,25 @@ import type { ProvenanceTrustRoot } from '../provenance/trust-root.js';
 import { computeAttestationVerdict } from '../provenance/verify-at-ingest.js';
 import type { AgentRegistry, WsLike } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
-import type { AgentTokenStore } from '../agent/token-store.js';
+import {
+  boundAgentIdFromCreatedBy,
+  BOOTSTRAP_CREATED_BY_PREFIX,
+  type AgentTokenStore,
+} from '../agent/token-store.js';
 import type { OwnershipTracker } from '../agent/ownership-tracker.js';
+import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
+import { gateOwnership } from './ownership-gate.js';
 import type { SourceCache } from '../cache/source-cache.js';
 import type { DepCache } from '../cache/dep-cache.js';
 import type { UserCache, UserCacheRef } from '../cache/user-cache.js';
+import {
+  ArtifactInvalidNameError,
+  ArtifactObjectMissingError,
+  classifyArtifactCommitFailure,
+  type ArtifactStore,
+} from '../artifacts/artifact-store.js';
+import { ArtifactInternalFailure } from '../artifacts/failure-messages.js';
+import { AgentWsInternalFailure } from './failure-messages.js';
 import type { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
 import type { PendingBuildTracker } from '../cache/pending-builds.js';
 import type { PendingInitTracker } from '../cache/pending-inits.js';
@@ -50,7 +69,11 @@ import type { PendingDynamicTracker } from '../cache/pending-dynamics.js';
 import type { CacheStorage } from '../storage/types.js';
 import { setAgentsActive } from '../metrics/prometheus.js';
 import type { AgentMetricsAggregator } from '../metrics/agent-metrics-aggregator.js';
-import type { AgentApiRegistry } from './agent-api-registry.js';
+import {
+  ApiRoleDeniedError,
+  UnknownApiMethodError,
+  type AgentApiRegistry,
+} from './agent-api-registry.js';
 import type { FleetAgentCollector } from './fleet-agent-collector.js';
 
 const logger = createLogger({ prefix: 'agent-ws-handler' });
@@ -60,6 +83,52 @@ const AUTH_TIMEOUT_MS = 5_000;
 
 /** Timeout for registration phase (must send agent.register after auth). */
 const REGISTER_TIMEOUT_MS = 10_000;
+
+/**
+ * Bounded retry for the artifact commit. The commit is idempotent (the storage
+ * key is server-derived and the DB insert is onConflict-do-nothing), so a
+ * momentary storage/DB blip is retried rather than failing the agent's step.
+ * Kept well inside the agent's 25s ack timeout.
+ */
+const ARTIFACT_COMMIT_RETRY = {
+  maxAttempts: 3,
+  delayMs: 100,
+  backoff: 'exponential',
+  maxDelayMs: 1_000,
+} as const;
+
+/**
+ * Commit an artifact upload, retrying transient failures. Two failures are
+ * terminal and rethrown immediately: a missing object (the presigned PUT never
+ * landed, so no amount of retrying will find it) and a name that violates the
+ * artifact-name contract (the name is fixed for the life of the request).
+ */
+async function completeUploadWithRetry(
+  artifactStore: ArtifactStore,
+  args: Parameters<ArtifactStore['completeUpload']>[0],
+): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await artifactStore.completeUpload(args);
+      return;
+    } catch (err) {
+      if (
+        err instanceof ArtifactObjectMissingError ||
+        err instanceof ArtifactInvalidNameError ||
+        attempt >= ARTIFACT_COMMIT_RETRY.maxAttempts
+      ) {
+        throw err;
+      }
+      logger.warn('artifact upload-complete attempt failed, retrying', {
+        runId: args.runId,
+        name: args.name,
+        attempt,
+        error: toErrorMessage(err),
+      });
+      await new Promise((r) => setTimeout(r, computeBackoffDelay(attempt, ARTIFACT_COMMIT_RETRY)));
+    }
+  }
+}
 
 /**
  * Token-bound authorization context captured at auth time and consulted
@@ -104,8 +173,9 @@ function toLifecycleClass(agentType: string | undefined): 'static' | 'ephemeral'
  * (Phase 2 / `pendingRegistration`) and on every subsequent re-register
  * arriving on the same registered WS — every code path that mutates the
  * registry's `agentId → entry` mapping for an authenticated WS MUST run
- * them, otherwise the §5.3 / §5.1 invariants only hold for the very first
- * register and a re-register can silently overwrite the authority.
+ * them, otherwise the token-scope and identity-binding invariants only
+ * hold for the very first register and a re-register can silently
+ * overwrite the authority.
  *
  * Gates:
  *  1. Token-scope subset — wire labels MUST be a subset of
@@ -124,7 +194,7 @@ function toLifecycleClass(agentType: string | undefined): 'static' | 'ephemeral'
  * case the caller MUST stop processing.
  */
 /**
- * WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455 §5.5.1).
+ * WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455, section 5.5.1).
  * A reason longer than that makes `ws.close()` throw a RangeError, which —
  * thrown from an async message handler — surfaces as an unhandled rejection
  * and skips the close entirely. Truncate on a byte boundary and drop any
@@ -197,24 +267,25 @@ function enforceRegisterAuthGates(
     }
   }
 
-  // Gate 2 — ephemeral identity-binding.
-  if (
-    tokenAgentType === 'ephemeral' &&
-    tokenCreatedBy !== undefined &&
-    tokenCreatedBy !== null &&
-    tokenCreatedBy !== agentId
-  ) {
-    logger.warn(
-      'Agent register-time identity-binding violation: ephemeral token bound to a different agentId',
-      { wireAgentId: agentId, tokenCreatedBy, tokenId },
-    );
-    ws.close(
-      WS_CLOSE_AGENT_AUTH_FAILED,
-      truncateCloseReason(
-        `Ephemeral token bound to a different agentId: expected ${tokenCreatedBy}, got ${agentId}`,
-      ),
-    );
-    return false;
+  // Gate 2 — ephemeral identity-binding. Scaler tokens store the bound id
+  // verbatim in `created_by`; a single-use bootstrap (init-runner) token stores
+  // it behind `bootstrap:` (mintBootstrapToken). Resolve the bare bound id so
+  // the init-runner can register as its target agent id.
+  if (tokenAgentType === 'ephemeral' && tokenCreatedBy !== undefined && tokenCreatedBy !== null) {
+    const boundAgentId = boundAgentIdFromCreatedBy(tokenCreatedBy);
+    if (boundAgentId !== agentId) {
+      logger.warn(
+        'Agent register-time identity-binding violation: ephemeral token bound to a different agentId',
+        { wireAgentId: agentId, tokenCreatedBy, boundAgentId, tokenId },
+      );
+      ws.close(
+        WS_CLOSE_AGENT_AUTH_FAILED,
+        truncateCloseReason(
+          `Ephemeral token bound to a different agentId: expected ${boundAgentId}, got ${agentId}`,
+        ),
+      );
+      return false;
+    }
   }
 
   // Gate 3 — agentId collision.
@@ -257,6 +328,8 @@ export interface AgentWsHandlerDeps {
       stepIndex: number;
       lines: string[];
       timestamp: number;
+      /** Absent when the agent does not report a stream; read as `stdout`. */
+      stream?: LogStream;
     },
   ) => void;
   /** Optional callback when agent sends step status updates. */
@@ -310,7 +383,17 @@ export interface AgentWsHandlerDeps {
   onAgentLog?: (agentId: string, msg: { lines: string[]; timestamp: number }) => void;
   /** Optional callback when agent acknowledges config (for MMDS clearing in Firecracker). */
   onConfigAck?: (agentId: string) => void;
-  /** Optional callback when agent emits a custom event via ctx.emit(). */
+  /**
+   * Optional callback when agent emits a custom event via ctx.emit().
+   *
+   * A returned `error` is relayed to the agent verbatim, and the agent runs
+   * untrusted workflow code that persists it into the author's step logs — so
+   * an implementation may only return author-facing wording (an unknown job
+   * context). Raw exception text belongs in the implementation's own
+   * `logger.*`, with {@link AgentWsInternalFailure.eventEmitFailed} returned in
+   * its place; a thrown exception is already replaced with the same string
+   * here.
+   */
   onEventEmit?: (
     agentId: string,
     msg: {
@@ -358,6 +441,12 @@ export interface AgentWsHandlerDeps {
    * which org/repo/scope that job resolves to.
    */
   dispatchCacheRefs?: DispatchCacheRefTracker;
+  /**
+   * User-facing artifact store for serving `artifacts.*` upload/download
+   * requests from the sandbox. The org (`customer_id`) + runId are resolved
+   * server-side from the job's dispatch ref, NEVER from the wire body.
+   */
+  artifactStore?: ArtifactStore;
   /** Cache storage for setting metadata after upload completion. */
   cacheStorage?: CacheStorage;
   /**
@@ -427,7 +516,15 @@ export interface AgentWsHandlerDeps {
   ) => Promise<void>;
   /** Agent metrics aggregator for receiving pushed metrics. */
   agentMetricsAggregator?: AgentMetricsAggregator;
-  /** Optional callback when agent reports a job belongs to a concurrency group. */
+  /**
+   * Optional callback when agent reports a job belongs to a concurrency group.
+   *
+   * A returned `reason` is relayed to the agent verbatim as the
+   * `job.concurrency.ack` reason, and the agent runs untrusted workflow code
+   * that persists it into the author's step logs — so an implementation may
+   * only return author-facing wording (the group the job queued behind). Raw
+   * exception text belongs in the implementation's own `logger.*`.
+   */
   onConcurrencyReport?: (
     agentId: string,
     msg: { runId: string; jobId: string; group: string; messageId: string },
@@ -440,6 +537,13 @@ export interface AgentWsHandlerDeps {
    * resolution back to the originating agent as a `step.approval-resolved`
    * message. The `agentId` lets the server drop the pending resolver when the
    * agent disconnects.
+   *
+   * The resolved `reason` is relayed to the agent verbatim, and the agent runs
+   * untrusted workflow code that persists it into the author's step logs — so
+   * an implementation may only resolve with author-facing wording (an
+   * approver's decline note, an invalid per-gate timeout). Raw exception text
+   * belongs in the implementation's own `logger.*`; a rejected promise is
+   * already replaced with {@link AgentWsInternalFailure.approvalFailed} here.
    */
   onStepApproval?: (
     agentId: string,
@@ -556,7 +660,7 @@ async function reconcileInFlightJobs(
  * If you change the schema, update this validator in the same commit.
  * See CLAUDE.md rule: "Zod fast-path sync invariant".
  */
-function isValidLogChunk(raw: unknown): raw is {
+export function isValidLogChunk(raw: unknown): raw is {
   type: 'log.chunk';
   messageId: string;
   runId: string;
@@ -564,6 +668,7 @@ function isValidLogChunk(raw: unknown): raw is {
   stepIndex: number;
   lines: string[];
   timestamp: number;
+  stream?: LogStream;
 } {
   if (typeof raw !== 'object' || raw === null) return false;
   const msg = raw as Record<string, unknown>;
@@ -574,7 +679,10 @@ function isValidLogChunk(raw: unknown): raw is {
     typeof msg.jobId === 'string' &&
     typeof msg.stepIndex === 'number' &&
     Array.isArray(msg.lines) &&
-    typeof msg.timestamp === 'number'
+    typeof msg.timestamp === 'number' &&
+    // Optional for backward compatibility with agents that omit it; when
+    // present it must be one of the two known streams.
+    (msg.stream === undefined || LogStream.safeParse(msg.stream).success)
   );
 }
 
@@ -613,6 +721,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     sourceCache,
     depCache,
     userCache,
+    artifactStore,
     dispatchCacheRefs,
     cacheStorage,
     provenanceTrustRoot,
@@ -1065,6 +1174,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           agentId,
           labels,
           scalerManaged: scalerInfo !== null,
+          capabilities: ORCH_AGENT_CAPABILITIES,
           ...(pendingDispatch ? { pendingDispatch: true } : {}),
         });
 
@@ -1079,7 +1189,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         if (
           tokenStore &&
           regEntry.tokenId !== undefined &&
-          regEntry.tokenCreatedBy?.startsWith('bootstrap:')
+          regEntry.tokenCreatedBy?.startsWith(BOOTSTRAP_CREATED_BY_PREFIX)
         ) {
           await tokenStore.consumeBootstrapToken(regEntry.tokenId);
         }
@@ -1140,16 +1250,13 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
       }
 
       if (isValidLogChunk(raw)) {
-        // Ownership validation with DB fallback. Synchronous check
-        // hits the in-memory dispatcher Map; a miss in HA failover
-        // falls through to `validateAsync` (DB-backed) before we
-        // accept or reject. The DB fallback makes the log writer
-        // tolerant of post-failover and post-complete chunks as
-        // benign duplicates — the per-coord 30s grace window no
-        // longer has to hide them.
-        if (ownershipTracker && !ownershipTracker.checkOwnership(agentId, raw.jobId, 'log.chunk')) {
-          const accept = await ownershipTracker.validateAsync(agentId, raw.jobId, 'log.chunk');
-          if (!accept) return;
+        // Ownership resolution with DB fallback. The synchronous check hits the
+        // in-memory dispatcher Map; a miss in HA failover falls through to the
+        // database before the chunk is accepted or refused. That makes the log
+        // writer tolerant of post-failover and post-complete chunks as benign
+        // duplicates rather than dropping them.
+        if ((await gateOwnership(ownershipTracker, agentId, raw.jobId, 'log.chunk')) === 'reject') {
+          return;
         }
 
         logger.debug('Log chunk received', {
@@ -1165,6 +1272,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           stepIndex: raw.stepIndex,
           lines: raw.lines,
           timestamp: raw.timestamp,
+          ...(raw.stream !== undefined && { stream: raw.stream }),
         });
         return;
       }
@@ -1230,8 +1338,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           // context comes from `wsToAuthState` (cached when the first
           // register's gates passed). Without this, a wire-supplied
           // `msg.labels` / `msg.agentId` would silently overwrite the
-          // registry entry — collapsing the §5.3 / §5.1 invariants for
-          // every re-register after Phase 2.
+          // registry entry — collapsing the token-scope and
+          // identity-binding invariants for every re-register after
+          // Phase 2.
           const reregisterAuthState = wsToAuthState.get(ws);
           if (
             !enforceRegisterAuthGates(
@@ -1285,12 +1394,15 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           wsToAgentId.set(ws, msg.agentId);
           setAgentsActive(registry.getActiveCount());
 
-          // Send register.ack for re-registration
+          // Send register.ack for re-registration. Capabilities are re-advertised
+          // so a reconnecting agent does not fall back to the pre-capability
+          // behavior of any optional feature it negotiated on first register.
           sendJson(ws, {
             type: 'register.ack',
             agentId: msg.agentId,
             labels: msg.labels,
             scalerManaged: false,
+            capabilities: ORCH_AGENT_CAPABILITIES,
           });
 
           logger.info('Agent re-registered', {
@@ -1359,13 +1471,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'job.status': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'job.status')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.status')) === 'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(agentId, msg.jobId, 'job.status');
-            if (!accept) break;
+            break;
           }
 
           const { runId, jobId, state, timestamp, data } = msg;
@@ -1445,13 +1555,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'job.reject': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'job.reject')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.reject')) === 'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(agentId, msg.jobId, 'job.reject');
-            if (!accept) break;
+            break;
           }
 
           logger.warn('Agent rejected job dispatch', {
@@ -1465,10 +1573,9 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'job.ack': {
-          // Ownership validation with DB fallback (HA-safe).
-          if (ownershipTracker && !ownershipTracker.checkOwnership(agentId, msg.jobId, 'job.ack')) {
-            const accept = await ownershipTracker.validateAsync(agentId, msg.jobId, 'job.ack');
-            if (!accept) break;
+          // A refused frame carries no reply: the agent is not awaiting one.
+          if ((await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.ack')) === 'reject') {
+            break;
           }
           logger.debug('Job dispatch acknowledged', {
             agentId,
@@ -1480,16 +1587,14 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'log.chunk': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'log.chunk')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'log.chunk')) === 'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(agentId, msg.jobId, 'log.chunk');
-            if (!accept) break;
+            break;
           }
 
-          const { runId, jobId, stepIndex, lines, timestamp } = msg;
+          const { runId, jobId, stepIndex, lines, timestamp, stream } = msg;
           logger.debug('Log chunk received', {
             agentId,
             runId,
@@ -1497,18 +1602,23 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             stepIndex,
             lineCount: lines.length,
           });
-          onLogChunk?.(agentId, { runId, jobId, stepIndex, lines, timestamp });
+          onLogChunk?.(agentId, {
+            runId,
+            jobId,
+            stepIndex,
+            lines,
+            timestamp,
+            ...(stream !== undefined && { stream }),
+          });
           break;
         }
 
         case 'step.status': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'step.status')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'step.status')) === 'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(agentId, msg.jobId, 'step.status');
-            if (!accept) break;
+            break;
           }
 
           const {
@@ -1549,17 +1659,12 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'step.approval-request': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'step.approval-request')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'step.approval-request')) ===
+            'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(
-              agentId,
-              msg.jobId,
-              'step.approval-request',
-            );
-            if (!accept) break;
+            break;
           }
 
           const {
@@ -1614,6 +1719,16 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               });
             },
             (err) => {
+              // The raw exception stays in the log line below — the author gets
+              // a safe fixed reason, because the agent runs untrusted workflow
+              // code and persists whatever it receives into the step's logs.
+              logger.error('Step approval bridge rejected', {
+                agentId,
+                runId,
+                jobId,
+                stepIndex,
+                error: toErrorMessage(err),
+              });
               sendJson(ws, {
                 type: 'step.approval-resolved',
                 requestId: messageId,
@@ -1621,7 +1736,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
                 jobId,
                 stepIndex,
                 outcome: 'rejected',
-                reason: toErrorMessage(err),
+                reason: AgentWsInternalFailure.approvalFailed,
               });
             },
           );
@@ -1629,17 +1744,12 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'job.heartbeat': {
-          // Ownership validation with DB fallback (HA-safe).
+          // A refused frame carries no reply: the agent is not awaiting one.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'job.heartbeat')
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'job.heartbeat')) ===
+            'reject'
           ) {
-            const accept = await ownershipTracker.validateAsync(
-              agentId,
-              msg.jobId,
-              'job.heartbeat',
-            );
-            if (!accept) break;
+            break;
           }
 
           const { runId, jobId, timestamp } = msg;
@@ -1667,12 +1777,20 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'cache.upload.request': {
-          // Ownership validation: silently drop if agent does not own this job
+          // A refused request still gets its reply — an empty upload URL, the
+          // same degraded value an unconfigured cache produces — so the agent
+          // skips the upload instead of waiting out its own deadline.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'cache.upload.request')
-          )
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'cache.upload.request')) ===
+            'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
             break;
+          }
 
           try {
             let uploadUrl: string;
@@ -1730,12 +1848,14 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'cache.upload.complete': {
-          // Ownership validation: silently drop if agent does not own this job
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'cache.upload.complete')
-          )
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'cache.upload.complete')) ===
+            'reject'
+          ) {
             break;
+          }
 
           // Compute the storage key from the message fields
           let storageKey: string;
@@ -1775,12 +1895,24 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'cache.user.restore.request': {
-          // Ownership: silently drop if the agent does not own this job.
+          // A refused restore replies with a miss — the same degraded value an
+          // unresolvable job produces — so the agent proceeds without a cache
+          // rather than waiting for a reply that never comes.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'cache.user.restore.request')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.restore.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.user.restore.response',
+              requestId: msg.messageId,
+              hit: false,
+            });
             break;
+          }
           // Resolve the namespace server-side. Missing userCache or an
           // unresolvable jobId both fail closed to a miss — never a cross-tenant
           // read and never a trust of the wire-supplied identity.
@@ -1829,12 +1961,24 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'cache.user.save.request': {
-          // Ownership: silently drop if the agent does not own this job.
+          // A refused save replies skip — the same degraded value an
+          // unresolvable job produces — so the agent abandons the upload
+          // instead of hanging on a reply that never comes.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'cache.user.save.request')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.save.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'cache.user.save.response',
+              requestId: msg.messageId,
+              skip: true,
+            });
             break;
+          }
           const ref = userCache ? resolveUserCacheRef(msg.jobId) : null;
           if (!userCache || !ref) {
             if (userCache && !ref) {
@@ -1879,12 +2023,18 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'cache.user.save.complete': {
-          // Ownership: silently drop if the agent does not own this job.
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'cache.user.save.complete')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'cache.user.save.complete',
+            )) === 'reject'
+          ) {
             break;
+          }
           const stashKey = `${msg.jobId}:${msg.key}`;
           const tempKey = pendingUserCacheTempKeys.get(stashKey);
           pendingUserCacheTempKeys.delete(stashKey);
@@ -1916,13 +2066,251 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           break;
         }
 
-        case 'provenance.upload.request': {
-          // Ownership: silently drop if the agent does not own this job.
+        case 'artifacts.upload.request': {
+          // A refused request is answered, never dropped: the agent awaits this
+          // reply and would otherwise burn its whole retry budget on silence.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'provenance.upload.request')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.upload.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error: OWNERSHIP_REFUSED,
+            });
             break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            // An internal failure carries a free-text `error` and NO enforcement
+            // `reason`: telling the author "you are over quota" for a
+            // misconfigured orchestrator sends them to delete artifacts that
+            // were never the problem.
+            const error = !artifactStore
+              ? ArtifactInternalFailure.uploadNotConfigured
+              : ArtifactInternalFailure.unresolvableRun;
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact upload for unresolvable job, rejecting', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error,
+            });
+            break;
+          }
+          try {
+            const result = await artifactStore.beginUpload({
+              customerId: ref.org,
+              runId: ref.runId,
+              name: msg.name,
+              declaredSizeBytes: msg.declaredSizeBytes,
+            });
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: result.outcome,
+              ...(result.uploadUrl && { uploadUrl: result.uploadUrl }),
+              ...(result.storageKey && { storageKey: result.storageKey }),
+              ...(result.reason && { reason: result.reason }),
+              // A store-level rejection with no enforcement reason (a name that
+              // violates the contract) travels as free text, same as the
+              // handler's own internal-failure paths.
+              ...(result.error && { error: result.error }),
+            });
+          } catch (err) {
+            logger.error('artifact begin-upload failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the safe literal.
+            sendJson(ws, {
+              type: 'artifacts.upload.response',
+              requestId: msg.messageId,
+              outcome: ArtifactUploadOutcome.enum.rejected,
+              error: ArtifactInternalFailure.uploadFailed,
+            });
+          }
+          break;
+        }
+
+        case 'artifacts.upload.complete': {
+          // Every path below that belongs to this agent's job sends exactly one
+          // ack: an agent that advertised-capability-awaits the ack must never
+          // hang on a silent drop, and a commit that failed must fail the step
+          // rather than leave a green run with no artifact.
+          const sendCompleteAck = (outcome: ArtifactCompleteAckOutcome, reason?: string): void => {
+            sendJson(ws, {
+              type: 'artifacts.upload.complete.ack',
+              requestId: msg.messageId,
+              outcome,
+              ...(reason ? { reason } : {}),
+            });
+          };
+
+          // Ownership is fully resolved before the frame is refused, and a
+          // refusal is acknowledged rather than dropped. A silent drop here
+          // hangs an agent that awaits the ack — which is exactly what happens
+          // on a coordinator failover, when the synchronous check cannot yet
+          // decide and the database can.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.upload.complete',
+            )) === 'reject'
+          ) {
+            sendCompleteAck(ArtifactCompleteAckOutcome.enum.failed, OWNERSHIP_REFUSED);
+            break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact upload.complete for unresolvable job, dropping', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendCompleteAck(
+              ArtifactCompleteAckOutcome.enum.failed,
+              !artifactStore
+                ? ArtifactInternalFailure.uploadNotConfigured
+                : ArtifactInternalFailure.unresolvableRun,
+            );
+            break;
+          }
+          try {
+            await completeUploadWithRetry(artifactStore, {
+              customerId: ref.org,
+              runId: ref.runId,
+              jobId: msg.jobId,
+              name: msg.name,
+              sizeBytes: msg.sizeBytes,
+              sha256: msg.sha256,
+              storageKey: msg.storageKey,
+            });
+            sendCompleteAck(ArtifactCompleteAckOutcome.enum.committed);
+          } catch (err) {
+            logger.error('artifact upload-complete failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the classified safe literal, same as the sibling upload and
+            // download responses.
+            sendCompleteAck(
+              ArtifactCompleteAckOutcome.enum.failed,
+              classifyArtifactCommitFailure(err),
+            );
+          }
+          break;
+        }
+
+        case 'artifacts.download.request': {
+          // A refused download is answered, never dropped: `not_found` is the
+          // only outcome this reply allows, and the free-text error says why.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'artifacts.download.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error: OWNERSHIP_REFUSED,
+            });
+            break;
+          }
+          const ref = artifactStore ? resolveUserCacheRef(msg.jobId) : null;
+          if (!artifactStore || !ref || !ref.runId) {
+            // `not_found` is the only outcome the schema allows here, so the
+            // free-text `error` is what separates "the artifact does not exist"
+            // from "this orchestrator could not look it up" — otherwise the
+            // author goes hunting for a missing upload that was never missing.
+            const error = !artifactStore
+              ? ArtifactInternalFailure.downloadNotConfigured
+              : ArtifactInternalFailure.unresolvableRun;
+            if (artifactStore && (!ref || !ref.runId)) {
+              logger.warn('artifact download for unresolvable job, replying not_found', {
+                agentId,
+                jobId: msg.jobId,
+              });
+            }
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error,
+            });
+            break;
+          }
+          try {
+            const result = await artifactStore.download({
+              customerId: ref.org,
+              runId: ref.runId,
+              name: msg.name,
+            });
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: result.outcome,
+              ...(result.downloadUrl && { downloadUrl: result.downloadUrl }),
+              ...(result.sizeBytes !== undefined && { sizeBytes: result.sizeBytes }),
+              ...(result.sha256 && { sha256: result.sha256 }),
+            });
+          } catch (err) {
+            logger.error('artifact download failed', {
+              agentId,
+              jobId: msg.jobId,
+              error: toErrorMessage(err),
+            });
+            // The raw exception stays in the log line above — the author gets
+            // only the safe literal.
+            sendJson(ws, {
+              type: 'artifacts.download.response',
+              requestId: msg.messageId,
+              outcome: ArtifactDownloadOutcome.enum.not_found,
+              error: ArtifactInternalFailure.downloadFailed,
+            });
+          }
+          break;
+        }
+
+        case 'provenance.upload.request': {
+          // A refused request still gets its reply — an empty upload URL, the
+          // same degraded value an unconfigured store produces.
+          if (
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.request',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'provenance.upload.response',
+              requestId: msg.messageId,
+              uploadUrl: '',
+            });
+            break;
+          }
 
           const ref = dispatchCacheRefs?.get(msg.jobId);
           if (!provenanceStorage || !ref) {
@@ -1965,12 +2353,18 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'provenance.upload.complete': {
-          // Ownership: silently drop if the agent does not own this job.
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'provenance.upload.complete')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.complete',
+            )) === 'reject'
+          ) {
             break;
+          }
 
           const ref = dispatchCacheRefs?.get(msg.jobId);
           if (!onProvenanceUpload || !ref) {
@@ -2029,12 +2423,18 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'provenance.upload.defer': {
-          // Ownership: silently drop if the agent does not own this job.
+          // No reply exists for this message, so a refusal is a drop — but the
+          // decision is still resolved rather than assumed.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'provenance.upload.defer')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'provenance.upload.defer',
+            )) === 'reject'
+          ) {
             break;
+          }
 
           const ref = dispatchCacheRefs?.get(msg.jobId);
           if (!onProvenanceDefer || !ref) {
@@ -2080,12 +2480,25 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'job.concurrency.report': {
-          // Ownership validation: silently drop if agent does not own this job
+          // A refused report is answered with `cancel`: the agent must not
+          // proceed on a job it does not own, and it must not park forever
+          // waiting for an ack that was never going to come.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'job.concurrency.report')
-          )
+            (await gateOwnership(
+              ownershipTracker,
+              agentId,
+              msg.jobId,
+              'job.concurrency.report',
+            )) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'job.concurrency.ack',
+              requestId: msg.messageId,
+              action: 'cancel',
+              reason: OWNERSHIP_REFUSED,
+            });
             break;
+          }
 
           const { runId, jobId, group, messageId } = msg;
           logger.info('Concurrency report received', { agentId, runId, jobId, group });
@@ -2118,12 +2531,18 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         }
 
         case 'event.emit': {
-          // Ownership validation: silently drop if agent does not own this job
+          // A refused emit is answered: the agent awaits this response and a
+          // drop would stall the step until its own deadline expired.
           if (
-            ownershipTracker &&
-            !ownershipTracker.checkOwnership(agentId, msg.jobId, 'event.emit')
-          )
+            (await gateOwnership(ownershipTracker, agentId, msg.jobId, 'event.emit')) === 'reject'
+          ) {
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: OWNERSHIP_REFUSED,
+            });
             break;
+          }
 
           if (!onEventEmit) {
             logger.warn('event.emit received but event routing not configured', { agentId });
@@ -2157,10 +2576,13 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               eventName: msg.eventName,
               error: toErrorMessage(err),
             });
+            // The raw exception stays in the log line above — the author gets a
+            // safe fixed error. An author-actionable failure rides the
+            // callback's own return value instead, with its own safe wording.
             sendJson(ws, {
               type: 'event.emit.response',
               requestId: msg.requestId,
-              error: toErrorMessage(err),
+              error: AgentWsInternalFailure.eventEmitFailed,
             });
           }
           break;
@@ -2200,10 +2622,18 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               method: msg.method,
               error: toErrorMessage(err),
             });
+            // The registry's two rejections are structured and bounded: they name
+            // only the caller's own method and roles, so the author sees why the
+            // call was refused. Anything else is an exception whose text can carry
+            // orchestrator infrastructure detail, so it stays in the log above and
+            // the author gets a safe fixed error. The gate is the error's type,
+            // never its wording.
+            const deliberate =
+              err instanceof UnknownApiMethodError || err instanceof ApiRoleDeniedError;
             sendJson(ws, {
               type: 'agent.api.response',
               requestId: msg.requestId,
-              error: toErrorMessage(err),
+              error: deliberate ? err.message : AgentWsInternalFailure.agentApiFailed,
             });
           }
           break;

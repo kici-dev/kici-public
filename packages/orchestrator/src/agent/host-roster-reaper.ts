@@ -1,5 +1,6 @@
-import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { createLogger } from '@kici-dev/shared';
 import type { HostRosterStore } from './host-roster.js';
+import { LeaderGatedScheduler } from '../cluster/leader-gated-scheduler.js';
 import { RebootDeadlineSweep } from '../stale-detector/reboot-deadline-sweep.js';
 
 const logger = createLogger({ prefix: 'host-roster-reaper' });
@@ -43,8 +44,7 @@ export class HostRosterReaper {
   private readonly scanIntervalMs: number;
   private readonly setUnreachableGauge: (value: number) => void;
   private readonly rebootSweep: RebootDeadlineSweep;
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private isLeader = false;
+  private readonly scheduler: LeaderGatedScheduler;
 
   constructor(opts: HostRosterReaperOptions) {
     this.store = opts.store;
@@ -53,46 +53,29 @@ export class HostRosterReaper {
     this.scanIntervalMs = opts.scanIntervalMs;
     this.setUnreachableGauge = opts.setUnreachableGauge;
     this.rebootSweep = new RebootDeadlineSweep({ rosterStore: opts.store });
+    this.scheduler = new LeaderGatedScheduler({
+      name: 'host roster reaper',
+      intervalMs: this.scanIntervalMs,
+      logger,
+      tick: () => this.tick(),
+    });
   }
 
   onBecomeLeader(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.isLeader = true;
-    logger.info('Became leader, starting host roster reaper', {
-      ttlMs: this.ttlMs,
-      scanIntervalMs: this.scanIntervalMs,
-    });
-    this.timer = setInterval(() => {
-      this.tick().catch((err) =>
-        logger.error('roster reaper tick failed', { error: toErrorMessage(err) }),
-      );
-    }, this.scanIntervalMs);
-    this.timer.unref?.();
+    void this.scheduler.onBecomeLeader();
   }
 
   onLoseLeadership(): void {
-    this.isLeader = false;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    logger.info('Lost leadership, stopped host roster reaper');
+    this.scheduler.onLoseLeadership();
   }
 
   stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-    this.isLeader = false;
+    this.scheduler.stop();
   }
 
   /** One reap pass. Public for tests. */
   async tick(): Promise<void> {
-    if (!this.isLeader) return;
+    if (!this.scheduler.isLeader) return;
     const deleted = await this.store.reapEphemeralPastTtl(this.ttlMs);
     if (deleted > 0) logger.info('Reaped expired ephemeral hosts', { deleted });
 

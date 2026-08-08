@@ -6,6 +6,7 @@ import type {
   BearerVerificationConfig,
   IpAllowlistVerificationConfig,
   NoneVerificationConfig,
+  VerificationConfig,
 } from './verification.js';
 
 describe('verifyGenericWebhook', () => {
@@ -180,6 +181,18 @@ describe('verifyGenericWebhook', () => {
 
       expect(verifyGenericWebhook('', {}, config)).toBe(true);
       expect(verifyGenericWebhook('any body', { 'x-foo': 'bar' }, config)).toBe(true);
+    });
+  });
+
+  describe('exhaustiveness guard', () => {
+    it('throws for an out-of-union verification method', () => {
+      // config.method is typed to the union; force an out-of-union value the way a
+      // corrupted/ahead-of-parser row would, and assert the switch no longer falls
+      // through to a silent undefined return.
+      const badConfig = { method: 'future_method' } as unknown as VerificationConfig;
+      expect(() => verifyGenericWebhook('{}', {}, badConfig)).toThrow(
+        /unsupported verification_method/,
+      );
     });
   });
 });

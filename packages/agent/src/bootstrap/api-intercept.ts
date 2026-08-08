@@ -15,9 +15,11 @@ import {
   type EnsureInitRunnerDeps,
 } from './ensure-init-runner.js';
 import { preBootSend, type PreBootSendOpts } from './pre-boot-send.js';
+import { runRestage } from './run-restage.js';
 
 const ENSURE_INIT_RUNNER = 'kici.ensureInitRunner';
 const PRE_BOOT_SEND = 'kici.preBootSend';
+const RESTAGE_AGENT = 'kici.restageAgent';
 
 /**
  * Wrap the orchestrator API transport so the two bootstrap methods are handled
@@ -43,6 +45,10 @@ export function withBootstrapInterception(
       };
       await preBootSend(relay, targetAgentId, opts, deps);
       return undefined;
+    }
+    if (method === RESTAGE_AGENT) {
+      const targetAgentId = String(params.targetAgentId ?? '');
+      return runRestage(relay, targetAgentId, deps);
     }
     return relay(method, params);
   };

@@ -5,6 +5,10 @@ description: Operator diagnostics for common KiCI failure modes
 
 Operator-facing diagnostics for runtime failures that aren't already covered by the monitoring or observability guides.
 
+Workflow authors hitting the same failures from the developer side have a
+companion reference at [Common failures](../user/common-failures.md); this page
+is the orchestrator-operator depth behind it.
+
 ## Investigating a failed run
 
 When a run ends in `failed`, work outward from the highest-signal surface to the lowest.
@@ -35,7 +39,7 @@ The scaler captures the underlying error (including a bounded tail of the agent 
 
 - The **dashboard run detail** shows it in the **Provisioning logs** section (collapsible, in the Logs view) and as a **Provisioning failed** entry in the **Provisioning** milestones of the **Timeline** tab.
 - When the job ultimately fails because no agent ever registered (the dispatch queue times out), the captured error becomes the run's `failureReason` and the failed job's `errorMessage` instead of a generic "No agents available to dispatch jobs". It shows in the dashboard failure banner, `kici-admin runs show <runId>`, and `kici runs show <runId>`.
-- The job may be marked `timed_out_stale` if no agent ever registered a heartbeat (see [Stale run detection](./stale-detection.md)).
+- The job may be marked `timed_out_stale` if no agent ever registered a heartbeat (see [Stale run detection](./stale-detection.md)). A recorded provisioning error is what keeps this verdict: the spawn was attempted, so the job's labels did route. The sibling verdict `unroutable` means the opposite — neither a connected agent nor a scaler backend could serve the labels at all, so nothing ever tried to spawn. If you see `unroutable`, the job's error message names the unsatisfied `runsOn` selectors and the fix is a label/fleet one, not a provisioning one; see [what happens when no match is found](./orchestrator/auto-scaler/operations.md#what-happens-when-no-match-is-found).
 
 If a run failed at provisioning (no agent ever came up), run `kici-admin diagnose` and check the `scaler:<name>` rows — a **fail** there confirms the backend could not spawn an agent for a queued job, and the row message carries the captured provisioning error.
 
@@ -61,12 +65,15 @@ Categories you may see:
 
 - **Secret context resolution failed** — the workflow's secret contexts couldn't be resolved.
 - **Install-secrets resolution rejected** — the .npmrc / install-secrets resolution rejected the dispatch.
-- **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated, so the orchestrator records the delivery as a failed run instead of silently skipping it. This covers corrupt JSON, a missing schema version, malformed routing labels, and a **schema-version mismatch**: a lock compiled by a different engine version than the one your orchestrator runs is rejected with a clear "recompile with `kici compile`" message rather than dispatched. The orchestrator and the lock move together (no backward compatibility across schema versions), so the fix is always to recompile the lock against your current toolchain and push again — never to force the old lock through. A repository with no lock file at all is not an error and produces no run.
+- **Lock-file / dependency resolution failed** — a lock file was present for the repository but could not be parsed or validated, so the orchestrator records the delivery as a failed run instead of silently skipping it. This covers corrupt JSON, a missing schema version, malformed routing labels, and an **out-of-window schema version**: the orchestrator reads a compatibility window of lock schema versions, and a lock below the floor (too old) or requiring a newer reader (too new) is rejected with a clear, actionable message rather than dispatched. A too-old lock is fixed by recompiling with `kici compile` and pushing again; a too-new lock means the orchestrator must be upgraded to the version the error names — never force an out-of-window lock through. A repository with no lock file at all is not an error and produces no run.
 - **Build coordination failed** — the build job dispatch was rejected or the build coordinator timed out.
 - **Rejected by context protection rules** — a protection rule (review / wait timer / branch restriction) rejected the job.
 - **Dynamic / deferred-init evaluation failed** — a dynamic or deferred-init job dispatch failed.
 - **No agent available to run this job** — no agent matching the job's `runs-on` labels was reachable.
 - **Matrix expansion failed** — a job's dynamic matrix function threw or timed out while resolving its matrix values, so that job is marked failed before any of its steps run.
+- **Sandbox escape-hatch request not permitted** — the workflow requested a container-sandbox capability or host networking the org's allow-list does not permit.
+- **Rejected by the org trust policy** — the org's trust policy is set to `reject` for this pull request (a fork PR, an unresolvable contributor, or a workflow-file change by a non-trusted contributor). The run fails before any job starts and is **not** approvable — an org owner must change the policy under **Settings > CI trust**, after which a new push re-evaluates it. See [CI security](security/security.md).
+- **Approval gate misconfigured** — an approval gate carried an invalid timeout (it must be a positive integer number of seconds). The whole run fails before any job dispatches rather than letting the gate silently expire open. Fix the `approval.timeout` in the workflow (or the lock file) and re-run.
 
 For run-scoped failures (the whole run never started), the dashboard offers
 four entry points: in-dashboard tabs (Timeline, Summary, metadata),
@@ -79,6 +86,172 @@ If the dashboard shows "Log content is served by the orchestrator, which is
 currently offline" above an otherwise-empty panel, the run-detail page is
 working from Platform's cached metadata — start the orchestrator (or wait
 for its WebSocket to reconnect) to retrieve step output.
+
+## No jobs dispatched (no matching agent)
+
+### Symptom
+
+A matched workflow produces no work: the run ends with `No jobs dispatched (all
+matched workflows had no static jobs or dispatch was rejected)`, a queued job
+reports `No matching agent available`, or the run fails with `No agents
+available to dispatch jobs`.
+
+### Cause
+
+The orchestrator matched the trigger and resolved jobs, but no agent carrying the
+job's `runsOn` labels is online and none can be spawned. Two distinct root
+causes:
+
+- **Label mismatch.** The job asks for labels no agent reports.
+  <!-- kici-lint-allow-github-runner: contrast line — GitHub-hosted labels never match a KiCI agent -->
+  GitHub-hosted labels (`ubuntu-latest`, `windows-latest`) match no KiCI agent;
+  agents report `kici:os:*` / `kici:arch:*` auto-labels plus whatever custom
+  labels each scaler declares.
+- **No capacity.** The labels are right, but every matching agent is busy and no
+  scaler is configured (or able) to spawn another.
+
+### Diagnose
+
+`kici-admin diagnose` reports a `scaler:<name>` row per configured scaler — a
+**pass** means the backend can spawn; a **fail** carries the spawn error.
+Cross-check the labels a scaler declares against the job's `runsOn`.
+`kici diagnostics` (or the dashboard Infrastructure page) lists the agents currently
+registered and the labels they report.
+
+### Fix
+
+Either correct the workflow's `runsOn` to a label a scaler provides, or add a
+scaler that declares the requested label (see
+[Auto-scaler common configuration](./orchestrator/auto-scaler/common-config.md)).
+A provisioning failure that prevents an otherwise-matching agent from spawning is
+covered under [Investigating a failed run](#3-low-level-provisioning--agent-init-failures)
+above.
+
+## Webhook delivered but no run appears
+
+### Symptom
+
+A provider delivered a webhook (the delivery shows 2xx on the provider side) but
+no run was created.
+
+### Cause
+
+The orchestrator records every delivery in its `event_log` with an outcome
+status. A missing run maps to one of these terminal statuses:
+
+- `processed` with a zero `matched_count` — the delivery was evaluated but no
+  workflow trigger matched the event/branch.
+- `lockfile_missing` — the repo lookup succeeded but no lock file existed at that
+  ref (and no global workflow matched). This is not an error; no run is the
+  correct outcome.
+- `lockfile_corrupt` — a lock file was present but could not be parsed or
+  validated; the orchestrator records a `lock_resolution` init-failure run rather
+  than silently skipping (so this one DOES produce a failed run — see
+  [Lock-file drift at the orchestrator](#lock-file-drift-at-the-orchestrator)).
+- `duplicate` — the dedup cache rejected a re-delivered event.
+
+### Diagnose
+
+`kici-admin event-log` lists recent deliveries with their status and
+`matched_count`. Find the delivery in question and read its status: it tells you
+directly which of the above happened.
+
+### Fix
+
+- `processed` / `matched_count = 0`: the workflow's triggers don't cover the
+  event — the customer broadens the trigger and recompiles.
+- `lockfile_missing`: no action unless a run WAS expected — then the lock file is
+  not committed at that ref.
+- `duplicate`: expected on provider retries; no action.
+
+## Agent won't connect or register
+
+### Symptom
+
+An agent connects to the orchestrator and is immediately dropped, or an ephemeral
+agent never registers so its queued job never dispatches.
+
+### Cause
+
+The orchestrator closes an agent WebSocket with a specific close code:
+
+- **4010 (agent auth failed)** — the agent's token is missing, wrong, or revoked.
+  A revoked token closes with `Token revoked`; the agent does **not** retry a bad
+  token, so it never registers.
+- **4003 (invalid message)** — the agent sent a malformed protocol frame (usually
+  a version skew between agent and orchestrator builds), or a second agent tried
+  to register with the same agent ID but a different token (`AgentId already
+registered with a different token`) — the later one is refused.
+
+A different class never reaches the WebSocket at all: an **ephemeral agent that
+failed to provision** (missing `node` binary — `spawn node ENOENT` — unpullable
+image, or a microVM that won't boot). No connection attempt is logged because the
+process never started.
+
+### Diagnose
+
+`kici diagnostics` (or the dashboard Infrastructure page) shows which agents are
+currently registered. For a provisioning failure, `kici-admin diagnose`'s
+`scaler:<name>` row carries the captured spawn error, and the dashboard run detail
+shows it under **Provisioning logs**. For a close-code drop, read the orchestrator
+log around the connection attempt — the close code names the cause.
+
+### Fix
+
+- 4010: reissue the agent token (`kici-admin`), update the agent config, and
+  restart the agent.
+- 4003: rebuild the agent so its protocol version matches the orchestrator; for an
+  agent-ID collision, give each agent a distinct agent ID (or the same ID with the
+  matching token).
+- Provisioning: fix the host-side root cause the captured error names (install
+  the binary, make the image pullable, repair the microVM boot inputs) — the
+  per-backend pages under [Auto-scaler](./orchestrator/auto-scaler.md) cover each
+  backend's prerequisites.
+
+## Lock-file drift at the orchestrator
+
+### Symptom
+
+Deliveries for a repo record `lockfile_corrupt` in the `event_log`, and each
+produces a failed `lock_resolution` init run rather than dispatching. The run's
+failure reason names a parse, schema-version, or label-matcher problem.
+
+### Cause
+
+The orchestrator validates every fetched lock at its cache choke point. Three
+rejections all surface as the corrupt-lock signal:
+
+- **Not valid JSON**, or **missing/invalid `schemaVersion`** — the file is
+  truncated or not a lock file.
+- **Out-of-window `schemaVersion`** — the lock's schema version falls outside the
+  orchestrator's compatibility window. A lock **below the floor** was compiled by
+  an SDK predating a breaking change this orchestrator relies on (`Lock file
+schema v<X> predates the oldest supported version v<Y>`) and must be recompiled;
+  a lock **above the window** requires a reader newer than this orchestrator
+  (`Lock file requires orchestrator schema >= v<X> but this orchestrator
+understands <= v<Y>`) and needs the orchestrator upgraded. Locks inside the
+  window (additive skew) are accepted, never rejected.
+- **Invalid label matcher** — a job's `runsOn`/`excludeLabels` element is not a
+  well-formed matcher (`The lock file is likely stale or compiled by an older
+engine`). Without this gate a legacy string array would parse as an empty label
+  set and mis-route jobs to an arbitrary scaler.
+
+### Diagnose
+
+`kici-admin event-log` shows the `lockfile_corrupt` status; the corresponding
+failed run's reason (dashboard run detail or `kici-admin runs show <runId>`) names
+which of the three rejections fired.
+
+### Fix
+
+The fix depends on which side of the window the lock fell on. A **too-old** lock
+(below the floor) or an **invalid label matcher** is a customer-side fix: the
+workflow repo recompiles with `kici compile` against the current toolchain and
+pushes the regenerated `kici.lock.json` — point the customer at
+[Common failures → Lock-file drift](../user/common-failures.md#lock-file-drift).
+A **too-new** lock (requires a newer reader) is an orchestrator-side fix: upgrade
+this orchestrator to the version the error names. Forcing an out-of-window lock
+through is never correct.
 
 ## SDK bundle drift (`Lock file is out of date`)
 

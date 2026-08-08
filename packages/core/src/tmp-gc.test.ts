@@ -96,4 +96,19 @@ describe('gcStaleTmpDirs', () => {
     });
     expect(lines.some((l) => l.includes('kici-run-aa11bb'))).toBe(true);
   });
+
+  it('spares excluded basenames even when they match and are stale', async () => {
+    const base = await makeBase();
+    const keep = await seed(base, 'kici-run-keeper', 30 * DAY_MS);
+    const drop = await seed(base, 'kici-run-dr0p11', 30 * DAY_MS);
+    const removed = await gcStaleTmpDirs({
+      base,
+      pattern: /^kici-run-/,
+      maxAgeMs: 3 * DAY_MS,
+      exclude: new Set(['kici-run-keeper']),
+    });
+    expect(removed).toEqual([drop]);
+    expect(await exists(keep)).toBe(true);
+    expect(await exists(drop)).toBe(false);
+  });
 });

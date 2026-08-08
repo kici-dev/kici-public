@@ -1,6 +1,15 @@
 /**
  * Provenance ID-token relay (orchestrator side).
  *
+ * @deprecated The Platform-rooted identity mint is hard-deprecated in favor of
+ * orchestrator-owned signing (`oidc/orchestrator-mint.ts`). This relay is
+ * registered ONLY when the orchestrator has NO provenance signer configured
+ * (`selectOidcMintRegistration` prefers the orchestrator-owned mint whenever
+ * `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` is set). It is kept wire-compatible for
+ * the mixed-version rollout window; the `oidc.mint.*` RPC shim is removed at
+ * v1.0. Existing Platform-signed bundles keep verifying forever (the Platform
+ * JWKS stays published). See docs/user/deprecations.md.
+ *
  * Backs the `oidc.token.request` agent.api method: an agent asks for a
  * short-lived OIDC ID token for a job it is running; the orchestrator verifies
  * the agent owns that job, resolves its runId from its own dispatch state, and

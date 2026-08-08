@@ -9,6 +9,7 @@ import { buildEventPayload, type PayloadOptions } from '../test-runner/payload-b
 import { matchAllWorkflows, type CheckMode } from '@kici-dev/engine';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import { displayDryRun } from '../test-runner/dry-run.js';
+import { analyzeJobPurity, type JobPurityWarning } from '../lockfile/index.js';
 import { loadSecretsFile, type ParsedSecrets } from '../test-runner/secrets-file.js';
 import type { Workflow } from '@kici-dev/sdk';
 import { flattenStepInputs } from '@kici-dev/sdk';
@@ -206,8 +207,23 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
       }
     }
 
+    // Collect impure dynamic-value warnings so the injected __init__ jobs show
+    // in the dry-run output before the first (slow) run.
+    const purityWarnings: JobPurityWarning[] = [];
+    for (const w of workflows) {
+      for (const j of w.jobs) {
+        if (typeof j === 'function') continue;
+        purityWarnings.push(...analyzeJobPurity(j, w.name));
+      }
+    }
+
     // Display dry-run output
-    displayDryRun(lockWorkflows, decisions, { workflow: options.workflow, job: options.job });
+    displayDryRun(
+      lockWorkflows,
+      decisions,
+      { workflow: options.workflow, job: options.job },
+      purityWarnings,
+    );
     return true;
   } catch (error) {
     const message = toErrorMessage(error);

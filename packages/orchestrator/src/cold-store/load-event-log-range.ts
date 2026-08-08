@@ -19,8 +19,6 @@ import type { Database, EventLogTable } from '../db/types.js';
 
 const logger = createLogger({ prefix: 'load-event-log-range' });
 
-const EVENT_LOG_WARM_TTL_DAYS = 30;
-
 export type EventLogColdStoreRow = Selectable<EventLogTable>;
 
 export interface LoadOrchEventLogRangeArgs {
@@ -64,8 +62,6 @@ export async function loadEventLogRange(
     includeArchived,
   } = args;
 
-  const warmCutoff = new Date(Date.now() - EVENT_LOG_WARM_TTL_DAYS * 86_400_000);
-
   let hotQuery = db.selectFrom('event_log').selectAll().where('routing_key', '=', routingKey);
   if (orgId) hotQuery = hotQuery.where('org_id', '=', orgId);
   if (event) hotQuery = hotQuery.where('event', '=', event);
@@ -83,6 +79,8 @@ export async function loadEventLogRange(
 
   if (!includeArchived || !coldStore) return hotRows;
 
+  // The bound comes from the store so it always matches what the archiver used.
+  const warmCutoff = coldStore.warmCutoff('event_log');
   const coldFromTs = fromTs ?? new Date(0);
   if (coldFromTs >= warmCutoff) return hotRows;
 
@@ -203,14 +201,13 @@ export async function loadEventLogByDeliveryId(args: {
     return null;
   }
 
-  const warmCutoff = new Date(Date.now() - EVENT_LOG_WARM_TTL_DAYS * 86_400_000);
+  // No explicit upper bound: the store resolves `event_log`'s warm cutoff.
   try {
     for await (const row of coldStore.fetchRange<EventLogColdStoreRow>({
       db: 'orchestrator',
       table: 'event_log',
       tenantId: routingKey,
       fromTs: new Date(0),
-      toTs: warmCutoff,
     })) {
       if (row.org_id === orgId && row.delivery_id === deliveryId) {
         return row;

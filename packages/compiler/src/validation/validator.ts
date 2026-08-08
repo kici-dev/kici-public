@@ -7,7 +7,14 @@ import {
   isDynamicGroupRef,
   getDynamicJobGroup,
 } from '@kici-dev/sdk';
-import { compilerError, type CompilerError } from '../errors/index.js';
+import {
+  compilerError,
+  locationForJob,
+  locationForWorkflow,
+  type CompilerError,
+  type SourceLocation,
+} from '../errors/index.js';
+import type { WorkflowWithSource } from '../types.js';
 
 /** Maximum jobs from static matrix expansion (GitHub Actions limit) */
 const MAX_STATIC_MATRIX_JOBS = 256;
@@ -26,20 +33,25 @@ export type ValidationResult = { valid: true } | { valid: false; errors: Compile
  * 3. Job dependencies are valid (exist, no cycles, no self-refs)
  * 4. Static matrix expansions stay under 256 job limit
  *
- * @param workflows - Array of workflows from config
- * @param configPath - Path for error location reporting
+ * Each error carries the most precise `file:line:column` the data allows: a
+ * job-scoped error anchors to the offending job's first step location (real
+ * file + real line), falling back to the workflow's source file at line 1 when
+ * no step exists; a workflow-scoped error uses the workflow source file (line 1,
+ * since `workflow()` captures no call-site).
+ *
+ * @param workflows - Source-carrying workflows from discovery
  * @returns Validation result with errors if any
  */
-export function validateConfig(workflows: Workflow[], configPath: string): ValidationResult {
+export function validateConfig(workflows: WorkflowWithSource[]): ValidationResult {
   const errors: CompilerError[] = [];
 
   // Check for duplicate workflow names
   const workflowNames = new Set<string>();
-  for (const workflow of workflows) {
+  for (const { workflow, source } of workflows) {
     if (workflowNames.has(workflow.name)) {
       errors.push(
         compilerError('E107', `Duplicate workflow name: "${workflow.name}"`, {
-          location: { file: configPath, line: 1, column: 1 },
+          location: locationForWorkflow(source.file),
           suggestion: 'Each workflow must have a unique name',
         }),
       );
@@ -48,9 +60,8 @@ export function validateConfig(workflows: Workflow[], configPath: string): Valid
   }
 
   // Validate each workflow
-  for (const workflow of workflows) {
-    const workflowErrors = validateWorkflow(workflow, configPath);
-    errors.push(...workflowErrors);
+  for (const { workflow, source } of workflows) {
+    errors.push(...validateWorkflow(workflow, source.file));
   }
 
   if (errors.length > 0) {
@@ -63,7 +74,7 @@ export function validateConfig(workflows: Workflow[], configPath: string): Valid
 /**
  * Validate a single workflow.
  */
-function validateWorkflow(workflow: Workflow, configPath: string): CompilerError[] {
+function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerError[] {
   const errors: CompilerError[] = [];
 
   // Separate static jobs from dynamic job functions
@@ -75,13 +86,19 @@ function validateWorkflow(workflow: Workflow, configPath: string): CompilerError
     // Dynamic job functions can't be validated at compile-time
   }
 
+  // Resolve a job name to its best source location (first step, else file:1).
+  const jobLoc = (name: string): SourceLocation => {
+    const j = staticJobs.find((s) => s.name === name);
+    return j ? locationForJob(j, workflowFile) : { file: workflowFile, line: 1, column: 1 };
+  };
+
   // Check for duplicate job names
   const jobNames = new Set<string>();
   for (const job of staticJobs) {
     if (jobNames.has(job.name)) {
       errors.push(
         compilerError('E106', `Duplicate job name "${job.name}" in workflow "${workflow.name}"`, {
-          location: { file: configPath, line: 1, column: 1 },
+          location: locationForJob(job, workflowFile),
           suggestion: 'Each job in a workflow must have a unique name',
         }),
       );
@@ -101,16 +118,24 @@ function validateWorkflow(workflow: Workflow, configPath: string): CompilerError
   }
 
   // Validate DAG dependencies (with synthetic group nodes)
-  const dagErrors = validateJobDag(staticJobs, workflow.name, configPath, dynamicGroupNames);
+  const dagErrors = validateJobDag(staticJobs, workflow.name, jobLoc, dynamicGroupNames);
   errors.push(...dagErrors);
 
   // Validate static matrix limits
   for (const job of staticJobs) {
-    const matrixErrors = validateStaticMatrix(job, workflow.name, configPath);
+    const matrixErrors = validateStaticMatrix(job, workflow.name, workflowFile);
     errors.push(...matrixErrors);
   }
 
   return errors;
+}
+
+/**
+ * Best location for a DAG node id: strip the synthetic `__group:` prefix (which
+ * has no backing Job) and resolve via the job-location lookup.
+ */
+function dagNodeLocation(nodeId: string, jobLoc: (name: string) => SourceLocation): SourceLocation {
+  return jobLoc(nodeId.startsWith('__group:') ? nodeId.slice('__group:'.length) : nodeId);
 }
 
 /**
@@ -120,7 +145,7 @@ function validateWorkflow(workflow: Workflow, configPath: string): CompilerError
 function validateJobDag(
   jobs: Job[],
   workflowName: string,
-  configPath: string,
+  jobLoc: (name: string) => SourceLocation,
   dynamicGroupNames?: Set<string>,
 ): CompilerError[] {
   const errors: CompilerError[] = [];
@@ -148,9 +173,12 @@ function validateJobDag(
         errors.push(
           compilerError(
             'E102',
-            `Circular dependency in workflow "${workflowName}": ${result.nodesInCycle.join(' -> ')}`,
+            // Comma-join, not ' -> ': nodesInCycle is an unordered set of the jobs on
+            // the cycle (declaration order), so arrows would imply a dependency path
+            // that the id list does not represent.
+            `Circular dependency in workflow "${workflowName}": ${result.nodesInCycle.join(', ')}`,
             {
-              location: { file: configPath, line: 1, column: 1 },
+              location: dagNodeLocation(result.nodesInCycle[0] ?? '', jobLoc),
               suggestion: 'Break the cycle by removing one of the dependencies',
             },
           ),
@@ -163,7 +191,7 @@ function validateJobDag(
             'E103',
             `Job "${result.nodeId}" in workflow "${workflowName}" depends on itself`,
             {
-              location: { file: configPath, line: 1, column: 1 },
+              location: dagNodeLocation(result.nodeId, jobLoc),
               suggestion: 'Remove the self-dependency',
             },
           ),
@@ -176,7 +204,7 @@ function validateJobDag(
             'E101',
             `Job "${result.nodeId}" in workflow "${workflowName}" depends on non-existent job "${result.missingDep}"`,
             {
-              location: { file: configPath, line: 1, column: 1 },
+              location: dagNodeLocation(result.nodeId, jobLoc),
               suggestion: `Create a job named "${result.missingDep}" or fix the dependency name`,
             },
           ),
@@ -219,7 +247,11 @@ function resolveNeeds(needs?: Job['needs']): string[] {
 /**
  * Validate static matrix doesn't exceed job limit.
  */
-function validateStaticMatrix(job: Job, workflowName: string, configPath: string): CompilerError[] {
+function validateStaticMatrix(
+  job: Job,
+  workflowName: string,
+  workflowFile: string,
+): CompilerError[] {
   const errors: CompilerError[] = [];
 
   if (!job.matrix) return errors;
@@ -258,7 +290,7 @@ function validateStaticMatrix(job: Job, workflowName: string, configPath: string
         'E104',
         `Static matrix for job "${job.name}" in workflow "${workflowName}" would generate ${expansionCount} jobs (max: ${MAX_STATIC_MATRIX_JOBS})`,
         {
-          location: { file: configPath, line: 1, column: 1 },
+          location: locationForJob(job, workflowFile),
           suggestion: 'Reduce matrix dimensions or use exclude patterns to limit combinations',
         },
       ),

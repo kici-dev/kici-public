@@ -81,9 +81,7 @@ workflow('deploy', {
     group: (ctx) => `deploy-${ctx.branch}`,
     cancelInProgress: true,
   },
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
 });
 ```
 
@@ -107,9 +105,7 @@ workflow('migrate-db', {
     cancelInProgress: false,
     max: 1,
   },
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
 });
 ```
 
@@ -127,9 +123,7 @@ workflow('test', {
     cancelInProgress: false,
     max: 3,
   },
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
 });
 ```
 
@@ -149,9 +143,7 @@ workflow('deploy', {
     job('deploy-staging', {
       runsOn: 'linux',
       context: 'staging',
-      steps: [
-        /* ... */
-      ],
+      steps: [/* ... */],
     }),
   ],
 });
@@ -166,9 +158,7 @@ workflow('migrate', {
     group: () => 'db-migration',
     cancelInProgress: false,
   },
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
 });
 ```
 
@@ -184,9 +174,7 @@ workflow('deploy', {
     },
     cancelInProgress: true,
   },
-  jobs: [
-    /* ... */
-  ],
+  jobs: [/* ... */],
 });
 ```
 
@@ -210,11 +198,11 @@ In addition to workflow-level concurrency, individual jobs can define their own 
 
 ## Local execution
 
-`kici run <event> --local` honors workflow-level `concurrency` per-machine, per-user. The `group` callback is evaluated against the simulated event identically to the remote orchestrator path; `cancelInProgress` carries the same semantics — `true` interrupts the holder via `SIGTERM` (escalating to `SIGKILL` after a grace window) and proceeds with the new run, while `false` queues the new invocation in FIFO order until the holder finishes.
+`kici run <event> --local` is a real routed dispatch: your machine becomes an ephemeral agent behind the local dev plane, whose own orchestrator applies the same concurrency machinery described above. The `group` callback is evaluated agent-side against the simulated event, and `cancelInProgress` carries its usual semantics — `true` supersedes the older run in the group, `false` queues the newer one behind it.
 
-Coordination is local only. Running the same workflow on two different machines does not serialize across them — that requires the orchestrator. For full cross-host enforcement (queueing across agents, dashboard visibility, `max > 1`), use `kici run remote` against a deployed orchestrator.
+Coordination is scoped to that plane. The plane's state (including its database) lives under `~/.kici/local/`, so enforcement is per-machine and per-user: running the same workflow on two different machines does not serialize across them. For cross-host enforcement (queueing across agents, dashboard visibility), use `kici run remote` against a deployed orchestrator.
 
-Lock files live under `$XDG_RUNTIME_DIR/kici-local-locks/` on Linux, falling back to `os.tmpdir()/kici-local-locks-<uid>/`. A workflow whose `group` callback throws aborts the run with a clear error rather than running unprotected. See [`kici run <event> --local` — Concurrency enforcement](cli-reference.md#concurrency-enforcement) for the `KICI_LOCAL_LOCK_KILL_GRACE_MS` override and the diagnostic output emitted while contending on a busy lock.
+See [`kici run <event> --local`](./cli/runs-and-approvals.md#kici-run-event---local) for the rest of the local-run behavior, and [the local dev plane](../operator/orchestrator/local-dev-plane.md) for the plane's state directory and lifecycle.
 
 ---
 

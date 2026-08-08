@@ -18,15 +18,26 @@ export interface UpstreamSnapshot {
   statuses?: Record<string, ExecutionJobStatus>;
 }
 
+/**
+ * A single-job need entry: the upstream's outputs proxy plus its terminal
+ * status. `T` is the upstream's inferred output shape (defaults to the loose
+ * `Record<string, unknown>`); a typed `needs: [jobRef]` threads the reference's
+ * outputs here so `ctx.needs.<job>.result.<field>` is checked.
+ */
+export interface SingleNeedEntry<T = Record<string, unknown>> {
+  result: OutputProxy<T>;
+  status: ExecutionJobStatus;
+}
+
 /** One entry in the array exposed for a `dynamicGroup(...)` need. */
-export interface GroupNeedEntry {
+export interface GroupNeedEntry<T = Record<string, unknown>> {
   name: string;
-  result: OutputProxy<any>;
+  result: OutputProxy<T>;
   status: ExecutionJobStatus;
 }
 
 /** A single-job need exposes `{ result, status }`; a group need exposes an ordered array. */
-export type NeedEntry = { result: OutputProxy<any>; status: ExecutionJobStatus } | GroupNeedEntry[];
+export type NeedEntry<T = Record<string, unknown>> = SingleNeedEntry<T> | GroupNeedEntry[];
 
 /** The resolved `ctx.needs` map keyed by job name or group name. */
 export type NeedsContext = Record<string, NeedEntry>;

@@ -10,7 +10,7 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { createLogger } from '@kici-dev/shared';
+import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
@@ -24,18 +24,31 @@ import { createSourceRoutes } from './admin-sources.js';
 import { createDbRoutes } from './admin-db.js';
 import { createBackendRoutes } from './admin-backends.js';
 import { createOrgSettingsRoutes } from './admin-org-settings.js';
+import { createTrustPolicyRoutes } from './admin-trust-policy.js';
+import { TrustPolicyStore } from '../security/trust-policy-store.js';
+import { createClusterSettingsRoutes } from './admin-cluster-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
+import { createOrchestratorDrainRoutes } from './admin-orchestrator-drain.js';
+import type { DrainController } from '../drain/drain-controller.js';
 import { createAdminContextRoutes } from './admin-contexts.js';
 import { createAdminQueueExecutionRoutes } from './admin-queue-execution.js';
 import type { SourceStore } from '../sources/source-store.js';
 import type { JoinTokenManager } from '../cluster/join-token.js';
 import type { BackendRegistry } from '../secrets/backend-registry.js';
 import type { BackendHealthChecker } from '../secrets/backend-health.js';
-import type { BackendSyncManager } from '@kici-dev/engine';
+import type { BackendSyncManager, OrchestratorMode } from '@kici-dev/engine';
+import { validateScopeName } from '@kici-dev/engine';
+import {
+  loadRoutableStores,
+  resolveScope,
+  toWireScope,
+  type ScopedSecretStore,
+} from '../secrets/scope-routing.js';
 import type { Kysely } from 'kysely';
 import type pg from 'pg';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-api' });
 
@@ -44,9 +57,22 @@ const logger = createLogger({ prefix: 'admin-api' });
  */
 export interface AdminRouteDeps {
   tokenManager: TokenManager;
+  /**
+   * Orchestrator operating mode. Gates mode-specific admin behavior — today the
+   * `observed`-mode refusal of GitHub-App source creation (those sources are
+   * Platform-relayed by nature, and an observed orchestrator never accepts a
+   * relay). Optional so WS-only / test admins can omit it.
+   */
+  mode?: OrchestratorMode;
   rbac: RbacEnforcer;
   secretStore: PgSecretStore;
   auditLogger: AuditLogger;
+  /**
+   * Optional -- the coordinator drain controller. When provided, the
+   * `POST`/`GET /api/v1/admin/orchestrator/drain` routes are mounted (backing
+   * the `kici-admin orchestrator drain` verbs). Omitted on WS-only admins.
+   */
+  drainController?: DrainController;
   /** Optional -- for agent token CRUD endpoints. */
   tokenStore?: AgentTokenStore;
   /**
@@ -153,6 +179,8 @@ const createTokenSchema = z.object({
   label: z.string().min(1).max(255),
   role: z.enum(['owner', 'admin', 'auditor']),
   routingKey: z.string().nullable().optional(),
+  // Optional absolute expiry (ISO datetime). Omitted = never expires.
+  expiresAt: z.string().datetime().optional(),
 });
 
 const createAgentTokenSchema = z.object({
@@ -177,26 +205,39 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   const app = new Hono<AdminEnv>();
 
   // ── Bearer token auth middleware ────────────────────────────────
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin',
+  });
   app.use('/api/v1/agent-tokens', authMiddleware);
   app.use('/api/v1/agent-tokens/*', authMiddleware);
   app.use('/api/v1/admin/*', authMiddleware);
 
   // ── Scoped secret CRUD ─────────────────────────────────────────
+  // Secret scopes and routing keys are disjoint namespaces: a routing key is
+  // `<provider>:<id>`, while a secret scope is a path in a backend namespace
+  // whose `:` is the backend qualifier. Stores are addressed with the bare
+  // path; `secrets/scope-routing.ts` owns the split. There is no
+  // per-routing-key slice of the secret store, so every secret route requires
+  // an unscoped admin token.
+
+  /**
+   * Load the registered secret backends for one request.
+   *
+   * A registry failure propagates to a 5xx rather than degrading to the
+   * default store. `secrets/scope-routing.ts` owns the loading rules — see
+   * `loadRoutableStores` for why the `pg` entry is always `deps.secretStore`.
+   */
+  const loadStores = (): Promise<Map<string, ScopedSecretStore>> =>
+    loadRoutableStores<ScopedSecretStore, AuditLogger>(
+      deps.backendRegistry,
+      deps.auditLogger,
+      deps.secretStore,
+    );
+
+  /** Resolve a wire-form scope against the live backend registry. */
+  const routeScope = async (wireScope: string) =>
+    resolveScope(wireScope, await loadStores(), deps.secretStore);
 
   // List scopes for an org
   app.get('/api/v1/admin/secrets/scopes', async (c) => {
@@ -206,7 +247,30 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       deps.rbac.requirePermission(c.get('role'), 'secret.read');
       const orgId = c.req.query('orgId');
       if (!orgId) return c.json({ error: 'orgId required' }, 400);
-      const scopes = await deps.secretStore.listScopes(orgId);
+      if (c.req.query('allBackends') !== 'true') {
+        // Default: bare, pg-only. Byte-identical to the historical response —
+        // cross-backend aggregation is opt-in until the default flips at v1.0.0
+        // (see docs/user/deprecations.md).
+        const scopes = await deps.secretStore.listScopes(orgId);
+        return c.json({ scopes }, 200);
+      }
+      const stores = await loadStores();
+      const scopes: string[] = [];
+      for (const [backendName, store] of stores) {
+        try {
+          for (const path of await store.listScopes(orgId)) {
+            scopes.push(toWireScope(backendName, path));
+          }
+        } catch (err) {
+          // One unreachable backend must not blank the whole listing — the
+          // operator still needs to see the backends that ARE reachable.
+          logger.warn('Skipping unreachable secret backend during scope listing', {
+            backendName,
+            error: toErrorMessage(err),
+          });
+        }
+      }
+      scopes.sort();
       return c.json({ scopes }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -216,13 +280,14 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // List secret key names in a scope (no values)
   app.get('/api/v1/admin/secrets/keys', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.read');
       const orgId = c.req.query('orgId');
       const scope = c.req.query('scope');
       if (!orgId || !scope) return c.json({ error: 'orgId and scope required' }, 400);
-      const denied = enforceRoutingKeyScope(c, scope);
-      if (denied) return denied;
-      const keys = await deps.secretStore.listKeys(orgId, scope);
+      const resolved = await routeScope(scope);
+      const keys = await resolved.store.listKeys(orgId, resolved.path);
       return c.json({ keys }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -235,12 +300,21 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Create empty scope
   app.post('/api/v1/admin/secrets/scopes', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
       const body = await c.req.json();
       const parsed = z.object({ orgId: z.string(), scope: z.string() }).parse(body);
-      const denied = enforceRoutingKeyScope(c, parsed.scope);
-      if (denied) return denied;
-      await deps.secretStore.createScope(parsed.orgId, parsed.scope);
+      const resolved = await routeScope(parsed.scope);
+      const scopeError = validateScopeName(resolved.path);
+      if (scopeError) return c.json({ error: scopeError }, 400);
+      if (!resolved.store.createScope) {
+        return c.json(
+          { error: `Backend '${resolved.backendName}' does not support scope creation` },
+          400,
+        );
+      }
+      await resolved.store.createScope(parsed.orgId, resolved.path);
       return c.json({ created: true }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -250,16 +324,42 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Rename scope
   app.put('/api/v1/admin/secrets/scopes/rename', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
       const body = await c.req.json();
       const parsed = z
         .object({ orgId: z.string(), oldScope: z.string(), newScope: z.string() })
         .parse(body);
-      const deniedOld = enforceRoutingKeyScope(c, parsed.oldScope);
-      if (deniedOld) return deniedOld;
-      const deniedNew = enforceRoutingKeyScope(c, parsed.newScope);
-      if (deniedNew) return deniedNew;
-      await deps.secretStore.renameScope(parsed.orgId, parsed.oldScope, parsed.newScope);
+      const stores = await loadStores();
+      const from = resolveScope(parsed.oldScope, stores, deps.secretStore);
+      const to = resolveScope(parsed.newScope, stores, deps.secretStore);
+      // A rename is a per-backend operation — the source store re-encrypts each
+      // row under the new scope's AAD. Moving a scope BETWEEN backends is a
+      // copy plus a delete, which this route does not perform, so reject it
+      // outright rather than silently renaming inside the source backend.
+      if (from.backendName !== to.backendName) {
+        return c.json(
+          {
+            error:
+              `Cannot rename a scope across backends ` +
+              `('${from.backendName}' -> '${to.backendName}'). ` +
+              `Recreate the secrets in the destination backend instead.`,
+          },
+          400,
+        );
+      }
+      // Validate only the destination name — renaming a pre-existing malformed
+      // scope to a conforming one is the built-in cleanup path.
+      const scopeError = validateScopeName(to.path);
+      if (scopeError) return c.json({ error: scopeError }, 400);
+      if (!from.store.renameScope) {
+        return c.json(
+          { error: `Backend '${from.backendName}' does not support scope rename` },
+          400,
+        );
+      }
+      await from.store.renameScope(parsed.orgId, from.path, to.path);
       return c.json({ renamed: true }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -269,12 +369,19 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Delete scope and all its secrets
   app.delete('/api/v1/admin/secrets/scopes/:orgId/:scope', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.delete');
       const orgId = c.req.param('orgId');
-      const scope = decodeURIComponent(c.req.param('scope'));
-      const denied = enforceRoutingKeyScope(c, scope);
-      if (denied) return denied;
-      await deps.secretStore.deleteScope(orgId, scope);
+      const scope = c.req.param('scope');
+      const resolved = await routeScope(scope);
+      if (!resolved.store.deleteScope) {
+        return c.json(
+          { error: `Backend '${resolved.backendName}' does not support scope deletion` },
+          400,
+        );
+      }
+      await resolved.store.deleteScope(orgId, resolved.path);
       return c.json({ deleted: true }, 200);
     } catch (err) {
       return handleError(c, err);
@@ -284,18 +391,25 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Set scoped secret
   app.put('/api/v1/admin/secrets/:orgId/:scope/:key', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
       const body = await c.req.json();
       const parsed = setScopedSecretSchema.parse(body);
       const orgId = c.req.param('orgId');
       const scope = c.req.param('scope');
       const key = c.req.param('key');
-      const denied = enforceRoutingKeyScope(c, scope);
-      if (denied) return denied;
-      await deps.secretStore.setSecret(orgId, scope, key, parsed.value);
+      const resolved = await routeScope(scope);
+      const scopeError = validateScopeName(resolved.path);
+      if (scopeError) return c.json({ error: scopeError }, 400);
+      await resolved.store.setSecret(orgId, resolved.path, key, parsed.value);
 
       await deps.auditLogger.log({
         action: 'setSecret',
+        // The scope exactly as the caller sent it. The audit filter matches
+        // `context_name` exactly, so normalising an unqualified scope into its
+        // `pg:` form would hide the row from `kici-admin audit --context <s>`
+        // and split one scope's history across two spellings at the upgrade.
         contextName: scope,
         routingKey: null,
         secretKeys: [key],
@@ -316,16 +430,18 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Delete scoped secret
   app.delete('/api/v1/admin/secrets/:orgId/:scope/:key', async (c) => {
     try {
+      const denied = requireUnscopedToken(c);
+      if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'secret.delete');
       const orgId = c.req.param('orgId');
       const scope = c.req.param('scope');
       const key = c.req.param('key');
-      const denied = enforceRoutingKeyScope(c, scope);
-      if (denied) return denied;
-      await deps.secretStore.deleteSecret(orgId, scope, key);
+      const resolved = await routeScope(scope);
+      await resolved.store.deleteSecret(orgId, resolved.path, key);
 
       await deps.auditLogger.log({
         action: 'deleteSecret',
+        // Recorded exactly as the caller sent it — see setSecret above.
         contextName: scope,
         routingKey: null,
         secretKeys: [key],
@@ -358,6 +474,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       const configsResult = deps.sharedStore
         ? await deps.sharedStore.rotateKey()
         : { reEncrypted: 0, skipped: 0 };
+      // Third sweep: external secret-backend configs, in their own transaction
+      // so a backend bug can't roll back a good scoped_secrets rotation. Same
+      // skip-and-count discipline as the config sweep.
+      const backendsResult = deps.backendRegistry
+        ? await deps.backendRegistry.rotateKey()
+        : { reEncrypted: 0, skipped: 0 };
       await deps.auditLogger.log({
         action: 'rotateKey',
         contextName: '*',
@@ -372,6 +494,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
           reEncrypted: secretsResult.reEncrypted,
           reEncryptedConfigs: configsResult.reEncrypted,
           skippedConfigs: configsResult.skipped,
+          reEncryptedBackends: backendsResult.reEncrypted,
+          skippedBackends: backendsResult.skipped,
         },
       });
       return c.json(
@@ -379,6 +503,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
           reEncrypted: secretsResult.reEncrypted,
           reEncryptedConfigs: configsResult.reEncrypted,
           skippedConfigs: configsResult.skipped,
+          reEncryptedBackends: backendsResult.reEncrypted,
+          skippedBackends: backendsResult.skipped,
         },
         200,
       );
@@ -437,6 +563,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         parsed.label,
         parsed.role,
         parsed.routingKey,
+        parsed.expiresAt ? new Date(parsed.expiresAt) : undefined,
       );
       return c.json({ token: result.token, id: result.id }, 201);
     } catch (err) {
@@ -609,6 +736,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         sourceStore: deps.sourceStore,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
+        mode: deps.mode,
       }),
     );
   }
@@ -639,6 +767,36 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
+  // Mount trust-policy routes (optional -- only when db is provided).
+  // Backs the `kici-admin trust-policy {show,set}` subcommands. PATCH refuses
+  // server-side on a Platform-attached orchestrator, where the Platform owns
+  // the policy and the next push would clobber a local write.
+  // The audit sink is part of the mount condition, not an optional extra: the
+  // route's contract is that a trust-policy write is always attributable, so an
+  // orchestrator assembled without an access log gets NO trust-policy route
+  // rather than an unauditable one. A wired orchestrator always has one
+  // (`accessLogWriter` is non-optional on the subsystem bundle), so this only
+  // ever bites a partially-constructed test harness.
+  if (deps.db && deps.accessLog) {
+    const accessLog = deps.accessLog;
+    app.route(
+      '/api/v1/admin',
+      createTrustPolicyRoutes({
+        store: new TrustPolicyStore(deps.db),
+        rbac: deps.rbac,
+        mode: deps.mode ?? 'platform',
+        accessLog,
+      }),
+    );
+  }
+
+  // Mount cluster-settings routes (optional -- only when db is provided).
+  // Backs the `kici-admin cluster-settings {show,set,reset}` subcommands (the
+  // fleet-wide tunables on cluster_settings).
+  if (deps.db) {
+    app.route('/api/v1/admin', createClusterSettingsRoutes({ db: deps.db, rbac: deps.rbac }));
+  }
+
   // Mount cluster-name routes (optional -- only when db is provided).
   // Backs the `kici-admin cluster-name {get,set}` subcommands.
   if (deps.db) {
@@ -652,6 +810,15 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // Optional -- only when db is provided (never a WS-only admin).
   if (deps.db) {
     app.route('/api/v1/admin', createMaintenanceRoutes({ db: deps.db }));
+  }
+
+  // Mount orchestrator drain routes (drain/resume/status for pre-upgrade
+  // quiescing). Optional -- only when the coordinator drain controller is wired.
+  if (deps.drainController) {
+    app.route(
+      '/api/v1/admin',
+      createOrchestratorDrainRoutes({ drainController: deps.drainController, rbac: deps.rbac }),
+    );
   }
 
   // Mount the deferred-attestation retry route. Optional -- only when the

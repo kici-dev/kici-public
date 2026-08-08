@@ -6,6 +6,7 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import {
   loadWorkflowSource,
+  resolveWorkflowSdkSetters,
   extractWorkflow,
   extractDynamicJobFn,
   extractSteps,
@@ -561,5 +562,74 @@ describe('extractStepsFromDynamicJob determinism guard', () => {
     );
     expect(result.steps).toHaveLength(1);
     expect(result.droppedJobs).toEqual([]);
+  });
+});
+
+describe('resolveWorkflowSdkSetters', () => {
+  let sdkDir: string;
+
+  beforeAll(async () => {
+    // Build a fixture that mimics a workflow tree whose @kici-dev/sdk resolves
+    // to a DIFFERENT physical copy than the agent's own bundle: a temp dir with
+    // a nested node_modules/@kici-dev/sdk stub that records its setter calls, so
+    // we can assert the resolver picked the workflow's copy (createRequire walk),
+    // not the agent's static import.
+    sdkDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-sdk-'));
+    const sdkPkgDir = path.join(sdkDir, 'node_modules', '@kici-dev', 'sdk');
+    const sdkDistDir = path.join(sdkPkgDir, 'dist');
+    await fs.mkdir(sdkDistDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sdkPkgDir, 'package.json'),
+      JSON.stringify({
+        name: '@kici-dev/sdk',
+        version: '0.0.0-stub',
+        type: 'module',
+        exports: { '.': { import: './dist/index.js', default: './dist/index.js' } },
+      }),
+      'utf-8',
+    );
+    await fs.writeFile(
+      path.join(sdkDistDir, 'index.js'),
+      `export const __STUB__ = true;
+export function setStepOutputsMap(m) { globalThis.__stubStepMap = m; }
+export function setStepRefMap(m) { globalThis.__stubRefMap = m; }
+export function setJobOutputsMap(m) { globalThis.__stubJobMap = m; }
+`,
+      'utf-8',
+    );
+    await fs.mkdir(path.join(sdkDir, 'workflows'), { recursive: true });
+    await fs.writeFile(path.join(sdkDir, 'workflows', 'wf.ts'), 'export default {};', 'utf-8');
+  });
+
+  afterAll(async () => {
+    await fs.rm(sdkDir, { recursive: true, force: true }).catch(() => {});
+    delete (globalThis as Record<string, unknown>).__stubStepMap;
+    delete (globalThis as Record<string, unknown>).__stubRefMap;
+    delete (globalThis as Record<string, unknown>).__stubJobMap;
+  });
+
+  it("resolves the workflow's own SDK instance from the workflow file context", async () => {
+    const setters = await resolveWorkflowSdkSetters(path.join(sdkDir, 'workflows', 'wf.ts'));
+    const stepMap = new Map();
+    const refMap = new Map();
+    const jobMap = new Map();
+    setters.setStepOutputsMap(stepMap);
+    setters.setStepRefMap(refMap);
+    setters.setJobOutputsMap(jobMap);
+    // The stub SDK (the workflow's nested copy) was the one invoked — proving the
+    // resolver followed the workflow's node_modules walk rather than the agent's
+    // bundled SDK.
+    expect((globalThis as Record<string, unknown>).__stubStepMap).toBe(stepMap);
+    expect((globalThis as Record<string, unknown>).__stubRefMap).toBe(refMap);
+    expect((globalThis as Record<string, unknown>).__stubJobMap).toBe(jobMap);
+  });
+
+  it('falls back to the bundled setters when no SDK resolves from the file context', async () => {
+    const setters = await resolveWorkflowSdkSetters('/nonexistent/dir/wf.ts');
+    // Bundled fallback: callable and non-throwing (the agent's own SDK setters).
+    expect(typeof setters.setStepOutputsMap).toBe('function');
+    expect(typeof setters.setStepRefMap).toBe('function');
+    expect(typeof setters.setJobOutputsMap).toBe('function');
+    expect(() => setters.setStepOutputsMap(new Map())).not.toThrow();
   });
 });

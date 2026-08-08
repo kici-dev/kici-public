@@ -14,7 +14,10 @@ export interface FailureSignals {
   hasInitFailure: boolean;
   /** The init-failure category (`InitFailureCategory`), if any. */
   initFailureCategory: string | null;
-  /** Any job ended in `timed_out_stale` (or a workflow/job timeout fired). */
+  /**
+   * Any job ended in an infra-class verdict that means it never really ran —
+   * `timed_out_stale` or `unroutable` — or a workflow/job timeout fired.
+   */
   timedOut: boolean;
   /** Any step recorded a non-zero exit code. */
   anyStepNonZeroExit: boolean;

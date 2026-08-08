@@ -30,6 +30,8 @@ import {
   type PeerCacheUploadResponse,
   type PeerConfigReload,
   type PeerConfigReloadResponse,
+  type PeerClusterSettingsRequest,
+  type WorkerClusterSettings,
   type PeerLogsCollectRequest,
   type PeerLeaving,
   type PeerAgentTokenRevoke,
@@ -89,9 +91,9 @@ export interface PeerHandlerDeps {
   /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
   /** Callback when a job progress update is received from peer. */
-  onJobProgress: (msg: JobProgress, reply: (m: JobProgressAck) => void) => void;
+  onJobProgress: (msg: JobProgress, fromPeerId: string, reply: (m: JobProgressAck) => void) => void;
   /** Callback when a scaler provisioning event is forwarded by a worker peer. */
-  onPeerScalerEvent?: (msg: PeerScalerEvent) => void;
+  onPeerScalerEvent?: (msg: PeerScalerEvent, fromPeerId: string) => void;
   /** Callback when a job cancel request is received from peer. */
   onJobCancel: (msg: PeerJobCancel) => void;
   /** Callback when a log chunk is received from a worker peer. */
@@ -130,6 +132,16 @@ export interface PeerHandlerDeps {
     restartRequired?: string[];
     fieldsChanged?: string[];
   }>;
+  /**
+   * Callback when a peer.clusterSettings.request arrives from a DB-less worker.
+   * Resolves the worker-relevant settings snapshot (async DB read) and the
+   * current cluster_settings version; the result is sent back via
+   * peer.clusterSettings.response. If undefined, requests are answered with the
+   * config-default snapshot at version 0.
+   */
+  onPeerClusterSettingsRequest?: (
+    msg: PeerClusterSettingsRequest,
+  ) => Promise<{ version: number; settings: WorkerClusterSettings }>;
   /**
    * Callback when a peer.logs.collect.request arrives from an incoming-dialed
    * peer. Builds this node's subtree bundle and streams it back through `send`
@@ -188,6 +200,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     onPeerLeaving,
     onAgentTokenRevoke,
     onPeerConfigReload,
+    onPeerClusterSettingsRequest,
     onLogsCollectRequest,
   } = deps;
 
@@ -354,12 +367,14 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'job.progress': {
-        onJobProgress(msg, (out) => sendEncryptedMessage(conn.ws, conn.sessionKey, out));
+        onJobProgress(msg, conn.peerInstanceId, (out) =>
+          sendEncryptedMessage(conn.ws, conn.sessionKey, out),
+        );
         break;
       }
 
       case 'scaler.event': {
-        onPeerScalerEvent?.(msg);
+        onPeerScalerEvent?.(msg, conn.peerInstanceId);
         break;
       }
 
@@ -495,6 +510,30 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
           configReloadWaiters.delete(msg.messageId);
           waiter.resolve(msg);
         }
+        break;
+      }
+
+      case 'peer.clusterSettings.request': {
+        // A DB-less worker pulls the worker-settings snapshot from the leader.
+        // A peer with no handler (not a DB-backed coordinator) simply does not
+        // reply — the worker times out and keeps its boot-time config default,
+        // never a poisoned zero snapshot.
+        if (!onPeerClusterSettingsRequest) break;
+        const replyMessageId = msg.messageId;
+        onPeerClusterSettingsRequest(msg)
+          .then((resolved) => {
+            sendEncryptedMessage(conn.ws, conn.sessionKey, {
+              type: 'peer.clusterSettings.response',
+              messageId: replyMessageId,
+              ...resolved,
+            });
+          })
+          .catch((err) => {
+            logger.error('Error resolving peer cluster-settings request', {
+              peerId: conn.peerInstanceId,
+              error: toErrorMessage(err),
+            });
+          });
         break;
       }
 

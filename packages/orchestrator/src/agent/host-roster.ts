@@ -11,6 +11,30 @@ import type { Database, HostRosterRow } from '../db/types.js';
 export type HostProperties = Record<string, string | number | boolean>;
 
 /**
+ * Reserved `host_properties` key holding the self-contained agent-payload version
+ * the orchestrator last staged onto a host. Read by the fleet-convergence gate;
+ * the `kici:` namespace is orchestrator-reserved so an agent never reports it.
+ */
+export const STAGED_AGENT_VERSION_KEY = 'kici:staged-agent-version';
+
+/**
+ * Drop every orchestrator-reserved `kici:`-namespaced key from an
+ * agent-reported host-property bag. Agent-reported properties win the roster
+ * shallow-merge, so without this an agent could FORGE reserved keys the
+ * orchestrator trusts — the staged-version convergence gate and the
+ * root-executed restart commands both read `kici:` keys. Only orchestrator
+ * writes (`recordStagedVersion`) and operator declares (`declareStatic`) set
+ * this namespace; a registering agent never may.
+ */
+export function stripReservedProperties(props: HostProperties): HostProperties {
+  const out: HostProperties = {};
+  for (const [key, value] of Object.entries(props)) {
+    if (!key.startsWith('kici:')) out[key] = value;
+  }
+  return out;
+}
+
+/**
  * Pre-agent reach metadata for a declared host — how to SSH to it for bootstrap
  * bring-up before it has a KiCI agent. All fields nullable: a host with no reach
  * metadata cannot be bootstrapped. `sshKeySecret` is a scoped-secret ref
@@ -22,6 +46,12 @@ export interface HostReach {
   sshUser: string | null;
   sshPort: number | null;
   sshKeySecret: string | null;
+  /**
+   * When true, the box can reach the orchestrator's object storage — bring-up
+   * picks the `s3-direct` delivery mode (box pulls the payload via a presigned
+   * URL). NULL / false ⇒ the conservative `ssh-push` fallback.
+   */
+  s3Reachable: boolean | null;
 }
 
 /**
@@ -140,7 +170,14 @@ export class HostRosterStore {
   /** Idempotent upsert on agent_id; stamps connected_instance_id + last_seen. */
   async upsert(input: UpsertHostInput): Promise<void> {
     const labelsJson = JSON.stringify(input.labels);
-    const reportedJson = JSON.stringify(input.properties ?? {});
+    // Strip the orchestrator-reserved `kici:` namespace from agent-reported
+    // properties before it is merged (agent-reported keys win the merge). This
+    // is a SECURITY boundary: without it, a compromised agent could forge
+    // `kici:staged-agent-version` (evading the fleet-upgrade convergence) or
+    // `kici:agent-restart-*` (a root command the ops agent would run over SSH).
+    // Only orchestrator code (recordStagedVersion) and operator declares
+    // (declareStatic) may set `kici:` keys.
+    const reportedJson = JSON.stringify(stripReservedProperties(input.properties ?? {}));
     await this.db
       .insertInto('host_roster')
       .values({
@@ -218,6 +255,7 @@ export class HostRosterStore {
     sshUser?: string;
     sshPort?: number;
     sshKeySecret?: string;
+    s3Reachable?: boolean;
   }): Promise<{ created: boolean }> {
     // Operator-declared field binds: undefined ⇒ NULL ⇒ COALESCE preserves the
     // existing column on update; on insert the .values() defaults apply.
@@ -237,6 +275,7 @@ export class HostRosterStore {
         ssh_user: input.sshUser ?? null,
         ssh_port: input.sshPort ?? null,
         ssh_key_secret: input.sshKeySecret ?? null,
+        s3_reachable: input.s3Reachable ?? null,
         last_seen: sql`now()`,
         updated_at: sql`now()`,
       })
@@ -254,6 +293,7 @@ export class HostRosterStore {
           ssh_user: sql`COALESCE(${input.sshUser ?? null}, host_roster.ssh_user)`,
           ssh_port: sql`COALESCE(${input.sshPort ?? null}, host_roster.ssh_port)`,
           ssh_key_secret: sql`COALESCE(${input.sshKeySecret ?? null}, host_roster.ssh_key_secret)`,
+          s3_reachable: sql`COALESCE(${input.s3Reachable ?? null}, host_roster.s3_reachable)`,
           updated_at: sql`now()`,
         }),
       )
@@ -269,7 +309,7 @@ export class HostRosterStore {
   async getReach(agentId: string): Promise<HostReach | null> {
     const row = await this.db
       .selectFrom('host_roster')
-      .select(['agent_id', 'address', 'ssh_user', 'ssh_port', 'ssh_key_secret'])
+      .select(['agent_id', 'address', 'ssh_user', 'ssh_port', 'ssh_key_secret', 's3_reachable'])
       .where('agent_id', '=', agentId)
       .executeTakeFirst();
     if (!row) return null;
@@ -279,6 +319,7 @@ export class HostRosterStore {
       sshUser: row.ssh_user,
       sshPort: row.ssh_port,
       sshKeySecret: row.ssh_key_secret,
+      s3Reachable: row.s3_reachable,
     };
   }
 
@@ -289,6 +330,34 @@ export class HostRosterStore {
       .where('agent_id', '=', agentId)
       .executeTakeFirst();
     return row ?? null;
+  }
+
+  /**
+   * Record the self-contained agent-payload version the orchestrator staged onto
+   * a host (bring-up or fleet re-stage). Stored in `host_properties` under a
+   * reserved key so the convergence gate can compare it against the target
+   * INDEPENDENTLY of the agent's own self-reported bundle version (two payloads
+   * can carry the same self-report but different staged keys). Shallow-merged, so
+   * it survives agent re-register (the agent never reports this reserved key).
+   */
+  async recordStagedVersion(agentId: string, version: string): Promise<void> {
+    const patch = JSON.stringify({ [STAGED_AGENT_VERSION_KEY]: version });
+    await this.db
+      .updateTable('host_roster')
+      .set({
+        host_properties: sql`COALESCE(host_roster.host_properties, '{}'::jsonb) || ${patch}::jsonb`,
+        updated_at: sql`now()`,
+      })
+      .where('agent_id', '=', agentId)
+      .execute();
+  }
+
+  /** Read a host's recorded staged agent-payload version, or null when never staged. */
+  async getStagedVersion(agentId: string): Promise<string | null> {
+    const row = await this.get(agentId);
+    if (!row) return null;
+    const value = parseHostProperties(row.host_properties)[STAGED_AGENT_VERSION_KEY];
+    return typeof value === 'string' ? value : null;
   }
 
   async listAll(): Promise<HostRosterRow[]> {

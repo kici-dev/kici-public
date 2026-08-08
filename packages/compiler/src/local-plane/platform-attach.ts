@@ -134,10 +134,5 @@ export async function probePlatformReachable(apiBase: string, timeoutMs = 4000):
 
 /** A short, non-sensitive label for the minted key name (the machine host). */
 function orgHostLabel(): string {
-  try {
-    // Lazy require so this module stays trivially testable without os in scope.
-    return process.env.HOSTNAME || 'kici-local';
-  } catch {
-    return 'kici-local';
-  }
+  return process.env.HOSTNAME || 'kici-local';
 }

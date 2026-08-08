@@ -13,7 +13,7 @@ KiCI uses a **two-tier detection model**:
 
 1. **Orchestrator tier** -- Detects stale agents. Agents send periodic heartbeats for each running job. If no heartbeat arrives within the stale threshold, the job is marked as `timed_out_stale`. The detector also catches dispatched jobs that were never acknowledged by an agent (dispatch sent but no heartbeat ever received).
 
-2. **Platform tier** -- Detects stale orchestrators. If an orchestrator disconnects from the Platform relay and does not reconnect within 5 minutes (default), all active runs for that orchestrator's routing keys are marked as `timed_out_stale`. On Platform startup, an immediate orphan scan marks any running runs with no active orchestrator connection as stale without waiting for the threshold.
+2. **Platform tier** -- Detects stale orchestrators. If an orchestrator disconnects from the Platform relay and does not reconnect within 5 minutes (default), all active runs for that orchestrator's routing keys are marked as `failed`. On Platform startup, an immediate orphan scan marks any running runs with no active orchestrator connection as failed without waiting for the threshold.
 
 ### Detection flow
 
@@ -48,7 +48,7 @@ This means a job is considered stale if no heartbeat has been received for 2 min
 
 ### Platform tier behaviour (informational)
 
-The Platform tier also performs stale-orchestrator detection: when an orchestrator disconnects from the Platform relay and does not reconnect within ~5 minutes, runs whose routing keys belong to that orchestrator are marked `timed_out_stale`. Operators of self-deployed orchestrators do not configure the Platform tier — its thresholds are managed by the SaaS Platform. If you operate the Platform itself (internal docs only), see internal Platform docs.
+The Platform tier also performs stale-orchestrator detection: when an orchestrator disconnects from the Platform relay and does not reconnect within ~5 minutes, runs whose routing keys belong to that orchestrator are marked `failed`. This tier is not operator-configurable — its thresholds are managed by the hosted Platform.
 
 ## Tuning guidance
 
@@ -122,6 +122,12 @@ When all jobs in a run reach a terminal state (including `timed_out_stale`), the
 
 The stale detector also handles expiring overdue held runs (runs awaiting environment approval that exceed their hold expiry timeout). When a `HeldRunStore` is configured, each scan calls `expireOverdue()` to transition expired pending holds to `expired` status, cancelling the associated jobs. See [Contexts](contexts.md) for details on hold expiry configuration.
 
+### Workflow deadline expiry
+
+The same scan interval also drives the **workflow deadline** scan. A workflow-level `timeout` caps the whole run's wall-clock across all jobs, so it is enforced orchestrator-side rather than agent-side. Each scan finds non-terminal runs whose `started_at + workflow_timeout_ms` has passed and drives them through the canonical run-cancel path, stamping the distinct `workflow_timeout` reason so the run reads as "timed out" rather than a generic cancel. The scan is bounded to deadlines that lapsed within the last 24 hours.
+
+Runs with no workflow `timeout` have a null `workflow_timeout_ms` and are never deadline-enforced. Lowering `KICI_STALE_DETECTOR_SCAN_INTERVAL_MS` tightens both the heartbeat-staleness scan and this deadline scan. See [Stale detection architecture](../architecture/execution/stale-detection.md#workflow-timeout--orchestrator-run-deadline) for the full model.
+
 ### Orphaned recovery jobs
 
 On startup, the stale detector cleans up jobs stuck in `recovering` state from a previous orchestrator instance. Recovery timers are in-memory and lost on restart, so any jobs still in `recovering` state are immediately failed with a descriptive error message.
@@ -170,7 +176,7 @@ Late updates from the orchestrator will overwrite the Platform-side expiry statu
 
 ## Stale check run cleanup
 
-When an orchestrator dies permanently, the Platform tier marks the associated `execution_runs` as `timed_out_stale` in its database. It also collects cleanup metadata (repository, SHA, workflow name, job names) for each affected run and queues it in memory, keyed by routing key.
+When an orchestrator dies permanently, the Platform tier marks the associated `execution_runs` as `failed` in its database (their jobs `timed_out_stale`). It also collects cleanup metadata (repository, SHA, workflow name, job names) for each affected run and queues it in memory, keyed by routing key.
 
 When a replacement orchestrator reconnects and sends `source.register` for the same routing keys, the Platform forwards the pending cleanup entries via the `stale.checkrun.cleanup` protocol message. The orchestrator then discovers the stuck GitHub check runs via `checks.listForRef` and updates them to a `timed_out` conclusion, so they no longer appear as "in_progress" on GitHub.
 

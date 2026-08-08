@@ -47,9 +47,60 @@ describe('loadConfig', () => {
     expect(config.properties).toEqual({});
   });
 
+  it('parses KICI_AGENT_PAYLOAD_DIR into agentPayloadDir', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_PAYLOAD_DIR = '/var/lib/kici/agent-packages';
+    expect(loadConfig().agentPayloadDir).toBe('/var/lib/kici/agent-packages');
+  });
+
+  it('leaves agentPayloadDir undefined when KICI_AGENT_PAYLOAD_DIR is unset', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    expect(loadConfig().agentPayloadDir).toBeUndefined();
+  });
+
+  it('parses KICI_AGENT_COMMAND into agentCommand (golden-image escape hatch)', () => {
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+    process.env.KICI_AGENT_COMMAND = '/opt/golden/kici-agent';
+    expect(loadConfig().agentCommand).toBe('/opt/golden/kici-agent');
+  });
+
   it('throws with clear error when KICI_ORCHESTRATOR_URL is missing', () => {
     expect(() => loadConfig()).toThrow('Configuration validation failed');
     expect(() => loadConfig()).toThrow('orchestratorUrl');
+  });
+
+  describe('container-sandbox hardening config', () => {
+    it('defaults to a secure hardened posture', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.sandboxHardened).toBe(true);
+      expect(config.sandboxReadonlyRootfs).toBe(false);
+      expect(config.sandboxUser).toBeUndefined();
+      expect(config.sandboxPidsLimit).toBe(512);
+      expect(config.sandboxMemoryBytes).toBe(2 * 1024 * 1024 * 1024);
+      expect(config.sandboxNanoCpus).toBe(2 * 1_000_000_000);
+    });
+
+    it('honors the KICI_SANDBOX_HARDENED rollback flag', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SANDBOX_HARDENED = 'false';
+      expect(loadConfig().sandboxHardened).toBe(false);
+    });
+
+    it('parses the read-only rootfs / user / cgroup-cap overrides', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SANDBOX_READONLY_ROOTFS = 'true';
+      process.env.KICI_SANDBOX_USER = '1000:1000';
+      process.env.KICI_SANDBOX_PIDS_LIMIT = '256';
+      process.env.KICI_SANDBOX_MEMORY_BYTES = '1073741824';
+      process.env.KICI_SANDBOX_NANO_CPUS = '500000000';
+      const config = loadConfig();
+      expect(config.sandboxReadonlyRootfs).toBe(true);
+      expect(config.sandboxUser).toBe('1000:1000');
+      expect(config.sandboxPidsLimit).toBe(256);
+      expect(config.sandboxMemoryBytes).toBe(1_073_741_824);
+      expect(config.sandboxNanoCpus).toBe(500_000_000);
+    });
   });
 
   it('splits KICI_LABELS comma-separated string into array', () => {
@@ -290,6 +341,29 @@ describe('loadConfig', () => {
       process.env.KICI_LABELS = 'linux,docker';
       const config = loadConfig();
       expect(config.labels).toEqual(['linux', 'docker']);
+    });
+
+    it('accepts reserved capability labels when a token is present (ops agent)', () => {
+      // A token-authenticated ssh-transport ops agent advertises
+      // kici:capability:ssh-transport; the orchestrator gates it against the
+      // token's authorized set at register, so the client-side guardrail must
+      // not block it.
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_AGENT_TOKEN = 'kat_ops_secret';
+      process.env.KICI_LABELS = 'kici:capability:ssh-transport,default';
+      const config = loadConfig();
+      expect(config.labels).toEqual(['kici:capability:ssh-transport', 'default']);
+    });
+
+    it('accepts reserved init-runner labels when a token is present', () => {
+      // The init-runner boots with a bootstrap token that authorizes
+      // kici:init / kici:privileged:root / kici:host:*; buildLauncher passes
+      // them via KICI_LABELS, so a token-bearing agent must accept them.
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_AGENT_TOKEN = 'kat_bootstrap';
+      process.env.KICI_LABELS = 'kici:init,kici:privileged:root,kici:host:box-00007';
+      const config = loadConfig();
+      expect(config.labels).toEqual(['kici:init', 'kici:privileged:root', 'kici:host:box-00007']);
     });
   });
 

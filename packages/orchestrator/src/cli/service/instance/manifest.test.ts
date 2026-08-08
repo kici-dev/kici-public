@@ -7,6 +7,7 @@ import {
   manifestPath,
   readKiciVersion,
   readManifest,
+  resolveNpmInstallTarget,
   resolveVersionFromLaunchSpec,
   writeManifest,
 } from './manifest.js';
@@ -144,5 +145,58 @@ describe('resolveVersionFromLaunchSpec', () => {
     fs.writeFileSync(entry, '// stub'); // no package.json written
     const spec = { execPath: '/usr/bin/node', args: [entry] };
     expect(resolveVersionFromLaunchSpec(spec, 'orchestrator')).toBeNull();
+  });
+});
+
+describe('resolveNpmInstallTarget', () => {
+  const NODE = '/home/u/.local/share/mise/installs/node/24.15.0/bin/node';
+  const NM = '/home/u/.local/share/mise/installs/node/24.15.0/lib/node_modules';
+
+  it('resolves kici-admin when orchestrator is nested under it', () => {
+    const spec = {
+      execPath: NODE,
+      args: [`${NM}/kici-admin/node_modules/@kici-dev/orchestrator/dist/server.js`],
+    };
+    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })).toEqual({
+      nodeExecPath: NODE,
+      npmPath: '/home/u/.local/share/mise/installs/node/24.15.0/bin/npm',
+      owningPackage: 'kici-admin',
+    });
+  });
+
+  it('resolves the standalone scoped package for a direct install', () => {
+    const spec = { execPath: NODE, args: [`${NM}/@kici-dev/orchestrator/dist/server.js`] };
+    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })?.owningPackage).toBe(
+      '@kici-dev/orchestrator',
+    );
+  });
+
+  it('uses npm.cmd on windows', () => {
+    const spec = {
+      execPath: 'C:\\node\\node.exe',
+      args: ['C:\\node\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js'],
+    };
+    expect(resolveNpmInstallTarget(spec, 'agent', { windows: true })).toEqual({
+      nodeExecPath: 'C:\\node\\node.exe',
+      npmPath: 'C:\\node\\npm.cmd',
+      owningPackage: 'kici-admin',
+    });
+  });
+
+  it('returns null for an opaque --binary install (no entry script)', () => {
+    expect(
+      resolveNpmInstallTarget({ execPath: '/opt/kici/orchestrator', args: [] }, 'orchestrator', {
+        windows: false,
+      }),
+    ).toBeNull();
+  });
+
+  it('returns null for a non-node_modules (dev checkout) entry', () => {
+    const spec = {
+      execPath: NODE,
+      args: ['/home/u/src/kici/packages/orchestrator/dist/server.js'],
+    };
+    // no @kici-dev/orchestrator/dist marker under node_modules → entry not found → null
+    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })).toBeNull();
   });
 });

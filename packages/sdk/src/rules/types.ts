@@ -12,8 +12,18 @@ export type { EventPayload } from '../events/event-payloads.js';
 export interface RuleContext {
   /** The triggering event payload */
   event: EventPayload;
-  /** List of files changed in this event (e.g., PR diff) */
+  /**
+   * Files changed in this event (PR diff / push diff). Available on push and
+   * pull_request events (the agent computes the diff from the checkout — no
+   * `paths:` trigger required). Accessing this throws
+   * `ChangedFilesUnavailableError` when the diff is not available
+   * (`changedFilesStatus !== 'fetched'`) — e.g. a schedule/tag/manual event.
+   * Guard with `changedFilesStatus` first when a rule runs on such events:
+   * `if (ctx.changedFilesStatus !== 'fetched') return true`.
+   */
   changedFiles: string[];
+  /** Availability of `changedFiles` (see `changedFiles`). */
+  changedFilesStatus: import('@kici-dev/engine').ChangedFilesStatus;
   /** Environment variables */
   env: Record<string, string | undefined>;
   /** Operator-supplied, validated + coerced workflow-dispatch inputs. Empty when none declared. */

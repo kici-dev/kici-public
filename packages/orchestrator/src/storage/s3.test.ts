@@ -224,7 +224,7 @@ vi.mock('@aws-sdk/client-s3', async () => {
 
 // Must re-import after mocking
 const { getSignedUrl } = await import('@aws-sdk/s3-request-presigner');
-const { PutObjectCommand, CopyObjectCommand, ListObjectsV2Command } =
+const { PutObjectCommand, CopyObjectCommand, ListObjectsV2Command, HeadObjectCommand } =
   await import('@aws-sdk/client-s3');
 
 describe('S3CacheStorage (unit)', () => {
@@ -270,6 +270,32 @@ describe('S3CacheStorage (unit)', () => {
         Bucket: 'test-bucket',
         Key: 'test-prefix/source/abc123.tar.gz',
       });
+    });
+  });
+
+  describe('getObjectSize()', () => {
+    it('returns the HeadObject ContentLength and null when the object is missing', async () => {
+      const mockSend = (storage as any).client.send as ReturnType<typeof vi.fn>;
+      let call = 0;
+      mockSend.mockImplementation(() => {
+        call++;
+        // 1st HeadObject: object present. 2nd: S3 reports NotFound.
+        if (call === 1) return Promise.resolve({ ContentLength: 42 });
+        return Promise.reject(Object.assign(new Error('not found'), { name: 'NotFound' }));
+      });
+
+      expect(await storage.getObjectSize('present')).toBe(42);
+      expect(HeadObjectCommand).toHaveBeenCalledWith({
+        Bucket: 'test-bucket',
+        Key: 'test-prefix/present',
+      });
+      expect(await storage.getObjectSize('absent')).toBeNull();
+    });
+
+    it('rethrows a non-not-found error rather than reporting a missing object', async () => {
+      const mockSend = (storage as any).client.send as ReturnType<typeof vi.fn>;
+      mockSend.mockImplementation(() => Promise.reject(new Error('AccessDenied')));
+      await expect(storage.getObjectSize('boom')).rejects.toThrow('AccessDenied');
     });
   });
 

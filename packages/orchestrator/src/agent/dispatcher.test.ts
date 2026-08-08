@@ -49,6 +49,7 @@ function mockMetrics(): DispatchMetrics {
   return {
     incJobsDispatched: vi.fn(),
     setQueueDepth: vi.fn(),
+    incScalerRedispatch: vi.fn(),
   };
 }
 
@@ -60,11 +61,19 @@ function mockQueue(
     depth?: number;
     enqueueFails?: boolean;
     dequeueJobs?: QueuedJob[];
+    /** Pending rows returned (oldest-first, capped) by listPending. */
+    pendingJobs?: QueuedJob[];
     /** Map of jobId -> { runId, status } for getJobById lookups. */
     jobLookups?: Map<string, { id: string; runId: string; status: string }>;
   } = {},
 ): JobQueue {
-  const { depth = 0, enqueueFails = false, dequeueJobs = [], jobLookups } = options;
+  const {
+    depth = 0,
+    enqueueFails = false,
+    dequeueJobs = [],
+    pendingJobs = [],
+    jobLookups,
+  } = options;
   let dequeueIndex = 0;
 
   // Track dispatched job IDs to auto-populate getJobById if no explicit map
@@ -74,10 +83,10 @@ function mockQueue(
     enqueue: enqueueFails
       ? vi.fn().mockRejectedValue(new Error('queue full'))
       : vi.fn().mockResolvedValue('enqueued-job-id'),
-    insertDispatched: vi.fn().mockImplementation(async () => {
-      const id = crypto.randomUUID();
+    insertDispatched: vi.fn().mockImplementation(async (input: QueuedJobInput) => {
+      const id = input.jobId ?? crypto.randomUUID();
       dispatchedJobIds.push(id);
-      return id;
+      return { id, inserted: true };
     }),
     dequeueForLabels: vi.fn().mockImplementation(async () => {
       if (dequeueIndex < dequeueJobs.length) {
@@ -99,6 +108,7 @@ function mockQueue(
     markExpired: vi.fn().mockResolvedValue(0),
     getDepth: vi.fn().mockResolvedValue(depth),
     getPendingJobs: vi.fn().mockResolvedValue(dequeueJobs),
+    listPending: vi.fn().mockImplementation(async (limit: number) => pendingJobs.slice(0, limit)),
     // Recovery methods
     markRecovering: vi.fn().mockResolvedValue(undefined),
     markFailedIfRecovering: vi.fn().mockResolvedValue(true),
@@ -168,6 +178,38 @@ describe('Dispatcher', () => {
 
       // Metrics
       expect(metrics.incJobsDispatched).toHaveBeenCalledWith('dispatched');
+    });
+
+    it('records the selected agent as the durable owner on the direct-dispatch insert', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      await dispatcher.dispatch(makeJobInput());
+
+      // The row is inserted already-dispatched, so it never reaches
+      // markDispatched — the owner has to be written by the insert itself or a
+      // cold coordinator can never resolve ownership of this job.
+      expect(queue.insertDispatched).toHaveBeenCalledWith(expect.anything(), 'agent-1');
+      expect(queue.markDispatched).not.toHaveBeenCalled();
+    });
+
+    it('returns duplicate and does NOT dispatch to the agent when the row already exists', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      // Model a concurrent reroute: insertDispatched finds the row already present.
+      (queue.insertDispatched as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        id: 'reroute-job-1',
+        inserted: false,
+      });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const result = await dispatcher.dispatch(makeJobInput({ jobId: 'reroute-job-1' }));
+
+      expect(result).toEqual({ status: 'duplicate', jobId: 'reroute-job-1' });
+      expect(onDispatch).not.toHaveBeenCalled();
+      // The claimed slot was released — the agent is back to idle.
+      expect(registry.get('agent-1')!.activeJobs).toBe(0);
     });
 
     it('dispatches a pinned job only to its pinned agent', async () => {
@@ -766,6 +808,112 @@ describe('Dispatcher', () => {
     });
   });
 
+  describe('drain gate', () => {
+    it('dispatch enqueues Pending and skips the agent + scaler while draining', async () => {
+      // A free matching agent is present — proves we do NOT use it while draining.
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      const onNoMatchingAgent = vi.fn();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+        isDraining: () => true,
+      });
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('queued');
+      expect(queue.enqueue).toHaveBeenCalledOnce();
+      expect(queue.insertDispatched).not.toHaveBeenCalled(); // no immediate dispatch
+      expect(onNoMatchingAgent).not.toHaveBeenCalled(); // no scaler consult
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(registry.get('agent-1')!.activeJobs).toBe(0); // agent untouched
+      expect(metrics.incJobsDispatched).toHaveBeenCalledWith('queued');
+    });
+
+    it('onAgentAvailable claims nothing while draining', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        isDraining: () => true,
+      });
+
+      await dispatcher.onAgentAvailable('agent-1');
+
+      expect(queue.dequeueForLabels).not.toHaveBeenCalled();
+      expect(queue.dequeueByPinnedAgent).not.toHaveBeenCalled();
+    });
+
+    it('dispatch behaves normally when not draining', async () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        isDraining: () => false,
+      });
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('dispatched');
+    });
+
+    it('queues a pinned job (with the pin) instead of dispatching while draining', async () => {
+      // The pinned agent is present, free, and matches — proves the drain gate,
+      // not agent unavailability, holds the job.
+      registry.register('a1', mockWs(), ['role:web']);
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        isDraining: () => true,
+      });
+
+      const result = await dispatcher.dispatch(
+        makeJobInput({ runsOnLabels: ['role:web'], pinnedAgentId: 'a1' }),
+      );
+
+      expect(result.status).toBe('queued');
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(queue.insertDispatched).not.toHaveBeenCalled();
+      // The pin is preserved so post-restart recovery delivers it to a1.
+      expect(queue.enqueue).toHaveBeenCalledWith(expect.objectContaining({ pinnedAgentId: 'a1' }));
+      expect(registry.get('a1')!.activeJobs).toBe(0);
+    });
+
+    it('dispatchBoundJob claims nothing while draining', async () => {
+      registry.register('scaler-firecracker-1', mockWs(), ['linux', 'firecracker']);
+      const boundJob = makeQueuedJob({ id: 'bound-1', runsOnLabels: ['firecracker'] });
+      const queue = mockQueue({ dequeueJobs: [boundJob] });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        isDraining: () => true,
+      });
+
+      const dispatched = await dispatcher.dispatchBoundJob('scaler-firecracker-1', 'bound-1');
+
+      expect(dispatched).toBe(false);
+      expect(queue.dequeueById).not.toHaveBeenCalled();
+      expect(queue.markDispatched).not.toHaveBeenCalled();
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(registry.get('scaler-firecracker-1')!.activeJobs).toBe(0);
+    });
+  });
+
   describe('onNoMatchingAgent hook', () => {
     it('enqueues job when onNoMatchingAgent returns spawning', async () => {
       const queue = mockQueue();
@@ -794,6 +942,7 @@ describe('Dispatcher', () => {
         queuedJobId,
         'run-1',
         [],
+        undefined,
         undefined,
       );
       expect(metrics.incJobsDispatched).toHaveBeenCalledWith('queued');
@@ -826,6 +975,7 @@ describe('Dispatcher', () => {
         'run-1',
         [],
         resources,
+        undefined,
       );
     });
 
@@ -854,6 +1004,7 @@ describe('Dispatcher', () => {
         queuedJobId,
         'run-attribution-1',
         [],
+        undefined,
         undefined,
       );
     });
@@ -964,6 +1115,159 @@ describe('Dispatcher', () => {
 
       expect(result.status).toBe('dispatched');
       expect(onNoMatchingAgent).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('retryPendingScaleRequests (capacity-freed re-drive)', () => {
+    it('re-offers each pending job to onNoMatchingAgent, oldest first, with dispatch-time args', async () => {
+      const pendingJobs = [
+        makeQueuedJob({
+          id: 'old',
+          runId: 'run-old',
+          runsOnLabels: ['linux'],
+          excludeLabels: ['windows'],
+        }),
+        makeQueuedJob({ id: 'new', runId: 'run-new', runsOnLabels: ['docker'] }),
+      ];
+      const queue = mockQueue({ pendingJobs });
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const redriven = await dispatcher.retryPendingScaleRequests();
+
+      expect(redriven).toBe(2);
+      expect(onNoMatchingAgent).toHaveBeenCalledTimes(2);
+      expect(onNoMatchingAgent).toHaveBeenNthCalledWith(
+        1,
+        ['linux'],
+        'old',
+        'run-old',
+        ['windows'],
+        undefined,
+        undefined,
+      );
+      expect(onNoMatchingAgent).toHaveBeenNthCalledWith(
+        2,
+        ['docker'],
+        'new',
+        'run-new',
+        [],
+        undefined,
+        undefined,
+      );
+      expect(metrics.incScalerRedispatch).toHaveBeenCalledWith('hook', 2);
+    });
+
+    it('respects the maxJobs cap (re-drives only the oldest)', async () => {
+      const pendingJobs = [
+        makeQueuedJob({ id: 'old', runId: 'run-old' }),
+        makeQueuedJob({ id: 'new', runId: 'run-new' }),
+      ];
+      const queue = mockQueue({ pendingJobs });
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const redriven = await dispatcher.retryPendingScaleRequests(1);
+
+      expect(queue.listPending).toHaveBeenCalledWith(1);
+      expect(redriven).toBe(1);
+      expect(onNoMatchingAgent).toHaveBeenCalledTimes(1);
+      expect(onNoMatchingAgent).toHaveBeenCalledWith(
+        ['linux'],
+        'old',
+        'run-old',
+        [],
+        undefined,
+        undefined,
+      );
+    });
+
+    it('passes the trigger label through to the metric', async () => {
+      const queue = mockQueue({ pendingJobs: [makeQueuedJob()] });
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      await dispatcher.retryPendingScaleRequests(10, 'sweep');
+
+      expect(metrics.incScalerRedispatch).toHaveBeenCalledWith('sweep', 1);
+    });
+
+    it('does not count (or emit) jobs that stay at-capacity', async () => {
+      const queue = mockQueue({ pendingJobs: [makeQueuedJob()] });
+      const onNoMatchingAgent = vi.fn().mockResolvedValue({ action: 'at-capacity' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const redriven = await dispatcher.retryPendingScaleRequests();
+
+      expect(redriven).toBe(0);
+      expect(metrics.incScalerRedispatch).not.toHaveBeenCalled();
+    });
+
+    it('returns 0 and does not throw when no scaler hook is configured', async () => {
+      const queue = mockQueue({ pendingJobs: [makeQueuedJob()] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const redriven = await dispatcher.retryPendingScaleRequests();
+
+      expect(redriven).toBe(0);
+      expect(queue.listPending).not.toHaveBeenCalled();
+    });
+
+    it('is single-flight: a concurrent call while one is in flight returns 0', async () => {
+      const queue = mockQueue({ pendingJobs: [makeQueuedJob()] });
+      let releaseFirst: (r: { action: 'spawning'; backendType: string }) => void = () => {};
+      const onNoMatchingAgent = vi.fn().mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseFirst = resolve;
+          }),
+      );
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const first = dispatcher.retryPendingScaleRequests();
+      // Second call races in while the first is still awaiting onNoMatchingAgent.
+      const second = await dispatcher.retryPendingScaleRequests();
+      expect(second).toBe(0);
+
+      releaseFirst({ action: 'spawning', backendType: 'docker' });
+      expect(await first).toBe(1);
+      expect(onNoMatchingAgent).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1145,6 +1449,59 @@ describe('Dispatcher', () => {
       vi.advanceTimersByTime(200_000);
       await vi.runAllTimersAsync();
       expect(queue.markFailedIfRecovering).not.toHaveBeenCalled();
+    });
+
+    it('a boot-swept job is reclaimable by the agent that owned it', async () => {
+      vi.useFakeTimers();
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      // The boot sweep passes the owner it read off the dispatched row.
+      await dispatcher.startRecoveryTimer('job-42', 'agent-1', 'run-42');
+
+      expect(queue.markRecovering).toHaveBeenCalledWith('job-42', expect.any(Date), 'agent-1');
+      expect(dispatcher.claimRecovery('job-42', 'agent-1')).toBe(true);
+
+      dispatcher.stopRecoveryTimers();
+    });
+
+    it('a boot-swept job is not reclaimable by a different agent', async () => {
+      vi.useFakeTimers();
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      await dispatcher.startRecoveryTimer('job-42', 'agent-1', 'run-42');
+
+      expect(dispatcher.claimRecovery('job-42', 'agent-2')).toBe(false);
+
+      dispatcher.stopRecoveryTimers();
+    });
+
+    it('a boot-swept job with no recorded owner stays unclaimable', async () => {
+      vi.useFakeTimers();
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      // A row dispatched before the owner column existed: the sweep falls back
+      // to the placeholder, so no real agent id can claim it.
+      await dispatcher.startRecoveryTimer('job-42', 'unknown', 'run-42');
+
+      expect(dispatcher.claimRecovery('job-42', 'agent-1')).toBe(false);
+
+      dispatcher.stopRecoveryTimers();
+    });
+
+    it('reconcileRecovery records the reclaiming agent as the durable owner', async () => {
+      vi.useFakeTimers();
+      const queue = mockQueue();
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      await dispatcher.startRecoveryTimer('job-42', 'agent-1', 'run-42');
+
+      await expect(dispatcher.reconcileRecovery('job-42', 'agent-1')).resolves.toBe(true);
+      expect(queue.markDispatchedIfRecovering).toHaveBeenCalledWith('job-42', 'agent-1');
+
+      dispatcher.stopRecoveryTimers();
     });
 
     it('claimRecovery returns false for wrong agent', async () => {
@@ -1563,7 +1920,14 @@ describe('Dispatcher', () => {
 
       await dispatcher.onJobRejected('busy-agent', 'job-1', 'busy');
 
-      expect(onNoMatchingAgent).toHaveBeenCalledWith(['linux'], 'job-1', 'run-1', [], undefined);
+      expect(onNoMatchingAgent).toHaveBeenCalledWith(
+        ['linux'],
+        'job-1',
+        'run-1',
+        [],
+        undefined,
+        undefined,
+      );
     });
   });
 
@@ -1762,7 +2126,7 @@ describe('Dispatcher', () => {
       await new Promise((r) => setTimeout(r, 5));
 
       const insertMock = queue.insertDispatched as ReturnType<typeof vi.fn>;
-      const jobId = (await insertMock.mock.results[0].value) as string;
+      const jobId = ((await insertMock.mock.results[0].value) as { id: string }).id;
 
       // Ack arrives before arming completes; recorded as an early ack.
       dispatcher.onJobAcked('a1', jobId);

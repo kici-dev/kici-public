@@ -3,13 +3,13 @@ title: Orchestrator
 description: Deploy and operate the KiCI orchestrator
 ---
 
-The KiCI orchestrator is the execution brain (Tier 2) of the three-tier architecture. It connects to the KiCI Platform relay via WebSocket, receives forwarded webhooks, fetches lock files from repositories, matches triggers against workflow configurations, and dispatches jobs to connected agents. It runs entirely in customer infrastructure with three operating modes: platform, hybrid, and independent.
+The KiCI orchestrator is the execution brain (Tier 2) of the three-tier architecture. It connects to the KiCI Platform relay via WebSocket, receives forwarded webhooks, fetches lock files from repositories, matches triggers against workflow configurations, and dispatches jobs to connected agents. It runs entirely in customer infrastructure with four operating modes: platform, hybrid, observed, and independent.
 
 ## Pages
 
 ### [Deploying the KiCI orchestrator](getting-started.md)
 
-Deploy the orchestrator using Docker or Docker Compose. Covers all three operating modes (platform for Platform-connected, hybrid for dual webhook sources, independent for fully self-hosted), PostgreSQL database setup, GitHub App configuration, API key provisioning, and health check verification.
+Deploy the orchestrator using Docker or Docker Compose. Covers all four operating modes (platform for Platform-connected, hybrid for dual webhook sources, observed for own-ingress-only with the hosted dashboard, independent for fully self-hosted), PostgreSQL database setup, GitHub App configuration, API key provisioning, and health check verification.
 
 ### [Configuration reference](configuration.md)
 
@@ -23,9 +23,9 @@ Configure ephemeral agent provisioning with Docker, bare-metal, and Firecracker 
 
 Shared config lifecycle: seeding config to the database, viewing and modifying config via CLI and REST API, hot-reloading, rollback, and cluster config synchronization.
 
-### [Firecracker setup guide](firecracker-setup.md)
+### [Firecracker host setup](firecracker/host-setup.md)
 
-Set up Firecracker microVMs for hardware-isolated ephemeral CI agents. Covers host prerequisites (KVM, binaries, architecture notes), helper scripts for network setup, jailer setup, and rootfs building, complete YAML configuration with dual-architecture examples, DB-backed IP allocation, MMDS-based agent bootstrap, security hardening, and troubleshooting common issues.
+Set up a host to run Firecracker microVMs for hardware-isolated ephemeral CI agents. Covers host prerequisites (KVM, packages, binaries, architecture notes), operator and jailer users, capabilities, kernel, network setup, jailer directories, dual-architecture setup, DB-backed IP allocation, security hardening, and troubleshooting. See also the [rootfs build guide](firecracker/rootfs.md) and [disk recovery](firecracker/disk-recovery.md).
 
 ## Test run support
 

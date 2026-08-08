@@ -4,9 +4,15 @@ import { Command } from 'commander';
 const mockListAll = vi.fn();
 const mockGet = vi.fn();
 const mockDeclareStatic = vi.fn();
+const mockRemoveStatic = vi.fn();
+const mockRecordOnDb = vi.fn();
 
 vi.mock('./shared/db.js', () => ({
   withDb: vi.fn(async (fn: (db: any) => Promise<any>) => fn({})),
+}));
+
+vi.mock('./shared/admin-cli-access-log.js', () => ({
+  recordAdminCliAccessOnDb: (...a: unknown[]) => mockRecordOnDb(...a),
 }));
 
 vi.mock('../../agent/host-roster.js', async (importActual) => {
@@ -17,6 +23,7 @@ vi.mock('../../agent/host-roster.js', async (importActual) => {
       listAll = mockListAll;
       get = mockGet;
       declareStatic = mockDeclareStatic;
+      removeStatic = mockRemoveStatic;
     },
   };
 });
@@ -236,5 +243,45 @@ describe('kici-admin host', () => {
     ]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('Invalid property');
+  });
+});
+
+describe('host declare/remove access-log', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDeclareStatic.mockResolvedValue({ created: true });
+    mockRemoveStatic.mockResolvedValue(1);
+  });
+
+  it('records fleet.host.declare on declare', async () => {
+    await runCommand(['host', 'declare', '--agent-id', 'agent-1']);
+    expect(mockRecordOnDb).toHaveBeenCalledTimes(1);
+    const entry = mockRecordOnDb.mock.calls[0][1];
+    expect(entry.action).toBe('fleet.host.declare');
+    expect(entry.target).toEqual({ type: 'fleet', id: 'agent-1' });
+    expect(entry.outcome).toBe('allowed');
+  });
+
+  it('records fleet.host.remove on remove', async () => {
+    await runCommand(['host', 'remove', '--agent-id', 'agent-1']);
+    expect(mockRecordOnDb).toHaveBeenCalledTimes(1);
+    const entry = mockRecordOnDb.mock.calls[0][1];
+    expect(entry.action).toBe('fleet.host.remove');
+    expect(entry.target).toEqual({ type: 'fleet', id: 'agent-1' });
+    expect(entry.outcome).toBe('allowed');
+  });
+
+  it('records fleet.host.declare with outcome error when declareStatic throws', async () => {
+    mockDeclareStatic.mockRejectedValueOnce(new Error('boom'));
+    const { exitCode } = await runCommand(['host', 'declare', '--agent-id', 'agent-x']);
+    expect(exitCode).toBe(1);
+    expect(mockRecordOnDb).toHaveBeenCalledTimes(1);
+    expect(mockRecordOnDb.mock.calls[0][1].outcome).toBe('error');
+  });
+
+  it('does NOT record on host list', async () => {
+    mockListAll.mockResolvedValue([]);
+    await runCommand(['host', 'list']);
+    expect(mockRecordOnDb).not.toHaveBeenCalled();
   });
 });

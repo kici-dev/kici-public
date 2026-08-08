@@ -16,6 +16,16 @@ import {
   separateLabels,
   scalerAgentLabels,
   isSelfReportedLabel,
+  derivePlatformTaints,
+  PLATFORM_TAINT_LABELS,
+  ScalerOs,
+  ScalerArch,
+  scalerPlatformSchema,
+  platformToOsArchLabels,
+  platformToTaints,
+  nodePlatformToScalerOs,
+  nodeArchToScalerArch,
+  hostToScalerPlatform,
 } from './labels.js';
 
 describe('deriveOsArchLabels', () => {
@@ -331,5 +341,128 @@ describe('isSelfReportedLabel', () => {
   it('does NOT treat user labels as self-reported', () => {
     expect(isSelfReportedLabel('linux')).toBe(false);
     expect(isSelfReportedLabel('container')).toBe(false);
+  });
+});
+
+describe('derivePlatformTaints', () => {
+  it('taints a windows bare-metal pool with windows', () => {
+    expect(derivePlatformTaints(['windows', 'bare-metal'])).toEqual(['windows']);
+  });
+  it('taints a macos pool with its os labels', () => {
+    expect(derivePlatformTaints(['macos', 'darwin', 'bare-metal']).sort()).toEqual([
+      'darwin',
+      'macos',
+    ]);
+  });
+  it('taints an arm64 linux pool with arm64 only (linux is default)', () => {
+    expect(derivePlatformTaints(['arm64', 'linux', 'bare-metal'])).toEqual(['arm64']);
+  });
+  it('does not taint a linux/x64 pool', () => {
+    expect(derivePlatformTaints(['linux', 'bare-metal'])).toEqual([]);
+    expect(derivePlatformTaints(['bare-metal'])).toEqual([]);
+  });
+  it('is case-insensitive and de-duplicates', () => {
+    expect(derivePlatformTaints(['Windows', 'WINDOWS', 'bare-metal'])).toEqual(['windows']);
+  });
+  it('excludes the defaults from the taint set', () => {
+    expect(PLATFORM_TAINT_LABELS.has('linux')).toBe(false);
+    expect(PLATFORM_TAINT_LABELS.has('x64')).toBe(false);
+    expect(PLATFORM_TAINT_LABELS.has('amd64')).toBe(false);
+    expect(PLATFORM_TAINT_LABELS.has('windows')).toBe(true);
+  });
+});
+
+describe('scalerPlatformSchema', () => {
+  it('accepts a valid structured platform', () => {
+    expect(scalerPlatformSchema.parse({ os: 'windows', arch: 'x64' })).toEqual({
+      os: 'windows',
+      arch: 'x64',
+    });
+  });
+
+  it('rejects an unknown os', () => {
+    expect(() => scalerPlatformSchema.parse({ os: 'freebsd', arch: 'x64' })).toThrow();
+  });
+
+  it('rejects an unknown arch', () => {
+    expect(() => scalerPlatformSchema.parse({ os: 'linux', arch: 'ppc64' })).toThrow();
+  });
+
+  it('rejects an extra key (strict)', () => {
+    expect(() => scalerPlatformSchema.parse({ os: 'linux', arch: 'x64', extra: true })).toThrow();
+  });
+
+  it('exposes exactly the os enum values', () => {
+    expect(ScalerOs.options).toEqual(['linux', 'macos', 'windows']);
+  });
+
+  it('exposes exactly the arch enum values', () => {
+    expect(ScalerArch.options).toEqual(['x64', 'arm64']);
+  });
+});
+
+describe('platformToOsArchLabels', () => {
+  it('derives linux/x64 labels', () => {
+    expect(platformToOsArchLabels({ os: 'linux', arch: 'x64' })).toEqual([
+      'kici:os:linux',
+      'kici:arch:x64',
+      'kici:arch:amd64',
+    ]);
+  });
+
+  it('derives windows/x64 labels (os synonyms included)', () => {
+    expect(platformToOsArchLabels({ os: 'windows', arch: 'x64' })).toEqual([
+      'kici:os:windows',
+      'kici:os:win32',
+      'kici:arch:x64',
+      'kici:arch:amd64',
+    ]);
+  });
+
+  it('derives macos/arm64 labels', () => {
+    expect(platformToOsArchLabels({ os: 'macos', arch: 'arm64' })).toEqual([
+      'kici:os:macos',
+      'kici:os:darwin',
+      'kici:arch:arm64',
+    ]);
+  });
+});
+
+describe('platformToTaints', () => {
+  it('does not taint the linux/x64 default', () => {
+    expect(platformToTaints({ os: 'linux', arch: 'x64' })).toEqual([]);
+  });
+
+  it('taints windows regardless of arch', () => {
+    expect(platformToTaints({ os: 'windows', arch: 'x64' })).toEqual(['windows']);
+  });
+
+  it('taints macos + arm64 together', () => {
+    expect(platformToTaints({ os: 'macos', arch: 'arm64' })).toEqual(['macos', 'arm64']);
+  });
+
+  it('taints arm64 on a linux pool', () => {
+    expect(platformToTaints({ os: 'linux', arch: 'arm64' })).toEqual(['arm64']);
+  });
+});
+
+describe('host → structured platform mapping', () => {
+  it('maps node platform strings', () => {
+    expect(nodePlatformToScalerOs('linux')).toBe('linux');
+    expect(nodePlatformToScalerOs('darwin')).toBe('macos');
+    expect(nodePlatformToScalerOs('win32')).toBe('windows');
+    expect(nodePlatformToScalerOs('sunos')).toBeNull();
+  });
+
+  it('maps node arch strings', () => {
+    expect(nodeArchToScalerArch('x64')).toBe('x64');
+    expect(nodeArchToScalerArch('arm64')).toBe('arm64');
+    expect(nodeArchToScalerArch('ppc64')).toBeNull();
+  });
+
+  it('combines into a structured platform or null', () => {
+    expect(hostToScalerPlatform('darwin', 'arm64')).toEqual({ os: 'macos', arch: 'arm64' });
+    expect(hostToScalerPlatform('linux', 'ppc64')).toBeNull();
+    expect(hostToScalerPlatform('sunos', 'x64')).toBeNull();
   });
 });

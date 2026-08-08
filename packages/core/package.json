@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/core",
-  "version": "0.1.27",
+  "version": "0.2.0",
   "description": "Light shared utilities for the KiCI stack (logging, errors, formatting, crypto, zx init, the TypeScript ESM loader hook). No server-side dependencies.",
   "keywords": [
     "ci",
@@ -52,20 +52,28 @@
       "import": "./dist/idempotency.js",
       "types": "./dist/idempotency.d.ts"
     },
+    "./ci-env": {
+      "import": "./dist/ci-env.js",
+      "types": "./dist/ci-env.d.ts"
+    },
     "./tmp-gc": {
       "import": "./dist/tmp-gc.js",
       "types": "./dist/tmp-gc.d.ts"
+    },
+    "./tmp": {
+      "import": "./dist/tmp.js",
+      "types": "./dist/tmp.d.ts"
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsgo --emitDeclarationOnly",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsgo --noEmit",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/core --name @kici-dev/core"
   },
   "dependencies": {
-    "oxc-transform": "0.135.0",
+    "oxc-transform": "0.140.0",
     "picocolors": "^1.1.1",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",

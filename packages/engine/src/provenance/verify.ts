@@ -144,7 +144,14 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
     const { payload } = await jwtVerify(
       bundle.verificationMaterial.identityToken,
       createLocalJWKSet(opts.jwks),
-      { issuer: opts.expectedIssuer, audience: opts.expectedAudience },
+      {
+        issuer: opts.expectedIssuer,
+        audience: opts.expectedAudience,
+        // Pin ES256 explicitly (defense-in-depth against alg-confusion / alg:none):
+        // KiCI provenance is ES256-only, so never accept any other JWS algorithm
+        // regardless of what the token header or a JWKS key claims.
+        algorithms: ['ES256'],
+      },
     );
     claims = payload as Record<string, unknown>;
     checks.jwt = 'pass';
@@ -230,8 +237,7 @@ function resolveAttestationOrigin(
   const fromClaim = AttestationOrigin.safeParse(claims?.attestation_origin);
   if (fromClaim.success) return fromClaim.data;
   const internal = statement?.predicate.buildDefinition.internalParameters as
-    | Record<string, unknown>
-    | undefined;
+    Record<string, unknown> | undefined;
   const fromStatement = AttestationOrigin.safeParse(internal?.attestationOrigin);
   return fromStatement.success ? fromStatement.data : AttestationOrigin.enum.live;
 }

@@ -1,14 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m034 from './034_held_runs_generalize.js';
 
 /**
  * Real-Postgres test for migration 034.
  *
- * Creates a throwaway database, runs every migration up to 034 via the
+ * Creates a throwaway database, applies migrations 001..034 via the
  * production provider, and asserts the generalized held_runs columns + the
  * held_run_approvals table (with its FK to held_runs). Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
@@ -74,8 +73,7 @@ describeDb('migration 034_held_runs_generalize', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

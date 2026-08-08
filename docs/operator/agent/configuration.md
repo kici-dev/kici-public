@@ -17,8 +17,10 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 | Env var                                | Required | Default    | Type                                    | Aliases | Description |
 | -------------------------------------- | -------- | ---------- | --------------------------------------- | ------- | ----------- |
+| `KICI_AGENT_COMMAND`                   | no       |            | string                                  |         |             |
 | `KICI_AGENT_ID`                        | no       |            | string                                  |         |             |
 | `KICI_AGENT_IS_ORCHESTRATOR_HOST`      | no       |            | string                                  |         |             |
+| `KICI_AGENT_PAYLOAD_DIR`               | no       |            | string                                  |         |             |
 | `KICI_AGENT_TOKEN`                     | no       |            | string                                  |         |             |
 | `KICI_BACKPRESSURE_MODE`               | no       | "pause"    | enum:pause\|drop                        |         |             |
 | `KICI_DEFAULT_STEP_TIMEOUT_MS`         | no       | 1800000    | number                                  |         |             |
@@ -33,7 +35,13 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_PROPERTIES`                      | no       |            | string                                  |         |             |
 | `KICI_ROLES`                           | no       |            | string                                  |         |             |
 | `KICI_SANDBOX`                         | no       | "false"    | string                                  |         |             |
+| `KICI_SANDBOX_HARDENED`                | no       | "true"     | string                                  |         |             |
+| `KICI_SANDBOX_MEMORY_BYTES`            | no       | 2147483648 | number                                  |         |             |
+| `KICI_SANDBOX_NANO_CPUS`               | no       | 2000000000 | number                                  |         |             |
 | `KICI_SANDBOX_NETWORK`                 | no       | "isolated" | enum:isolated\|host                     |         |             |
+| `KICI_SANDBOX_PIDS_LIMIT`              | no       | 512        | number                                  |         |             |
+| `KICI_SANDBOX_READONLY_ROOTFS`         | no       | "false"    | string                                  |         |             |
+| `KICI_SANDBOX_USER`                    | no       |            | string                                  |         |             |
 | `KICI_SCALER_IDLE_TIMEOUT`             | no       | 5000       | number                                  |         |             |
 | `KICI_SCALER_MANAGED`                  | no       |            | string                                  |         |             |
 | `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` | no       | 60000      | number                                  |         |             |
@@ -93,6 +101,30 @@ The `kici:*` label prefix is reserved for internal use. User-provided labels in 
 
 Each agent executes one job at a time. When a job is already running, the agent rejects additional dispatches, and the orchestrator routes them to another available agent or queues them.
 
+## Execution profiles
+
+Two agent-launch profiles change how a dispatched job is prepared. Both are set **only** by the operator at agent (or scaler) launch — neither is derivable from a dispatch payload or from workflow code, so a Platform-connected agent can never be pushed onto them.
+
+| Variable           | Default | Effect                                                                                                                                                                                                                                                              |
+| ------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_TRUSTED_ENV` | `false` | Trusted fleet-agent profile: step sandboxes receive the ambient host environment (minus the agent's own KiCI identity and operational secrets) instead of the system-variable allowlist. See [Agent security](../security/agent-security.md).                       |
+| `KICI_IN_PLACE`    | `false` | In-place no-clone profile: when the dispatched source is a `file://` local source, the agent uses that source's real repository path as the job work directory and skips the git clone. Any other source is unaffected and still clones into a throwaway directory. |
+
+`KICI_IN_PLACE` exists for running an operator's own already-built working tree directly — module-relative paths, installed dependencies, and build output are all present because nothing is copied. See [Local development plane](../orchestrator/local-dev-plane.md).
+
+## Co-located orchestrator guard
+
+Set `KICI_AGENT_IS_ORCHESTRATOR_HOST=true` when the agent shares a host with the orchestrator. A workflow's `restartHost()` step is then refused locally (`refusing to reboot the orchestrator host`), so a fleet-wide reboot workflow cannot take the control plane down with it. Defaults to `false`; the orchestrator refuses the same request independently.
+
+## Bring-up payload source
+
+An ops agent holding the `kici:capability:ssh-transport` capability stages a self-contained agent plus vendored Node runtime onto a fresh box during [init-runner bring-up](../orchestrator/host-roster.md#payload-delivery). By default that payload comes from the orchestrator's own object storage. Two variables, read only by the agent performing the bring-up, override that:
+
+| Variable                 | Effect                                                                                                                                                                                                                                          |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_AGENT_PAYLOAD_DIR` | Local directory holding version-keyed payloads (`<dir>/<version>/kici-agent-<platform>.tar.gz`) as produced by `kici-admin agent package`. When set, the payload is read from disk instead of pulled from object storage — the air-gapped path. |
+| `KICI_AGENT_COMMAND`     | Golden-image escape hatch: a fixed command that starts the init-runner on a target that already ships `kici-agent` and a Node runtime at a known path. When set, payload staging is skipped entirely.                                           |
+
 ## Docker job requirements
 
 For workflows that specify `container` in their job configuration, the agent executes steps inside Docker containers.
@@ -109,10 +141,11 @@ volumes:
 
 The agent:
 
-1. Pulls the specified container image
-2. Creates a container with the cloned repo mounted at `/workspace`
-3. Runs each step command inside the container via `docker exec`
-4. Removes the container after job completion
+1. Creates a job container from the specified image (already-present images are used as-is; a missing image is pulled on demand first) with `/workspace` as a container-owned volume
+2. Starts the workflow runner inside the container via a single `docker exec` — the repository clone, dependency install, and every step all run inside the container
+3. Removes the container (and its workspace volume) after job completion
+
+Job containers are hardened by default: all Linux capabilities dropped, no-new-privileges, cgroup PID/memory/CPU caps, and a private tmpfs `/tmp`, tunable via the `KICI_SANDBOX_*` variables above. See [Agent security](../security/agent-security.md) for the full isolation model and the per-job `sandbox:` escape hatch.
 
 Set `KICI_DOCKER_KEEP_FAILED=true` to preserve failed containers for debugging. The container name follows the pattern `kici-sandbox-{jobId}-{timestamp}`.
 

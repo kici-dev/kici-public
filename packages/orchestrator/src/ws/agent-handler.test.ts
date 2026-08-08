@@ -1,22 +1,57 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Capture every module logger so the artifact tests can assert that the raw
+// exception a failed commit must NOT put on the wire is still recorded
+// server-side. Stripping the disclosure without keeping the log line would
+// trade a leak for an observability regression, so both halves are asserted.
+const mockLogError = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: mockLogError, debug: vi.fn() }),
+  };
+});
+
+import { LogStream, agentLogChunkSchema } from '@kici-dev/engine';
 import {
   createAgentWsHandler,
+  isValidLogChunk,
   truncateCloseReason,
   type AgentWsHandlerDeps,
 } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
-import { OwnershipTracker } from '../agent/ownership-tracker.js';
+import { OwnershipTracker, type OwnershipDbResult } from '../agent/ownership-tracker.js';
+import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
 import {
   WS_CLOSE_AUTH_TIMEOUT,
   WS_CLOSE_INVALID_MESSAGE,
   WS_CLOSE_AGENT_AUTH_FAILED,
   PRIVILEGED_ROOT_LABEL,
+  ArtifactCompleteAckOutcome,
+  ORCH_AGENT_CAPABILITIES,
 } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
 import type { UserCache } from '../cache/user-cache.js';
+import {
+  ArtifactInvalidNameError,
+  ArtifactObjectMissingError,
+  type ArtifactStore,
+} from '../artifacts/artifact-store.js';
+import {
+  ARTIFACT_INVALID_NAME_PREFIX,
+  ArtifactInternalFailure,
+  artifactInvalidNameError,
+} from '../artifacts/failure-messages.js';
+import {
+  AgentApiRegistry,
+  ApiRoleDeniedError,
+  UnknownApiMethodError,
+} from './agent-api-registry.js';
+import { AgentWsInternalFailure } from './failure-messages.js';
 import { CacheRefScope } from '@kici-dev/engine';
 
 /** Create a mock Dispatcher with controllable methods. */
@@ -96,6 +131,9 @@ describe('createAgentWsHandler', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    // Per-test isolation for the shared module-logger stub, so a
+    // `toHaveBeenCalledWith` on it can only be satisfied by its own test.
+    mockLogError.mockClear();
     registry = new AgentRegistry();
     dispatcher = mockDispatcher();
     onJobStatus = vi.fn();
@@ -220,6 +258,7 @@ describe('createAgentWsHandler', () => {
         agentId: 'agent-ack',
         labels: ['linux'],
         scalerManaged: false,
+        capabilities: ORCH_AGENT_CAPABILITIES,
       });
     });
   });
@@ -1155,12 +1194,26 @@ describe('createAgentWsHandler', () => {
       opts: {
         owned?: boolean;
         userCache?: UserCache;
+        artifactStore?: ArtifactStore;
         dispatchCacheRefs?: DispatchCacheRefTracker;
         recordRef?: boolean;
+        /**
+         * Verdict the database-backed fallback returns. Present ⇒ the tracker is
+         * built with a fallback, which is what a coordinator that never saw the
+         * dispatch looks like: the synchronous check cannot decide, so the
+         * database has to.
+         */
+        ownershipDb?: OwnershipDbResult;
       } = {},
     ) {
       const isJobOwnedByAgent = vi.fn().mockReturnValue(opts.owned ?? true);
-      const tracker = new OwnershipTracker({ isJobOwnedByAgent, onDisconnect: vi.fn() });
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent,
+        onDisconnect: vi.fn(),
+        ...(opts.ownershipDb
+          ? { isJobOwnedByAgentInDb: async () => opts.ownershipDb as OwnershipDbResult }
+          : {}),
+      });
       const dispatchCacheRefs = opts.dispatchCacheRefs ?? new DispatchCacheRefTracker();
       if (opts.recordRef !== false) {
         dispatchCacheRefs.record('job-1', {
@@ -1178,9 +1231,25 @@ describe('createAgentWsHandler', () => {
         onJobStatus,
         ownershipTracker: tracker,
         userCache,
+        artifactStore: opts.artifactStore,
         dispatchCacheRefs,
       });
       return { handler, userCache, dispatchCacheRefs };
+    }
+
+    /** Minimal ArtifactStore stub exposing only the methods the handler drives. */
+    function mockArtifactStore(
+      opts: {
+        beginUpload?: ReturnType<typeof vi.fn>;
+        completeUpload?: ReturnType<typeof vi.fn>;
+        download?: ReturnType<typeof vi.fn>;
+      } = {},
+    ): ArtifactStore {
+      return {
+        beginUpload: opts.beginUpload ?? vi.fn().mockResolvedValue({ outcome: 'granted' }),
+        completeUpload: opts.completeUpload ?? vi.fn().mockResolvedValue(undefined),
+        download: opts.download ?? vi.fn().mockResolvedValue({ outcome: 'not_found' }),
+      } as unknown as ArtifactStore;
     }
 
     async function register(
@@ -1190,6 +1259,26 @@ describe('createAgentWsHandler', () => {
       handler.onOpen!(new Event('open'), ws as any);
       await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
       (ws.send as ReturnType<typeof vi.fn>).mockClear();
+    }
+
+    /** The canonical owned+resolvable `artifacts.upload.complete` frame. */
+    function completeMsg() {
+      return {
+        type: 'artifacts.upload.complete',
+        messageId: 'm1',
+        jobId: 'job-1',
+        name: 'bundle',
+        sizeBytes: 100,
+        sha256: 'abc',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      };
+    }
+
+    /** The `artifacts.upload.complete.ack` the handler sent, if any. */
+    function sentAck(ws: ReturnType<typeof mockWs>): Record<string, unknown> | undefined {
+      return (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === 'artifacts.upload.complete.ack');
     }
 
     it('cache.user.restore.request resolves the ref server-side and replies with the stub result', async () => {
@@ -1266,7 +1355,7 @@ describe('createAgentWsHandler', () => {
       expect(callArg.runId).toBe('run-1');
     });
 
-    it('cache.user.restore.request for an unowned job is dropped (no reply, no restore)', async () => {
+    it('cache.user.restore.request for an unowned job replies a miss, never silence', async () => {
       const { handler, userCache } = setup({ owned: false });
       const ws = mockWs();
       await register(handler, ws);
@@ -1282,7 +1371,12 @@ describe('createAgentWsHandler', () => {
       );
 
       expect(userCache.restore).not.toHaveBeenCalled();
-      expect((ws.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0);
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.restore.response',
+        requestId: 'm1',
+        hit: false,
+      });
     });
 
     it('cache.user.restore.request for an unknown jobId fails closed (miss reply, no restore)', async () => {
@@ -1449,6 +1543,625 @@ describe('createAgentWsHandler', () => {
       );
 
       expect(dispatchCacheRefs.get('job-1')).toBeUndefined();
+    });
+
+    it('artifacts.upload.request resolves the ref server-side and replies with the grant', async () => {
+      const beginUpload = vi.fn().mockResolvedValue({
+        outcome: 'granted',
+        uploadUrl: 'mem://put',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ beginUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+          // forged fields — must be ignored (org/run resolved server-side)
+          orgId: 'victim',
+          runId: 'victim-run',
+        }),
+        ws as any,
+      );
+
+      expect(beginUpload).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        name: 'bundle',
+        declaredSizeBytes: 100,
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.upload.response',
+        requestId: 'm1',
+        outcome: 'granted',
+        uploadUrl: 'mem://put',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+    });
+
+    it('artifacts.upload.request relays a rejection reason verbatim', async () => {
+      const beginUpload = vi
+        .fn()
+        .mockResolvedValue({ outcome: 'rejected', reason: 'duplicate_name' });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ beginUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toMatchObject({ outcome: 'rejected', reason: 'duplicate_name' });
+      expect(response.error).toBeUndefined();
+    });
+
+    /** Drive one `artifacts.upload.request` and return the response the handler sent. */
+    async function uploadRequest(
+      setupOpts: Parameters<typeof setup>[0],
+    ): Promise<Record<string, unknown>> {
+      const { handler } = setup(setupOpts);
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+      return JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    }
+
+    it('artifacts.upload.request relays a non-conforming-name rejection from the store', async () => {
+      // The store refuses the name before any gate; the handler must forward its
+      // free-text detail so the author is told the name is the problem, rather
+      // than falling back to the generic "upload was rejected".
+      const beginUpload = vi.fn().mockResolvedValue({
+        outcome: 'rejected',
+        error: artifactInvalidNameError('artifact name may only contain letters'),
+      });
+      const response = await uploadRequest({ artifactStore: mockArtifactStore({ beginUpload }) });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: expect.stringContaining(ARTIFACT_INVALID_NAME_PREFIX),
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with a config error (not org_quota) when artifacts are unconfigured', async () => {
+      // No artifactStore -> the store is unset.
+      const response = await uploadRequest({});
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.uploadNotConfigured,
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with an unresolvable-run error when the ref has no runId', async () => {
+      const response = await uploadRequest({
+        artifactStore: mockArtifactStore(),
+        recordRef: false,
+      });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.unresolvableRun,
+      });
+      expect(response.reason).toBeUndefined();
+    });
+
+    it('artifacts.upload.request rejects with an internal error when beginUpload throws', async () => {
+      const beginUpload = vi.fn().mockRejectedValue(new Error('s3 endpoint unreachable'));
+      const response = await uploadRequest({ artifactStore: mockArtifactStore({ beginUpload }) });
+      expect(response).toMatchObject({
+        outcome: 'rejected',
+        error: ArtifactInternalFailure.uploadFailed,
+      });
+      expect(response.reason).toBeUndefined();
+      // The raw exception text must never reach the wire.
+      expect(JSON.stringify(response)).not.toContain('s3 endpoint unreachable');
+    });
+
+    it('artifacts.upload.complete writes the row via the store', async () => {
+      const completeUpload = vi.fn().mockResolvedValue(undefined);
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.complete',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          sizeBytes: 100,
+          sha256: 'abc',
+          storageKey: 'artifacts/run-1/bundle.tar.gz',
+        }),
+        ws as any,
+      );
+
+      expect(completeUpload).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        jobId: 'job-1',
+        name: 'bundle',
+        sizeBytes: 100,
+        sha256: 'abc',
+        storageKey: 'artifacts/run-1/bundle.tar.gz',
+      });
+      expect(sentAck(ws)).toEqual({
+        type: 'artifacts.upload.complete.ack',
+        requestId: 'm1',
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete acks failed after the retries exhaust', async () => {
+      // Infrastructure-shaped text: the assertions below are that NONE of this
+      // reaches the agent, which runs untrusted workflow code. Asserting only
+      // the safe literal would still pass if the send site went back to
+      // forwarding the raw exception and its text happened to match.
+      const raw = 'connect ECONNREFUSED 10.1.2.3:5432 relation "artifacts" violates constraint';
+      const completeUpload = vi.fn().mockRejectedValue(new Error(raw));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Fake timers are active suite-wide, so the retry backoff has to be
+      // advanced explicitly for the handler promise to settle.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // Bounded retry: the commit is idempotent, so a transient blip is retried
+      // before the agent's step is failed.
+      expect(completeUpload).toHaveBeenCalledTimes(3);
+      const ack = sentAck(ws);
+      expect(ack).toMatchObject({
+        type: 'artifacts.upload.complete.ack',
+        requestId: 'm1',
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.commitFailed,
+      });
+      expect(JSON.stringify(ack)).not.toContain('ECONNREFUSED');
+      expect(JSON.stringify(ack)).not.toContain('10.1.2.3');
+      expect(JSON.stringify(ack)).not.toContain('constraint');
+      // The other half of the invariant: the operator can still debug the real
+      // failure, because the raw exception went to the orchestrator's own log.
+      expect(mockLogError).toHaveBeenCalledWith(
+        'artifact upload-complete failed',
+        expect.objectContaining({ error: raw }),
+      );
+    });
+
+    it('artifacts.upload.complete acks committed when a transient failure recovers', async () => {
+      const completeUpload = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('transient'))
+        .mockResolvedValue(undefined);
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      expect(completeUpload).toHaveBeenCalledTimes(2);
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete does not retry a missing object, and does not leak its key', async () => {
+      const storageKey = 'artifacts/run-1/bundle-0123456789abcdef.tar.gz';
+      const completeUpload = vi.fn().mockRejectedValue(new ArtifactObjectMissingError(storageKey));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Advance the retry backoff even though a terminal failure should never
+      // arm it: if the terminal classification regressed, the retries run and
+      // the call-count assertion fails instead of the promise hanging.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // The presigned PUT never landed an object — retrying cannot help.
+      expect(completeUpload).toHaveBeenCalledTimes(1);
+      const ack = sentAck(ws);
+      expect(ack).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        // Still its own actionable category, but the error's message embeds the
+        // storage key and that must not travel to the workflow author.
+        reason: ArtifactInternalFailure.commitObjectMissing,
+      });
+      expect(JSON.stringify(ack)).not.toContain(storageKey);
+    });
+
+    it('artifacts.upload.complete does not retry a non-conforming name', async () => {
+      const completeUpload = vi
+        .fn()
+        .mockRejectedValue(new ArtifactInvalidNameError('artifact name may only contain letters'));
+      const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      // Same timer advance as the missing-object case: a regressed terminal
+      // classification fails the call-count assertion rather than hanging.
+      const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await done;
+
+      // The name is fixed for the life of the request — retrying cannot help.
+      expect(completeUpload).toHaveBeenCalledTimes(1);
+      // Safe by construction: the detail is one of the schema's own fixed
+      // messages, so it passes through and the author still learns what was
+      // wrong with the name.
+      const reason = sentAck(ws)!.reason as string;
+      expect(reason).toContain(ARTIFACT_INVALID_NAME_PREFIX);
+      expect(reason).toContain('artifact name may only contain letters');
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+      });
+    });
+
+    it('artifacts.upload.complete acks failed for an unresolvable job', async () => {
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        artifactStore: mockArtifactStore({ completeUpload }),
+        recordRef: false,
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      // No commit is possible, but the agent must not hang waiting for an ack.
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.unresolvableRun,
+      });
+    });
+
+    it('artifacts.upload.complete acks not-configured when there is no artifact store', async () => {
+      // The guard covers two distinct operator problems and keeps them apart:
+      // storage that was never configured (here), and a run the orchestrator
+      // could not resolve (the test above).
+      const { handler } = setup({});
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: ArtifactInternalFailure.uploadNotConfigured,
+      });
+    });
+
+    it('artifacts.upload.complete for an unowned job is refused with an ack, never dropped', async () => {
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      // The commit must not run — but the agent is awaiting an ack, so a
+      // refusal is an explicit `failed`, not silence.
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('artifacts.upload.complete on a cold coordinator commits once the database confirms ownership', async () => {
+      // The failover shape: the in-memory map is empty on the newly-elected
+      // leader, so only the database can answer. The frame must be handled,
+      // not dropped for want of a synchronous hit.
+      const completeUpload = vi.fn().mockResolvedValue(undefined);
+      const { handler } = setup({
+        owned: false,
+        ownershipDb: 'owned',
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(completeUpload).toHaveBeenCalledOnce();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.committed,
+      });
+    });
+
+    it('artifacts.upload.complete is refused with the shared wording when the database cannot decide', async () => {
+      // An undecided lookup and a decided refusal are indistinguishable on the
+      // wire: a caller that could tell them apart would hold an oracle for job
+      // existence and orchestrator database health.
+      const completeUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        ownershipDb: 'unknown',
+        artifactStore: mockArtifactStore({ completeUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
+
+      expect(completeUpload).not.toHaveBeenCalled();
+      expect(sentAck(ws)).toMatchObject({
+        outcome: ArtifactCompleteAckOutcome.enum.failed,
+        reason: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('register.ack advertises the artifactCompleteAck capability', async () => {
+      const { handler } = setup({});
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === 'register.ack');
+      expect(ack?.capabilities?.artifactCompleteAck).toBe(true);
+    });
+
+    it('artifacts.download.request replies found with the presigned GET', async () => {
+      const download = vi.fn().mockResolvedValue({
+        outcome: 'found',
+        downloadUrl: 'mem://get',
+        sizeBytes: 100,
+        sha256: 'abc',
+      });
+      const { handler } = setup({ artifactStore: mockArtifactStore({ download }) });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+
+      expect(download).toHaveBeenCalledWith({
+        customerId: 'org-1',
+        runId: 'run-1',
+        name: 'bundle',
+      });
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.download.response',
+        requestId: 'm1',
+        outcome: 'found',
+        downloadUrl: 'mem://get',
+        sizeBytes: 100,
+        sha256: 'abc',
+      });
+    });
+
+    /** Drive one `artifacts.download.request` and return the response the handler sent. */
+    async function downloadRequest(
+      setupOpts: Parameters<typeof setup>[0],
+    ): Promise<Record<string, unknown>> {
+      const { handler } = setup(setupOpts);
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+      return JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+    }
+
+    it('artifacts.download.request replies not_found with no error on a genuine miss', async () => {
+      const download = vi.fn().mockResolvedValue({ outcome: 'not_found' });
+      const response = await downloadRequest({ artifactStore: mockArtifactStore({ download }) });
+      expect(response).toMatchObject({ outcome: 'not_found' });
+      expect(response.error).toBeUndefined();
+    });
+
+    it('artifacts.download.request carries a config error when artifacts are unconfigured', async () => {
+      const response = await downloadRequest({});
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.downloadNotConfigured,
+      });
+    });
+
+    it('artifacts.download.request carries an unresolvable-run error when the ref has no runId', async () => {
+      const response = await downloadRequest({
+        artifactStore: mockArtifactStore(),
+        recordRef: false,
+      });
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.unresolvableRun,
+      });
+    });
+
+    it('artifacts.download.request carries an internal error when download throws', async () => {
+      const download = vi.fn().mockRejectedValue(new Error('s3 endpoint unreachable'));
+      const response = await downloadRequest({ artifactStore: mockArtifactStore({ download }) });
+      expect(response).toMatchObject({
+        outcome: 'not_found',
+        error: ArtifactInternalFailure.downloadFailed,
+      });
+      // The raw exception text must never reach the wire.
+      expect(JSON.stringify(response)).not.toContain('s3 endpoint unreachable');
+    });
+
+    it('artifacts.upload.request for an unowned job is refused with a reply, no grant', async () => {
+      const beginUpload = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ beginUpload }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+          declaredSizeBytes: 100,
+        }),
+        ws as any,
+      );
+
+      expect(beginUpload).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.upload.response',
+        requestId: 'm1',
+        outcome: 'rejected',
+        error: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('artifacts.download.request for an unowned job replies not_found, no lookup', async () => {
+      const download = vi.fn();
+      const { handler } = setup({
+        owned: false,
+        artifactStore: mockArtifactStore({ download }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'artifacts.download.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          name: 'bundle',
+        }),
+        ws as any,
+      );
+
+      expect(download).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'artifacts.download.response',
+        requestId: 'm1',
+        outcome: 'not_found',
+        error: OWNERSHIP_REFUSED,
+      });
+    });
+
+    it('cache.upload.request for an unowned job replies an empty upload URL', async () => {
+      const { handler } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          cacheType: 'source',
+          contentHash: 'abc',
+          platform: 'linux',
+          arch: 'x64',
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.upload.response',
+        requestId: 'm1',
+        uploadUrl: '',
+      });
+    });
+
+    it('cache.user.save.request for an unowned job replies skip, no beginSave', async () => {
+      const beginSave = vi.fn();
+      const { handler, userCache } = setup({
+        owned: false,
+        userCache: mockUserCache({ beginSave }),
+      });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'cache.user.save.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          key: 'k1',
+        }),
+        ws as any,
+      );
+
+      expect(userCache.beginSave).not.toHaveBeenCalled();
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'cache.user.save.response',
+        requestId: 'm1',
+        skip: true,
+      });
+    });
+
+    it('provenance.upload.request for an unowned job replies an empty upload URL', async () => {
+      const { handler } = setup({ owned: false });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'provenance.upload.request',
+          messageId: 'm1',
+          jobId: 'job-1',
+          subjectDigest: 'sha256:abc',
+          sizeBytes: 10,
+        }),
+        ws as any,
+      );
+
+      const response = JSON.parse((ws.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
+      expect(response).toEqual({
+        type: 'provenance.upload.response',
+        requestId: 'm1',
+        uploadUrl: '',
+      });
     });
   });
 
@@ -1989,6 +2702,195 @@ describe('createAgentWsHandler', () => {
       expect(ws.close).not.toHaveBeenCalled();
     });
   });
+
+  describe('agent-bound error disclosure', () => {
+    // Infrastructure-shaped text. The assertions are that NONE of it reaches the
+    // agent, which runs untrusted customer workflow code and persists whatever
+    // it receives into the author's step logs.
+    const SECRET_TEXT = 'connect ECONNREFUSED 10.0.0.7:5432 relation "held_runs"';
+
+    /** Build a handler that owns every job the tests drive through it. */
+    function setup(extraDeps: Partial<AgentWsHandlerDeps> = {}) {
+      const tracker = new OwnershipTracker({
+        isJobOwnedByAgent: vi.fn().mockReturnValue(true),
+        onDisconnect: vi.fn(),
+      });
+      return createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        ownershipTracker: tracker,
+        ...extraDeps,
+      });
+    }
+
+    async function register(
+      handler: ReturnType<typeof createAgentWsHandler>,
+      ws: ReturnType<typeof mockWs>,
+    ) {
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      (ws.send as ReturnType<typeof vi.fn>).mockClear();
+    }
+
+    /** The frame of the given type the handler sent, if any. */
+    function sent(
+      ws: ReturnType<typeof mockWs>,
+      type: string,
+    ): Record<string, unknown> | undefined {
+      return (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => JSON.parse(c[0]))
+        .find((m) => m.type === type);
+    }
+
+    function approvalRequestMsg() {
+      return {
+        type: 'step.approval-request',
+        messageId: 'm1',
+        runId: 'run-1',
+        jobId: 'job-1',
+        stepIndex: 2,
+        stepName: 'deploy',
+        clauses: [],
+        reason: 'production deploy',
+      };
+    }
+
+    it('step.approval-resolved replaces a bridge rejection with a safe fixed reason', async () => {
+      const onStepApproval = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onStepApproval });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(makeMessageEvent(approvalRequestMsg()), ws as any);
+
+      // The bridge is awaited off the message-handling path, so the reply lands
+      // on a later microtask.
+      await vi.waitFor(() => expect(sent(ws, 'step.approval-resolved')).toBeDefined());
+      const frame = sent(ws, 'step.approval-resolved')!;
+      expect(frame).toMatchObject({
+        outcome: 'rejected',
+        reason: AgentWsInternalFailure.approvalFailed,
+      });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+      expect(JSON.stringify(frame)).not.toContain('ECONNREFUSED');
+      // The other half of the invariant: the operator can still debug the real
+      // failure, because the raw exception went to the orchestrator's own log.
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Step approval bridge rejected',
+        expect.objectContaining({ error: expect.stringContaining('ECONNREFUSED') }),
+      );
+    });
+
+    it('event.emit.response replaces a thrown callback with a safe fixed error', async () => {
+      const onEventEmit = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy.done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'event.emit.response')!;
+      expect(frame).toMatchObject({ error: AgentWsInternalFailure.eventEmitFailed });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+      expect(mockLogError).toHaveBeenCalledWith(
+        'Failed to process event.emit',
+        expect.objectContaining({ error: expect.stringContaining('ECONNREFUSED') }),
+      );
+    });
+
+    it('event.emit.response forwards an author-actionable error from the callback verbatim', async () => {
+      // The callback's own return value carries safe wording that stays specific
+      // enough for the author to fix their workflow.
+      const onEventEmit = vi.fn().mockResolvedValue({ error: 'Unknown job context' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy.done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(sent(ws, 'event.emit.response')).toMatchObject({ error: 'Unknown job context' });
+    });
+
+    /** Drive one `agent.api.request` and return the response the handler sent. */
+    async function apiRequest(
+      agentApiRegistry: AgentApiRegistry,
+      method: string,
+    ): Promise<Record<string, unknown>> {
+      const handler = setup({ agentApiRegistry });
+      const ws = mockWs();
+      await register(handler, ws);
+      await handler.onMessage!(
+        makeMessageEvent({ type: 'agent.api.request', requestId: 'r1', method, params: {} }),
+        ws as any,
+      );
+      return sent(ws, 'agent.api.response')!;
+    }
+
+    it('agent.api.response forwards an unknown-method rejection verbatim', async () => {
+      const response = await apiRequest(new AgentApiRegistry(), 'nope.missing');
+      expect(response).toMatchObject({ error: "Unknown API method 'nope.missing'" });
+    });
+
+    it('agent.api.response forwards a role-denied rejection verbatim', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('admin.destroy', 'read', async () => {
+        throw new ApiRoleDeniedError('admin.destroy', 'write', ['read']);
+      });
+      const response = await apiRequest(registry, 'admin.destroy');
+      expect(response).toMatchObject({
+        error: "Method 'admin.destroy' requires 'write' role, caller only has [read]",
+      });
+    });
+
+    it('agent.api.response replaces any other handler exception with a safe fixed error', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('infra.list', 'read', async () => {
+        throw new Error(SECRET_TEXT);
+      });
+      const response = await apiRequest(registry, 'infra.list');
+      expect(response).toMatchObject({ error: AgentWsInternalFailure.agentApiFailed });
+      expect(JSON.stringify(response)).not.toContain(SECRET_TEXT);
+      expect(JSON.stringify(response)).not.toContain('ECONNREFUSED');
+    });
+
+    it('agent.api.response gates on the error type, not on its text', async () => {
+      // A plain Error carrying the same wording as a deliberate rejection is
+      // still replaced: only the registry's own typed rejections are trusted.
+      const registry = new AgentApiRegistry();
+      registry.register('infra.list', 'read', async () => {
+        throw new Error("Unknown API method 'infra.list'");
+      });
+      const response = await apiRequest(registry, 'infra.list');
+      expect(response).toMatchObject({ error: AgentWsInternalFailure.agentApiFailed });
+    });
+
+    it('both registry rejection classes construct as Errors', () => {
+      expect(new UnknownApiMethodError('a.b')).toBeInstanceOf(Error);
+      expect(new ApiRoleDeniedError('a.b', 'write', ['read'])).toBeInstanceOf(Error);
+    });
+  });
 });
 
 describe('truncateCloseReason', () => {
@@ -2006,5 +2908,43 @@ describe('truncateCloseReason', () => {
     const out = truncateCloseReason('é'.repeat(200)); // 2 bytes each
     expect(Buffer.from(out, 'utf-8').length).toBeLessThanOrEqual(123);
     expect(out).not.toContain('�');
+  });
+});
+
+// The `log.chunk` fast path bypasses Zod, so the hand-written validator has to
+// track the schema itself — including the optional `stream` discriminator.
+describe('isValidLogChunk', () => {
+  const base = {
+    type: 'log.chunk',
+    messageId: 'm1',
+    runId: 'r1',
+    jobId: 'j1',
+    stepIndex: 0,
+    lines: ['x'],
+    timestamp: 1,
+  };
+
+  it('accepts a chunk with no stream (the field is optional)', () => {
+    expect(isValidLogChunk(base)).toBe(true);
+  });
+
+  it('accepts a chunk carrying either known stream', () => {
+    expect(isValidLogChunk({ ...base, stream: LogStream.enum.stdout })).toBe(true);
+    expect(isValidLogChunk({ ...base, stream: LogStream.enum.stderr })).toBe(true);
+  });
+
+  it('rejects a chunk whose stream is not a known value', () => {
+    expect(isValidLogChunk({ ...base, stream: 'syslog' })).toBe(false);
+    expect(isValidLogChunk({ ...base, stream: 3 })).toBe(false);
+  });
+
+  it('stays in step with the Zod schema it fast-paths', () => {
+    for (const candidate of [
+      base,
+      { ...base, stream: LogStream.enum.stderr },
+      { ...base, stream: 'syslog' },
+    ]) {
+      expect(isValidLogChunk(candidate)).toBe(agentLogChunkSchema.safeParse(candidate).success);
+    }
   });
 });

@@ -10,6 +10,8 @@
 import { z } from 'zod';
 import { browserRunEventSchema, browserJobContextSchema } from './run-events.js';
 import { browserEventLogPayloadChunkSchema } from './dashboard.js';
+import { OrchLogPhase } from './platform-orchestrator.js';
+import { LogStream } from './log-stream.js';
 
 // --- Browser -> Platform messages ---
 
@@ -41,6 +43,26 @@ export const browserLogUnsubscribeSchema = z.object({
   runId: z.string(),
   jobId: z.string(),
   stepIndex: z.number(),
+});
+
+/**
+ * Browser subscribes to live orchestration/provisioning logs for a job.
+ *
+ * Keyed by `(runId, jobId)` — no `stepIndex` (orch logs are job-level, not
+ * per-step). On subscribe the Platform backfills persisted history via the
+ * `dashboard.orch.logs` RPC, then streams live `orch-log.lines`.
+ */
+export const browserOrchLogSubscribeSchema = z.object({
+  type: z.literal('orch-log.subscribe'),
+  runId: z.string(),
+  jobId: z.string(),
+});
+
+/** Browser unsubscribes from live orchestration/provisioning logs for a job. */
+export const browserOrchLogUnsubscribeSchema = z.object({
+  type: z.literal('orch-log.unsubscribe'),
+  runId: z.string(),
+  jobId: z.string(),
 });
 
 /** Browser subscribes to org-level status updates (run/job/step status changes). */
@@ -84,6 +106,8 @@ export const browserToPlatformMessageSchema = z.discriminatedUnion('type', [
   browserAuthRefreshSchema,
   browserLogSubscribeSchema,
   browserLogUnsubscribeSchema,
+  browserOrchLogSubscribeSchema,
+  browserOrchLogUnsubscribeSchema,
   browserStatusSubscribeSchema,
   browserStatusUnsubscribeSchema,
   browserEventLogPayloadFetchSchema,
@@ -113,6 +137,35 @@ export const browserLogLinesSchema = z.object({
   lines: z.array(z.string()),
   /** Total line count (cumulative offset so browser knows position). */
   lineCount: z.number(),
+  /**
+   * Which stream these lines came from. Absent when the producing orchestrator
+   * does not report one; read as `stdout`.
+   */
+  stream: LogStream.optional(),
+});
+
+/**
+ * Platform sends orchestration/provisioning log lines for a subscribed job.
+ *
+ * Delivered in two forms over the same message:
+ * - **Backfill** (on subscribe): `lines` are the persisted JSONL strings from
+ *   the `dashboard.orch.logs` RPC (each carrying its own `phase`/`ts`), so the
+ *   top-level `phase`/`ts` are omitted.
+ * - **Live** (streamed after backfill): `lines` are raw message strings for a
+ *   single `phase` at timestamp `ts`.
+ *
+ * The dashboard normalizes both by attempting to JSON-parse each line and
+ * falling back to the envelope `phase`/`ts`, and dedups on `(ts, phase,
+ * message)` so an overlap between the backfill snapshot and the first live
+ * chunk is not double-appended.
+ */
+export const browserOrchLogLinesSchema = z.object({
+  type: z.literal('orch-log.lines'),
+  runId: z.string(),
+  jobId: z.string(),
+  phase: OrchLogPhase.optional(),
+  lines: z.array(z.string()),
+  ts: z.number().optional(),
 });
 
 /** Platform notifies browser that lines were dropped due to backpressure. */
@@ -238,6 +291,7 @@ export const platformToBrowserMessageSchema = z.discriminatedUnion('type', [
   browserAuthSuccessSchema,
   browserAuthFailureSchema,
   browserLogLinesSchema,
+  browserOrchLogLinesSchema,
   browserGapSchema,
   browserLogStreamTerminatedSchema,
   browserRunStatusSchema,

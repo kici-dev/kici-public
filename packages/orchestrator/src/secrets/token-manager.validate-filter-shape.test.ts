@@ -29,7 +29,7 @@ import { createHash } from 'node:crypto';
 import { TokenManager } from './token-manager.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
-describe('§4.1 TokenManager.validate query-shape invariant', () => {
+describe('TokenManager.validate query-shape invariant', () => {
   it('filters by token_hash, revoked=false, and expires_at on every validate call', async () => {
     const plaintext = 'a'.repeat(64);
     const expectedHash = createHash('sha256').update(plaintext).digest('hex');

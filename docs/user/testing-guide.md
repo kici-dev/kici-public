@@ -7,6 +7,15 @@ Test your workflows remotely against the full CI pipeline from your local machin
 
 ## Overview
 
+KiCI gives you four ways to exercise a workflow before it runs in real CI, ordered from fastest / least faithful to slowest / most faithful:
+
+- **`kici preview <event>`** — a pure dry-run that shows _which_ workflows and jobs a trigger event would match. No steps execute. Use it to check trigger and rule logic. See [`kici preview`](./cli/authoring-and-local.md#kici-preview).
+- **Unit-test a step function** — call your step's function directly in vitest with a fabricated context from `@kici-dev/sdk/testing`. No orchestrator, no agent — just your step logic. See [Unit-testing step functions](#unit-testing-step-functions) below.
+- **`kici run <event> --local`** — executes the whole workflow on your own machine, which becomes an ephemeral agent. A faithful end-to-end run without a remote round-trip. See [Local execution as an alternative](#local-execution-as-an-alternative).
+- **`kici run remote`** — uploads your working tree and runs the full pipeline (orchestrator + agent) remotely, streaming logs back. The most faithful check.
+
+The rest of this guide covers `kici run remote`.
+
 `kici run remote` connects your local development environment to the remote orchestrator/agent pipeline. Instead of pushing a commit and waiting for CI, you can:
 
 - Run any workflow against your current working tree (including unstaged changes)
@@ -26,6 +35,68 @@ The command is remote-only -- all execution happens on the orchestrator and agen
 
 See [Storage layout](../operator/orchestrator/storage-layout.md) for the full env-var reference.
 :::
+
+## Unit-testing step functions
+
+A KiCI step is just a TypeScript function that takes a context and does work — so you can test it in isolation with vitest, no orchestrator or agent required. `@kici-dev/sdk/testing` builds a real step context for you: `ctx.$` runs real shell commands, `ctx.secrets` resolves values you seed, and `ctx.emit(...)` is recorded so you can assert on it.
+
+Extract your step body into a named function so both your workflow and your test can call it:
+
+```typescript
+// steps/deploy.ts
+import type { StepContext } from '@kici-dev/sdk';
+
+export async function deployStep(ctx: StepContext): Promise<void> {
+  const branch = (await ctx.$`git rev-parse --abbrev-ref HEAD`).stdout.trim();
+  const token = await ctx.secrets.get('DEPLOY_TOKEN');
+  ctx.setEnv('DEPLOYED_BRANCH', branch);
+  await ctx.emit('deploy-complete', { branch });
+  ctx.log.info(`deployed ${branch} with a ${token.length}-char token`);
+}
+```
+
+```typescript
+// steps/deploy.test.ts
+import { describe, it, expect, afterEach } from 'vitest';
+import { createTestStepContext, type TestStepContext } from '@kici-dev/sdk/testing';
+import { deployStep } from './deploy.js';
+
+describe('deployStep', () => {
+  let harness: TestStepContext | undefined;
+  afterEach(async () => {
+    await harness?.dispose();
+    harness = undefined;
+  });
+
+  it('records the deploy event and sets the output env var', async () => {
+    harness = createTestStepContext({
+      repoRoot: process.cwd(),
+      secrets: { flat: { DEPLOY_TOKEN: 'test-token' } },
+    });
+
+    await deployStep(harness.ctx);
+
+    expect(harness.ctx.env.DEPLOYED_BRANCH).toBeDefined();
+    expect(harness.emitCalls).toHaveLength(1);
+    expect(harness.emitCalls[0].eventName).toBe('deploy-complete');
+  });
+});
+```
+
+`createTestStepContext(options?)` takes zero required arguments. Common options:
+
+| Option     | Purpose                                                                               |
+| ---------- | ------------------------------------------------------------------------------------- |
+| `repoRoot` | Directory `ctx.$` runs in. Defaults to the current working directory.                 |
+| `secrets`  | Seed `ctx.secrets`: `{ flat: { KEY: 'value' } }`, or `{ contexts: { prod: { … } } }`. |
+| `inputs`   | Typed `ctx.inputs` from upstream `needs`.                                             |
+| `matrix`   | `ctx.matrix` values for a matrix job instance.                                        |
+| `$`        | Inject a fake shell for pure-logic tests that must not actually run commands.         |
+| `log`      | Replace the default console logger (e.g. a spy).                                      |
+
+Every other `StepContext` member (`cache`, `kici`, `artifacts`, `attestProvenance`, …) has a safe default and can be overridden the same way. The returned handle exposes `ctx` (pass to your step), `emitCalls` (assert emitted events), and `dispose()` (call in `afterEach` to clean up seeded secret state and restore any `process.env` variables the step set via `setEnv` / `addPath`).
+
+Orchestrator-backed APIs — `ctx.kici.*`, `ctx.artifacts.*`, `ctx.attestProvenance(...)` — reject by default (there is no orchestrator in a unit test); override them with a stub if your step calls them.
 
 ## Getting started
 
@@ -143,7 +214,7 @@ This maps the `db` secret context to the `test-database` context, and `api` to `
 
 This mapping is honored by **both** `kici run <event> --local` and `kici run remote`:
 
-- For a local **`kici run <event> --local`** (see [`kici run <event> --local`](cli-reference.md#kici-run-event---local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
+- For a local **`kici run <event> --local`** (see [`kici run <event> --local`](./cli/runs-and-approvals.md#kici-run-event---local)), each named context is resolved from your local secret files (`.kici/.secrets`, `.env.local`, `secrets.yaml`, and `--env` flags).
 - For **`kici run remote`**, each named context maps to an orchestrator **context**, and the orchestrator resolves that context's secrets for the run. The target context must be flagged `allowLocalExecution: true` — mapping a context to a missing or non-test context rejects the run (see [Secret contexts for testing](#secret-contexts-for-testing) below).
 
 **A fixture `secrets:` mapping is fail-closed; a job's bound `context:` is not.** The reject above applies only to the fixture `secrets:` mapping — an explicit request for that context's secrets. A job's own bound `context:` (`job('deploy', { context: 'production', … })`) is treated differently on a test run: if it resolves to a non-test or unconfigured context it is **skipped with a warning**, not rejected, so a job that deploys to production in real runs stays locally testable for its non-secret logic. `kici run remote` prints a warning naming the skipped context(s), and the dashboard run view shows the same notice. See [Skip-on-test](contexts.md#multiple-contexts-per-job) in the contexts guide.
@@ -346,7 +417,7 @@ or via the dashboard's "Test runs" toggle on the context detail page. `kici secr
 
 ### Local execution as an alternative
 
-`kici run <event> --local` resolves the same local secret files entirely on your machine and honors the fixture `secrets: { ... }` mapping to pick which local context backs each name (see [`kici run <event> --local`](cli-reference.md#kici-run-event---local)). Because the values never leave your machine, it's a good fit when you want to exercise secret-dependent steps without involving the orchestrator at all.
+`kici run <event> --local` resolves the same local secret files entirely on your machine and honors the fixture `secrets: { ... }` mapping to pick which local context backs each name (see [`kici run <event> --local`](./cli/runs-and-approvals.md#kici-run-event---local)). Because the values never leave your machine, it's a good fit when you want to exercise secret-dependent steps without involving the orchestrator at all.
 
 ### Discovering available contexts
 

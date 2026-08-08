@@ -456,3 +456,36 @@ describe('KICI_LOG_FORMAT format selection', () => {
     expect(out!.message).toBe('explicit wins');
   });
 });
+
+describe('KICI_LOG_STDERR routing', () => {
+  const orig = process.env.KICI_LOG_STDERR;
+  afterEach(() => {
+    if (orig === undefined) delete process.env.KICI_LOG_STDERR;
+    else process.env.KICI_LOG_STDERR = orig;
+  });
+
+  function consoleTransport(logger: winston.Logger) {
+    return logger.transports.find(
+      (t): t is winston.transports.ConsoleTransportInstance =>
+        t instanceof winston.transports.Console,
+    );
+  }
+
+  it('routes every level (including info) to stderr when KICI_LOG_STDERR is set', () => {
+    process.env.KICI_LOG_STDERR = '1';
+    const t = consoleTransport(createLogger());
+    // winston stores stderrLevels as a set-like object { level: true }.
+    expect(t?.stderrLevels).toMatchObject({
+      info: true,
+      error: true,
+      warn: true,
+      debug: true,
+    });
+  });
+
+  it('keeps info on stdout (empty stderrLevels) when KICI_LOG_STDERR is unset', () => {
+    delete process.env.KICI_LOG_STDERR;
+    const t = consoleTransport(createLogger());
+    expect(t?.stderrLevels?.info).toBeUndefined();
+  });
+});

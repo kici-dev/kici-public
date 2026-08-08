@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
-import { sshExec, sshPush, type SpawnFn, type SshResult } from './ssh-exec.js';
+import {
+  defaultSpawn,
+  sshExec,
+  sshPush,
+  sshPushFile,
+  type SpawnFn,
+  type SshResult,
+} from './ssh-exec.js';
 import type { HostReach } from './reach.js';
 
 const reach: HostReach = {
@@ -110,6 +117,84 @@ describe('sshExec', () => {
     const { spawnFn } = makeSpawn({ 'ssh-add': { exitCode: 1, stdout: '', stderr: 'bad key' } });
     await expect(sshExec(reach, KEY, 'true', {}, { spawnFn })).rejects.toThrow(/ssh-add failed/);
   });
+
+  it('clears an inherited SSH_AGENT_PID when the agent start output does not parse', async () => {
+    // Simulate a login/parent ssh-agent already present in this process's env.
+    const priorPid = process.env.SSH_AGENT_PID;
+    process.env.SSH_AGENT_PID = '9999';
+    try {
+      // ssh-agent start stdout that parseAgentPid cannot extract a PID from
+      // (no `SSH_AGENT_PID=<n>;` token) — the fallback branch.
+      const { spawnFn, calls } = makeSpawn();
+      const unparsable: SshResult = {
+        exitCode: 0,
+        stdout: 'SSH_AUTH_SOCK=/tmp/agent.sock; export SSH_AUTH_SOCK;\n',
+        stderr: '',
+      };
+      // Override the ssh-agent START result (any ssh-agent call that is not -k).
+      const wrapped: SpawnFn = async (command, args, opts) => {
+        if (command === 'ssh-agent' && args[0] !== '-k') {
+          // still record the call via the underlying spawnFn's recorder
+          return spawnFn(command, args, { ...opts, env: opts.env }).then(() => unparsable);
+        }
+        return spawnFn(command, args, opts);
+      };
+
+      await sshExec(reach, KEY, 'true', {}, { spawnFn: wrapped });
+
+      // The parent PID must NOT reach the key-load, the body ssh call, or teardown.
+      const add = calls.find((c) => c.command === 'ssh-add');
+      const ssh = calls.find((c) => c.command === 'ssh');
+      const kill = calls.find((c) => c.command === 'ssh-agent' && c.args[0] === '-k');
+      expect(add?.env.SSH_AGENT_PID).toBeUndefined();
+      expect(ssh?.env.SSH_AGENT_PID).toBeUndefined();
+      expect(kill?.env.SSH_AGENT_PID).toBeUndefined();
+      // Structural invariant: the key is absent, not merely set to the string.
+      expect(add && 'SSH_AGENT_PID' in add.env).toBe(false);
+      expect(kill && 'SSH_AGENT_PID' in kill.env).toBe(false);
+      // The socket is still our ephemeral one (unchanged behavior).
+      expect(kill?.env.SSH_AUTH_SOCK).toMatch(/kici-bootstrap-ssh-[^/]+\/agent\.sock$/);
+    } finally {
+      if (priorPid === undefined) delete process.env.SSH_AGENT_PID;
+      else process.env.SSH_AGENT_PID = priorPid;
+    }
+  });
+
+  it('carries the ephemeral agent PID (not any inherited one) when start output parses', async () => {
+    const priorPid = process.env.SSH_AGENT_PID;
+    process.env.SSH_AGENT_PID = '9999';
+    try {
+      // makeSpawn's default agentStart stdout carries SSH_AGENT_PID=4242.
+      const { spawnFn, calls } = makeSpawn();
+      await sshExec(reach, KEY, 'true', {}, { spawnFn });
+      const kill = calls.find((c) => c.command === 'ssh-agent' && c.args[0] === '-k');
+      expect(kill?.env.SSH_AGENT_PID).toBe('4242');
+      expect(kill?.env.SSH_AGENT_PID).not.toBe('9999');
+    } finally {
+      if (priorPid === undefined) delete process.env.SSH_AGENT_PID;
+      else process.env.SSH_AGENT_PID = priorPid;
+    }
+  });
+});
+
+describe('defaultSpawn', () => {
+  it('resolves with the exit code when the child drops its stdin read end (EPIPE), without crashing', async () => {
+    // A child that exits immediately without reading stdin closes its read end
+    // while a large write is still pending, so child.stdin emits EPIPE. Without
+    // an 'error' handler on the stdin stream this becomes an uncaught exception
+    // that would crash the agent process; with the handler the promise still
+    // resolves via the process 'close' event carrying the real exit code.
+    //
+    // The payload must exceed the kernel pipe buffer (64 KiB on Linux) so the
+    // write cannot fully buffer before the reader exits — that is what
+    // guarantees the pending write hits EPIPE rather than silently succeeding.
+    const bigStdin = 'x'.repeat(1024 * 1024); // 1 MiB
+    const result = await defaultSpawn('sh', ['-c', 'exit 42'], {
+      env: process.env,
+      stdin: bigStdin,
+    });
+    expect(result.exitCode).toBe(42);
+  });
 });
 
 describe('sshPush', () => {
@@ -126,5 +211,33 @@ describe('sshPush', () => {
     await expect(sshPush(reach, KEY, 'x', '/tmp/x', {}, { spawnFn })).rejects.toThrow(
       /sshPush.*exit 1/s,
     );
+  });
+});
+
+describe('sshPushFile (binary-safe scp)', () => {
+  it('streams a local file over scp -P with the key from the ephemeral agent', async () => {
+    const { spawnFn, calls } = makeSpawn();
+    await sshPushFile(reach, KEY, '/tmp/payload.tar.gz', '/tmp/p.tgz', {}, { spawnFn });
+
+    // A binary payload MUST NOT take the string `cat >` path — no ssh call at all.
+    expect(calls.some((c) => c.command === 'ssh')).toBe(false);
+
+    const scp = calls.find((c) => c.command === 'scp');
+    expect(scp).toBeDefined();
+    expect(scp?.args).toContain('-P');
+    expect(scp?.args).toContain('22');
+    expect(scp?.args).toContain('/tmp/payload.tar.gz');
+    expect(scp?.args).toContain('root@10.0.0.7:/tmp/p.tgz');
+    // The key rides the ephemeral agent (SSH_AUTH_SOCK), never a temp key file.
+    expect(scp?.args.join(' ')).not.toContain('-i');
+    expect(scp?.env.SSH_AUTH_SOCK).toBeDefined();
+    expect(calls.some((c) => c.command === 'ssh-add')).toBe(true);
+  });
+
+  it('throws on a non-zero scp exit', async () => {
+    const { spawnFn } = makeSpawn({ scp: { exitCode: 1, stdout: '', stderr: 'no space' } });
+    await expect(
+      sshPushFile(reach, KEY, '/tmp/p.tar.gz', '/tmp/p.tgz', {}, { spawnFn }),
+    ).rejects.toThrow(/sshPushFile.*exit 1/s);
   });
 });

@@ -60,6 +60,14 @@ export interface DeveloperOperation {
   mcpAppropriate: boolean;
   /** MCP tool name when `entrypoints.mcp` is true; null otherwise. */
   mcpTool: string | null;
+  /**
+   * True when the op acts on a specific repository's resource and must honour
+   * the caller's repo glob patterns on EVERY entrypoint. Required on every row
+   * so a new op cannot compile without an explicit decision, and NOT derivable
+   * from `domain` — `workflows.list` is repo-scoped while `secrets.list`, whose
+   * rows are context-keyed with no repository to scope against, is not.
+   */
+  repoScoped: boolean;
 }
 
 /** Build a row, defaulting every unspecified entrypoint to false. */
@@ -70,6 +78,7 @@ function op(
   ep: Partial<DeveloperOpEntrypoints>,
   mcpAppropriate: boolean,
   mcpTool: string | null,
+  repoScoped: boolean,
 ): DeveloperOperation {
   return {
     id,
@@ -78,6 +87,7 @@ function op(
     entrypoints: { http: false, cli: false, mcp: false, ui: false, ...ep },
     mcpAppropriate,
     mcpTool,
+    repoScoped,
   };
 }
 
@@ -94,8 +104,17 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'list_runs',
+    true,
   ),
-  op('runs.get', 'runs', 'read', { http: true, cli: true, mcp: true, ui: true }, true, 'get_run'),
+  op(
+    'runs.get',
+    'runs',
+    'read',
+    { http: true, cli: true, mcp: true, ui: true },
+    true,
+    'get_run',
+    true,
+  ),
   op(
     'runs.stepLogs',
     'runs',
@@ -103,6 +122,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'get_step_logs',
+    true,
   ),
   op(
     'runs.cancel',
@@ -111,6 +131,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'cancel_run',
+    true,
   ),
   op(
     'runs.cancelByBranch',
@@ -119,6 +140,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: false },
     true,
     'cancel_runs_by_branch',
+    true,
   ),
   op(
     'runs.rerun',
@@ -127,6 +149,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'rerun_run',
+    true,
   ),
   // workflows
   op(
@@ -136,6 +159,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'list_workflows',
+    true,
   ),
   op(
     'workflows.trigger',
@@ -144,6 +168,26 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: false, mcp: true, ui: true },
     true,
     'trigger_run',
+    true,
+  ),
+  op(
+    'workflows.disable',
+    'workflows',
+    'write',
+    { http: true, cli: false, mcp: false, ui: true },
+    false,
+    null,
+    true,
+  ),
+  // A destructive delete is never an agent tool.
+  op(
+    'workflows.delete',
+    'workflows',
+    'write',
+    { http: true, cli: false, mcp: false, ui: true },
+    false,
+    null,
+    true,
   ),
   // secrets (key names only via mcp; values never cross any entrypoint)
   op(
@@ -153,6 +197,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'list_secrets',
+    false,
   ),
   op(
     'secrets.set',
@@ -161,6 +206,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: false, mcp: false, ui: true },
     false,
     null,
+    false,
   ),
   op(
     'secrets.delete',
@@ -169,6 +215,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: false, mcp: false, ui: true },
     false,
     null,
+    false,
   ),
   // contexts (destructive delete is never an agent tool)
   op(
@@ -178,8 +225,17 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: false, mcp: false, ui: true },
     false,
     null,
+    false,
   ),
   // held-runs
+  // No `cli` / `mcp`: neither plane exposes listing holds as an operation of
+  // its own. `kici approve` / `kici reject` / `kici run` do read this route
+  // (`listHeldRunsForRun` in the compiler's `held-run-client.ts`), but only as
+  // an internal step of resolving the hold they are about to act on — there is
+  // no `kici held-runs list` command for the CLI congruence guard to bind. The
+  // MCP tools never reach the route at all: `approve_run` / `reject_run` relay
+  // through the private `resolveHeldRunForRun` path instead.
+  op('held-runs.list', 'held-runs', 'read', { http: true, ui: true }, false, null, true),
   op(
     'held-runs.approve',
     'held-runs',
@@ -187,6 +243,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'approve_run',
+    true,
   ),
   op(
     'held-runs.reject',
@@ -195,6 +252,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'reject_run',
+    true,
   ),
   // diagnostics
   op(
@@ -204,6 +262,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'get_diagnostics',
+    false,
   ),
   // orchestrators
   op(
@@ -213,6 +272,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'list_orchestrators',
+    false,
   ),
   // orgs (per-user discovery tool)
   op(
@@ -222,6 +282,7 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     { http: true, cli: true, mcp: true, ui: true },
     true,
     'list_orgs',
+    false,
   ),
 ] as const;
 

@@ -46,6 +46,8 @@ export {
   writeManifest,
   readKiciVersion,
   resolveVersionFromLaunchSpec,
+  resolveNpmInstallTarget,
+  type NpmInstallTarget,
 } from './instance/manifest.js';
 
 // Reconciled instance index cache.
@@ -58,7 +60,12 @@ export {
 } from './instance/index-file.js';
 
 // Resolve dispatcher + reconciled listing + refusal formatter.
-export { listInstances, resolveInstance, formatRefusal } from './instance/resolve.js';
+export {
+  listInstances,
+  resolveInstance,
+  formatRefusal,
+  InstanceNotFoundError,
+} from './instance/resolve.js';
 export type { ListedInstance, ResolveArgs, ListInstancesArgs } from './instance/resolve.js';
 
 import type { ServiceManager, ServicePlatform } from './types.js';

@@ -11,7 +11,7 @@ describe('createStepContext', () => {
     // zx shell took effect (local-dispatch parity with agent execution).
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-step-ctx-'));
     try {
-      const ctx = createStepContext(
+      const { ctx } = createStepContext(
         { name: 'test-wf' },
         { name: 'test-job', runsOn: 'local' },
         tmp,
@@ -27,7 +27,7 @@ describe('createStepContext', () => {
   });
 
   it('exposes an unaborted AbortSignal by default', () => {
-    const ctx = createStepContext(
+    const { ctx } = createStepContext(
       { name: 'test-wf' },
       { name: 'test-job', runsOn: 'local' },
       process.cwd(),
@@ -38,7 +38,7 @@ describe('createStepContext', () => {
 
   it('exposes the provided AbortSignal and reflects its aborted state', () => {
     const controller = new AbortController();
-    const ctx = createStepContext(
+    const { ctx } = createStepContext(
       { name: 'test-wf' },
       { name: 'test-job', runsOn: 'local' },
       process.cwd(),
@@ -59,7 +59,7 @@ describe('createStepContext', () => {
 
   it('propagates rawPayload + provider when supplied', () => {
     const rawPayload = { client_payload: { foo: 'bar' }, action: 'cdn-bundle' };
-    const ctx = createStepContext(
+    const { ctx } = createStepContext(
       { name: 'test-wf' },
       { name: 'test-job', runsOn: 'local' },
       process.cwd(),
@@ -76,7 +76,7 @@ describe('createStepContext', () => {
   });
 
   it('leaves rawPayload + provider undefined when not supplied', () => {
-    const ctx = createStepContext(
+    const { ctx } = createStepContext(
       { name: 'test-wf' },
       { name: 'test-job', runsOn: 'local' },
       process.cwd(),

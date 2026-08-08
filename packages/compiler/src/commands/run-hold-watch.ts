@@ -30,8 +30,7 @@ export type HoldOutput = (line: string) => void;
 
 /** What to do with a newly-observed hold. Pure — no IO. */
 export type HoldAction =
-  | { kind: 'prompt'; hold: HeldRunSummary }
-  | { kind: 'notify'; hold: HeldRunSummary };
+  { kind: 'prompt'; hold: HeldRunSummary } | { kind: 'notify'; hold: HeldRunSummary };
 
 /**
  * Classify the holds observed this tick against the set already seen. Returns

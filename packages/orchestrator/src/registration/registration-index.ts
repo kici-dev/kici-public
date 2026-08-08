@@ -301,7 +301,7 @@ export class RegistrationIndex {
    *
    * Event type -> trigger type mapping:
    * - 'kici_event' -> 'kici_event'
-   * - 'workflow_complete' -> 'workflow_complete' or 'lifecycle'
+   * - 'workflow_complete' -> 'workflow_complete', 'lifecycle', or 'workflows_failed_batch'
    * - 'job_complete' -> 'job_complete' or 'lifecycle'
    * - 'generic_webhook' -> 'generic_webhook'
    * - 'schedule' -> 'schedule'
@@ -311,13 +311,20 @@ export class RegistrationIndex {
     // Direct trigger type match (filter disabled)
     const direct = (this.byTriggerType.get(eventType) ?? []).filter((e) => !e.disabled);
 
-    // Lifecycle triggers also listen for workflow_complete and job_complete
+    // Lifecycle triggers also listen for workflow_complete and job_complete.
+    // A failed workflow_complete additionally feeds workflowsFailedBatch
+    // subscribers (accumulated into a batch instead of dispatched now).
     if (eventType === 'workflow_complete' || eventType === 'job_complete') {
-      const lifecycle = (this.byTriggerType.get('lifecycle') ?? []).filter((e) => !e.disabled);
-      if (lifecycle.length === 0) return direct;
-      if (direct.length === 0) return lifecycle;
-      // Merge unique entries
-      return [...direct, ...lifecycle.filter((l) => !direct.includes(l))];
+      const merged = [...direct];
+      const alsoTypes =
+        eventType === 'workflow_complete' ? ['lifecycle', 'workflows_failed_batch'] : ['lifecycle'];
+      for (const alsoType of alsoTypes) {
+        const extra = (this.byTriggerType.get(alsoType) ?? []).filter((e) => !e.disabled);
+        for (const entry of extra) {
+          if (!merged.includes(entry)) merged.push(entry);
+        }
+      }
+      return merged;
     }
 
     return direct;

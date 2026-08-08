@@ -1,5 +1,29 @@
 import { describe, it, expect } from 'vitest';
-import { accessLogItemSchema, dashboardAccessLogListRequestSchema } from './access-log.js';
+import {
+  AccessLogAction,
+  AccessLogTargetType,
+  accessLogItemSchema,
+  dashboardAccessLogListRequestSchema,
+} from './access-log.js';
+
+describe('access-log enums — admin_cli db subcommands', () => {
+  it('carries the six db.* action values', () => {
+    for (const a of [
+      'db.fresh',
+      'db.ensure',
+      'db.create_role',
+      'db.create_readonly_user',
+      'db.reindex',
+      'db.refresh_collation_version',
+    ]) {
+      expect(AccessLogAction.safeParse(a).success).toBe(true);
+    }
+  });
+
+  it('carries the database target type', () => {
+    expect(AccessLogTargetType.safeParse('database').success).toBe(true);
+  });
+});
 
 describe('dashboardAccessLogListRequestSchema', () => {
   it('accepts agentLabel and agentOnly filters', () => {

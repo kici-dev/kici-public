@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { up } from './061_execution_runs_environment_id.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -75,10 +74,7 @@ describeDb('migration 061_execution_runs_environment_id', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -107,7 +103,7 @@ describeDb('migration 061_execution_runs_environment_id', () => {
   it('backfills environment_id for rows whose environment matches a unique fixed env', async () => {
     const e1 = await insertEnv('org_aaaaaaaa', 'production', 'fixed');
     await insertRun('11111111-1111-1111-1111-111111111111', 'production');
-    // The new column already exists (migrateToLatest ran up once on empty data),
+    // The new column already exists (the beforeAll migration ran up() once on empty data),
     // so up() now only re-runs the idempotent backfill over the seeded rows.
     await up(db);
     expect(await envId('11111111-1111-1111-1111-111111111111')).toBe(e1);

@@ -3,15 +3,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { Migrator } from 'kysely/migration';
-import { HoldScope, TriggerSource } from '@kici-dev/engine';
+import { HoldScope, HoldType, TriggerSource } from '@kici-dev/engine';
 import { createMigrationProvider } from '../db/migration-provider.js';
 import { HeldRunStore } from './held-runs.js';
 import type { Database } from '../db/types.js';
 
 /**
- * Real-Postgres integration test for the workflow install-hold release helpers
- * (releaseDueWaitHolds + releaseConcurrencyHold). Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres integration test for the workflow install-hold release helper
+ * `releaseDueWaitHolds`. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -89,8 +88,6 @@ describeDb('HeldRunStore release helpers', () => {
 
   // Real context uuids (FK target of held_runs.context_id).
   let envId1 = '';
-  let envIdC = '';
-  let envIdA = '';
 
   const insertEnv = async (name: string): Promise<string> => {
     const row = await sql<{ id: string }>`
@@ -105,41 +102,50 @@ describeDb('HeldRunStore release helpers', () => {
     await sql`DELETE FROM held_runs`.execute(db);
     await sql`DELETE FROM contexts`.execute(db);
     envId1 = await insertEnv('env-1');
-    envIdC = await insertEnv('env-c');
-    envIdA = await insertEnv('env-a');
   });
 
-  it('releaseDueWaitHolds releases only overdue wait_timer workflow holds', async () => {
+  it('releaseDueWaitHolds releases only overdue timer workflow holds', async () => {
     const overdueRun = randomUUID();
+    const legacyOverdueRun = randomUUID();
     const futureRun = randomUUID();
     const reviewerRun = randomUUID();
+    // What the install gate writes today.
     const overdueId = await seedHold({
       runId: overdueRun,
+      holdType: HoldType.enum.timer,
+      envId: envId1,
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+    // A row an un-upgraded orchestrator wrote before the backfill. It must
+    // resume too — otherwise it falls through to `expireOverdue()` and the
+    // workflow fails instead of continuing.
+    const legacyOverdueId = await seedHold({
+      runId: legacyOverdueRun,
       holdType: 'wait_timer',
       envId: envId1,
       expiresAt: new Date(Date.now() - 60_000),
     });
     await seedHold({
       runId: futureRun,
-      holdType: 'wait_timer',
+      holdType: HoldType.enum.timer,
       envId: envId1,
       expiresAt: new Date(Date.now() + 60_000),
     });
     // A reviewer hold past expiry must NOT be released by the wait sweep.
     await seedHold({
       runId: reviewerRun,
-      holdType: 'reviewer',
+      holdType: HoldType.enum.reviewer,
       envId: envId1,
       expiresAt: new Date(Date.now() - 60_000),
     });
 
     const released = await store.releaseDueWaitHolds();
-    expect(released).toHaveLength(1);
-    expect(released[0]).toMatchObject({
-      holdId: overdueId,
-      runId: overdueRun,
-      scope: 'workflow',
-    });
+    expect(released).toHaveLength(2);
+    expect(released.map((r) => r.holdId).sort()).toEqual([overdueId, legacyOverdueId].sort());
+    for (const signal of released) {
+      expect(signal.scope).toBe(HoldScope.enum.workflow);
+    }
+    expect(released.map((r) => r.runId).sort()).toEqual([overdueRun, legacyOverdueRun].sort());
 
     const stillPending = await db
       .selectFrom('held_runs')
@@ -148,43 +154,5 @@ describeDb('HeldRunStore release helpers', () => {
       .execute();
     const pendingRuns = stillPending.map((r) => r.run_id).sort();
     expect(pendingRuns).toEqual([futureRun, reviewerRun].sort());
-  });
-
-  it('releaseConcurrencyHold releases the oldest queued concurrency hold for the env', async () => {
-    const oldRun = randomUUID();
-    const newRun = randomUUID();
-    const oldestId = await seedHold({
-      runId: oldRun,
-      holdType: 'concurrency',
-      envId: envIdC,
-      expiresAt: new Date(Date.now() + 600_000),
-      createdAt: new Date(Date.now() - 120_000),
-    });
-    await seedHold({
-      runId: newRun,
-      holdType: 'concurrency',
-      envId: envIdC,
-      expiresAt: new Date(Date.now() + 600_000),
-      createdAt: new Date(Date.now() - 60_000),
-    });
-
-    const released = await store.releaseConcurrencyHold('org-1', envIdC);
-    expect(released?.holdId).toBe(oldestId);
-    expect(released?.runId).toBe(oldRun);
-
-    // A second call releases the next-oldest; a third returns null.
-    const second = await store.releaseConcurrencyHold('org-1', envIdC);
-    expect(second?.runId).toBe(newRun);
-    expect(await store.releaseConcurrencyHold('org-1', envIdC)).toBeNull();
-  });
-
-  it('releaseConcurrencyHold returns null for a different env group', async () => {
-    await seedHold({
-      runId: randomUUID(),
-      holdType: 'concurrency',
-      envId: envIdA,
-      expiresAt: new Date(Date.now() + 600_000),
-    });
-    expect(await store.releaseConcurrencyHold('org-1', randomUUID())).toBeNull();
   });
 });

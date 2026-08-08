@@ -511,7 +511,15 @@ describe('serializeJobsToLock', () => {
     expect(result[0].needs).toEqual([
       {
         name: 'build',
-        runOn: ['success', 'failed', 'cancelled', 'skipped', 'timed_out_stale', 'drift_dropped'],
+        runOn: [
+          'success',
+          'failed',
+          'cancelled',
+          'skipped',
+          'timed_out_stale',
+          'drift_dropped',
+          'unroutable',
+        ],
       },
     ]);
   });
@@ -535,7 +543,15 @@ describe('serializeJobsToLock', () => {
       'lint',
       {
         group: 'test-shards',
-        runOn: ['success', 'failed', 'cancelled', 'skipped', 'timed_out_stale', 'drift_dropped'],
+        runOn: [
+          'success',
+          'failed',
+          'cancelled',
+          'skipped',
+          'timed_out_stale',
+          'drift_dropped',
+          'unroutable',
+        ],
       },
     ]);
     expect(result[1].dependsOnGroups).toEqual(['test-shards']);

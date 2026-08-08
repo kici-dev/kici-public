@@ -31,11 +31,18 @@ export async function runsCancelCommand(
       return false;
     }
     logger.info(`${options.force ? 'Force-cancelling' : 'Cancelling'} run ${pc.cyan(runId)}...`);
-    const { cancelledJobs = 0 } = await client.cancelRun(runId, options.force ?? false);
+    const { cancelledJobs = 0, alreadyTerminal } = await client.cancelRun(
+      runId,
+      options.force ?? false,
+    );
+    // An already-finished run is left untouched, so reporting a cancellation
+    // would be false — say what actually happened instead.
     console.log(
-      pc.green(
-        `Run ${runId} cancelled (${cancelledJobs} job${cancelledJobs !== 1 ? 's' : ''} affected).`,
-      ),
+      alreadyTerminal
+        ? pc.yellow(`Run ${runId} had already finished; nothing was cancelled.`)
+        : pc.green(
+            `Run ${runId} cancelled (${cancelledJobs} job${cancelledJobs !== 1 ? 's' : ''} affected).`,
+          ),
     );
     return true;
   } catch (err) {

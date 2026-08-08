@@ -294,10 +294,6 @@ export const METRIC_LABEL_POLICY: Partial<
     'v8js.gc.type': { maxUniqueValues: 6 },
     scaler: { values: AGENT_SCALER_VALUES },
   },
-  'v8js.memory.heap.limit': {
-    'v8js.heap.space.name': { maxUniqueValues: 20 },
-    scaler: { values: AGENT_SCALER_VALUES },
-  },
   'v8js.memory.heap.used': {
     'v8js.heap.space.name': { maxUniqueValues: 20 },
     scaler: { values: AGENT_SCALER_VALUES },
@@ -308,6 +304,10 @@ export const METRIC_LABEL_POLICY: Partial<
   },
   'v8js.memory.heap.space.physical_size': {
     'v8js.heap.space.name': { maxUniqueValues: 20 },
+    scaler: { values: AGENT_SCALER_VALUES },
+  },
+  'v8js.resource.active': {
+    'v8js.resource.type': { maxUniqueValues: 20 },
     scaler: { values: AGENT_SCALER_VALUES },
   },
 };

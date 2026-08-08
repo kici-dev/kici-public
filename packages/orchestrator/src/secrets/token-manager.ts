@@ -31,12 +31,15 @@ export class TokenManager {
    * @param label - Human-readable label for this token.
    * @param role - Role to assign (owner, admin, auditor).
    * @param routingKey - Optional routing key scope (null = all).
+   * @param expiresAt - Optional absolute expiry. When omitted the token
+   *   never expires (null); `validate()` already enforces the column.
    * @returns The plaintext token (shown once) and the row ID.
    */
   async generateToken(
     label: string,
     role: Role,
     routingKey?: string | null,
+    expiresAt?: Date | null,
   ): Promise<{ token: string; id: string }> {
     const token = randomBytes(32).toString('hex');
     const tokenHash = hashToken(token);
@@ -48,6 +51,7 @@ export class TokenManager {
         label,
         role,
         routing_key: routingKey ?? null,
+        expires_at: expiresAt ?? null,
       })
       .returningAll()
       .executeTakeFirstOrThrow();
@@ -57,6 +61,8 @@ export class TokenManager {
 
   /**
    * Validate a plaintext token against stored hashes.
+   *
+   * On success, fires a non-blocking update to last_used_at.
    *
    * @param token - The plaintext token to validate.
    * @returns Token info if valid, null if invalid/expired/revoked.
@@ -76,12 +82,18 @@ export class TokenManager {
 
     if (!row) return null;
 
-    // Update last_used_at
-    await this.db
+    // Fire-and-forget last_used_at update. A best-effort bookkeeping write must
+    // not fail an authentication that already succeeded -- the row was found and
+    // the credential is valid. Mirrors agent/token-store.ts, which does the same
+    // for agent tokens' last_seen_at.
+    this.db
       .updateTable('admin_tokens')
       .set({ last_used_at: sql`now()` })
       .where('id', '=', row.id)
-      .execute();
+      .execute()
+      .catch(() => {
+        // Intentionally swallowed -- last_used_at is best-effort
+      });
 
     return {
       id: row.id,

@@ -242,30 +242,31 @@ Response to a peer authentication request. **Encrypted** with the shared session
 
 Sent every 30 seconds by each peer. Carries agent inventory, scaler capacity, and Raft consensus state. This is the primary mechanism for routing decisions — the coordinator uses peer heartbeats to determine which peers can handle a job's label requirements.
 
-| Field             | Type                    | Required | Description                                               |
-| ----------------- | ----------------------- | -------- | --------------------------------------------------------- |
-| type              | `"peer.heartbeat"`      | Yes      | Message discriminator                                     |
-| instanceId        | string                  | Yes      | Sender's cluster instance ID                              |
-| term              | number                  | Yes      | Current Raft term                                         |
-| leaderId          | string or null          | Yes      | Known Raft leader's instance ID                           |
-| draining          | boolean                 | Yes      | Whether the sender is gracefully shutting down            |
-| agents            | PeerAgentSummary[]      | Yes      | Connected agent inventory                                 |
-| capabilities      | PeerCapabilities        | Yes      | Feature flags (S3 log access, log routing override)       |
-| scalerCapacity    | ScalerCapacitySummary[] | No       | On-demand backend capacity for routing decisions          |
-| configVersion     | number                  | No       | Shared config version for sync detection                  |
-| registryVersion   | number                  | No       | Registry version for cross-orchestrator registration sync |
-| timestamp         | number                  | Yes      | Unix timestamp (milliseconds)                             |
-| hostname          | string                  | No       | Machine hostname (`os.hostname()`)                        |
-| osRelease         | string                  | No       | OS kernel release (`os.release()`)                        |
-| totalMemoryMb     | number                  | No       | Total system memory in MiB                                |
-| memoryUsedMb      | number                  | No       | Used memory in MiB                                        |
-| memoryAvailableMb | number                  | No       | Available memory in MiB                                   |
-| cpuCount          | number                  | No       | Number of logical CPUs                                    |
-| uptimeSeconds     | number                  | No       | System uptime in seconds                                  |
-| nodeVersion       | string                  | No       | Node.js version                                           |
-| runningAsUser     | string or null          | No       | Username of the OS user running the orchestrator          |
-| runningAsUid      | number or null          | No       | UID of the OS user running the orchestrator               |
-| version           | string                  | No       | Orchestrator version (e.g., `"0.0.1"`)                    |
+| Field                  | Type                    | Required | Description                                                        |
+| ---------------------- | ----------------------- | -------- | ------------------------------------------------------------------ |
+| type                   | `"peer.heartbeat"`      | Yes      | Message discriminator                                              |
+| instanceId             | string                  | Yes      | Sender's cluster instance ID                                       |
+| term                   | number                  | Yes      | Current Raft term                                                  |
+| leaderId               | string or null          | Yes      | Known Raft leader's instance ID                                    |
+| draining               | boolean                 | Yes      | Whether the sender is gracefully shutting down                     |
+| agents                 | PeerAgentSummary[]      | Yes      | Connected agent inventory                                          |
+| capabilities           | PeerCapabilities        | Yes      | Feature flags (S3 log access, log routing override)                |
+| scalerCapacity         | ScalerCapacitySummary[] | No       | On-demand backend capacity for routing decisions                   |
+| configVersion          | number                  | No       | Shared config version for sync detection                           |
+| registryVersion        | number                  | No       | Registry version for cross-orchestrator registration sync          |
+| clusterSettingsVersion | number                  | No       | Shared cluster-settings version for leader-to-worker settings pull |
+| timestamp              | number                  | Yes      | Unix timestamp (milliseconds)                                      |
+| hostname               | string                  | No       | Machine hostname (`os.hostname()`)                                 |
+| osRelease              | string                  | No       | OS kernel release (`os.release()`)                                 |
+| totalMemoryMb          | number                  | No       | Total system memory in MiB                                         |
+| memoryUsedMb           | number                  | No       | Used memory in MiB                                                 |
+| memoryAvailableMb      | number                  | No       | Available memory in MiB                                            |
+| cpuCount               | number                  | No       | Number of logical CPUs                                             |
+| uptimeSeconds          | number                  | No       | System uptime in seconds                                           |
+| nodeVersion            | string                  | No       | Node.js version                                                    |
+| runningAsUser          | string or null          | No       | Username of the OS user running the orchestrator                   |
+| runningAsUid           | number or null          | No       | UID of the OS user running the orchestrator                        |
+| version                | string                  | No       | Orchestrator version (e.g., `"0.0.1"`)                             |
 
 PeerAgentSummary:
 
@@ -382,7 +383,7 @@ Acknowledgment of a reroute request. The coordinator tries the next peer if reje
 
 #### job.progress
 
-Sent by the worker orchestrator back to the coordinator as the agent reports job-level and step-level state changes. The coordinator uses this to drive its run-level state machine, update GitHub check runs, and track per-step progress.
+Sent by the worker orchestrator back to the coordinator as the agent reports job-level and step-level state changes. The coordinator uses this to drive its run-level status tracking, update GitHub check runs, and track per-step progress.
 
 The `kind` discriminator decides which `ExecutionTracker` call the receiver makes:
 
@@ -573,6 +574,30 @@ Response from the target peer carrying the reload result fields.
 
 > Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerConfigReloadResponseSchema`
 
+#### peer.clusterSettings.request
+
+Cluster-settings pull request: a DB-less worker asks the leader for the current worker-settings snapshot after observing the leader's advertised `clusterSettingsVersion` (on `peer.heartbeat`) ahead of its own. The leader replies with `peer.clusterSettings.response`.
+
+| Field     | Type                             | Required | Description           |
+| --------- | -------------------------------- | -------- | --------------------- |
+| type      | `"peer.clusterSettings.request"` | Yes      | Message discriminator |
+| messageId | string                           | Yes      | Unique message ID     |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerClusterSettingsRequestSchema`
+
+#### peer.clusterSettings.response
+
+Cluster-settings pull response: the leader resolves the worker-relevant settings snapshot from its cluster settings and replies with it plus the current version. The snapshot is a typed, concrete object (not an open key/value bus) — each worker-consumed cluster knob is a field on it.
+
+| Field     | Type                              | Required | Description                                        |
+| --------- | --------------------------------- | -------- | -------------------------------------------------- |
+| type      | `"peer.clusterSettings.response"` | Yes      | Message discriminator                              |
+| messageId | string                            | Yes      | Unique message ID                                  |
+| version   | number                            | Yes      | Current cluster-settings version                   |
+| settings  | WorkerClusterSettings             | Yes      | Worker-settings snapshot (e.g., `agentTokenTtlMs`) |
+
+> Authoritative source: `packages/engine/src/protocol/messages/peer.ts` -- `peerClusterSettingsResponseSchema`, `workerClusterSettingsSchema`
+
 ### Agent-token revoke fan-out
 
 #### peer.agent-token.revoke
@@ -761,20 +786,21 @@ Acknowledge a cancellation.
 
 KiCI defines custom close codes in the 4000-4999 range (reserved for application use by RFC 6455) alongside standard codes.
 
-| Code | Constant                         | Meaning                                                                                                                                                                              | Sent By |
-| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| 1001 | `WS_CLOSE_GOING_AWAY`            | Server shutdown or browser navigating away                                                                                                                                           | Server  |
-| 4001 | `WS_CLOSE_UNAUTHORIZED`          | Client failed authentication                                                                                                                                                         | Server  |
-| 4002 | `WS_CLOSE_AUTH_TIMEOUT`          | Auth timeout expired                                                                                                                                                                 | Server  |
-| 4003 | `WS_CLOSE_INVALID_MESSAGE`       | Invalid or unparseable message received                                                                                                                                              | Server  |
-| 4004 | `WS_CLOSE_HEARTBEAT_TIMEOUT`     | Heartbeat timed out (180 seconds)                                                                                                                                                    | Server  |
-| 4005 | `WS_CLOSE_PROTOCOL_ERROR`        | Protocol-level error                                                                                                                                                                 | Server  |
-| 4006 | `WS_CLOSE_INTERNAL_ERROR`        | Unexpected internal server error                                                                                                                                                     | Server  |
-| 4010 | `WS_CLOSE_AGENT_AUTH_FAILED`     | Agent token authentication failed                                                                                                                                                    | Server  |
-| 4011 | `WS_CLOSE_CLUSTER_NAME_CONFLICT` | Reserved constant; no Platform code path emits this today. Platform accepts N connected orchestrators per `(org_id, cluster_name)` and the dashboard listing dedupes by cluster name | —       |
-| 4020 | `WS_CLOSE_PLAN_LIMIT`            | Organization has reached its plan limit                                                                                                                                              | Server  |
-| 4030 | `WS_CLOSE_REBALANCE`             | Connection rebalancing: a newly-joined Platform instance asked peers holding excess connections to shed some; the orchestrator reconnects immediately and load redistributes evenly  | Server  |
-| 4031 | `WS_CLOSE_DISPATCH_ACK_TIMEOUT`  | A dispatched job went unacknowledged past its deadline; the orchestrator requeues the job and disconnects the unresponsive agent                                                     | Server  |
+| Code | Constant                         | Meaning                                                                                                                                                                                                                              | Sent By |
+| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
+| 1000 | --                               | Normal closure. Sent by the connecting side when it disconnects on purpose -- an agent or orchestrator shutting down its uplink, or a peer client abandoning a handshake that failed                                                 | Client  |
+| 1001 | `WS_CLOSE_GOING_AWAY`            | Server shutdown or browser navigating away                                                                                                                                                                                           | Server  |
+| 4001 | `WS_CLOSE_UNAUTHORIZED`          | Client failed authentication. Also sent when the Platform times out an unauthenticated connection, when a client's API key is revoked mid-session, and on an operator force-disconnect                                               | Server  |
+| 4002 | `WS_CLOSE_AUTH_TIMEOUT`          | Auth timeout expired                                                                                                                                                                                                                 | Server  |
+| 4003 | `WS_CLOSE_INVALID_MESSAGE`       | Invalid or unparseable message received                                                                                                                                                                                              | Server  |
+| 4004 | `WS_CLOSE_HEARTBEAT_TIMEOUT`     | Heartbeat timed out (180 seconds)                                                                                                                                                                                                    | Server  |
+| 4005 | `WS_CLOSE_PROTOCOL_ERROR`        | Protocol-level error                                                                                                                                                                                                                 | Server  |
+| 4006 | `WS_CLOSE_INTERNAL_ERROR`        | Unexpected internal server error                                                                                                                                                                                                     | Server  |
+| 4010 | `WS_CLOSE_AGENT_AUTH_FAILED`     | Agent token authentication failed. On the Platform-orchestrator channel the same code is also sent as a safety fallback when every source in a `source.register` is rejected for missing S3 log storage in a multi-orchestrator pool | Server  |
+| 4011 | `WS_CLOSE_CLUSTER_NAME_CONFLICT` | Reserved constant; no Platform code path emits this today. Platform accepts N connected orchestrators per `(org_id, cluster_name)` and the dashboard listing dedupes by cluster name                                                 | —       |
+| 4020 | `WS_CLOSE_PLAN_LIMIT`            | Organization has reached its plan limit                                                                                                                                                                                              | Server  |
+| 4030 | `WS_CLOSE_REBALANCE`             | Connection rebalancing: a newly-joined Platform instance asked peers holding excess connections to shed some; the orchestrator reconnects immediately and load redistributes evenly                                                  | Server  |
+| 4031 | `WS_CLOSE_DISPATCH_ACK_TIMEOUT`  | A dispatched job went unacknowledged past its deadline; the orchestrator requeues the job and disconnects the unresponsive agent                                                                                                     | Server  |
 
 > Authoritative source: `packages/engine/src/ws/close-codes.ts`
 
@@ -784,12 +810,12 @@ All protocol messages are validated at runtime using Zod discriminated unions. E
 
 **Orchestrator-Agent layer:**
 
-- Incoming (Orchestrator receives): `agentToOrchestratorMessageSchema` -- parses `agent.register`, `agent.status`, `job.status`, `job.reject`, `job.ack`, `log.chunk`, `step.status`, `job.heartbeat`, `agent.log`, `job.concurrency.report`, `config.ack`, `cache.upload.request`, `cache.upload.complete`, `cache.user.restore.request`, `cache.user.save.request`, `cache.user.save.complete`, `provenance.upload.request`, `provenance.upload.complete`, `event.emit`, `agent.api.request`, `agent.metrics`, `auth.request`, `fleet.bundle.chunk`, `fleet.bundle.error`, `step.approval-request`
-- Outgoing (Orchestrator sends): `orchestratorToAgentMessageSchema` -- validates `job.dispatch`, `job.cancel`, `register.ack`, `job.concurrency.ack`, `cache.upload.response`, `cache.user.restore.response`, `cache.user.save.response`, `provenance.upload.response`, `event.emit.response`, `agent.api.response`, `auth.success`, `auth.failure`, `fleet.logs.request`, `step.approval-resolved`
+- Incoming (Orchestrator receives): `agentToOrchestratorMessageSchema` -- parses `agent.register`, `agent.status`, `job.status`, `job.reject`, `job.ack`, `log.chunk`, `step.status`, `job.heartbeat`, `agent.log`, `job.concurrency.report`, `config.ack`, `cache.upload.request`, `cache.upload.complete`, `cache.user.restore.request`, `cache.user.save.request`, `cache.user.save.complete`, `provenance.upload.request`, `provenance.upload.complete`, `provenance.upload.defer`, `artifacts.upload.request`, `artifacts.upload.complete`, `artifacts.download.request`, `event.emit`, `agent.api.request`, `agent.metrics`, `auth.request`, `fleet.bundle.chunk`, `fleet.bundle.error`, `step.approval-request`
+- Outgoing (Orchestrator sends): `orchestratorToAgentMessageSchema` -- validates `job.dispatch`, `job.cancel`, `register.ack`, `job.concurrency.ack`, `cache.upload.response`, `cache.user.restore.response`, `cache.user.save.response`, `provenance.upload.response`, `artifacts.upload.response`, `artifacts.upload.complete.ack`, `artifacts.download.response`, `event.emit.response`, `agent.api.response`, `auth.success`, `auth.failure`, `fleet.logs.request`, `step.approval-resolved`
 
 **Peer-to-peer layer:**
 
-- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
+- Bidirectional: `peerToPeerMessageSchema` / `peerFromPeerMessageSchema` -- parses `peer.hello`, `peer.hello.response`, `peer.auth.request`, `peer.auth.response`, `peer.heartbeat`, `job.reroute`, `job.reroute.ack`, `job.progress`, `job.progress.ack`, `peer.job.cancel`, `raft.vote.request`, `raft.vote.response`, `raft.append.entries`, `peer.log.chunk`, `peer.cache.upload.request`, `peer.cache.upload.response`, `peer.config.reload`, `peer.config.reload.response`, `peer.clusterSettings.request`, `peer.clusterSettings.response`, `peer.logs.collect.request`, `peer.logs.collect.chunk`, `peer.logs.collect.error`, `peer.leaving`, `peer.agent-token.revoke`, `scaler.event`
 
 The upstream layers (orchestrator↔KiCI and browser↔KiCI) have their own discriminated unions.
 

@@ -18,12 +18,18 @@ import { promisify } from 'node:util';
 import { writeFile } from 'node:fs/promises';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { RFC1918_RANGES, METADATA_RANGE } from '../scaler/nftables.js';
+import { FIRECRACKER_NET_INTERFACES } from './net-interfaces.js';
+
+// Re-exported so the orchestrator's own consumers keep importing it from the
+// module that renders the drop-in; it lives in a leaf module so out-of-package
+// readers (the NM drift watchdog) do not pull this module's runtime graph.
+export { FIRECRACKER_NET_INTERFACES };
 
 const execFileP = promisify(execFileCb);
 const logger = createLogger({ prefix: 'fc-host-network' });
 
 /** Privileged binaries that need `sudo -n` on a non-root orchestrator host. */
-const PRIVILEGED_BINS = new Set(['ip', 'nft', 'sysctl']);
+const PRIVILEGED_BINS = new Set(['ip', 'nft', 'sysctl', 'iptables']);
 
 /** Timeout for a single host-network provisioning command. */
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -192,18 +198,38 @@ export function buildBridgeCommands(cfg: FirecrackerBridgeConfig): CommandSpec[]
       'set',
       '1460',
     ),
+    // 6. Docker coexistence. When docker is co-installed on the FC host it sets
+    //    the netfilter FORWARD policy to DROP and only permits its own bridges,
+    //    which silently drops the FC bridge's NAT'd guest traffic (no guest
+    //    internet). DOCKER-USER is docker's sanctioned hook, evaluated before
+    //    its DROP rules; accept the FC subnet there (both directions). Delete-
+    //    then-insert keeps it idempotent. On a host without docker the
+    //    DOCKER-USER chain is absent and these iptables calls fail benignly
+    //    (swallowed by provisionBridge / `|| true` in the boot script).
+    { bin: 'iptables', args: ['-D', 'DOCKER-USER', '-s', subnet, '-j', 'ACCEPT'] },
+    { bin: 'iptables', args: ['-I', 'DOCKER-USER', '-s', subnet, '-j', 'ACCEPT'] },
+    { bin: 'iptables', args: ['-D', 'DOCKER-USER', '-d', subnet, '-j', 'ACCEPT'] },
+    { bin: 'iptables', args: ['-I', 'DOCKER-USER', '-d', subnet, '-j', 'ACCEPT'] },
   ];
 }
 
 export const NM_CONF_PATH = '/etc/NetworkManager/conf.d/90-kici-unmanaged.conf';
+
 export const NM_CONF_CONTENT = [
   '# Managed by kici-admin firecracker — do not hand-edit.',
   '#',
   "# KiCI's Firecracker scaler creates and destroys many kici-* interfaces",
   '# (TAP devices + bridges). NetworkManager must not manage them: it auto-adopts',
   '# them and can wedge the NM main thread at 100% CPU under churn.',
+  '#',
+  '# The `+=` append operator is mandatory: NM merges conf.d drop-ins last-wins',
+  '# per key, so a bare `unmanaged-devices=` here would be silently clobbered by',
+  "# (or would silently clobber) any other drop-in's unmanaged-devices line — e.g.",
+  '# the wifi drop-in from @kici-dev/util-linux-management. `+=` accumulates',
+  '# across files so every drop-in survives. See',
+  '# .claude/rules/networkmanager-unmanaged.md.',
   '[keyfile]',
-  'unmanaged-devices=interface-name:kici-*',
+  ...FIRECRACKER_NET_INTERFACES.map((p) => `unmanaged-devices+=interface-name:${p}`),
   '',
 ].join('\n');
 
@@ -293,7 +319,16 @@ export async function provisionBridge(
       const benignExists =
         /File exists|already a member|already assigned|exists/i.test(msg) &&
         (line.includes('link add') || line.includes('addr add'));
-      if (benignDelete || benignExists) {
+      // Docker-coexistence carve-out: the DOCKER-USER accept rules are
+      // best-effort. A `-D` of an absent rule, an absent DOCKER-USER chain (no
+      // docker on this host), or a missing iptables binary must not fail
+      // provisioning.
+      const benignDockerUser =
+        line.includes('DOCKER-USER') &&
+        /does a matching rule exist|does not exist|No chain|not found|ENOENT|command not found/i.test(
+          msg,
+        );
+      if (benignDelete || benignExists || benignDockerUser) {
         logger.debug(`idempotent skip: ${line} (${msg})`);
         continue;
       }
@@ -392,7 +427,11 @@ const HOST_IFACE_SENTINEL = '__HOST_IFACE__';
 export function renderBootScript(cfg: FirecrackerBridgeConfig): string {
   const specs = buildBridgeCommands({ ...cfg, hostIface: HOST_IFACE_SENTINEL });
   const lines = specs.map((s) => {
-    const benign = s.bin === 'nft' && s.args[0] === 'delete' && s.args[1] === 'table';
+    // nft table-delete and every DOCKER-USER iptables call are best-effort:
+    // the table may not exist yet, and DOCKER-USER only exists when docker is
+    // installed (and iptables may be absent entirely on a non-docker host).
+    const benign =
+      (s.bin === 'nft' && s.args[0] === 'delete' && s.args[1] === 'table') || s.bin === 'iptables';
     const argv = [s.bin, ...s.args]
       .map((tok) => (tok === HOST_IFACE_SENTINEL ? '"$HOST_IFACE"' : shellQuote(tok)))
       .join(' ');

@@ -26,7 +26,7 @@ import { describe, it, expect } from 'vitest';
 import type { TrustTier } from '@kici-dev/engine';
 import { selectLockFileSource } from './lock-source.js';
 
-describe('§5.6 lock-file source selection — A7 untrusted contributor cannot inject HEAD lock', () => {
+describe('lock-file source selection — A7 untrusted contributor cannot inject HEAD lock', () => {
   it('returns "head" for non-PR events regardless of tier', () => {
     // Non-PR events (push, tag, schedule, etc.) come from someone with
     // direct write access to the repo; HEAD is correct.

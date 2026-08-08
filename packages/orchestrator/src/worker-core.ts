@@ -30,9 +30,9 @@
  * - HTTP server with /health and agent WS endpoint
  */
 
-import { serve } from '@hono/node-server';
+import { serve, upgradeWebSocket } from '@hono/node-server';
 import { Hono } from 'hono';
-import { createNodeWebSocket } from '@hono/node-ws';
+import { WebSocketServer } from 'ws';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import {
@@ -75,13 +75,16 @@ const WORKER_ENGINE_BUNDLE_HASH =
   typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown';
 import { AgentRegistry } from './agent/registry.js';
 import { Dispatcher } from './agent/dispatcher.js';
+import { incScalerRedispatch } from './metrics/prometheus.js';
 import { PeerClient, PeerRegistry, PeerAuthCoordinator } from './cluster/index.js';
 import { TERMINAL_JOB_STATES, WS_CLOSE_DISPATCH_ACK_TIMEOUT } from '@kici-dev/engine';
+import type { PeerLogChunk } from '@kici-dev/engine';
 import { InMemoryExecutionTracker } from './worker/in-memory-execution-tracker.js';
 import { InMemoryJobQueue } from './worker/in-memory-job-queue.js';
 import { StaticAgentTokenStore } from './worker/static-agent-token-store.js';
 import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
+import { configureSecureWsServer } from './ws/server-options.js';
 import {
   ScalerManager,
   ContainerScalerBackend,
@@ -91,7 +94,12 @@ import {
   loadScalerConfig,
   detectLabelSetOverlaps,
 } from './scaler/index.js';
-import type { ScalerBackend, ScalerConfig, ScalerEvent } from './scaler/index.js';
+import type {
+  ScalerBackend,
+  ScalerConfig,
+  ScalerEvent,
+  ScalerRedispatchTrigger,
+} from './scaler/index.js';
 import { runDiskGuard } from './scaler/disk-guard.js';
 import { createAgentWsHandler } from './ws/agent-handler.js';
 import { FleetAgentCollector } from './ws/fleet-agent-collector.js';
@@ -103,7 +111,13 @@ import { resolveDataDir } from './data-dir.js';
 import { PeerOutbox } from './worker/peer-outbox.js';
 import { buildTerminalJobProgress, replayPending } from './worker/worker-outbox-relay.js';
 import { join } from 'node:path';
-import type { PeerJobCancel, JobReroute, JobProgress } from '@kici-dev/engine';
+import { createOnErrorHandler } from './app-on-error.js';
+import type {
+  PeerJobCancel,
+  JobReroute,
+  JobProgress,
+  WorkerClusterSettings,
+} from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'worker' });
 const DRAIN_TIMEOUT_MS = 300_000; // 5 minutes
@@ -131,6 +145,19 @@ interface WorkerSubsystems {
 }
 
 /**
+ * Resolve the ephemeral agent-token TTL a worker-spawned agent should use:
+ * the fleet-wide `agent_token_ttl_ms` pulled from the leader when a snapshot has
+ * landed, otherwise the boot-time config default. This is the single seam the
+ * worker's three scaler backends read at spawn.
+ */
+export function resolveWorkerAgentTokenTtlMs(
+  pushed: { settings: WorkerClusterSettings } | null,
+  fallback: number,
+): number {
+  return pushed?.settings.agentTokenTtlMs ?? fallback;
+}
+
+/**
  * Initialize scaler backends for worker mode.
  *
  * Similar to the coordinator's initializeScaler but uses the in-memory
@@ -142,6 +169,7 @@ async function initializeWorkerScaler(
   config: AppConfig,
   tokenStore: StaticAgentTokenStore,
   onScalerEvent: (runId: string, jobId: string, event: ScalerEvent) => void,
+  tokenTtlProvider: () => Promise<number>,
 ): Promise<{ manager: ScalerManager; config: ScalerConfig } | null> {
   if (!config.scalerConfigPath) return null;
 
@@ -181,6 +209,10 @@ async function initializeWorkerScaler(
             networkIsolation: s.networkIsolation,
             tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // Honor the fleet-wide agent_token_ttl_ms pulled from the leader
+            // (DB-less workers cannot read cluster_settings directly); falls
+            // back to config.agentTokenTtlMs until the first pull lands.
+            tokenTtlProvider,
             roles: s.roles,
           }),
         };
@@ -194,6 +226,8 @@ async function initializeWorkerScaler(
             defaultResources: scalerConfig.defaults?.resources,
             tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // See the container backend above — honor the leader-pulled TTL.
+            tokenTtlProvider,
             roles: s.roles,
             enforceCgroups: s.enforceCgroups,
           }),
@@ -205,6 +239,7 @@ async function initializeWorkerScaler(
         const gateway = fcNet?.gateway ?? '10.0.0.1';
         const netmask = fcNet?.netmask ?? '255.255.255.0';
         const table = fcNet?.table ?? 'kici';
+        const autoProvisionHost = fcNet?.autoProvisionHost ?? true;
         const ipAllocator = new InMemoryIpAllocator({ cidr, gateway, netmask });
         return {
           name: s.name,
@@ -226,8 +261,11 @@ async function initializeWorkerScaler(
             gateway,
             netmask,
             table,
+            autoProvisionHost,
             tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
             tokenTtlMs: config.agentTokenTtlMs,
+            // See the container backend above — honor the leader-pulled TTL.
+            tokenTtlProvider,
             roles: s.roles,
             requireSudo: s.requireSudo,
           }),
@@ -256,6 +294,8 @@ async function initializeWorkerScaler(
       instanceId: config.cluster.instanceId,
     },
     onScalerEvent,
+    // The worker has no DB; the spawn deadline is the cluster-wide default.
+    spawnTimeoutMs: config.scalerSpawnTimeoutMs,
   });
 
   // Run orphan cleanup for container backends
@@ -274,6 +314,10 @@ async function initializeWorkerScaler(
       }
     }
   }
+
+  // Verify + self-provision each backend's host prerequisites (Firecracker
+  // bridge) before spawning starts. Degraded-on-failure — never aborts startup.
+  await scalerManager.ensureHostsReady();
 
   scalerManager.start();
   logger.info('Worker scaler initialized', {
@@ -301,15 +345,12 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
     // No DB lookup needed -- just forward to the agent.
     const dispatchSecrets = job.jobConfig.secrets as Record<string, string> | undefined;
     const dispatchNamespacedSecrets = job.jobConfig.namespacedSecrets as
-      | Record<string, Record<string, string>>
-      | undefined;
+      Record<string, Record<string, string>> | undefined;
     const dispatchRunPublicKey = job.jobConfig.runPublicKey as string | undefined;
     const dispatchNpmRegistries = job.jobConfig.npmRegistries as
-      | Array<Record<string, unknown>>
-      | undefined;
+      Array<Record<string, unknown>> | undefined;
     const dispatchInstallEnvSecrets = job.jobConfig.installEnvSecrets as
-      | Record<string, string>
-      | undefined;
+      Record<string, string> | undefined;
     // The coordinator pre-resolves a clone token in its onJobReroute path
     // (mintSourceAuth at the dispatch site) and stuffs it into
     // jobConfig.cloneToken — workers have no provider credentials of their
@@ -464,7 +505,19 @@ export async function bootstrapWorker(
   const tokenStore = new StaticAgentTokenStore();
   const agentRegistry = new AgentRegistry();
   const jobQueue = new InMemoryJobQueue();
-  const peerRegistry = new PeerRegistry();
+
+  // Worker-relevant cluster settings pulled from the leader over the peer
+  // channel. A worker is DB-less, so it cannot read cluster_settings directly;
+  // it advertises its last-pulled version on the heartbeat and pulls the
+  // snapshot when the leader is ahead. Until the first pull lands, every read
+  // falls back to the boot-time config default.
+  const pushedClusterSettings: {
+    current: { version: number; settings: WorkerClusterSettings } | null;
+  } = { current: null };
+  const workerTokenTtlProvider = (): Promise<number> =>
+    Promise.resolve(
+      resolveWorkerAgentTokenTtlMs(pushedClusterSettings.current, config.agentTokenTtlMs),
+    );
 
   // Fleet log collection: a worker collects bundles only from its own agents.
   const fleetAgentCollector = new FleetAgentCollector({ timeoutMs: FLEET_NODE_TIMEOUT_MS });
@@ -477,6 +530,46 @@ export async function bootstrapWorker(
   // on terminal job state.
   const peerClients = new Map<string, PeerClient>();
   const jobOwnership = new Map<string, string>();
+
+  // Guard against overlapping pulls: at most one in-flight request per version gap.
+  let clusterSettingsPullInFlight = false;
+  const requestClusterSettings = async (peerVersion: number): Promise<void> => {
+    if (clusterSettingsPullInFlight) return;
+    if ((pushedClusterSettings.current?.version ?? 0) >= peerVersion) return;
+    // Any connected coordinator can resolve the snapshot — they all read the
+    // same cluster DB — so pull from the first connected peer.
+    const client = [...peerClients.values()].find((c) => c.state === 'connected');
+    if (!client) return;
+    clusterSettingsPullInFlight = true;
+    try {
+      const resp = await client.sendClusterSettingsRequestAndWait({
+        type: 'peer.clusterSettings.request',
+        messageId: randomUUID(),
+      });
+      if (resp && resp.version > (pushedClusterSettings.current?.version ?? 0)) {
+        pushedClusterSettings.current = { version: resp.version, settings: resp.settings };
+        // Advance the registry's local version so the hook stops re-firing on
+        // every subsequent heartbeat that still advertises this version.
+        peerRegistry.setLocalClusterSettingsVersion(resp.version);
+        logger.info('Pulled cluster settings from leader; worker-spawned agents now use this TTL', {
+          version: resp.version,
+          agentTokenTtlMs: resp.settings.agentTokenTtlMs,
+        });
+      }
+    } catch (err) {
+      logger.warn('Cluster-settings pull failed; keeping current worker settings', {
+        error: toErrorMessage(err),
+      });
+    } finally {
+      clusterSettingsPullInFlight = false;
+    }
+  };
+
+  const peerRegistry = new PeerRegistry({
+    onClusterSettingsVersionBehind: (peerVersion: number) => {
+      void requestClusterSettings(peerVersion);
+    },
+  });
 
   // Durable outbox: terminal job statuses are persisted here before the
   // best-effort live send, replayed to the owning coord on every (re)connect,
@@ -567,17 +660,22 @@ export async function bootstrapWorker(
   // Workers have no database, so a scaler provisioning event is forwarded to
   // the coordinator that owns the job; the coordinator's ExecutionTracker
   // persists it. Routing reuses jobOwnership, exactly like job/step progress.
-  const scalerResult = await initializeWorkerScaler(config, tokenStore, (runId, jobId, ev) => {
-    sendToOwningCoord(jobId, {
-      type: 'scaler.event',
-      runId,
-      jobId,
-      agentId: ev.agentId,
-      eventType: ev.eventType,
-      detail: ev.detail,
-      timestampMs: ev.timestampMs,
-    });
-  });
+  const scalerResult = await initializeWorkerScaler(
+    config,
+    tokenStore,
+    (runId, jobId, ev) => {
+      sendToOwningCoord(jobId, {
+        type: 'scaler.event',
+        runId,
+        jobId,
+        agentId: ev.agentId,
+        eventType: ev.eventType,
+        detail: ev.detail,
+        timestampMs: ev.timestampMs,
+      });
+    },
+    workerTokenTtlProvider,
+  );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
 
@@ -586,6 +684,8 @@ export async function bootstrapWorker(
   const noopMetrics = {
     incJobsDispatched: () => {},
     setQueueDepth: () => {},
+    incScalerRedispatch: (trigger: ScalerRedispatchTrigger, count: number) =>
+      incScalerRedispatch(trigger, count),
   };
   const dispatcher = new Dispatcher({
     registry: agentRegistry,
@@ -594,8 +694,8 @@ export async function bootstrapWorker(
     metrics: noopMetrics,
     onDispatch,
     onNoMatchingAgent: scalerManager
-      ? async (labels, jobId, runId, excludeLabels, resources) =>
-          scalerManager.requestScale(labels, jobId, runId, excludeLabels, resources)
+      ? async (labels, jobId, runId, excludeLabels, resources, orgId) =>
+          scalerManager.requestScale(labels, jobId, runId, excludeLabels, resources, orgId)
       : undefined,
     // The worker has no DB; the deadline is the cluster-wide default.
     getAckTimeoutMs: async () => config.dispatchAckTimeoutMs,
@@ -622,6 +722,15 @@ export async function bootstrapWorker(
       }
     },
   });
+
+  // Capacity-freed re-drive: re-offer the oldest pending jobs to the scaler the
+  // moment an agent releases its slot, instead of waiting for a timeout. The
+  // dispatcher single-flights the re-drive.
+  if (scalerManager) {
+    scalerManager.onCapacityFreed = () => {
+      void dispatcher.retryPendingScaleRequests();
+    };
+  }
 
   // 6. Create one PeerClient per coordinator URL.
   // The worker fans out so every coord can dispatch directly. Each PeerClient
@@ -656,6 +765,7 @@ export async function bootstrapWorker(
     }),
     configVersion: 0,
     registryVersion: 0,
+    clusterSettingsVersion: pushedClusterSettings.current?.version ?? 0,
     term: 0,
     leaderId: null,
     hostname: osHostname(),
@@ -806,7 +916,19 @@ export async function bootstrapWorker(
         // owning coordinator would never advance past `running`.
         const result = await dispatcher.dispatch(jobInput);
 
-        if (
+        if (result.status === 'duplicate') {
+          // A dispatch_queue row for this preassigned jobId already exists — a
+          // concurrent reroute from a sibling coordinator racing the same jobId,
+          // or a replayed job.reroute. The job is already tracked; accept the
+          // reroute as a benign no-op without re-registering ownership/execution
+          // tracking. Reporting accepted:false here would wrongly drive the owning
+          // coordinator to reroute an already-handled job. (Idempotent no-op.)
+          client.send({
+            type: 'job.reroute.ack',
+            messageId: msg.messageId,
+            accepted: true,
+          });
+        } else if (
           result.status === 'dispatched' ||
           result.status === 'queued' ||
           result.status === 'queued-no-backend'
@@ -893,7 +1015,12 @@ export async function bootstrapWorker(
 
   // 7. Create HTTP server with minimal routes
   const app = new Hono().basePath(config.basePath);
-  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+  app.onError(createOnErrorHandler({ role: 'worker' }));
+  // Construct the WebSocket server ourselves (built-in WS support in
+  // @hono/node-server). Apply the same compression-bomb defense the
+  // coordinator + platform use on the worker's agent-WS listener.
+  const wss = new WebSocketServer({ noServer: true });
+  configureSecureWsServer(wss);
 
   // Health endpoint (no DB readiness check for workers). Drift-diagnostic fields
   // mirror coordinator/health so curl-diffing across roles works uniformly.
@@ -1012,16 +1139,23 @@ export async function bootstrapWorker(
         msg.lines,
       );
       // Forward log chunks to the coord that dispatched this job (the one
-      // with the run rows in its DB).
-      sendToOwningCoord(msg.jobId, {
+      // with the run rows in its DB). `peer.log.chunk` carries one object per
+      // line (text + timestamp + originating stream), so the flat string array
+      // the agent sent is expanded here; the annotation makes the peer schema's
+      // shape a compile-time requirement rather than a runtime surprise on the
+      // receiving coordinator.
+      const forwarded: PeerLogChunk = {
         type: 'peer.log.chunk',
-        messageId: randomUUID(),
         runId: msg.runId,
         jobId: msg.jobId,
         stepIndex: msg.stepIndex,
-        lines: msg.lines,
-        timestamp: msg.timestamp,
-      });
+        lines: msg.lines.map((text) => ({
+          text,
+          timestamp: msg.timestamp,
+          ...(msg.stream !== undefined && { stream: msg.stream }),
+        })),
+      };
+      sendToOwningCoord(msg.jobId, forwarded);
     },
     onStepStatus: (_agentId, msg) => {
       // Merge top-level wire fields back into data for the persistence/forward pipeline.
@@ -1066,16 +1200,17 @@ export async function bootstrapWorker(
   );
 
   // Start HTTP server
-  const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
-    logger.info(`Worker started on port ${info.port}`, {
-      port: info.port,
-      role: 'worker',
-      coordinatorUrls: coordUrls,
-      instanceId: config.cluster.instanceId,
-    });
-  });
-
-  injectWebSocket(server);
+  const server = serve(
+    { fetch: app.fetch, port: config.port, websocket: { server: wss } },
+    (info) => {
+      logger.info(`Worker started on port ${info.port}`, {
+        port: info.port,
+        role: 'worker',
+        coordinatorUrls: coordUrls,
+        instanceId: config.cluster.instanceId,
+      });
+    },
+  );
 
   // 8. Start heartbeat monitor
   const heartbeatMonitor = new AgentHeartbeatMonitor({

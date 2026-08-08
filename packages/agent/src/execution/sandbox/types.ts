@@ -1,4 +1,4 @@
-import type { JobDispatch } from '@kici-dev/engine';
+import type { JobDispatch, LogStream } from '@kici-dev/engine';
 import type {
   EventEmitRequest,
   EventEmitResponse,
@@ -8,6 +8,8 @@ import type {
   CacheResponseIpc,
   ProvenanceRequestIpc,
   ProvenanceResponseIpc,
+  ArtifactRequestIpc,
+  ArtifactResponseIpc,
   StepApprovalRequestIpc,
   StepApprovalResolvedIpc,
 } from './ipc-protocol.js';
@@ -70,6 +72,15 @@ export interface SandboxSetupOptions {
   workDir: string;
   /** Sanitized environment variables (user env + secrets, NO agent credentials). */
   env: Record<string, string>;
+  /**
+   * Extra read-only host paths to expose in the sandbox beyond the workspace +
+   * runner — the `file://` clone-source dir(s) so the in-sandbox `git clone`
+   * can read a local source. Derived from the dispatch `repoUrl` by the
+   * job-runner (empty for https/ssh remotes). The container backend binds each
+   * as `<dir>:<dir>:ro`; the bare-metal backend derives its own equivalent
+   * inside `executeJob`, so it ignores this field.
+   */
+  extraReadOnlyBinds?: string[];
 }
 
 // --- Job execution options ---
@@ -85,8 +96,11 @@ export interface JobExecutionOptions {
     state: string,
     data?: Record<string, unknown>,
   ) => void;
-  /** Callback for real-time log line forwarding. */
-  onLogLine: (stepIndex: number, line: string) => void;
+  /**
+   * Callback for real-time log line forwarding. `stream` names the subprocess
+   * stream the line came from; absent means stdout.
+   */
+  onLogLine: (stepIndex: number, line: string, stream?: LogStream) => void;
   /** Abort signal for cancellation. */
   signal: AbortSignal;
   /**
@@ -125,6 +139,15 @@ export interface JobExecutionOptions {
    * working — the runner falls back to a "not configured" error response.
    */
   onProvenanceRequest?: (request: ProvenanceRequestIpc) => Promise<ProvenanceResponseIpc>;
+  /**
+   * Callback for relaying a user-facing artifact request from the sandbox to the
+   * orchestrator. The sandbox runner sends `artifacts.request` IPC; the agent
+   * wraps it in the matching `artifacts.upload.*` / `artifacts.download.*` WS
+   * message and forwards to the orchestrator. Optional so harnesses that don't
+   * thread artifacts keep working — the runner falls back to a "not configured"
+   * error response.
+   */
+  onArtifactRequest?: (request: ArtifactRequestIpc) => Promise<ArtifactResponseIpc>;
   /**
    * Callback for relaying a step-level approval request from the sandbox to the
    * orchestrator. The sandbox runner sends `approval.request` IPC; the agent

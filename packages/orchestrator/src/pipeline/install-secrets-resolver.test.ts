@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { initTelemetry } from '@kici-dev/shared';
 import type { Context as DbContext } from '../db/types.js';
+import { HoldType } from '@kici-dev/engine';
 import type { Context as EngineContext, ProtectionGateResult } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
@@ -10,6 +11,7 @@ import {
   parseQualifiedSecretRef,
   validateRegistryUrlScheme,
   resolveInstallSecrets,
+  resolveHoldType,
 } from './install-secrets-resolver.js';
 import * as metrics from '../metrics/prometheus.js';
 
@@ -265,7 +267,7 @@ describe('resolveInstallSecrets', () => {
     expect(r.decision).toBe('hold');
     if (r.decision === 'hold') {
       expect(r.action).toBe('hold');
-      expect(r.holdType).toBe('reviewer');
+      expect(r.holdType).toBe(HoldType.enum.reviewer);
       expect(r.envName).toBe('prod');
       expect(r.contextId).toBe('env-prod');
       expect(r.queueType).toBe('context');
@@ -274,7 +276,20 @@ describe('resolveInstallSecrets', () => {
     }
   });
 
-  it('returns a hold decision with wait_timer hold type for a wait-timer env', async () => {
+  it('persists an install-gate wait hold under the same type as a dispatch-gate one', () => {
+    // Both gates persist a wait hold under the same type, so two semantically
+    // identical holds get the same badge, the same live countdown and the same
+    // "Skip timer" button whichever gate produced them.
+    expect(resolveHoldType('wait', HoldType.enum.timer)).toBe(HoldType.enum.timer);
+    expect(resolveHoldType('wait', undefined)).toBe(HoldType.enum.timer);
+  });
+
+  it('keeps the queue and reviewer fallbacks on the gate vocabulary', () => {
+    expect(resolveHoldType('queue', undefined)).toBe(HoldType.enum.concurrency);
+    expect(resolveHoldType('hold', undefined)).toBe(HoldType.enum.reviewer);
+  });
+
+  it('returns a hold decision with the timer hold type for a wait-timer env', async () => {
     const envs = new Map<string, DbContext>([
       ['prod', makeEnvRow({ id: 'env-prod', wait_timer_seconds: 30 })],
     ]);
@@ -291,7 +306,7 @@ describe('resolveInstallSecrets', () => {
     expect(r.decision).toBe('hold');
     if (r.decision === 'hold') {
       expect(r.action).toBe('wait');
-      expect(r.holdType).toBe('wait_timer');
+      expect(r.holdType).toBe(HoldType.enum.timer);
     }
   });
 

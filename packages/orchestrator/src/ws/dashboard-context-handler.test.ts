@@ -2,9 +2,21 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DashboardContextHandler } from './dashboard-context-handler.js';
 import type { DashboardContextHandlerDeps } from './dashboard-context-handler.js';
 import type { DashboardPlatformToOrchMessage } from '@kici-dev/engine';
-import { ContextDeleteErrorCode, AccessLogOutcome } from '@kici-dev/engine';
+import { ContextDeleteErrorCode, AccessLogOutcome, HoldType } from '@kici-dev/engine';
 import { ContextDeleteBlockedError } from '../contexts/context-store.js';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
+import { loadRoutableStores } from '../secrets/scope-routing.js';
+import { generateDashboardEncryptionKey } from '../secrets/dashboard-encryption-key.js';
+import { decryptPrivateKey } from '../secrets/ephemeral-keys.js';
+import {
+  generateKeyPairSync,
+  createPrivateKey,
+  createPublicKey,
+  diffieHellman,
+  hkdfSync,
+  randomBytes,
+  createCipheriv,
+} from 'node:crypto';
 
 function createMockDeps(): DashboardContextHandlerDeps & { sent: unknown[] } {
   const sent: unknown[] = [];
@@ -84,6 +96,8 @@ function createMockDeps(): DashboardContextHandlerDeps & { sent: unknown[] } {
       where: vi.fn().mockReturnThis(),
       orderBy: vi.fn().mockReturnThis(),
       distinct: vi.fn().mockReturnThis(),
+      limit: vi.fn().mockReturnThis(),
+      offset: vi.fn().mockReturnThis(),
       execute: vi.fn().mockResolvedValue([]),
       updateTable: vi.fn().mockReturnThis(),
       set: vi.fn().mockReturnThis(),
@@ -241,6 +255,66 @@ describe('DashboardContextHandler', () => {
         action: 'context.delete',
         outcome: AccessLogOutcome.enum.denied,
       });
+    });
+  });
+
+  describe('context update — omitted vs explicitly-null vs value', () => {
+    /** Drive `dashboard.contexts.update` and return the store's `updates` arg. */
+    async function updatesFor(updates: Record<string, unknown>): Promise<Record<string, unknown>> {
+      await handler.handleMessage({
+        type: 'dashboard.contexts.update',
+        requestId: 'req-upd',
+        contextId: 'env-1',
+        updates,
+      } as unknown as DashboardPlatformToOrchMessage);
+      const call = (deps.contextStore.update as any).mock.calls[0];
+      expect(call).toBeDefined();
+      expect(call[0]).toBe('org-1');
+      expect(call[1]).toBe('env-1');
+      return call[2] as Record<string, unknown>;
+    }
+
+    it('forwards an explicit null so the field is cleared', async () => {
+      // The bug: every null became undefined, and the store skips undefined
+      // keys — so "turn required reviewers off" silently did nothing and the
+      // approval gate could not be removed through the UI at all.
+      const updates = await updatesFor({ requiredReviewers: null, holdExpirySeconds: null });
+
+      expect(updates.requiredReviewers).toBeNull();
+      expect(updates.holdExpirySeconds).toBeNull();
+    });
+
+    it('forwards a null concurrency strategy and branch restrictions', async () => {
+      const updates = await updatesFor({ concurrencyStrategy: null, branchRestrictions: null });
+
+      expect(updates.concurrencyStrategy).toBeNull();
+      expect(updates.branchRestrictions).toBeNull();
+    });
+
+    it('still omits a field the message did not mention', async () => {
+      const updates = await updatesFor({ name: 'renamed' });
+
+      expect(updates.name).toBe('renamed');
+      expect(updates.requiredReviewers).toBeUndefined();
+      expect(updates.holdExpirySeconds).toBeUndefined();
+      expect(updates.concurrencyStrategy).toBeUndefined();
+      expect(updates.branchRestrictions).toBeUndefined();
+    });
+
+    it('maps a reviewer count to the stored array form', async () => {
+      // The column holds a JSON array; the wire carries a count. This mapping
+      // is pre-existing and must survive the null fix.
+      const updates = await updatesFor({
+        requiredReviewers: 2,
+        holdExpirySeconds: 3600,
+        branchRestrictions: ['main'],
+        concurrencyStrategy: 'cancel-pending',
+      });
+
+      expect(updates.requiredReviewers).toEqual(['2']);
+      expect(updates.holdExpirySeconds).toBe(3600);
+      expect(updates.branchRestrictions).toEqual(['main']);
+      expect(updates.concurrencyStrategy).toBe('cancel-pending');
     });
   });
 
@@ -428,6 +502,45 @@ describe('DashboardContextHandler', () => {
       expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
     });
 
+    it('routes a pg:-qualified write to the CONFIGURED store, never the registry-built one', async () => {
+      // This composes `loadBackendStores` exactly the way the server bootstrap
+      // does. The backend registry synthesizes its own PgSecretStore for the
+      // seeded `pg` row, and that instance carries none of the orchestrator's
+      // configuration — `customerSecretsEnabled` defaults to true (so it would
+      // ignore an operator's `pgCustomerSecrets: false`), its key version is
+      // hardcoded to 1, and it has no old-master-key fallback. Routing
+      // `pg:<path>` there while `<path>` goes to the configured store makes two
+      // spellings of one scope behave differently.
+      const registryPgStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn().mockResolvedValue(undefined),
+        deleteSecret: vi.fn(),
+      };
+      deps.loadBackendStores = () =>
+        loadRoutableStores(
+          { loadAllStores: async () => new Map([['pg', registryPgStore as any]]) },
+          {},
+          deps.secretStore,
+        );
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.set',
+        requestId: 'req-cfg',
+        scope: 'pg:aws/prod',
+        key: 'NEW_KEY',
+        value: 'secret-value',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.setSecret).toHaveBeenCalledWith(
+        'org-1',
+        'aws/prod',
+        'NEW_KEY',
+        'secret-value',
+      );
+      expect(registryPgStore.setSecret).not.toHaveBeenCalled();
+    });
+
     it('handles dashboard.contexts.secrets.set for PG with prefixed scope', async () => {
       const handled = await handler.handleMessage({
         type: 'dashboard.contexts.secrets.set',
@@ -564,6 +677,108 @@ describe('DashboardContextHandler', () => {
       expect(vaultStore.deleteScope).toHaveBeenCalledWith('org-1', 'databases/staging');
     });
 
+    it('refuses a rename that crosses backends instead of renaming inside the source', async () => {
+      // Resolving oldScope and newScope independently and ignoring the backend
+      // each landed on renames INSIDE the source store: `pg:a -> vault:b`
+      // would rewrite the pg scope to `b` while the operator is told the
+      // secrets now live in Vault. The AAD binds the scope name, so the rows
+      // are re-encrypted under a name that points at the wrong store.
+      const vaultStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+        renameScope: vi.fn().mockResolvedValue(undefined),
+      };
+      deps.secretStore.renameScope = vi.fn().mockResolvedValue(undefined);
+      deps.loadBackendStores = vi.fn().mockResolvedValue(
+        new Map([
+          ['pg', deps.secretStore],
+          ['vault', vaultStore],
+        ]),
+      );
+
+      const handled = await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.rename',
+        requestId: 'req-xbr',
+        oldScope: 'pg:aws/old',
+        newScope: 'vault:aws/new',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+      expect(vaultStore.renameScope).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.type).toBe('dashboard.contexts.secrets.scope.rename.response');
+      expect(resp.error).toContain('across backends');
+      // Both scopes must be resolved against ONE snapshot of the backend map.
+      // With a load per scope, a backend registered or removed between the two
+      // decides this comparison — a qualifier resolving to a backend in one
+      // snapshot and falling through to the default in the other silently
+      // turns a cross-backend rename back into an accepted same-backend one.
+      expect(deps.loadBackendStores).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows a rename that stays inside one non-default backend', async () => {
+      const vaultStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+        renameScope: vi.fn().mockResolvedValue(undefined),
+      };
+      deps.secretStore.renameScope = vi.fn().mockResolvedValue(undefined);
+      deps.loadBackendStores = vi.fn().mockResolvedValue(
+        new Map([
+          ['pg', deps.secretStore],
+          ['vault', vaultStore],
+        ]),
+      );
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.rename',
+        requestId: 'req-vbr',
+        oldScope: 'vault:aws/old',
+        newScope: 'vault:aws/new',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(vaultStore.renameScope).toHaveBeenCalledWith('org-1', 'aws/old', 'aws/new');
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.error).toBeUndefined();
+    });
+
+    it('refuses a rename from an unqualified scope to a non-default backend', async () => {
+      // An unqualified scope resolves to the default backend, so `a -> vault:b`
+      // is just as much a cross-backend move as `pg:a -> vault:b`.
+      const vaultStore = {
+        listScopes: vi.fn(),
+        listKeys: vi.fn(),
+        setSecret: vi.fn(),
+        deleteSecret: vi.fn(),
+        renameScope: vi.fn().mockResolvedValue(undefined),
+      };
+      deps.secretStore.renameScope = vi.fn().mockResolvedValue(undefined);
+      deps.loadBackendStores = vi.fn().mockResolvedValue(
+        new Map([
+          ['pg', deps.secretStore],
+          ['vault', vaultStore],
+        ]),
+      );
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.rename',
+        requestId: 'req-ubr',
+        oldScope: 'aws/old',
+        newScope: 'vault:aws/new',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+      expect(vaultStore.renameScope).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.error).toContain('across backends');
+    });
+
     it('returns error when backend does not support scope creation', async () => {
       // secretStore has no createScope method
       const handled = await handler.handleMessage({
@@ -576,6 +791,87 @@ describe('DashboardContextHandler', () => {
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.contexts.secrets.scope.create.response');
       expect(resp.error).toContain('does not support');
+    });
+  });
+
+  describe('scope-name validation', () => {
+    it('rejects handleScopeCreate for a scope with an empty path segment', async () => {
+      deps.secretStore.createScope = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.create',
+        requestId: 'r1',
+        scope: 'pg:a//b',
+      } as DashboardPlatformToOrchMessage);
+
+      const resp = deps.sent[0] as any;
+      expect(resp.type).toBe('dashboard.contexts.secrets.scope.create.response');
+      expect(resp.requestId).toBe('r1');
+      expect(resp.error).toContain('empty path segments');
+      expect(deps.secretStore.createScope).not.toHaveBeenCalled();
+    });
+
+    it('rejects handleScopeCreate for a scope containing a percent', async () => {
+      deps.secretStore.createScope = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.create',
+        requestId: 'r1b',
+        scope: 'pg:a%b',
+      } as DashboardPlatformToOrchMessage);
+
+      const resp = deps.sent[0] as any;
+      expect(resp.error).toEqual(expect.any(String));
+      expect(deps.secretStore.createScope).not.toHaveBeenCalled();
+    });
+
+    it('allows renaming a malformed scope to a valid one', async () => {
+      deps.secretStore.renameScope = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.rename',
+        requestId: 'r2',
+        oldScope: 'pg:bad%name',
+        newScope: 'pg:good/name',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.renameScope).toHaveBeenCalledWith('org-1', 'bad%name', 'good/name');
+      const resp = deps.sent[0] as any;
+      expect(resp.type).toBe('dashboard.contexts.secrets.scope.rename.response');
+      expect(resp.error).toBeUndefined();
+    });
+
+    it('rejects renaming to a malformed newScope', async () => {
+      deps.secretStore.renameScope = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.scope.rename',
+        requestId: 'r3',
+        oldScope: 'pg:good/name',
+        newScope: 'pg:bad%name',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.renameScope).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.requestId).toBe('r3');
+      expect(resp.error).toEqual(expect.any(String));
+    });
+
+    it('rejects setting a secret into a malformed scope', async () => {
+      deps.secretStore.setSecret = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.set',
+        requestId: 'r4',
+        scope: 'pg:a//b',
+        key: 'K',
+        value: 'V',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.requestId).toBe('r4');
+      expect(resp.error).toEqual(expect.any(String));
     });
   });
 
@@ -727,7 +1023,7 @@ describe('DashboardContextHandler', () => {
         "aws/prod' OR org_id='other",
         'pg:../../etc/passwd',
         'pg:other-tenant/admin',
-        ' pg:null-byte',
+        '\u0000pg:null-byte',
       ];
 
       for (const scope of maliciousScopes) {
@@ -818,6 +1114,322 @@ describe('DashboardContextHandler', () => {
       // (recorded under its `remote_sources` org) is resolvable.
       expect(deps.db.where).toHaveBeenCalledWith('org_id', '=', 'org-remote');
       expect(deps.db.where).not.toHaveBeenCalledWith('org_id', '=', 'org-1');
+    });
+  });
+
+  describe('handleEnvHistory hasMore', () => {
+    const testActor = { type: 'user' as const, sub: 'zsub-test' };
+
+    function makeRuns(n: number) {
+      return Array.from({ length: n }, (_, i) => ({
+        id: `run-${i}`,
+        run_id: `rid-${i}`,
+        workflow_name: 'ci',
+        status: 'success',
+        ref: 'refs/heads/main',
+        sha: 'abc',
+        started_at: new Date('2026-01-01'),
+        completed_at: new Date('2026-01-01'),
+        context: 'production',
+      }));
+    }
+
+    it('exactly limit rows available -> hasMore false, returns all rows', async () => {
+      // The handler queries with limit+1 (21); the DB has only 20 rows total,
+      // so it returns 20 -> no further page.
+      (deps.db.execute as any).mockResolvedValueOnce(makeRuns(20));
+
+      const handled = await handler.handleMessage({
+        type: 'dashboard.contexts.history',
+        requestId: 'req-hist-1',
+        actor: testActor,
+        contextId: 'env-1',
+        limit: 20,
+        offset: 0,
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      const resp = deps.sent.at(-1) as any;
+      expect(resp.type).toBe('dashboard.contexts.history.response');
+      expect(resp.hasMore).toBe(false);
+      expect(resp.runs).toHaveLength(20);
+    });
+
+    it('limit+1 rows available -> hasMore true, probe row sliced off', async () => {
+      // The limit+1 (21) query returns 21 rows -> another page exists; the
+      // 21st probe row must not be leaked to the client.
+      (deps.db.execute as any).mockResolvedValueOnce(makeRuns(21));
+
+      const handled = await handler.handleMessage({
+        type: 'dashboard.contexts.history',
+        requestId: 'req-hist-2',
+        actor: testActor,
+        contextId: 'env-1',
+        limit: 20,
+        offset: 0,
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      const resp = deps.sent.at(-1) as any;
+      expect(resp.hasMore).toBe(true);
+      expect(resp.runs).toHaveLength(20);
+    });
+  });
+});
+
+// ── encrypted-posture (browser-sealed) secret / variable writes ───────────────
+
+describe('DashboardContextHandler — encrypted dashboard writes', () => {
+  let deps: ReturnType<typeof createMockDeps>;
+  let handler: DashboardContextHandler;
+  let key: Awaited<ReturnType<typeof generateDashboardEncryptionKey>>;
+  const SECRET = 'a'.repeat(64);
+
+  /** Node stand-in for the browser seal (DER-SPKI eph pubkey + dashboard info). */
+  function seal(value: string, orchPubDer: Buffer) {
+    const eph = generateKeyPairSync('x25519', {
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+    });
+    const shared = diffieHellman({
+      privateKey: createPrivateKey({ key: eph.privateKey as Buffer, format: 'der', type: 'pkcs8' }),
+      publicKey: createPublicKey({ key: orchPubDer, format: 'der', type: 'spki' }),
+    });
+    const aes = Buffer.from(
+      hkdfSync('sha256', shared, Buffer.alloc(0), 'kici-dashboard-sealed-write', 32),
+    );
+    const iv = randomBytes(12);
+    const c = createCipheriv('aes-256-gcm', aes, iv, { authTagLength: 16 });
+    const ct = Buffer.concat([c.update(value, 'utf-8'), c.final()]);
+    return {
+      keyId: key.kid,
+      ephemeralPublicKey: (eph.publicKey as Buffer).toString('base64'),
+      encrypted: Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64'),
+    };
+  }
+
+  beforeEach(async () => {
+    deps = createMockDeps();
+    key = await generateDashboardEncryptionKey(SECRET);
+    deps.dashboardEncryption = {
+      resolve: async () => ({
+        activeKid: key.kid,
+        publicJwk: key.publicJwk,
+        decryptPrivateKeyDer: async (kid: string) =>
+          kid === key.kid ? decryptPrivateKey(key.encryptedPrivateKey, SECRET) : null,
+      }),
+    };
+    handler = new DashboardContextHandler(deps);
+    invalidateDashboardWritePolicyCache();
+  });
+
+  it('decrypts a sealed secrets.set and stores the plaintext', async () => {
+    const env = seal('s3cr3t', key.publicKeyDer);
+    const handled = await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-seal',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      sealed: env,
+    } as DashboardPlatformToOrchMessage);
+    expect(handled).toBe(true);
+    expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'API_KEY', 's3cr3t');
+    const resp = deps.sent.at(-1) as any;
+    expect(resp.type).toBe('dashboard.contexts.secrets.set.response');
+    expect(resp.error).toBeUndefined();
+  });
+
+  it('decrypts a sealed variables.set and stores the plaintext', async () => {
+    const env = seal('v4lue', key.publicKeyDer);
+    await handler.handleMessage({
+      type: 'dashboard.contexts.variables.set',
+      requestId: 'r-vseal',
+      actor: { type: 'user', sub: 'u' },
+      contextId: 'ctx-1',
+      key: 'TOKEN',
+      sealed: env,
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.variableStore.setVar).toHaveBeenCalledWith(
+      'org-1',
+      'ctx-1',
+      'TOKEN',
+      'v4lue',
+      undefined,
+    );
+  });
+
+  it('fail-closed: rejects a plaintext value under the encrypted posture', async () => {
+    // Policy read returns encrypted for secrets.set.
+    (deps.db.executeTakeFirst as any).mockResolvedValue({
+      dashboard_write_policy: { 'secrets.set': 'encrypted' },
+    });
+    const handled = await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-plain',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      value: 'plaintext-leak',
+    } as DashboardPlatformToOrchMessage);
+    expect(handled).toBe(true);
+    expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    const resp = deps.sent.at(-1) as any;
+    expect(resp.error).toBe('operation_requires_encryption');
+  });
+
+  it('rejects a sealed envelope whose keyId is unknown', async () => {
+    const env = { keyId: 'bogus-kid', ephemeralPublicKey: 'AA==', encrypted: 'AAAA' };
+    await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-badkid',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      sealed: env,
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    const resp = deps.sent.at(-1) as any;
+    expect(resp.error).toBe('unknown_encryption_key');
+  });
+
+  it('fails closed when no encryption key is available (resolver returns null)', async () => {
+    deps.dashboardEncryption = { resolve: async () => null };
+    handler = new DashboardContextHandler(deps);
+    const env = seal('x', key.publicKeyDer);
+    await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-nokey',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      sealed: env,
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    expect((deps.sent.at(-1) as any).error).toBe('encryption_unavailable');
+  });
+
+  it('permissive posture still accepts a plaintext value', async () => {
+    await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-perm',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      value: 'plain-ok',
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'API_KEY', 'plain-ok');
+  });
+});
+
+describe('DashboardContextHandler held-runs list hold types', () => {
+  let deps: ReturnType<typeof createMockDeps>;
+  let handler: DashboardContextHandler;
+
+  beforeEach(() => {
+    deps = createMockDeps();
+    handler = new DashboardContextHandler(deps);
+    invalidateDashboardWritePolicyCache();
+  });
+
+  /** A held-runs row as the list query selects it. */
+  function heldRow(holdType: string): Record<string, unknown> {
+    return {
+      id: 'hr-1',
+      run_id: 'run-1',
+      job_id: 'job-1',
+      context_id: 'env-1',
+      context_name: 'production',
+      hold_type: holdType,
+      queue_type: 'context',
+      status: 'pending',
+      reason: 'held',
+      approved_by: null,
+      created_at: new Date('2026-01-01'),
+      resolved_at: null,
+      expires_at: new Date('2026-01-02'),
+      hold_scope: 'workflow',
+      step_index: null,
+      approval_requirement: null,
+      payload: null,
+      contributor_username: null,
+      trust_tier: null,
+    };
+  }
+
+  /** Run the held-runs list handler over one row and return its wire holdType. */
+  async function listHoldType(holdType: string): Promise<string> {
+    (deps.db.execute as any).mockResolvedValueOnce([heldRow(holdType)]).mockResolvedValueOnce([]);
+
+    await handler.handleMessage({
+      type: 'dashboard.held-runs.list',
+      requestId: 'req-held',
+    } as DashboardPlatformToOrchMessage);
+
+    const resp = deps.sent.at(-1) as any;
+    expect(resp.type).toBe('dashboard.held-runs.list.response');
+    return resp.heldRuns[0].holdType;
+  }
+
+  it('normalizes a legacy persisted hold type onto the wire', async () => {
+    // A row written by an un-upgraded orchestrator (or before the backfill)
+    // must still render correctly — this is what lets the migration ship
+    // without a lockstep deploy.
+    expect(await listHoldType('wait_timer')).toBe(HoldType.enum.timer);
+  });
+
+  it('normalizes the legacy reviewer spelling onto the wire', async () => {
+    expect(await listHoldType('approval')).toBe(HoldType.enum.reviewer);
+  });
+
+  it('passes a current hold type through untouched', async () => {
+    for (const member of HoldType.options) {
+      expect(await listHoldType(member)).toBe(member);
+    }
+  });
+
+  it('passes an unknown hold type through untouched', async () => {
+    // The gray fallback badge stays reachable for a genuinely unknown type.
+    expect(await listHoldType('some_future_type')).toBe('some_future_type');
+  });
+
+  describe('heldRunId filter', () => {
+    /** Every `.where(...)` argument tuple the list query built. */
+    function whereCalls(): unknown[][] {
+      return (deps.db.where as any).mock.calls as unknown[][];
+    }
+
+    it('narrows on held_runs.id when heldRunId is given', async () => {
+      (deps.db.execute as any)
+        .mockResolvedValueOnce([heldRow(HoldType.enum.security)])
+        .mockResolvedValueOnce([]);
+
+      const handled = await handler.handleMessage({
+        type: 'dashboard.held-runs.list',
+        requestId: 'req-held-id',
+        heldRunId: 'hr-1',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(handled).toBe(true);
+      // The predicate has to reach the query builder. Narrowing in memory
+      // instead would still return one row here while shipping the org's whole
+      // hold history over the wire.
+      expect(whereCalls()).toContainEqual(['held_runs.id', '=', 'hr-1']);
+
+      const resp = deps.sent.at(-1) as any;
+      expect(resp.heldRuns).toHaveLength(1);
+      expect(resp.heldRuns[0].id).toBe('hr-1');
+    });
+
+    it('omits the id predicate when heldRunId is absent', async () => {
+      (deps.db.execute as any).mockResolvedValueOnce([heldRow(HoldType.enum.reviewer)]);
+
+      await handler.handleMessage({
+        type: 'dashboard.held-runs.list',
+        requestId: 'req-held-noid',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(whereCalls().some((call) => call[0] === 'held_runs.id')).toBe(false);
     });
   });
 });

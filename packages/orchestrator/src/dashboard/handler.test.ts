@@ -11,6 +11,7 @@ import type {
   DashboardPayloadRequest,
   DashboardOrchLogsRequest,
   DashboardEventLogListRequest,
+  DashboardEventLogActivityRequest,
   DashboardEventLogDetailRequest,
   RunRerunRequest,
   RunCancelRequest,
@@ -988,6 +989,89 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.attestations).toEqual([]);
       expect(response.error).toBe('Provenance storage not configured');
+    });
+  });
+
+  describe('handleArtifactsList', () => {
+    function fakeArtifactStore(entries: unknown[], downloadUrlExpiresInSeconds = 900) {
+      return {
+        listForRunWithUrls: vi.fn(async () => ({ artifacts: entries, downloadUrlExpiresInSeconds })),
+      } as never;
+    }
+
+    it('lists a run artifacts with presigned download urls', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const send = vi.fn();
+      const artifactStore = fakeArtifactStore([
+        {
+          name: 'bundle',
+          jobId: 'job-1',
+          sizeBytes: 42,
+          sha256: 'a'.repeat(64),
+          createdAt: '2026-07-18T00:00:00.000Z',
+          downloadUrl: 'https://s3/get/artifacts/run-42/bundle.tar.gz',
+        },
+      ]);
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage(),
+        send,
+        artifactStore,
+        orgId: 'org1',
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+
+      await handler.handleArtifactsList({
+        type: 'dashboard.artifacts.list',
+        requestId: 'req-art-1',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-42',
+      });
+
+      expect(artifactStore.listForRunWithUrls).toHaveBeenCalledWith('org1', 'run-42');
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.artifacts.list.response');
+      expect(response.requestId).toBe('req-art-1');
+      expect(response.artifacts).toHaveLength(1);
+      expect(response.artifacts[0].name).toBe('bundle');
+      expect(response.artifacts[0].downloadUrl).toContain('/get/');
+      expect(response.downloadUrlExpiresInSeconds).toBe(900);
+      expect(response.error).toBeUndefined();
+    });
+
+    it('replies with an error when no artifact store is configured', async () => {
+      const {
+        db,
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = createMockDb();
+      const send = vi.fn();
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage: createMockLogStorage(),
+        send,
+        orgId: 'org1',
+        ...noopCallbacks,
+      });
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+
+      await handler.handleArtifactsList({
+        type: 'dashboard.artifacts.list',
+        requestId: 'req-art-noconfig',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-42',
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response.artifacts).toEqual([]);
+      expect(response.error).toBe('Artifact storage not configured');
     });
   });
 
@@ -2254,6 +2338,66 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.items).toHaveLength(2);
       expect(response.nextCursor).toBeTruthy();
+    });
+  });
+
+  describe('handleEventLogActivity', () => {
+    const activityMsg: DashboardEventLogActivityRequest = {
+      type: 'dashboard.event-log.activity',
+      requestId: 'req-act-1',
+      actor: { type: 'user', sub: 'u-1' },
+      orgId: 'org-001',
+      fromTimestamp: '2026-07-17T00:00:00.000Z',
+      toTimestamp: '2026-07-17T01:00:00.000Z',
+    };
+
+    it('maps the aggregate row to bucketed counts and sends the response', async () => {
+      // The aggregate query resolves via executeTakeFirstOrThrow → selectFirstRow.
+      // Postgres returns count(*) as bigint strings, so exercise the Number() cast.
+      const { db } = createMockDb({
+        selectFirstRow: {
+          total: '4',
+          matched: '1',
+          unmatched: '2',
+          lockfileMissing: '1',
+          lockfileCorrupt: '0',
+          failed: '0',
+        },
+      });
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+
+      await handler.handleEventLogActivity(activityMsg);
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0][0]).toEqual({
+        type: 'dashboard.event-log.activity.response',
+        requestId: 'req-act-1',
+        counts: {
+          total: 4,
+          matched: 1,
+          unmatched: 2,
+          lockfileMissing: 1,
+          lockfileCorrupt: 0,
+          failed: 0,
+        },
+      });
+    });
+
+    it('sends a structured error response when the query throws', async () => {
+      const { db, mocks } = createMockDb();
+      mocks.selectExecuteTakeFirstOrThrow.mockRejectedValueOnce(new Error('boom'));
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+
+      await handler.handleEventLogActivity(activityMsg);
+
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.event-log.activity.response');
+      expect(response.counts).toBeUndefined();
+      expect(response.error).toBeTruthy();
     });
   });
 

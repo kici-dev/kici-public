@@ -88,6 +88,11 @@ export class StreamingFormatter {
     const prefix = color(`[${jobName}]`);
     const duration = durationMs !== undefined ? ` (${formatDuration(durationMs)})` : '';
 
+    // Deliberately narrow: only the step states that get their own sentence are
+    // cased. Anything else — including a status added after this build — falls
+    // through to the default arm, which prints the status verbatim. That is the
+    // honest degrade for a log stream: an unrecognised state reads as itself,
+    // never as a benign one.
     switch (state) {
       case 'running':
         return `${prefix} ▶ Step '${stepName}' started\n`;
@@ -110,6 +115,9 @@ export class StreamingFormatter {
   formatStatusChange(status: string, jobName?: string): string {
     if (this.isQuiet) return '';
 
+    // Same narrow-by-design shape as `formatStepEvent` above: a status without
+    // its own sentence prints verbatim via the default arm rather than being
+    // collapsed into one that has.
     switch (status) {
       case 'queued':
         return `${pc.dim('Queued...')}\n`;

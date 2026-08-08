@@ -26,6 +26,28 @@ describe('CheckRunTrackingStore', () => {
       expect(mocks.insertInto).toHaveBeenCalledWith('check_run_tracking');
       expect(mocks.onConflict).toHaveBeenCalled();
     });
+
+    it('includes run_id in the upsert when a runId is supplied', async () => {
+      const { db, mocks } = createMockDb();
+      const store = new CheckRunTrackingStore(db);
+
+      await store.setCheckRunId(KEY, 12345, 'run-abc');
+
+      expect(mocks.insertInto).toHaveBeenCalledWith('check_run_tracking');
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ check_run_id: 12345, run_id: 'run-abc' }),
+      );
+    });
+
+    it('omits run_id when no runId is supplied', async () => {
+      const { db, mocks } = createMockDb();
+      const store = new CheckRunTrackingStore(db);
+
+      await store.setCheckRunId(KEY, 12345);
+
+      const values = mocks.insertValues.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(values).not.toHaveProperty('run_id');
+    });
   });
 
   describe('getCheckRunId', () => {
@@ -202,6 +224,52 @@ describe('CheckRunTrackingStore', () => {
       const count = await store.deleteByRunId('run-001');
 
       expect(count).toBe(0);
+    });
+  });
+
+  describe('pruneStale', () => {
+    it('returns 0 and issues no delete when retentionDays is 0', async () => {
+      const { db, mocks } = createMockDb({ deleteResult: { numDeletedRows: 9n } });
+      const store = new CheckRunTrackingStore(db);
+
+      const count = await store.pruneStale(0);
+
+      expect(count).toBe(0);
+      expect(mocks.deleteFrom).not.toHaveBeenCalled();
+    });
+
+    it('returns 0 and issues no delete when retentionDays is negative', async () => {
+      const { db, mocks } = createMockDb({ deleteResult: { numDeletedRows: 9n } });
+      const store = new CheckRunTrackingStore(db);
+
+      const count = await store.pruneStale(-1);
+
+      expect(count).toBe(0);
+      expect(mocks.deleteFrom).not.toHaveBeenCalled();
+    });
+
+    it('deletes rows older than the window and returns the row count', async () => {
+      const { db, mocks } = createMockDb({ deleteResult: { numDeletedRows: 4n } });
+      const store = new CheckRunTrackingStore(db);
+
+      const count = await store.pruneStale(7);
+
+      expect(count).toBe(4);
+      expect(mocks.deleteFrom).toHaveBeenCalledWith('check_run_tracking');
+      expect(mocks.deleteWhere).toHaveBeenCalledWith('updated_at', '<', expect.anything());
+    });
+
+    it('prunes on updated_at alone, never filtered by run_id', async () => {
+      const { db, mocks } = createMockDb({ deleteResult: { numDeletedRows: 4n } });
+      const store = new CheckRunTrackingStore(db);
+
+      await store.pruneStale(7);
+
+      // The rows most in need of reaping are precisely the ones a create-time
+      // write left with a NULL run_id, so adding a run_id predicate here would
+      // make the sweep skip its own primary target.
+      const columns = mocks.deleteWhere.mock.calls.map((c) => c[0] as string);
+      expect(columns).toEqual(['updated_at']);
     });
   });
 

@@ -23,7 +23,7 @@ import type {
   JobExecutionOptions,
   JobExecutionResult,
 } from './types.js';
-import { createForkRunner, type ForkRunnerHandle } from './fork-runner.js';
+import { createForkRunner, fileCloneSourceBinds, type ForkRunnerHandle } from './fork-runner.js';
 
 const logger = createLogger({ prefix: 'bare-metal-sandbox' });
 
@@ -114,19 +114,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
     // read-only inside the sandbox so the workflow runner's `git clone`
     // step can read it. Without this the clone fails inside bwrap with
     // `does not appear to be a git repository`.
-    const extraReadOnlyBinds: string[] = [];
-    if (this.useBwrap) {
-      const repoUrl = options.dispatch.repoUrl;
-      if (typeof repoUrl === 'string' && repoUrl.startsWith('file://')) {
-        try {
-          const url = new URL(repoUrl);
-          if (url.pathname) extraReadOnlyBinds.push(url.pathname);
-        } catch {
-          // Malformed file:// URL: let git clone fail with the real error
-          // rather than masking it here.
-        }
-      }
-    }
+    const extraReadOnlyBinds = this.useBwrap ? fileCloneSourceBinds(options.dispatch.repoUrl) : [];
 
     this.runner = createForkRunner(
       {

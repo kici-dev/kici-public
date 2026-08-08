@@ -14,7 +14,7 @@ The six steps are:
 2. **Create a workflow** -- `kici init` scaffolds a `.kici/` directory in your repository.
 3. **Run a workflow locally** -- `kici run pr:open --local` executes a workflow on your machine with no orchestrator deployment required.
 4. **Connect an orchestrator** -- deploy an orchestrator and connect it with a join token from **Settings → Orchestrator keys**.
-5. **Add a webhook source** -- register a source under **Settings → Sources** so pushes and pull requests trigger runs.
+5. **Add a webhook source** -- register a source with `kici-admin source add`; it then appears under **Settings → Sources**, where you can view its webhook URL. Pushes and pull requests to that source trigger runs.
 6. **Trigger your first run** -- push to your repository to produce your first run through the relay.
 
 If the onboarding data can't be loaded (for example a transient network error), the checklist area shows a short message with a **Try again** button instead of loading indefinitely -- retry once the connection recovers.

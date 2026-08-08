@@ -10,9 +10,7 @@
  * It goes directly to: lock file parse -> job expansion -> dispatch.
  */
 
-import { randomUUID } from 'node:crypto';
 import { createLogger, type ColdStore } from '@kici-dev/shared';
-import { partitionMatchers } from '@kici-dev/engine';
 import type { Kysely, Selectable } from 'kysely';
 import type { Database, ExecutionRunTable } from '../db/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
@@ -31,27 +29,23 @@ import type { BuildCoordinator } from '../cache/index.js';
 import type { DepCache } from '../cache/index.js';
 import type { PendingBuildTracker } from '../cache/index.js';
 import { claimRequestId } from './request-idempotency.js';
-import type { QueuedJobInput } from '../queue/job-queue.js';
-import type { JobToRoute, RunContext } from '../cluster/coordinator.js';
+import type { RunContext } from '../cluster/coordinator.js';
 import {
-  isLockStaticJob,
-  TERMINAL_RUN_STATES,
-  materializeFanout,
-  matrixEnvelopeFields,
-  FanoutError,
-} from '@kici-dev/engine';
+  routeOrDispatchJobs,
+  registerDispatchedJobs,
+  type DispatchedJobEntry,
+  type RejectedJobEntry,
+} from './route-or-dispatch-jobs.js';
+import { isLockStaticJob, TERMINAL_RUN_STATES, matrixEnvelopeFields } from '@kici-dev/engine';
 import type { LockFile as FullLockFile, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
-
-const ROUTE_JOBS_TIMEOUT_MS = 30_000;
 
 const logger = createLogger({ prefix: 'rerun' });
 
 /**
- * Thrown when a rerun is attempted on an archived run AND the cold-store
- * replay path failed (chunk missing, contentHash mismatch, S3 outage, or
- * cold-store probe disabled). Phase F replaced the Phase-C "rerun is
- * blocked" semantics with a real replay path; this error now signals
- * a genuine "we tried to bring the row back and could not".
+ * Thrown when a rerun is attempted on a run whose row is absent from PG AND
+ * the cold-store replay path failed or is unavailable (chunk missing,
+ * contentHash mismatch, S3 outage, or cold-store probe disabled). Signals a
+ * genuine "we tried to bring the row back and could not".
  *
  * The WS dashboard handler maps this to a structured response that the
  * Platform proxy surfaces as HTTP 410 (`errorCode: 'runArchivedNotRerunnable'`).
@@ -85,10 +79,10 @@ export interface RerunDeps {
   buildCoordinator: BuildCoordinator | null;
   pendingBuilds: PendingBuildTracker | null;
   /**
-   * Phase F — when set, a PG miss on `originalRunId` triggers a
-   * cold-store replay of the chunk containing the row, then a re-read.
-   * `null` keeps the legacy "throw RunArchivedNotRerunnableError on PG
-   * miss" path for deployments without cold-store wired up.
+   * When set, a PG miss on `originalRunId` triggers a cold-store replay of
+   * the chunk containing the row, then a re-read. `null` keeps the "throw
+   * RunArchivedNotRerunnableError on PG miss" path for deployments without
+   * cold-store wired up.
    */
   coldStore: ColdStore | null;
 }
@@ -110,18 +104,6 @@ interface ResolvedRerunWorkflow {
   routingKey: string;
 }
 
-interface DispatchedJob {
-  jobId: string;
-  jobName: string;
-  matrixValues?: Record<string, unknown>;
-  runsOnLabels?: string[];
-}
-
-interface RejectedJob {
-  jobId: string;
-  reason: string;
-}
-
 export async function handleRerun(
   originalRunId: string,
   triggeredBy: string | null,
@@ -136,9 +118,9 @@ export async function handleRerun(
    */
   requestId: string,
   /**
-   * Phase F — routing key for the original run, forwarded by Platform
-   * via the WS `run.rerun.request` payload. Required to address the
-   * cold-store chunk under the right tenant prefix.
+   * Routing key for the original run, forwarded by Platform via the WS
+   * `run.rerun.request` payload. Required to address the cold-store chunk
+   * under the right tenant prefix.
    */
   routingKeyHint?: string,
 ): Promise<{ newRunId: string }> {
@@ -214,17 +196,12 @@ export async function handleRerun(
   });
 
   // 7c. Register dispatched jobs with the execution tracker (dispatcher-assigned IDs).
-  if (dispatchedJobs.length > 0) {
-    await deps.executionTracker.addJobsToRun(newRunId, dispatchedJobs);
-
-    // Mark rejected jobs as failed (standalone-fallback path only — the coordinator
-    // logs failed jobs separately and does not produce synthetic rejected IDs).
-    for (const { jobId, reason } of rejectedJobs) {
-      await deps.executionTracker.onJobStatus(newRunId, jobId, 'failed', Date.now(), undefined, {
-        error: reason,
-      });
-    }
-  }
+  await registerDispatchedJobs({
+    newRunId,
+    dispatchedJobs,
+    rejectedJobs,
+    executionTracker: deps.executionTracker,
+  });
 
   // 8 + 9. Fire workflow.rerun event + GitHub check run.
   await emitRerunEventAndCheckRun({
@@ -259,12 +236,12 @@ async function loadAndValidateOriginalRun(
     .executeTakeFirst();
 
   if (!originalRun) {
-    // Phase F: attempt to restore the row from cold-store before failing.
+    // Attempt to restore the row from cold-store before failing.
     // Requires (a) cold-store wired into deps, and (b) Platform forwarded
     // `routingKey` over the WS protocol so we know which tenant prefix
     // to scan. Both conditions hold for the standard hybrid deploy; a
     // standalone orchestrator without Platform forwarding falls through
-    // to the legacy error.
+    // to the RunArchivedNotRerunnableError path below.
     if (deps.coldStore && routingKeyHint) {
       try {
         const replay = await deps.coldStore.replayRow({
@@ -487,31 +464,12 @@ async function dispatchRerunJobs(opts: {
   originalRun: OriginalRunRow;
   resolved: ResolvedRerunWorkflow;
   payload: Record<string, unknown> | null;
-}): Promise<{ dispatchedJobs: DispatchedJob[]; rejectedJobs: RejectedJob[] }> {
+}): Promise<{ dispatchedJobs: DispatchedJobEntry[]; rejectedJobs: RejectedJobEntry[] }> {
   const { deps, newRunId, originalRun, resolved, payload } = opts;
   const { workflow, fullLockFile, providerContext, providerBundle, routingKey } = resolved;
 
   const staticJobs = workflow.jobs.filter(isLockStaticJob);
-  const dispatchedJobs: DispatchedJob[] = [];
-  const rejectedJobs: RejectedJob[] = [];
   const repoUrl = providerBundle.repoUrlBuilder?.buildCloneUrl(originalRun.repo_identifier) ?? '';
-
-  // Re-materialize the matrix fresh from the current lock content (re-expansion,
-  // not cloning prior child rows). A matrix that can no longer expand fails that
-  // job; the rest of the rerun proceeds.
-  let materializedJobs: MaterializedJob[] = [];
-  try {
-    materializedJobs = materializeFanout(staticJobs).jobs;
-  } catch (err) {
-    if (err instanceof FanoutError) {
-      const syntheticId = `rejected-${randomUUID()}`;
-      dispatchedJobs.push({ jobId: syntheticId, jobName: err.jobName, runsOnLabels: undefined });
-      rejectedJobs.push({ jobId: syntheticId, reason: err.message });
-      materializedJobs = materializeFanout(staticJobs.filter((j) => j.name !== err.jobName)).jobs;
-    } else {
-      throw err;
-    }
-  }
 
   const buildRerunJobConfig = (mat: MaterializedJob) => {
     const job = mat.lockJob;
@@ -534,153 +492,39 @@ async function dispatchRerunJobs(opts: {
       ? ((providerContext as { installationId: number }).installationId as number)
       : undefined;
 
-  const matrixByName = new Map<string, Record<string, unknown>>();
-  for (const mj of materializedJobs) {
-    if (mj.variantValues) matrixByName.set(mj.expandedName, mj.variantValues);
-  }
+  const runContext: RunContext = {
+    runId: newRunId,
+    deliveryId: `rerun:${newRunId}`,
+    routingKey,
+    event: 'rerun',
+    action: null,
+    provider: originalRun.provider,
+    payload: (payload as Record<string, unknown> | undefined) ?? {},
+    repoIdentifier: originalRun.repo_identifier,
+    sha: originalRun.sha,
+    ref: originalRun.ref,
+    workflowName: workflow.name,
+    ...(installationId !== undefined && { installationId }),
+  };
 
-  let routedViaCoordinator = false;
-  if (deps.coordinator && materializedJobs.length > 0) {
-    const jobsToRoute: JobToRoute[] = materializedJobs.map((mat) => {
-      const job = mat.lockJob;
-      const runsOnSel = partitionMatchers(job.runsOn ?? []);
-      const excludeSel = partitionMatchers(job.excludeLabels ?? []);
-      return {
-        jobName: mat.expandedName,
-        runsOnLabels: [runsOnSel.exact],
-        runsOnPatterns: runsOnSel.regex,
-        excludeLabels: excludeSel.exact,
-        excludePatterns: excludeSel.regex,
-        jobConfig: buildRerunJobConfig(mat),
-        repoUrl,
-        ref: originalRun.ref,
-        sha: originalRun.sha,
-        ...(job.resources && { resources: job.resources }),
-      };
-    });
-
-    const runCtx: RunContext = {
-      runId: newRunId,
-      deliveryId: `rerun:${newRunId}`,
-      routingKey,
-      event: 'rerun',
-      action: null,
-      provider: originalRun.provider,
-      payload: (payload as Record<string, unknown> | undefined) ?? {},
-      repoIdentifier: originalRun.repo_identifier,
-      sha: originalRun.sha,
-      ref: originalRun.ref,
-      workflowName: workflow.name,
-      ...(installationId !== undefined && { installationId }),
-    };
-
-    const routeResult = await Promise.race([
-      deps.coordinator.routeJobs(runCtx, jobsToRoute),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`routeJobs timed out after ${ROUTE_JOBS_TIMEOUT_MS}ms`)),
-          ROUTE_JOBS_TIMEOUT_MS,
-        ),
-      ),
-    ]).catch((err: unknown) => {
-      logger.warn('Coordinator routing timed out for rerun, falling back to direct dispatch', {
-        newRunId,
-        workflow: workflow.name,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return null;
-    });
-
-    if (routeResult) {
-      routedViaCoordinator = true;
-      for (const local of routeResult.localJobs) {
-        const runsOnLabels = (() => {
-          const mat = materializedJobs.find((m) => m.expandedName === local.jobName);
-          const job = mat?.lockJob;
-          return job ? partitionMatchers(job.runsOn ?? []).exact : undefined;
-        })();
-        const matrixValues = matrixByName.get(local.jobName);
-        dispatchedJobs.push({
-          jobId: local.jobId,
-          jobName: local.jobName,
-          ...(matrixValues && { matrixValues }),
-          runsOnLabels,
-        });
-      }
-      for (const rerouted of routeResult.reroutedJobs) {
-        logger.info('Re-run job rerouted to peer', {
-          newRunId,
-          workflow: workflow.name,
-          job: rerouted.jobName,
-          peerId: rerouted.peerId,
-        });
-      }
-      for (const failed of routeResult.failedJobs) {
-        logger.warn('Re-run job routing failed', {
-          newRunId,
-          workflow: workflow.name,
-          job: failed.jobName,
-          reason: failed.reason,
-        });
-      }
-    }
-  }
-
-  if (!routedViaCoordinator) {
-    // Standalone mode OR coordinator timeout: direct dispatch locally.
-    for (const mat of materializedJobs) {
-      const job = mat.lockJob;
-      const matrixValues = mat.variantValues;
-      const runsOnSel = partitionMatchers(job.runsOn ?? []);
-      const excludeSel = partitionMatchers(job.excludeLabels ?? []);
-      const runsOnLabels = runsOnSel.exact;
-      const jobInput: QueuedJobInput = {
-        runId: newRunId,
-        workflowName: workflow.name,
-        jobName: mat.expandedName,
-        runsOnLabels,
-        runsOnPatterns: runsOnSel.regex,
-        excludeLabels: excludeSel.exact,
-        excludePatterns: excludeSel.regex,
-        jobConfig: buildRerunJobConfig(mat),
-        repoUrl,
-        ref: originalRun.ref,
-        sha: originalRun.sha,
-        deliveryId: `rerun:${newRunId}`,
-        provider: originalRun.provider,
-        providerContext: providerContext as Record<string, unknown>,
-        routingKey,
-      };
-
-      const result = await deps.dispatcher.dispatch(jobInput);
-      if (result.status === 'rejected') {
-        const syntheticId = `rejected-${randomUUID()}`;
-        dispatchedJobs.push({
-          jobId: syntheticId,
-          jobName: mat.expandedName,
-          ...(matrixValues && { matrixValues }),
-          runsOnLabels,
-        });
-        rejectedJobs.push({ jobId: syntheticId, reason: result.reason });
-      } else {
-        dispatchedJobs.push({
-          jobId: result.jobId,
-          jobName: mat.expandedName,
-          ...(matrixValues && { matrixValues }),
-          runsOnLabels,
-        });
-      }
-
-      logger.info('Re-run job dispatched', {
-        newRunId,
-        workflow: workflow.name,
-        job: mat.expandedName,
-        status: result.status,
-      });
-    }
-  }
-
-  return { dispatchedJobs, rejectedJobs };
+  return routeOrDispatchJobs({
+    newRunId,
+    staticJobs,
+    workflowName: workflow.name,
+    repoUrl,
+    ref: originalRun.ref,
+    sha: originalRun.sha,
+    deliveryId: `rerun:${newRunId}`,
+    provider: originalRun.provider,
+    providerContext: providerContext as Record<string, unknown>,
+    routingKey,
+    runContext,
+    buildJobConfig: buildRerunJobConfig,
+    logger,
+    label: 'Re-run',
+    coordinator: deps.coordinator,
+    dispatcher: deps.dispatcher,
+  });
 }
 
 /**

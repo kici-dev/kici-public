@@ -7,9 +7,11 @@
  */
 import picomatch from 'picomatch';
 import { sql, type Kysely } from 'kysely';
-import type { Context as EngineContext } from '@kici-dev/engine';
+import { DEFAULT_CONCURRENCY_STRATEGY, DEFAULT_HOLD_EXPIRY_SECONDS } from '@kici-dev/engine';
+import type { ConcurrencyStrategy, Context as EngineContext } from '@kici-dev/engine';
 import type { Database, Context, NewContext } from '../db/types.js';
 import { HeldRunStatus } from './held-runs.js';
+import { compareGlobSpecificity } from './glob-specificity.js';
 
 /** Thrown by `delete` when pending held runs reference the context. */
 export class ContextDeleteBlockedError extends Error {
@@ -60,11 +62,17 @@ export function toContext(row: Context): EngineContext {
     triggerTypeFilters: parseJsonArray(row.trigger_type_filters),
     repoPatterns: parseJsonArray(row.repo_patterns),
     concurrencyLimit: row.concurrency_limit,
-    concurrencyStrategy: row.concurrency_strategy as EngineContext['concurrencyStrategy'],
+    // Both columns are nullable and a cleared value means "unset", so they are
+    // resolved here rather than handed to the gates as null — the gates take
+    // non-nullable values. The strategy resolves to `DEFAULT_CONCURRENCY_STRATEGY`
+    // (which is also the column's own default); the hold window to
+    // `DEFAULT_HOLD_EXPIRY_SECONDS`.
+    concurrencyStrategy: (row.concurrency_strategy ??
+      DEFAULT_CONCURRENCY_STRATEGY) as EngineContext['concurrencyStrategy'],
     concurrencyTimeoutMs: row.concurrency_timeout_ms,
     requiredReviewers: parseJsonArrayOrNull(row.required_reviewers),
     waitTimerSeconds: row.wait_timer_seconds,
-    holdExpirySeconds: row.hold_expiry_seconds,
+    holdExpirySeconds: row.hold_expiry_seconds ?? DEFAULT_HOLD_EXPIRY_SECONDS,
     minimumTrust: (row.minimum_trust as EngineContext['minimumTrust']) ?? undefined,
     allowLocalExecution: row.allow_local_execution,
     enabled: row.enabled,
@@ -85,7 +93,7 @@ export interface ContextCreateInput {
   triggerTypeFilters?: string[];
   repoPatterns?: string[];
   concurrencyLimit?: number | null;
-  concurrencyStrategy?: 'queue' | 'cancel-pending';
+  concurrencyStrategy?: ConcurrencyStrategy;
   concurrencyTimeoutMs?: number;
   requiredReviewers?: string[] | null;
   waitTimerSeconds?: number | null;
@@ -96,20 +104,30 @@ export interface ContextCreateInput {
   createdBy?: string | null;
 }
 
-/** Fields accepted when updating a context. */
+/**
+ * Fields accepted when updating a context.
+ *
+ * Convention for every nullable column: `undefined` means "the caller did not
+ * mention this field, leave the column alone"; `null` means "clear it". The two
+ * are distinct on the wire (`contextUpdateRequestSchema` declares these fields
+ * `.nullable().optional()`), so the handler forwards both verbatim and `update`
+ * below writes the column's cleared state for an explicit `null` — SQL NULL for
+ * the nullable columns, and the empty array for `branchRestrictions`, whose
+ * column is `jsonb NOT NULL DEFAULT '[]'`.
+ */
 export interface ContextUpdateInput {
   name?: string;
   type?: 'fixed' | 'glob';
   globPattern?: string | null;
-  branchRestrictions?: string[];
+  branchRestrictions?: string[] | null;
   triggerTypeFilters?: string[];
   repoPatterns?: string[];
   concurrencyLimit?: number | null;
-  concurrencyStrategy?: 'queue' | 'cancel-pending';
+  concurrencyStrategy?: ConcurrencyStrategy | null;
   concurrencyTimeoutMs?: number;
   requiredReviewers?: string[] | null;
   waitTimerSeconds?: number | null;
-  holdExpirySeconds?: number;
+  holdExpirySeconds?: number | null;
   minimumTrust?: 'known' | 'trusted' | null;
   allowLocalExecution?: boolean;
   enabled?: boolean;
@@ -192,7 +210,12 @@ export class ContextStore {
     if (updates.type !== undefined) set.type = updates.type;
     if (updates.globPattern !== undefined) set.glob_pattern = updates.globPattern;
     if (updates.branchRestrictions !== undefined)
-      set.branch_restrictions = JSON.stringify(updates.branchRestrictions);
+      // Cleared means "no restrictions", which for this column is the empty
+      // array — it is `jsonb NOT NULL DEFAULT '[]'`, so a SQL NULL is rejected
+      // outright and would abort the whole update. Going through
+      // `JSON.stringify` on the coalesced value also keeps the four-character
+      // string "null" (what `JSON.stringify(null)` yields) out of the column.
+      set.branch_restrictions = JSON.stringify(updates.branchRestrictions ?? []);
     if (updates.triggerTypeFilters !== undefined)
       set.trigger_type_filters = JSON.stringify(updates.triggerTypeFilters);
     if (updates.repoPatterns !== undefined)
@@ -260,8 +283,11 @@ export class ContextStore {
    * Match a context name against org contexts.
    *
    * First tries exact name match (for fixed contexts).
-   * If no exact match, scans glob-type contexts and uses picomatch.
-   * Returns the first matching context or null.
+   * If no exact match, scans glob-type contexts and uses picomatch. When the
+   * name matches more than one glob pattern, the most-specific pattern wins
+   * (most literal characters; ties break toward fewer wildcards, then name
+   * ascending) so the winning context — and its protection rules — is
+   * deterministic across dispatches. Returns the matching context or null.
    */
   async matchContext(orgId: string, name: string): Promise<Context | null> {
     // Try exact match first
@@ -270,20 +296,29 @@ export class ContextStore {
 
     // Scan glob-type contexts (don't filter by enabled — let protection pipeline
     // handle it consistently with exact match, so disabled glob envs get a proper
-    // "disabled" rejection instead of silently bypassing protection)
+    // "disabled" rejection instead of silently bypassing protection). Order by
+    // name for a stable input; the specificity ranking below is authoritative.
     const globEnvs = await this.db
       .selectFrom('contexts')
       .selectAll()
       .where('org_id', '=', orgId)
       .where('type', '=', 'glob')
+      .orderBy('name', 'asc')
       .execute();
 
-    for (const env of globEnvs) {
-      if (env.glob_pattern && picomatch.isMatch(name, env.glob_pattern)) {
-        return env;
-      }
-    }
+    // Collect every glob whose pattern matches, then pick the most specific so
+    // the winner is deterministic when an env name matches multiple globs.
+    const matches = globEnvs.filter(
+      (env) => env.glob_pattern && picomatch.isMatch(name, env.glob_pattern),
+    );
+    if (matches.length === 0) return null;
 
-    return null;
+    matches.sort((a, b) =>
+      compareGlobSpecificity(
+        { pattern: a.glob_pattern as string, name: a.name },
+        { pattern: b.glob_pattern as string, name: b.name },
+      ),
+    );
+    return matches[0];
   }
 }

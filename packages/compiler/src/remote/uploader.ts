@@ -1,10 +1,10 @@
 import { execSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { create as tarCreate } from 'tar';
 import picomatch from 'picomatch';
 import { formatBytes, sha256, sha256File } from '@kici-dev/core';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import { encryptTarball } from './encryption.js';
 
 /**
@@ -312,8 +312,10 @@ export async function createOverlayTarball(
     checksums,
   };
 
-  // Create temp dir for the tarball and manifest
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-overlay-'));
+  // Create temp dir for the tarball and manifest. Persist mode: the dir holds
+  // the returned tarball path and outlives this function, so it is not
+  // auto-registered to any temp scope (cleanup is the caller's / GC's).
+  const { path: tmpDir } = await makeTempDir('overlay', { persist: true });
   const manifestPath = path.join(tmpDir, 'manifest.json');
   await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 

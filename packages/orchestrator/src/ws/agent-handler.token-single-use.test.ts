@@ -97,6 +97,7 @@ function tokenStoreFor(opts: {
     revoke: vi.fn(),
     list: vi.fn(),
     cleanupExpired: vi.fn(),
+    consumeBootstrapToken: vi.fn().mockResolvedValue(true),
   } as unknown as AgentTokenStore;
 }
 
@@ -203,6 +204,65 @@ describe(' ephemeral-token single-use binding (created_by → agentId)', () => {
 
     expect(registry.get('agent-real')).toBeDefined();
     expect(wsReconnect.close).not.toHaveBeenCalled();
+  });
+
+  it('allows an init-runner to register as its bare target id with a bootstrap token', async () => {
+    // A single-use bootstrap (init-runner) token stores its bound identity as
+    // `bootstrap:<targetAgentId>` (mintBootstrapToken). The init-runner boots on
+    // the fresh box and registers as the bare `<targetAgentId>` — Gate 2 must
+    // strip the `bootstrap:` prefix so this succeeds.
+    const tokenStore = tokenStoreFor({
+      agentType: 'ephemeral',
+      createdBy: 'bootstrap:fresh-box-1',
+      labels: ['kici:init'],
+    });
+    const handler = createAgentWsHandler({
+      registry,
+      dispatcher,
+      agentAuthMode: 'token',
+      tokenStore,
+    });
+
+    const wsInit = mockWs();
+    handler.onOpen!(new Event('open'), wsInit as any);
+    await handler.onMessage!(makeMessageEvent(authRequestMsg()), wsInit as any);
+    await handler.onMessage!(
+      makeMessageEvent(registerMsg({ agentId: 'fresh-box-1', labels: ['kici:init'] })),
+      wsInit as any,
+    );
+
+    expect(registry.get('fresh-box-1')).toBeDefined();
+    expect(wsInit.close).not.toHaveBeenCalled();
+  });
+
+  it('rejects a bootstrap token registering as an agentId other than its target', async () => {
+    // The bootstrap token is bound to `fresh-box-1`; a stolen token trying to
+    // register a different id must still be refused after prefix-stripping.
+    const tokenStore = tokenStoreFor({
+      agentType: 'ephemeral',
+      createdBy: 'bootstrap:fresh-box-1',
+      labels: ['kici:init'],
+    });
+    const handler = createAgentWsHandler({
+      registry,
+      dispatcher,
+      agentAuthMode: 'token',
+      tokenStore,
+    });
+
+    const wsGhost = mockWs();
+    handler.onOpen!(new Event('open'), wsGhost as any);
+    await handler.onMessage!(makeMessageEvent(authRequestMsg()), wsGhost as any);
+    await handler.onMessage!(
+      makeMessageEvent(registerMsg({ agentId: 'fresh-box-2', labels: ['kici:init'] })),
+      wsGhost as any,
+    );
+
+    expect(registry.get('fresh-box-2')).toBeUndefined();
+    expect(wsGhost.close).toHaveBeenCalledWith(
+      WS_CLOSE_AGENT_AUTH_FAILED,
+      expect.stringMatching(/ephemeral token bound to a different agentId: expected fresh-box-1/i),
+    );
   });
 
   it('allows distinct agentIds to share a STATIC token (operator-issued N-use)', async () => {

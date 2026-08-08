@@ -54,6 +54,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'run.orch_logs.read': 30,
   'step.logs.read': 30,
   'attestations.read': 30,
+  'artifacts.read': 30,
   'event_log.list.read': 30,
   'context.list.read': 30,
   'context.get.read': 30,
@@ -111,8 +112,17 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'fleet.pre_boot.send': 180,
   'global_workflows.update': 180,
   'org_settings.dashboard_write_policy.update': 180,
+  'trust_policy.updated': 180,
   'cluster_name.update': 180,
   'attestation.retry': 180,
+
+  // 180 days — direct-DB kici-admin mutations (source 'admin_cli')
+  'db.fresh': 180,
+  'db.ensure': 180,
+  'db.create_role': 180,
+  'db.create_readonly_user': 180,
+  'db.reindex': 180,
+  'db.refresh_collation_version': 180,
 
   // 180 days — event DLQ admin actions (Phase 5 — at-least-once delivery)
   'event_dlq.list.read': 30,
@@ -388,6 +398,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'run.orch_logs.read': 180,
   'step.logs.read': 180,
   'attestations.read': 180,
+  'artifacts.read': 180,
   'event_log.list.read': 180,
   'context.list.read': 180,
   'context.get.read': 180,
@@ -445,8 +456,17 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'fleet.pre_boot.send': 730,
   'global_workflows.update': 730,
   'org_settings.dashboard_write_policy.update': 730,
+  'trust_policy.updated': 730,
   'cluster_name.update': 730,
   'attestation.retry': 730,
+
+  // 730 days — direct-DB kici-admin mutations (source 'admin_cli')
+  'db.fresh': 730,
+  'db.ensure': 730,
+  'db.create_role': 730,
+  'db.create_readonly_user': 730,
+  'db.reindex': 730,
+  'db.refresh_collation_version': 730,
 
   // 730 days — event DLQ admin actions (Phase 5 — at-least-once delivery)
   'event_dlq.list.read': 180,

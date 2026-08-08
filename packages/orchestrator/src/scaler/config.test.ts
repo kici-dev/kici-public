@@ -46,6 +46,33 @@ describe('scalerFileSchema', () => {
     expect(result.scalers[0].name).toBe('container-linux');
     expect(result.scalers[0].type).toBe('container');
     expect(result.scalers[0].labelSets[0].containerSocket).toBe(false); // default
+    expect(result.scalers[0].maxConcurrentSpawns).toBe(8); // default
+    expect(result.scalers[0].labelSets[0].imagePullPolicy).toBe('IfNotPresent'); // default
+  });
+
+  it('reads an explicit maxConcurrentSpawns and defaults it to 8 when unset', () => {
+    const config = {
+      version: 1,
+      scalers: [
+        {
+          name: 'a',
+          type: 'container',
+          maxAgents: 10,
+          maxConcurrentSpawns: 4,
+          labelSets: [{ labels: ['linux'], image: 'ghcr.io/my/agent:latest' }],
+        },
+        {
+          name: 'b',
+          type: 'container',
+          maxAgents: 10,
+          labelSets: [{ labels: ['win'], image: 'ghcr.io/my/agent:latest' }],
+        },
+      ],
+    };
+
+    const result = scalerFileSchema.parse(config);
+    expect(result.scalers[0].maxConcurrentSpawns).toBe(4); // explicit
+    expect(result.scalers[1].maxConcurrentSpawns).toBe(8); // default
   });
 
   it('validates config with two scalers (container + bare-metal)', () => {
@@ -387,7 +414,18 @@ describe('scalerFileSchema', () => {
       gateway: '10.0.0.1',
       netmask: '255.255.255.0',
       table: 'kici',
+      autoProvisionHost: true,
     });
+  });
+
+  it('defaults autoProvisionHost to true', () => {
+    const parsed = firecrackerNetworkSchema.parse({});
+    expect(parsed.autoProvisionHost).toBe(true);
+  });
+
+  it('round-trips an explicit autoProvisionHost false', () => {
+    const parsed = firecrackerNetworkSchema.parse({ autoProvisionHost: false });
+    expect(parsed.autoProvisionHost).toBe(false);
   });
 
   it('validates Firecracker network config with custom values', () => {
@@ -806,6 +844,77 @@ describe('mandatoryLabels validation', () => {
       ],
     };
     expect(() => scalerFileSchema.parse(config)).toThrow(/labelSets\[2\]/);
+  });
+});
+
+describe('structured platform field', () => {
+  it('accepts a scaler entry with a valid platform', () => {
+    const parsed = scalerFileSchema.parse({
+      version: 1,
+      globalMaxAgents: 10,
+      scalers: [
+        {
+          name: 'win-pool',
+          type: 'bare-metal',
+          maxAgents: 2,
+          platform: { os: 'windows', arch: 'x64' },
+          labelSets: [{ labels: ['windows', 'bare-metal'], binaryPath: '/kici-agent.exe' }],
+        },
+      ],
+    });
+    expect(parsed.scalers[0].platform).toEqual({ os: 'windows', arch: 'x64' });
+  });
+
+  it('defaults platform to undefined when omitted', () => {
+    const parsed = scalerFileSchema.parse({
+      version: 1,
+      globalMaxAgents: 10,
+      scalers: [
+        {
+          name: 'linux-pool',
+          type: 'bare-metal',
+          maxAgents: 2,
+          labelSets: [{ labels: ['linux', 'bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
+        },
+      ],
+    });
+    expect(parsed.scalers[0].platform).toBeUndefined();
+  });
+
+  it('rejects an unknown os enum value', () => {
+    expect(() =>
+      scalerFileSchema.parse({
+        version: 1,
+        globalMaxAgents: 10,
+        scalers: [
+          {
+            name: 'bad-pool',
+            type: 'bare-metal',
+            maxAgents: 2,
+            platform: { os: 'freebsd', arch: 'x64' },
+            labelSets: [{ labels: ['bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
+  it('rejects an unknown arch enum value', () => {
+    expect(() =>
+      scalerFileSchema.parse({
+        version: 1,
+        globalMaxAgents: 10,
+        scalers: [
+          {
+            name: 'bad-pool',
+            type: 'bare-metal',
+            maxAgents: 2,
+            platform: { os: 'linux', arch: 'ppc64' },
+            labelSets: [{ labels: ['bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
+          },
+        ],
+      }),
+    ).toThrow();
   });
 });
 

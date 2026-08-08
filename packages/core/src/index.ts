@@ -15,6 +15,7 @@ export {
   type RequestContext,
 } from './request-context.js';
 export { formatBytes } from './format-bytes.js';
+export { REPO_ANCHOR, HOME_ANCHOR } from './cache-anchors.js';
 export { formatDuration, formatUptime } from './format-duration.js';
 export {
   sha256,
@@ -27,3 +28,13 @@ export {
   decryptJson,
 } from './crypto.js';
 export { computeBackoffDelay, type ResolvedRetry, type RetryBackoff } from './retry.js';
+export {
+  DIAGNOSE_STATUSES,
+  DIAGNOSE_OVERALLS,
+  diagnoseExitCode,
+  deriveDiagnoseOverall,
+  type DiagnoseStatus,
+  type DiagnoseOverall,
+  type DiagnoseResult,
+  type DiagnoseResponse,
+} from './diagnostics-contract.js';

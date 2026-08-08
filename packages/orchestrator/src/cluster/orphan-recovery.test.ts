@@ -3,8 +3,20 @@ import { OrphanRecovery } from './orphan-recovery.js';
 import { PeerRegistry } from './peer-registry.js';
 import type { RaftNode } from './raft.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import type { ClusterSettingsReader } from './cluster-settings-reader.js';
 
 // ── Mock helpers ──────────────────────────────────────────────────
+
+/**
+ * Cluster-settings reader stub. `getNumber` returns `override` when provided,
+ * else the caller's `fallback` (the config.ts default) — mirroring the real
+ * reader's null-column behavior.
+ */
+function makeClusterSettingsStub(override?: number): ClusterSettingsReader {
+  return {
+    getNumber: async (_col: string, fallback: number) => override ?? fallback,
+  } as unknown as ClusterSettingsReader;
+}
 
 function createMockRaft(isLeader = false): RaftNode {
   return {
@@ -34,21 +46,40 @@ function createMockExecutionTracker(): ExecutionTracker {
  * '../__test-helpers__/mock-db.js' because OrphanRecovery calls selectFrom
  * multiple times in a single scan and needs different results each time.
  */
-function createMockDb(config: { staleRuns?: any[]; jobs?: any[] }) {
+function createMockDb(config: {
+  staleRuns?: any[];
+  jobs?: any[];
+  /**
+   * Row returned by the `hasRecentProgress` aggregate (the 2nd `selectFrom` of
+   * a recovery pass). Undefined (the default) means "no progress recorded", so
+   * the run stays orphan-eligible — the shape every pre-existing test assumes.
+   */
+  progress?: {
+    last_heartbeat_at?: Date | null;
+    completed_at?: Date | null;
+    started_at?: Date | null;
+  };
+}) {
   const staleRuns = config.staleRuns ?? [];
   const jobs = config.jobs ?? [];
 
-  const queryResults = [staleRuns, jobs];
+  // Per recovery pass the orchestrator issues three reads in order:
+  //   0 — the stale-run candidate list (`execute`)
+  //   1 — the run's last-progress aggregate (`executeTakeFirst`)
+  //   2 — the run's jobs (`execute`)
+  const queryResults = [staleRuns, [], jobs];
   let selectFromCallIndex = 0;
 
   const selectFromFn = vi.fn(() => {
     const resultIndex = selectFromCallIndex++;
     const results = queryResults[resultIndex] ?? [];
+    const takeFirst = resultIndex === 1 ? config.progress : undefined;
 
     const chain: any = {};
-    for (const method of ['select', 'where', 'execute']) {
+    for (const method of ['select', 'where', 'execute', 'executeTakeFirst']) {
       chain[method] = vi.fn((..._args: any[]) => {
         if (method === 'execute') return Promise.resolve(results);
+        if (method === 'executeTakeFirst') return Promise.resolve(takeFirst);
         return chain;
       });
     }
@@ -106,6 +137,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -122,6 +155,93 @@ describe('OrphanRecovery', () => {
   // ── Orphan detection ────────────────────────────────────────────
 
   describe('orphan detection', () => {
+    it('does NOT reap a healthy long run on a single-node orchestrator (no peers)', async () => {
+      // The candidate query selects on `started_at`, so ANY run longer than the
+      // stale threshold lands in `recoverRun`, and a single-node orchestrator
+      // has no peer that can vouch for its own coordinator. Recent job progress
+      // is what keeps the run alive.
+      const raft = createMockRaft(true);
+      const tracker = createMockExecutionTracker();
+
+      const mockDb = createMockDb({
+        staleRuns: [
+          {
+            run_id: 'run-live',
+            routing_key: 'generic:__default__:src-1',
+            workflow_name: 'deploy-stg',
+            provider: 'generic',
+            repo_identifier: '.',
+            sha: 'HEAD',
+          },
+        ],
+        // A job finished seconds ago — the run is progressing, not orphaned.
+        progress: { last_heartbeat_at: null, completed_at: new Date(), started_at: null },
+        jobs: [
+          { job_id: 'job-1', job_name: 'pending', status: 'pending', last_heartbeat_at: null },
+        ],
+      });
+
+      const recovery = new OrphanRecovery({
+        db: mockDb.db,
+        raft,
+        peerRegistry,
+        executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
+        scanIntervalMs: 1000,
+      });
+
+      await recovery.scanForOrphans();
+
+      // Nothing was force-failed and the run was not finalized.
+      expect(mockDb.updateTable).not.toHaveBeenCalled();
+      expect(tracker.completeRunIfAllJobsTerminal).not.toHaveBeenCalled();
+      expect(tracker.emitInfraEvent).not.toHaveBeenCalled();
+
+      recovery.stop();
+    });
+
+    it('still reaps a run whose last progress predates the stale window', async () => {
+      const raft = createMockRaft(true);
+      const tracker = createMockExecutionTracker();
+
+      const mockDb = createMockDb({
+        staleRuns: [
+          {
+            run_id: 'run-dead',
+            routing_key: 'github:42',
+            workflow_name: 'ci',
+            provider: 'github',
+            repo_identifier: 'owner/repo',
+            sha: 'abc123',
+          },
+        ],
+        // Last movement 30 minutes ago — genuinely stuck.
+        progress: {
+          last_heartbeat_at: new Date(Date.now() - 30 * 60_000),
+          completed_at: null,
+          started_at: new Date(Date.now() - 30 * 60_000),
+        },
+        jobs: [{ job_id: 'job-1', job_name: 'test', status: 'success', last_heartbeat_at: null }],
+      });
+
+      const recovery = new OrphanRecovery({
+        db: mockDb.db,
+        raft,
+        peerRegistry,
+        executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
+        scanIntervalMs: 1000,
+      });
+
+      await recovery.scanForOrphans();
+
+      expect(tracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-dead');
+
+      recovery.stop();
+    });
+
     it('should find and finalize orphan run (coordinator disconnected)', async () => {
       const raft = createMockRaft(true);
       const tracker = createMockExecutionTracker();
@@ -151,6 +271,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -203,6 +325,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
         jobStuckThresholdMs: 3 * 60 * 1000, // 3 min
       });
@@ -261,6 +385,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
         jobStuckThresholdMs: 3 * 60 * 1000,
       });
@@ -320,6 +446,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
         jobStuckThresholdMs: 3 * 60 * 1000,
       });
@@ -367,6 +495,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
         jobStuckThresholdMs: 3 * 60 * 1000,
       });
@@ -375,6 +505,67 @@ describe('OrphanRecovery', () => {
 
       expect(tracker.updateInMemoryJob).toHaveBeenCalledWith('run-1', 'job-1', 'failed');
 
+      recovery.stop();
+    });
+
+    /**
+     * A flapping peer last seen 60s ago sits inside the 120s cluster default but
+     * outside a 30s cluster override. Proves the reroute-flap grace is resolved
+     * live from cluster_settings at the read site (override wins, else fallback).
+     */
+    function makeFlappingScan(override?: number) {
+      const raft = createMockRaft(true);
+      const tracker = createMockExecutionTracker();
+      const mockDb = createMockDb({
+        staleRuns: [
+          {
+            run_id: 'run-1',
+            routing_key: 'github:42',
+            workflow_name: 'ci',
+            provider: 'github',
+            repo_identifier: 'owner/repo',
+            sha: 'abc123',
+          },
+        ],
+        jobs: [
+          {
+            job_id: 'job-1',
+            job_name: 'test',
+            status: 'running',
+            last_heartbeat_at: new Date('2026-02-18T11:50:00Z'),
+            rerouted_to_peer: 'arm-stg',
+          },
+        ],
+      });
+      // Peer disconnected but its last heartbeat was 60s ago.
+      const fakePeerRegistry = {
+        getPeer: () => ({ connected: false, lastHeartbeatAt: Date.now() - 60_000 }),
+        getConnectedPeers: () => [],
+      } as unknown as PeerRegistry;
+      const recovery = new OrphanRecovery({
+        db: mockDb.db,
+        raft,
+        peerRegistry: fakePeerRegistry,
+        executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(override),
+        rerouteFlapGraceFallbackMs: 120_000,
+        scanIntervalMs: 1000,
+        jobStuckThresholdMs: 3 * 60 * 1000,
+      });
+      return { recovery, tracker };
+    }
+
+    it('defers a flapping rerouted job under the cluster-default flap grace', async () => {
+      const { recovery, tracker } = makeFlappingScan(); // fallback 120s > 60s -> defer
+      await recovery.scanForOrphans();
+      expect(tracker.updateInMemoryJob).not.toHaveBeenCalled();
+      recovery.stop();
+    });
+
+    it('fails a flapping rerouted job when a cluster override shrinks the flap grace', async () => {
+      const { recovery, tracker } = makeFlappingScan(30_000); // 30s < 60s -> fail
+      await recovery.scanForOrphans();
+      expect(tracker.updateInMemoryJob).toHaveBeenCalledWith('run-1', 'job-1', 'failed');
       recovery.stop();
     });
 
@@ -409,6 +600,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -449,6 +642,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -474,6 +669,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -505,6 +702,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 
@@ -533,6 +732,8 @@ describe('OrphanRecovery', () => {
         raft,
         peerRegistry,
         executionTracker: tracker,
+        clusterSettings: makeClusterSettingsStub(),
+        rerouteFlapGraceFallbackMs: 120_000,
         scanIntervalMs: 1000,
       });
 

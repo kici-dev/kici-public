@@ -105,7 +105,7 @@ Values are sanitized to filesystem-safe characters. If none of these env vars is
 
 Rotated files are compressed (gzip). Old files are automatically deleted when they exceed the retention period.
 
-**Example — a typical staging stack:** every process writes to `${KICI_LOG_DIR}/` with a per-instance filename, e.g. `orchestrator-<host>-stg-YYYY-MM-DD.log`, `orchestrator-worker-orch-stg-YYYY-MM-DD.log`, `agent-stg-stateful-agent-YYYY-MM-DD.log`. The reference dogfooding setup wires these env vars via `packages/ci/src/deploy-stg/config.ts` (native orchestrator env) and `packages/ci/src/deploy-stg/platform.ts` (compose env).
+**Example — a typical staging stack:** every process writes to `${KICI_LOG_DIR}/` with a per-instance filename, e.g. `orchestrator-<host>-stg-YYYY-MM-DD.log`, `orchestrator-worker-orch-stg-YYYY-MM-DD.log`, `agent-stg-stateful-agent-YYYY-MM-DD.log`. The reference dogfooding setup wires these env vars in two places: the native orchestrator's own service environment, and the Platform's compose environment.
 
 ## Diagnostic tools
 
@@ -167,7 +167,7 @@ kici-admin debug-bundle [--output /path/to/bundle.zip] [--log-dir /var/log/kici]
 
 **Security:** All secrets, tokens, and credentials are automatically redacted using an allowlist approach. Only known-safe configuration fields are included.
 
-**Fleet-wide collection:** Add `--fleet` to collect from every node in the cluster at once — the orchestrator, its coordinator-mesh peers, every worker, and every connected agent — over the existing authenticated WebSocket channels. The result is one nested ZIP (`local/`, `agents/<id>.zip`, `workers/<id>.zip`, `peers/<id>.zip`) plus a `fleet-manifest.json` recording each node's status, with each node redacting its own config at source. Use `--list` to enumerate the fleet and `--pick` to collect a subset. See the [debug-bundle reference](../orchestrator/kici-admin-cli.md#fleet-wide-collection) for the full flag set.
+**Fleet-wide collection:** Add `--fleet` to collect from every node in the cluster at once — the orchestrator, its coordinator-mesh peers, every worker, and every connected agent — over the existing authenticated WebSocket channels. The result is one nested ZIP (`local/`, `agents/<id>.zip`, `workers/<id>.zip`, `peers/<id>.zip`) plus a `fleet-manifest.json` recording each node's status, with each node redacting its own config at source. Use `--list` to enumerate the fleet and `--pick` to collect a subset. See the [debug-bundle reference](../orchestrator/kici-admin/inspection-recovery.md#fleet-wide-collection) for the full flag set.
 
 ### `kici-admin inspect-bundle`
 
@@ -270,7 +270,7 @@ The KiCI dashboard includes a built-in infrastructure page at `/orgs/:orgId/infr
 
 - **Execution metrics** -- 24-hour summary including total runs, success rate, average duration, and active job counts (queued and running)
 - **Infrastructure tree** -- hierarchical view of orchestrators, scaler pools, and connected agents with OS metadata, connection status, and scaler configuration details
-- **Per-orchestrator command helper** -- a command-line icon next to each orchestrator opens a popover showing the correct, copy-ready `kici-admin` invocation for that orchestrator's deployment shape: `<runtime> exec <container> kici-admin …` for a container (compose) deployment, a bare `kici-admin …` for a systemd / launchd install, `kici-admin.exe …` for a Windows service, and a `kici-admin …` plus `KICI_ADMIN_URL` note for a hand-run orchestrator. The snippet never embeds a token — it reminds you to set `KICI_ADMIN_TOKEN` (create one with `kici-admin token create <label> --role owner`).
+- **Per-orchestrator command helper** -- a command-line icon next to each orchestrator opens a popover showing the correct, copy-ready `kici-admin` invocation for that orchestrator's deployment shape: `<runtime> exec <container> kici-admin …` for a container (compose) deployment, a `<node> <kici-admin> …` pair pinned to the unit's own runtime for a systemd / launchd install, with either half shell-quoted when its path contains whitespace (falling back to a bare `kici-admin …` whenever no pinned command is reported — the orchestrator is offline, or it could not locate its own `kici-admin` on disk), `kici-admin.cmd …` for a Windows service (npm installs the launcher as a `.cmd` shim), and a `kici-admin …` plus `KICI_ADMIN_URL` note for a hand-run orchestrator. The snippet never embeds a token — it reminds you to set `KICI_ADMIN_TOKEN` (create one with `kici-admin token create <label> --role owner`).
 - **Secret backends** -- health status of registered secret backends (PostgreSQL and Vault) with sync and connectivity controls
 - **Running user** -- OS user identity of the orchestrator process, with color-coded warnings for root with bare-metal scalers
 
@@ -333,10 +333,10 @@ Each line includes `deliveryId`, `routingKey`, and usually `event` — correlate
 
 **Prometheus metrics** (scrape `http://orchestrator:4000/metrics`):
 
-- `kici_webhooks_received_total{source="direct"|"generic"|"relay", event}` — count of deliveries entering the orchestrator
-- `kici_webhooks_processed_total{result="matched"|"skipped"}` — pipeline outcome
-- `kici_dedup_hits_total` — suppressed duplicates
-- `kici_trigger_match_duration_seconds` — matcher latency
+- `kici_orch_webhooks_received_total{source="direct"|"relay", event}` — count of deliveries entering the orchestrator
+- `kici_orch_webhooks_processed_total{result="matched"|"skipped"|"error"}` — pipeline outcome
+- `kici_orch_dedup_hits_total` — suppressed duplicates
+- `kici_orch_trigger_match_duration_seconds` — matcher latency
 
 **Debug bundle** — `kici-admin debug-bundle --log-window 4` packages the above logs, metrics snapshot, and redacted config for offline analysis or support. See [Debug bundles](#debug-bundles) above.
 

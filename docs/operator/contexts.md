@@ -9,13 +9,13 @@ This guide covers the operational aspects of KiCI's deployment context system: d
 
 Contexts are stored in the **orchestrator database**. The squashed baseline migration `001_initial.ts` creates the following tables:
 
-| Table                          | Purpose                                          |
-| ------------------------------ | ------------------------------------------------ |
-| `contexts`                 | Context definitions with protection rules    |
-| `context_variables`        | Key-value pairs per context (with lock flag) |
+| Table                      | Purpose                                          |
+| -------------------------- | ------------------------------------------------ |
+| `contexts`                 | Context definitions with protection rules        |
+| `context_variables`        | Key-value pairs per context (with lock flag)     |
 | `context_source_overrides` | Per-source variable overrides                    |
-| `context_bindings`         | Scope-to-context secret bindings             |
-| `held_runs`                    | Runs held by protection gates (pending approval) |
+| `context_bindings`         | Scope-to-context secret bindings                 |
+| `held_runs`                | Runs held by protection gates (pending approval) |
 
 The `execution_runs` table also gains an `context` column (TEXT, nullable) to track which context each run targeted.
 
@@ -24,7 +24,8 @@ The `execution_runs` table also gains an `context` column (TEXT, nullable) to tr
 - `contexts(org_id, name)` -- unique context name per org
 - `context_variables(context_id, key)` -- unique variable key per context
 - `context_source_overrides(context_id, routing_key, key)` -- unique override per source+key
-- `held_runs(run_id, job_id)` -- one held entry per job
+
+`held_runs` is keyed only by its own `id`: a run can carry several holds at once (one per gated job), so `(run_id, job_id)` is not unique.
 
 ## Context management via API
 
@@ -46,6 +47,12 @@ INSERT INTO contexts (org_id, name, type, glob_pattern, enabled)
 VALUES ('my-org', 'review/*', 'glob', 'review/*', true);
 ```
 
+#### How a context name resolves
+
+An exact name match always wins first. When no fixed context matches the name, the orchestrator scans glob contexts. If the name matches **more than one** glob pattern, the **most-specific pattern wins** — the pattern with the most literal (non-wildcard) characters; ties break toward fewer wildcards, then alphabetically by name. This makes overlapping glob contexts resolve predictably and identically on every run, so a given context name is always gated by the same protection rules.
+
+For example, `review/PR-42` matches both `review/*` and `review/PR-*`. The `review/PR-*` context wins because it has more literal characters, so its branch, trust, reviewer, and concurrency protection rules govern the run.
+
 ### Setting variables
 
 ```sql
@@ -66,7 +73,7 @@ UPDATE contexts SET
   wait_timer_seconds = 300,
   concurrency_limit = 1,
   concurrency_strategy = 'queue',
-  hold_expiry_seconds = 86400
+  hold_expiry_seconds = 7200
 WHERE org_id = 'my-org' AND name = 'production';
 ```
 
@@ -100,7 +107,33 @@ When using Vault:
 - Vault connection is operator-managed, not configurable per-scope in the dashboard
 - PG-stored secrets and Vault-stored secrets can coexist (backend is per-scope)
 
+## Valid scope names
+
+Secret scope names are validated whenever a scope is created, renamed, or
+written to — via the dashboard, the admin API, or the CLI. A scope name must:
+
+- be non-empty and at most 512 characters;
+- use `/` only as a separator between non-empty segments (no `//`, and no
+  leading or trailing `/`);
+- contain only letters, digits, and `_`, `.`, `-` within each segment (no `:`,
+  `%`, or whitespace);
+- not use `.` or `..` as a standalone segment.
+
+A write that violates these rules is rejected with a structured validation
+error (HTTP 400 on the admin API), not a server fault. Existing scopes that do
+not meet these rules keep working for reads and deletes, and can be renamed to a
+conforming name.
+
 ## Held run lifecycle
+
+### Identifying a hold
+
+`held_runs.job_id` carries the held job's **expanded name** — the name the dashboard approval queue renders and the value `kici approve <run-id> --job <name>` resolves. A matrix job expands into one hold per child, each carrying its own name (`build (18)`, `build (20)`), so sibling holds on one run stay distinguishable.
+
+Two gates are not scoped to a single job and store a run-wide sentinel instead:
+
+- `__install__<workflow>` -- the workflow install gate (registry / install-env resolution).
+- `__workflow_modification__` -- the PR-wide security hold for a non-trusted contributor who modified workflow files.
 
 ### States
 
@@ -114,6 +147,9 @@ When using Vault:
 ### Expiry and cleanup
 
 - Default hold expiry: 3600 seconds (1 hour), configurable per-context via `hold_expiry_seconds`
+- A context whose `hold_expiry_seconds` is cleared (`NULL`) uses that same 3600-second default — as does a context that never set one, since the column carries no default of its own
+- Clear a context's hold expiry with an empty value: `kici-admin context set-policy --org <id> --env <name> --hold-expiry ""`
+- A hold expiry of `0` is rejected. It would place the hold's deadline at the instant the hold is created, so the stale detector expires it before a reviewer can act — cancelling the job the hold existed to gate
 - The stale run detector (Sub-scan E) periodically calls `heldRunStore.expireOverdue()` to transition expired pending holds to `expired` status
 - Expired held runs result in the associated job being cancelled
 
@@ -129,12 +165,12 @@ When using Vault:
 
 ### Key metrics to watch
 
-| Metric                          | Description                                   | Alert threshold                     |
-| ------------------------------- | --------------------------------------------- | ----------------------------------- |
-| Held runs pending               | Count of `held_runs WHERE status = 'pending'` | > 10 (may indicate stale approvals) |
-| Held runs expired               | Rate of `status = 'expired'` transitions      | Increasing trend                    |
-| Context var resolution time | Time to resolve vars in processor             | > 100ms                             |
-| Protection pipeline rejections  | Rate of branch/concurrency rejections         | Depends on workflow                 |
+| Metric                         | Description                                   | Alert threshold                     |
+| ------------------------------ | --------------------------------------------- | ----------------------------------- |
+| Held runs pending              | Count of `held_runs WHERE status = 'pending'` | > 10 (may indicate stale approvals) |
+| Held runs expired              | Rate of `status = 'expired'` transitions      | Increasing trend                    |
+| Context var resolution time    | Time to resolve vars in processor             | > 100ms                             |
+| Protection pipeline rejections | Rate of branch/concurrency rejections         | Depends on workflow                 |
 
 ### Useful queries
 

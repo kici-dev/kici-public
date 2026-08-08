@@ -65,12 +65,12 @@ that never got a human-friendly name.
 kici-admin cluster-name set production-arm
 # Renamed: cluster-a3f81c -> production-arm
 # Reconnect to Platform to publish the new name. Restart the
-# orchestrator or run `kici-admin orchestrator-service restart`.
+# orchestrator or run `kici-admin orchestrator restart`.
 ```
 
 The orchestrator persists the new name immediately but keeps using
 the old one on its current Platform WebSocket connection. **Restart
-the orchestrator** (`kici-admin orchestrator-service restart`, or
+the orchestrator** (`kici-admin orchestrator restart`, or
 your service manager's equivalent) so the next `source.register`
 publishes the new name. After Platform acknowledges, the dashboard's
 per-orch URL segment updates and the orchestrator picker shows the
@@ -129,7 +129,7 @@ The same identifier surfaces in three places:
   `platform_connections.cluster_name`.
 - **Dashboard URL.** Per-orch panels live under
   `/orgs/:customerId/infrastructure/:clusterName/...` — for example
-  `/orgs/acme/infrastructure/production-arm/settings/security/dashboard-policy`.
+  `/orgs/acme/infrastructure/production-arm/settings/orchestrator-security/dashboard-policy`.
 - **Run metadata.** The run-detail page on the dashboard renders the
   executing orchestrator's cluster name as a link back to that orch's
   pages.

@@ -267,10 +267,23 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     prettyFormat,
   );
 
+  // When KICI_LOG_STDERR is set, route every log level to stderr instead of
+  // stdout. Short-lived CLIs (kici-admin) emit structured data on stdout (e.g.
+  // `--json` output); keeping diagnostic logs off stdout keeps that data
+  // machine-parseable. Long-running services leave this unset so their logs
+  // stay on stdout for the log shipper. `stderrLevels` covering every npm level
+  // sends all output to stderr.
+  const stderrTransport = Boolean(process.env.KICI_LOG_STDERR);
   const loggerInstance = winston.createLogger({
     level,
     format: json ? jsonFormat : prettyPipeline,
-    transports: [new winston.transports.Console()],
+    transports: [
+      new winston.transports.Console(
+        stderrTransport
+          ? { stderrLevels: ['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly'] }
+          : {},
+      ),
+    ],
   });
 
   // Add file rotation transport when KICI_LOG_DIR is set (for bare-metal operators).

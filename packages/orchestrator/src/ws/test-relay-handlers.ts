@@ -13,7 +13,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
-import { stringifyActor } from '@kici-dev/engine';
+import { TERMINAL_RUN_STATES, stringifyActor } from '@kici-dev/engine';
 import type {
   TestRelayRequest,
   TestRelayUploadsInitRequest,
@@ -30,8 +30,10 @@ import { initTestUpload } from '../routes/uploads.js';
 import { processTestTrigger } from '../pipeline/test-pipeline.js';
 import type { ProcessingDeps } from '../pipeline/processor.js';
 
-/** Terminal execution-run states for the relay status/logs `done` flag. */
-const TERMINAL_RUN_STATES = new Set(['success', 'failed', 'cancelled']);
+// `TERMINAL_RUN_STATES` for the relay status/logs `done` flag comes from the
+// engine, not a local copy: a hand-written duplicate of the terminal set is how
+// a newly-added terminal status silently leaves this relay reporting `done:
+// false` forever.
 
 /** Dependencies shared by all five test-relay handlers. */
 export interface TestRelayHandlerDeps extends ProcessingDeps {
@@ -110,8 +112,7 @@ export async function handleTestTrigger(
   // at all) and corrupt decryption when secrets are present (wrong key).
   const cliPublicKey = msg.cliPublicKey;
   let resolvedOverlay:
-    | { tarballUrl: string; cliPublicKey: string; orchestratorPrivateKey: string }
-    | undefined;
+    { tarballUrl: string; cliPublicKey: string; orchestratorPrivateKey: string } | undefined;
 
   if (msg.uploadId && cliPublicKey && deps.cacheStorage) {
     const upload = await deps.db

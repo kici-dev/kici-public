@@ -8,8 +8,10 @@ import { EVENT_CATCHUP_BATCH_SIZE } from './event-store.js';
 import type { EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
-import type { RegistrationIndex } from '../registration/registration-index.js';
+import type { RegisteredWorkflow, RegistrationIndex } from '../registration/registration-index.js';
 import type { EventRouterConfig, StoredEvent } from './types.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
+import { appendBatchItem, openOrGetBatchWindow } from './batch-accumulator.js';
 import {
   eventAttemptsHistogram,
   eventDispatchSuccessTotal,
@@ -53,6 +55,12 @@ export interface EventRouterOptions {
   circuitBreaker: EventCircuitBreaker;
   trustStore: TrustStore;
   config: EventRouterConfig;
+  /**
+   * Fleet-wide settings reader. When present, the per-event insert TTL and the
+   * max-dispatch-attempts cap are read live from cluster_settings, falling back
+   * to `config.eventTtlSeconds` / `config.maxDispatchAttempts`.
+   */
+  clusterSettings?: ClusterSettingsReader;
   onEventMatched: (
     event: StoredEvent,
     lockFile: LockFile,
@@ -84,6 +92,7 @@ export class EventRouter {
   private readonly circuitBreaker: EventCircuitBreaker;
   private readonly trustStore: TrustStore;
   private readonly config: EventRouterConfig;
+  private readonly clusterSettings?: ClusterSettingsReader;
   private readonly onEventMatched: EventRouterOptions['onEventMatched'];
   private readonly registrationIndex: RegistrationIndex;
   private readonly nodeId: string;
@@ -98,6 +107,7 @@ export class EventRouter {
     this.circuitBreaker = options.circuitBreaker;
     this.trustStore = options.trustStore;
     this.config = options.config;
+    this.clusterSettings = options.clusterSettings;
     this.onEventMatched = options.onEventMatched;
     this.registrationIndex = options.registrationIndex;
     this.nodeId = options.nodeId;
@@ -191,7 +201,7 @@ export class EventRouter {
     // is genuinely per-workflow-source, not one global bucket per event name.
     if (!event.eventName.startsWith('__')) {
       const rateKey = `${event.sourceRoutingKey ?? 'unknown'}:${event.eventName}`;
-      const rateCheck = this.circuitBreaker.checkRateLimit(rateKey);
+      const rateCheck = await this.circuitBreaker.checkRateLimit(rateKey);
       if (!rateCheck.allowed) {
         throw new Error(
           `Rate limit exceeded for event '${event.eventName}'. Retry after ${rateCheck.retryAfterMs}ms`,
@@ -199,8 +209,13 @@ export class EventRouter {
       }
     }
 
-    // Persist event
-    const ttlMs = this.config.eventTtlSeconds * 1000;
+    // Persist event. TTL is a fleet-wide cluster tunable (live override wins).
+    const ttlSeconds =
+      (await this.clusterSettings?.getNumber(
+        'event_router_event_ttl_seconds',
+        this.config.eventTtlSeconds,
+      )) ?? this.config.eventTtlSeconds;
+    const ttlMs = ttlSeconds * 1000;
     const expiresAt = new Date(Date.now() + ttlMs);
 
     const targetRepos =
@@ -295,7 +310,13 @@ export class EventRouter {
       });
     } catch (err) {
       const errMsg = toErrorMessage(err);
-      if (event.attempts >= this.config.maxDispatchAttempts) {
+      // Max dispatch attempts is a fleet-wide cluster tunable (live override wins).
+      const maxDispatchAttempts =
+        (await this.clusterSettings?.getNumber(
+          'event_router_max_dispatch_attempts',
+          this.config.maxDispatchAttempts,
+        )) ?? this.config.maxDispatchAttempts;
+      if (event.attempts >= maxDispatchAttempts) {
         await this.eventStore.markDlq(event.id, 'exhausted_retries', errMsg);
         eventDlqTotal.add(1, { event_name: event.eventName, reason: 'exhausted_retries' });
         eventAttemptsHistogram.record(event.attempts, {
@@ -306,7 +327,7 @@ export class EventRouter {
           eventId: event.id,
           eventName: event.eventName,
           attempts: event.attempts,
-          maxDispatchAttempts: this.config.maxDispatchAttempts,
+          maxDispatchAttempts,
           error: errMsg,
         });
       } else {
@@ -370,6 +391,21 @@ export class EventRouter {
       }
     }
 
+    // For __workflows_failed_batch events, the leader sweep already targeted the
+    // single subscribing registration (via registrationId in payload). Only match
+    // that one so a shared batch event does not dispatch every batch subscriber.
+    if (event.eventName === '__workflows_failed_batch' && event.payload.registrationId) {
+      const targetId = event.payload.registrationId as string;
+      registrations = registrations.filter((r) => r.id === targetId);
+      if (registrations.length === 0) {
+        logger.debug('Batch event target registration not found', {
+          eventId: event.id,
+          registrationId: targetId,
+        });
+        return;
+      }
+    }
+
     // Filter by target repos when cross-repo targeting is specified.
     // If the event has targetRepos, only deliver to registrations whose repo matches.
     if (event.targetRepos && event.targetRepos.length > 0) {
@@ -426,23 +462,127 @@ export class EventRouter {
       // Match against the registered workflow
       const decisions = matchAllWorkflows(syntheticLockFile.workflows, simulatedEvent);
       const matchedDecisions = decisions.filter((d) => d.matched);
+      if (matchedDecisions.length === 0) continue;
 
-      if (matchedDecisions.length > 0) {
-        logger.info('Event matched registered workflow', {
-          eventId: event.id,
-          eventName: event.eventName,
-          routingKey: reg.routingKey,
-          repoIdentifier: reg.repoIdentifier,
-          workflowName: reg.workflowName,
-          matchedCount: matchedDecisions.length,
-        });
+      // A failed workflow_complete that matched a workflowsFailedBatch trigger is
+      // buffered into the accumulation window instead of dispatched now; the rest
+      // dispatch as usual.
+      const dispatchNow = await this.bufferBatchDecisions(event, reg, matchedDecisions);
+      if (dispatchNow.length === 0) continue;
 
-        await this.onEventMatched(event, syntheticLockFile, matchedDecisions, {
-          routingKey: reg.routingKey,
-          repoIdentifier: reg.repoIdentifier,
-          providerContext: reg.providerContext,
-        });
+      logger.info('Event matched registered workflow', {
+        eventId: event.id,
+        eventName: event.eventName,
+        routingKey: reg.routingKey,
+        repoIdentifier: reg.repoIdentifier,
+        workflowName: reg.workflowName,
+        matchedCount: dispatchNow.length,
+      });
+
+      await this.onEventMatched(event, syntheticLockFile, dispatchNow, {
+        routingKey: reg.routingKey,
+        repoIdentifier: reg.repoIdentifier,
+        providerContext: reg.providerContext,
+      });
+    }
+  }
+
+  /**
+   * Partition matched decisions into "dispatch now" and "buffer into a batch
+   * window". A decision whose matched trigger is `workflows_failed_batch` and
+   * whose event is a failed `__workflow_complete` is buffered (and excluded from
+   * the returned dispatch set) so the whole burst notifies once per window.
+   *
+   * Self-exclusion: a failed `__workflow_complete` whose originating run was
+   * itself dispatched by a failure-lifecycle trigger is neither buffered nor
+   * dispatched — a broken notifier must not re-trigger the batch on its own
+   * failure. The chain-depth breaker remains the backstop for anything missed.
+   */
+  private async bufferBatchDecisions(
+    event: StoredEvent,
+    reg: RegisteredWorkflow,
+    matchedDecisions: WorkflowDecision[],
+  ): Promise<WorkflowDecision[]> {
+    const isFailedCompletion =
+      event.eventName === '__workflow_complete' && event.payload.status === 'failed';
+    if (!isFailedCompletion) return matchedDecisions;
+
+    const dispatchNow: WorkflowDecision[] = [];
+    let selfExcluded: boolean | null = null;
+    for (const decision of matchedDecisions) {
+      const trigger = reg.lockEntry.triggers[decision.matchedTrigger ?? -1];
+      if (trigger?._type !== 'workflows_failed_batch') {
+        dispatchNow.push(decision);
+        continue;
       }
+      // Resolve the self-exclusion lookup once per event (all batch decisions
+      // for this registration share the same originating run).
+      if (selfExcluded === null) {
+        selfExcluded = await this.isFailureLifecycleRun(event.sourceRunId);
+      }
+      if (selfExcluded) {
+        logger.debug('Skipping batch buffering for failure-lifecycle run (self-exclusion)', {
+          eventId: event.id,
+          sourceRunId: event.sourceRunId,
+          registrationId: reg.id,
+        });
+        continue;
+      }
+      await this.bufferBatchFailure(event, reg, trigger.accumulateFor);
+    }
+    return dispatchNow;
+  }
+
+  /** Open (or reuse) the registration's batch window and append the failed run. */
+  private async bufferBatchFailure(
+    event: StoredEvent,
+    reg: RegisteredWorkflow,
+    accumulateForMs: number,
+  ): Promise<void> {
+    const { windowId, opened } = await openOrGetBatchWindow(this.db, {
+      registrationId: reg.id,
+      customerId: reg.customerId,
+      routingKey: reg.routingKey,
+      repoIdentifier: reg.repoIdentifier,
+      accumulateForMs,
+    });
+    await appendBatchItem(this.db, {
+      windowId,
+      run: {
+        runId: (event.payload.runId as string) ?? event.sourceRunId ?? '',
+        repoIdentifier: (event.payload.sourceRepo as string) ?? reg.repoIdentifier,
+        workflowName: (event.payload.workflowName as string) ?? reg.workflowName,
+        failureClass: (event.payload.failureClass as string | undefined) ?? null,
+        senderUsername: (event.payload.senderUsername as string | undefined) ?? null,
+      },
+    });
+    logger.debug('Buffered failed run into batch window', {
+      eventId: event.id,
+      registrationId: reg.id,
+      windowId,
+      openedWindow: opened,
+    });
+  }
+
+  /**
+   * True when the given run was dispatched by a failure-lifecycle trigger
+   * (`workflows_failed_batch` or a `workflow_complete` failed-status trigger),
+   * recorded in `execution_runs.trigger_decision.dispatchedByFailureLifecycle`
+   * at dispatch time. Used for batch self-exclusion.
+   */
+  private async isFailureLifecycleRun(runId?: string | null): Promise<boolean> {
+    if (!runId) return false;
+    const row = await this.db
+      .selectFrom('execution_runs')
+      .select('trigger_decision')
+      .where('run_id', '=', runId)
+      .executeTakeFirst();
+    if (!row?.trigger_decision) return false;
+    try {
+      const parsed = JSON.parse(row.trigger_decision) as Record<string, unknown>;
+      return parsed.dispatchedByFailureLifecycle === true;
+    } catch {
+      return false;
     }
   }
 

@@ -21,6 +21,7 @@ import type { RaftNode } from './raft.js';
 import type { PeerRegistry } from './peer-registry.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import { shouldDeferReroutedJob } from './rerouted-job-guard.js';
+import type { ClusterSettingsReader } from './cluster-settings-reader.js';
 
 const logger = createLogger({ prefix: 'orphan-recovery' });
 
@@ -35,6 +36,10 @@ interface OrphanRecoveryDeps {
   raft: RaftNode;
   peerRegistry: PeerRegistry;
   executionTracker: ExecutionTracker;
+  /** Reader for fleet-wide cluster tunables (reroute flap-grace override). */
+  clusterSettings: ClusterSettingsReader;
+  /** Cluster default for the reroute flap-grace window (config.rerouteFlapGraceMs). */
+  rerouteFlapGraceFallbackMs: number;
   /** Scan interval in ms. Default: 60000 (1 minute). */
   scanIntervalMs?: number;
   /** How long a run must be stale before considered orphaned. Default: 5 minutes. */
@@ -48,6 +53,8 @@ export class OrphanRecovery {
   private readonly raft: RaftNode;
   private readonly peerRegistry: PeerRegistry;
   private readonly executionTracker: ExecutionTracker;
+  private readonly clusterSettings: ClusterSettingsReader;
+  private readonly rerouteFlapGraceFallbackMs: number;
   private readonly scanIntervalMs: number;
   private readonly staleThresholdMs: number;
   private readonly jobStuckThresholdMs: number;
@@ -58,6 +65,8 @@ export class OrphanRecovery {
     this.raft = deps.raft;
     this.peerRegistry = deps.peerRegistry;
     this.executionTracker = deps.executionTracker;
+    this.clusterSettings = deps.clusterSettings;
+    this.rerouteFlapGraceFallbackMs = deps.rerouteFlapGraceFallbackMs;
     this.scanIntervalMs = deps.scanIntervalMs ?? 60_000;
     this.staleThresholdMs = deps.staleThresholdMs ?? DEFAULT_STALE_THRESHOLD_MS;
     this.jobStuckThresholdMs = deps.jobStuckThresholdMs ?? DEFAULT_JOB_STUCK_THRESHOLD_MS;
@@ -150,6 +159,19 @@ export class OrphanRecovery {
       return;
     }
 
+    // A run that is still making progress is NOT orphaned, whatever the peer
+    // registry says. The candidate query selects on `started_at`, so any run
+    // simply LONGER than the stale threshold lands here, and the peer check
+    // above can never vouch for a single-node orchestrator (it has no peers).
+    // Without this guard, a healthy long run on a single-node deployment is
+    // force-failed by its own coordinator.
+    if (await this.hasRecentProgress(run.run_id)) {
+      logger.debug('Skipping orphan recovery: run is still making progress', {
+        runId: run.run_id,
+      });
+      return;
+    }
+
     logger.info('Recovering orphan run', {
       runId: run.run_id,
       routingKey: run.routing_key,
@@ -201,7 +223,11 @@ export class OrphanRecovery {
       // peer that is connected — or was seen within the flap-grace window of a
       // transient reconnect — defer the force-fail: the worker's terminal
       // status may still be replayed from its durable outbox.
-      if (shouldDeferReroutedJob(job, this.peerRegistry)) {
+      const flapGraceMs = await this.clusterSettings.getNumber(
+        'reroute_flap_grace_ms',
+        this.rerouteFlapGraceFallbackMs,
+      );
+      if (shouldDeferReroutedJob(job, this.peerRegistry, { flapGraceMs })) {
         logger.info(
           'Deferring orphan-fail for rerouted job; worker peer connected or recently seen',
           {
@@ -277,6 +303,28 @@ export class OrphanRecovery {
     // This method handles DB update, Platform notification, commit status updates,
     // and workflow completion callbacks — same path used by StaleRunDetector.
     await this.executionTracker.completeRunIfAllJobsTerminal(run.run_id);
+  }
+
+  /**
+   * Whether any job of the run moved within the stale window — a heartbeat, a
+   * start, or a completion. A crashed coordinator stops producing all three, so
+   * a genuinely orphaned run becomes eligible again within one window; a healthy
+   * long run never does.
+   */
+  private async hasRecentProgress(runId: string): Promise<boolean> {
+    const cutoff = new Date(Date.now() - this.staleThresholdMs);
+    const row = await this.db
+      .selectFrom('execution_jobs')
+      .select((eb) => [
+        eb.fn.max('last_heartbeat_at').as('last_heartbeat_at'),
+        eb.fn.max('completed_at').as('completed_at'),
+        eb.fn.max('started_at').as('started_at'),
+      ])
+      .where('run_id', '=', runId)
+      .executeTakeFirst();
+    if (!row) return false;
+    const stamps = [row.last_heartbeat_at, row.completed_at, row.started_at];
+    return stamps.some((t) => t != null && new Date(t) >= cutoff);
   }
 
   /**

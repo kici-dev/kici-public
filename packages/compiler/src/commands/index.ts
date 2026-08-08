@@ -44,6 +44,12 @@ export type { RunsRerunOptions } from './runs/rerun.js';
 export { runsCancelCommand } from './runs/cancel.js';
 export type { RunsCancelOptions } from './runs/cancel.js';
 
+export { runsArtifactsListCommand } from './runs/artifacts/list.js';
+export type { RunsArtifactsListOptions } from './runs/artifacts/list.js';
+
+export { runsArtifactsDownloadCommand } from './runs/artifacts/download.js';
+export type { RunsArtifactsDownloadOptions } from './runs/artifacts/download.js';
+
 export { typesCommand } from './types.js';
 export type { TypesOptions } from './types.js';
 
@@ -52,6 +58,8 @@ export type { EndpointsOptions } from './endpoints.js';
 
 export { diagnosticsCommand } from './diagnostics.js';
 export type { DiagnosticsOptions } from './diagnostics.js';
+export { doctorCommand } from './doctor.js';
+export type { DoctorOptions } from './doctor.js';
 
 export { orgListCommand, orgUseCommand, orgCurrentCommand } from './org.js';
 
@@ -87,3 +95,22 @@ export type { DocsOptions, DocsLlmOptions } from './docs.js';
 
 export { verifyAttestationCommand } from './verify-attestation.js';
 export type { VerifyAttestationOptions } from './verify-attestation.js';
+
+export {
+  notificationsChannelsListCommand,
+  notificationsChannelsAddCommand,
+  notificationsChannelsRemoveCommand,
+  notificationsSubscriptionsListCommand,
+  notificationsSubscriptionsAddCommand,
+  notificationsSubscriptionsRemoveCommand,
+  notificationsRosterListCommand,
+  notificationsRosterAddCommand,
+  notificationsRosterRemoveCommand,
+} from './notifications.js';
+export type {
+  NotificationsCommonOptions,
+  NotificationsListOptions,
+  ChannelsAddOptions,
+  SubscriptionsAddOptions,
+  RosterAddOptions,
+} from './notifications.js';

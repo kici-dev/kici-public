@@ -25,6 +25,7 @@
 import type { ProviderBundle } from '../../provider-registry.js';
 import type { GenericWebhookSource } from '../../db/types.js';
 import type { SecretResolver } from '../../secrets/secret-resolver.js';
+import type { ClusterSettingsReader } from '../../cluster/cluster-settings-reader.js';
 import { safeParseUniversalGitConfig, type UniversalGitConfig } from './config.js';
 import { UniversalGitWebhookNormalizer } from './normalizer.js';
 import { UniversalGitLockFileFetcher } from './lock-file.js';
@@ -93,6 +94,7 @@ export function parseSourceGitConfig(
 export function createUniversalGitProviderBundle(
   source: Pick<GenericWebhookSource, 'id' | 'customer_id' | 'routing_key' | 'git_config'>,
   secretResolver: SecretResolver,
+  opts?: { clusterSettings?: ClusterSettingsReader; lockFileMaxBytes?: number },
 ): ProviderBundle | null {
   const config = parseSourceGitConfig(source.git_config ?? null);
   if (!config) return null;
@@ -110,6 +112,8 @@ export function createUniversalGitProviderBundle(
       sourceId,
       config,
       secretResolver,
+      clusterSettings: opts?.clusterSettings,
+      lockFileMaxBytes: opts?.lockFileMaxBytes,
     }),
     changedFilesFetcher: new UniversalGitChangedFilesFetcher({ config }),
     cloneTokenProvider: new UniversalGitCloneTokenProvider({

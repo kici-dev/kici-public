@@ -6,7 +6,7 @@ import {
   PutObjectCommand,
 } from '@aws-sdk/client-s3';
 import { BaseColdStore, type BaseColdStoreDeps } from './cold-store.js';
-import type { ColdStoreConfig } from './config.js';
+import type { ColdStoreConfig, ColdStoreTableConfig } from './config.js';
 import { ChunkLru } from './lru.js';
 import type { ChunkCommitMetadata, TableAdapter } from './table-adapter.js';
 
@@ -19,11 +19,14 @@ class TestColdStore extends BaseColdStore {
   }
 }
 
-function makeConfig(enabled: boolean): ColdStoreConfig {
+function makeConfig(
+  enabled: boolean,
+  tables: Record<string, Partial<ColdStoreTableConfig>> = {},
+): ColdStoreConfig {
   return {
     enabled,
     s3Concurrency: 4,
-    tables: {},
+    tables,
     storage: { bucket: 'test-bucket', prefix: 'cold-store/' },
   };
 }
@@ -907,5 +910,156 @@ describe('BaseColdStore', () => {
       }),
     ).rejects.toThrow(/replay-chunk deadbeef00000000 not found/);
     expect(replayInsert).not.toHaveBeenCalled();
+  });
+});
+
+describe('BaseColdStore.warmCutoff', () => {
+  const DAY_MS = 86_400_000;
+
+  /** Assert `got` is `days` before now, tolerating test-execution drift. */
+  function expectDaysAgo(got: Date, days: number): void {
+    const drift = Math.abs(got.getTime() - (Date.now() - days * DAY_MS));
+    expect(drift).toBeLessThan(60_000);
+  }
+
+  it('resolves from the registered adapter effective config', () => {
+    const { adapter } = makeTestAdapter({ warmTtlDays: 5 });
+    const store = new TestColdStore({
+      db: 'platform',
+      instanceId: 'a',
+      log: vi.fn(),
+      config: makeConfig(true),
+      s3Client: makeMockS3().client,
+    });
+    store.registerAdapterForTests(adapter);
+
+    expectDaysAgo(store.warmCutoff('run_events'), 5);
+  });
+
+  it('honours a per-table override for a table with no registered adapter', () => {
+    const store = new TestColdStore({
+      db: 'platform',
+      instanceId: 'a',
+      log: vi.fn(),
+      config: makeConfig(true, { execution_runs: { warmTtlDays: 5 } }),
+      s3Client: makeMockS3().client,
+    });
+
+    expectDaysAgo(store.warmCutoff('execution_runs'), 5);
+  });
+
+  it('falls back to DEFAULT_TABLE_CONFIG for an unknown table', () => {
+    const store = new TestColdStore({
+      db: 'platform',
+      instanceId: 'a',
+      log: vi.fn(),
+      config: makeConfig(true),
+      s3Client: makeMockS3().client,
+    });
+
+    expectDaysAgo(store.warmCutoff('no_such_table'), 30);
+  });
+});
+
+describe('fetchRange default toTs', () => {
+  const DAY_MS = 86_400_000;
+
+  /**
+   * Archive one chunk of rows aged `ageDays`, then read it back with no
+   * explicit `toTs`. The store must bound the read at the table's own
+   * resolved cutoff.
+   */
+  async function archiveAgedRows(opts: { ageDays: number; warmTtlDays: number }) {
+    const mock = makeMockS3();
+    const rowTs = new Date(Date.now() - opts.ageDays * DAY_MS);
+    const ymd = rowTs.toISOString().slice(0, 10);
+    const { adapter } = makeTestAdapter({
+      warmTtlDays: opts.warmTtlDays,
+      rows: [{ id: 1, org_id: 'org1', created_at: rowTs.toISOString(), payload: 'a' }],
+      eligiblePartitions: [{ tenantId: 'org1', partitionDate: ymd }],
+    });
+    const store = new TestColdStore({
+      db: 'platform',
+      instanceId: 'a',
+      log: vi.fn(),
+      config: makeConfig(true),
+      s3Client: mock.client,
+    });
+    store.registerAdapterForTests(adapter);
+    await store.runArchiveCycle();
+    return store;
+  }
+
+  it('returns rows archived under a lowered warm TTL — the regression case', async () => {
+    // Rows are 10 days old and the table's resolved TTL is 5 days, so they
+    // are archived AND inside the read window. A reader hardcoding 30 would
+    // bound the read at now-30d and silently drop them.
+    const store = await archiveAgedRows({ ageDays: 10, warmTtlDays: 5 });
+
+    const out: TestRow[] = [];
+    for await (const row of store.fetchRange<TestRow>({
+      db: 'platform',
+      table: 'run_events',
+      tenantId: 'org1',
+      fromTs: new Date(0),
+    })) {
+      out.push(row);
+    }
+    expect(out.map((r) => r.id)).toEqual([1]);
+  });
+
+  it('excludes rows newer than the resolved cutoff', async () => {
+    // Same rows, but a 30-day TTL puts the cutoff at now-30d — the 10-day-old
+    // rows are newer than the bound, so the default correctly excludes them.
+    const store = await archiveAgedRows({ ageDays: 10, warmTtlDays: 30 });
+
+    const out: TestRow[] = [];
+    for await (const row of store.fetchRange<TestRow>({
+      db: 'platform',
+      table: 'run_events',
+      tenantId: 'org1',
+      fromTs: new Date(0),
+    })) {
+      out.push(row);
+    }
+    expect(out).toEqual([]);
+  });
+
+  it('an explicit toTs still wins over the default', async () => {
+    const store = await archiveAgedRows({ ageDays: 10, warmTtlDays: 30 });
+
+    const out: TestRow[] = [];
+    for await (const row of store.fetchRange<TestRow>({
+      db: 'platform',
+      table: 'run_events',
+      tenantId: 'org1',
+      fromTs: new Date(0),
+      toTs: new Date(),
+    })) {
+      out.push(row);
+    }
+    expect(out.map((r) => r.id)).toEqual([1]);
+  });
+
+  it('hasRange and countRange apply the same default', async () => {
+    const store = await archiveAgedRows({ ageDays: 10, warmTtlDays: 5 });
+
+    await expect(
+      store.hasRange({
+        db: 'platform',
+        table: 'run_events',
+        tenantId: 'org1',
+        fromTs: new Date(0),
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      store.countRange({
+        db: 'platform',
+        table: 'run_events',
+        tenantId: 'org1',
+        fromTs: new Date(0),
+      }),
+    ).resolves.toBe(1);
   });
 });

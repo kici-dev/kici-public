@@ -94,6 +94,8 @@ export async function handleApprovalComment(
     commenterUsername,
     commenterUserId,
     provider,
+    repoIdentifier,
+    prNumber,
     orgId,
     identityLinks,
     orgMemberPermissions,
@@ -136,15 +138,25 @@ export async function handleApprovalComment(
     return { handled: false, reason: 'Insufficient ci_trust level' };
   }
 
-  // 4. Find pending security holds for this org
-  const pendingHolds = await heldRunStore.listByQueueType(orgId, 'security', { status: 'pending' });
+  // 4. Find pending security holds for THIS PR (repo + pr_number scoped) so a
+  //    /kici command never releases holds from unrelated PRs (or repos) in the
+  //    org. A hold whose run has a NULL pr_number is excluded by the scoped
+  //    query — fail-closed, we only release holds we can attribute to this PR.
+  const pendingHolds = await heldRunStore.listPendingSecurityHoldsForPr(
+    orgId,
+    repoIdentifier,
+    prNumber,
+  );
 
   if (pendingHolds.length === 0) {
-    logger.info('No pending security holds found', { orgId });
+    logger.info('No pending security holds found for PR', { orgId, repoIdentifier, prNumber });
     return { handled: true };
   }
 
-  // 5. Filter to specific run if provided, otherwise process all pending
+  // 5. Filter to a specific run within this PR's scoped set if a runId was
+  //    given, otherwise process all of the PR's pending holds. Because the set
+  //    is already repo+PR scoped, an explicit runId that belongs to a different
+  //    PR or repo matches nothing here — the explicit path is not a bypass.
   const targetHolds = command.runId
     ? pendingHolds.filter((h) => h.run_id === command.runId)
     : pendingHolds;

@@ -240,4 +240,32 @@ describe('ContributorCache', () => {
       expect(cache.size).toBe(1);
     });
   });
+
+  describe('cluster_settings contributor_cache_ttl_ms', () => {
+    it('applies the cluster override TTL per entry (re-resolves after the override)', async () => {
+      // Tiny override TTL so the entry goes stale within the test.
+      const clusterSettings = {
+        getNumber: async (_col: string, _fallback: number) => 10, // 10ms override
+      } as never;
+      const overrideCache = new ContributorCache({ ttlMs: 3_600_000, clusterSettings });
+      const resolver = createMockResolver();
+      await overrideCache.resolve('github', 'owner/repo', 'u', resolver, {});
+      await new Promise((r) => setTimeout(r, 30)); // past the 10ms override
+      await overrideCache.resolve('github', 'owner/repo', 'u', resolver, {});
+      // A cache hit would keep the count at 1; the expired entry forces a second call.
+      expect(resolver.resolveContributor).toHaveBeenCalledTimes(2);
+    });
+
+    it('falls back to the config default TTL when the cluster value is null (still cached)', async () => {
+      const clusterSettings = {
+        getNumber: async (_col: string, fallback: number) => fallback,
+      } as never;
+      const fallbackCache = new ContributorCache({ ttlMs: 60_000, clusterSettings });
+      const resolver = createMockResolver();
+      await fallbackCache.resolve('github', 'owner/repo', 'u', resolver, {});
+      await new Promise((r) => setTimeout(r, 30)); // well within the 60s default
+      await fallbackCache.resolve('github', 'owner/repo', 'u', resolver, {});
+      expect(resolver.resolveContributor).toHaveBeenCalledTimes(1);
+    });
+  });
 });

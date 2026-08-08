@@ -3,6 +3,10 @@ title: Cluster identity recovery
 description: Recover an orchestrator that refuses to start with a cluster identity mismatch by reconciling the database and the S3 sentinel.
 ---
 
+> This page covers cluster **identity**. For backing up and restoring the
+> orchestrator's **state** (run history, queue, encrypted secrets), see
+> [orchestrator database backup and restore](./db-backup-restore.md).
+
 An orchestrator that uses object storage for its cache stores a **cluster
 identity sentinel** — a small file at `<prefix>/.kici-cluster-id` in the cache
 bucket whose contents are the orchestrator's `cluster_id` (the `cluster_id` row

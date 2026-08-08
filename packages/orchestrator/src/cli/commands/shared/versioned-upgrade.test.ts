@@ -31,6 +31,8 @@ import {
   selectablePickTargets,
   switchToInstalledVersion,
   checkPickFlagConflicts,
+  planNpmSourceUpgrade,
+  installGlobalPackage,
 } from './versioned-upgrade.js';
 import { writeManifest, writeIndex } from '../../service/index.js';
 import type { DiscoveredInstance, InstanceManifest, ServiceManager } from '../../service/index.js';
@@ -435,5 +437,107 @@ describe('checkPickFlagConflicts — --pick mutual exclusivity', () => {
     const msg = checkPickFlagConflicts({ pick: true, from: 'x', rollback: true })!;
     expect(msg).toContain('--from');
     expect(msg).toContain('--rollback');
+  });
+});
+
+describe('planNpmSourceUpgrade', () => {
+  const NODE = '/n/24.15.0/bin/node';
+  const nested = (c: string) =>
+    `/n/24.15.0/lib/node_modules/kici-admin/node_modules/@kici-dev/${c}/dist/server.js`;
+
+  it('self-drives with the resolved target when --version is given', () => {
+    const action = planNpmSourceUpgrade({
+      component: 'orchestrator',
+      spec: { execPath: NODE, args: [nested('orchestrator')] },
+      invoked: '0.1.27',
+      requestedVersion: '0.1.27',
+      restartOnly: false,
+      force: false,
+      windows: false,
+    });
+    expect(action.kind).toBe('self-drive');
+    if (action.kind === 'self-drive') {
+      expect(action.target.owningPackage).toBe('kici-admin');
+      expect(action.version).toBe('0.1.27');
+    }
+  });
+
+  it('errors when self-driving without --version', () => {
+    const action = planNpmSourceUpgrade({
+      component: 'orchestrator',
+      spec: { execPath: NODE, args: [nested('orchestrator')] },
+      invoked: '0.1.27',
+      requestedVersion: undefined,
+      restartOnly: false,
+      force: false,
+      windows: false,
+    });
+    expect(action.kind).toBe('error');
+    if (action.kind === 'error') expect(action.reason).toMatch(/requires --version/);
+  });
+
+  it('errors when self-driving an opaque --binary install', () => {
+    const action = planNpmSourceUpgrade({
+      component: 'orchestrator',
+      spec: { execPath: '/opt/kici/orchestrator', args: [] },
+      invoked: '0.1.27',
+      requestedVersion: '0.1.27',
+      restartOnly: false,
+      force: false,
+      windows: false,
+    });
+    expect(action.kind).toBe('error');
+    if (action.kind === 'error') expect(action.reason).toMatch(/cannot self-install/);
+  });
+
+  it('restart-only returns a verifyNpmSourceLaunch verdict', () => {
+    const action = planNpmSourceUpgrade({
+      component: 'orchestrator',
+      spec: { execPath: NODE, args: [nested('orchestrator')] },
+      invoked: '0.1.27',
+      requestedVersion: undefined,
+      restartOnly: true,
+      force: false,
+      windows: false,
+    });
+    expect(action.kind).toBe('restart-only');
+  });
+});
+
+describe('installGlobalPackage', () => {
+  const target = {
+    nodeExecPath: '/n/bin/node',
+    npmPath: '/n/bin/npm',
+    owningPackage: 'kici-admin',
+  };
+
+  it('runs `<npm> install -g <pkg>@<version>` and reports success', () => {
+    const calls: Array<[string, string[]]> = [];
+    const run = (cmd: string, args: string[]) => {
+      calls.push([cmd, args]);
+      return { status: 0, stderr: '' };
+    };
+    const res = installGlobalPackage(target, '0.1.27', run);
+    expect(res.ok).toBe(true);
+    expect(calls).toEqual([['/n/bin/npm', ['install', '-g', 'kici-admin@0.1.27']]]);
+  });
+
+  it('runs npm under the pinned node by prepending its bin dir to the spawn PATH', () => {
+    let capturedEnv: NodeJS.ProcessEnv | undefined;
+    const run = (_cmd: string, _args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+      capturedEnv = opts?.env;
+      return { status: 0, stderr: '' };
+    };
+    installGlobalPackage(target, '0.1.27', run);
+    // The pinned node's bin dir must be the FIRST PATH entry so npm's
+    // `env node` / wrapper resolves the unit's node, not the shell's active one.
+    expect(capturedEnv?.PATH?.split(path.delimiter)[0]).toBe('/n/bin');
+  });
+
+  it('reports failure with captured stderr on non-zero exit', () => {
+    const run = () => ({ status: 1, stderr: 'npm ERR! code EACCES' });
+    const res = installGlobalPackage(target, '0.1.27', run);
+    expect(res.ok).toBe(false);
+    expect(res.stderr).toMatch(/EACCES/);
   });
 });

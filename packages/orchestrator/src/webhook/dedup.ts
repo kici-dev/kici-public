@@ -1,6 +1,7 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 /**
  * Maximum number of delivery IDs to keep in the in-memory fast-path cache.
@@ -8,7 +9,8 @@ import { toErrorMessage } from '@kici-dev/shared';
 const MAX_MEMORY_CACHE_SIZE = 10_000;
 
 /**
- * Default TTL for dedup cache entries (24 hours in milliseconds).
+ * Cluster-wide fallback TTL for dedup cache entries (24 hours in milliseconds),
+ * used when no ClusterSettingsReader / config default is injected.
  */
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -24,9 +26,24 @@ export class DedupCache {
   private readonly db: Kysely<Database>;
   private readonly memoryCache = new Set<string>();
   private readonly insertionOrder: string[] = [];
+  private readonly clusterSettings?: ClusterSettingsReader;
+  private readonly defaultTtlMs: number;
 
-  constructor(db: Kysely<Database>) {
+  constructor(
+    db: Kysely<Database>,
+    opts?: { clusterSettings?: ClusterSettingsReader; defaultTtlMs?: number },
+  ) {
     this.db = db;
+    this.clusterSettings = opts?.clusterSettings;
+    this.defaultTtlMs = opts?.defaultTtlMs ?? DEFAULT_TTL_MS;
+  }
+
+  /** Resolve the fleet-wide dedup TTL (ms), falling back to the config default. */
+  private async ttlMs(): Promise<number> {
+    return (
+      (await this.clusterSettings?.getNumber('webhook_dedup_ttl_ms', this.defaultTtlMs)) ??
+      this.defaultTtlMs
+    );
   }
 
   /**
@@ -62,7 +79,7 @@ export class DedupCache {
    * Idempotent -- duplicate marks are silently ignored.
    */
   async mark(deliveryId: string): Promise<void> {
-    const expiresAt = new Date(Date.now() + DEFAULT_TTL_MS).toISOString();
+    const expiresAt = new Date(Date.now() + (await this.ttlMs())).toISOString();
 
     try {
       await this.db
@@ -109,7 +126,7 @@ export class DedupCache {
       return false;
     }
 
-    const expiresAt = new Date(Date.now() + DEFAULT_TTL_MS).toISOString();
+    const expiresAt = new Date(Date.now() + (await this.ttlMs())).toISOString();
     const result = await this.db
       .insertInto('dedup_cache')
       .values({

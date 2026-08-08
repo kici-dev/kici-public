@@ -11,7 +11,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createAdminRunRoutes, type AdminRunRoutesDeps } from './admin-runs.js';
+import { RUN_STATUSES, createAdminRunRoutes, type AdminRunRoutesDeps } from './admin-runs.js';
+import { ExecutionJobStatus, ExecutionRunStatus } from '@kici-dev/engine';
 import { RbacEnforcer } from '../secrets/rbac.js';
 import type { Role } from '../secrets/rbac.js';
 import { encrypt, deriveKey } from '@kici-dev/shared';
@@ -26,12 +27,19 @@ function createMockDb() {
   const mockExecuteTakeFirst = vi.fn().mockResolvedValue(undefined);
   const mockExecuteTakeFirstOrThrow = vi.fn().mockResolvedValue({ total: 0 });
 
+  const whereCalls: Array<unknown[]> = [];
+
   const chainMethods: Record<string, any> = {};
   const chain = new Proxy(chainMethods, {
     get(_target, prop) {
       if (prop === 'execute') return mockExecute;
       if (prop === 'executeTakeFirst') return mockExecuteTakeFirst;
       if (prop === 'executeTakeFirstOrThrow') return mockExecuteTakeFirstOrThrow;
+      if (prop === 'where')
+        return (...args: unknown[]) => {
+          whereCalls.push(args);
+          return chain;
+        };
       return () => chain;
     },
   });
@@ -42,6 +50,7 @@ function createMockDb() {
     mockExecute,
     mockExecuteTakeFirst,
     mockExecuteTakeFirstOrThrow,
+    whereCalls,
   };
 }
 
@@ -196,6 +205,17 @@ describe('admin run routes', () => {
       expect(body.error).toContain('Invalid status');
     });
 
+    it('accepts every run status on ?status, including held and cancelling', async () => {
+      // The route-level assertion, not just the constant: `?status=held` used
+      // to be rejected with 400 even though held runs exist, and a test that
+      // only probed the exported set would still pass with the validation loop
+      // deleted.
+      for (const status of ExecutionRunStatus.options) {
+        const res = await request(app, `?status=${status}`, { token: validToken });
+        expect(res.status, `?status=${status} should be accepted`).toBe(200);
+      }
+    });
+
     it('honours ?count=true with count-only response shape', async () => {
       deps.mockDb.mockExecuteTakeFirstOrThrow.mockResolvedValueOnce({ total: 7 });
       const res = await request(
@@ -216,6 +236,18 @@ describe('admin run routes', () => {
       });
       // The count path must NOT query the list of rows.
       expect(deps.mockDb.mockExecute).not.toHaveBeenCalled();
+    });
+
+    it('applies a delivery_id filter when ?deliveryId= is present', async () => {
+      const res = await request(app, '?deliveryId=rk%3Amine', { token: validToken });
+      expect(res.status).toBe(200);
+      // The (url-decoded) delivery id is pushed as an exact-match where clause.
+      expect(deps.mockDb.whereCalls).toContainEqual(['delivery_id', '=', 'rk:mine']);
+    });
+
+    it('does not filter by delivery_id when the param is absent', async () => {
+      await request(app, '', { token: validToken });
+      expect(deps.mockDb.whereCalls.some((c) => c[0] === 'delivery_id')).toBe(false);
     });
   });
 
@@ -659,5 +691,22 @@ describe('admin run routes', () => {
       const res = await request(appNoLog, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
       expect(res.status).toBe(503);
     });
+  });
+});
+
+describe('admin runs status filter', () => {
+  it('accepts every run status, including held and cancelling', () => {
+    for (const status of ExecutionRunStatus.options) {
+      expect(RUN_STATUSES.has(status)).toBe(true);
+    }
+  });
+
+  it('still accepts the job-only statuses it accepted before', () => {
+    expect(RUN_STATUSES.has(ExecutionJobStatus.enum.timed_out_stale)).toBe(true);
+    expect(RUN_STATUSES.has(ExecutionJobStatus.enum.skipped)).toBe(true);
+  });
+
+  it('rejects an unknown status', () => {
+    expect(RUN_STATUSES.has('brand_new_status')).toBe(false);
   });
 });

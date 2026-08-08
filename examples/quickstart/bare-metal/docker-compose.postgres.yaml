@@ -38,7 +38,7 @@ services:
     restart: unless-stopped
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.38
+    image: chrislusf/seaweedfs:4.40
     # S3 gateway on :8333; the static identity lives in seaweedfs-s3.json and
     # the kici-cache bucket is created on first write. Required for
     # `kici run remote` against the native orchestrator on this host.

@@ -5,11 +5,15 @@
  * and metadata fields. Lines are written to the standard log path layout:
  * executions/{runId}/job-{name}/step-{index}.log
  *
- * For filesystem storage, data is appended immediately (no buffering).
- * For S3 storage, the LogStorage backend handles read-concat-put.
+ * Step-log writes go through the high-frequency `appendStreaming` verb: the
+ * filesystem backend appends immediately (no buffering); the S3 backend buffers
+ * per step key and seals immutable append-only segments. `drain(runId)` awaits
+ * the in-flight appends and then finalizes each step path so the S3 tail
+ * segment is sealed before a reader declares the stream complete.
  */
 
 import type { LogStorage } from './log-storage.js';
+import { LogStream } from '@kici-dev/engine';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
 
@@ -38,6 +42,13 @@ export class LogWriter {
    * disk, dropping it from a blocking `kici run remote` follow.
    */
   private readonly pendingAppends = new Map<string, Set<Promise<void>>>();
+  /**
+   * Log paths written for each run, populated in `appendChunk`. `drain(runId)`
+   * finalizes each one so the S3 backend seals its buffered tail segment before
+   * a reader declares the stream complete. The filesystem backend's `finalize`
+   * is a no-op.
+   */
+  private readonly runPaths = new Map<string, Set<string>>();
 
   constructor(deps: LogWriterDeps) {
     this.logStorage = deps.logStorage;
@@ -47,15 +58,35 @@ export class LogWriter {
 
   /**
    * Await every in-flight log append for `runId` that was registered before
-   * this call. Settles even if an append rejected (errors are already logged
-   * by `appendChunk`); the point is ordering, not error propagation. New
-   * appends started after this call are not waited on — a terminal run emits
-   * no further chunks, so the snapshot taken at call time is complete.
+   * this call, then seal each step log's buffered tail segment so the durable
+   * S3 record is complete. Settles even if an append rejected (errors are
+   * already logged by `appendChunk`); the point is ordering, not error
+   * propagation. New appends started after this call are not waited on — a
+   * terminal run emits no further chunks, so the snapshot taken at call time is
+   * complete.
    */
   async drain(runId: string): Promise<void> {
+    // 1) Await every in-flight append first, so all bytes for this run are
+    //    buffered/sealed before we seal the tail. Doing this before finalize
+    //    guarantees the tail seal includes the last in-flight chunk.
     const pending = this.pendingAppends.get(runId);
-    if (!pending || pending.size === 0) return;
-    await Promise.allSettled([...pending]);
+    if (pending && pending.size > 0) await Promise.allSettled([...pending]);
+
+    // 2) Seal each path's buffered tail segment (S3); a no-op on FS.
+    const paths = this.runPaths.get(runId);
+    if (paths) {
+      for (const path of paths) {
+        try {
+          await this.logStorage.finalize(path);
+        } catch (err) {
+          logger.error('Failed to finalize log path', {
+            path,
+            error: toErrorMessage(err),
+          });
+        }
+      }
+      this.runPaths.delete(runId);
+    }
   }
 
   /**
@@ -74,6 +105,8 @@ export class LogWriter {
    * @param timestamp - Timestamp from the agent message (epoch ms)
    * @param jobId - Job ID for observer broadcasting (optional)
    * @param stepName - Step name for observer broadcasting (optional)
+   * @param stream - Which subprocess stream the lines came from. Absent means
+   *   the agent did not report one, which is recorded as `stdout`.
    */
   async appendChunk(
     runId: string,
@@ -83,17 +116,26 @@ export class LogWriter {
     timestamp: number,
     jobId?: string,
     stepName?: string,
+    stream?: LogStream,
   ): Promise<void> {
     if (lines.length === 0) return;
 
     const path = `executions/${runId}/job-${jobName}/step-${stepIndex}.log`;
+    let paths = this.runPaths.get(runId);
+    if (!paths) {
+      paths = new Set();
+      this.runPaths.set(runId, paths);
+    }
+    paths.add(path);
     const isoTimestamp = new Date(timestamp).toISOString();
 
     const jsonlLines = lines.map(
       (line) =>
         JSON.stringify({
           ts: isoTimestamp,
-          level: 'stdout',
+          // An absent stream means the agent could not distinguish the two;
+          // stdout is the reading applied to every such line.
+          level: stream ?? LogStream.enum.stdout,
           msg: line,
           meta: {},
         }) + '\n',
@@ -122,7 +164,7 @@ export class LogWriter {
     // method, so the write would otherwise race the run-status transition.
     const appendPromise = (async () => {
       try {
-        await this.logStorage.append(path, data);
+        await this.logStorage.appendStreaming(path, data);
       } catch (err) {
         logger.error('Failed to append log chunk', {
           path,

@@ -77,6 +77,16 @@ describe('buildMatrixOutputsEnvelope', () => {
     // name order is a, b -> b wins on `v`.
     expect(env.merged).toEqual({ v: '2', only_b: 'yes' });
   });
+
+  it('keeps a child whose matrix value is literally __proto__', () => {
+    // `byMatrix[suffix] = …` would run the inherited setter and drop the child.
+    const env = buildMatrixOutputsEnvelope('test', [
+      { job_name: 'test (__proto__)', parsed: { v: '1' } },
+      { job_name: 'test (linux)', parsed: { v: '2' } },
+    ]);
+    expect(Object.keys(env.byMatrix).sort()).toEqual(['__proto__', 'linux']);
+    expect(env.byMatrix['__proto__']).toEqual({ v: '1' });
+  });
 });
 
 describe('buildHostOutputsEnvelope', () => {
@@ -218,6 +228,56 @@ describe('buildInternalJobConfigForWorkflow dispatchInputs', () => {
     expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
   });
 
+  it('resolves inputs of the schedule that actually fired when several are declared', () => {
+    const wf = {
+      name: 'multi-sched-wf',
+      source: 'test/repo',
+      triggers: [
+        {
+          _type: 'schedule',
+          cronExpression: '0 9 * * 1',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+        },
+        {
+          _type: 'schedule',
+          cronExpression: '0 18 * * 5',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'quick' } },
+        },
+      ],
+    };
+    // Event carries the SECOND schedule's cron → its inputs (default 'quick') win.
+    const cfg = buildInternalJobConfigForWorkflow(wf, job, undefined, {
+      cronExpression: '0 18 * * 5',
+      timezone: 'UTC',
+    });
+    expect(cfg.dispatchInputs).toEqual({ mode: 'quick' });
+  });
+
+  it('falls back to the first schedule when the event carries no cron', () => {
+    const wf = {
+      name: 'multi-sched-wf',
+      source: 'test/repo',
+      triggers: [
+        {
+          _type: 'schedule',
+          cronExpression: '0 9 * * 1',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+        },
+        {
+          _type: 'schedule',
+          cronExpression: '0 18 * * 5',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'quick' } },
+        },
+      ],
+    };
+    const cfg = buildInternalJobConfigForWorkflow(wf, job);
+    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
+  });
+
   it('omits dispatchInputs for a non-schedule internal event workflow', () => {
     const wf = {
       name: 'wc-wf',
@@ -226,5 +286,20 @@ describe('buildInternalJobConfigForWorkflow dispatchInputs', () => {
     };
     const cfg = buildInternalJobConfigForWorkflow(wf, job);
     expect('dispatchInputs' in cfg).toBe(false);
+  });
+
+  it('propagates a job container image so it selects the container backend on the agent', () => {
+    const wf = { name: 'ctr-wf', source: 'test/repo', triggers: [] };
+    const containerJob = { name: 'j', steps: [], needs: [], container: 'node:20' };
+    const cfg = buildInternalJobConfigForWorkflow(wf, containerJob);
+    // Without this the agent's determineExecutionMode never sees the field and
+    // a container:-field job silently runs bare-metal.
+    expect(cfg.container).toBe('node:20');
+  });
+
+  it('omits container when the job has none', () => {
+    const wf = { name: 'plain-wf', source: 'test/repo', triggers: [] };
+    const cfg = buildInternalJobConfigForWorkflow(wf, job);
+    expect('container' in cfg).toBe(false);
   });
 });

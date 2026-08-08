@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { formatRefusal, listInstances, resolveInstance, type ListedInstance } from './resolve.js';
+import {
+  formatRefusal,
+  InstanceNotFoundError,
+  listInstances,
+  resolveInstance,
+  type ListedInstance,
+} from './resolve.js';
 import { writeManifest } from './manifest.js';
 import { writeIndex } from './index-file.js';
 import type { InstanceManifest, IndexEntry } from './types.js';
@@ -223,6 +229,38 @@ describe('resolveInstance — priority order', () => {
           isUserLevel: true,
         }),
       ).rejects.toThrow(/does-not-exist.*not found.*kici-existing/is);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('--name not found throws a typed InstanceNotFoundError carrying component + name', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-r-'));
+    try {
+      const err = await resolveInstance({
+        component: 'orchestrator',
+        opts: { name: 'does-not-exist' },
+        cwd: '/elsewhere',
+        kiciRoot: root,
+        manager: fakeManager([
+          {
+            name: 'kici-existing',
+            platform: 'systemd',
+            isUserLevel: true,
+            component: 'orchestrator',
+          },
+        ]),
+        isUserLevel: true,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(InstanceNotFoundError);
+      const e = err as InstanceNotFoundError;
+      expect(e.component).toBe('orchestrator');
+      expect(e.instanceName).toBe('does-not-exist');
+      // Message is preserved (still lists candidates).
+      expect(e.message).toMatch(/does-not-exist.*not found.*kici-existing/is);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

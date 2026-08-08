@@ -37,7 +37,11 @@ const SAMPLE_HOT_1: SecretAuditLogRow = {
   timestamp: new Date(),
 } as SecretAuditLogRow;
 
-function makeColdStoreMock(opts: { rows?: SecretAuditLogRow[]; throwOnFetch?: Error }): {
+function makeColdStoreMock(opts: {
+  rows?: SecretAuditLogRow[];
+  throwOnFetch?: Error;
+  warmCutoff?: Date;
+}): {
   coldStore: ColdStore;
   fetchRange: ReturnType<typeof vi.fn>;
 } {
@@ -56,7 +60,9 @@ function makeColdStoreMock(opts: { rows?: SecretAuditLogRow[]; throwOnFetch?: Er
     }
     return gen();
   });
-  return { coldStore: { fetchRange } as unknown as ColdStore, fetchRange };
+  // 30 days is `minSecretAuditLogWarmDays()` — the value the adapter archives at.
+  const warmCutoff = vi.fn(() => opts.warmCutoff ?? new Date(Date.now() - 30 * 86_400_000));
+  return { coldStore: { fetchRange, warmCutoff } as unknown as ColdStore, fetchRange };
 }
 
 /**

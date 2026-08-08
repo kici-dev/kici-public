@@ -1,26 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { $ as zx$ } from 'zx';
-import type {
-  StepContext,
-  Logger,
-  WorkflowInfo,
-  JobInfo,
-  MatrixValues,
-  StepSecretsFileHost,
-} from '@kici-dev/sdk';
-import { createStepSecrets, resolveStepOutputs, resolveJobOutputs } from '@kici-dev/sdk';
-import { initZx } from '@kici-dev/core';
+import type { StepContext, WorkflowInfo, JobInfo, MatrixValues, Logger } from '@kici-dev/sdk';
+import { createTestStepContext } from '@kici-dev/sdk/testing';
 import { formatter } from './output-formatter.js';
 
-// Initialize zx for cross-platform execution (module-level, runs once on import).
-// initZx() mutates the zx global's defaults (verbose / prefix / etc.); those
-// defaults propagate into scoped shells built via zx$({ ... }) below.
-initZx();
-
 /**
- * Create a logger that prefixes output with job name.
+ * Create a logger that prefixes output with the job name.
  */
 function createTestLogger(jobName: string): Logger {
   return {
@@ -46,14 +29,33 @@ function createTestLogger(jobName: string): Logger {
   };
 }
 
+/** Handle returned by {@link createStepContext}. */
+export interface LocalStepContext {
+  /** The built step context, threaded into every step of the job. */
+  ctx: StepContext;
+  /**
+   * Drain the job's temp scope (and secrets state). Call once at job end —
+   * success, failure, or throw — to reclaim every `ctx.mktemp`/`ctx.mktempFile`
+   * allocation the job made. Delegates to the shared builder's `dispose`.
+   */
+  dispose: () => Promise<void>;
+}
+
 /**
  * Create a step context for local test execution.
  *
- * `repoRoot` pins `ctx.$` to the workflow's repository root so steps running
- * via local-dispatch behave the same as on the agent path (see
+ * `repoRoot` pins `ctx.$` to the workflow's repository root so steps running via
+ * local-dispatch behave the same as on the agent path (see
  * `packages/agent/src/execution/sandbox/workflow-runner.ts`). Without this,
- * `ctx.$` would inherit `process.cwd()` — i.e. wherever the user invoked
- * `kici` — which silently breaks any step that uses relative paths.
+ * `ctx.$` would inherit `process.cwd()` — i.e. wherever the user invoked `kici`
+ * — which silently breaks any step that uses relative paths.
+ *
+ * This is a thin adapter over the shared `@kici-dev/sdk/testing` builder — the
+ * single source of truth for constructing a test step context — supplying the
+ * local runner's formatter-backed logger. The shared builder owns the
+ * job-scoped temp allocator backing `ctx.mktemp`/`ctx.mktempFile`; the returned
+ * `dispose` surfaces its drain so the caller (`executeJob`) can reclaim the
+ * job's temp dirs at job end rather than only via the exit backstop.
  */
 export function createStepContext(
   workflowInfo: WorkflowInfo,
@@ -67,176 +69,20 @@ export function createStepContext(
   provider?: string,
   dispatchInputs: Readonly<Record<string, string | number | boolean | null>> = {},
   signal: AbortSignal = new AbortController().signal,
-): StepContext {
-  const flat = testSecrets?.flat ?? {};
-  const namespacedSecrets = testSecrets?.contexts ?? {};
-
-  // Auto-flatten context secrets into flat (same merge logic as workflow-runner)
-  const mergedFlat: Record<string, string> = { ...flat };
-  for (const contextSecrets of Object.values(namespacedSecrets)) {
-    Object.assign(mergedFlat, contextSecrets);
-  }
-
-  const env = { ...process.env } as Record<string, string | undefined>;
-
-  // zx$({...}) returns a Shell<...> (a plain callable), not the proxy type the
-  // StepContext expects. The agent path does the same cast (see
-  // `packages/agent/src/execution/sandbox/workflow-runner.ts`).
-  const scoped$ = zx$({ cwd: repoRoot }) as unknown as typeof zx$;
-
-  // Per-step tmpdir for ctx.secrets.mountFile / exposeFile. Allocated lazily on
-  // first use so steps that never mount pay nothing. The accompanying cleanup
-  // closure is wired into createStepSecrets() and runs from the test runner's
-  // step-completion path (see `runStepWithSecretsDispose` callers below if any
-  // are added; for now the test runner does not call dispose -- callers
-  // creating contexts via this factory should call `secretsHandle.dispose()`
-  // themselves when the step ends).
-  let tmpdirPath: string | null = null;
-  const exposedEnvVars = new Set<string>();
-  let mountCounter = 0;
-  // Auto-cleanup on process exit so the test runner doesn't leak tmpdirs.
-  // Production agent path wires explicit per-step `dispose()` via the
-  // step-loop's finally; the test runner re-uses one context per job, so
-  // the cleanest hook is `process.on('exit')` here. Best-effort -- rmSync
-  // with `{ force: true }` cannot throw on a missing path. The handler is
-  // registered LAZILY (on first mount) so jobs that never mount don't add
-  // an exit listener (each job calls createStepContext; without the lazy
-  // guard the test runner would trip Node's MaxListeners warning at scale).
-  let exitHandlerRegistered = false;
-  const onProcessExit = (): void => {
-    for (const envVar of exposedEnvVars) {
-      delete env[envVar];
-      delete process.env[envVar];
-    }
-    exposedEnvVars.clear();
-    if (tmpdirPath !== null) {
-      try {
-        rmSync(tmpdirPath, { recursive: true, force: true });
-      } catch {
-        // Swallow -- exit handlers must not throw.
-      }
-      tmpdirPath = null;
-    }
-  };
-  const fileHost: StepSecretsFileHost = {
-    async writeMountedFile(args) {
-      if (tmpdirPath === null) {
-        tmpdirPath = mkdtempSync(join(tmpdir(), 'kici-secret-files-'));
-      }
-      if (!exitHandlerRegistered) {
-        process.once('exit', onProcessExit);
-        exitHandlerRegistered = true;
-      }
-      mountCounter += 1;
-      const filename = args.name ?? `secret-${mountCounter}`;
-      const filePath = join(tmpdirPath, filename);
-      writeFileSync(filePath, args.content);
-      chmodSync(filePath, args.mode);
-      return filePath;
-    },
-    trackExposedEnv(envVar: string) {
-      exposedEnvVars.add(envVar);
-    },
-  };
-  const secretsHandle = createStepSecrets(mergedFlat, env, undefined, {
-    host: fileHost,
-    cleanup: async () => {
-      if (exitHandlerRegistered) {
-        process.off('exit', onProcessExit);
-        exitHandlerRegistered = false;
-      }
-      onProcessExit();
-    },
-  });
-
-  return {
-    $: scoped$,
-    log: createTestLogger(jobInfo.name),
-    signal,
-    env,
-    setEnv: (key: string, value: string) => {
-      env[key] = value;
-      process.env[key] = value;
-    },
-    addPath: (dir: string) => {
-      const current = env.PATH ?? process.env.PATH ?? '';
-      const updated = `${dir}:${current}`;
-      env.PATH = updated;
-      process.env.PATH = updated;
-    },
-    inputs,
-    dispatchInputs,
+): LocalStepContext {
+  const { ctx, dispose } = createTestStepContext({
     workflow: workflowInfo,
     job: jobInfo,
-    matrix,
-    isTestRun: false,
-    context,
-    ...(rawPayload && { rawPayload }),
-    ...(provider && { provider }),
-    secrets: secretsHandle.secrets,
-    emit: async () => {
-      // No-op in local test runner -- events are not routed locally
-      return { deliveryId: 'local-test-noop' };
-    },
-    outputsOf: <T>(ref: { _tag: 'Step'; name: string } | ((...args: any[]) => any)): T => {
-      return resolveStepOutputs<T>(ref as any);
-    },
-    jobOutputs: (ref: { name: string }): Record<string, unknown> => {
-      return resolveJobOutputs(ref);
-    },
-    setSecretOutput: () => {
-      // No-op in local test runner -- secret outputs require orchestrator infrastructure
-    },
-    kici: {
-      infrastructure: {
-        list: () => Promise.resolve({ scalers: [], agents: [] }),
-      },
-      inventory: {
-        // The host roster is orchestrator-cluster state; the local test runner
-        // has no cluster, so it reports an empty roster.
-        query: () => Promise.resolve([]),
-        get: () => Promise.resolve(null),
-      },
-      oidc: {
-        // OIDC ID tokens require the orchestrator->Platform mint relay, which
-        // is not available in the local test runner.
-        token: () =>
-          Promise.reject(
-            new Error('ctx.kici.oidc.token() is not available in the local test runner'),
-          ),
-      },
-      host: {
-        // Host reboot runs on the agent's own host via the orchestrator; the
-        // local test runner has no host to reboot.
-        requestReboot: () =>
-          Promise.reject(
-            new Error('ctx.kici.host.requestReboot() is not available in the local test runner'),
-          ),
-      },
-      bootstrap: {
-        // Bring-up requires an ops agent + orchestrator; neither exists in the
-        // local test runner.
-        ensureInitRunner: () =>
-          Promise.reject(
-            new Error(
-              'ctx.kici.bootstrap.ensureInitRunner() is not available in the local test runner',
-            ),
-          ),
-        preBootSend: () =>
-          Promise.reject(
-            new Error('ctx.kici.bootstrap.preBootSend() is not available in the local test runner'),
-          ),
-      },
-    },
-    cache: {
-      // No-op in local test runner -- the user-facing cache requires
-      // orchestrator object-storage infrastructure not available locally.
-      restore: async () => ({ hit: false }),
-      save: async () => {},
-    },
-    // Provenance attestation requires the orchestrator->Platform mint relay and
-    // object storage, neither of which is available in the local test runner.
-    attestProvenance: () =>
-      Promise.reject(new Error('ctx.attestProvenance() is not available in the local test runner')),
-  };
+    repoRoot,
+    inputs,
+    dispatchInputs,
+    signal,
+    log: createTestLogger(jobInfo.name),
+    secrets: testSecrets,
+    ...(matrix !== undefined && { matrix }),
+    ...(context !== undefined && { context }),
+    ...(rawPayload !== undefined && { rawPayload }),
+    ...(provider !== undefined && { provider }),
+  });
+  return { ctx, dispose };
 }

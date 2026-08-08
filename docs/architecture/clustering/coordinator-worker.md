@@ -76,7 +76,7 @@ Workers do not have a local job queue. When a worker receives `job.reroute`:
 
 The coordinator tracks NAK count per peer with backoff. After repeated NAKs from the same peer, the coordinator deprioritizes that peer temporarily.
 
-If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the worker fails the job and reports failure to the coordinator. No return-for-rerouting after ACK.
+If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the coordinator re-dispatches the job (to another peer or locally) rather than stranding the run. A bounded post-ACK spawn window backstops this: the first progress from the accepting peer disarms it, and a worker-relayed provisioning failure re-dispatches immediately. The re-dispatch, the disarm, and a job's terminal cleanup are all keyed to the peer the job is tracked against, so a stale signal relayed for the same job by a superseded peer (after an earlier re-dispatch moved it) is ignored — it cannot bounce the healthy replacement, wrongly mark the run finished, or strip the replacement's spawn-window backstop.
 
 ## Reliable terminal-status relay
 
@@ -106,10 +106,13 @@ Locally dispatched jobs (`rerouted_to_peer = NULL`) are never deferred — recov
 Workers relay log chunks to the coordinator in real-time:
 
 ```
-Agent --> Worker (log.chunk) --> Coordinator (stepLogBuffer) --> Platform --> Dashboard
+Agent --> Worker (log.chunk) --> Coordinator (peer.log.chunk) --> log storage
+                                                              \-> Platform --> Dashboard
 ```
 
-Log chunk relay is fire-and-forget (no ACK required). Some log loss is acceptable for real-time relay -- logs are buffered and flushed to storage by the coordinator.
+A worker owns no log storage. The coordinator that dispatched the job persists every relayed chunk under `executions/{runId}/job-{name}/step-{index}.log`, keyed by the same job name that fills the step's `log_path`, and forwards it to the Platform for browser fan-out — so a worker-dispatched job's logs are stored and viewable exactly like a locally-dispatched one's, with the originating stream (`stdout` / `stderr`) preserved per line. The coordinator also feeds a short in-memory tail used by check-run summaries.
+
+Log chunk relay is fire-and-forget (no ACK required). Some log loss is acceptable for real-time relay.
 
 ## Cache relay
 
@@ -148,7 +151,9 @@ Future protocol versions are always accepted (minimum-version semantics, not exa
 Above the protocol version baseline, individual features are negotiated via capability flags:
 
 - **Peer capabilities** (`peerCapabilitiesSchema`): exchanged in `peer.auth.response` and `peer.heartbeat`. Current flags: `s3LogAccess`, `logRoutingOverride`.
-- **Platform/orchestrator capabilities** (`orchCapabilitiesSchema`, `platformCapabilitiesSchema`): exchanged in `auth.request` and `auth.success`.
+- **Orchestrator capabilities** (`orchCapabilitiesSchema`): sent in `auth.request`.
+- **Platform capabilities** (`platformCapabilitiesSchema`): advertised once after authentication as a standalone `platform.capabilities` message, not as a field on `auth.success`. A self-hosted orchestrator can run ahead of the hosted Platform, so it pre-flight-checks its own feature-gated sends against what the Platform advertises.
+- **Orchestrator to agent capabilities** (`orchAgentCapabilitiesSchema`): advertised on `register.ack`, so the agent learns which optional agent-facing features this orchestrator build supports.
 
 Schemas use `.passthrough()` so newer peers sending unknown flags don't get stripped. Missing flags default to `false` (unsupported).
 

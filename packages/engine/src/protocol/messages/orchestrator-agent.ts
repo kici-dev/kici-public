@@ -1,7 +1,9 @@
 import { z } from 'zod';
+import { LogStream } from './log-stream.js';
 
-import { approverClauseSchema } from '../../approval/types.js';
+import { approverClauseSchema, approvalTimeoutSecondsSchema } from '../../approval/types.js';
 import { dsseEnvelopeSchema } from '../../provenance/dsse.js';
+import { orchAgentCapabilitiesSchema } from './capabilities.js';
 import {
   ExecutionJobStatus,
   ExecutionStepStatus,
@@ -106,6 +108,12 @@ export const jobDispatchSchema = z
     namespacedSecrets: z.record(z.string(), z.record(z.string(), z.string())).optional(),
     /** Max log size per step in bytes. Agent falls back to its own config default (10MB). */
     maxLogSizeBytes: z.coerce.number().optional(),
+    /**
+     * Orchestrator-resolved concurrency-slot wait timeout (ms), from the
+     * fleet-wide `cluster_settings.concurrency_wait_timeout_ms`. Agent falls
+     * back to its own env/config default (1h) when absent (older orchestrators).
+     */
+    concurrencyWaitTimeoutMs: z.coerce.number().optional(),
     /** URL or file:// path to a pre-packed `.kici/` source tarball. If present, agent extracts it into workDir instead of cloning the repo. */
     sourceTarUrl: z.string().optional(),
     /** SHA-256 hash of the source tarball bytes for integrity verification on download. */
@@ -228,6 +236,12 @@ export const registerAckSchema = z.object({
    * KICI_SCALER_PENDING_DISPATCH_TIMEOUT (default 60s) acts as a safety net.
    */
   pendingDispatch: z.boolean().optional(),
+  /**
+   * Optional agent-facing capabilities this orchestrator supports (absent on
+   * pre-capability orchestrators). The agent reads it to decide whether to
+   * await optional acks like `artifacts.upload.complete.ack`.
+   */
+  capabilities: orchAgentCapabilitiesSchema.optional(),
 });
 
 // --- Agent -> Orchestrator messages ---
@@ -378,6 +392,11 @@ export const agentLogChunkSchema = z.object({
   stepIndex: z.number(),
   lines: z.array(z.string()),
   timestamp: z.number(),
+  /**
+   * Which stream these lines came from. Optional for backward compatibility
+   * with agents that do not send it; absent is read as `stdout`.
+   */
+  stream: LogStream.optional(),
 });
 
 /** Step-level execution state report (agent -> orchestrator). */
@@ -634,6 +653,157 @@ export const provenanceUploadDeferSchema = z.object({
   publicKey: z.record(z.string(), z.unknown()),
 });
 
+// --- User-facing artifacts protocol (ctx.artifacts.upload/download) ---
+
+/**
+ * Outcome of an artifact upload grant: the orchestrator either mints a
+ * presigned PUT (`granted`) or refuses with a named reason (`rejected`).
+ */
+export const ArtifactUploadOutcome = z.enum(['granted', 'rejected']);
+export type ArtifactUploadOutcome = z.infer<typeof ArtifactUploadOutcome>;
+
+/**
+ * Why an artifact upload was refused. Each value maps to an enforcement gate
+ * checked BEFORE a presigned PUT is minted; the agent surfaces the reason
+ * verbatim in the step error.
+ */
+export const ArtifactRejectReason = z.enum(['duplicate_name', 'size_cap', 'run_cap', 'org_quota']);
+export type ArtifactRejectReason = z.infer<typeof ArtifactRejectReason>;
+
+/** Outcome of an artifact download lookup: the named artifact exists or not. */
+export const ArtifactDownloadOutcome = z.enum(['found', 'not_found']);
+export type ArtifactDownloadOutcome = z.infer<typeof ArtifactDownloadOutcome>;
+
+/** Agent -> Orchestrator: request a presigned PUT for a named artifact upload. */
+export const artifactsUploadRequestSchema = z.object({
+  type: z.literal('artifacts.upload.request'),
+  messageId: z.string(),
+  /** Job producing the artifact (ownership-checked; run + org resolved server-side). */
+  jobId: z.string(),
+  /** Artifact name (immutability + storage-key discriminator within the run). */
+  name: z.string(),
+  /** Packed tarball size in bytes — drives the size/run/quota enforcement gates. */
+  declaredSizeBytes: z.number().int().nonnegative(),
+});
+
+/**
+ * Orchestrator -> Agent: a presigned PUT (`granted`) or a named refusal
+ * (`rejected`). All enforcement (duplicate name, per-artifact/per-run cap, org
+ * quota) happens before minting, so a `granted` URL is safe to upload to.
+ */
+export const artifactsUploadResponseSchema = z.object({
+  type: z.literal('artifacts.upload.response'),
+  requestId: z.string(),
+  outcome: ArtifactUploadOutcome,
+  /** Presigned PUT URL. Present only on `granted`. */
+  uploadUrl: z.string().optional(),
+  /** Final storage key the agent echoes back on complete. Present only on `granted`. */
+  storageKey: z.string().optional(),
+  /** Enforcement-gate refusal reason. Present only on `rejected` at an enforcement gate. */
+  reason: ArtifactRejectReason.optional(),
+  /**
+   * Failure detail. Present only on `rejected` when no enforcement `reason`
+   * applies — the requested name violates the artifact-name contract, artifact
+   * uploads are not configured on the orchestrator, the job's run could not be
+   * resolved, the job is not owned by this agent, or the orchestrator hit an
+   * internal error. A safe, fixed,
+   * human-readable string; never a raw exception. Older agents ignore the field
+   * and fall back to a generic rejection message.
+   */
+  error: z.string().optional(),
+});
+
+/** Agent -> Orchestrator: confirm an artifact upload finished; records the DB row. */
+export const artifactsUploadCompleteSchema = z.object({
+  type: z.literal('artifacts.upload.complete'),
+  messageId: z.string(),
+  jobId: z.string(),
+  name: z.string(),
+  /**
+   * Packed tarball size in bytes.
+   *
+   * @deprecated Advisory only — the orchestrator reads the real object size back
+   * from storage and records that instead. Still sent for backward compatibility
+   * with older orchestrators; removed at v1.0.0.
+   */
+  sizeBytes: z.number().int().nonnegative(),
+  /** SHA-256 (hex) of the tarball bytes. */
+  sha256: z.string(),
+  /**
+   * Storage key echoed from the grant response.
+   *
+   * @deprecated Ignored server-side — the orchestrator derives the storage key
+   * from the server-resolved run and artifact name. Still sent for backward
+   * compatibility with older orchestrators; removed at v1.0.0.
+   */
+  storageKey: z.string(),
+});
+
+/**
+ * Outcome the orchestrator reports for an artifact commit: the DB row was
+ * written (`committed`) or the commit could not be completed (`failed`).
+ */
+export const ArtifactCompleteAckOutcome = z.enum(['committed', 'failed']);
+export type ArtifactCompleteAckOutcome = z.infer<typeof ArtifactCompleteAckOutcome>;
+
+/**
+ * Orchestrator -> Agent: the outcome of committing an
+ * `artifacts.upload.complete`. Sent by orchestrators that advertise the
+ * `artifactCompleteAck` capability on `register.ack`; the agent awaits it and
+ * fails the workflow step on `failed`/timeout, so a lost commit surfaces as a
+ * failed step instead of a green run with a missing artifact. `requestId`
+ * echoes the complete message's `messageId`.
+ */
+export const artifactsUploadCompleteAckSchema = z.object({
+  type: z.literal('artifacts.upload.complete.ack'),
+  requestId: z.string(),
+  outcome: ArtifactCompleteAckOutcome,
+  /**
+   * Failure detail — present only on `failed`. A safe, fixed, human-readable
+   * string classifying the failure: artifact uploads are not configured, the
+   * job's run could not be resolved, the job is not owned by this agent, the
+   * uploaded object was missing at commit time, the name violates the
+   * artifact-name contract, or the commit failed internally.
+   */
+  reason: z.string().optional(),
+});
+
+/** Agent -> Orchestrator: request a presigned GET for a named artifact of this run. */
+export const artifactsDownloadRequestSchema = z.object({
+  type: z.literal('artifacts.download.request'),
+  messageId: z.string(),
+  /** Job requesting the download (ownership-checked; run resolved server-side). */
+  jobId: z.string(),
+  /** Artifact name to resolve within the run. */
+  name: z.string(),
+});
+
+/**
+ * Orchestrator -> Agent: presigned GET + size/sha256 for the named artifact, or
+ * `not_found` when the run never uploaded an artifact by that name.
+ */
+export const artifactsDownloadResponseSchema = z.object({
+  type: z.literal('artifacts.download.response'),
+  requestId: z.string(),
+  outcome: ArtifactDownloadOutcome,
+  /** Presigned GET URL. Present only on `found`. */
+  downloadUrl: z.string().optional(),
+  /** Artifact size in bytes. Present only on `found`. */
+  sizeBytes: z.number().int().nonnegative().optional(),
+  /** SHA-256 (hex) of the tarball bytes for integrity verification. Present only on `found`. */
+  sha256: z.string().optional(),
+  /**
+   * Internal-failure detail. Present only on `not_found` when the outcome
+   * reflects an orchestrator failure — artifact downloads are not configured,
+   * the job's run could not be resolved, the job is not owned by this agent, or
+   * the orchestrator hit an internal error — rather than a genuinely missing
+   * artifact. A safe, fixed,
+   * human-readable string; never a raw exception. Older agents ignore the field
+   * and render the plain not-found message.
+   */
+  error: z.string().optional(),
+});
+
 // --- Event emit protocol (custom event emission from workflow steps) ---
 
 /** Agent -> Orchestrator: emit a custom event from a running workflow step. */
@@ -819,7 +989,7 @@ export const stepApprovalRequestSchema = z.object({
    * Absent ⇒ the orchestrator uses the org-default `approval_expiry_seconds`.
    * The orchestrator owns the authoritative `expiresAt` computation.
    */
-  timeoutSeconds: z.number().int().positive().optional(),
+  timeoutSeconds: approvalTimeoutSecondsSchema.optional(),
   /** Computed drift payload, present only for `when: 'drift'` gates. */
   payload: stepApprovalPayloadSchema.optional(),
 });
@@ -856,6 +1026,9 @@ export const orchestratorToAgentMessageSchema = z.discriminatedUnion('type', [
   cacheUserRestoreResponseSchema,
   cacheUserSaveResponseSchema,
   provenanceUploadResponseSchema,
+  artifactsUploadResponseSchema,
+  artifactsUploadCompleteAckSchema,
+  artifactsDownloadResponseSchema,
   eventEmitResponseSchema,
   agentApiResponseSchema,
   agentAuthSuccessSchema,
@@ -885,6 +1058,9 @@ export const agentToOrchestratorMessageSchema = z.discriminatedUnion('type', [
   provenanceUploadRequestSchema,
   provenanceUploadCompleteSchema,
   provenanceUploadDeferSchema,
+  artifactsUploadRequestSchema,
+  artifactsUploadCompleteSchema,
+  artifactsDownloadRequestSchema,
   eventEmitSchema,
   agentApiRequestSchema,
   agentMetricsSchema,
@@ -913,6 +1089,12 @@ export type ProvenanceUploadRequest = z.infer<typeof provenanceUploadRequestSche
 export type ProvenanceUploadResponse = z.infer<typeof provenanceUploadResponseSchema>;
 export type ProvenanceUploadComplete = z.infer<typeof provenanceUploadCompleteSchema>;
 export type ProvenanceUploadDefer = z.infer<typeof provenanceUploadDeferSchema>;
+export type ArtifactsUploadRequest = z.infer<typeof artifactsUploadRequestSchema>;
+export type ArtifactsUploadResponse = z.infer<typeof artifactsUploadResponseSchema>;
+export type ArtifactsUploadComplete = z.infer<typeof artifactsUploadCompleteSchema>;
+export type ArtifactsUploadCompleteAck = z.infer<typeof artifactsUploadCompleteAckSchema>;
+export type ArtifactsDownloadRequest = z.infer<typeof artifactsDownloadRequestSchema>;
+export type ArtifactsDownloadResponse = z.infer<typeof artifactsDownloadResponseSchema>;
 export type FleetLogsRequest = z.infer<typeof fleetLogsRequestSchema>;
 export type FleetBundleChunk = z.infer<typeof fleetBundleChunkSchema>;
 export type FleetBundleError = z.infer<typeof fleetBundleErrorSchema>;

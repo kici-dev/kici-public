@@ -2,7 +2,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
-import type { Job, Step, Workflow, Rule } from '@kici-dev/sdk';
+import type { Job, Step, Workflow, Rule, StepContext } from '@kici-dev/sdk';
 import {
   setStepOutputsMap as setStepOutputsMapLocal,
   setStepRefMap as setStepRefMapLocal,
@@ -85,16 +85,13 @@ interface WorkflowResult {
   durationMs: number;
   jobs: JobResult[];
   ruleResults?: RuleResult[];
+  error?: Error;
 }
 
 /**
  * Execute a single step.
  */
-async function executeStep(
-  step: Step,
-  ctx: ReturnType<typeof createStepContext>,
-  jobName: string,
-): Promise<StepResult> {
+async function executeStep(step: Step, ctx: StepContext, jobName: string): Promise<StepResult> {
   formatter.logStepStart(jobName, step.name);
   const startTime = Date.now();
 
@@ -146,12 +143,31 @@ export async function executeJob(
   // Evaluate job rules first
   let ruleResults: RuleResult[] | undefined;
   if (job.rules && job.rules.length > 0) {
-    const ruleContext = createRuleContext(event as EventPayload, event.changedFiles);
+    const ruleContext = createRuleContext({
+      event: event as EventPayload,
+      changedFiles: event.changedFiles,
+      changedFilesStatus: event.changedFilesStatus ?? 'fetched',
+    });
     const ruleEval = await evaluateRules(job.rules, ruleContext, job.name);
     ruleResults = ruleEval.results;
 
     if (!ruleEval.allPassed) {
       const durationMs = Date.now() - startTime;
+      // A rule's check() threw -- fail the job (non-zero test-runner result) so
+      // the crash surfaces rather than silently skipping. A clean return false
+      // still skips.
+      if (ruleEval.evaluationError) {
+        return {
+          name: job.name,
+          status: 'failure',
+          durationMs,
+          steps: [],
+          ruleResults,
+          error: new Error(
+            `rule '${ruleEval.evaluationError.label}' errored: ${ruleEval.evaluationError.message}`,
+          ),
+        };
+      }
       return {
         name: job.name,
         status: 'skipped',
@@ -172,8 +188,11 @@ export async function executeJob(
   setStepOutputsMapLocal(outputsMap);
   setStepRefMapLocal(refMap);
 
-  // Create step context
-  const ctx = createStepContext(
+  // Create step context. The shared builder owns the job-scoped temp allocator
+  // backing `ctx.mktemp`/`ctx.mktempFile`; `dispose` drains it (and secrets
+  // state) at job end. This path runs no job-end hooks, so the drain is wired
+  // directly via the `finally` below rather than through a hook.
+  const { ctx, dispose } = createStepContext(
     { name: workflowName },
     {
       name: job.name,
@@ -188,59 +207,75 @@ export async function executeJob(
     event.provider,
   );
 
-  // Execute steps sequentially
-  let stepCounter = 0;
-  for (const stepOrFn of job.steps) {
-    // Normalize bare functions to Step-like objects
-    let normalizedStep: Step;
-    if (typeof stepOrFn === 'function') {
-      stepCounter++;
-      const name = `step-${stepCounter}`;
-      refMap.set(stepOrFn, name);
-      normalizedStep = {
-        _tag: 'Step' as const,
-        name,
-        run: stepOrFn,
-      } as Step;
-    } else {
-      normalizedStep = stepOrFn as Step;
-      // Only increment counter for unnamed steps
-      if (!normalizedStep.name) stepCounter++;
-    }
-    const result = await executeStep(normalizedStep, ctx, job.name);
+  try {
+    // Execute steps sequentially
+    let stepCounter = 0;
+    for (const stepOrFn of job.steps) {
+      // Normalize bare functions to Step-like objects
+      let normalizedStep: Step;
+      if (typeof stepOrFn === 'function') {
+        stepCounter++;
+        const name = `step-${stepCounter}`;
+        refMap.set(stepOrFn, name);
+        normalizedStep = {
+          _tag: 'Step' as const,
+          name,
+          run: stepOrFn,
+        } as Step;
+      } else {
+        normalizedStep = stepOrFn as Step;
+        // Assign the counter name onto the ORIGINAL object (not a clone) so the
+        // SDK's late-bound .result proxy resolves, and so each id-less step gets
+        // a distinct step-N key in outputsMap. This loop iterates each step object
+        // once, so mutating it in place is sufficient (no repeat-encounter clone).
+        if (!normalizedStep.name) {
+          stepCounter++;
+          (normalizedStep as { name: string }).name = `step-${stepCounter}`;
+        }
+      }
+      const result = await executeStep(normalizedStep, ctx, job.name);
 
-    // Store successful step outputs in the map for .result proxy resolution
-    if (result.status === 'success' && result.outputs != null) {
-      outputsMap.set(normalizedStep.name, result.outputs);
-    }
-    stepResults.push(result);
+      // Store successful step outputs in the map for .result proxy resolution
+      if (result.status === 'success' && result.outputs != null) {
+        outputsMap.set(normalizedStep.name, result.outputs);
+      }
+      stepResults.push(result);
 
-    // Fail fast on step failure
-    if (result.status === 'failure') {
-      const durationMs = Date.now() - startTime;
-      formatter.logJobFailure(job.name, durationMs, result.error!);
+      // Fail fast on step failure
+      if (result.status === 'failure') {
+        const durationMs = Date.now() - startTime;
+        formatter.logJobFailure(job.name, durationMs, result.error!);
 
-      return {
-        name: job.name,
-        status: 'failure',
-        durationMs,
-        steps: stepResults,
-        ruleResults,
-        error: result.error,
-      };
+        return {
+          name: job.name,
+          status: 'failure',
+          durationMs,
+          steps: stepResults,
+          ruleResults,
+          error: result.error,
+        };
+      }
     }
+
+    const durationMs = Date.now() - startTime;
+    formatter.logJobComplete(job.name, durationMs);
+
+    return {
+      name: job.name,
+      status: 'success',
+      durationMs,
+      steps: stepResults,
+      ruleResults,
+    };
+  } finally {
+    // Reclaim the job's `ctx.mktemp`/`ctx.mktempFile` allocations on success,
+    // failure, and throw alike. A cleanup failure must NEVER change the job's
+    // terminal status, so any drain error is swallowed into a warn.
+    await dispose().catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(`local job temp scope cleanup failed: ${message}`);
+    });
   }
-
-  const durationMs = Date.now() - startTime;
-  formatter.logJobComplete(job.name, durationMs);
-
-  return {
-    name: job.name,
-    status: 'success',
-    durationMs,
-    steps: stepResults,
-    ruleResults,
-  };
 }
 
 /**
@@ -263,12 +298,32 @@ export async function executeWorkflow(
   // Evaluate workflow rules first
   let ruleResults: RuleResult[] | undefined;
   if (workflow.rules && workflow.rules.length > 0) {
-    const ruleContext = createRuleContext(event as EventPayload, event.changedFiles);
+    const ruleContext = createRuleContext({
+      event: event as EventPayload,
+      changedFiles: event.changedFiles,
+      changedFilesStatus: event.changedFilesStatus ?? 'fetched',
+    });
     const ruleEval = await evaluateRules(workflow.rules as Rule[], ruleContext, workflow.name);
     ruleResults = ruleEval.results;
 
     if (!ruleEval.allPassed) {
       const durationMs = Date.now() - startTime;
+      // A rule's check() threw -- fail the workflow (non-zero exit). A clean
+      // return false is a legitimate skip.
+      if (ruleEval.evaluationError) {
+        const error = new Error(
+          `rule '${ruleEval.evaluationError.label}' errored: ${ruleEval.evaluationError.message}`,
+        );
+        logger.info(pc.red(`\n✗ Workflow failed: ${error.message}\n`));
+        return {
+          name: workflow.name,
+          status: 'failure',
+          durationMs,
+          jobs: [],
+          ruleResults,
+          error,
+        };
+      }
       logger.info(pc.yellow(`\n⚠ Workflow skipped due to rule failure\n`));
       return {
         name: workflow.name,

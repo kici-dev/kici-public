@@ -7,13 +7,14 @@ The KiCI dashboard is the browser interface for monitoring workflow runs, inspec
 
 This guide is split across the following pages:
 
-| Page                                                                                  | Covers                                                                  |
-| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| [Getting started](./dashboard/getting-started.md)                                     | Onboarding checklist and your organizations list                        |
-| [Navigation and layout](./dashboard/navigation.md)                                    | Sidebar, mobile nav, theme, time display, shortcuts, error pages        |
-| [Runs and logs](./dashboard/runs.md)                                                  | Run list, run detail, the log viewer                                    |
-| [Settings](./dashboard/settings.md)                                                   | Members, roles, teams, keys, sources, billing, security, support access |
-| [Workflows, diagnostics, and orchestrators](./dashboard/workflows-and-diagnostics.md) | Registered workflows, infra health, per-cluster views                   |
-| [Contexts, secrets, and approvals](./dashboard/contexts-and-secrets.md)               | Contexts, secret scopes, approval queue                                 |
-| [Activity and DLQ](./dashboard/activity-and-dlq.md)                                   | Forensic activity log and dead-letter queue                             |
-| [Account](./dashboard/account.md)                                                     | Personal account settings                                               |
+| Page                                                                                  | Covers                                                                        |
+| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| [Getting started](./dashboard/getting-started.md)                                     | Onboarding checklist and your organizations list                              |
+| [Navigation and layout](./dashboard/navigation.md)                                    | Sidebar, mobile nav, theme, time display, shortcuts, error pages              |
+| [Runs and logs](./dashboard/runs.md)                                                  | Run list, run detail, the log viewer                                          |
+| [Settings](./dashboard/settings.md)                                                   | Members, roles, teams, keys, sources, billing, security, support access       |
+| [Workflows, diagnostics, and orchestrators](./dashboard/workflows-and-diagnostics.md) | Registered workflows, infra health, per-cluster views                         |
+| [Contexts, secrets, and approvals](./dashboard/contexts-and-secrets.md)               | Contexts, secret scopes, approval queue                                       |
+| [Activity and DLQ](./dashboard/activity-and-dlq.md)                                   | Forensic activity log and dead-letter queue                                   |
+| [Notifications](./dashboard/notifications.md)                                         | Personal run notifications and org-wide channels, subscriptions, delivery log |
+| [Account](./dashboard/account.md)                                                     | Personal account settings                                                     |

@@ -1,11 +1,25 @@
-import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, it, expect, vi, afterAll } from 'vitest';
+import { rmSync } from 'node:fs';
+import { kiciMkdtemp } from '@kici-dev/shared';
 import { registerProviderBundleForSource } from './register-source-bundle.js';
 import { ProviderRegistry } from '../provider-registry.js';
 import type { GenericWebhookSource } from '../db/types.js';
 import type { AppConfig } from '../config.js';
+
+/**
+ * Temp repo dirs for the local-provider cases. Allocated under the KiCI temp
+ * base so the shared GC sweeps any survivor, and removed here so a normal run
+ * leaves nothing behind.
+ */
+const tmpDirs: string[] = [];
+function tmpRepoDir(): string {
+  const dir = kiciMkdtemp('kici-local-source-bundle-');
+  tmpDirs.push(dir);
+  return dir;
+}
+afterAll(() => {
+  for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
+});
 
 const baseConfig = {} as AppConfig;
 
@@ -38,7 +52,7 @@ function makeRow(overrides: Partial<GenericWebhookSource>): GenericWebhookSource
 
 describe('registerProviderBundleForSource — local', () => {
   it('registers a local bundle from the row git_config repoBasePath', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const registry = new ProviderRegistry();
     const row = makeRow({
       provider_type: 'local',
@@ -90,7 +104,7 @@ describe('registerProviderBundleForSource — local', () => {
   });
 
   it('does NOT register a universal-git bundle for a local row (git_config is dual-purpose)', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const registry = new ProviderRegistry();
     const row = makeRow({
       provider_type: 'local',
@@ -109,7 +123,7 @@ describe('registerProviderBundleForSource — local', () => {
 
 describe('registerProviderBundleForSource — scaler-coexistence warning', () => {
   it('invokes the warning sink once when a local source coexists with a container scaler', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const registry = new ProviderRegistry();
     const onScalerWarning = vi.fn();
     const row = makeRow({
@@ -132,7 +146,7 @@ describe('registerProviderBundleForSource — scaler-coexistence warning', () =>
   });
 
   it('does NOT warn on a bare-metal scaler', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const registry = new ProviderRegistry();
     const onScalerWarning = vi.fn();
     const row = makeRow({
@@ -151,7 +165,7 @@ describe('registerProviderBundleForSource — scaler-coexistence warning', () =>
   });
 
   it('warns on a firecracker scaler', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'kici-local-'));
+    const dir = tmpRepoDir();
     const registry = new ProviderRegistry();
     const onScalerWarning = vi.fn();
     const row = makeRow({

@@ -23,7 +23,7 @@ All KiCI packages are published to the public npm registry (`npmjs.com`).
 | `@kici-dev/compiler`     | CLI tooling (compile, test, init, run, fixture, hook)                                                 |
 | `@kici-dev/core`         | Light shared utilities (logging, errors, formatting, crypto, TS loader hook) — no server dependencies |
 | `@kici-dev/shared`       | Shared utilities (logger, database, crypto, telemetry); re-exports `@kici-dev/core`                   |
-| `@kici-dev/engine`       | Business logic (protocol, triggers, state machine, providers)                                         |
+| `@kici-dev/engine`       | Business logic (protocol, triggers, execution status vocabulary, providers)                           |
 | `@kici-dev/orchestrator` | Customer-deployable orchestrator with provider abstraction                                            |
 | `@kici-dev/agent`        | Customer-deployable job execution agent                                                               |
 
@@ -74,7 +74,7 @@ The agent requires `git`, a shell (`bash` on Linux/macOS, `pwsh` on Windows), `n
 
 ### Publishing (maintainers)
 
-Packages are published in dependency order using `packages/ci/src/release.ts` (invoked as `pnpm release <pkg>` or `pnpm release --all`). The script publishes one or more workspace packages to the npm registry, then bumps every workspace `package.json` version (root + 9 publishables) so subsequent local builds emit prereleases against the new base. The bump level is derived automatically from the release's unreleased changelog fragments — a `feature` fragment produces a minor bump, anything else a patch — and can be overridden with `--minor` / `--patch`; the major version is locked behind `--major --allow-major` until a GA milestone. Each package's `prepublishOnly` script regenerates `sbom.spdx.json` before the tarball is packed, so the published SBOM always matches the published version.
+Packages are published in dependency order by `pnpm release <pkg>` (or `pnpm release --all`). The release command publishes one or more workspace packages to the npm registry, then bumps every workspace `package.json` version (root + 9 publishables) so subsequent local builds emit prereleases against the new base. The bump level is derived automatically from the conventional commits since the previous version tag — a `feat` commit (or a breaking change) produces a minor bump, anything else a patch — and can be overridden with `--minor` / `--patch`; the major version is locked behind `--major --allow-major` until a GA milestone. Each package's `prepublishOnly` script regenerates `sbom.spdx.json` before the tarball is packed, so the published SBOM always matches the published version.
 
 ### Public release phase (maintainers)
 
@@ -167,7 +167,7 @@ podman push registry.example.com/kici-agent:latest
 
 Firecracker microVM execution requires a root filesystem image containing the agent and all its dependencies. Due to image size (~500MB+), the rootfs is **not distributed as a pre-built artifact**. Instead, operators build it once and cache it locally.
 
-See the dedicated [Firecracker rootfs build guide](../orchestrator/firecracker-rootfs.md) for full instructions.
+See the dedicated [Firecracker rootfs build guide](../orchestrator/firecracker/rootfs.md) for full instructions.
 
 ---
 
@@ -188,7 +188,7 @@ services:
       - '10143:10143'
     environment:
       MODE: platform
-      KICI_PLATFORM_URL: wss://relay.kici.dev
+      KICI_PLATFORM_URL: wss://api.kici.dev/ws
       KICI_PLATFORM_TOKEN: ${KICI_PLATFORM_TOKEN}
       KICI_DATABASE_URL: ${KICI_DATABASE_URL}
     depends_on:
@@ -282,7 +282,46 @@ scalers:
     labels: [linux, x64, isolated]
 ```
 
-See [Firecracker rootfs build guide](../orchestrator/firecracker-rootfs.md) for building the image.
+See [Firecracker rootfs build guide](../orchestrator/firecracker/rootfs.md) for building the image.
+
+### Self-contained payload (fresh-box bootstrap)
+
+For provisioning an agent onto a machine that has **no Node.js installed**, `kici-admin agent package` produces a self-contained tarball: the published agent, its full runtime dependency closure (including the native TypeScript loader binding), and a vendored, integrity-verified Node binary, plus a `kici-agent` launcher that runs the agent on the vendored Node exclusively — no system Node on `PATH` is required.
+
+```bash
+# Produce a version-keyed payload for the glibc-Linux bootstrap set.
+kici-admin agent package --platform linux-x64,linux-arm64 --out ./agent-packages
+#   → ./agent-packages/<version>/kici-agent-<platform>.tar.gz (+ .sha256)
+
+# Optionally presign-upload each payload to the orchestrator cache bucket.
+kici-admin agent package --platform linux-x64 --upload
+```
+
+The payload version equals the orchestrator's own version, so a given version is always the same agent. Extract the tarball on the target host and run its `kici-agent` launcher — the launcher boots on the vendored `bin/node`. See the [`agent package` CLI reference](../orchestrator/kici-admin/agents-peers-hosts.md) for every flag (`--node-mirror` and `--npm-registry` cover air-gapped mirrors).
+
+Payloads are built on your own orchestrator from the sources you already trust — nodejs.org (checksum-verified) and npm (lockfile-verified) — and stored in your own object-storage cache bucket. `KICI_AGENT_BINARY_SOURCE` overrides the source to another bucket or mirror on the same endpoint (for an air-gapped replica); it defaults to the orchestrator's own cache bucket and rejects any non-`s3://` value, so there is no vendor CDN in the path.
+
+**Set a routable connect-back URL for boxes on other machines.** A bootstrapped agent dials the orchestrator at the URL the bring-up hands it, which defaults to `ws://127.0.0.1:<port>/ws` — correct only for a box that shares the orchestrator's host. Whenever the fresh box is a different machine, set `KICI_ORCHESTRATOR_URL` on the orchestrator to an address that box can reach (for example `ws://10.0.0.5:4000/ws`); otherwise the payload stages and boots but the agent never connects. The same variable sets the connect-back URL for scaler-spawned agents that a per-scaler `orchestratorUrl` does not already cover.
+
+#### Auto-package on orchestrator upgrade
+
+`kici-admin orchestrator upgrade` refreshes the fleet's payloads automatically: after the orchestrator advances to a new version, it produces and uploads `agent-packages/<version>/kici-agent-<platform>.tar.gz(.sha256)` for the platforms the fleet already runs (discovered from the cache bucket; the glibc-Linux bootstrap set on a fresh cache). It is idempotent — a version whose payloads already exist is skipped — so re-running an upgrade re-uploads nothing. Pass `--no-agent-packages` to skip this and publish payloads out of band, or `--agent-package-platforms <list>` to override the platform set. An orchestrator with no object-storage cache configured skips the step entirely (payloads are served from the cache bucket).
+
+#### Fleet auto-upgrade convergence
+
+Once bare boxes bootstrap themselves into the fleet, the orchestrator's version is the single source of truth for the whole fleet's agent version. The `agentVersionConverge(targetAgentId)` workflow check-step rolls a permanent fleet agent up to the orchestrator's version:
+
+```ts
+// A job on an ops agent (one holding kici:capability:ssh-transport) converges a host.
+job({ runsOn: ['kici:capability:ssh-transport'], steps: [agentVersionConverge('box-00007')] });
+```
+
+The check compares the host's staged version against the orchestrator target and reports drift; the apply re-stages the target payload onto the host and restarts its agent. Two properties make the roll safe:
+
+- **Availability-gated.** The convergence never rolls a host onto a version whose payload objects don't exist for the host's platform — it holds the host at its current version and reports the block instead. A missing payload can never produce a version skew.
+- **External-actor re-stage.** The re-stage is driven by the ops agent over SSH — it swaps the install and restarts the target's agent, which reconnects on its own persistent credential. The host's agent never updates its own running binary.
+
+Declare how a host restarts its agent so the convergence can drive it, via host properties on `kici-admin host declare`: either a systemd unit name (`kici:agent-service`) or explicit `kici:agent-restart-stop` / `kici:agent-restart-start` commands, plus an optional `kici:agent-install-dir` (default `/opt/kici-agent`). Combine `agentVersionConverge()` with a run-level check mode and drift approval for a controlled, health-gated rolling upgrade across the fleet.
 
 ---
 

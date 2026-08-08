@@ -72,6 +72,16 @@ export function verifyGenericWebhook(
       return verifyIpAllowlist(clientIp, config);
     case 'none':
       return true;
+    default: {
+      // Compile-time exhaustiveness for the exported function: a new
+      // VerificationMethod added without a case here fails to build. Unreachable
+      // via the relay path (parseGenericVerificationConfig throws first for an
+      // out-of-union method), so this throw never fires for a valid config.
+      const _exhaustive: never = config;
+      throw new Error(
+        `unsupported verification_method: ${String((_exhaustive as VerificationConfig).method)}`,
+      );
+    }
   }
 }
 

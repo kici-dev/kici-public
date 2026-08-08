@@ -58,6 +58,13 @@ function captureCallSite(): SourceLocation | undefined {
         if (file.startsWith('file://')) {
           file = file.slice(7);
         }
+        // Strip any loader cache-buster query (e.g. the compiler imports modules
+        // as `file://…/ci.ts?t=<epoch>`); a real filesystem path never carries a
+        // `?query`, so the captured location must be a clean path.
+        const queryIndex = file.indexOf('?');
+        if (queryIndex !== -1) {
+          file = file.slice(0, queryIndex);
+        }
         return {
           file,
           line: parseInt(match[2], 10),
@@ -84,7 +91,7 @@ function captureCallSite(): SourceLocation | undefined {
  */
 export function step<TResult = void>(
   run: (ctx: import('./context.js').StepContext) => Promise<TResult>,
-): Step<TResult>;
+): Step<TResult, ''>;
 
 /**
  * Create an id-less step with full options.
@@ -98,7 +105,7 @@ export function step<TResult = void>(
  *   timeout: 60000,
  * });
  */
-export function step<TResult = void>(options: StepOptions<TResult>): Step<TResult>;
+export function step<TResult = void>(options: StepOptions<TResult>): Step<TResult, ''>;
 
 /**
  * Create a named step with just a run function (no outputs).
@@ -108,7 +115,7 @@ export function step<TResult = void>(options: StepOptions<TResult>): Step<TResul
  *   await ctx.$`git checkout`;
  * });
  */
-export function step(name: string, run: StepRunFn): Step<void>;
+export function step<TName extends string>(name: TName, run: StepRunFn): Step<void, TName>;
 
 /**
  * Create a named step with full options and generic return type.
@@ -125,7 +132,10 @@ export function step(name: string, run: StepRunFn): Step<void>;
  *   }
  * });
  */
-export function step<TResult = void>(name: string, options: StepOptions<TResult>): Step<TResult>;
+export function step<TResult = void, TName extends string = string>(
+  name: TName,
+  options: StepOptions<TResult>,
+): Step<TResult, TName>;
 
 /**
  * Create a named idempotent step with a check facet.
@@ -142,17 +152,17 @@ export function step<TResult = void>(name: string, options: StepOptions<TResult>
  *   whenInSync: async () => ({ reloaded: false }),
  * });
  */
-export function step<TResult = void, TDrift = unknown>(
-  name: string,
+export function step<TResult = void, TDrift = unknown, TName extends string = string>(
+  name: TName,
   options: StepOptionsWithCheck<TResult, TDrift>,
-): Step<TResult>;
+): Step<TResult, TName>;
 
 /**
  * Create an id-less idempotent step with a check facet.
  */
 export function step<TResult = void, TDrift = unknown>(
   options: StepOptionsWithCheck<TResult, TDrift>,
-): Step<TResult>;
+): Step<TResult, ''>;
 
 /**
  * Implementation of step() factory.
@@ -213,7 +223,12 @@ export function step<TResult = void, TDrift = unknown>(
 
   const retry = normalizeRetry(options.retry);
 
-  return {
+  // Build the step object first, then attach the output proxy with a
+  // self-reference so the proxy reads `stepObj.name` lazily at access time.
+  // Id-less steps start with `name === ''`; the runner assigns `step-N` onto
+  // this same object before execution, so `.result` resolves under the final
+  // name (see createStepOutputProxy).
+  const stepObj = {
     _tag: 'Step' as const,
     name,
     outputs: options.outputs,
@@ -231,6 +246,7 @@ export function step<TResult = void, TDrift = unknown>(
     cleanup: options.cleanup,
     ...(options.approval !== undefined && { approval: options.approval }),
     _sourceLocation,
-    result: createStepOutputProxy(name),
   } as Step<TResult>;
+  (stepObj as { result: unknown }).result = createStepOutputProxy<TResult>(stepObj);
+  return stepObj;
 }

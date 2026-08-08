@@ -86,17 +86,68 @@ function bindingScopeForHost(
   return binding.scopePattern.includes('${') ? null : binding.scopePattern;
 }
 
-interface ScopeCandidate {
+/** The winning scoped secret for a key, with the precedence tuple that selected it. */
+export interface ResolvedSecretCandidate {
   secret: ScopedSecret;
   scopeDepth: number;
   hostSpec: number;
 }
 
 /** Higher `(hostSpec, scopeDepth)` wins; ties keep the first-encountered. */
-function candidateWins(c: ScopeCandidate, existing: ScopeCandidate | undefined): boolean {
+function candidateWins(
+  c: ResolvedSecretCandidate,
+  existing: ResolvedSecretCandidate | undefined,
+): boolean {
   if (!existing) return true;
   if (c.hostSpec !== existing.hostSpec) return c.hostSpec > existing.hostSpec;
   return c.scopeDepth > existing.scopeDepth;
+}
+
+/**
+ * Resolve the winning secret per key by matching bindings against scoped secrets,
+ * applying the host gate and `(host specificity, scope depth)` precedence — WITHOUT
+ * decrypting, keeping this module crypto-free. This is the single source of truth for
+ * scope precedence; `resolveSecretsForContext` delegates to it and adds the decrypt step.
+ *
+ * Takes already-filtered bindings (for the target context). For each binding, finds
+ * secrets whose (substituted) scope matches the binding's scopePattern via picomatch.
+ * When multiple scopes provide the same key, precedence is the tuple
+ * `(host specificity, scope depth)` — a per-host binding (exact host) overrides a
+ * fleet-wide one, then longest scope path wins. Scope depth is computed AFTER stripping
+ * the backend prefix.
+ *
+ * When `hostFacts` is supplied (a fan-out child's identity), each binding is gated by
+ * its `host_pattern` and its `scope_pattern` is templated per-child
+ * (`${agentId}`/`${host}`/`${label:NAME}`). When omitted, only fleet-wide (`'**'`/NULL)
+ * non-templated bindings contribute — preserving the workflow-level (no-host) behaviour.
+ *
+ * @param bindings - Bindings already filtered for the target context
+ * @param allSecrets - All scoped secrets in the org
+ * @param hostFacts - Optional fan-out child identity for per-host resolution
+ * @returns Map of secret key → winning candidate (secret + precedence tuple)
+ */
+export function resolveSecretsWithProvenance(
+  bindings: ContextBinding[],
+  allSecrets: ScopedSecret[],
+  hostFacts?: HostFacts,
+): Map<string, ResolvedSecretCandidate> {
+  const resolved = new Map<string, ResolvedSecretCandidate>();
+
+  for (const binding of bindings) {
+    const scopePattern = bindingScopeForHost(binding, hostFacts);
+    if (scopePattern === null) continue;
+    const hostSpec = hostSpecificity(binding.hostPattern);
+    for (const secret of allSecrets) {
+      if (!matchScopePattern(secret.scope, scopePattern)) continue;
+      const scopeDepth = stripScopePrefix(secret.scope).split('/').length;
+      const candidate: ResolvedSecretCandidate = { secret, scopeDepth, hostSpec };
+      if (candidateWins(candidate, resolved.get(secret.key))) {
+        resolved.set(secret.key, candidate);
+      }
+    }
+  }
+
+  return resolved;
 }
 
 /**
@@ -115,6 +166,9 @@ function candidateWins(c: ScopeCandidate, existing: ScopeCandidate | undefined):
  * (`'**'`/NULL) non-templated bindings contribute — preserving the workflow-level
  * (no-host) behaviour.
  *
+ * Delegates precedence to `resolveSecretsWithProvenance` and applies `decryptFn`
+ * to each winning secret.
+ *
  * @param bindings - Bindings already filtered for the target context
  * @param allSecrets - All scoped secrets in the org
  * @param decryptFn - Pure decryption function (keeps this module crypto-free)
@@ -127,26 +181,10 @@ export function resolveSecretsForContext(
   decryptFn: (s: ScopedSecret) => string,
   hostFacts?: HostFacts,
 ): Record<string, string> {
-  const resolved = new Map<string, ScopeCandidate>();
-
-  for (const binding of bindings) {
-    const scopePattern = bindingScopeForHost(binding, hostFacts);
-    if (scopePattern === null) continue;
-    const hostSpec = hostSpecificity(binding.hostPattern);
-    for (const secret of allSecrets) {
-      if (!matchScopePattern(secret.scope, scopePattern)) continue;
-      const scopeDepth = stripScopePrefix(secret.scope).split('/').length;
-      const candidate: ScopeCandidate = { secret, scopeDepth, hostSpec };
-      if (candidateWins(candidate, resolved.get(secret.key))) {
-        resolved.set(secret.key, candidate);
-      }
-    }
-  }
-
+  const resolved = resolveSecretsWithProvenance(bindings, allSecrets, hostFacts);
   const result: Record<string, string> = {};
   for (const [key, { secret }] of resolved) {
     result[key] = decryptFn(secret);
   }
-
   return result;
 }

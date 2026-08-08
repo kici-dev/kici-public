@@ -36,6 +36,8 @@ import type {
   DashboardPayloadRequest,
   DashboardOrchLogsRequest,
   DashboardEventLogListRequest,
+  DashboardEventLogActivityRequest,
+  EventLogActivityCounts,
   DashboardEventLogDetailRequest,
   DashboardEventLogPayloadStreamRequest,
   DashboardAccessLogListRequest,
@@ -50,11 +52,13 @@ import type {
   RunCancelRequest,
   ManualScheduleRequest,
   DashboardRunStructuredRequest,
+  DashboardArtifactsListRequest,
 } from '@kici-dev/engine';
 import {
   AccessLogAction as AccessLogActionEnum,
   dashboardRunDetailApiResponseSchema,
   dashboardStepLogsApiResponseSchema,
+  dashboardArtifactsListResponseSchema,
   dashboardAttestationsListResponseSchema,
   dashboardAttestationsListAllResponseSchema,
   dashboardAttestationGetResponseSchema,
@@ -84,6 +88,7 @@ import { buildRunDetailJobs, aggregateRunDetail } from '../reporting/run-aggrega
 import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { CacheStorage } from '../storage/types.js';
+import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { EventStore } from '../events/event-store.js';
 import { loadEventLogByDeliveryId } from '../cold-store/load-event-log-range.js';
@@ -100,6 +105,13 @@ interface DashboardHandlerDeps {
   db: Kysely<Database>;
   logStorage: LogStorage;
   /**
+   * The orchestrator's own provenance issuer (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`)
+   * when it owns signing. Surfaced on attestations-list responses so the Platform
+   * returns it as `trustedIssuer` — the dashboard / CLI verify against the
+   * orchestrator that actually signed the bundles, not the Platform's own issuer.
+   */
+  provenanceSigningIssuer?: string | null;
+  /**
    * Object-storage backend for provenance bundles. The attestations handler
    * reads each stored bundle by `storage_key` and inlines it into the response
    * so the dashboard verifies it client-side without a second fetch. Optional —
@@ -108,6 +120,13 @@ interface DashboardHandlerDeps {
    * (the same one P1.5 writes bundles to).
    */
   provenanceStorage?: CacheStorage | null;
+  /**
+   * User-facing artifacts layer. Backs `dashboard.artifacts.list` — lists a
+   * run's named artifacts and mints a presigned GET per entry. Optional — when
+   * absent (orchestrator without a DB / cache storage) the handler replies with
+   * an `error` and an empty list.
+   */
+  artifactStore?: ArtifactStore | null;
   /**
    * Drain the deferred-attestation outbox on demand (mints in this process,
    * which owns the Platform WS). Backs `dashboard.attestation.retry`. Optional —
@@ -167,7 +186,10 @@ interface DashboardHandlerDeps {
     cancelledBy: string | null,
     cancelledByAgentLabel: string | null,
     force?: boolean,
-  ) => Promise<{ cancelledJobs: number }>;
+    // `alreadyTerminal` is optional so a caller that cannot distinguish the case
+    // (and every existing test double) still satisfies the type; it is forwarded
+    // verbatim when present.
+  ) => Promise<{ cancelledJobs: number; alreadyTerminal?: boolean }>;
   /**
    * Callback for handling manual schedule trigger requests.
    * Returns { newRunId } on success or throws on failure.
@@ -207,6 +229,7 @@ export class DashboardHandler {
   private readonly db: Kysely<Database>;
   private readonly logStorage: LogStorage;
   private readonly provenanceStorage: CacheStorage | null;
+  private readonly artifactStore: ArtifactStore | null;
   private readonly send: (msg: unknown) => void;
   private readonly orchestratorId: string | undefined;
   private readonly accessLog: AccessLogWriter | undefined;
@@ -218,13 +241,16 @@ export class DashboardHandler {
   private readonly coldStore: ColdStore | null;
   private readonly eventStore: EventStore | null;
   private readonly retryAttestations: DashboardHandlerDeps['retryAttestations'];
+  private readonly provenanceSigningIssuer: string | null;
   private readonly testMode: boolean;
   private readonly testRerunDelayMs: number | undefined;
 
   constructor(deps: DashboardHandlerDeps) {
     this.db = deps.db;
     this.logStorage = deps.logStorage;
+    this.provenanceSigningIssuer = deps.provenanceSigningIssuer ?? null;
     this.provenanceStorage = deps.provenanceStorage ?? null;
+    this.artifactStore = deps.artifactStore ?? null;
     this.send = deps.send;
     this.orchestratorId = deps.orchestratorId;
     this.accessLog = deps.accessLog;
@@ -1449,6 +1475,7 @@ export class DashboardHandler {
         type: 'dashboard.attestations.list.response',
         requestId: msg.requestId,
         attestations,
+        trustedIssuer: this.provenanceSigningIssuer,
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.attestations.list response validation failed', {
@@ -1494,6 +1521,93 @@ export class DashboardHandler {
         requestId: msg.requestId,
         attestations: [],
         error: 'Internal error reading attestations',
+      });
+    }
+  }
+
+  /**
+   * Handle a dashboard.artifacts.list request: list the run's named artifacts
+   * with a presigned GET per entry. Mirrors `handleAttestationsList` (per-run
+   * org resolution + `recordAccess` + `send`). Org is resolved server-side from
+   * the run row, never the wire, so the listing cannot cross tenants.
+   */
+  async handleArtifactsList(msg: DashboardArtifactsListRequest): Promise<void> {
+    const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
+    const target = { type: 'run' as const, id: msg.runId };
+    try {
+      if (!this.artifactStore || !ctx.orgId) {
+        this.recordAccess(
+          ctx,
+          msg.actor,
+          'artifacts.read',
+          target,
+          msg.requestId,
+          'error',
+          this.artifactStore ? 'run org not resolvable' : 'artifact store not configured',
+        );
+        this.send({
+          type: 'dashboard.artifacts.list.response',
+          requestId: msg.requestId,
+          artifacts: [],
+          error: this.artifactStore
+            ? 'Run organization not resolvable'
+            : 'Artifact storage not configured',
+        });
+        return;
+      }
+
+      const { artifacts, downloadUrlExpiresInSeconds } =
+        await this.artifactStore.listForRunWithUrls(ctx.orgId, msg.runId);
+      const validated = dashboardArtifactsListResponseSchema.safeParse({
+        type: 'dashboard.artifacts.list.response',
+        requestId: msg.requestId,
+        artifacts,
+        downloadUrlExpiresInSeconds,
+      });
+      if (!validated.success) {
+        logger.error('Outgoing dashboard.artifacts.list response validation failed', {
+          runId: msg.runId,
+          errors: validated.error.issues,
+        });
+        this.recordAccess(
+          ctx,
+          msg.actor,
+          'artifacts.read',
+          target,
+          msg.requestId,
+          'error',
+          'response validation failed',
+        );
+        this.send({
+          type: 'dashboard.artifacts.list.response',
+          requestId: msg.requestId,
+          artifacts: [],
+          error: 'Internal error: response validation failed',
+        });
+        return;
+      }
+
+      this.recordAccess(ctx, msg.actor, 'artifacts.read', target, msg.requestId, 'allowed');
+      this.send(validated.data);
+    } catch (err) {
+      logger.error('Error handling dashboard.artifacts.list', {
+        runId: msg.runId,
+        error: toErrorMessage(err),
+      });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        'artifacts.read',
+        target,
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.artifacts.list.response',
+        requestId: msg.requestId,
+        artifacts: [],
+        error: 'Internal error reading artifacts',
       });
     }
   }
@@ -1688,6 +1802,7 @@ export class DashboardHandler {
         page: msg.page,
         pageSize,
         total,
+        trustedIssuer: this.provenanceSigningIssuer,
       });
       if (!validated.success) {
         logger.error('Outgoing dashboard.attestations.list.all response validation failed', {
@@ -2216,6 +2331,7 @@ export class DashboardHandler {
         type: 'run.cancel.response',
         requestId: msg.requestId,
         cancelledJobs: result.cancelledJobs,
+        ...(result.alreadyTerminal !== undefined && { alreadyTerminal: result.alreadyTerminal }),
       });
     } catch (err) {
       logger.error('Error handling run.cancel.request', {
@@ -2360,6 +2476,84 @@ export class DashboardHandler {
         items: [],
         nextCursor: null,
         error: 'Internal error querying event log',
+      });
+    }
+  }
+
+  /**
+   * Handle a dashboard.event-log.activity request — windowed aggregate counts
+   * for the org (matched vs unmatched vs lockfile-missing), the
+   * orchestrator-only facts the Platform relay cannot compute (it only sees
+   * "delivered", not whether a trigger matched). Powers the Runs-page misconfig
+   * strip + the `kici runs` hint. Aggregate counts only — no payloads, no repo
+   * identifiers — so the Platform route serves them to all org members.
+   */
+  async handleEventLogActivity(msg: DashboardEventLogActivityRequest): Promise<void> {
+    const ctx = { orgId: msg.orgId, routingKey: this.routingKey };
+    try {
+      const row = await this.db
+        .selectFrom('event_log')
+        .where('org_id', '=', msg.orgId)
+        .where('received_at', '>=', new Date(msg.fromTimestamp))
+        .where('received_at', '<', new Date(msg.toTimestamp))
+        .select([
+          sql<number>`count(*)`.as('total'),
+          sql<number>`count(*) filter (where status = ${EventLogStatus.enum.processed} and matched_count > 0)`.as(
+            'matched',
+          ),
+          sql<number>`count(*) filter (where status = ${EventLogStatus.enum.processed} and matched_count = 0)`.as(
+            'unmatched',
+          ),
+          sql<number>`count(*) filter (where status = ${EventLogStatus.enum.lockfile_missing})`.as(
+            'lockfileMissing',
+          ),
+          sql<number>`count(*) filter (where status = ${EventLogStatus.enum.lockfile_corrupt})`.as(
+            'lockfileCorrupt',
+          ),
+          sql<number>`count(*) filter (where status = ${EventLogStatus.enum.failed})`.as('failed'),
+        ])
+        .executeTakeFirstOrThrow();
+
+      const counts: EventLogActivityCounts = {
+        total: Number(row.total),
+        matched: Number(row.matched),
+        unmatched: Number(row.unmatched),
+        lockfileMissing: Number(row.lockfileMissing),
+        lockfileCorrupt: Number(row.lockfileCorrupt),
+        failed: Number(row.failed),
+      };
+
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['event_log.list.read'],
+        { type: 'event_log', id: msg.orgId },
+        msg.requestId,
+        'allowed',
+      );
+      this.send({
+        type: 'dashboard.event-log.activity.response',
+        requestId: msg.requestId,
+        counts,
+      });
+    } catch (err) {
+      logger.error('Error handling dashboard.event-log.activity', {
+        orgId: msg.orgId,
+        error: toErrorMessage(err),
+      });
+      this.recordAccess(
+        ctx,
+        msg.actor,
+        AccessLogActionEnum.enum['event_log.list.read'],
+        { type: 'event_log', id: msg.orgId },
+        msg.requestId,
+        'error',
+        toErrorMessage(err),
+      );
+      this.send({
+        type: 'dashboard.event-log.activity.response',
+        requestId: msg.requestId,
+        error: 'Internal error querying webhook activity',
       });
     }
   }
@@ -3168,9 +3362,11 @@ export class DashboardHandler {
     };
     if (!this.coldStore) return out;
     const epoch = new Date(0);
-    // 30 days warm window matches the Phase C adapter defaults.
-    const warmCutoff = new Date(Date.now() - 30 * 86_400_000);
 
+    // No explicit upper bound: the store resolves each table's own warm
+    // cutoff. These three tables are tuned independently via
+    // KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS, so each read is bounded by
+    // that table's own value rather than by one shared cutoff.
     const fetchByRun = async (table: 'execution_runs' | 'execution_jobs' | 'execution_steps') => {
       const rows: Record<string, unknown>[] = [];
       try {
@@ -3179,7 +3375,6 @@ export class DashboardHandler {
           table,
           tenantId: routingKey,
           fromTs: epoch,
-          toTs: warmCutoff,
         })) {
           const r = row as Record<string, unknown>;
           if (r.run_id === runId) rows.push(r);

@@ -275,6 +275,10 @@ export class S3CacheStorage implements CacheStorage {
     return url;
   }
 
+  presignedGetTtlSeconds(): number {
+    return PRESIGNED_URL_EXPIRY_SECONDS;
+  }
+
   async getUploadUrl(key: string): Promise<string> {
     const objectKey = this.objectKey(key);
     return getSignedUrl(
@@ -345,6 +349,21 @@ export class S3CacheStorage implements CacheStorage {
 
   async getMetadata(key: string): Promise<CacheMetadata | null> {
     return this.readMeta(key);
+  }
+
+  async getObjectSize(key: string): Promise<number | null> {
+    try {
+      const head = await this.client.send(
+        new HeadObjectCommand({
+          Bucket: this.bucket,
+          Key: this.objectKey(key),
+        }),
+      );
+      return head.ContentLength ?? null;
+    } catch (err: unknown) {
+      if (this.isNotFoundError(err)) return null;
+      throw err;
+    }
   }
 
   async copy(srcKey: string, destKey: string): Promise<void> {

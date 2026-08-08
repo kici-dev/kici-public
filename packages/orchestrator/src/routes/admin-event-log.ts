@@ -28,6 +28,7 @@ import type { LogStorage } from '../reporting/log-storage.js';
 import { loadEventLogRange, loadEventLogByDeliveryId } from '../cold-store/load-event-log-range.js';
 import { handleAdminError } from './admin-errors.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-event-log' });
 
@@ -52,21 +53,10 @@ export function createAdminEventLogRoutes(deps: AdminEventLogRoutesDeps): Hono<A
   const app = new Hono<AdminEnv>();
 
   // ── Auth middleware ────────────────────────────────────────────
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin-event-log',
+  });
   app.use('/api/v1/admin/event-log', authMiddleware);
   app.use('/api/v1/admin/event-log/*', authMiddleware);
 

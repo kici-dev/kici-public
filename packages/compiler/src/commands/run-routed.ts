@@ -18,6 +18,7 @@ import { compileCommand } from './compile.js';
 import { withStdoutOnStderr } from './run.js';
 import { renderRunBanner } from './run-banner.js';
 import { resolvePlaneForRun } from '../local-plane/resolve-plane.js';
+import { planeLogPath } from '../local-plane/plane-manager.js';
 import { resolveWorkdir } from '../local-plane/source-provider.js';
 import { ensureLocalSource } from '../local-plane/plane-seed.js';
 import { seedLocalSecrets } from '../local-plane/secret-seed.js';
@@ -25,6 +26,7 @@ import { triggerRun } from '../local-plane/plane-trigger.js';
 import { TRUSTED_ROUTING_LABEL, IN_PLACE_ROUTING_LABEL } from '../local-plane/scaler-config.js';
 import { injectRunsOnLabel } from '../local-plane/trusted-routing.js';
 import { followRun } from '../local-plane/run-follow.js';
+import { detectOsMismatchHints } from '../local-plane/os-mismatch-hint.js';
 import { formatSummary, type RunResult } from '../remote/output/summary.js';
 
 export interface RunRoutedOptions {
@@ -113,6 +115,19 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     : await compileCommand({ kiciDir, check: false, verbose: options.debug ?? false });
   if (!compileOk) return false;
 
+  // Warn honestly when a job targets an OS this host cannot satisfy locally
+  // (the local plane matches only the host's own kici:os:* label).
+  if (!quiet) {
+    try {
+      const os = await import('node:os');
+      const lockRaw = readFileSync(path.join(kiciDir, 'kici.lock.json'), 'utf-8');
+      const hints = detectOsMismatchHints(JSON.parse(lockRaw), os.platform(), os.arch());
+      for (const hint of hints) logger.warn(pc.yellow(hint));
+    } catch {
+      // Best-effort: an unreadable/partial lock never blocks the run.
+    }
+  }
+
   let cleanup: (() => Promise<void>) | undefined;
   const restoreLocks: Array<() => void> = [];
   try {
@@ -189,7 +204,8 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     }
 
     if (!quiet) logger.info(pc.dim(`Triggering ${options.event} …`));
-    const dispatch = options.event === 'dispatch' ? readDispatchPayload(options.payload) : undefined;
+    const dispatch =
+      options.event === 'dispatch' ? readDispatchPayload(options.payload) : undefined;
     const runId = await triggerRun(plane.url, plane.adminToken, {
       orgId: seeded.orgId,
       // The generic webhook route resolves a source by (customer_id, name), not
@@ -212,6 +228,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     const outcome = await followRun(plane.url, plane.adminToken, runId, {
       quiet,
       onLine: (line) => process.stdout.write(line + '\n'),
+      hintLogPath: planeLogPath(),
     });
 
     if (!quiet) {

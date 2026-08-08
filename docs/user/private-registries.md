@@ -59,6 +59,17 @@ The agent never writes the token bytes to your `.kici/.npmrc`. Each registry tok
 
 After the install completes (success or failure), the agent restores the original `.kici/.npmrc` — your committed file is never permanently modified.
 
+### Package managers
+
+The agent detects the package manager from the cloned repo — npm, pnpm, or yarn (classic and berry are both supported) — and applies the auth overlay the detected manager actually reads:
+
+| Detected manager        | Auth file the agent overlays | Notes                                                                                                                                       |
+| ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm, pnpm, yarn classic | `.kici/.npmrc`               | Auth lines carry `${VAR}` references to the job-scoped token env vars.                                                                      |
+| yarn berry (v2+)        | `.kici/.yarnrc.yml`          | Berry reads `.yarnrc.yml` instead of `.npmrc`, so the overlay uses berry's own registry/scope/auth keys with the same `${VAR}` indirection. |
+
+Either file is restored on cleanup, exactly as described above.
+
 ## Option C — committed `.kici/.npmrc` + `installEnv:`
 
 If you'd rather hand-craft the `.npmrc`, commit it under `.kici/.npmrc` with `${VAR}` placeholders, then list each variable in the workflow's `installEnv:` block using the same qualified syntax as `tokenSecret`.
@@ -214,8 +225,8 @@ registries: [
 ## Security model
 
 - **Per-context scoping.** Every `tokenSecret` and `installEnv` entry is qualified with a context name. The orchestrator runs the same protection-rule pipeline (branch / trust / concurrency / reviewer / wait-timer) against each named context **before** resolving any secret, so a workflow that wants a `production` token from a feature branch is rejected exactly like a job that tries to deploy to `production` from a feature branch. A reviewer-gated install context **pauses** the whole workflow dispatch as a workflow-scoped held run instead of resolving the token — see [Reviewer-gated installs](#reviewer-gated-installs) below.
-- **Untrusted contributors get no tokens.** When a fork PR is dispatched and the contributor-trust resolution returns anything other than `trusted`, the orchestrator strips both `npmRegistries` and `installEnvSecrets` out of the dispatch. The install runs without auth and fails naturally on the first private dep — fork PRs cannot ever observe a registry token, even if a misconfigured context lacks an explicit `requiredTrustTier`.
-- **Lifecycle scripts disabled.** Whenever a private registry is in scope, the agent runs the install with `--ignore-scripts` (npm or pnpm alike). A malicious `preinstall` / `postinstall` hook in committed `package.json` cannot read the synthesized token env vars, even though they exist in the install subprocess. For a pnpm workspace, the agent builds your in-repo dependency closure as a separate step **after** the install's auth is torn down, so build scripts never see the tokens either.
+- **Untrusted contributors get no tokens.** When a fork PR is dispatched and the contributor-trust resolution returns anything other than `trusted`, the orchestrator strips both `npmRegistries` and `installEnvSecrets` out of the dispatch. The install runs without auth and fails naturally on the first private dep — fork PRs cannot ever observe a registry token, even if a misconfigured context lacks an explicit [minimum trust](contexts.md#minimum-trust) rule.
+- **Lifecycle scripts disabled.** Whenever a private registry is in scope, the agent runs the install with `--ignore-scripts` (npm, pnpm, and yarn classic alike; yarn berry gets the equivalent `enableScripts: false`). A malicious `preinstall` / `postinstall` hook in committed `package.json` cannot read the synthesized token env vars, even though they exist in the install subprocess. For a pnpm or yarn workspace, the agent builds your in-repo dependency closure as a separate step **after** the install's auth is torn down, so build scripts never see the tokens either.
 - **Stderr is redacted.** If the install fails, the agent masks every token literal out of the surfaced stderr / stdout chunks before logging.
 - **Job-scoped env-var names.** The synthesized auth env var is `KICI_NPM_TOKEN_<jobIdShort>_<i>` where `jobIdShort` is the first 8 chars of the dispatched job id. The name is unguessable from outside the install subprocess and not reused across jobs.
 - **`.npmrc` restored.** Whatever the agent appended for one install is stripped (or the file unlinked) on cleanup, so the workspace is never permanently modified.

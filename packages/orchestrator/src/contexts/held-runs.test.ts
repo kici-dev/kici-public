@@ -5,10 +5,28 @@
  * Uses the shared mock Kysely builder.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { ApprovalDecision } from '@kici-dev/engine';
+import {
+  ApprovalDecision,
+  HoldScope,
+  HoldType,
+  TriggerSource,
+  HeldRunStatus as WireHeldRunStatus,
+} from '@kici-dev/engine';
 
-import { HeldRunStore } from './held-runs.js';
+import { HeldRunStore, HeldRunStatus, SecurityHoldReason } from './held-runs.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
+
+describe('SecurityHoldReason', () => {
+  it('enumerates the four security hold reasons', () => {
+    expect(SecurityHoldReason.options).toEqual([
+      'workflow_modification',
+      'unknown_contributor',
+      'fork_pr',
+      'context_trust',
+    ]);
+    expect(SecurityHoldReason.enum.workflow_modification).toBe('workflow_modification');
+  });
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────
 
@@ -19,7 +37,7 @@ function makeHeldRunRow(overrides: Partial<Record<string, unknown>> = {}): Recor
     run_id: 'run-001',
     job_id: 'job-001',
     context_id: 'env-001',
-    hold_type: 'approval',
+    hold_type: HoldType.enum.reviewer,
     status: 'pending',
     reason: 'Requires approval',
     approved_by: null,
@@ -43,7 +61,7 @@ describe('HeldRunStore', () => {
         runId: 'run-001',
         jobId: 'job-001',
         contextId: 'env-001',
-        holdType: 'approval',
+        holdType: HoldType.enum.reviewer,
         reason: 'Requires approval',
         expiresAt: new Date('2026-03-09T12:00:00Z'),
       });
@@ -142,7 +160,7 @@ describe('HeldRunStore', () => {
         runId: 'run-001',
         jobId: 'job-001',
         contextId: 'env-001',
-        holdType: 'security',
+        holdType: HoldType.enum.security,
         reason: 'Unknown contributor',
         expiresAt: new Date('2026-03-09T12:00:00Z'),
         queueType: 'security',
@@ -177,6 +195,41 @@ describe('HeldRunStore', () => {
 
       expect(mocks.selectFrom).toHaveBeenCalledWith('held_runs');
       expect(result).toEqual(rows);
+    });
+  });
+
+  describe('listPendingSecurityHoldsForPr', () => {
+    it('joins execution_runs and scopes by org, security queue, pending, repo, and pr_number', async () => {
+      const rows = [makeHeldRunRow({ id: 'hr-pr1', queue_type: 'security', run_id: 'run-pr1' })];
+      const { db, mocks } = createMockDb({ selectRows: rows });
+      const store = new HeldRunStore(db);
+
+      const result = await store.listPendingSecurityHoldsForPr('org-abc', 'owner/repo', 42);
+
+      expect(mocks.selectFrom).toHaveBeenCalledWith('held_runs');
+      expect(result).toEqual(rows);
+
+      // The scoping predicates are what isolate a /kici approve to one PR's holds.
+      const whereCalls = mocks.selectWhere.mock.calls as Array<[string, string, unknown]>;
+      const clause = (col: string) => whereCalls.find(([c]) => c === col);
+      expect(clause('held_runs.org_id')).toEqual(['held_runs.org_id', '=', 'org-abc']);
+      expect(clause('held_runs.queue_type')).toEqual(['held_runs.queue_type', '=', 'security']);
+      expect(clause('held_runs.status')).toEqual(['held_runs.status', '=', 'pending']);
+      expect(clause('execution_runs.repo_identifier')).toEqual([
+        'execution_runs.repo_identifier',
+        '=',
+        'owner/repo',
+      ]);
+      expect(clause('execution_runs.pr_number')).toEqual(['execution_runs.pr_number', '=', 42]);
+    });
+
+    it('returns the (already-scoped) rows the query yields', async () => {
+      const { db } = createMockDb({ selectRows: [] });
+      const store = new HeldRunStore(db);
+
+      const result = await store.listPendingSecurityHoldsForPr('org-abc', 'owner/repo', 7);
+
+      expect(result).toEqual([]);
     });
   });
 
@@ -291,6 +344,102 @@ describe('HeldRunStore', () => {
 
       const insertedValues = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
       expect('payload' in insertedValues).toBe(false);
+    });
+
+    it('defaults a hold with no explicit type to the reviewer gate vocabulary', async () => {
+      // The default has to stay inside the gate vocabulary: the dashboard
+      // badge switches on `HoldType`, and anything outside it renders as a
+      // gray raw string.
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.createHold('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        scope: HoldScope.enum.job,
+        triggerSource: TriggerSource.enum.context,
+        requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'r' },
+      });
+
+      const insertedValues = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(insertedValues.hold_type).toBe(HoldType.enum.reviewer);
+    });
+
+    it('persists an explicit hold type verbatim', async () => {
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.createHold('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        scope: HoldScope.enum.workflow,
+        triggerSource: TriggerSource.enum.context,
+        holdType: HoldType.enum.security,
+        requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'r' },
+      });
+
+      const insertedValues = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(insertedValues.hold_type).toBe(HoldType.enum.security);
+    });
+  });
+
+  describe('releaseDueWaitHolds', () => {
+    /** The `where(column, op, value)` triples the sweep issued, in order. */
+    function whereClauses(mocks: { updateWhere: { mock: { calls: unknown[][] } } }) {
+      return mocks.updateWhere.mock.calls.map((call) => [call[0], call[1], call[2]]);
+    }
+
+    it('matches every persisted spelling of the timer hold type', async () => {
+      // The sweep RESUMES an expired install-gate wait hold; `expireOverdue()`
+      // would instead fail the run. A filter pinned to one spelling stops
+      // matching rows the other writer produced, so the hold silently turns
+      // into a failure.
+      const { db, mocks } = createMockDb({ updatedRows: [] });
+      const store = new HeldRunStore(db);
+
+      await store.releaseDueWaitHolds();
+
+      expect(whereClauses(mocks)).toContainEqual([
+        'hold_type',
+        'in',
+        [HoldType.enum.timer, 'wait_timer'],
+      ]);
+    });
+
+    it('stays scoped to workflow holds so job-scoped timer holds are untouched', async () => {
+      // A dispatch-gate timer hold is job-scoped and must keep flowing through
+      // the ordinary expiry path, not this resume sweep.
+      const { db, mocks } = createMockDb({ updatedRows: [] });
+      const store = new HeldRunStore(db);
+
+      await store.releaseDueWaitHolds();
+
+      expect(whereClauses(mocks)).toContainEqual(['hold_scope', '=', HoldScope.enum.workflow]);
+    });
+
+    it('returns a release signal per released row', async () => {
+      const row = makeHeldRunRow({
+        id: 'hr-wait',
+        hold_type: 'wait_timer',
+        hold_scope: HoldScope.enum.workflow,
+        step_index: null,
+        trigger_source: TriggerSource.enum.context,
+      });
+      const { db } = createMockDb({ updatedRows: [row] });
+      const store = new HeldRunStore(db);
+
+      const signals = await store.releaseDueWaitHolds();
+
+      expect(signals).toEqual([
+        {
+          holdId: 'hr-wait',
+          runId: 'run-001',
+          jobId: 'job-001',
+          scope: HoldScope.enum.workflow,
+          stepIndex: null,
+          triggerSource: TriggerSource.enum.context,
+        },
+      ]);
     });
   });
 
@@ -491,5 +640,20 @@ describe('HeldRunStore', () => {
         }),
       ).rejects.toThrow(/not found or not pending/);
     });
+  });
+});
+
+describe('HeldRunStatus wire parity', () => {
+  it('the engine vocabulary matches every persisted status', () => {
+    // The engine enum is what the dashboard renders a labelled badge and a
+    // queue tab for; `held_runs.status` is what this orchestrator actually
+    // writes. Nothing else tied the two together: when `released` was added
+    // here and not there, the Platform's strict wire enum failed the entire
+    // relayed held-runs response — and because that message type is one the
+    // Platform recognizes, the failure closed the orchestrator's WebSocket
+    // rather than dropping a single row.
+    //
+    // Sorted comparison — declaration order is not part of the contract.
+    expect([...WireHeldRunStatus.options].sort()).toEqual(Object.values(HeldRunStatus).sort());
   });
 });

@@ -1,8 +1,10 @@
 /**
  * User-facing cache layer wrapping CacheStorage.
  *
- * Namespacing: `cache/<orgId>/<repoId>/<refScope>/<key>.tar.gz`, where
- * `refScope` is `shared` for trusted refs (org-shared, default-branch cache)
+ * Namespacing: `cache/<orgId>/<repoId>/<refScope>/<key>-<discriminator>.tar.gz`.
+ * The discriminator is a hash of the exact cache key, so two keys differing
+ * only by case stay two objects even on a case-insensitive store. `refScope`
+ * is `shared` for trusted refs (org-shared, default-branch cache)
  * or `iso/<runId>` for untrusted refs (per-run isolated scope). Restores from
  * an untrusted ref read the shared scope as a fallback but writes can NEVER
  * land in the shared scope — the GitHub Actions cache-isolation model. Keyed
@@ -24,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import { createLogger } from '@kici-dev/shared';
 import type { CacheRefScope } from '@kici-dev/engine';
 import type { CacheStorage } from '../storage/types.js';
+import { KEY_DISCRIMINATOR_LENGTH, keyDiscriminator } from '../storage/key-discriminator.js';
 
 const logger = createLogger({ prefix: 'user-cache' });
 
@@ -56,6 +59,47 @@ export type UserCacheOrgLimitsReader = (orgId: string) => Promise<UserCacheOrgLi
 
 /** Tarball suffix for committed cache entries. */
 const TAR_SUFFIX = '.tar.gz';
+
+/** Matches a stem ending in the fixed-width discriminator this module appends. */
+const KEY_DISCRIMINATOR_TAIL = new RegExp(`^(.*)-([0-9a-f]{${KEY_DISCRIMINATOR_LENGTH}})$`);
+
+/**
+ * Recover the reported cache key from a stored object's stem.
+ *
+ * The value on this path is already the sanitized, lossy form, so this only
+ * needs to undo the discriminator the key format appends. A stem that itself
+ * ends in a discriminator-shaped tail loses it — that affects only the string
+ * reported back as `matchedKey`, never which object is served.
+ */
+function stripKeyDiscriminator(stem: string): string {
+  return KEY_DISCRIMINATOR_TAIL.exec(stem)?.[1] ?? stem;
+}
+
+/** Device names NTFS reserves; a file cannot actually be created under one. */
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/;
+
+/** Keys that cannot have been part of a case collision in the old key format. */
+const UNAMBIGUOUS_LEGACY_KEY = /^[a-z0-9_][a-z0-9._-]*$/;
+
+/**
+ * Whether a cache key is safe to look up in the pre-discriminator key format.
+ *
+ * Every clause rules out a way the old format could have folded two distinct
+ * keys onto one object:
+ *
+ * - the character class is a subset of what `seg()` preserves, so a match
+ *   implies the key survives sanitization unchanged (no many-to-one rewrite)
+ *   and is pure ASCII, which rules out HFS+ Unicode normalisation;
+ * - requiring lowercase rules out case folding, the collision this change fixes;
+ * - a trailing `.` is stripped by NTFS, and a reserved device name cannot be
+ *   created there at all.
+ *
+ * A key failing any clause simply gets no legacy fallback — it is re-fetched
+ * and re-saved under the discriminated key, which is always correct.
+ */
+function unambiguousLegacyKey(key: string): boolean {
+  return UNAMBIGUOUS_LEGACY_KEY.test(key) && !key.endsWith('.') && !WINDOWS_RESERVED_NAME.test(key);
+}
 
 /** Identifies the org + repo + write scope a cache operation targets. */
 export interface UserCacheRef {
@@ -175,8 +219,66 @@ export class UserCache {
     return [`${base}/shared/`];
   }
 
+  /**
+   * Object key for a committed cache entry.
+   *
+   * The trailing discriminator is a hash of the EXACT cache key, and it is what
+   * keeps `build` and `Build` apart on a case-insensitive namespace — the
+   * filesystem backend on a macOS or Windows host, where the two would
+   * otherwise resolve to one object and a restore could return the other key's
+   * tarball.
+   *
+   * It is deliberately a SUFFIX: `restoreByPrefix` matches `restoreKeys` by
+   * string prefix, so appending leaves those semantics untouched. The only
+   * parse that has to know about it is the `matchedKey` slice.
+   */
   private finalKey(prefix: string, key: string): string {
+    return `${prefix}${this.seg(key)}-${keyDiscriminator(key)}${TAR_SUFFIX}`;
+  }
+
+  /**
+   * The pre-discriminator object key.
+   *
+   * @deprecated Read-only compatibility path for entries written before the key
+   * carried a discriminator. Nothing writes this format; it is removed at the
+   * next major, by which point every such entry has aged out of the cache TTL.
+   */
+  private legacyFinalKey(prefix: string, key: string): string {
     return `${prefix}${this.seg(key)}${TAR_SUFFIX}`;
+  }
+
+  /**
+   * Restore an entry still stored in the pre-discriminator key format.
+   *
+   * Two gates, and BOTH are load-bearing — dropping either re-creates the
+   * wrong-cache-hit this change fixes:
+   *
+   * 1. `unambiguousLegacyKey` statically rules out any key that could have
+   *    collided with a case variant in the old format.
+   * 2. The listed name must match byte-exactly. A case-insensitive backend
+   *    resolves `getUrl('build')` to an object created as `Build`, but its
+   *    *listing* reports the real created name — so comparing against the
+   *    listing is what detects that the object is not really ours.
+   *
+   * @deprecated Removed at the next major; see `legacyFinalKey`.
+   */
+  private async restoreLegacyExact(
+    ref: UserCacheRef & { key: string },
+    prefix: string,
+    ttlMs: number,
+  ): Promise<UserCacheRestoreResult | null> {
+    if (!unambiguousLegacyKey(ref.key)) return null;
+    const legacyKey = this.legacyFinalKey(prefix, ref.key);
+    if (!(await this.storage.list(prefix)).includes(legacyKey)) return null;
+    const url = await this.storage.getUrl(legacyKey, ttlMs);
+    if (!url) return null;
+    await this.storage.touch(legacyKey);
+    return {
+      hit: true,
+      matchedKey: ref.key,
+      downloadUrl: url,
+      tarHash: await this.readHash(legacyKey),
+    };
   }
 
   /** Restore: try the exact key across read prefixes, then restoreKeys prefix scan (newest wins). */
@@ -208,6 +310,10 @@ export class UserCache {
           tarHash: await this.readHash(key),
         };
       }
+      // Fall back to the pre-discriminator format within this same prefix, so
+      // scope priority (isolated before shared) still dominates key format.
+      const legacy = await this.restoreLegacyExact(ref, prefix, ttlMs);
+      if (legacy) return legacy;
     }
     return null;
   }
@@ -228,7 +334,7 @@ export class UserCache {
         const url = await this.storage.getUrl(winner, ttlMs);
         if (!url) continue;
         await this.storage.touch(winner);
-        const matchedKey = winner.slice(prefix.length, -TAR_SUFFIX.length);
+        const matchedKey = stripKeyDiscriminator(winner.slice(prefix.length, -TAR_SUFFIX.length));
         return { hit: true, matchedKey, downloadUrl: url, tarHash: await this.readHash(winner) };
       }
     }

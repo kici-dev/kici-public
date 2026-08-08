@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { buildManualJobConfig, handleManualSchedule } from './manual-schedule.js';
-import type { LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import {
+  buildManualJobConfig,
+  handleManualSchedule,
+  mergeScheduleInputs,
+} from './manual-schedule.js';
+import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 
 // Mock the idempotency claim with an in-memory stateful implementation so the
 // `handleManualSchedule` wiring — a `claimed: false` re-send short-circuits
@@ -181,6 +185,58 @@ describe('handleManualSchedule', () => {
     expect(byName['beat (a)'].jobConfig.matrixValues).toEqual({ value: 'a' });
     expect(byName['beat (a)'].jobConfig.baseJobName).toBe('beat');
     expect(byName['beat (a)'].jobConfig.matrix).toBeUndefined();
+  });
+
+  it('degrades gracefully when one matrix job can no longer expand (FanoutError)', async () => {
+    harness = makeDeps(
+      makeRegistration({
+        lockEntry: {
+          name: 'heartbeat',
+          source: '.kici/workflows/heartbeat.ts',
+          contentHash: 'content-hash-1',
+          triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
+          jobs: [
+            {
+              _type: 'static',
+              name: 'bad',
+              runsOn: [{ kind: 'exact', value: 'default' }],
+              steps: [{ name: 'ping', run: 'echo ok' }],
+              needs: [],
+              // Static matrix with no `values` → materializeFanout throws FanoutError.
+              matrix: { _type: 'static' },
+            },
+            {
+              _type: 'static',
+              name: 'good',
+              runsOn: [{ kind: 'exact', value: 'default' }],
+              steps: [{ name: 'ping', run: 'echo ok' }],
+              needs: [],
+            },
+          ],
+        },
+      }),
+    );
+
+    const result = await handleManualSchedule(
+      'reg-abc',
+      'user@test.com',
+      null,
+      harness.deps,
+      'req-test',
+    );
+
+    // The whole manual trigger no longer fails wholesale — the good job dispatches.
+    expect(result.newRunId).toBeDefined();
+    expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
+    expect(harness.dispatcher.dispatch.mock.calls[0][0].jobName).toBe('good');
+    // Both jobs are registered: the surviving 'good' job plus the synthetic
+    // rejected entry for 'bad'.
+    expect(harness.executionTracker.addJobsToRun).toHaveBeenCalledOnce();
+    const registered = harness.executionTracker.addJobsToRun.mock.calls[0][1];
+    expect(registered.some((j: { jobName: string }) => j.jobName === 'good')).toBe(true);
+    expect(registered.some((j: { jobName: string }) => j.jobName === 'bad')).toBe(true);
+    // The synthetic-rejected 'bad' job is marked failed.
+    expect(harness.executionTracker.onJobStatus).toHaveBeenCalled();
   });
 
   it('throws if registration is missing', async () => {
@@ -365,5 +421,57 @@ describe('buildManualJobConfig dispatchInputs', () => {
   it('omits dispatchInputs when the schedule declares no inputs', () => {
     const cfg = buildManualJobConfig(fakeScheduleWorkflow(), fakeMat());
     expect('dispatchInputs' in cfg).toBe(false);
+  });
+
+  it('merges defaults across ALL schedule triggers on a manual fire', () => {
+    const wf = {
+      name: 'multi-sched-wf',
+      source: 'test/repo',
+      triggers: [
+        {
+          _type: 'schedule',
+          cronExpression: '0 9 * * 1',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+        },
+        {
+          _type: 'schedule',
+          cronExpression: '0 18 * * 5',
+          timezone: 'UTC',
+          inputs: { region: { type: 'string', default: 'eu' } },
+        },
+      ],
+      jobs: [],
+    } as unknown as LockWorkflow;
+    const cfg = buildManualJobConfig(wf, fakeMat());
+    expect(cfg.dispatchInputs).toEqual({ mode: 'full', region: 'eu' });
+  });
+});
+
+describe('mergeScheduleInputs', () => {
+  it('returns undefined when no schedule declares inputs', () => {
+    const triggers = [
+      { _type: 'schedule', cronExpression: '0 9 * * 1', timezone: 'UTC' },
+      { _type: 'schedule', cronExpression: '0 18 * * 5', timezone: 'UTC' },
+    ] as unknown as LockScheduleTrigger[];
+    expect(mergeScheduleInputs(triggers)).toBeUndefined();
+  });
+
+  it('merges defaults across schedules (later wins on key collision)', () => {
+    const triggers = [
+      {
+        _type: 'schedule',
+        cronExpression: '0 9 * * 1',
+        timezone: 'UTC',
+        inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+      },
+      {
+        _type: 'schedule',
+        cronExpression: '0 18 * * 5',
+        timezone: 'UTC',
+        inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'quick' } },
+      },
+    ] as unknown as LockScheduleTrigger[];
+    expect(mergeScheduleInputs(triggers)).toEqual({ mode: 'quick' });
   });
 });

@@ -1,5 +1,27 @@
 import { describe, it, expect, vi } from 'vitest';
-import { followRun, type RunFollowClient } from './run-follow.js';
+import { followRun, resolveAcceptanceTimeoutMs, type RunFollowClient } from './run-follow.js';
+
+describe('resolveAcceptanceTimeoutMs', () => {
+  const DEFAULT_MS = 120_000;
+
+  it('prefers an explicit option over the environment', () => {
+    expect(resolveAcceptanceTimeoutMs(50, '999')).toBe(50);
+  });
+
+  it('reads a positive numeric override', () => {
+    expect(resolveAcceptanceTimeoutMs(undefined, '15000')).toBe(15_000);
+  });
+
+  it('falls back to the default for junk, empty, zero, and negative values', () => {
+    // NaN would make every `now > deadline` comparison false, silently
+    // disabling the window; 0 (what `Number('')` yields) would fail every run
+    // on its first poll. Both are worse than ignoring the typo.
+    for (const raw of ['2 min', '', '  ', '0', '-1', 'Infinity']) {
+      expect(resolveAcceptanceTimeoutMs(undefined, raw), raw).toBe(DEFAULT_MS);
+    }
+    expect(resolveAcceptanceTimeoutMs(undefined, undefined)).toBe(DEFAULT_MS);
+  });
+});
 
 describe('followRun', () => {
   it('polls to a terminal status and returns mapped jobs', async () => {
@@ -39,7 +61,9 @@ describe('followRun', () => {
     const get = vi.fn(async (path: string) => {
       if (path === '/api/v1/admin/runs/run-2') return { run: { status: 'success' } };
       if (path.startsWith('/api/v1/admin/runs/run-2/jobs?includeSteps=true')) {
-        return { jobs: [{ jobId: 'j1', jobName: 'build', status: 'success', steps: [{ stepIndex: 0 }] }] };
+        return {
+          jobs: [{ jobId: 'j1', jobName: 'build', status: 'success', steps: [{ stepIndex: 0 }] }],
+        };
       }
       if (path.includes('/steps/0/logs')) {
         return { lines: [{ value: 'hello' }, { value: 'world' }], totalLines: 2, nextCursor: null };
@@ -88,8 +112,15 @@ describe('followRun', () => {
   });
 
   it('throws when the run never reaches terminal before the timeout', async () => {
+    // The jobs path must answer with a jobs array like the real admin API: the
+    // acceptance check reads it too, so a run-header-shaped response there would
+    // surface as a TypeError instead of the idle timeout under test.
     const client: RunFollowClient = {
-      get: vi.fn().mockResolvedValue({ run: { status: 'running' } }),
+      get: vi.fn(async (path: string) =>
+        path.endsWith('/jobs')
+          ? { jobs: [{ jobId: 'j1', jobName: 'build', status: 'running', durationMs: null }] }
+          : { run: { status: 'running' } },
+      ) as RunFollowClient['get'],
     };
     await expect(
       followRun('http://127.0.0.1:4319', 'tok', 'run-3', {
@@ -118,7 +149,9 @@ describe('followRun', () => {
       }
       if (path.includes('?includeSteps=true')) {
         // One fresh log line per tick keeps the idle window resetting.
-        return { jobs: [{ jobId: 'j1', jobName: 'deploy', status: 'running', steps: [{ stepIndex: 0 }] }] };
+        return {
+          jobs: [{ jobId: 'j1', jobName: 'deploy', status: 'running', steps: [{ stepIndex: 0 }] }],
+        };
       }
       if (path.includes('/steps/0/logs')) {
         return { lines: [{ value: `line-${tick}` }], totalLines: tick, nextCursor: null };
@@ -139,5 +172,123 @@ describe('followRun', () => {
     });
     expect(outcome.status).toBe('success');
     expect(emitted.length).toBeGreaterThan(0);
+  });
+  it('fails fast when no agent ever claims the run', async () => {
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-stuck') return { run: { status: 'pending' } };
+      if (path === '/api/v1/admin/runs/run-stuck/jobs') {
+        return { jobs: [{ jobId: 'j1', jobName: 'build', status: 'queued', durationMs: null }] };
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    await expect(
+      followRun('http://127.0.0.1:4319', 'tok', 'run-stuck', {
+        client: { get },
+        quiet: true,
+        pollIntervalMs: 1,
+        acceptanceTimeoutMs: 50,
+        hintLogPath: '/home/u/.kici/local/orchestrator.log',
+      }),
+    ).rejects.toThrow(/no agent picked up this run/);
+  });
+
+  it('names the plane log in the acceptance failure', async () => {
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-stuck2') return { run: { status: 'pending' } };
+      if (path === '/api/v1/admin/runs/run-stuck2/jobs') return { jobs: [] };
+      throw new Error(`unexpected path ${path}`);
+    });
+    await expect(
+      followRun('http://127.0.0.1:4319', 'tok', 'run-stuck2', {
+        client: { get },
+        quiet: true,
+        pollIntervalMs: 1,
+        acceptanceTimeoutMs: 50,
+        hintLogPath: '/home/u/.kici/local/orchestrator.log',
+      }),
+    ).rejects.toThrow(/orchestrator\.log/);
+  });
+
+  it('does not trip once a job has been claimed', async () => {
+    let polls = 0;
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-ok') {
+        polls++;
+        return { run: { status: polls > 3 ? 'success' : 'running' } };
+      }
+      if (path === '/api/v1/admin/runs/run-ok/jobs') {
+        // Claimed from the first poll (running, not queued), and terminal once
+        // the run header reports success — otherwise the follow never concludes.
+        return {
+          jobs: [
+            {
+              jobId: 'j1',
+              jobName: 'build',
+              status: polls > 3 ? 'success' : 'running',
+              durationMs: null,
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const outcome = await followRun('http://127.0.0.1:4319', 'tok', 'run-ok', {
+      client: { get },
+      quiet: true,
+      pollIntervalMs: 1,
+      acceptanceTimeoutMs: 30,
+    });
+    expect(outcome.status).toBe('success');
+  });
+
+  it('does not trip while the run is held for approval', async () => {
+    let polls = 0;
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-held') {
+        polls++;
+        // Held well past the acceptance window, then released and completed.
+        return { run: { status: polls < 25 ? 'held' : 'success' } };
+      }
+      if (path === '/api/v1/admin/runs/run-held/jobs') {
+        return {
+          jobs: [
+            {
+              jobId: 'j1',
+              jobName: 'build',
+              status: polls < 25 ? 'queued' : 'success',
+              durationMs: 1,
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const outcome = await followRun('http://127.0.0.1:4319', 'tok', 'run-held', {
+      client: { get },
+      quiet: true,
+      pollIntervalMs: 1,
+      acceptanceTimeoutMs: 20,
+    });
+    expect(outcome.status).toBe('success');
+  });
+
+  it('reports a terminal run rather than blaming acceptance for it', async () => {
+    // Cancelled before any agent could claim it: every job stays queued, so the
+    // acceptance window elapses — but the run's outcome is already known, and
+    // "no agent picked up this run" would be a misdiagnosis of a cancellation.
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-cancelled') return { run: { status: 'cancelled' } };
+      if (path === '/api/v1/admin/runs/run-cancelled/jobs') {
+        return { jobs: [{ jobId: 'j1', jobName: 'build', status: 'cancelled', durationMs: null }] };
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const outcome = await followRun('http://127.0.0.1:4319', 'tok', 'run-cancelled', {
+      client: { get },
+      quiet: true,
+      pollIntervalMs: 1,
+      acceptanceTimeoutMs: -1, // already elapsed on the first poll
+    });
+    expect(outcome.status).toBe('cancelled');
   });
 });

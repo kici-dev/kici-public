@@ -61,6 +61,16 @@ const configSchema = z.object({
     .transform((s) => s === 'true'),
   jobHeartbeatIntervalMs: z.coerce.number().default(60_000),
   backpressureMode: z.enum(['pause', 'drop']).default('pause'),
+  // Local directory holding version-keyed self-contained agent payloads
+  // (`<dir>/<version>/kici-agent-<platform>.tar.gz`), produced by
+  // `kici-admin agent package`. When set, an ops agent stages the matching
+  // payload onto a bare box during bring-up so it boots with no system Node.
+  agentPayloadDir: z.string().optional(),
+  // Golden-image escape hatch: a fixed command to start the init-runner on a
+  // bring-up target that already ships `kici-agent` + a Node runtime at a known
+  // path. When set, payload staging is skipped. Leave unset for a stock rescue
+  // box (a payload dir is staged instead).
+  agentCommand: z.string().optional(),
   sandbox: z
     .string()
     .default('false')
@@ -89,11 +99,53 @@ const configSchema = z.object({
     .string()
     .default('false')
     .transform((s) => s === 'true'),
-  // 'isolated' (default when sandbox=true): bwrap --unshare-net, loopback only,
-  // strongest isolation, but breaks workflows that need to talk to npm/git/etc.
-  // 'host': keep host network namespace, allow outbound traffic. Use this when
-  // workflows must reach package registries or external services.
+  // Sandbox network posture for BOTH backends.
+  // 'isolated' (default): bwrap --unshare-net (loopback only, strongest
+  // isolation, breaks workflows that need npm/git/etc.); the container backend
+  // keeps the runtime default bridge (egress works).
+  // 'host': keep the host network namespace and allow outbound traffic — use
+  // when workflows must reach package registries or external services. On the
+  // container backend this also binds the host /etc/hosts read-only so a
+  // host-resolved-only registry name resolves inside the job container. The
+  // container backend applies this under the default hardened posture
+  // (KICI_SANDBOX_HARDENED=true).
   sandboxNetwork: z.enum(['isolated', 'host']).default('isolated'),
+  // Container-sandbox hardening posture (the per-job Docker/Podman sandbox).
+  // Secure-by-default: every job container drops all Linux capabilities, sets
+  // no-new-privileges, and gets pids/memory/CPU cgroup caps + a private
+  // tmpfs /tmp. These knobs tune that posture; see execution/sandbox/
+  // container-hardening.ts for how they map to the HostConfig.
+  //
+  // Master rollback affordance (documented-temporary): setting this false
+  // reproduces the legacy unhardened container posture. Default ON.
+  sandboxHardened: z
+    .string()
+    .default('true')
+    .transform((s) => s !== 'false'),
+  // Opt-in read-only rootfs. Off by default — many images write outside
+  // /workspace (npm cache, /home, tool state); /tmp is always a writable tmpfs.
+  sandboxReadonlyRootfs: z
+    .string()
+    .default('false')
+    .transform((s) => s === 'true'),
+  // Explicit container user override (uid, uid:gid, or name). When unset the
+  // image's configured user is honored as-is — a root image is never silently
+  // rewritten.
+  sandboxUser: z.string().optional(),
+  // cgroup caps for the job container. Defaults mirror the operator-visible
+  // constants in container-hardening.ts (512 pids / 2 GiB / 2 CPUs). Raise
+  // these for heavy builds; they bound fork-bomb / memory / CPU DoS on the host.
+  sandboxPidsLimit: z.coerce.number().int().positive().default(512),
+  sandboxMemoryBytes: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(2 * 1024 * 1024 * 1024),
+  sandboxNanoCpus: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(2 * 1_000_000_000),
   // Scaler integration. The auto-scaler injects KICI_SCALER_MANAGED=1 into
   // every ephemeral agent it spawns; the agent uses these to know when it
   // should self-shutdown after going idle.
@@ -154,10 +206,18 @@ export const envDef = defineEnv({
     dockerKeepFailed: 'KICI_DOCKER_KEEP_FAILED',
     jobHeartbeatIntervalMs: 'KICI_JOB_HEARTBEAT_INTERVAL_MS',
     backpressureMode: 'KICI_BACKPRESSURE_MODE',
+    agentPayloadDir: 'KICI_AGENT_PAYLOAD_DIR',
+    agentCommand: 'KICI_AGENT_COMMAND',
     sandbox: 'KICI_SANDBOX',
     trustedEnv: 'KICI_TRUSTED_ENV',
     inPlace: 'KICI_IN_PLACE',
     sandboxNetwork: 'KICI_SANDBOX_NETWORK',
+    sandboxHardened: 'KICI_SANDBOX_HARDENED',
+    sandboxReadonlyRootfs: 'KICI_SANDBOX_READONLY_ROOTFS',
+    sandboxUser: 'KICI_SANDBOX_USER',
+    sandboxPidsLimit: 'KICI_SANDBOX_PIDS_LIMIT',
+    sandboxMemoryBytes: 'KICI_SANDBOX_MEMORY_BYTES',
+    sandboxNanoCpus: 'KICI_SANDBOX_NANO_CPUS',
     scalerManaged: 'KICI_SCALER_MANAGED',
     scalerIdleTimeoutMs: 'KICI_SCALER_IDLE_TIMEOUT',
     scalerPendingDispatchTimeoutMs: 'KICI_SCALER_PENDING_DISPATCH_TIMEOUT',
@@ -188,7 +248,13 @@ export const envDef = defineEnv({
  * - KICI_SANDBOX (default: false) — enable bubblewrap (bwrap) namespace isolation for bare-metal execution
  * - KICI_TRUSTED_ENV (default: false) — trusted fleet-agent profile: pass the ambient host env (minus the agent's own KiCI identity secrets) through to steps
  * - KICI_IN_PLACE (default: false) — in-place no-clone profile: for a file:// source, use the real repo path as workDir and skip the clone (the routed deploy:stg profile)
- * - KICI_SANDBOX_NETWORK (default: isolated, options: isolated | host) — when sandbox=true, controls bwrap network namespace
+ * - KICI_SANDBOX_NETWORK (default: isolated, options: isolated | host) — sandbox network posture for BOTH backends: the bwrap network namespace (when sandbox=true) and the container job network. `host` shares the host network (container backend also binds host /etc/hosts read-only for name resolution); applies to the container backend under the default hardened posture (KICI_SANDBOX_HARDENED=true)
+ * - KICI_SANDBOX_HARDENED (default: true) — hardened-by-default job containers (CapDrop ALL, no-new-privileges, cgroup caps, tmpfs /tmp); set false to roll back to the legacy unhardened posture
+ * - KICI_SANDBOX_READONLY_ROOTFS (default: false) — opt-in read-only container rootfs (/tmp stays a writable tmpfs)
+ * - KICI_SANDBOX_USER (optional) — container user override (uid, uid:gid, or name); honors the image user when unset
+ * - KICI_SANDBOX_PIDS_LIMIT (default: 512) — max PIDs in the job container cgroup
+ * - KICI_SANDBOX_MEMORY_BYTES (default: 2 GiB) — memory cap in bytes for the job container cgroup
+ * - KICI_SANDBOX_NANO_CPUS (default: 2 CPUs) — CPU cap in nano-CPUs for the job container cgroup
  * - KICI_SCALER_MANAGED (set to "1" by the orchestrator's auto-scaler — agent self-shuts down on idle)
  * - KICI_SCALER_IDLE_TIMEOUT (ms, default 5000) — how long a scaler-managed agent waits before shutdown after going idle
  * - KICI_SCALER_PENDING_DISPATCH_TIMEOUT (ms, default 60000) — extended idle window when register.ack signals a queued bound job
@@ -198,10 +264,19 @@ export const envDef = defineEnv({
 export function loadConfig(): AppConfig {
   const data = envDef.parse();
 
-  // Validate no reserved kici:* prefix in user-provided labels.
-  // Skip validation for scaler-managed agents since the orchestrator's scaler
-  // injects kici:role:* labels into KICI_LABELS automatically.
-  if (!data.scalerManaged) {
+  // Validate no reserved kici:* prefix in user-provided labels. This is a
+  // client-side guardrail against a user spoofing a system label; it does NOT
+  // apply when the orchestrator is the authority on which reserved labels the
+  // agent may advertise:
+  //   - scaler-managed agents get kici:role:* injected into KICI_LABELS by the
+  //     orchestrator's scaler;
+  //   - token-authenticated agents (an ssh-transport ops agent advertising
+  //     kici:capability:ssh-transport, or an init-runner advertising
+  //     kici:init / kici:privileged:root / kici:host:* from its bootstrap
+  //     token) have every wire label checked against the token's authorized set
+  //     at register time (agent-handler Gate 1), so an unauthorized reserved
+  //     label is rejected there rather than needing a client-side block.
+  if (!data.scalerManaged && !data.agentToken) {
     validateNoReservedLabels(data.labels, 'KICI_LABELS');
   }
 

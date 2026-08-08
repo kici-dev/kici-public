@@ -38,6 +38,12 @@ The package manager is detected from your repo's `packageManager` field, lockfil
 | `--skip-install`                      | Create files without installing dependencies                 |
 | `--package-manager <npm\|pnpm\|yarn>` | Force a package manager for the install step (default: auto) |
 | `--mjs`                               | JavaScript-only mode (no TypeScript, no deps)                |
+| `--workspace`                         | Integrate `.kici/` into the surrounding workspace            |
+| `--standalone`                        | Force a self-contained `.kici/` even inside a workspace      |
+
+### Workspace integration
+
+If you run `kici init` inside a pnpm, npm, or yarn workspace, it offers to **integrate** `.kici/` into that workspace instead of scaffolding a self-contained folder. In integrate mode there is no `.kici/package.json`: `@kici-dev/sdk` is added to your workspace-root `package.json`, and your workflows can `import` your other workspace packages directly — for example shared build or deploy utilities. Pass `--workspace` to opt in non-interactively, or `--standalone` to keep the self-contained layout. In CI the default is standalone. See the [`kici init` reference](./cli/account-and-org.md#kici-init) for details.
 
 ### MJS mode
 
@@ -92,7 +98,7 @@ Create `.kici/workflows/ci.ts`:
 import { workflow, job, step, pr } from '@kici-dev/sdk';
 
 const lint = job('lint', {
-  runsOn: 'linux',
+  runsOn: 'kici:os:linux',
   steps: [
     step('install', async ({ $ }) => {
       await $`pnpm install --frozen-lockfile`;
@@ -104,7 +110,7 @@ const lint = job('lint', {
 });
 
 const test = job('test', {
-  runsOn: 'linux',
+  runsOn: 'kici:os:linux',
   needs: [lint],
   steps: [
     step('install', async ({ $ }) => {
@@ -128,7 +134,7 @@ This workflow:
 - Runs a `lint` job first
 - Runs a `test` job after lint succeeds (`needs: [lint]`)
 
-`runsOn` selects which agents may run a job. Every agent self-reports `kici:os:<platform>`, `kici:arch:<cpu>`, and `kici:host:<hostname>`, so `runsOn: 'kici:os:linux'` targets any connected Linux agent with zero configuration — `kici init` scaffolds workflows with exactly that. Use a custom label such as `'linux'` or `'gpu'` (defined in your scaler's `labelSet`) to target a specific pool instead. See the [runsOn forms](./sdk/core.md#runson-forms) reference for the full label model.
+`runsOn` selects which agents may run a job. Every agent self-reports `kici:os:<platform>`, `kici:arch:<cpu>`, and `kici:host:<hostname>`, so `runsOn: 'kici:os:linux'` targets any connected Linux agent with zero configuration. `kici init` scaffolds workflows targeting your own host's OS label (`kici:os:linux`, `kici:os:macos`, or `kici:os:windows`) so your first local run dispatches on this machine. Use a custom label such as `'linux'` or `'gpu'` (defined in your scaler's `labelSet`) to target a specific pool instead. See the [runsOn forms](./sdk/core.md#runson-forms) reference for the full label model.
 
 **Single-step shortcut.** If a job only has one step, pass `run` directly to `job()` instead of building a `steps: [step(...)]` array:
 
@@ -199,6 +205,8 @@ npx kici run pr:open --local
 ```
 
 This compiles, matches triggers, and runs all matched jobs on this machine — which joins as an ephemeral agent through the warm local dev plane — with DAG-based parallel scheduling.
+
+If a run never appears or a webhook seems ignored, run `kici doctor` — it walks your login, organization, orchestrator connection, and compiled lock file, and tells you the exact command to fix the first broken step.
 
 ## Workflow dependencies
 
@@ -356,6 +364,7 @@ The compiler watches `.kici/workflows/*.ts` and recompiles on every save.
 ## Next steps
 
 - **[5-minute quickstart](quickstart.md)** -- ready to run your workflow on real infrastructure? Stand up an orchestrator + agent (Docker / Podman or bare metal)
+- **[How your workflow code executes](execution-model.md)** -- the mental model: which parts of your workflow run at compile time, on the orchestrator, and on the agent
 - **[SDK reference](sdk-reference.md)** -- complete API for workflows, jobs, steps, triggers, rules, and matrix
 - **[CLI reference](cli-reference.md)** -- all CLI commands with options and examples
 - **[Workflow patterns](workflow-patterns.md)** -- common patterns for real-world CI/CD workflows

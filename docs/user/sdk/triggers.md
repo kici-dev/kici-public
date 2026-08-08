@@ -1,11 +1,11 @@
 ---
 title: 'SDK reference: triggers'
-description: GitHub event triggers, kiciEvent, workflowComplete, jobComplete, genericWebhook, schedule, lifecycle
+description: GitHub event triggers, kiciEvent, workflowComplete, workflowsFailedBatch, jobComplete, genericWebhook, schedule, lifecycle
 ---
 
 ## Triggers
 
-Triggers define when a workflow runs. KiCI provides 22 trigger types: 16 GitHub webhook triggers and 6 internal/generic triggers for event routing, scheduling, and non-GitHub sources. Each trigger returns a frozen config object with a unique `_tag` discriminator.
+Triggers define when a workflow runs. KiCI provides 23 trigger types: 16 GitHub webhook triggers and 7 internal/generic triggers for event routing, scheduling, and non-GitHub sources. Each trigger returns a frozen config object with a unique `_tag` discriminator.
 
 All triggers use a config object form -- pass an options object to configure the trigger.
 
@@ -82,6 +82,17 @@ push({ branches: ['main', 'develop'], paths: ['src/**'] });
 // Tag pushes
 push({ tags: ['v*'] });
 ```
+
+### Path filter behavior
+
+A `pr()` or `push()` trigger with `paths` matches the event's changed files
+against your patterns. An available list is matched exactly (an event with no
+matching change — including a diff-less branch create or delete — does not run).
+When the diff is **unavailable** (chiefly a universal-git pull-request event,
+whose webhook carries no diff), path filters match **conservatively** so the
+workflow runs rather than being silently dropped, and the delivery is recorded
+as degraded. GitHub always provides an exact list; a transient API error fails
+loudly, not as empty.
 
 ### tag()
 
@@ -371,7 +382,7 @@ The orchestrator emits `kici_cross_source_fanout_size` (histogram) per inbound w
 
 ### Event triggers
 
-The following 6 trigger types support internal event routing, scheduling, lifecycle orchestration, and non-GitHub webhook sources.
+The following 7 trigger types support internal event routing, scheduling, lifecycle orchestration, and non-GitHub webhook sources.
 
 ### kiciEvent()
 
@@ -426,6 +437,51 @@ workflowComplete({ name: 'CI' }); // Specific workflow
 workflowComplete({ name: 'CI', status: ['success'] }); // Success only
 workflowComplete({ name: 'CI', status: ['success'], source: 'org/repo' }); // Cross-repo
 ```
+
+### workflowsFailedBatch()
+
+Create a batched failure trigger. Instead of firing once per failed workflow, it accumulates every failed workflow completion over a time window and fires the subscribing workflow **once** with the whole list — so a mass incident (a bad deploy failing hundreds of runs at once) notifies a single time, not once per failure. Returns a frozen `WorkflowsFailedBatchTriggerConfig`.
+
+```typescript
+function workflowsFailedBatch(
+  config: WorkflowsFailedBatchConfigInput,
+): WorkflowsFailedBatchTriggerConfig;
+```
+
+**Config options:**
+
+```typescript
+interface WorkflowsFailedBatchConfigInput {
+  accumulateFor: number; // Accumulation window in milliseconds (opens on the first failure)
+  name?: string; // Filter by failed workflow name
+  source?: string; // Cross-repo source filter
+  description?: string;
+}
+```
+
+The first failure inside the window opens it; when the window closes, the subscribing workflow is dispatched once. The batch is delivered on `ctx.event.payload`:
+
+```typescript
+// ctx.event.payload for a workflowsFailedBatch dispatch:
+// {
+//   total: number,               // total failures in the window
+//   runs: Array<{                // the failed runs (bounded — the first 200)
+//     runId: string;
+//     repo: string;
+//     workflowName: string;
+//     failureClass?: string;     // why the run failed
+//     senderUsername?: string;   // triggering actor, when known
+//   }>,
+// }
+```
+
+```typescript
+workflowsFailedBatch({ accumulateFor: 10000 }); // One notification per 10s burst of failures
+workflowsFailedBatch({ accumulateFor: 30000, name: 'CI' }); // Only CI failures
+workflowsFailedBatch({ accumulateFor: 30000, source: 'org/repo' }); // Cross-repo source filter
+```
+
+A workflow dispatched by a failure trigger (`workflowsFailedBatch`, or `workflowComplete({ status: ['failed'] })`) never re-triggers the same batch on its own failure — a notifier that itself fails cannot loop.
 
 ### jobComplete()
 
@@ -516,6 +572,14 @@ schedule({ cron: '0 * * * *' }); // Every hour
 schedule({ cron: '0 0 * * *' }); // Daily at midnight UTC
 schedule({ cron: '0 9 * * 1', timezone: 'America/New_York' }); // Monday 9am ET
 schedule({ cron: '*/15 * * * *', description: 'health check every 15 min' });
+```
+
+A workflow may declare **multiple** `schedule()` triggers. Each schedule is
+evaluated and fired independently — a `Monday 9am` schedule and a `Friday 6pm`
+schedule on the same workflow both run at their own times:
+
+```typescript
+on: [schedule({ cron: '0 9 * * 1' }), schedule({ cron: '0 18 * * 5' })];
 ```
 
 #### Schedule inputs (defaults-only)

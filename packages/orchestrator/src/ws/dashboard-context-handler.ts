@@ -12,6 +12,7 @@
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { HeldRunStatus } from '../contexts/held-runs.js';
 import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import type { TeamMembershipLookup } from '../approvals/approval-resolver.js';
 import { applyDecision } from '../approvals/apply-decision.js';
@@ -45,8 +46,16 @@ import type {
   HeldRunsListRequest,
   HeldRunApproveRequest,
   HeldRunRejectRequest,
+  ConcurrencyStrategy,
 } from '@kici-dev/engine';
-import { ContextDeleteErrorCode } from '@kici-dev/engine';
+import {
+  ApprovalDecision,
+  ContextDeleteErrorCode,
+  HeldRunQueueType,
+  HoldScope,
+  assertValidScopeName,
+  normalizePersistedHoldType,
+} from '@kici-dev/engine';
 import { ContextDeleteBlockedError } from '../contexts/context-store.js';
 import type { ContextStore } from '../contexts/context-store.js';
 import type { VariableStore } from '../contexts/variable-store.js';
@@ -57,8 +66,16 @@ import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboar
 import {
   assertDashboardWriteAllowed,
   buildPolicyDeniedResponse,
+  getDashboardWritePolicyState,
   DashboardWritePolicyDisabledError,
 } from '../policy/dashboard-write-policy.js';
+import { decryptDashboardSealedWrite } from '../secrets/ephemeral-keys.js';
+import { resolveScope, type ScopedSecretStore } from '../secrets/scope-routing.js';
+import type { ResolvedDashboardEncryptionKey } from '../secrets/dashboard-encryption-key.js';
+import {
+  DashboardSealedWriteError,
+  type DashboardSealedEnvelope,
+} from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 
 const logger = createLogger({ prefix: 'dashboard-context-handler' });
 
@@ -88,16 +105,13 @@ function safeJsonParse(s: string): unknown {
   }
 }
 
-/** Secret store interface (subset of PgSecretStore methods used here). */
-interface SecretStoreForDashboard {
-  listScopes(orgId: string): Promise<string[]>;
-  listKeys(orgId: string, scope: string): Promise<string[]>;
-  setSecret(orgId: string, scope: string, key: string, value: string): Promise<void>;
-  deleteSecret(orgId: string, scope: string, key: string): Promise<void>;
-  createScope?(orgId: string, scope: string): Promise<void>;
-  renameScope?(orgId: string, oldScope: string, newScope: string): Promise<void>;
-  deleteScope?(orgId: string, scope: string): Promise<void>;
-}
+/**
+ * Secret store interface (subset of PgSecretStore methods used here).
+ *
+ * Alias of the shared `ScopedSecretStore` so the WS plane and the HTTP admin
+ * plane route scopes against one contract.
+ */
+type SecretStoreForDashboard = ScopedSecretStore;
 
 export interface DashboardContextHandlerDeps {
   /** Organization ID for all operations. */
@@ -124,6 +138,15 @@ export interface DashboardContextHandlerDeps {
    * handlers fall back to the direct status flip.
    */
   approvals?: ApprovalHandlerDeps;
+  /**
+   * Dashboard-encryption key resolver. Present when KICI_SECRET_KEY is
+   * configured. Under the `encrypted` posture the secret/variable set handlers
+   * decrypt the browser-sealed envelope with the resolved private key. Absent ⇒
+   * `encrypted` writes fail closed (`encryption_unavailable`).
+   */
+  dashboardEncryption?: {
+    resolve: () => Promise<ResolvedDashboardEncryptionKey | null>;
+  };
 }
 
 /** Dependencies enabling the resolver-backed approve/reject + resume path. */
@@ -201,6 +224,45 @@ export class DashboardContextHandler {
       }
       throw err;
     }
+  }
+
+  /**
+   * Resolve the plaintext value for a secret/variable set under the write
+   * policy. When the client sends a `sealed` envelope, decrypt it with the
+   * orchestrator's X25519 key (honored regardless of posture — the client chose
+   * to seal, so never expose that plaintext through the Platform). Otherwise,
+   * under the `encrypted` posture a plaintext `value` is refused (fail-closed);
+   * under `permissive` the plaintext `value` is used. Returns the plaintext or a
+   * structured error code the caller records + sends back.
+   */
+  private async resolveWriteValue(
+    msg: { value?: string; sealed?: DashboardSealedEnvelope },
+    op: DashboardWriteOperation,
+  ): Promise<{ plaintext: string } | { error: DashboardSealedWriteError }> {
+    if (msg.sealed) {
+      const resolved = await this.deps.dashboardEncryption?.resolve();
+      if (!resolved) {
+        return { error: DashboardSealedWriteError.enum.encryption_unavailable };
+      }
+      const priv = await resolved.decryptPrivateKeyDer(msg.sealed.keyId);
+      if (!priv) {
+        return { error: DashboardSealedWriteError.enum.unknown_encryption_key };
+      }
+      try {
+        return { plaintext: decryptDashboardSealedWrite(msg.sealed, priv) };
+      } catch {
+        return { error: DashboardSealedWriteError.enum.decryption_failed };
+      }
+    }
+    const state = await getDashboardWritePolicyState(this.deps.db, this.deps.orgId, op);
+    if (state === 'encrypted') {
+      // Fail-closed: never accept a plaintext value under the encrypted posture.
+      return { error: DashboardSealedWriteError.enum.operation_requires_encryption };
+    }
+    if (msg.value === undefined) {
+      return { error: DashboardSealedWriteError.enum.missing_value };
+    }
+    return { plaintext: msg.value };
   }
 
   /**
@@ -458,7 +520,7 @@ export class DashboardContextHandler {
           globPattern: env.glob_pattern,
           branchRestrictions: env.branch_restrictions ?? null,
           concurrencyLimit: env.concurrency_limit,
-          concurrencyStrategy: env.concurrency_strategy as 'queue' | 'cancel-pending' | null,
+          concurrencyStrategy: env.concurrency_strategy as ConcurrencyStrategy | null,
           requiredReviewers: env.required_reviewers != null ? Number(env.required_reviewers) : null,
           waitTimerSeconds: env.wait_timer_seconds,
           holdExpirySeconds: env.hold_expiry_seconds ?? null,
@@ -552,12 +614,23 @@ export class DashboardContextHandler {
         name: u.name,
         type: u.contextType,
         globPattern: u.globPattern,
-        branchRestrictions: u.branchRestrictions ?? undefined,
+        // `undefined` = the message did not mention the field, leave it alone;
+        // `null` = clear it. The two are distinct on the wire (every field here
+        // is `.nullable().optional()`), so they are forwarded verbatim —
+        // collapsing them makes "turn this off" a silent no-op.
+        branchRestrictions: u.branchRestrictions,
         concurrencyLimit: u.concurrencyLimit,
-        concurrencyStrategy: u.concurrencyStrategy ?? undefined,
-        requiredReviewers: u.requiredReviewers != null ? [String(u.requiredReviewers)] : undefined,
+        concurrencyStrategy: u.concurrencyStrategy,
+        // The column stores a JSON array; the wire carries a count. Three-way
+        // rather than `??`, so an explicit null survives as a clear.
+        requiredReviewers:
+          u.requiredReviewers === undefined
+            ? undefined
+            : u.requiredReviewers === null
+              ? null
+              : [String(u.requiredReviewers)],
         waitTimerSeconds: u.waitTimerSeconds,
-        holdExpirySeconds: u.holdExpirySeconds ?? undefined,
+        holdExpirySeconds: u.holdExpirySeconds,
         enabled: u.enabled,
       });
       if (!env) {
@@ -765,12 +838,29 @@ export class DashboardContextHandler {
     ) {
       return;
     }
+    const resolved = await this.resolveWriteValue(msg, 'variables.set');
+    if ('error' in resolved) {
+      this.recordAccess(
+        msg.actor,
+        'context_var.set',
+        { type: 'context', id: `${msg.contextId}:${msg.key}` },
+        msg.requestId,
+        'denied',
+        resolved.error,
+      );
+      this.deps.send({
+        type: 'dashboard.contexts.variables.set.response',
+        requestId: msg.requestId,
+        error: resolved.error,
+      });
+      return;
+    }
     try {
       await this.deps.variableStore.setVar(
         this.deps.orgId,
         msg.contextId,
         msg.key,
-        msg.value,
+        resolved.plaintext,
         msg.locked,
       );
       this.recordAccess(
@@ -1053,19 +1143,9 @@ export class DashboardContextHandler {
     store: SecretStoreForDashboard;
     scope: string;
   }> {
-    const colonIdx = prefixedScope.indexOf(':');
     const stores = await this.getBackendStores();
-
-    if (colonIdx >= 0) {
-      const backendName = prefixedScope.slice(0, colonIdx);
-      const store = stores.get(backendName);
-      if (store) {
-        return { store, scope: prefixedScope.slice(colonIdx + 1) };
-      }
-    }
-
-    // Fallback: use the default secretStore with scope as-is
-    return { store: this.deps.secretStore, scope: prefixedScope };
+    const { store, path } = resolveScope(prefixedScope, stores, this.deps.secretStore);
+    return { store, scope: path };
   }
 
   private async handleSecretsList(msg: ContextSecretsListRequest): Promise<void> {
@@ -1168,9 +1248,27 @@ export class DashboardContextHandler {
     ) {
       return;
     }
+    const resolved = await this.resolveWriteValue(msg, 'secrets.set');
+    if ('error' in resolved) {
+      this.recordAccess(
+        msg.actor,
+        'secret.set',
+        { type: 'secret_scope', id: `${msg.scope}:${msg.key}` },
+        msg.requestId,
+        'denied',
+        resolved.error,
+      );
+      this.deps.send({
+        type: 'dashboard.contexts.secrets.set.response',
+        requestId: msg.requestId,
+        error: resolved.error,
+      });
+      return;
+    }
     try {
       const { store, scope } = await this.resolveStoreForScope(msg.scope);
-      await store.setSecret(this.deps.orgId, scope, msg.key, msg.value);
+      assertValidScopeName(scope);
+      await store.setSecret(this.deps.orgId, scope, msg.key, resolved.plaintext);
       this.recordAccess(
         msg.actor,
         'secret.set',
@@ -1250,6 +1348,7 @@ export class DashboardContextHandler {
     }
     try {
       const { store, scope } = await this.resolveStoreForScope(msg.scope);
+      assertValidScopeName(scope);
       if (!store.createScope) {
         throw new Error('Backend does not support scope creation');
       }
@@ -1291,12 +1390,33 @@ export class DashboardContextHandler {
       return;
     }
     try {
-      const { store, scope: oldScope } = await this.resolveStoreForScope(msg.oldScope);
-      if (!store.renameScope) {
+      // Both scopes resolve against ONE snapshot of the backend map. Loading it
+      // twice would let a backend registered or removed between the two loads
+      // decide the comparison below — the same qualifier could resolve to a
+      // backend in one snapshot and fall through to the default in the other,
+      // which is exactly the cross-backend rename this guard must catch.
+      const stores = await this.getBackendStores();
+      const from = resolveScope(msg.oldScope, stores, this.deps.secretStore);
+      const to = resolveScope(msg.newScope, stores, this.deps.secretStore);
+      // A rename is a per-backend operation — the source store re-encrypts each
+      // row under the new scope's AAD. Moving a scope BETWEEN backends is a
+      // copy plus a delete, which this path does not perform, so reject it
+      // outright rather than silently renaming inside the source backend and
+      // reporting success. Mirrors the HTTP admin route's 400.
+      if (from.backendName !== to.backendName) {
+        throw new Error(
+          `Cannot rename a scope across backends ` +
+            `('${from.backendName}' -> '${to.backendName}'). ` +
+            `Recreate the secrets in the destination backend instead.`,
+        );
+      }
+      if (!from.store.renameScope) {
         throw new Error('Backend does not support scope rename');
       }
-      const { scope: newScope } = await this.resolveStoreForScope(msg.newScope);
-      await store.renameScope(this.deps.orgId, oldScope, newScope);
+      // Validate only the destination name — renaming a pre-existing malformed
+      // scope to a conforming one is the built-in cleanup path.
+      assertValidScopeName(to.path);
+      await from.store.renameScope(this.deps.orgId, from.path, to.path);
       this.recordAccess(
         msg.actor,
         'secret_scope.rename',
@@ -1370,7 +1490,11 @@ export class DashboardContextHandler {
       const limit = msg.limit ?? 20;
       const offset = msg.offset ?? 0;
 
-      const runs = await this.deps.db
+      // Over-fetch by one to detect whether a further page exists without a
+      // separate count query: if the DB returns more than `limit` rows, there
+      // is at least one more page. The probe row is sliced off below and never
+      // reaches the client.
+      const fetched = await this.deps.db
         .selectFrom('execution_runs')
         .select([
           'id',
@@ -1385,9 +1509,12 @@ export class DashboardContextHandler {
         ])
         .where('context_id', '=', msg.contextId)
         .orderBy('started_at', 'desc')
-        .limit(limit)
+        .limit(limit + 1)
         .offset(offset)
         .execute();
+
+      const hasMore = fetched.length > limit;
+      const runs = hasMore ? fetched.slice(0, limit) : fetched;
 
       this.recordAccess(
         msg.actor,
@@ -1399,6 +1526,7 @@ export class DashboardContextHandler {
       this.deps.send({
         type: 'dashboard.contexts.history.response',
         requestId: msg.requestId,
+        hasMore,
         runs: runs.map((r) => ({
           id: r.id,
           runId: r.run_id,
@@ -1479,6 +1607,9 @@ export class DashboardContextHandler {
       if (msg.runId) {
         query = query.where('held_runs.run_id', '=', msg.runId);
       }
+      if (msg.heldRunId) {
+        query = query.where('held_runs.id', '=', msg.heldRunId);
+      }
 
       const rows = await query.execute();
 
@@ -1521,9 +1652,18 @@ export class DashboardContextHandler {
           runId: r.run_id,
           contextId: r.context_id,
           contextName: r.context_name,
-          holdType: r.hold_type,
-          queueType: (r.queue_type ?? 'context') as 'context' | 'security',
-          status: r.status as 'pending' | 'approved' | 'rejected' | 'expired',
+          // A row an un-upgraded orchestrator wrote may carry `approval` /
+          // `wait_timer`; the wire and the UI speak one vocabulary. An unknown
+          // type passes through — the field is `z.string()` so a newer
+          // orchestrator's type survives an older reader.
+          holdType: normalizePersistedHoldType(r.hold_type),
+          // Emitted verbatim: both are plain-text columns and the wire fields
+          // are `z.string()`, so a status this build does not know (or one a
+          // newer orchestrator writes) still reaches the reader instead of
+          // failing validation for the whole message. `?? 'context'` is a real
+          // default for the nullable column read, not a cast.
+          queueType: r.queue_type ?? HeldRunQueueType.enum.context,
+          status: r.status,
           requestedAt:
             r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
           resolvedAt: r.resolved_at
@@ -1541,7 +1681,11 @@ export class DashboardContextHandler {
           contributorUsername: r.contributor_username ?? null,
           trustTier: r.trust_tier ?? null,
           jobId: r.job_id,
-          holdScope: (r.hold_scope ?? 'job') as 'workflow' | 'job' | 'step',
+          // Still a cast: the wire field is a strict `HoldScope` enum while the
+          // column is plain text. Safe today because `hold_scope` is only ever
+          // written from `HoldScope` (and defaults to 'job'); widen the wire
+          // field the moment that stops being true.
+          holdScope: (r.hold_scope ?? HoldScope.enum.job) as HoldScope,
           stepIndex: r.step_index ?? null,
           requirement:
             r.approval_requirement &&
@@ -1563,7 +1707,10 @@ export class DashboardContextHandler {
           payload: normalizeHeldRunPayload(r.payload),
           decisions: (decisionsByHold.get(r.id) ?? []).map((d) => ({
             approverUserId: d.approver_user_id,
-            decision: d.decision as 'approve' | 'reject',
+            // Same shape as `holdScope` above: strict on the wire, plain text
+            // in `held_run_approvals.decision`, only ever written from
+            // `ApprovalDecision`.
+            decision: d.decision as ApprovalDecision,
             clausesSatisfied: (d.clauses_satisfied ?? null) as Array<
               { team: string } | { user: string }
             > | null,
@@ -1718,13 +1865,13 @@ export class DashboardContextHandler {
       const result = await this.deps.db
         .updateTable('held_runs')
         .set({
-          status: 'approved',
+          status: HeldRunStatus.Approved,
           resolved_at: sql`now()`,
           approved_by: 'dashboard-user',
         })
         .where('id', '=', msg.heldRunId)
         .where('org_id', '=', orgId)
-        .where('status', '=', 'pending')
+        .where('status', '=', HeldRunStatus.Pending)
         .executeTakeFirst();
 
       if (!result || (result.numUpdatedRows ?? 0n) === 0n) {
@@ -1792,13 +1939,13 @@ export class DashboardContextHandler {
       const result = await this.deps.db
         .updateTable('held_runs')
         .set({
-          status: 'rejected',
+          status: HeldRunStatus.Rejected,
           resolved_at: sql`now()`,
           reason: msg.reason ?? 'Rejected via dashboard',
         })
         .where('id', '=', msg.heldRunId)
         .where('org_id', '=', orgId)
-        .where('status', '=', 'pending')
+        .where('status', '=', HeldRunStatus.Pending)
         .executeTakeFirst();
 
       if (!result || (result.numUpdatedRows ?? 0n) === 0n) {

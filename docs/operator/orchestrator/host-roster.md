@@ -125,12 +125,13 @@ kici-admin host declare --agent-id box-00007 \
   --ssh-key-secret prod/bootstrap/ssh
 ```
 
-| Flag               | Meaning                                                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `--address`        | IP / hostname to SSH to before the host has an agent.                                                           |
-| `--ssh-user`       | SSH login user for the bring-up (defaults to `root`).                                                           |
-| `--ssh-port`       | SSH port for the bring-up (defaults to `22`).                                                                   |
-| `--ssh-key-secret` | A [scoped-secret](../../operator/security/secrets.md) reference (`scope/key`) holding the bring-up private key. |
+| Flag               | Meaning                                                                                                                                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--address`        | IP / hostname to SSH to before the host has an agent.                                                                                                                                                   |
+| `--ssh-user`       | SSH login user for the bring-up (defaults to `root`).                                                                                                                                                   |
+| `--ssh-port`       | SSH port for the bring-up (defaults to `22`).                                                                                                                                                           |
+| `--ssh-key-secret` | A [scoped-secret](../../operator/security/secrets.md) reference (`scope/key`) holding the bring-up private key.                                                                                         |
+| `--s3-reachable`   | Marks the box as able to reach the orchestrator's object storage, so it pulls the agent payload directly (see [Payload delivery](#payload-delivery)). Omit for a box that can only be reached over SSH. |
 
 All four are nullable: a host declared without reach metadata simply cannot be bootstrapped and behaves exactly as before. The private key is **never** stored in the roster — only the reference is. The orchestrator resolves it server-side at bring-up time and hands it to the ops agent that performs the SSH, mirroring how every other [scoped secret](../../operator/security/secrets.md) reaches an agent.
 
@@ -153,6 +154,25 @@ job({
 `ensureInitRunner` is a **no-op** when the target already has a live agent — re-running a bootstrap workflow against an initialized box does nothing. When the target is fresh, it mints a **single-use, short-TTL bootstrap token** (≈10 min, labels `kici:init` + `kici:privileged:root` + `kici:host:<id>`), drops + starts the agent binary on the target over SSH (ephemeral SSH agent, key never written to disk), and the existing auto-register flow enrolls it as a temporary `kici:init`-labeled ephemeral host. The init-runner dies on reboot and the reaper GCs its ephemeral roster row.
 
 Every bring-up writes an [access-log](../../operator/security/audit-log.md) row (actor = the ops agent, target = the fresh host), and a bring-up attempt by an agent lacking the capability is logged as `denied`.
+
+### Payload delivery
+
+A stock rescue box has **no Node runtime**, so the bring-up must first stage a self-contained agent + vendored-Node payload onto it. Produce and publish that payload from your own orchestrator:
+
+```bash
+# Build the payloads and upload them to the orchestrator's object storage,
+# version-keyed under agent-packages/<version>/kici-agent-<platform>.tar.gz.
+kici-admin agent package --upload
+```
+
+The payload is stored in **your own** object storage bucket (never a vendor CDN), built from the sources you already trust (nodejs.org + npm + the installed agent bundle). The bring-up then delivers it to the box by one of two paths, chosen per host:
+
+| Delivery      | When                                                         | How                                                                                                                                |
+| ------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| **S3-direct** | The box is declared `--s3-reachable`.                        | The orchestrator mints a short-lived presigned URL and the box pulls the payload itself — no large transfer through the ops agent. |
+| **SSH-push**  | Default (box not `--s3-reachable`, or storage unconfigured). | The ops agent fetches the payload from object storage and streams it to the box over a binary-safe SSH copy.                       |
+
+Both paths verify the payload's `sha256` **on the box before extraction**, so a corrupted or tampered payload is never unpacked. `KICI_AGENT_BINARY_SOURCE` defaults to the orchestrator's own cache bucket; set it to an `s3://bucket[/prefix]` value to point the delivery at a mirror bucket. An external HTTP(S) source is rejected — payloads always come from object storage you control.
 
 ### Fleet convergence — one workflow, init-or-not
 

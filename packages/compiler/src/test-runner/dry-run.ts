@@ -1,11 +1,33 @@
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
 import type { LockWorkflow, LockJob } from '../types.js';
+import type { JobPurityWarning } from '../lockfile/purity-diagnostics.js';
 import type { WorkflowDecision } from '@kici-dev/engine';
 
 interface DryRunOptions {
   workflow?: string;
   job?: string;
+}
+
+/**
+ * Print the injected `__init__` job line for each impure dynamic value on a job,
+ * so the ~5-10s init-job cost is visible before the first run. Returns the number
+ * of lines rendered so the caller can count the jobs it actually surfaced.
+ */
+function renderJobInitWarnings(
+  purityWarnings: JobPurityWarning[],
+  workflowName: string,
+  jobName: string,
+): number {
+  let rendered = 0;
+  for (const w of purityWarnings) {
+    if (w.workflowName !== workflowName || w.jobName !== jobName) continue;
+    logger.info(
+      pc.yellow(`      ⚠ __init__ job required (~5-10s): ${w.field} is not pure — ${w.reason}`),
+    );
+    rendered++;
+  }
+  return rendered;
 }
 
 /**
@@ -15,10 +37,17 @@ export function displayDryRun(
   workflows: readonly LockWorkflow[],
   decisions: WorkflowDecision[],
   options: DryRunOptions,
+  purityWarnings: JobPurityWarning[] = [],
 ): void {
   logger.info(pc.bold('\n🔍 DRY RUN - No commands will be executed\n'));
 
   const matchedWorkflows = decisions.filter((d) => d.matched);
+
+  // Distinct (workflow, job) pairs for which an __init__ line was actually
+  // rendered below. The summary counts these — not every warning passed in —
+  // so it never reports jobs that were skipped (unmatched event or filtered by
+  // --workflow / --job) and stays consistent with the per-job detail lines.
+  const injectedInitJobs = new Set<string>();
 
   if (matchedWorkflows.length === 0) {
     logger.info(pc.yellow('No workflows matched the event.\n'));
@@ -83,6 +112,10 @@ export function displayDryRun(
       for (const step of job.steps) {
         logger.info(pc.gray(`        - ${step.name}`));
       }
+
+      if (renderJobInitWarnings(purityWarnings, decision.workflowName, job.name) > 0) {
+        injectedInitJobs.add(`${decision.workflowName} ${job.name}`);
+      }
     }
 
     // Show dynamic jobs
@@ -95,6 +128,14 @@ export function displayDryRun(
     }
 
     logger.info('');
+  }
+
+  if (injectedInitJobs.size > 0) {
+    logger.info(
+      pc.yellow(
+        `⚠ ${injectedInitJobs.size} __init__ job(s) will be injected for impure dynamic values (~5-10s each).`,
+      ),
+    );
   }
 
   displayDecisionSummary(decisions);

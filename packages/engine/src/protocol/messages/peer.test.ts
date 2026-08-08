@@ -16,6 +16,8 @@ import {
   raftAppendEntriesSchema,
   peerLeavingSchema,
   peerAgentTokenRevokeSchema,
+  peerClusterSettingsRequestSchema,
+  peerClusterSettingsResponseSchema,
   peerToPeerMessageSchema,
   peerFromPeerMessageSchema,
 } from './peer.js';
@@ -210,6 +212,15 @@ describe('peerHeartbeatSchema', () => {
     expect(() => peerHeartbeatSchema.parse(msg)).toThrow();
   });
 
+  it('parses without clusterSettingsVersion (backward-compat)', () => {
+    expect(peerHeartbeatSchema.parse(valid).clusterSettingsVersion).toBeUndefined();
+  });
+
+  it('parses with clusterSettingsVersion', () => {
+    const msg = { ...valid, clusterSettingsVersion: 5 };
+    expect(peerHeartbeatSchema.parse(msg).clusterSettingsVersion).toBe(5);
+  });
+
   it('rejects missing agents field', () => {
     const { agents, ...rest } = valid;
     expect(() => peerHeartbeatSchema.parse(rest)).toThrow();
@@ -292,6 +303,44 @@ describe('peerHeartbeatSchema', () => {
     };
     const parsed = peerHeartbeatSchema.parse(msg);
     expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual([]);
+  });
+});
+
+describe('peerClusterSettings request/response schemas', () => {
+  it('parses a well-formed request', () => {
+    const msg = { type: 'peer.clusterSettings.request', messageId: 'm1' };
+    expect(peerClusterSettingsRequestSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('parses a well-formed response with the worker-settings snapshot', () => {
+    const msg = {
+      type: 'peer.clusterSettings.response',
+      messageId: 'm1',
+      version: 3,
+      settings: { agentTokenTtlMs: 1_800_000 },
+    };
+    expect(peerClusterSettingsResponseSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('rejects a response whose settings omit agentTokenTtlMs', () => {
+    expect(() =>
+      peerClusterSettingsResponseSchema.parse({
+        type: 'peer.clusterSettings.response',
+        messageId: 'm1',
+        version: 3,
+        settings: {},
+      }),
+    ).toThrow();
+  });
+
+  it('rejects a response missing version', () => {
+    expect(() =>
+      peerClusterSettingsResponseSchema.parse({
+        type: 'peer.clusterSettings.response',
+        messageId: 'm1',
+        settings: { agentTokenTtlMs: 1000 },
+      }),
+    ).toThrow();
   });
 });
 

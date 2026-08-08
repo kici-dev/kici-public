@@ -1,8 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { up } from './064_execution_jobs_skipped_environments.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -39,10 +38,7 @@ describeDb('migration 064_execution_jobs_skipped_environments', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 
@@ -71,7 +67,7 @@ describeDb('migration 064_execution_jobs_skipped_environments', () => {
   });
 
   it('is idempotent (re-running up() over an already-migrated table is a no-op)', async () => {
-    // migrateToLatest already applied up() once; a second run must not throw.
+    // the beforeAll migration already applied up() once; a second run must not throw.
     await up(db);
     const skipped = await column('execution_jobs', 'skipped_environments');
     expect(skipped?.data_type).toBe('text');

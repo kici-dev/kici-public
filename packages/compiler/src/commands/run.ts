@@ -6,6 +6,8 @@ import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import {
   parseInputPairs,
   coerceDispatchInputs,
+  toCanonicalStatus,
+  TERMINAL_RUN_STATES,
   type HostTargetSelector,
   type InputsDescriptorMap,
 } from '@kici-dev/engine';
@@ -18,7 +20,9 @@ import {
   AuthenticationError,
   AccessDeniedError,
   ConnectionError,
+  NotFoundError,
   type ClusterTarget,
+  type PlatformRunLogsResponse,
   type PlatformRunStatusResponse,
 } from '../remote/platform-client.js';
 import { compileFixtures, filterFixtures, type CompiledFixture } from '../fixtures/compiler.js';
@@ -46,8 +50,18 @@ import { compileCommand } from './compile.js';
 import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
 
-/** Terminal run statuses returned by the Platform run-status snapshot. */
-const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled', 'error']);
+/**
+ * True when the Platform run-status snapshot reports a terminal run status.
+ *
+ * Resolves through the engine's canonical vocabulary rather than matching a
+ * hand-written literal set: that is what makes the legacy `error` spelling
+ * terminal without a second copy of the alias, and what stops a newly-added
+ * terminal status leaving `kici run` polling a finished run forever.
+ */
+function isTerminalRunStatus(status: string): boolean {
+  const canonical = toCanonicalStatus(status.toLowerCase());
+  return canonical !== undefined && TERMINAL_RUN_STATES.has(canonical);
+}
 
 /**
  * Compile `--target` selector strings into a {@link HostTargetSelector}. Each
@@ -124,6 +138,20 @@ export function buildDispatchInputs(
 
 /** Interval between status/log polls while a run is active. */
 const POLL_INTERVAL_MS = 750;
+
+/**
+ * How long a freshly triggered run may still read as missing before a 404 is
+ * reported as a real error.
+ *
+ * The trigger call answers with the run id as soon as the orchestrator has
+ * created the run, while the Platform's view of that run arrives over the
+ * relay a moment later. The first poll therefore fires while the run is not
+ * yet readable and legitimately 404s. Within this budget — and only until the
+ * first successful read — a 404 means "not visible yet" and the poll retries;
+ * after it, or once the run has been read at least once, a 404 is surfaced as
+ * a genuinely missing run.
+ */
+const RUN_VISIBILITY_GRACE_MS = 30_000;
 
 /**
  * Run `fn` with everything written to `process.stdout` redirected to
@@ -731,8 +759,28 @@ async function pollRunToCompletion(
     // Resolved lazily on the first hold so a hold-free run pays no cost.
     let heldCtx: HeldRunContext | null | undefined;
 
+    // Flipped by the first successful read. Until then a 404 is treated as
+    // "the Platform has not seen this run yet" (see RUN_VISIBILITY_GRACE_MS).
+    let runSeen = false;
+
     while (!cancelled) {
-      const logs = await ctx.client.runLogs(ctx.orgId, runId, cursor, ctx.target);
+      let logs: PlatformRunLogsResponse;
+      try {
+        logs = await ctx.client.runLogs(ctx.orgId, runId, cursor, ctx.target);
+        lastStatus = await ctx.client.runStatus(ctx.orgId, runId, ctx.target);
+      } catch (err) {
+        if (
+          err instanceof NotFoundError &&
+          !runSeen &&
+          Date.now() - startTime < RUN_VISIBILITY_GRACE_MS
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+          continue;
+        }
+        throw err;
+      }
+      runSeen = true;
+
       for (const line of logs.lines) {
         if (!options.quiet) process.stdout.write(line + '\n');
         tailLines.push(line);
@@ -740,8 +788,7 @@ async function pollRunToCompletion(
       }
       cursor = logs.nextCursor;
 
-      lastStatus = await ctx.client.runStatus(ctx.orgId, runId, ctx.target);
-      const terminal = lastStatus.done || TERMINAL_STATUSES.has(lastStatus.status);
+      const terminal = lastStatus.done || isTerminalRunStatus(lastStatus.status);
 
       if (terminal && logs.done) {
         return finishRun(fixtureId, runId, lastStatus, startTime, tailLines, options);

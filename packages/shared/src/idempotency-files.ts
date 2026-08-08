@@ -81,6 +81,13 @@ export interface FileDriftEntry {
   /** Set when content capture was intentionally skipped — used by the renderer to explain the gap. */
   contentSkipped?: ContentSkipReason;
   /**
+   * Fleet machine the remote side of this comparison lives on. Stamped by the
+   * preview helpers, which already know the box. Consumers that aggregate
+   * drift across a whole fleet need it to attribute a file to a machine —
+   * `remotePath` alone is identical on every box.
+   */
+  box?: string;
+  /**
    * Renderer hint. When omitted, the renderer auto-detects from
    * `remotePath`: `.env` → `'env-semantic'`, `.yaml` / `.yml` →
    * `'yaml-semantic'`, otherwise → `'unified-text'`. Explicit values

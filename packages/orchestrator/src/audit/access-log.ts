@@ -1,9 +1,8 @@
-import type { Kysely } from 'kysely';
+import type { Kysely, Transaction } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import {
   agentLabelOf,
   flattenActor,
-  minAccessLogWarmDays,
   shouldRecordAccess,
   type AccessLogAction,
   type AccessLogItem,
@@ -113,44 +112,7 @@ export class AccessLogWriter {
     // unhandled promise rejection — which crashes the orchestrator
     // under Node's default rejection handling.
     try {
-      // Apply the engine's per-action policy (sample / rate-limit / always)
-      // with the platform_operator + denied/error overrides. Drops here are
-      // the volume-reduction half of
-      if (
-        !shouldRecordAccess(
-          entry.action,
-          entry.outcome,
-          entry.actor,
-          entry.requestId,
-          this.rateLimiter,
-        )
-      ) {
-        return;
-      }
-      const { actorType, actorId, actorMeta } = flattenActor(entry.actor);
-      const mergedMeta = entry.meta ? { ...(actorMeta ?? {}), ...entry.meta } : actorMeta;
-      // An agent-kind credential carries its label on the user (PAT) or api_key
-      // actor; promote it to a queryable column so the access log can be
-      // filtered by agent regardless of credential family.
-      const agentLabel = agentLabelOf(entry.actor);
-      await this.db
-        .insertInto('access_log')
-        .values({
-          org_id: entry.orgId,
-          routing_key: entry.routingKey,
-          actor_type: actorType,
-          actor_id: actorId,
-          actor_meta: mergedMeta,
-          action: entry.action,
-          target_type: entry.target?.type ?? null,
-          target_id: entry.target?.id ?? null,
-          request_id: entry.requestId,
-          source: entry.source,
-          outcome: entry.outcome,
-          error_message: entry.errorMessage ?? null,
-          agent_label: agentLabel,
-        })
-        .execute();
+      await this.insert(this.db, entry);
     } catch (err) {
       logger.error('access_log record failed', {
         error: toErrorMessage(err),
@@ -158,6 +120,72 @@ export class AccessLogWriter {
         source: entry.source,
       });
     }
+  }
+
+  /**
+   * Transactional variant: writes the row through the caller's executor so it
+   * commits or rolls back with the mutation it audits.
+   *
+   * Unlike `record`, failures PROPAGATE. The best-effort swallow exists so a
+   * broken `access_log` cannot take down dashboard reads; a caller that opted
+   * into a transaction is asserting the opposite — the mutation must not land
+   * unaudited — so the error has to reach the transaction and abort it.
+   *
+   * The per-action `POLICY_BY_ACTION` gate still applies, so a `sample` /
+   * `rate_limit` action would be dropped here silently and the caller's
+   * mutation would commit unaudited after all. Callers must therefore use an
+   * action whose policy is `always` — which is why `trust_policy.updated` is
+   * one.
+   */
+  async recordInTransaction(
+    executor: Kysely<Database> | Transaction<Database>,
+    entry: AccessLogRecord,
+  ): Promise<void> {
+    await this.insert(executor, entry);
+  }
+
+  private async insert(
+    executor: Kysely<Database> | Transaction<Database>,
+    entry: AccessLogRecord,
+  ): Promise<void> {
+    // Apply the engine's per-action policy (sample / rate-limit / always)
+    // with the platform_operator + denied/error overrides. Drops here are
+    // the volume-reduction half of the design.
+    if (
+      !shouldRecordAccess(
+        entry.action,
+        entry.outcome,
+        entry.actor,
+        entry.requestId,
+        this.rateLimiter,
+      )
+    ) {
+      return;
+    }
+    const { actorType, actorId, actorMeta } = flattenActor(entry.actor);
+    const mergedMeta = entry.meta ? { ...(actorMeta ?? {}), ...entry.meta } : actorMeta;
+    // An agent-kind credential carries its label on the user (PAT) or api_key
+    // actor; promote it to a queryable column so the access log can be
+    // filtered by agent regardless of credential family.
+    const agentLabel = agentLabelOf(entry.actor);
+    await executor
+      .insertInto('access_log')
+      .values({
+        org_id: entry.orgId,
+        routing_key: entry.routingKey,
+        actor_type: actorType,
+        actor_id: actorId,
+        actor_meta: mergedMeta,
+        action: entry.action,
+        target_type: entry.target?.type ?? null,
+        target_id: entry.target?.id ?? null,
+        request_id: entry.requestId,
+        source: entry.source,
+        outcome: entry.outcome,
+        error_message: entry.errorMessage ?? null,
+        agent_label: agentLabel,
+      })
+      .execute();
   }
 
   /**
@@ -221,14 +249,14 @@ export class AccessLogWriter {
     if (!this.coldStore) return null;
 
     const tenantId = opts?.orgId ?? SYNTHETIC_ORCH_TENANT;
-    const warmCutoff = new Date(Date.now() - minAccessLogWarmDays() * 86_400_000);
+    // No explicit upper bound: the store resolves `access_log`'s warm cutoff
+    // from the same adapter config the archiver uses.
     try {
       for await (const row of this.coldStore.fetchRange<AccessLogColdRow>({
         db: 'orchestrator',
         table: 'access_log',
         tenantId,
         fromTs: new Date(0),
-        toTs: warmCutoff,
       })) {
         if (String(row.id) === id) {
           return toAccessLogItem(row);

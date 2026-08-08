@@ -1,7 +1,20 @@
 import pc from 'picocolors';
 
-/** Error code string (e.g., 'E001', 'E102'). */
+/**
+ * Error code string. Thrown compile errors use `E<digits>` (e.g. 'E001', 'E102');
+ * advisory, render-only diagnostics use `W<digits>` (e.g. 'W101'). `isCompilerError`
+ * only matches the `E<digits>` family — warning codes are never thrown, only rendered.
+ */
 type ErrorCode = string;
+
+/** Diagnostic severity. Errors abort compilation; warnings are advisory (compile still succeeds). */
+export enum DiagnosticSeverity {
+  Error = 'error',
+  Warning = 'warning',
+}
+
+/** Warning code for the impure dynamic-value → init-job fallback. */
+export const PURITY_FALLBACK_CODE = 'W101';
 
 /** Source location for error reporting */
 export interface SourceLocation {
@@ -16,6 +29,7 @@ export interface CompilerError {
   readonly message: string;
   readonly location?: SourceLocation;
   readonly suggestion?: string;
+  readonly severity?: DiagnosticSeverity;
 }
 
 /**
@@ -33,8 +47,10 @@ export function formatError(error: CompilerError): string {
     parts.push(pc.cyan(`${error.location.file}:${error.location.line}:${error.location.column}`));
   }
 
-  // Error with code
-  parts.push(pc.red('error') + pc.gray(` [${error.code}]`) + ': ' + error.message);
+  // Severity label with code
+  const label =
+    error.severity === DiagnosticSeverity.Warning ? pc.yellow('warning') : pc.red('error');
+  parts.push(label + pc.gray(` [${error.code}]`) + ': ' + error.message);
 
   let output = parts.join(' ');
 
@@ -53,6 +69,7 @@ export function compilerError(
   options?: {
     location?: SourceLocation;
     suggestion?: string;
+    severity?: DiagnosticSeverity;
   },
 ): CompilerError {
   return {
@@ -60,6 +77,7 @@ export function compilerError(
     message,
     location: options?.location,
     suggestion: options?.suggestion,
+    severity: options?.severity,
   };
 }
 

@@ -154,6 +154,13 @@ function categorizeTrigger(workflowName: string, trigger: LockTrigger, groups: T
       });
       break;
 
+    case 'workflows_failed_batch':
+      groups.kiciEvent.push({
+        workflowName,
+        eventName: `workflows_failed_batch${trigger.name ? `:${trigger.name}` : ''}`,
+      });
+      break;
+
     case 'job_complete':
       groups.kiciEvent.push({
         workflowName,

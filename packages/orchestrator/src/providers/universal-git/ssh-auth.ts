@@ -24,9 +24,10 @@
  */
 
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
-import { mkdtemp, writeFile, chmod, rm } from 'node:fs/promises';
+import { writeFile, chmod } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { makeTempDir } from '@kici-dev/shared/tmp';
 import type { SshHostKeyPolicy } from './config.js';
 
 /** Material the caller has prepared (key file + optional known_hosts file). */
@@ -74,7 +75,7 @@ export interface PrepareSshAuthOptions {
  */
 export async function prepareSshAuth(opts: PrepareSshAuthOptions): Promise<SshAuthArtefacts> {
   assertPinnedHasKnownHosts(opts);
-  const dir = await mkdtemp(join(tmpdir(), 'kici-ugit-ssh-'));
+  const { path: dir, cleanup } = await makeTempDir('ugit-ssh');
 
   const keyPath = join(dir, 'id_key');
   await writeFile(keyPath, normaliseKey(opts.privateKey), { mode: 0o600 });
@@ -94,9 +95,7 @@ export async function prepareSshAuth(opts: PrepareSshAuthOptions): Promise<SshAu
     privateKeyPath: keyPath,
     knownHostsPath,
     gitSshCommand: composeGitSshCommand(keyPath, opts.policy, knownHostsPath),
-    cleanup: async () => {
-      await rm(dir, { recursive: true, force: true });
-    },
+    cleanup,
   };
 }
 

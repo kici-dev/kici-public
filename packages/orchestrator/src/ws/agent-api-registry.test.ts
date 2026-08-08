@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { AgentApiRegistry } from './agent-api-registry.js';
+import {
+  AgentApiRegistry,
+  ApiRoleDeniedError,
+  UnknownApiMethodError,
+} from './agent-api-registry.js';
 
 describe('AgentApiRegistry', () => {
   it('registers and handles a read method', async () => {
@@ -74,5 +78,45 @@ describe('AgentApiRegistry', () => {
     registry.register('b.two', 'write', async () => null);
 
     expect(registry.getMethods()).toEqual(['a.one', 'b.two']);
+  });
+
+  describe('typed rejections', () => {
+    // The two rejections the registry raises deliberately are typed so the agent
+    // WS handler can forward their message verbatim, while any other exception
+    // is replaced with a safe fixed string before it reaches the workflow author.
+    it('rejects an unknown method with UnknownApiMethodError', async () => {
+      const registry = new AgentApiRegistry();
+      await expect(registry.handle('agent-1', 'nope', {}, ['read'])).rejects.toBeInstanceOf(
+        UnknownApiMethodError,
+      );
+      await expect(registry.handle('agent-1', 'nope', {}, ['read'])).rejects.toBeInstanceOf(Error);
+      await expect(registry.handle('agent-1', 'nope', {}, ['read'])).rejects.toThrow(
+        "Unknown API method 'nope'",
+      );
+    });
+
+    it('rejects an unauthorized role with ApiRoleDeniedError', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('admin.destroy', 'write', async () => 'destroyed');
+
+      await expect(
+        registry.handle('agent-1', 'admin.destroy', {}, ['read']),
+      ).rejects.toBeInstanceOf(ApiRoleDeniedError);
+      await expect(registry.handle('agent-1', 'admin.destroy', {}, ['read'])).rejects.toThrow(
+        "Method 'admin.destroy' requires 'write' role, caller only has [read]",
+      );
+    });
+
+    it('leaves a handler exception as a plain Error', async () => {
+      const registry = new AgentApiRegistry();
+      registry.register('test.boom', 'read', async () => {
+        throw new Error('connect ECONNREFUSED 10.0.0.7:5432');
+      });
+
+      const err = await registry.handle('agent-1', 'test.boom', {}, ['read']).catch((e) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(UnknownApiMethodError);
+      expect(err).not.toBeInstanceOf(ApiRoleDeniedError);
+    });
   });
 });

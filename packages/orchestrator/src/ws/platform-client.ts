@@ -2,10 +2,14 @@ import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
 import { createLogger, requestContext, getReconnectDelay, toErrorMessage } from '@kici-dev/shared';
 import { OrchRpcRegistry } from './orch-rpc.js';
+import { chunkReplayRuns, REPLAY_BYTE_REFILL_BYTES_PER_SEC } from './replay-chunker.js';
+import { stateReplayBreakerTripsTotal } from '../metrics/prometheus.js';
 import {
   platformToOrchestratorMessageSchema,
   logPullPlatformToOrchSchema,
   joinRequestSchema,
+  stateReplaySchema,
+  type StateReplayRun,
   type OrchestratorToPlatformMessage,
   type PlatformToOrchestratorMessage,
   type WebhookRelay,
@@ -14,6 +18,7 @@ import {
   type StaleCheckrunCleanup,
   type DashboardRunDetailRequest,
   type DashboardRunStructuredRequest,
+  type DashboardRunStateRequest,
   type DashboardRunsListRequest,
   type DashboardRunsFiltersRequest,
   type DashboardSourcesListRequest,
@@ -22,6 +27,7 @@ import {
   type DashboardAttestationsListAllRequest,
   type DashboardAttestationGetRequest,
   type DashboardAttestationRetryRequest,
+  type DashboardArtifactsListRequest,
   type DashboardOrchLogsRequest,
   type RunRerunRequest,
   type ManualScheduleRequest,
@@ -45,11 +51,23 @@ import {
   WS_MAX_PAYLOAD_BYTES,
   DASHBOARD_REQUEST_TYPE_SET,
   DashboardResponseErrorCode,
+  buildUnsupportedMessageNack,
+  collectDiscriminatorTypes,
+  PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
+  hasPlatformCapability,
   type OrchCapabilities,
   type OrchRole,
+  type PlatformCapabilities,
+  type OrchestratorMode,
 } from '@kici-dev/engine';
 import { EventBuffer } from './event-buffer.js';
 import { RelayBufferRegistry, type RelayStartMeta } from '../webhook/relay-buffer.js';
+import type { AdmitResult } from '../webhook/ingest-admission.js';
+import {
+  wsUnsupportedMessageSentTotal,
+  wsNackReceivedTotal,
+  wsPlatformCapabilityGapTotal,
+} from '../metrics/prometheus.js';
 
 /**
  * Verification + processing outcome returned by the chunked relay path's
@@ -64,7 +82,34 @@ export interface InboundVerifyOutcome {
 
 const logger = createLogger({ prefix: 'platform-client' });
 
+/**
+ * Every message `type` this orchestrator recognizes on an inbound Platform frame:
+ * the mainline Platform→orchestrator union (dashboard request types included) plus
+ * the extra recognition-chain schemas `handleNonStandardMessage` tries separately
+ * (log-pull, cluster join). A known-but-invalid frame (its `type` is in this set
+ * but validation failed) is malformed, not version skew, so
+ * `buildUnsupportedMessageNack` returns null and no spurious skew NACK is sent.
+ * Derived from the schema discriminators so it can never drift.
+ */
+const PLATFORM_TO_ORCH_KNOWN_TYPES: ReadonlySet<string> = new Set<string>([
+  ...PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
+  ...collectDiscriminatorTypes(logPullPlatformToOrchSchema),
+  ...collectDiscriminatorTypes(joinRequestSchema),
+  ...DASHBOARD_REQUEST_TYPE_SET,
+]);
+
 export type ConnectionState = 'disconnected' | 'connecting' | 'authenticating' | 'authenticated';
+
+/**
+ * Outcome of a chunked `state.replay` send. `skipped` names why the replay did
+ * not complete: an empty payload, a frame that failed wire validation locally,
+ * a socket that closed mid-send, or the circuit breaker being open.
+ */
+export type ReplaySendResult = {
+  sent: number;
+  chunks: number;
+  skipped?: 'empty' | 'invalid' | 'disconnected' | 'breaker';
+};
 
 /**
  * A webhook source that this orchestrator manages.
@@ -80,6 +125,25 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'authenticating' |
  */
 export type { ProviderSource } from '../entry-helpers.js';
 import type { ProviderSource } from '../entry-helpers.js';
+
+/**
+ * Hard ceiling on how long an admitted fire-and-forget relay pipeline may hold
+ * its admission slot before it is force-released. A pipeline running longer than
+ * this is treated as hung; releasing its slot (idempotently) prevents a
+ * permanent slot leak that would otherwise shrink capacity for every future
+ * webhook. Well above any legitimate ingest-pipeline duration.
+ */
+const ADMITTED_PIPELINE_LIFETIME_MS = 5 * 60 * 1000;
+
+/**
+ * How long a connection must stay open after authenticating before it counts as
+ * healthy enough to reset the reconnect backoff. Authentication succeeding is
+ * not proof of viability — the state replay send is still ahead of it.
+ */
+const CONNECTION_STABLE_MS = 30_000;
+
+/** Consecutive replay-attributed disconnects before replay is skipped entirely. */
+const REPLAY_BREAKER_THRESHOLD = 3;
 
 /**
  * Wire-shape for one source inside a `source.register` message — matches the
@@ -100,6 +164,34 @@ function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEn
     name: source.name,
     subtype: source.subtype,
     ...(source.slug ? { slug: source.slug } : {}),
+  };
+}
+
+/**
+ * Test-only: remove the comma-separated `dashboard.*` request types in `omit`
+ * from the advertised manifest, so an integration test can reproduce an
+ * orchestrator that predates a given capability. Double-gated on `testMode`
+ * (config `KICI_TEST_MODE=1`, matching the other orchestrator test seams), so a
+ * stray env var can never strip advertised capabilities in production — which
+ * leaves `KICI_TEST_MODE` unset. No-op unless both are set; production
+ * advertises the full set. The values flow from config (registered in the
+ * orchestrator env schema), never read from `process.env` here.
+ */
+function applyTestCapabilityOmissions(
+  caps: OrchCapabilities,
+  opts: { testMode?: boolean; omit?: string },
+): OrchCapabilities {
+  if (!opts.testMode || !opts.omit) return caps;
+  const omit = new Set(
+    opts.omit
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+  if (omit.size === 0 || !Array.isArray(caps.supportedDashboardRequests)) return caps;
+  return {
+    ...caps,
+    supportedDashboardRequests: caps.supportedDashboardRequests.filter((t) => !omit.has(t)),
   };
 }
 
@@ -186,6 +278,8 @@ export interface PlatformClientOptions {
   onDashboardRunDetail?: (msg: DashboardRunDetailRequest) => void;
   /** Optional callback for dashboard structured run-result requests from Platform. */
   onDashboardRunStructured?: (msg: DashboardRunStructuredRequest) => void;
+  /** Optional callback for the run-state system reconciliation read from Platform. */
+  onDashboardRunState?: (msg: DashboardRunStateRequest) => void;
   /** Optional callback for dashboard runs.list (operator console) requests from Platform. */
   onDashboardRunsList?: (msg: DashboardRunsListRequest) => void;
   /** Optional callback for dashboard runs.filters (operator console) requests from Platform. */
@@ -201,6 +295,8 @@ export interface PlatformClientOptions {
   /** Optional callback for single-attestation detail requests from Platform. */
   onDashboardAttestationGet?: (msg: DashboardAttestationGetRequest) => void;
   onDashboardAttestationRetry?: (msg: DashboardAttestationRetryRequest) => void;
+  /** Optional callback for dashboard artifacts-list requests from Platform. */
+  onDashboardArtifactsList?: (msg: DashboardArtifactsListRequest) => void;
   /** Optional callback for run re-run requests from Platform (dashboard action). */
   onRunRerun?: (msg: RunRerunRequest) => void;
   /** Optional callback for manual schedule trigger requests from Platform (dashboard action). */
@@ -242,6 +338,17 @@ export interface PlatformClientOptions {
   /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
+   * Test-only. Whether the orchestrator runs in test mode (config
+   * `KICI_TEST_MODE=1`). Gates `testOmitDashboardRequestTypes`.
+   */
+  testMode?: boolean;
+  /**
+   * Test-only. Comma-separated `dashboard.*` request types to drop from the
+   * advertised capability manifest (config `KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES`).
+   * Only honored when `testMode` is true; production leaves both unset.
+   */
+  testOmitDashboardRequestTypes?: string;
+  /**
    * Verify a reassembled inbound webhook from the chunked relay path.
    *
    * Wired to `verifyInboundWebhook(deps, ...)` in production. Required when
@@ -258,6 +365,21 @@ export interface PlatformClientOptions {
    * TTL; production constructs a default one per PlatformClient.
    */
   relayBuffer?: RelayBufferRegistry;
+  /**
+   * Webhook-ingest admission hook. Called with the relay's routing key BEFORE
+   * signature verification (so an unverified flood is throttled too — a verify
+   * does a DB read). When it sheds, the relay acks `shed_retry_later` (429) and
+   * no pipeline work runs. When it admits, the returned slot is held for the
+   * fire-and-forget pipeline's lifetime and released on completion / error /
+   * timeout. Absent → no admission gate (tests, minimal wirings).
+   */
+  onAdmit?: (routingKey: string) => Promise<AdmitResult>;
+  /**
+   * Optional durable-overflow capture seam. Invoked with the pre-verify relay
+   * meta + assembled body on a shed, before the shed_retry_later ack. Best-effort
+   * — the client wraps it so a capture failure never blocks the ack.
+   */
+  onShedCapture?: (meta: RelayStartMeta, body: Buffer) => Promise<void>;
 }
 
 /** Error `*.response` frame shape for a dashboard request that failed validation. */
@@ -315,6 +437,14 @@ export class PlatformClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  /** Armed on auth; resets the backoff only if the connection survives it. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True once the current connection has survived CONNECTION_STABLE_MS. */
+  private connectionProvenStable = false;
+  /** True once a state replay has been sent on the current connection. */
+  private replaySentOnConnection = false;
+  private replayConsecutiveFailures = 0;
+  private replayBreakerOpen = false;
   private intentionalDisconnect = false;
   private readonly url: string;
   private readonly token: string;
@@ -339,6 +469,16 @@ export class PlatformClient {
    * awaits the Platform's matching `.response`; rejected on timeout or close.
    */
   private readonly orchRpc = new OrchRpcRegistry();
+  /**
+   * Platform capabilities advertised on this connection (Platform → orchestrator
+   * `platform.capabilities` frame). `undefined` means nothing advertised yet —
+   * either a pre-capability Platform (which never advertises) or the frame has
+   * not arrived. Feature-gated sends treat "undefined" as optimistic (send
+   * anyway, backward-safe); only an advertised-but-absent flag suppresses a send.
+   * Reset to `undefined` on every (re)connect so a stale advertisement can't
+   * leak across connections.
+   */
+  private platformCapabilities: PlatformCapabilities | undefined;
   private readonly instanceId?: string;
   private readonly clusterName?: string;
   private readonly clusterId?: string;
@@ -359,6 +499,7 @@ export class PlatformClient {
   private readonly onProvenanceIssuer?: PlatformClientOptions['onProvenanceIssuer'];
   private readonly onDashboardRunDetail?: PlatformClientOptions['onDashboardRunDetail'];
   private readonly onDashboardRunStructured?: PlatformClientOptions['onDashboardRunStructured'];
+  private readonly onDashboardRunState?: PlatformClientOptions['onDashboardRunState'];
   private readonly onDashboardRunsList?: PlatformClientOptions['onDashboardRunsList'];
   private readonly onDashboardRunsFilters?: PlatformClientOptions['onDashboardRunsFilters'];
   private readonly onDashboardSourcesList?: PlatformClientOptions['onDashboardSourcesList'];
@@ -367,6 +508,7 @@ export class PlatformClient {
   private readonly onDashboardAttestationsListAll?: PlatformClientOptions['onDashboardAttestationsListAll'];
   private readonly onDashboardAttestationGet?: PlatformClientOptions['onDashboardAttestationGet'];
   private readonly onDashboardAttestationRetry?: PlatformClientOptions['onDashboardAttestationRetry'];
+  private readonly onDashboardArtifactsList?: PlatformClientOptions['onDashboardArtifactsList'];
   private readonly onRunRerun?: PlatformClientOptions['onRunRerun'];
   private readonly onManualSchedule?: PlatformClientOptions['onManualSchedule'];
   private readonly onRunCancel?: PlatformClientOptions['onRunCancel'];
@@ -386,6 +528,8 @@ export class PlatformClient {
   private readonly onJoinRequest?: PlatformClientOptions['onJoinRequest'];
   private orchCapabilities: OrchCapabilities;
   private readonly onVerifyInbound?: PlatformClientOptions['onVerifyInbound'];
+  private readonly onAdmit?: PlatformClientOptions['onAdmit'];
+  private readonly onShedCapture?: PlatformClientOptions['onShedCapture'];
   private readonly relayBuffer: RelayBufferRegistry;
   /**
    * Public alias of the orchestrator's owning org as supplied by
@@ -406,6 +550,11 @@ export class PlatformClient {
   }
 
   constructor(options: PlatformClientOptions) {
+    // Prime the breaker counter so its series exists from boot. An OTel counter
+    // that has never been incremented exports nothing, and an alert against an
+    // absent series can never fire — the "dark alert" class this repo already
+    // tracks. A rare-event counter must be born at zero, not on first trip.
+    stateReplayBreakerTripsTotal.add(0);
     this.url = options.url;
     this.token = options.token;
     this.onWebhookRelay = options.onWebhookRelay;
@@ -431,6 +580,7 @@ export class PlatformClient {
     this.onProvenanceIssuer = options.onProvenanceIssuer;
     this.onDashboardRunDetail = options.onDashboardRunDetail;
     this.onDashboardRunStructured = options.onDashboardRunStructured;
+    this.onDashboardRunState = options.onDashboardRunState;
     this.onDashboardRunsList = options.onDashboardRunsList;
     this.onDashboardRunsFilters = options.onDashboardRunsFilters;
     this.onDashboardSourcesList = options.onDashboardSourcesList;
@@ -439,6 +589,7 @@ export class PlatformClient {
     this.onDashboardAttestationsListAll = options.onDashboardAttestationsListAll;
     this.onDashboardAttestationGet = options.onDashboardAttestationGet;
     this.onDashboardAttestationRetry = options.onDashboardAttestationRetry;
+    this.onDashboardArtifactsList = options.onDashboardArtifactsList;
     this.onRunRerun = options.onRunRerun;
     this.onManualSchedule = options.onManualSchedule;
     this.onRunCancel = options.onRunCancel;
@@ -456,8 +607,13 @@ export class PlatformClient {
     this.onTrustPolicyUpdate = options.onTrustPolicyUpdate;
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
-    this.orchCapabilities = { ...ORCH_CAPABILITIES, ...options.orchCapabilities };
+    this.orchCapabilities = applyTestCapabilityOmissions(
+      { ...ORCH_CAPABILITIES, ...options.orchCapabilities },
+      { testMode: options.testMode, omit: options.testOmitDashboardRequestTypes },
+    );
     this.onVerifyInbound = options.onVerifyInbound;
+    this.onAdmit = options.onAdmit;
+    this.onShedCapture = options.onShedCapture;
     this.relayBuffer = options.relayBuffer ?? new RelayBufferRegistry();
   }
 
@@ -521,9 +677,47 @@ export class PlatformClient {
       return;
     }
 
+    // Admission control BEFORE signature verify: verify does a DB read, so
+    // gating after it would leave an unverified flood un-throttled. Admit on the
+    // Platform-established routing key (available pre-verify). The WS ack is
+    // awaited synchronously by Platform (5 s budget), so this path never queues
+    // — the controller grants immediately or sheds `shed_retry_later` (429).
+    const admit = this.onAdmit ? await this.onAdmit(meta.routingKey) : undefined;
+    if (admit && !admit.admitted) {
+      logger.warn('Chunked webhook.relay shed by ingest admission control', {
+        messageId,
+        deliveryId: meta.deliveryId,
+        routingKey: meta.routingKey,
+        reason: admit.reason,
+      });
+      // Additively capture the shed delivery into the durable overflow buffer
+      // for replay once capacity recovers. Best-effort — a capture failure never
+      // blocks the shed_retry_later ack (the caller redelivers regardless).
+      if (this.onShedCapture) {
+        try {
+          await this.onShedCapture(meta, body);
+        } catch (err) {
+          logger.warn('Failed to capture shed relay delivery to overflow buffer', {
+            deliveryId: meta.deliveryId,
+            error: toErrorMessage(err),
+          });
+        }
+      }
+      this.sendDirect({
+        type: 'webhook.ack',
+        messageId,
+        deliveryId: meta.deliveryId,
+        result: 'shed_retry_later',
+      });
+      return;
+    }
+    // From here every exit path must release the admitted slot exactly once.
+    const releaseSlot = admit?.admitted ? admit.release : (): void => {};
+
     const outcome = await this.onVerifyInbound(meta, body);
 
     if (outcome.result !== 'accepted') {
+      releaseSlot();
       logger.warn('Chunked webhook.relay verify rejected', {
         messageId,
         deliveryId: meta.deliveryId,
@@ -553,6 +747,7 @@ export class PlatformClient {
       try {
         payload = body.length === 0 ? {} : JSON.parse(body.toString('utf8'));
       } catch (err) {
+        releaseSlot();
         logger.warn('Accepted webhook body is not valid JSON; rejecting', {
           messageId,
           deliveryId: meta.deliveryId,
@@ -592,13 +787,41 @@ export class PlatformClient {
       ...(meta.requestId && { requestId: meta.requestId }),
     };
 
-    this.onWebhookRelay(relay).catch((err) => {
-      logger.error('Error processing chunked webhook relay', {
-        messageId,
-        deliveryId: meta.deliveryId,
-        error: toErrorMessage(err),
+    // Fire-and-forget pipeline: hold the admitted slot for its lifetime and
+    // release exactly once on completion / error / a hard lifetime timeout (so a
+    // hung pipeline can never leak its slot). release() is itself idempotent, so
+    // a timeout-release followed by a late real completion is safe. Wrapping the
+    // call in Promise.resolve().then keeps a synchronous throw inside the finally.
+    let released = false;
+    const releaseOnce = (): void => {
+      if (released) return;
+      released = true;
+      releaseSlot();
+    };
+    const lifetimeTimer = setTimeout(() => {
+      logger.warn(
+        'Chunked webhook.relay pipeline exceeded admitted lifetime; force-releasing slot',
+        {
+          messageId,
+          deliveryId: meta.deliveryId,
+        },
+      );
+      releaseOnce();
+    }, ADMITTED_PIPELINE_LIFETIME_MS);
+    lifetimeTimer.unref?.();
+    Promise.resolve()
+      .then(() => this.onWebhookRelay(relay))
+      .catch((err) => {
+        logger.error('Error processing chunked webhook relay', {
+          messageId,
+          deliveryId: meta.deliveryId,
+          error: toErrorMessage(err),
+        });
+      })
+      .finally(() => {
+        clearTimeout(lifetimeTimer);
+        releaseOnce();
       });
-    });
   }
 
   /**
@@ -621,6 +844,7 @@ export class PlatformClient {
   disconnect(): void {
     this.intentionalDisconnect = true;
     this.stopHeartbeat();
+    this.clearStabilityTimer();
     this.cancelReconnect();
 
     if (this.ws) {
@@ -646,6 +870,115 @@ export class PlatformClient {
     } else {
       this.eventBuffer.add(message);
     }
+  }
+
+  /**
+   * Send the reconnect state replay as N paced frames.
+   *
+   * The payload is bounded by BOTH the wire schema's run cap and the Platform
+   * limiter's byte budget, and paced under its refill rate, because a frame
+   * breaching either one is rejected with a 4003 close — and since reconnecting
+   * does not reduce the run count, an oversized frame is resent forever rather
+   * than failing once.
+   *
+   * Uses `this.ws.send` directly rather than `this.send()` on purpose: `send()`
+   * falls back to `this.eventBuffer` when the socket is not open, which for a
+   * multi-frame replay would queue the remaining frames for the NEXT connection
+   * instead of abandoning a replay whose connection has already gone. The
+   * Platform's replay handler upserts per run, so abandoning is safe — the next
+   * reconnect replays from scratch.
+   */
+  async sendStateReplay(runs: StateReplayRun[]): Promise<ReplaySendResult> {
+    if (runs.length === 0) return { sent: 0, chunks: 0, skipped: 'empty' };
+
+    if (this.replayBreakerOpen) {
+      logger.warn('Skipping state replay — breaker open after consecutive rejections', {
+        consecutiveFailures: this.replayConsecutiveFailures,
+        runCount: runs.length,
+      });
+      return { sent: 0, chunks: 0, skipped: 'breaker' };
+    }
+
+    const chunks = chunkReplayRuns(runs);
+    let sent = 0;
+
+    for (const [index, chunk] of chunks.entries()) {
+      if (this._state !== 'authenticated' || this.ws?.readyState !== WebSocket.OPEN) {
+        logger.warn('Abandoning state replay — connection no longer open', {
+          chunksSent: index,
+          chunksTotal: chunks.length,
+          runsSent: sent,
+        });
+        return { sent, chunks: index, skipped: 'disconnected' };
+      }
+
+      const frame = {
+        type: 'state.replay' as const,
+        messageId: randomUUID(),
+        runs: chunk,
+        timestamp: Date.now(),
+      };
+
+      const parsed = stateReplaySchema.safeParse(frame);
+      if (!parsed.success) {
+        logger.error('Refusing to send an invalid state replay frame', {
+          chunkIndex: index,
+          chunkRuns: chunk.length,
+          issue: parsed.error.issues[0]?.message,
+          path: parsed.error.issues[0]?.path.join('.'),
+        });
+        return { sent, chunks: index, skipped: 'invalid' };
+      }
+
+      const payload = JSON.stringify(frame);
+      this.ws.send(payload);
+      // Attribution marker. Deliberately NOT cleared when the send completes:
+      // the Platform rejects an unacceptable frame milliseconds AFTER the write
+      // succeeds, so a flag cleared on send-completion would never be set when
+      // the close arrives. A close is replay-attributed when a replay went out
+      // on this connection and the connection died before proving stable.
+      this.replaySentOnConnection = true;
+      sent += chunk.length;
+
+      // Pace under the Platform limiter's byte refill so a large replay cannot
+      // trip its sustained-violation disconnect. Skipped after the last frame.
+      if (index < chunks.length - 1) {
+        const delayMs =
+          (Buffer.byteLength(payload, 'utf8') / REPLAY_BYTE_REFILL_BYTES_PER_SEC) * 1000;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    logger.info('Sent state replay to Platform', { runCount: sent, chunks: chunks.length });
+    return { sent, chunks: chunks.length };
+  }
+
+  /**
+   * Send a feature-gated message only if the Platform is known to support the
+   * named capability — the orchestrator-side pre-flight for a self-hosted
+   * orchestrator running ahead of the hosted Platform.
+   *
+   * Backward-safe: a Platform that never advertised capabilities (a
+   * pre-capability build, or the advertisement hasn't arrived yet) is treated as
+   * "unknown → send optimistically", exactly like the Platform's dashboard
+   * pre-flight treats an absent `supportedDashboardRequests` as "unknown", never
+   * "supports nothing". Only an *advertised* capability set that explicitly lacks
+   * the flag suppresses the send — surfacing a diagnosable capability gap instead
+   * of firing a frame the Platform would silently drop.
+   */
+  sendIfPlatformSupports(capability: string, message: OrchestratorToPlatformMessage): void {
+    if (
+      this.platformCapabilities === undefined ||
+      hasPlatformCapability(this.platformCapabilities, capability)
+    ) {
+      this.send(message);
+      return;
+    }
+    wsPlatformCapabilityGapTotal.add(1, { capability, type: message.type });
+    logger.warn('Suppressed feature-gated send: Platform does not advertise capability', {
+      capability,
+      type: message.type,
+    });
   }
 
   /**
@@ -692,7 +1025,7 @@ export class PlatformClient {
       ...(this.clusterId && { clusterId: this.clusterId }),
       ...(this.address !== undefined && { address: this.address }),
       ...(this.version && { version: this.version }),
-      ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
+      ...(this.mode && { mode: this.mode as OrchestratorMode }),
       ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
       ...(this.deployment && { deployment: this.deployment }),
       ...(this.queueTimeoutMs && { queueTimeoutMs: this.queueTimeoutMs }),
@@ -757,7 +1090,7 @@ export class PlatformClient {
         ...(this.clusterId && { clusterId: this.clusterId }),
         ...(this.address !== undefined && { address: this.address }),
         ...(this.version && { version: this.version }),
-        ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
+        ...(this.mode && { mode: this.mode as OrchestratorMode }),
         ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
         ...(this.deployment && { deployment: this.deployment }),
         ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
@@ -777,7 +1110,7 @@ export class PlatformClient {
         ...(this.clusterId && { clusterId: this.clusterId }),
         ...(this.address !== undefined && { address: this.address }),
         ...(this.version && { version: this.version }),
-        ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
+        ...(this.mode && { mode: this.mode as OrchestratorMode }),
         ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
         ...(this.deployment && { deployment: this.deployment }),
         ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
@@ -895,7 +1228,25 @@ export class PlatformClient {
       });
 
       this._state = 'disconnected';
+      // Drop the advertised Platform capabilities: a new connection re-advertises,
+      // so never let a stale advertisement leak across reconnects.
+      this.platformCapabilities = undefined;
       this.stopHeartbeat();
+      this.clearStabilityTimer();
+
+      if (this.replaySentOnConnection && !this.connectionProvenStable) {
+        this.replayConsecutiveFailures++;
+        if (this.replayConsecutiveFailures >= REPLAY_BREAKER_THRESHOLD && !this.replayBreakerOpen) {
+          this.replayBreakerOpen = true;
+          stateReplayBreakerTripsTotal.add(1);
+          logger.error('State replay breaker opened — connecting without replay', {
+            consecutiveFailures: this.replayConsecutiveFailures,
+            code,
+          });
+        }
+      }
+      this.replaySentOnConnection = false;
+      this.connectionProvenStable = false;
       this.rejectPendingSourceRegistrations('Platform connection closed before ack');
       // Fail any in-flight orchestrator-initiated RPC (e.g. an OIDC mint) fast
       // instead of letting it hang until its own timeout.
@@ -969,6 +1320,24 @@ export class PlatformClient {
     // guardedDashboardDispatch — both guarantee every forwarded dashboard request
     // gets exactly one response frame.
     if (this.respondToInvalidDashboardRequest(raw, primaryIssues)) {
+      return;
+    }
+
+    // Version-skew diagnosability: a frame that failed every recognition schema
+    // is either a genuinely-unknown message type (the Platform is ahead of this
+    // orchestrator build) or malformed garbage. For a recognizable-but-unknown
+    // type, reply with a NACK naming it so the skew surfaces as a diagnosable
+    // error instead of a silent drop → downstream timeout. `buildUnsupportedMessageNack`
+    // returns null (stay drop-and-warn) for garbage, for a `nack` (loop guard),
+    // and for streaming frame classes (`log.chunk` / `orch-log.chunk`).
+    const nack = buildUnsupportedMessageNack(raw, 'orchestrator', PLATFORM_TO_ORCH_KNOWN_TYPES);
+    if (nack) {
+      wsUnsupportedMessageSentTotal.add(1, { received_type: nack.receivedType ?? 'unknown' });
+      logger.warn('Unsupported message type from Platform; replying with NACK (version skew)', {
+        receivedType: nack.receivedType,
+        errors: primaryIssues,
+      });
+      this.sendRaw(nack);
       return;
     }
 
@@ -1133,6 +1502,14 @@ export class PlatformClient {
         this.onDashboardAttestationRetry?.(msg);
         break;
 
+      case 'dashboard.artifacts.list':
+        logger.debug('Dashboard artifacts list request received', {
+          requestId: msg.requestId,
+          runId: msg.runId,
+        });
+        this.onDashboardArtifactsList?.(msg);
+        break;
+
       case 'run.rerun.request':
         logger.info('Run rerun request received', {
           requestId: msg.requestId,
@@ -1189,12 +1566,45 @@ export class PlatformClient {
         this.onStaleCheckrunCleanup?.(msg);
         break;
 
+      case 'platform.capabilities':
+        // Platform advertises what it supports (Platform → orchestrator). Cache
+        // per connection so feature-gated sends can pre-flight against it. A
+        // self-hosted orchestrator running ahead of the hosted Platform uses
+        // this to avoid firing frames the Platform would drop.
+        this.platformCapabilities = msg.capabilities;
+        logger.info('Platform capabilities advertised', {
+          capabilities: Object.keys(msg.capabilities),
+        });
+        break;
+
+      case 'nack':
+        // The Platform could not process a frame we sent — for version skew it
+        // names the unsupported `receivedType`. Surface it as a structured
+        // warning so the skew is diagnosable in Loki instead of a phantom
+        // timeout. Never NACK a NACK (the loop guard lives at the send site).
+        wsNackReceivedTotal.add(1, { received_type: msg.receivedType ?? 'unknown' });
+        logger.warn('Platform rejected a message (NACK) — likely version skew', {
+          receivedType: msg.receivedType,
+          messageId: msg.messageId,
+          reason: msg.reason,
+        });
+        break;
+
       // Diagnostics
       case 'dashboard.diagnostics':
         logger.debug('Dashboard diagnostics request received', {
           requestId: msg.requestId,
         });
         this.onDashboardDiagnostics?.(msg);
+        break;
+
+      // Run-state system reconciliation read (Platform RunMirrorReconciler)
+      case 'dashboard.run.state':
+        logger.debug('Dashboard run-state reconciliation request received', {
+          requestId: msg.requestId,
+          runId: msg.runId,
+        });
+        this.onDashboardRunState?.(msg);
         break;
 
       // Fleet read (roster, host detail, runsOnAll preview)
@@ -1256,6 +1666,7 @@ export class PlatformClient {
       case 'dashboard.registration.disable':
       case 'dashboard.registration.delete':
       case 'dashboard.event-log.list':
+      case 'dashboard.event-log.activity':
       case 'dashboard.event-log.detail':
       case 'dashboard.event-log.payload.stream':
       case 'dashboard.event-dlq.list':
@@ -1340,7 +1751,21 @@ export class PlatformClient {
     });
 
     this._state = 'authenticated';
-    this.reconnectAttempts = 0;
+    // Do NOT reset the attempt counter here. Authenticating does not mean the
+    // connection is viable: the state replay send is still ahead of it, and a
+    // frame the Platform rejects closes the socket immediately after. Resetting
+    // on auth is what let a post-auth failure reconnect at the 1.0-1.5s floor
+    // forever instead of escalating toward the 60s ceiling. Only surviving
+    // CONNECTION_STABLE_MS proves health.
+    this.clearStabilityTimer();
+    this.stabilityTimer = setTimeout(() => {
+      this.stabilityTimer = null;
+      this.connectionProvenStable = true;
+      this.reconnectAttempts = 0;
+      // A connection that lived this long carried its replay successfully.
+      this.replayConsecutiveFailures = 0;
+    }, CONNECTION_STABLE_MS);
+    this.stabilityTimer.unref?.();
     // Cache the owning org's public alias for outbound URLs. Falls back
     // to whatever was set on the previous connection (typically the
     // same value); only overwritten when Platform actually supplies one.
@@ -1374,7 +1799,7 @@ export class PlatformClient {
       ...(this.clusterId && { clusterId: this.clusterId }),
       ...(this.address !== undefined && { address: this.address }),
       ...(this.version && { version: this.version }),
-      ...(this.mode && { mode: this.mode as 'platform' | 'hybrid' | 'independent' }),
+      ...(this.mode && { mode: this.mode as OrchestratorMode }),
       ...(this.scalerBackends && { scalerBackends: this.scalerBackends }),
       ...(this.deployment && { deployment: this.deployment }),
       ...(this.s3LogAccess !== undefined && { s3LogAccess: this.s3LogAccess }),
@@ -1626,6 +2051,13 @@ export class PlatformClient {
         this.doConnect();
       }
     }, delay);
+  }
+
+  private clearStabilityTimer(): void {
+    if (this.stabilityTimer) {
+      clearTimeout(this.stabilityTimer);
+      this.stabilityTimer = null;
+    }
   }
 
   private cancelReconnect(): void {

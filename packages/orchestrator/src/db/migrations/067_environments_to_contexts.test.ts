@@ -1,13 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
-import { Migrator } from 'kysely/migration';
-import { createMigrationProvider } from '../migration-provider.js';
+import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './067_environments_to_contexts.js';
 
 /**
- * Real-Postgres test for migration 067. Creates a throwaway database, runs every
- * migration to latest, and asserts the environment→context rename landed:
+ * Real-Postgres test for migration 067. Creates a throwaway database, applies
+ * migrations 001..067, and asserts the environment→context rename landed:
  * `contexts`/`context_*` tables + `context`/`contexts`/`skipped_contexts`
  * columns exist, the old `environment*` names are gone, the held-run
  * `queue_type`/`trigger_source` defaults are `'context'`, and the data UPDATE
@@ -66,10 +65,7 @@ describeDb('migration 067_environments_to_contexts', () => {
     }
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
+    const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
 

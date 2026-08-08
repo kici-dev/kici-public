@@ -25,7 +25,8 @@
  */
 
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
+import { makeTempDir } from '@kici-dev/core/tmp';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
@@ -105,9 +106,9 @@ async function detectKiciYarnFlavor(repoRoot: string, kiciDir: string): Promise<
  * Install `.kici/` dependencies inline with the repo's package manager.
  *
  * Falls back to this when the dep cache is unavailable or a download fails.
- * The install runs with an isolated cache/store directory (created in
- * `os.tmpdir()`) to prevent cache poisoning between build jobs; the directory
- * is removed after installation.
+ * The install runs with an isolated cache/store directory (allocated under the
+ * global temp base, which honors `KICI_TMPDIR`) to prevent cache poisoning
+ * between build jobs; the directory is removed after installation.
  *
  * If `opts.npmRegistries` / `opts.installEnvSecrets` is provided, a job-scoped
  * `.kici/.npmrc` overlay is synthesized for the install, restored in `finally`,
@@ -218,7 +219,7 @@ async function runNpmInstall(args: {
   registryConfig: ApplyNpmRegistryConfigResult;
 }): Promise<void> {
   const { npmCliPath, nodeExe, nodeDir } = resolveNpm();
-  const cacheDir = await mkdtemp(join(tmpdir(), 'kici-npm-cache-'));
+  const { path: cacheDir, cleanup } = await makeTempDir('npm-cache');
   const env = envWithNodeOnPath(args.registryConfig.extraEnv, nodeDir);
 
   // Always `npm install` (not `npm ci`): `npm ci` uses resolved URLs baked into
@@ -244,7 +245,7 @@ async function runNpmInstall(args: {
       maxBuffer: INSTALL_MAX_BUFFER,
     });
   } finally {
-    await rm(cacheDir, { recursive: true, force: true }).catch(() => {});
+    await cleanup().catch(() => {});
   }
 }
 
@@ -263,7 +264,7 @@ async function runPnpmInstall(args: {
 }): Promise<void> {
   await assertPnpmAvailable();
   const { nodeDir } = resolveNpm();
-  const storeDir = await mkdtemp(join(tmpdir(), 'kici-pnpm-store-'));
+  const { path: storeDir, cleanup } = await makeTempDir('pnpm-store');
   const env = envWithNodeOnPath(args.registryConfig.extraEnv, nodeDir);
 
   const argv = [
@@ -289,7 +290,7 @@ async function runPnpmInstall(args: {
       maxBuffer: INSTALL_MAX_BUFFER,
     });
   } finally {
-    await rm(storeDir, { recursive: true, force: true }).catch(() => {});
+    await cleanup().catch(() => {});
   }
 }
 
@@ -315,7 +316,7 @@ async function runYarnInstall(args: {
 }): Promise<void> {
   await assertYarnAvailable();
   const { nodeDir } = resolveNpm();
-  const cacheDir = await mkdtemp(join(tmpdir(), 'kici-yarn-cache-'));
+  const { path: cacheDir, cleanup } = await makeTempDir('yarn-cache');
   const env = envWithNodeOnPath(args.registryConfig.extraEnv, nodeDir);
   const argv = buildYarnInstallArgs(cacheDir, args.hasPrivateRegistry);
 
@@ -328,7 +329,7 @@ async function runYarnInstall(args: {
       maxBuffer: INSTALL_MAX_BUFFER,
     });
   } finally {
-    await rm(cacheDir, { recursive: true, force: true }).catch(() => {});
+    await cleanup().catch(() => {});
   }
 }
 

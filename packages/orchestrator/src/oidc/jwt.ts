@@ -4,19 +4,22 @@
  * returns the JOSE-raw r||s ES256 signature directly, so we base64url-assemble
  * the compact JWS (`header.payload.signature`) by hand.
  */
-import type { LocalSigner } from './local-dev-signer.js';
-
 export interface JwsProtectedHeader {
   alg: 'ES256';
   kid: string;
   typ: 'JWT';
 }
 
+/** The minimal signing surface `signCompactJws` needs (both `LocalSigner` and `Signer` satisfy it). */
+export interface CompactJwsSigner {
+  sign(data: Uint8Array): Promise<Uint8Array>;
+}
+
 const b64url = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString('base64url');
 
 /** Assemble a compact JWS from a protected header + payload, signed by `signer`. */
 export async function signCompactJws(
-  signer: LocalSigner,
+  signer: CompactJwsSigner,
   protectedHeader: JwsProtectedHeader,
   payload: Record<string, unknown>,
 ): Promise<string> {

@@ -10,7 +10,11 @@ import {
   ExecutionRunStatus,
   ExecutionStepStatus,
   InitFailureCategory,
+  RunFailureClass,
   ScalerEventType,
+  TERMINAL_JOB_STATES,
+  TERMINAL_RUN_STATES,
+  resolveWhenToRunOn,
 } from '@kici-dev/engine';
 
 // Mock Prometheus metrics
@@ -59,6 +63,8 @@ function createMockDb() {
   const stepRows = new Map<string, { id: string }>();
   /** Track execution_jobs rows for upsert + select checks. */
   const jobRows = new Map<string, { id: string; job_name?: string; job_id?: string }>();
+  /** Track execution_runs rows so a second write is captured as an update. */
+  const runRows = new Map<string, { status?: string }>();
 
   const db = {
     insertInto: vi.fn((table: string) => {
@@ -83,13 +89,45 @@ function createMockDb() {
                   job_id: v.job_id as string | undefined,
                 });
               }
+              // Track execution_runs rows for subsequent upserts
+              if (table === 'execution_runs') {
+                runRows.set(String(v.run_id), { status: v.status as string | undefined });
+              }
             }
             return [];
           };
           return {
             execute: vi.fn(executeInsert),
-            onConflict: vi.fn((_ocFn: unknown) => ({
-              execute: vi.fn(async () => {
+            onConflict: vi.fn((ocFn: (oc: unknown) => unknown) => {
+              // Record which conflict resolution the caller chose, so a test can
+              // tell an upsert from a doNothing. Without this the mock treats
+              // both alike and any assertion about upsert behavior is vacuous.
+              let resolution: 'doNothing' | 'doUpdateSet' = 'doNothing';
+              // Captured from the production `.where(col, op, values)` guard so
+              // the mock applies the caller's condition instead of restating it
+              // — deleting the guard from the source must fail a test.
+              let guard: [string, string, unknown] | undefined;
+              const target = () => ({
+                doNothing: () => {
+                  resolution = 'doNothing';
+                  return {};
+                },
+                doUpdateSet: (vals: Record<string, unknown>) => {
+                  resolution = 'doUpdateSet';
+                  const chain: Record<string, unknown> = { __values: vals };
+                  chain.where = (col: string, op: string, val: unknown) => {
+                    guard = [col, op, val];
+                    return chain;
+                  };
+                  return chain;
+                },
+              });
+              ocFn({ column: target, columns: target });
+              // Returns how many rows the upsert actually wrote, so a caller
+              // that gates on `numInsertedOrUpdatedRows` (the terminal-clobber
+              // guard) sees the guard's real verdict rather than a constant.
+              const runUpsert = async (): Promise<number> => {
+                const before = inserts.length + updates.length;
                 // Simulate upsert: if row exists, record as update; otherwise, record as insert
                 for (const v of insertValues) {
                   if (table === 'execution_steps') {
@@ -129,13 +167,52 @@ function createMockDb() {
                         job_id: v.job_id as string | undefined,
                       });
                     }
+                  } else if (table === 'execution_runs') {
+                    const key = String(v.run_id);
+                    const existing = runRows.get(key);
+                    if (existing) {
+                      // A conflicting row exists. `doNothing` leaves it alone;
+                      // an upsert rewrites it, but the tracker's guard keeps an
+                      // already-terminal row untouched.
+                      if (resolution === 'doNothing') continue;
+                      if (guard && existing.status !== undefined) {
+                        const [col, op, val] = guard;
+                        const column = col.split('.').pop();
+                        const excluded = Array.isArray(val) ? (val as unknown[]) : [val];
+                        if (
+                          column === 'status' &&
+                          op === 'not in' &&
+                          excluded.includes(existing.status)
+                        ) {
+                          continue;
+                        }
+                      }
+                      updates.push({
+                        table,
+                        values: v,
+                        where: [['run_id', '=', v.run_id]],
+                      });
+                      runRows.set(key, { status: v.status as string | undefined });
+                    } else {
+                      inserts.push({ table, values: v });
+                      runRows.set(key, { status: v.status as string | undefined });
+                    }
                   } else {
                     inserts.push({ table, values: v });
                   }
                 }
-                return [];
-              }),
-            })),
+                return inserts.length + updates.length - before;
+              };
+              return {
+                execute: vi.fn(async () => {
+                  await runUpsert();
+                  return [];
+                }),
+                executeTakeFirst: vi.fn(async () => ({
+                  numInsertedOrUpdatedRows: BigInt(await runUpsert()),
+                })),
+              };
+            }),
           };
         }),
       };
@@ -151,10 +228,39 @@ function createMockDb() {
               return buildExecute();
             }),
             execute: vi.fn(async () => {
-              updates.push({ table, values: vals, where: [...currentWheres] });
+              runUpdate();
               return [];
             }),
+            // Mirrors `execute`, but reports the row count so a caller that
+            // gates on `numUpdatedRows` (the terminal-clobber guard) sees the
+            // guard's real verdict rather than a constant.
+            executeTakeFirst: vi.fn(async () => ({
+              numUpdatedRows: BigInt(runUpdate()),
+            })),
           });
+          /**
+           * Apply one guarded UPDATE. Honours a `status in [...]` predicate
+           * against the tracked run row, so an update whose guard excludes the
+           * row's current status is a no-op — the same way Postgres behaves.
+           * Without this the mock would apply every write and any assertion
+           * about a clobber guard would be vacuous.
+           */
+          const runUpdate = (): number => {
+            const runId = currentWheres.find((w) => w[0] === 'run_id')?.[2];
+            const statusGuard = currentWheres.find((w) => w[0] === 'status' && w[1] === 'in');
+            if (table === 'execution_runs' && runId && statusGuard) {
+              const existing = runRows.get(String(runId));
+              const allowed = statusGuard[2] as unknown[];
+              if (existing?.status !== undefined && !allowed.includes(existing.status)) return 0;
+            }
+            updates.push({ table, values: vals, where: [...currentWheres] });
+            // Keep the tracked run status current, so a later upsert's guard
+            // sees the status the row actually holds.
+            if (table === 'execution_runs' && typeof vals.status === 'string' && runId) {
+              runRows.set(String(runId), { status: vals.status });
+            }
+            return 1;
+          };
           return buildExecute();
         }),
       };
@@ -200,6 +306,32 @@ function createMockDb() {
                     }
                   }
                   return undefined;
+                }
+                // Rehydration path: return the tracked run row so recovery sees
+                // the status the DB actually holds.
+                if (table === 'execution_runs') {
+                  const runId = currentWheres.find((w) => w[0] === 'run_id')?.[2];
+                  const row = runId ? runRows.get(String(runId)) : undefined;
+                  if (!row) return undefined;
+                  return {
+                    status: row.status,
+                    workflow_name: 'wf',
+                    provider: 'github',
+                    repo_identifier: 'org/repo',
+                    sha: 'deadbeef',
+                    ref: 'refs/heads/main',
+                    routing_key: 'github:1',
+                    provider_context: {},
+                    started_at: new Date(),
+                    parent_run_id: null,
+                    original_run_id: null,
+                    triggered_by: null,
+                    triggered_by_agent_label: null,
+                    trigger_actor_username: null,
+                    trigger_actor_user_id: null,
+                    check_mode: null,
+                    local_working_tree: false,
+                  };
                 }
                 return undefined;
               }),
@@ -306,6 +438,82 @@ describe('ExecutionTracker', () => {
       expect(runInsert!.values.delivery_id).toBe('delivery-1');
       expect(runInsert!.values.provider_context).toBe('{"installationId":42}');
       expect(runInsert!.values.trigger_decision).toBe('{"matched":true}');
+    });
+
+    it('populates execution_runs.customer_id from the injected resolveOrgId', async () => {
+      const seen: string[] = [];
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        resolveOrgId: async (rk: string) => {
+          seen.push(rk);
+          return rk === 'generic:org-a:s1' ? 'org-a' : '__default__';
+        },
+      });
+      await t.onExecutionStarted(
+        'run-org',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+        'generic:org-a:s1', // routingKey
+      );
+      const runInsert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-org',
+      );
+      expect(runInsert!.values.customer_id).toBe('org-a');
+      expect(seen).toContain('generic:org-a:s1');
+    });
+
+    it('falls back to __default__ customer_id when routingKey is undefined', async () => {
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        resolveOrgId: async () => {
+          throw new Error('resolveOrgId must not be called for a null routing key');
+        },
+      });
+      await t.onExecutionStarted(
+        'run-nokey',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+        undefined, // routingKey
+      );
+      const runInsert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-nokey',
+      );
+      expect(runInsert!.values.customer_id).toBe('__default__');
+    });
+
+    it('falls back to __default__ customer_id when no resolver is injected', async () => {
+      // The default `tracker` (beforeEach) has no resolveOrgId dep.
+      await tracker.onExecutionStarted(
+        'run-noresolver',
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-1',
+        {},
+        null,
+        baseJobs,
+        'generic:org-a:s1', // routingKey present, but no resolver wired
+      );
+      const runInsert = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-noresolver',
+      );
+      expect(runInsert!.values.customer_id).toBe('__default__');
     });
 
     it('persists workflow_timeout_ms when provided', async () => {
@@ -1118,6 +1326,140 @@ describe('ExecutionTracker', () => {
     });
   });
 
+  describe('failure_class derivation + forwarding', () => {
+    async function completeSingleJobRun(
+      jobStatus: string,
+      onStatusChange: ReturnType<typeof vi.fn>,
+      onWf: ReturnType<typeof vi.fn>,
+    ): Promise<void> {
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange: onStatusChange,
+        onWorkflowComplete: onWf,
+      });
+      await t.onExecutionStarted(
+        'run-fc',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+      await t.onJobStatus('run-fc', 'job-1', jobStatus, Date.now());
+    }
+
+    function terminalRunUpdate(): Record<string, unknown> | undefined {
+      return mockDb.updates.find(
+        (u) => u.table === 'execution_runs' && u.values.completed_at !== undefined,
+      )?.values;
+    }
+
+    it('a failed job stamps step_failure on the run row and forwards it', async () => {
+      const onStatusChange = vi.fn();
+      const onWf = vi.fn();
+      await completeSingleJobRun(ExecutionJobStatus.enum.failed, onStatusChange, onWf);
+      expect(terminalRunUpdate()!.failure_class).toBe(RunFailureClass.enum.step_failure);
+      expect(onStatusChange.mock.calls.at(-1)![2].failureClass).toBe(
+        RunFailureClass.enum.step_failure,
+      );
+      expect(onWf).toHaveBeenCalledWith(
+        expect.objectContaining({ failureClass: RunFailureClass.enum.step_failure }),
+      );
+    });
+
+    it('a timed_out_stale job stamps timed_out (infra class)', async () => {
+      const onStatusChange = vi.fn();
+      const onWf = vi.fn();
+      await completeSingleJobRun(ExecutionJobStatus.enum.timed_out_stale, onStatusChange, onWf);
+      expect(terminalRunUpdate()!.failure_class).toBe(RunFailureClass.enum.timed_out);
+      expect(onWf).toHaveBeenCalledWith(
+        expect.objectContaining({ failureClass: RunFailureClass.enum.timed_out }),
+      );
+    });
+
+    it('a cancelled run stamps cancelled', async () => {
+      const onStatusChange = vi.fn();
+      const onWf = vi.fn();
+      await completeSingleJobRun(ExecutionJobStatus.enum.cancelled, onStatusChange, onWf);
+      expect(terminalRunUpdate()!.failure_class).toBe(RunFailureClass.enum.cancelled);
+    });
+
+    it('a successful run stamps null and omits failureClass from the workflow event', async () => {
+      const onStatusChange = vi.fn();
+      const onWf = vi.fn();
+      await completeSingleJobRun(ExecutionJobStatus.enum.success, onStatusChange, onWf);
+      expect(terminalRunUpdate()!.failure_class).toBeNull();
+      expect(onWf.mock.calls.at(-1)![0].failureClass).toBeUndefined();
+    });
+
+    it('failRun stamps never_started on the row, the status context, and the workflow event', async () => {
+      const onStatusChange = vi.fn();
+      const onWf = vi.fn();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange: onStatusChange,
+        onWorkflowComplete: onWf,
+      });
+      await t.onExecutionStarted(
+        'run-if',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+      await t.failRun('run-if', 'No agents available', {
+        scope: 'run',
+        category: InitFailureCategory.enum.no_agent,
+        message: 'No agents available',
+      });
+      const failUpdate = mockDb.updates.find(
+        (u) => u.table === 'execution_runs' && u.values.failure_class !== undefined,
+      );
+      expect(failUpdate!.values.failure_class).toBe(RunFailureClass.enum.never_started);
+      expect(onStatusChange.mock.calls.at(-1)![2].failureClass).toBe(
+        RunFailureClass.enum.never_started,
+      );
+      expect(onWf).toHaveBeenCalledWith(
+        expect.objectContaining({ failureClass: RunFailureClass.enum.never_started }),
+      );
+    });
+
+    it('recordInitFailureRun stamps never_started on the inserted row and forward context', async () => {
+      const onStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange: onStatusChange });
+      await t.recordInitFailureRun({
+        runId: 'run-init',
+        workflowName: 'ci',
+        provider: 'github',
+        repoIdentifier: 'owner/repo',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        providerContext: {},
+        routingKey: 'rk',
+        initFailure: {
+          scope: 'run',
+          category: InitFailureCategory.enum.secret_resolution,
+          message: 'secret missing',
+        },
+      });
+      const insert = mockDb.inserts.find((i) => i.table === 'execution_runs');
+      expect(insert!.values.failure_class).toBe(RunFailureClass.enum.never_started);
+      expect(onStatusChange.mock.calls.at(-1)![2].failureClass).toBe(
+        RunFailureClass.enum.never_started,
+      );
+    });
+  });
+
   describe('onExecutionComplete callback', () => {
     it('fires on completion with correct status, context, and no description for success', async () => {
       await tracker.onExecutionStarted(
@@ -1147,6 +1489,40 @@ describe('ExecutionTracker', () => {
         },
         undefined,
       );
+    });
+
+    it('finalizes a run at most once', async () => {
+      // Finalization stamps `completedAt` but only prunes the in-memory run on
+      // a delay, so the run is still tracked afterwards. A late terminal status
+      // arriving in that window finds a complete run, and without the
+      // `completedAt` guard rolls it up a second time — a duplicate provider
+      // check and a second terminal run status forwarded to the Platform.
+      await tracker.onExecutionStarted(
+        'run-idem',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        { installationId: 42 },
+        null,
+        [
+          { jobId: 'job-1', jobName: 'test' },
+          { jobId: 'job-2', jobName: 'lint' },
+        ],
+      );
+
+      await tracker.onJobStatus('run-idem', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+      // Both jobs terminal: the run is finalized exactly here.
+      await tracker.onJobStatus('run-idem', 'job-2', ExecutionJobStatus.enum.success, Date.now());
+      expect(onExecutionComplete).toHaveBeenCalledTimes(1);
+
+      // A late terminal status for job-1 in a different state, so the job-level
+      // replay guard does not absorb it. The run is still in memory.
+      await tracker.onJobStatus('run-idem', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
+
+      expect(onExecutionComplete).toHaveBeenCalledTimes(1);
     });
 
     it('includes failed job names in description for failed runs', async () => {
@@ -1820,6 +2196,65 @@ describe('ExecutionTracker', () => {
       expect(onJobComplete.mock.calls[0][0].status).toBe(ExecutionRunStatus.enum.failed);
     });
 
+    it('fires for an orchestrator-set skipped job, carrying the status payload', async () => {
+      // The check run is completed from this hook, so a job the orchestrator
+      // itself ends (a needs-scheduler skip — no agent message involved) must
+      // reach it, or its check run stays queued forever on the commit.
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+        'github:42',
+      );
+
+      await tracker.onJobStatus(
+        'run-1',
+        'job-1',
+        ExecutionJobStatus.enum.skipped,
+        Date.now(),
+        undefined,
+        { error: 'needs not satisfied' },
+      );
+
+      expect(onJobComplete).toHaveBeenCalledOnce();
+      const data = onJobComplete.mock.calls[0][0];
+      expect(data.status).toBe(ExecutionJobStatus.enum.skipped);
+      expect(data.jobName).toBe('test');
+      expect(data.data).toMatchObject({ error: 'needs not satisfied' });
+    });
+
+    it('fires for a drift-dropped job', async () => {
+      await tracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+
+      await tracker.onJobStatus(
+        'run-1',
+        'job-1',
+        ExecutionJobStatus.enum.drift_dropped,
+        Date.now(),
+      );
+
+      expect(onJobComplete).toHaveBeenCalledOnce();
+      expect(onJobComplete.mock.calls[0][0].status).toBe(ExecutionJobStatus.enum.drift_dropped);
+    });
+
     it('fires independently for each job', async () => {
       await tracker.onExecutionStarted(
         'run-1',
@@ -2111,6 +2546,89 @@ describe('ExecutionTracker', () => {
       expect(lastCall[1]).toContain('"phase":"teardown"');
       expect(lastCall[1]).toContain('Job completed with status success');
     });
+
+    it('forwards dispatch orch-log lines to Platform via onOrchLog', async () => {
+      const onOrchLog = vi.fn();
+      const forwardTracker = new ExecutionTracker({
+        db: mockDb.db,
+        logStorage: mockLogStorage,
+        orgId: 'org-1',
+        onOrchLog,
+      });
+
+      await forwardTracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+
+      // The dispatch write both persists AND forwards the same line.
+      expect(onOrchLog).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: 'run-1',
+          jobId: 'job-1',
+          phase: 'dispatch',
+          lines: ['Job dispatched to queue'],
+          ts: expect.any(Number),
+        }),
+      );
+    });
+
+    it('forwards provisioning orch-log lines via onOrchLog on emitScalerEvent', () => {
+      const onOrchLog = vi.fn();
+      const forwardTracker = new ExecutionTracker({
+        db: mockDb.db,
+        logStorage: mockLogStorage,
+        orgId: 'org-1',
+        onOrchLog,
+      });
+
+      forwardTracker.emitScalerEvent('run-1', 'job-1', {
+        agentId: 'agent-1',
+        eventType: ScalerEventType.enum['scaler.provisioning'],
+        detail: 'Provisioning container agent',
+        timestampMs: 1234,
+      });
+
+      expect(onOrchLog).toHaveBeenCalledWith({
+        runId: 'run-1',
+        jobId: 'job-1',
+        phase: 'provisioning',
+        lines: ['Provisioning container agent'],
+        ts: 1234,
+      });
+    });
+
+    it('does not forward orch-log lines when orgId is unset', async () => {
+      const onOrchLog = vi.fn();
+      const noOrgTracker = new ExecutionTracker({
+        db: mockDb.db,
+        logStorage: mockLogStorage,
+        onOrchLog,
+      });
+
+      await noOrgTracker.onExecutionStarted(
+        'run-1',
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'test' }],
+      );
+
+      expect(onOrchLog).not.toHaveBeenCalled();
+    });
   });
 
   describe('cancelStepsForJob', () => {
@@ -2301,13 +2819,12 @@ describe('ExecutionTracker', () => {
           Date.now(),
         );
 
-        // Job reaches terminal cancelled state
-        await tracker.onJobStatus(
-          'run-cancel',
-          'job-1',
-          ExecutionJobStatus.enum.cancelled,
-          Date.now(),
-        );
+        // Job reaches terminal cancelled state. Mirror the production cancel
+        // path (`cancel/cancel-run.ts`), which marks the remaining job row
+        // directly and then asks the tracker to finish the run — going through
+        // `onJobStatus` instead would auto-complete the run first, leaving
+        // nothing for the call under test to do.
+        tracker.updateInMemoryJob('run-cancel', 'job-1', ExecutionJobStatus.enum.cancelled);
 
         // Now call completeRunIfAllJobsTerminal (stale detector path)
         await tracker.completeRunIfAllJobsTerminal('run-cancel');
@@ -2331,6 +2848,41 @@ describe('ExecutionTracker', () => {
       });
     });
 
+    it('clears the test-run marker when the stale detector, not the normal path, finishes the run', async () => {
+      await requestContext.run({ requestId: 'req-tr', runId: 'run-tr' }, async () => {
+        await tracker.onExecutionStarted(
+          'run-tr',
+          'ci',
+          'github',
+          'owner/repo',
+          'main',
+          'abc123',
+          null,
+          { installationId: 1 },
+          null,
+          [{ jobId: 'job-1', jobName: 'test' }],
+        );
+        tracker.markTestRun('run-tr');
+        expect(tracker.isTestRun('run-tr')).toBe(true);
+
+        // Stale-detector flow (see the sibling tests): mutate the in-memory job
+        // directly, then ask the tracker to finish the run.
+        await tracker.onJobStatus('run-tr', 'job-1', ExecutionJobStatus.enum.running, Date.now());
+        tracker.updateInMemoryJob('run-tr', 'job-1', ExecutionJobStatus.enum.timed_out_stale);
+        await tracker.completeRunIfAllJobsTerminal('run-tr');
+
+        // The marker survives the grace period — a late status still broadcasts.
+        expect(tracker.isTestRun('run-tr')).toBe(true);
+
+        // ...and is dropped with the rest of the run's in-memory state once the
+        // prune fires. Without this, a run finished by the stale detector rather
+        // than the normal completion path leaks its marker for the process's
+        // lifetime.
+        vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+        expect(tracker.isTestRun('run-tr')).toBe(false);
+      });
+    });
+
     it('stamps the generic stale reason guarded by failure_reason IS NULL on a failed run', async () => {
       await requestContext.run({ requestId: 'req-fail', runId: 'run-fail' }, async () => {
         await tracker.onExecutionStarted(
@@ -2347,7 +2899,12 @@ describe('ExecutionTracker', () => {
         );
 
         await tracker.onJobStatus('run-fail', 'job-1', ExecutionJobStatus.enum.running, Date.now());
-        await tracker.onJobStatus('run-fail', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
+        // Mirror the production stale-detector flow (`stale-run-detector.ts`):
+        // it mutates the in-memory job directly and then asks the tracker to
+        // finish the run. Routing this through `onJobStatus` would auto-complete
+        // the run first, so the call under test would find an already-terminal
+        // row and correctly do nothing.
+        tracker.updateInMemoryJob('run-fail', 'job-1', ExecutionJobStatus.enum.timed_out_stale);
 
         await tracker.completeRunIfAllJobsTerminal('run-fail');
 
@@ -2403,7 +2960,10 @@ describe('ExecutionTracker', () => {
         );
 
         await tracker.onJobStatus('run-ok', 'job-1', ExecutionJobStatus.enum.running, Date.now());
-        await tracker.onJobStatus('run-ok', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+        // In-memory mutation (not `onJobStatus`) so the run is still open when
+        // the call under test runs — otherwise this negative assertion would
+        // hold vacuously, for want of any write at all.
+        tracker.updateInMemoryJob('run-ok', 'job-1', ExecutionJobStatus.enum.success);
 
         await tracker.completeRunIfAllJobsTerminal('run-ok');
 
@@ -2418,6 +2978,45 @@ describe('ExecutionTracker', () => {
         expect(reasonUpdates.length).toBe(0);
       });
     });
+
+    it('does not forward a recomputed status the terminal guard rejected', async () => {
+      // A job marked `timed_out_stale` after the run already finished green
+      // recomputes the run to `failed`. The DB guard keeps the recorded
+      // `success` — and the Platform forward must be suppressed with it, or the
+      // Platform mirror reads `failed` for a run this orchestrator reads as
+      // `success`, forever (the mirror reconciler only revisits NON-terminal
+      // rows, so nothing ever corrects it).
+      const onExecutionStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
+      await requestContext.run({ requestId: 'req-late', runId: 'run-late-stale' }, async () => {
+        await t.onExecutionStarted(
+          'run-late-stale',
+          'ci',
+          'github',
+          'owner/repo',
+          'main',
+          'abc123',
+          null,
+          { installationId: 1 },
+          null,
+          [{ jobId: 'job-1', jobName: 'test' }],
+        );
+        await t.onJobStatus('run-late-stale', 'job-1', ExecutionJobStatus.enum.running, Date.now());
+        // Normal completion: the run finishes green and forwards `success`.
+        await t.onJobStatus('run-late-stale', 'job-1', ExecutionJobStatus.enum.success, Date.now());
+        expect(onExecutionStatusChange.mock.calls.at(-1)?.[1]).toBe(
+          ExecutionRunStatus.enum.success,
+        );
+        onExecutionStatusChange.mockClear();
+
+        // The stale detector then marks the (already finished) job stale and
+        // asks the tracker to complete the run again.
+        t.updateInMemoryJob('run-late-stale', 'job-1', ExecutionJobStatus.enum.timed_out_stale);
+        await t.completeRunIfAllJobsTerminal('run-late-stale');
+
+        expect(onExecutionStatusChange).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe('completeRunFromDbFallback failure_reason guard', () => {
@@ -2429,9 +3028,18 @@ describe('ExecutionTracker', () => {
      */
     function createDbFallbackMockDb(
       jobs: Array<{ status: string; job_name: string }>,
-      runRow: Record<string, unknown>,
+      runRowInput: Record<string, unknown>,
+      /**
+       * Status the run row takes on immediately AFTER the fallback's run-state
+       * read — simulating a concurrent normal completion landing between that
+       * read and the guarded write. Omit for the ordinary case.
+       */
+      statusAfterRead?: string,
     ) {
       const updates: MockUpdate[] = [];
+      // Copy: `apply` below mutates the row's status, and the callers share one
+      // literal across tests.
+      const runRow = { ...runRowInput };
 
       const buildSelectChain = (executeFn: () => Promise<unknown>) => {
         const chain: Record<string, unknown> = {};
@@ -2444,7 +3052,12 @@ describe('ExecutionTracker', () => {
       const db = {
         selectFrom: vi.fn((table: string) => ({
           select: vi.fn(() =>
-            buildSelectChain(async () => (table === 'execution_jobs' ? jobs : runRow)),
+            buildSelectChain(async () => {
+              if (table === 'execution_jobs') return jobs;
+              const snapshot = { ...runRow };
+              if (statusAfterRead !== undefined) runRow.status = statusAfterRead;
+              return snapshot;
+            }),
           ),
         })),
         updateTable: vi.fn((table: string) => ({
@@ -2455,10 +3068,26 @@ describe('ExecutionTracker', () => {
               wheres.push([col, op, val]);
               return chain;
             });
-            chain.execute = vi.fn(async () => {
+            const apply = (): number => {
+              // Honour a `status in [...]` clobber guard against the run row's
+              // current status, the way Postgres would: an update whose guard
+              // excludes it writes nothing.
+              const statusGuard = wheres.find((w) => w[0] === 'status' && w[1] === 'in');
+              if (table === 'execution_runs' && statusGuard) {
+                const allowed = statusGuard[2] as unknown[];
+                if (!allowed.includes(runRow.status)) return 0;
+              }
               updates.push({ table, values: vals, where: [...wheres] });
+              if (table === 'execution_runs' && typeof vals.status === 'string') {
+                runRow.status = vals.status;
+              }
+              return 1;
+            };
+            chain.execute = vi.fn(async () => {
+              apply();
               return [];
             });
+            chain.executeTakeFirst = vi.fn(async () => ({ numUpdatedRows: BigInt(apply()) }));
             return chain;
           }),
         })),
@@ -2512,6 +3141,44 @@ describe('ExecutionTracker', () => {
       expect('failure_reason' in statusUpdates[0].values).toBe(false);
     });
 
+    it('fails a DB-fallback run whose only non-success job never ran', async () => {
+      // The false-green this guards: `__build__` succeeded and the declared job
+      // was settled `unroutable` / `drift_dropped` without ever dispatching. A
+      // hand-listed failure set here reported the whole run `success`.
+      for (const neverRan of [
+        ExecutionJobStatus.enum.unroutable,
+        ExecutionJobStatus.enum.drift_dropped,
+      ]) {
+        const jobs = [
+          { status: ExecutionJobStatus.enum.success, job_name: '__build__' },
+          { status: neverRan, job_name: 'deploy' },
+        ];
+        const { db, updates } = createDbFallbackMockDb(jobs, runningRunRow);
+        const onExecutionComplete = vi.fn();
+        const fallbackTracker = new ExecutionTracker({ db, onExecutionComplete });
+
+        await fallbackTracker.completeRunIfAllJobsTerminal(`run-never-ran-${neverRan}`);
+
+        // The run row is written `failed` — never `success` — and classified as
+        // infra (`timed_out`), since no step ever ran to fail.
+        const statusUpdates = updates.filter(
+          (u) => u.table === 'execution_runs' && u.values.status !== undefined,
+        );
+        expect(statusUpdates.length).toBe(1);
+        expect(statusUpdates[0].values.status).toBe(ExecutionRunStatus.enum.failed);
+        expect(statusUpdates[0].values.failure_class).toBe(RunFailureClass.enum.timed_out);
+
+        // ...and the job that never ran is named, so the description is not an
+        // empty `Failed jobs:` list.
+        expect(onExecutionComplete).toHaveBeenCalledWith(
+          `run-never-ran-${neverRan}`,
+          ExecutionRunStatus.enum.failed,
+          expect.anything(),
+          'Failed jobs: deploy',
+        );
+      }
+    });
+
     it('does not stamp an orphan reason when the DB-fallback run succeeds', async () => {
       const successJobs = [{ status: ExecutionJobStatus.enum.success, job_name: 'test' }];
       const { db, updates } = createDbFallbackMockDb(successJobs, runningRunRow);
@@ -2526,6 +3193,29 @@ describe('ExecutionTracker', () => {
           'failure_reason' in u.values,
       );
       expect(reasonUpdates.length).toBe(0);
+    });
+
+    it('does not forward when a concurrent completion lands between read and write', async () => {
+      // The run-state read and the guarded write are not one transaction, so a
+      // normal completion can turn the row terminal in between. The guard then
+      // rejects the write — and the Platform forward must go with it, or the
+      // mirror is left holding a `failed` this orchestrator never recorded.
+      const onExecutionStatusChange = vi.fn();
+      const { db, updates } = createDbFallbackMockDb(
+        failedJobs,
+        runningRunRow,
+        ExecutionRunStatus.enum.success,
+      );
+      const fallbackTracker = new ExecutionTracker({ db, onExecutionStatusChange });
+
+      await fallbackTracker.completeRunIfAllJobsTerminal('run-orphan-raced');
+
+      expect(onExecutionStatusChange).not.toHaveBeenCalled();
+      expect(
+        updates.filter(
+          (u) => u.table === 'execution_runs' && u.values.status === ExecutionRunStatus.enum.failed,
+        ),
+      ).toHaveLength(0);
     });
   });
 
@@ -2615,6 +3305,107 @@ describe('ExecutionTracker', () => {
 
       // NOW it should be complete
       expect(tracker.isRunComplete('run-synth')).toBe(true);
+    });
+
+    async function startBuildWindowRun(runId: string) {
+      await tracker.onExecutionStarted(
+        runId,
+        'ci',
+        'github',
+        'owner/repo',
+        'refs/heads/main',
+        'abc123',
+        'delivery-bw',
+        { installationId: 42 },
+        { matched: true },
+        // A run registered with ONLY the source-pack build job — the shape the
+        // dispatch path produces while it awaits the build.
+        [{ jobId: 'build-1', jobName: '__build__ci' }],
+      );
+      tracker.holdRunForPendingJobs(runId);
+    }
+
+    it('does not finalize a run while a pending-jobs token is held', async () => {
+      await startBuildWindowRun('run-build-window');
+
+      await tracker.onJobStatus(
+        'run-build-window',
+        'build-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+      );
+
+      // The build finishing is NOT the run finishing: the post-build jobs have
+      // not been dispatched yet.
+      expect(tracker.isRunComplete('run-build-window')).toBe(false);
+      expect(onExecutionComplete).not.toHaveBeenCalled();
+
+      // Post-build jobs land, then the hold is released.
+      await tracker.addJobsToRun('run-build-window', [
+        { jobId: 'producer-1', jobName: 'producer' },
+      ]);
+      await tracker.releasePendingJobsHold('run-build-window');
+      expect(tracker.isRunComplete('run-build-window')).toBe(false);
+      expect(onExecutionComplete).not.toHaveBeenCalled();
+
+      // Only the real job's outcome decides the run's terminal status.
+      await tracker.onJobStatus(
+        'run-build-window',
+        'producer-1',
+        ExecutionJobStatus.enum.failed,
+        Date.now(),
+      );
+      expect(tracker.isRunComplete('run-build-window')).toBe(true);
+      expect(onExecutionComplete).toHaveBeenCalledWith(
+        'run-build-window',
+        ExecutionRunStatus.enum.failed,
+        expect.objectContaining({ workflowName: 'ci' }),
+        expect.any(String),
+      );
+    });
+
+    it('finalizes on release when the token was the only thing keeping the run open', async () => {
+      await startBuildWindowRun('run-build-window-noop');
+
+      await tracker.onJobStatus(
+        'run-build-window-noop',
+        'build-1',
+        ExecutionJobStatus.enum.success,
+        Date.now(),
+      );
+      expect(onExecutionComplete).not.toHaveBeenCalled();
+
+      // No post-build job was ever registered (every static job was rejected).
+      // Releasing the hold must complete the run rather than leave it
+      // hanging in `running` forever.
+      await tracker.releasePendingJobsHold('run-build-window-noop');
+      expect(tracker.isRunComplete('run-build-window-noop')).toBe(true);
+      expect(onExecutionComplete).toHaveBeenCalledWith(
+        'run-build-window-noop',
+        ExecutionRunStatus.enum.success,
+        expect.objectContaining({ workflowName: 'ci' }),
+        undefined,
+      );
+    });
+
+    it('does not expose a pending-jobs token as a job in the replay projection', async () => {
+      await startBuildWindowRun('run-build-window-replay');
+
+      // The hold must be invisible to every outward projection: a synthetic job
+      // entry here would be mirrored into the Platform's execution_jobs table on
+      // reconnect (a phantom pending job on the run page, forever) and would
+      // inflate the reported job count for the length of the build.
+      const replayed = tracker.getReplayData().find((r) => r.runId === 'run-build-window-replay');
+      expect(replayed?.jobs.map((j) => j.jobName)).toEqual(['__build__ci']);
+      expect(replayed?.jobCount).toBe(1);
+    });
+
+    it('releasePendingJobsHold is a no-op when no token is outstanding', async () => {
+      await setupRunWithSyntheticJob();
+      await tracker.releasePendingJobsHold('run-synth');
+      await tracker.releasePendingJobsHold('run-unknown');
+      expect(tracker.isRunComplete('run-synth')).toBe(false);
+      expect(onExecutionComplete).not.toHaveBeenCalled();
     });
 
     it('handles race condition where real entry already exists (upsert)', async () => {
@@ -2847,6 +3638,217 @@ describe('ExecutionTracker', () => {
       expect(lastCall[1]).toBe(ExecutionRunStatus.enum.failed);
       expect(lastCall[9]).toMatchObject({ category: 'install_secrets' });
     });
+
+    const initFailureArgs = (runId: string) => ({
+      runId,
+      workflowName: 'wf',
+      provider: 'github',
+      repoIdentifier: 'org/repo',
+      ref: 'refs/heads/main',
+      sha: 'deadbeef',
+      deliveryId: 'd1',
+      providerContext: {},
+      routingKey: 'github:1',
+      initFailure: {
+        scope: 'run' as const,
+        category: InitFailureCategory.enum.secret_resolution,
+        message: 'init blew up',
+      },
+    });
+
+    it('overwrites a live run row rather than leaving it mid-flight', async () => {
+      const runId = 'run-init-fail-upsert';
+      // Dispatch already registered the run before init failed, so the insert
+      // conflicts. Leaving the pending row untouched would strand the run.
+      await tracker.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await tracker.recordInitFailureRun(initFailureArgs(runId));
+
+      const update = mockDb.updates.find(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      );
+      expect(update).toBeDefined();
+      expect(update!.values.status).toBe(ExecutionRunStatus.enum.failed);
+    });
+
+    it('a late job status cannot re-finalize an init-failed run', async () => {
+      const runId = 'run-init-fail-late-status';
+      await tracker.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await tracker.recordInitFailureRun(initFailureArgs(runId));
+
+      // The run is stamped complete, so the late success neither rolls it up nor
+      // overwrites the recorded failure.
+      await tracker.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+
+      expect(onExecutionComplete).not.toHaveBeenCalled();
+      const rewrite = mockDb.updates.find(
+        (u) =>
+          u.table === 'execution_runs' &&
+          u.values.run_id === runId &&
+          u.values.status === ExecutionRunStatus.enum.success,
+      );
+      expect(rewrite).toBeUndefined();
+    });
+
+    it('does not overwrite an already-terminal run row', async () => {
+      const runId = 'run-init-fail-terminal-guard';
+      // A run that genuinely finished must not be rewritten as failed by a late
+      // init-failure record.
+      await tracker.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await tracker.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+      const before = mockDb.updates.filter(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      ).length;
+
+      await tracker.recordInitFailureRun(initFailureArgs(runId));
+
+      const after = mockDb.updates.filter(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      ).length;
+      expect(after).toBe(before);
+    });
+
+    it('does not forward a failure the terminal guard rejected', async () => {
+      // The mirror the Platform serves is whatever it was last told, and it
+      // never revisits a terminal mirror row. So a forward the orchestrator's
+      // own guard refused to record would leave the Platform reading `failed`
+      // for a run this orchestrator reads as `success` — permanently.
+      const runId = 'run-init-fail-no-forward';
+      const onExecutionStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
+      await t.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await t.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+      // Positive control: the genuine completion did forward `success`.
+      expect(onExecutionStatusChange.mock.calls.at(-1)?.[1]).toBe(ExecutionRunStatus.enum.success);
+      onExecutionStatusChange.mockClear();
+
+      await t.recordInitFailureRun(initFailureArgs(runId));
+
+      expect(onExecutionStatusChange).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('recordRunHeld', () => {
+    const heldArgs = (runId: string) => ({
+      runId,
+      workflowName: 'wf',
+      provider: 'github',
+      repoIdentifier: 'org/repo',
+      ref: 'refs/heads/main',
+      sha: 'deadbeef',
+      deliveryId: 'd1',
+      providerContext: {},
+      routingKey: 'github:1',
+      contextName: 'prod',
+      reason: 'registries',
+    });
+
+    it('overwrites a live run row so the hold is visible', async () => {
+      const runId = 'run-held-upsert';
+      await tracker.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await tracker.recordRunHeld(heldArgs(runId));
+
+      const update = mockDb.updates.find(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      );
+      expect(update).toBeDefined();
+      expect(update!.values.status).toBe(ExecutionRunStatus.enum.held);
+    });
+
+    it('drops the in-memory run so a held run is not finalized', async () => {
+      const runId = 'run-held-delete';
+      await tracker.onExecutionStarted(
+        runId,
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'deadbeef',
+        'd1',
+        {},
+        { matched: true },
+        [{ jobId: 'j1', jobName: 'build' }],
+      );
+      await tracker.recordRunHeld(heldArgs(runId));
+
+      // The jobs registered before the gate held the run must not satisfy the
+      // completion check: the run is paused, not finished.
+      await tracker.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+      expect(onExecutionComplete).not.toHaveBeenCalledWith(
+        runId,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(tracker.getReplayData().find((r) => r.runId === runId)).toBeUndefined();
+    });
+
+    it('does not rehydrate a held run from the DB', async () => {
+      const runId = 'run-held-no-rehydrate';
+      await tracker.recordRunHeld(heldArgs(runId));
+
+      // A late status from the pre-hold dispatch must not resurrect the run:
+      // rehydrating it would let the recovered job set roll up as complete
+      // while the run is still parked at the install gate.
+      await tracker.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+
+      expect(tracker.getReplayData().find((r) => r.runId === runId)).toBeUndefined();
+      expect(onExecutionComplete).not.toHaveBeenCalled();
+    });
   });
 
   describe('failRun with initFailure', () => {
@@ -2897,6 +3899,58 @@ describe('ExecutionTracker', () => {
       const lastCall = onExecutionStatusChange.mock.calls.at(-1)!;
       expect(lastCall[1]).toBe(ExecutionRunStatus.enum.failed);
       expect(lastCall[9]).toMatchObject({ category: 'no_agent' });
+    });
+
+    it('failRun emits onWorkflowComplete for a never-started run (Plane B parity)', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const onWorkflowComplete = vi.fn();
+      const tracker = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange,
+        onWorkflowComplete,
+      });
+      await tracker.onExecutionStarted(
+        'run-fr-2',
+        'wf',
+        'github',
+        'org/repo',
+        'refs/heads/main',
+        'd1',
+        null,
+        {},
+        null,
+        [],
+        'github:1',
+      );
+      await tracker.failRun('run-fr-2', 'No agent for label kici:os:linux', {
+        scope: 'run',
+        category: InitFailureCategory.enum.no_agent,
+        message: 'No agent for label kici:os:linux',
+      });
+
+      expect(onWorkflowComplete).toHaveBeenCalledOnce();
+      const data = onWorkflowComplete.mock.calls[0][0];
+      expect(data).toMatchObject({
+        runId: 'run-fr-2',
+        workflowName: 'wf',
+        status: ExecutionRunStatus.enum.failed,
+        repo: 'org/repo',
+        routingKey: 'github:1',
+      });
+      expect(data.duration).toBeGreaterThanOrEqual(0);
+      expect(Array.isArray(data.jobResults)).toBe(true);
+    });
+
+    it('failRun without in-memory run state does not emit onWorkflowComplete', async () => {
+      const onWorkflowComplete = vi.fn();
+      const tracker = new ExecutionTracker({
+        db: mockDb.db,
+        onWorkflowComplete,
+      });
+      // No onExecutionStarted → no in-memory run; the emit lives inside the
+      // `if (run)` block, so a DB-only failRun must not fire it.
+      await tracker.failRun('run-fr-3', 'orphaned failure');
+      expect(onWorkflowComplete).not.toHaveBeenCalled();
     });
   });
 
@@ -3051,4 +4105,43 @@ describe('ExecutionTracker', () => {
       expect(t.runLockTails.has('run-gc')).toBe(false);
     });
   });
+});
+
+/**
+ * Cross-file guard: the run roll-up (`computeRunStatus`, orchestrator) and the
+ * `on-failure` needs-edge expansion (`resolveWhenToRunOn`, engine) are two
+ * separate answers to one question — "did this job fail?" — and both read
+ * `STATUS_FAILURE_CLASS`. This pins them to the same answer for every terminal
+ * status, across the package boundary that separates them: a run that fails on
+ * a given status must be exactly a run whose status releases an `on-failure`
+ * downstream. Nothing else in either package checks the two agree.
+ */
+describe('run rollup agrees with the on-failure needs edge', () => {
+  const onFailure = new Set<string>(resolveWhenToRunOn('on-failure'));
+
+  for (const status of TERMINAL_JOB_STATES) {
+    it(`a run whose only job is ${status} fails iff on-failure covers ${status}`, async () => {
+      const db = createMockDb();
+      const onComplete = vi.fn();
+      const t = new ExecutionTracker({ db: db.db, onExecutionComplete: onComplete });
+
+      await t.onExecutionStarted(
+        `run-${status}`,
+        'ci',
+        'github',
+        'owner/repo',
+        'main',
+        'abc',
+        null,
+        {},
+        null,
+        [{ jobId: 'job-1', jobName: 'only' }],
+      );
+      await t.onJobStatus(`run-${status}`, 'job-1', status as ExecutionJobStatus, Date.now());
+
+      expect(onComplete).toHaveBeenCalled();
+      const runStatus = onComplete.mock.calls[0][1] as string;
+      expect(runStatus === ExecutionRunStatus.enum.failed).toBe(onFailure.has(status));
+    });
+  }
 });

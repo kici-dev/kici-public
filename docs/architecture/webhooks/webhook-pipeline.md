@@ -31,7 +31,7 @@ specific branching outside the bundles themselves.
 3. **Event normalization** — `bundle.normalizer.normalizeEvent(...)` turns the provider-native payload into a `SimulatedEvent` (push, pull_request, …).
 4. **Extract repo/ref/credentials** — `bundle.normalizer.extractRepoIdentifier`, `extractRef`, `extractCredentials`.
 5. **Lock-file fetch** — via the multi-provider fallback resolver (see below).
-6. **Trigger match** — `matchAllWorkflows(lockFile.workflows, event, changedFiles)` against the resolved lock file.
+6. **Trigger match** — `matchWorkflowsForEvent(lockFile.workflows, eventWithFiles)` against the resolved lock file. Workflows are indexed by the event type(s) their triggers subscribe to (built once per cached lock file), so only the candidates for the incoming event type are evaluated rather than every workflow. The matched set is identical to a full scan.
 7. **Dispatch** — `dispatcher.dispatch(...)` routes each matched job to an agent or queue.
 8. **Decision trace** — the orchestrator forwards the decision trace upstream to KiCI for dashboard visibility.
 9. **Metrics** — `webhooksProcessedTotal`, `triggerMatchDurationSeconds`, etc.

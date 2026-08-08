@@ -6,7 +6,7 @@ description: Personal account settings.
 
 
 
-Your own email-to-self run notifications now live on the dedicated [Notifications](./notifications.md) page (in the org sidebar), on its **My notifications** tab.
+Your own email-to-self run notifications live on the dedicated [Notifications](./notifications.md) page (in the org sidebar), on its **My notifications** tab. The `/account/notifications` URL redirects there.
 
 ## Account
 

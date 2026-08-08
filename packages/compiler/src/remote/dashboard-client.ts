@@ -12,6 +12,8 @@ import {
   dashboardRunDetailApiResponseSchema,
   dashboardStepLogsApiResponseSchema,
   registrationItemSchema,
+  artifactListItemSchema,
+  type ArtifactListItem,
   type RunListResponse,
   type RunListItem,
   type DiagnosticsInfrastructureResponse,
@@ -54,12 +56,30 @@ export interface RunsListFilters {
   trigger?: string;
   source?: string;
   since?: string;
-  page?: number;
+  /** Opaque keyset cursor (from a prior page's `nextCursor`). Absent = first page. */
+  cursor?: string;
 }
 
 const singleRunSchema = z.object({ run: runListItemSchema });
+export const webhookActivitySchema = z.object({
+  windowMinutes: z.number(),
+  received: z.number(),
+  delivered: z.number(),
+  edgeRejected: z.number(),
+  failed: z.number(),
+  matched: z.number().optional(),
+  unmatched: z.number().optional(),
+  lockfileMissing: z.number().optional(),
+  orchestratorUnavailable: z.boolean(),
+});
+export type WebhookActivity = z.infer<typeof webhookActivitySchema>;
 const rerunResponseSchema = z.object({ newRunId: z.string() });
-const cancelResponseSchema = z.object({ cancelledJobs: z.number().optional() });
+// `alreadyTerminal` is optional: an orchestrator predating the field reports
+// nothing, and absent means "not reported", not "false".
+const cancelResponseSchema = z.object({
+  cancelledJobs: z.number().optional(),
+  alreadyTerminal: z.boolean().optional(),
+});
 const cancelByBranchResponseSchema = z.object({ cancelledRuns: z.number().optional() });
 
 const registrationsListSchema = z.object({
@@ -99,6 +119,20 @@ const contextsListSchema = z.object({
 
 /** A secret context (context) returned by {@link DashboardClient.listContexts}. */
 export type ContextContext = z.infer<typeof contextContextSchema>;
+
+/**
+ * Parsed shape of `GET /runs/:runId/artifacts` for the CLI. The per-artifact
+ * shape is reused from `@kici-dev/engine` so the CLI and the server cannot drift.
+ */
+export interface ArtifactsListResult {
+  artifacts: ArtifactListItem[];
+  downloadUrlExpiresInSeconds?: number;
+}
+
+const artifactsListResultSchema = z.object({
+  artifacts: z.array(artifactListItemSchema),
+  downloadUrlExpiresInSeconds: z.number().int().positive().optional(),
+});
 
 const STATUS_ERROR_MAP: Record<number, [DashboardErrorKind, string]> = {
   401: ['unauthorized', 'Authentication failed. Run `kici login` to re-authenticate.'],
@@ -189,6 +223,11 @@ export class DashboardClient {
     return this.request('POST', path, body);
   }
 
+  /** Generic DELETE helper used by typed methods (and tests). */
+  async deleteJson(path: string): Promise<unknown> {
+    return this.request('DELETE', path);
+  }
+
   async getDiagnosticsSummary(): Promise<DiagnosticsSummaryResponse> {
     return diagnosticsSummaryResponseSchema.parse(await this.getJson('/diagnostics'));
   }
@@ -208,13 +247,29 @@ export class DashboardClient {
     if (filters.trigger) qs.set('triggerType', filters.trigger);
     if (filters.source) qs.set('source', filters.source);
     if (filters.since) qs.set('since', filters.since);
-    if (filters.page) qs.set('page', String(filters.page));
+    if (filters.cursor) qs.set('cursor', filters.cursor);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return runListResponseSchema.parse(await this.getJson(`/runs${suffix}`));
   }
 
   async getRun(runId: string): Promise<RunListItem> {
     return singleRunSchema.parse(await this.getJson(`/runs/${runId}`)).run;
+  }
+
+  /**
+   * Fetch the org's recent webhook-activity counts. Returns null on ANY error
+   * (older Platform without the route, a network blip, an unexpected shape) so
+   * the `kici runs` empty-window hint degrades silently to today's output — the
+   * hint is a nicety, never a hard dependency.
+   */
+  async getWebhookActivity(windowMinutes = 60): Promise<WebhookActivity | null> {
+    try {
+      return webhookActivitySchema.parse(
+        await this.getJson(`/webhook-activity?windowMinutes=${windowMinutes}`),
+      );
+    } catch {
+      return null;
+    }
   }
 
   async getRunDetail(runId: string): Promise<DashboardRunDetailApiResponse> {
@@ -231,11 +286,23 @@ export class DashboardClient {
     );
   }
 
+  /**
+   * List a run's artifacts (`GET /runs/:runId/artifacts`). Each entry carries a
+   * presigned `downloadUrl` minted by the customer's orchestrator; the Platform
+   * relays it without re-signing, so the artifact bytes never transit Platform.
+   */
+  async listArtifacts(runId: string): Promise<ArtifactsListResult> {
+    return artifactsListResultSchema.parse(await this.getJson(`/runs/${runId}/artifacts`));
+  }
+
   async rerunRun(runId: string): Promise<{ newRunId: string }> {
     return rerunResponseSchema.parse(await this.postJson(`/runs/${runId}/rerun`));
   }
 
-  async cancelRun(runId: string, force: boolean): Promise<{ cancelledJobs?: number }> {
+  async cancelRun(
+    runId: string,
+    force: boolean,
+  ): Promise<{ cancelledJobs?: number; alreadyTerminal?: boolean }> {
     return cancelResponseSchema.parse(await this.postJson(`/runs/${runId}/cancel`, { force }));
   }
 

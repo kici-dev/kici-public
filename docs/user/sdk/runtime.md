@@ -25,7 +25,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | `ContainerConfig` | Container config for job execution (`image`, `env?`)                                                                                                                                                                                                                               |
 | `RunsOn`          | Union of `runsOn` forms: `string \| RegExp \| (string \| RegExp)[] \| RunsOnSelector`. A plain string matches exactly, a string with glob metacharacters (`*?[]{}`) is a glob, and a `RegExp` is a regular expression. See [Targeting by pattern](./core.md#targeting-by-pattern). |
 | `RunsOnSelector`  | Object form for `runsOn` with `labels` (required) and `exclude` (optional) properties. Each element accepts the exact / glob / regex forms on both sides.                                                                                                                          |
-| `RunsOnAllInput`  | Union of `runsOnAll` host fan-out forms: `string \| RegExp \| (string \| RegExp)[] \| { include: { all: (string \| RegExp)[] }[]; exclude?: (string \| RegExp)[] }`. Same exact / glob / regex semantics per element. See [runsOnAll](./runs-on-all.md#targeting-by-pattern).      |
+| `RunsOnPick`      | Single-agent selection policy when several agents match a `runsOn` selector: `'deterministic'` (stable hash — same job lands on the same host across re-runs) or `'any'` (spread load). See [runsOnAll](./runs-on-all.md#targeting-by-pattern) for the fan-out forms.              |
 | `Fixture`         | Test fixture definition returned by `fixture()`                                                                                                                                                                                                                                    |
 | `FixtureOptions`  | Options for `fixture()` factory                                                                                                                                                                                                                                                    |
 | `Registry`        | Private npm registry declaration used in `WorkflowOptions.registries`                                                                                                                                                                                                              |
@@ -35,7 +35,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | Type                            | Description                                                           |
 | ------------------------------- | --------------------------------------------------------------------- |
 | `Trigger`                       | Trigger definition (trigger config + source location)                 |
-| `TriggerConfig`                 | Union of all 22 trigger config types                                  |
+| `TriggerConfig`                 | Union of all 23 trigger config types                                  |
 | `PrTriggerConfig`               | PR trigger configuration (from `pr()`)                                |
 | `PushTriggerConfig`             | Push trigger configuration (from `push()`)                            |
 | `TagTriggerConfig`              | Tag trigger configuration (from `tag()`)                              |
@@ -112,17 +112,21 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 
 ### Context types
 
-| Type                  | Description                                                        |
-| --------------------- | ------------------------------------------------------------------ |
-| `StepContext<T>`      | Context passed to step run functions                               |
-| `Logger`              | Logger interface (info, warn, error, debug)                        |
-| `WorkflowInfo`        | Workflow metadata: `{ name: string }`                              |
-| `JobInfo`             | Job metadata: `{ name: string, runsOn: string }`                   |
-| `RepoInfo`            | Repository metadata available in step context                      |
-| `StepSecrets`         | Async accessor interface for step secrets (`get`, `expose`, `has`) |
-| `StepSecretsTyped`    | Typed step secrets with known key inference                        |
-| `KnownSecretKeys`     | String literal union of declared secret context keys               |
-| `SecretNotFoundError` | Thrown when accessing a nonexistent key in secrets                 |
+| Type                  | Description                                                                                                      |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `StepContext<T>`      | Context passed to step run functions                                                                             |
+| `Logger`              | Logger interface (info, warn, error, debug)                                                                      |
+| `WorkflowInfo`        | Workflow metadata: `{ name: string }`                                                                            |
+| `JobInfo`             | Job metadata: `{ name: string, runsOn: string }`                                                                 |
+| `AgentInfo`           | Facts about the pinned agent (`hostname`, `labels`, `platform`, `arch`), set on `runsOnAll` fan-out jobs         |
+| `FanoutPosition`      | Position of a child within its fan-out (host or matrix), deterministically ordered                               |
+| `MatrixJobOutputs`    | Envelope returned by `jobOutputs()` for a matrix upstream: `{ byMatrix, merged }`                                |
+| `HostJobOutputs`      | Envelope returned by `jobOutputs()` for a `runsOnAll` upstream, keyed per host                                   |
+| `RepoInfo`            | Repository metadata available in step context                                                                    |
+| `StepSecrets`         | Async accessor interface for step secrets (`get`, `expose`, `has`, `getMeta`, `list`, `mountFile`, `exposeFile`) |
+| `StepSecretsTyped`    | Typed step secrets with known key inference                                                                      |
+| `KnownSecretKeys`     | String literal union of declared secret context keys                                                             |
+| `SecretNotFoundError` | Thrown when accessing a nonexistent key in secrets                                                               |
 
 ## StepContext
 
@@ -140,25 +144,44 @@ interface StepContext<TInputs = Record<string, unknown>> {
   setEnv(key: string, value: string): void;
   /** Prepend a directory to PATH, visible to this step and all subsequent steps */
   addPath(dir: string): void;
+  /** Aborted when this step should stop early (job cancelled, job timeout, fail-fast sibling) */
+  signal: AbortSignal;
   /** Typed inputs from dependency step outputs */
   inputs: TInputs;
+  /** Validated workflow-dispatch inputs declared via `dispatch({ inputs })` */
+  dispatchInputs: Readonly<Record<string, string | number | boolean | null>>;
   /** Current workflow metadata */
   workflow: WorkflowInfo;
   /** Current job metadata */
   job: JobInfo;
   /** Matrix values for current job instance (undefined without matrix) */
   matrix?: MatrixValues;
+  /** Hostname of the pinned agent — set only on `runsOnAll` host fan-out */
+  host?: string;
+  /** Facts about the pinned agent — set only on `runsOnAll` host fan-out */
+  agent?: AgentInfo;
+  /** Position of this child within its fan-out (host or matrix); undefined otherwise */
+  fanout?: FanoutPosition;
   /** Raw webhook payload from the git provider */
   rawPayload?: Record<string, unknown>;
   /** Which git provider triggered this workflow (e.g. 'github', 'gitlab') */
   provider?: string;
   /** Whether this execution was triggered by `kici run remote` (developer-initiated remote run) */
   isTestRun: boolean;
-  /** The resolved deployment environment name for this job (undefined without environment) */
-  environment?: string;
-  /** Flat secrets resolved for this job. Throws SecretNotFoundError on missing key. */
-  secrets: StepSecrets;
-  /** Emit a custom event that can trigger other workflows */
+  /** Registering repo of a global workflow (undefined for non-global workflows) */
+  workflowRepo?: RepoInfo;
+  /** Repo where the triggering event occurred (undefined for non-global workflows) */
+  sourceRepo?: RepoInfo;
+  /** The resolved context name for this job (undefined for jobs without a context) */
+  context?: string;
+  /** Secrets resolved for this job's context. Never injected into env automatically. */
+  secrets: StepSecretsTyped;
+  /** Emit a custom event that can trigger other workflows — typed or ad-hoc by name */
+  emit<T extends z.ZodTypeAny>(
+    definition: EventDefinition<T>,
+    payload: z.infer<T>,
+    options?: EventEmitOptions,
+  ): Promise<{ deliveryId: string }>;
   emit(
     eventName: string,
     payload?: Record<string, unknown>,
@@ -166,10 +189,24 @@ interface StepContext<TInputs = Record<string, unknown>> {
   ): Promise<{ deliveryId: string }>;
   /** Resolve outputs from a preceding step by reference */
   outputsOf<T>(ref: { _tag: 'Step'; name: string } | ((...args: any[]) => any)): T;
-  /** Resolve outputs from a preceding job by reference */
-  jobOutputs(ref: { name: string }): Record<string, unknown>;
+  /** Resolve outputs from a preceding job by reference (fan-out upstreams return an envelope) */
+  jobOutputs<T>(ref: Job<T>): T | MatrixJobOutputs<T> | HostJobOutputs<T>;
   /** Publish a secret output value from this job (encrypted before leaving the agent) */
   setSecretOutput(key: string, value: string): void;
+  /** Typed KiCI API — orchestrator queries over WS (e.g. `kici.infrastructure.list()`) */
+  kici: KiciApi;
+  /** Imperative cache API — `cache.restore(spec)` / `cache.save(spec)` */
+  cache: CacheApi;
+  /** Imperative artifacts API — `artifacts.upload(name, paths)` / `artifacts.download(name)` */
+  artifacts: ArtifactsApi;
+  /** Build, sign, and persist a build-provenance attestation for a produced artifact */
+  attestProvenance(opts: AttestProvenanceOptions): Promise<AttestProvenanceResult>;
+  /** Allocate a job-scoped scratch directory, removed automatically when the job ends */
+  mktemp(label?: string): Promise<TempHandle>;
+  /** Allocate a job-scoped scratch file, removed automatically when the job ends */
+  mktempFile(label?: string, opts?: { suffix?: string }): Promise<TempHandle>;
+  /** Upstream needs keyed by job or group name — `needs.<job>.result` / `.status` */
+  needs?: NeedsContext;
 }
 ```
 
@@ -209,8 +246,8 @@ step('example', async ({ $, log, env, matrix, workflow, job }) => {
 - **Inside a step body** — the agent merges three streams into the step's log: `ctx.log.*` structured calls, subprocess stdout/stderr from `ctx.$`, and any direct `console.log` / `.error` / `.warn` / `.info` / `.debug` (or other library that writes to `process.stdout` / `process.stderr`).
 - **Inside hooks** (`beforeStep`, `afterStep`, `onSuccess`, `onFailure`, `onCancel`, `cleanup`) — the same three streams are captured; per-step hooks share the step's log, post-loop hooks get their own dashboard row.
 - **At workflow module top-level, in rule `check` functions, and in the workflow `concurrency.group` function** — captured to the workflow-level `prepare` log bucket for the job, alongside KiCI's own setup narration.
-- **Inside a dynamic `environment` / `env` / `concurrencyGroup` function** on a static job — captured to the `__init__` job's synthetic step-0 log, which appears in the timeline as "Init: _jobname_".
-- **Inside a `DynamicJobFn` body and the per-generated-job `environment` / `env` / `concurrencyGroup` / `matrix` functions** — captured to the `__dynamic__` job's synthetic step-0 log ("Evaluate: _jobname_" in the timeline). The `$` parameter in that context is a scoped zx shell, so `await $\`...\`` subprocess output is captured too.
+- **Inside a dynamic `context` / `env` / `concurrencyGroup` function** on a static job — captured to the `__init__` job's synthetic step-0 log, which appears in the timeline as "Init: _jobname_".
+- **Inside a `DynamicJobFn` body and the per-generated-job `context` / `env` / `concurrencyGroup` / `matrix` functions** — captured to the `__dynamic__` job's synthetic step-0 log ("Evaluate: _jobname_" in the timeline). The `$` parameter in that context is a scoped zx shell, so `await $\`...\`` subprocess output is captured too.
 
 Use whichever style is convenient — you don't have to wrap `console.log` in the provided `log` parameter to make it visible. One limitation applies to in-process contexts only (init, build, dynamic-eval): direct `process.stdout.write` / `printf` is not captured there, because the agent's own logger uses that path and we don't want agent-internal output leaking into your step logs. Use `console.*` or the `log` parameter instead. See [Log streaming](../../architecture/execution/job-execution.md#log-streaming) for the full capture surface and limits (default 10 MB per step, backpressure behavior).
 
@@ -329,7 +366,7 @@ const deploy = job('deploy', {
 
 ### ctx.kici.oidc.token({ audience })
 
-Request a short-lived OIDC ID token for the current job, bound to an `audience`. The token is a signed JWT whose identity claims (`repository`, `ref`, `sha`, `kici_run_id`, `kici_job_id`) are derived by the build platform from the run context — a step cannot spoof them. Use it to authenticate the build to an external service that trusts the platform's OIDC issuer (for example, when generating build provenance).
+Request a short-lived OIDC ID token for the current job, bound to an `audience`. The token is a signed JWT whose identity claims (`repository`, `ref`, `sha`, `kici_run_id`, `kici_job_id`) are derived by your orchestrator from the run context — a step cannot spoof them. Use it to authenticate the build to an external service that trusts the orchestrator's OIDC issuer (for example, when generating build provenance).
 
 ```typescript
 const publish = job('publish', {
@@ -347,8 +384,8 @@ const publish = job('publish', {
 
 - The token is short-lived (about 10 minutes) and scoped to the current run and job.
 - The returned token value is automatically masked in step logs.
-- The step never holds platform credentials — the request is relayed through the orchestrator, which mints the token on the step's behalf.
-- Only available inside a running job step; calling it outside one (for example, during local execution) rejects with a clear error.
+- The step never holds signing credentials — the orchestrator mints and signs the token on the step's behalf from its own run records.
+- Only available inside a running job step; calling it outside one (a dynamic-job generator, or the workflow module's top level) rejects with a clear error. `kici run --local` runs are supported: the local dev plane mints dev-signed tokens under the clearly-non-production issuer `kici-local`.
 
 ### ctx.kici.inventory.query(selector?) / .get(agentId)
 
@@ -416,7 +453,7 @@ A `runsOn` of a single host's `agentId` (as in `runsOn: [h.agentId]` above) **pi
 
 ### ctx.attestProvenance({ subject })
 
-Build, sign, and persist a build-provenance attestation for an artifact your step produced. KiCI assembles an in-toto SLSA v1.0 provenance statement whose build identity (`repository`, `ref`, `sha`, run/job ids) comes from the platform — not from the step — so it cannot be spoofed, signs it, and stores a verifiable bundle that the dashboard surfaces and the `kici verify-attestation` CLI checks.
+Build, sign, and persist a build-provenance attestation for an artifact your step produced. KiCI assembles an in-toto SLSA v1.0 provenance statement whose build identity (`repository`, `ref`, `sha`, run/job ids) comes from your orchestrator — not from the step — so it cannot be spoofed, signs it, and stores a verifiable bundle that the dashboard surfaces and the `kici verify-attestation` CLI checks.
 
 The artifact is **caller-supplied**: give it either a precomputed digest or a path (relative to the step working directory) that KiCI digests with SHA-256. For a container image, pass the manifest digest your build tool emitted.
 
@@ -445,10 +482,10 @@ const publish = job('publish', {
 **Behavior:**
 
 - The attestation is a signed [DSSE](https://github.com/secure-systems-lab/dsse) envelope over an [in-toto](https://in-toto.io) statement carrying the [SLSA v1.0](https://slsa.dev/spec/v1.0/provenance) provenance predicate.
-- It is signed with an ephemeral key bound to a platform-minted identity token, so it is **offline-verifiable** against the platform's published signing keys — no online lookup needed at verify time.
+- It is signed with an ephemeral key bound to an orchestrator-minted identity token, so it is **offline-verifiable** against the orchestrator's published signing keys — no online lookup needed at verify time.
 - The bundle is persisted to object storage and recorded so the dashboard can show it and `kici verify-attestation` can retrieve it.
 - The returned `{ storageKey, subjectDigest, bundleMediaType }` identifies the stored bundle.
-- Only available inside a running job step; calling it outside one (for example, during local execution) rejects with a clear error.
+- Only available inside a running job step; calling it outside one (a dynamic-job generator, or the workflow module's top level) rejects with a clear error. `kici run --local` runs are supported: the offline local dev plane signs with a dev identity under the clearly-non-production issuer `kici-local`, and those bundles verify against a trust root exported with `kici local trust-root`.
 
 See the [build provenance guide](../provenance.md) for the end-to-end attest →
 verify → view journey, including how to verify a bundle with `kici verify-attestation`.
@@ -465,9 +502,7 @@ Each job picks its secret context via the `context` option on `job()`. The orche
 const deploy = job('deploy', {
   runsOn: 'linux',
   context: 'production',
-  steps: [
-    /* ... */
-  ],
+  steps: [/* ... */],
 });
 
 export default workflow('deploy', {
@@ -503,7 +538,7 @@ import { workflow, job, step, push } from '@kici-dev/sdk';
 
 const deploy = job('deploy', {
   runsOn: 'linux',
-  environment: 'production',
+  context: 'production',
   steps: [
     step('deploy', async (ctx) => {
       const token = await ctx.secrets.get('DEPLOY_TOKEN');

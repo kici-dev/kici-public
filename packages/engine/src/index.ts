@@ -4,7 +4,6 @@
  * Single source of truth for shared logic used across tiers:
  * - Protocol message schemas (Zod-based, direction-specific unions)
  * - Trigger matching engine (branch, path, event evaluation)
- * - Execution state machine (pure function transitions)
  * - Webhook signature verification (HMAC-SHA256)
  * - WebSocket close codes (unified across all tiers)
  */
@@ -23,7 +22,11 @@ export * from './protocol/messages/auth.js';
 export * from './protocol/messages/capabilities.js';
 
 // --- Protocol: Platform <-> Orchestrator messages ---
-// Explicit re-exports to resolve ExecutionEvent name collision with state machine
+// Explicit curated re-exports of the platform-orchestrator protocol surface,
+// rather than `export *`. The list deliberately omits the capabilities-update
+// shapes (orchCapabilitiesUpdateSchema / OrchCapabilitiesUpdate) and the bare
+// `ExecutionEvent` type: those stay internal to the discriminated unions and
+// are not part of the barrel surface (only executionEventSchema is exported).
 export {
   webhookRelaySchema,
   webhookRelayStartSchema,
@@ -34,25 +37,36 @@ export {
   WEBHOOK_RELAY_CHUNK_SIZE,
   executionEventSchema,
   logChunkSchema,
+  orchLogChunkSchema,
+  OrchLogPhase,
   peerDiscoverSchema,
   peerUpdateSchema,
   cacheStatsSchema,
   orchMetricsSchema,
   platformToOrchestratorMessageSchema,
   orchestratorToPlatformMessageSchema,
+  collectDiscriminatorTypes,
+  ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
+  PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
   type WebhookRelay,
   type WebhookRelayStart,
   type WebhookRelayChunk,
   type WebhookAck,
   type LogChunk,
+  type OrchLogChunk,
   type PeerDiscover,
   type PeerUpdate,
   type CacheStats,
   type OrchMetrics,
+  DEFAULT_APPROVAL_EXPIRY_HOURS,
+  trustPolicySchema,
+  type TrustPolicy,
   trustPolicyUpdateSchema,
   type TrustPolicyUpdate,
   staleCheckrunCleanupSchema,
   type StaleCheckrunCleanup,
+  platformCapabilitiesMessageSchema,
+  type PlatformCapabilitiesMessage,
   type PlatformToOrchestratorMessage,
   type OrchestratorToPlatformMessage,
 } from './protocol/messages/platform-orchestrator.js';
@@ -60,11 +74,17 @@ export {
 // --- Protocol: Execution status (orchestrator -> Platform, in main union) ---
 export * from './protocol/messages/execution-status.js';
 
+// --- Execution-status presentation vocabulary (browser-safe) ---
+export * from './status/presentation.js';
+
 // --- Protocol: Agent-facing provenance-tagged run-result (read path) ---
 export * from './protocol/messages/agent-run-result.js';
 
 // --- Protocol: Agent-facing dev-ops read shapes (orgs, orchestrators, diagnostics, secrets) ---
 export * from './protocol/messages/agent-dev-ops.js';
+
+// --- Protocol: Heartbeat-freshness policy (shared by Platform + dashboard) ---
+export * from './protocol/messages/heartbeat-health.js';
 
 // --- Developer-operations API contract (registry + congruence helpers) ---
 export * from './dev-ops/operations.js';
@@ -116,6 +136,10 @@ export {
   sourceDeregisterAckSchema,
   SourceSubtype,
   SourceProvider,
+  OrchestratorMode,
+  PLATFORM_CONNECTED_MODES,
+  RELAY_INGRESS_MODES,
+  OWN_INGRESS_MODES,
   type SourceRegistration,
   type SourceRegistrationAck,
   type SourceDeregister,
@@ -129,25 +153,34 @@ export * from './protocol/messages/join.js';
 export * from './protocol/messages/peer.js';
 
 // --- Protocol: Orchestrator <-> Agent messages ---
+export * from './protocol/messages/log-stream.js';
 export * from './protocol/messages/orchestrator-agent.js';
 
 // --- Trigger matching ---
+export * from './sandbox/capabilities.js';
 export * from './trigger/types.js';
 export * from './trigger/trigger-event-type.js';
 export * from './trigger/decision-trace.js';
 export * from './trigger/matcher.js';
+export * from './trigger/event-buckets.js';
+export { scheduleTriggerKey } from './trigger/schedule-key.js';
 
 // --- Dispatch inputs (descriptor + extract/build/coerce; browser-safe) ---
 export * from './inputs/index.js';
-
-// --- Execution state machine ---
-export * from './state-machine/index.js';
 
 // --- Provider interfaces ---
 export * from './provider/index.js';
 
 // --- Webhook URL format (browser-safe; org-scoped route shape) ---
 export { githubWebhookPath, githubIngressPath } from './webhook/webhook-url-format.js';
+
+// --- Webhook event types (browser-safe; shared subscribable enum) ---
+export {
+  PING_EVENT_TYPE,
+  SUBSCRIBABLE_WEBHOOK_EVENT_TYPES,
+  SubscribableWebhookEventType,
+  WebhookEventType,
+} from './webhook/event-types.js';
 
 // --- WebSocket types ---
 export type { WsLike } from './ws/ws-like.js';
@@ -171,6 +204,16 @@ export * from './context/index.js';
 // --- Structured auto-labels (kici:os:, kici:arch:, kici:agent:, kici:scaler:, kici:host:, kici:role:) ---
 export {
   deriveOsArchLabels,
+  derivePlatformTaints,
+  PLATFORM_TAINT_LABELS,
+  ScalerOs,
+  ScalerArch,
+  scalerPlatformSchema,
+  platformToOsArchLabels,
+  platformToTaints,
+  nodePlatformToScalerOs,
+  nodeArchToScalerArch,
+  hostToScalerPlatform,
   hostLabel,
   parseHostLabel,
   HOST_LABEL_PREFIX,
@@ -192,6 +235,7 @@ export {
 } from './labels.js';
 export type { NormalizedRunsOn } from './labels.js';
 export type { AgentRole } from './labels.js';
+export type { ScalerPlatform } from './labels.js';
 
 // --- Label matchers (glob/regex selectors, browser-safe eval) ---
 export {
@@ -224,6 +268,11 @@ export {
   expandMultiDimension,
   expandMatrix,
   applyIncludeExclude,
+  normalizeMatrixInput,
+  matrixCombinationCount,
+  findDuplicateCombination,
+  MatrixShapeError,
+  type NormalizedMatrix,
   type StaticMatrixArray,
   type StaticMatrixObject,
   type MatrixInclude,
@@ -237,3 +286,12 @@ export * from './fanout/materialize.js';
 
 // --- Check mode (idempotent run mode + per-step outcome) ---
 export * from './check-mode.js';
+
+// --- Artifacts: the shared name contract (trust boundary + SDK) ---
+export * from './artifacts/name.js';
+
+// --- Billing: hosted plan-tier vocabulary (browser-safe, pure Zod) ---
+export * from './billing/plan-type.js';
+
+// --- Diagnostics: infrastructure alert vocabulary (browser-safe, pure Zod) ---
+export * from './diagnostics/infra-alert.js';

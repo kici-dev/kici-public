@@ -7,6 +7,7 @@
  */
 
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
+import { OrchestratorMode } from '@kici-dev/engine';
 
 /** Required config fields and their descriptions. */
 const REQUIRED_FIELDS: Array<{ key: string; label: string }> = [
@@ -38,7 +39,7 @@ export async function checkConfigValidity(deps: DiagnosticDeps): Promise<Diagnos
 
   // Check for valid mode values
   const mode = deps.config.mode as string;
-  const validModes = ['platform', 'hybrid', 'independent'];
+  const validModes: readonly string[] = OrchestratorMode.options;
   if (!validModes.includes(mode)) {
     return {
       name: 'Config validity',

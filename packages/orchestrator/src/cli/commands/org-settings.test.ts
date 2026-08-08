@@ -31,6 +31,8 @@ const SAMPLE_SETTINGS = {
   allowHttpNpmRegistries: false,
   userCacheQuotaBytes: null,
   userCacheTtlMs: null,
+  artifactMaxBytes: null,
+  artifactMaxPerRun: null,
   createdAt: '2026-04-17T10:00:00Z',
   updatedAt: '2026-04-17T10:00:00Z',
 };
@@ -428,6 +430,148 @@ describe('kici-admin org-settings user-cache', () => {
   });
 });
 
+describe('kici-admin org-settings artifacts', () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockPatch: ReturnType<typeof vi.fn>;
+  let client: Partial<AdminApiClient>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    mockPatch = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    client = { get: mockGet as any, patch: mockPatch as any };
+  });
+
+  it('show prints the per-org size cap + per-run cap (cluster default when null)', async () => {
+    const { stdout } = await runCommand(
+      ['org-settings', 'artifacts', 'show', '--customer-id', ORG],
+      client,
+    );
+    expect(stdout).toContain('Artifact max bytes:');
+    expect(stdout).toContain('Artifact max/run:');
+    expect(stdout).toContain('(cluster default)');
+  });
+
+  it('set-max-bytes patches artifactMaxBytes with a positive integer', async () => {
+    await runCommand(
+      ['org-settings', 'artifacts', 'set-max-bytes', '2147483648', '--customer-id', ORG],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      artifactMaxBytes: 2147483648,
+    });
+  });
+
+  it('set-max-per-run patches artifactMaxPerRun with a positive integer', async () => {
+    await runCommand(
+      ['org-settings', 'artifacts', 'set-max-per-run', '3', '--customer-id', ORG],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      artifactMaxPerRun: 3,
+    });
+  });
+
+  it('reset-max-bytes patches artifactMaxBytes to null (cluster default)', async () => {
+    await runCommand(['org-settings', 'artifacts', 'reset-max-bytes', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      artifactMaxBytes: null,
+    });
+  });
+
+  it('reset-max-per-run patches artifactMaxPerRun to null (cluster default)', async () => {
+    await runCommand(['org-settings', 'artifacts', 'reset-max-per-run', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      artifactMaxPerRun: null,
+    });
+  });
+
+  it('set-max-per-run rejects a non-positive / non-integer value with exit 1', async () => {
+    const { exitCode, stderr } = await runCommand(
+      ['org-settings', 'artifacts', 'set-max-per-run', '0', '--customer-id', ORG],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('positive integer');
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('kici-admin org-settings reroute', () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockPatch: ReturnType<typeof vi.fn>;
+  let client: Partial<AdminApiClient>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    mockPatch = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    client = { get: mockGet as any, patch: mockPatch as any };
+  });
+
+  it('show fetches the settings', async () => {
+    await runCommand(['org-settings', 'reroute', 'show', '--customer-id', ORG], client);
+    expect(mockGet).toHaveBeenCalledWith(
+      `/api/v1/admin/org-settings/global-workflows?customerId=${encodeURIComponent(ORG)}`,
+    );
+  });
+
+  it('set patches only the flags provided', async () => {
+    await runCommand(
+      [
+        'org-settings',
+        'reroute',
+        'set',
+        '--customer-id',
+        ORG,
+        '--window',
+        '120000',
+        '--max-hops',
+        '5',
+      ],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      rerouteSpawnWindowMs: 120000,
+      rerouteMaxHops: 5,
+    });
+  });
+
+  it('set with no flags exits 1', async () => {
+    const { exitCode, stderr } = await runCommand(
+      ['org-settings', 'reroute', 'set', '--customer-id', ORG],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('at least one of');
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('set rejects a window below the 1000ms floor', async () => {
+    const { exitCode } = await runCommand(
+      ['org-settings', 'reroute', 'set', '--customer-id', ORG, '--window', '500'],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('reset clears all three overrides to null', async () => {
+    await runCommand(['org-settings', 'reroute', 'reset', '--org', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      rerouteSpawnWindowMs: null,
+      rerouteAckTimeoutMs: null,
+      rerouteMaxHops: null,
+    });
+  });
+});
+
 describe('kici-admin org-settings dashboard-writes', () => {
   let mockGet: ReturnType<typeof vi.fn>;
   let mockPatch: ReturnType<typeof vi.fn>;
@@ -489,7 +633,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
     );
     expect(result.stdout).toContain('SECRETS');
     expect(result.stdout).toContain('secrets.set');
-    expect(result.stdout).toContain('enabled');
+    expect(result.stdout).toContain('permissive');
   });
 
   it('show --category=Secrets filters to one category', async () => {
@@ -519,7 +663,18 @@ describe('kici-admin org-settings dashboard-writes', () => {
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/dashboard-writes', {
       customerId: ORG,
-      updates: { 'secrets.set': false },
+      updates: { 'secrets.set': 'disabled' },
+    });
+  });
+
+  it('set --op secrets.set=encrypted sends the encrypted posture', async () => {
+    await runCommand(
+      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'secrets.set=encrypted'],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/dashboard-writes', {
+      customerId: ORG,
+      updates: { 'secrets.set': 'encrypted' },
     });
   });
 
@@ -540,7 +695,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
     );
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/dashboard-writes', {
       customerId: ORG,
-      updates: { 'secrets.set': false, 'variables.set': false },
+      updates: { 'secrets.set': 'disabled', 'variables.set': 'disabled' },
     });
   });
 
@@ -563,9 +718,9 @@ describe('kici-admin org-settings dashboard-writes', () => {
     const body = mockPatch.mock.calls[0]?.[1] as {
       updates: Record<string, boolean>;
     };
-    expect(body.updates['secrets.set']).toBe(false);
-    expect(body.updates['secrets.delete']).toBe(false);
-    expect(body.updates['secrets.scope.create']).toBe(false);
+    expect(body.updates['secrets.set']).toBe('disabled');
+    expect(body.updates['secrets.delete']).toBe('disabled');
+    expect(body.updates['secrets.scope.create']).toBe('disabled');
     expect(body.updates['variables.set']).toBeUndefined();
   });
 
@@ -587,7 +742,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
     const body = mockPatch.mock.calls[0]?.[1] as {
       updates: Record<string, boolean>;
     };
-    expect(body.updates).toEqual({ 'secrets.set': false, 'variables.set': false });
+    expect(body.updates).toEqual({ 'secrets.set': 'disabled', 'variables.set': 'disabled' });
   });
 
   it('set rejects unknown --op operations', async () => {
@@ -622,6 +777,94 @@ describe('kici-admin org-settings dashboard-writes', () => {
     expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/dashboard-writes', {
       customerId: ORG,
       reset: true,
+    });
+  });
+});
+
+describe('kici-admin org-settings sandbox-allowlist', () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockPatch: ReturnType<typeof vi.fn>;
+  let client: Partial<AdminApiClient>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn().mockResolvedValue({
+      settings: {
+        ...SAMPLE_SETTINGS,
+        sandboxAllowedCapabilities: ['NET_ADMIN'],
+        sandboxAllowHostNetwork: true,
+      },
+    });
+    mockPatch = vi.fn().mockResolvedValue({ settings: SAMPLE_SETTINGS });
+    client = { get: mockGet as any, patch: mockPatch as any };
+  });
+
+  it('show prints the capability list + host-network flag', async () => {
+    const { stdout } = await runCommand(
+      ['org-settings', 'sandbox-allowlist', 'show', '--customer-id', ORG],
+      client,
+    );
+    expect(stdout).toContain('Sandbox capabilities:');
+    expect(stdout).toContain('NET_ADMIN');
+    expect(stdout).toContain('Sandbox host network:  true');
+  });
+
+  it('set-capabilities patches a parsed, comma-separated list', async () => {
+    await runCommand(
+      [
+        'org-settings',
+        'sandbox-allowlist',
+        'set-capabilities',
+        'NET_ADMIN, SYS_PTRACE',
+        '--customer-id',
+        ORG,
+      ],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      sandboxAllowedCapabilities: ['NET_ADMIN', 'SYS_PTRACE'],
+    });
+  });
+
+  it('set-capabilities with an empty string clears the list', async () => {
+    await runCommand(
+      ['org-settings', 'sandbox-allowlist', 'set-capabilities', '', '--customer-id', ORG],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      sandboxAllowedCapabilities: [],
+    });
+  });
+
+  it('allow-host-network true patches the flag', async () => {
+    await runCommand(
+      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'true', '--customer-id', ORG],
+      client,
+    );
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      sandboxAllowHostNetwork: true,
+    });
+  });
+
+  it('allow-host-network rejects a non-boolean with exit 1', async () => {
+    const { exitCode, stderr } = await runCommand(
+      ['org-settings', 'sandbox-allowlist', 'allow-host-network', 'maybe', '--customer-id', ORG],
+      client,
+    );
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('must be "true" or "false"');
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('reset clears both the capability list and host-network flag', async () => {
+    await runCommand(['org-settings', 'sandbox-allowlist', 'reset', '--customer-id', ORG], client);
+    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
+      customerId: ORG,
+      sandboxAllowedCapabilities: null,
+      sandboxAllowHostNetwork: false,
     });
   });
 });

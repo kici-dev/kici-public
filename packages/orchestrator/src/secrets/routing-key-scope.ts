@@ -17,6 +17,12 @@
  * access is denied, or `null` to let the handler continue. The middleware
  * mounted in each admin route file is responsible for calling
  * `c.set('routingKey', tokenInfo.routingKey)` so these helpers can read it.
+ *
+ * NOT a scope name. `requested` must be a routing key (`<provider>:<id>`) read
+ * from a row or an explicit request field. Secret scope names live in a
+ * different namespace — a path whose `:` is reserved as the backend qualifier —
+ * and must never be passed here. Secret routes have no per-routing-key slice;
+ * they use `requireUnscopedToken` instead.
  */
 
 import type { Context } from 'hono';

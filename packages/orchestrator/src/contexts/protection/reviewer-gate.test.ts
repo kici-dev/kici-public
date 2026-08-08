@@ -4,6 +4,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import type { Context } from '@kici-dev/engine';
+import { HoldType } from '@kici-dev/engine';
 
 import { evaluateReviewerGate } from './reviewer-gate.js';
 
@@ -39,7 +40,7 @@ describe('evaluateReviewerGate', () => {
   it('holds with one user clause per required reviewer', () => {
     const result = evaluateReviewerGate(makeEnv({ requiredReviewers: ['alice', 'bob'] }));
     expect(result.action).toBe('hold');
-    expect(result.holdType).toBe('reviewer');
+    expect(result.holdType).toBe(HoldType.enum.reviewer);
     expect(result.clauses).toEqual([{ user: 'alice' }, { user: 'bob' }]);
   });
 });

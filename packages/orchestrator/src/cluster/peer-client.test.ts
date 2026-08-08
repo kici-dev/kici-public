@@ -885,6 +885,34 @@ describe('PeerClient', () => {
       );
     });
 
+    it('routes encrypted job.progress to callback with the authenticated target peer id', async () => {
+      const onJobProgress = vi.fn();
+      const { client } = createPeerClient({ onJobProgress });
+      const { mock, sessionKey } = await authenticateClient(client);
+
+      const jobProgress = {
+        type: 'job.progress',
+        kind: 'job',
+        runId: 'run-1',
+        jobId: 'job-1',
+        jobName: 'build',
+        stepIndex: 0,
+        stepName: '',
+        state: 'running',
+        timestamp: Date.now(),
+      };
+      mock.emit('message', encryptMessage(JSON.stringify(jobProgress), sessionKey));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(onJobProgress).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'job.progress', runId: 'run-1', jobId: 'job-1' }),
+        // `_targetInstanceId` set at the auth handshake — the coordinator uses it
+        // to verify signal provenance against the tracked reroute target.
+        'remote-orch',
+        expect.any(Function),
+      );
+    });
+
     it('routes encrypted peer.agent-token.revoke to onAgentTokenRevoke callback', async () => {
       const onAgentTokenRevoke = vi.fn();
       const { client } = createPeerClient({ onAgentTokenRevoke });
@@ -914,6 +942,36 @@ describe('PeerClient', () => {
       // routeMessage is private; exercise it via a typed test seam.
       (client as unknown as { routeMessage(m: unknown): void }).routeMessage(ack);
       expect(onJobProgressAck).toHaveBeenCalledWith(ack);
+    });
+
+    it('resolves a cluster-settings pull with the leader response', async () => {
+      const { client } = createPeerClient();
+      const { mock, sessionKey } = await authenticateClient(client);
+
+      const pending = client.sendClusterSettingsRequestAndWait({
+        type: 'peer.clusterSettings.request',
+        messageId: 'cs-1',
+      });
+
+      const response = {
+        type: 'peer.clusterSettings.response',
+        messageId: 'cs-1',
+        version: 4,
+        settings: { agentTokenTtlMs: 42_000 },
+      };
+      mock.emit('message', encryptMessage(JSON.stringify(response), sessionKey));
+
+      await expect(pending).resolves.toEqual(response);
+    });
+
+    it('sendClusterSettingsRequestAndWait returns null when not connected', async () => {
+      const { client } = createPeerClient();
+      await expect(
+        client.sendClusterSettingsRequestAndWait({
+          type: 'peer.clusterSettings.request',
+          messageId: 'cs-x',
+        }),
+      ).resolves.toBeNull();
     });
   });
 

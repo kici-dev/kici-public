@@ -109,6 +109,21 @@ describe('orchestrator install — folder-anchored', () => {
     ]);
   }
 
+  it('writes the enumerated stub env file when no --env-file is given', async () => {
+    await runInstall();
+
+    const envFile = path.join(tmpServiceConfigDir, 'kici-test.env');
+    const content = fs.readFileSync(envFile, 'utf-8');
+    expect(content).toContain('KICI_DATABASE_URL');
+    expect(content).toContain('KICI_PLATFORM_TOKEN');
+    expect(content).toContain('KICI_BOOTSTRAP_ADMIN_TOKEN');
+    expect(content).toContain('openssl rand -hex 32');
+    expect(content).toContain('https://docs.kici.dev/user/quickstart/compose/');
+    // Token-vocabulary cross-reference lives in the stub comments.
+    expect(content).toContain('kici_ok_');
+    expect(content).toContain('kici_join_v1');
+  });
+
   it('writes the manifest into --instance-dir', async () => {
     await runInstall();
 

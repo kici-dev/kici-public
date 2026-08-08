@@ -15,6 +15,7 @@ import { toErrorMessage } from '@kici-dev/shared';
 import { parseHostPropertyAssignments } from '@kici-dev/engine';
 
 import { withDb } from './shared/db.js';
+import { recordAdminCliAccessOnDb } from './shared/admin-cli-access-log.js';
 import { deriveHostStatus, HostRosterStore } from '../../agent/host-roster.js';
 import type { Database, HostRosterRow } from '../../db/types.js';
 
@@ -111,6 +112,10 @@ export function registerHostCommands(program: Command): void {
       '--ssh-key-secret <ref>',
       'Scoped-secret ref (scope/key) holding the bring-up private key',
     )
+    .option(
+      '--s3-reachable',
+      'The box can reach the orchestrator object storage — bring-up delivers the agent payload via a presigned S3 pull (else it falls back to SSH-push)',
+    )
     .action(
       async (opts: {
         agentId: string;
@@ -121,6 +126,7 @@ export function registerHostCommands(program: Command): void {
         sshUser?: string;
         sshPort?: string;
         sshKeySecret?: string;
+        s3Reachable?: boolean;
       }) => {
         try {
           const labels = opts.labels
@@ -137,18 +143,35 @@ export function registerHostCommands(program: Command): void {
               throw new Error(`--ssh-port must be a positive integer (got "${opts.sshPort}")`);
             }
           }
-          await withDb((db) =>
-            new HostRosterStore(db as unknown as Kysely<Database>).declareStatic({
-              agentId: opts.agentId,
-              labels,
-              hostname: opts.hostname,
-              properties,
-              address: opts.address,
-              sshUser: opts.sshUser,
-              sshPort,
-              sshKeySecret: opts.sshKeySecret,
-            }),
-          );
+          await withDb(async (db) => {
+            const kdb = db as unknown as Kysely<Database>;
+            try {
+              await new HostRosterStore(kdb).declareStatic({
+                agentId: opts.agentId,
+                labels,
+                hostname: opts.hostname,
+                properties,
+                address: opts.address,
+                sshUser: opts.sshUser,
+                sshPort,
+                sshKeySecret: opts.sshKeySecret,
+                s3Reachable: opts.s3Reachable,
+              });
+              await recordAdminCliAccessOnDb(kdb, {
+                action: 'fleet.host.declare',
+                target: { type: 'fleet', id: opts.agentId },
+                outcome: 'allowed',
+              });
+            } catch (err) {
+              await recordAdminCliAccessOnDb(kdb, {
+                action: 'fleet.host.declare',
+                target: { type: 'fleet', id: opts.agentId },
+                outcome: 'error',
+                errorMessage: toErrorMessage(err),
+              });
+              throw err;
+            }
+          });
           console.log(`Declared static host: ${opts.agentId}`);
         } catch (err) {
           console.error(`Error: ${toErrorMessage(err)}`);
@@ -163,9 +186,27 @@ export function registerHostCommands(program: Command): void {
     .requiredOption('--agent-id <id>', 'Agent id to remove')
     .action(async (opts: { agentId: string }) => {
       try {
-        const deleted = await withDb((db) =>
-          new HostRosterStore(db as unknown as Kysely<Database>).removeStatic(opts.agentId),
-        );
+        const deleted = await withDb(async (db) => {
+          const kdb = db as unknown as Kysely<Database>;
+          try {
+            const n = await new HostRosterStore(kdb).removeStatic(opts.agentId);
+            await recordAdminCliAccessOnDb(kdb, {
+              action: 'fleet.host.remove',
+              target: { type: 'fleet', id: opts.agentId },
+              outcome: 'allowed',
+              meta: { removed: n > 0 },
+            });
+            return n;
+          } catch (err) {
+            await recordAdminCliAccessOnDb(kdb, {
+              action: 'fleet.host.remove',
+              target: { type: 'fleet', id: opts.agentId },
+              outcome: 'error',
+              errorMessage: toErrorMessage(err),
+            });
+            throw err;
+          }
+        });
         if (deleted === 0) {
           console.error(`No host found: ${opts.agentId}`);
           process.exit(1);

@@ -27,6 +27,56 @@ export const SourceSubtype = z.enum(['github_app', 'generic_webhook', 'universal
 export type SourceSubtype = z.infer<typeof SourceSubtype>;
 
 /**
+ * Operating mode of a customer-deployed orchestrator. The single source of
+ * truth for the `KICI_MODE` vocabulary — the orchestrator config schema, the
+ * `source.register` protocol message, and the Platform's relay-eligibility
+ * filter all read it from here.
+ *
+ * - `platform`    — the hosted Platform relays every webhook; no local ingress.
+ * - `hybrid`      — Platform relay **plus** the orchestrator's own direct
+ *                   (GitHub / generic) ingress; full hosted observability.
+ * - `observed`    — the orchestrator ingests only its OWN webhooks (nothing
+ *                   transits the Platform) but keeps its Platform WebSocket for
+ *                   hosted observability. The Platform never relays to it and
+ *                   records its sources as observe-only.
+ * - `independent` — own ingress only, no Platform connection at all.
+ */
+export const OrchestratorMode = z.enum(['platform', 'hybrid', 'independent', 'observed']);
+export type OrchestratorMode = z.infer<typeof OrchestratorMode>;
+
+/**
+ * Modes in which the orchestrator holds a Platform WebSocket connection (and so
+ * requires `KICI_PLATFORM_URL` + `KICI_PLATFORM_TOKEN`). `observed` connects for
+ * observability + observe-only source registration; `independent` never does.
+ */
+export const PLATFORM_CONNECTED_MODES: readonly OrchestratorMode[] = [
+  OrchestratorMode.enum.platform,
+  OrchestratorMode.enum.hybrid,
+  OrchestratorMode.enum.observed,
+];
+
+/**
+ * Modes in which the orchestrator accepts Platform-relayed webhooks. `observed`
+ * is deliberately absent: it ingests only its own webhooks, and both sides
+ * enforce that (the orchestrator refuses any relay it receives, and the Platform
+ * excludes observed connections from every relay-candidate lookup).
+ */
+export const RELAY_INGRESS_MODES: readonly OrchestratorMode[] = [
+  OrchestratorMode.enum.platform,
+  OrchestratorMode.enum.hybrid,
+];
+
+/**
+ * Modes in which the orchestrator serves its OWN webhook ingress (the direct
+ * GitHub route plus generic webhook sources).
+ */
+export const OWN_INGRESS_MODES: readonly OrchestratorMode[] = [
+  OrchestratorMode.enum.hybrid,
+  OrchestratorMode.enum.independent,
+  OrchestratorMode.enum.observed,
+];
+
+/**
  * Source provider family used by Platform's webhook router. Coarser-grained
  * than `SourceSubtype` — every universal-git / generic_webhook / local row
  * collapses to `'generic'` here because Platform routes them through the same
@@ -92,7 +142,7 @@ export const sourceRegistrationSchema = z.object({
   /** Orchestrator version (e.g. "0.0.1"). Optional for backward compatibility with older orchestrators. */
   version: z.string().optional(),
   /** Orchestrator config mode. Optional for backward compatibility. */
-  mode: z.enum(['platform', 'hybrid', 'independent']).optional(),
+  mode: OrchestratorMode.optional(),
   /** Scaler backends configured on this orchestrator (e.g. ["container", "firecracker"]). */
   scalerBackends: z.array(z.string()).optional(),
   /**

@@ -36,73 +36,111 @@ describe('local-plane scaler-config', () => {
     expect(fs.statSync(wrapper).mode & 0o111).toBeTruthy(); // has an exec bit
   });
 
-  it('writeScalerConfig emits a bare-metal scaler with a default label set', () => {
-    freshRoot();
-    const file = writeScalerConfig(4319);
+  interface ParsedLabelSet {
+    labels: string[];
+    binaryPath?: string;
+    env?: Record<string, string>;
+  }
+  interface ParsedScaler {
+    name: string;
+    type: string;
+    orchestratorUrl: string;
+    mandatoryLabels?: string[];
+    labelSets: ParsedLabelSet[];
+  }
+
+  function parseScalers(port = 4319): ParsedScaler[] {
+    const file = writeScalerConfig(port);
     expect(file).toBe(planePaths().scalerConfigFile);
     const parsed = parseYaml(fs.readFileSync(file, 'utf-8')) as {
       version: number;
-      scalers: Array<{
-        type: string;
-        orchestratorUrl: string;
-        labelSets: Array<{ labels: string[]; binaryPath: string }>;
-      }>;
+      scalers: ParsedScaler[];
     };
     expect(parsed.version).toBe(1);
-    expect(parsed.scalers).toHaveLength(1);
-    const scaler = parsed.scalers[0];
-    expect(scaler.type).toBe('bare-metal');
-    expect(scaler.orchestratorUrl).toBe('ws://127.0.0.1:4319/ws');
-    expect(scaler.labelSets[0].labels).toEqual(['default']);
-    expect(scaler.labelSets[0].binaryPath).toBe(planePaths().agentWrapperFile);
+    return parsed.scalers;
+  }
+
+  function allLabelSets(scalers: ParsedScaler[]): ParsedLabelSet[] {
+    return scalers.flatMap((s) => s.labelSets);
+  }
+
+  it('emits a sandboxed bare-metal scaler with a single untainted default label set', () => {
+    freshRoot();
+    const scalers = parseScalers();
+    const sandboxed = scalers.find((s) => s.name === 'kici-local-bare-metal');
+    expect(sandboxed).toBeDefined();
+    expect(sandboxed!.type).toBe('bare-metal');
+    expect(sandboxed!.orchestratorUrl).toBe('ws://127.0.0.1:4319/ws');
+    // Sandboxed pool: exactly the default label set, no trusted env, no taint.
+    expect(sandboxed!.labelSets).toHaveLength(1);
+    expect(sandboxed!.labelSets[0].labels).toEqual(['default']);
+    expect(sandboxed!.labelSets[0].binaryPath).toBe(planePaths().agentWrapperFile);
+    expect(sandboxed!.labelSets[0].env).toBeUndefined();
+    expect(sandboxed!.mandatoryLabels ?? []).toEqual([]);
   });
 
-  it('emits a second trusted label set (default+self-hosted) with KICI_TRUSTED_ENV=true', () => {
+  it('emits a self-hosted-tainted trusted scaler with the two trusted label sets', () => {
     freshRoot();
-    const file = writeScalerConfig(4319);
-    const parsed = parseYaml(fs.readFileSync(file, 'utf-8')) as {
-      scalers: Array<{
-        labelSets: Array<{ labels: string[]; env?: Record<string, string> }>;
-      }>;
-    };
-    const labelSets = parsed.scalers[0].labelSets;
-    expect(labelSets).toHaveLength(3);
-
-    // The trusted (non-in-place) set: exactly [default, self-hosted].
-    const trusted = labelSets.find(
-      (ls) =>
-        ls.labels.includes(TRUSTED_ROUTING_LABEL) && !ls.labels.includes(IN_PLACE_ROUTING_LABEL),
-    );
+    const scalers = parseScalers();
+    const trusted = scalers.find((s) => s.name === 'kici-local-bare-metal-trusted');
     expect(trusted).toBeDefined();
-    expect(trusted!.labels).toEqual(['default', 'self-hosted']);
-    expect(trusted!.env).toEqual({ KICI_TRUSTED_ENV: 'true', KICI_SANDBOX: 'false' });
+    expect(trusted!.type).toBe('bare-metal');
+    // The taint: only jobs requesting `self-hosted` may route to this pool.
+    expect(trusted!.mandatoryLabels).toEqual([TRUSTED_ROUTING_LABEL]);
+    expect(trusted!.labelSets).toHaveLength(2);
 
-    // The default (sandboxed) set carries no trusted env.
-    const sandboxed = labelSets.find((ls) => !ls.labels.includes(TRUSTED_ROUTING_LABEL));
-    expect(sandboxed!.env).toBeUndefined();
+    const trustedSet = trusted!.labelSets.find((ls) => !ls.labels.includes(IN_PLACE_ROUTING_LABEL));
+    expect(trustedSet!.labels).toEqual(['default', 'self-hosted']);
+    expect(trustedSet!.env).toEqual({ KICI_TRUSTED_ENV: 'true', KICI_SANDBOX: 'false' });
 
-    // No label set uses a reserved kici: label.
-    for (const ls of labelSets) {
-      expect(ls.labels.some((l) => l.startsWith('kici:'))).toBe(false);
-    }
-  });
-
-  it('emits a trusted in-place label set (default+self-hosted+in-place) with KICI_IN_PLACE=true', () => {
-    freshRoot();
-    const file = writeScalerConfig(4319);
-    const parsed = parseYaml(fs.readFileSync(file, 'utf-8')) as {
-      scalers: Array<{
-        labelSets: Array<{ labels: string[]; env?: Record<string, string> }>;
-      }>;
-    };
-    const labelSets = parsed.scalers[0].labelSets;
-    const inPlace = labelSets.find((ls) => ls.labels.includes(IN_PLACE_ROUTING_LABEL));
-    expect(inPlace).toBeDefined();
+    const inPlace = trusted!.labelSets.find((ls) => ls.labels.includes(IN_PLACE_ROUTING_LABEL));
     expect(inPlace!.labels).toEqual(['default', 'self-hosted', 'in-place']);
     expect(inPlace!.env).toEqual({
       KICI_TRUSTED_ENV: 'true',
       KICI_SANDBOX: 'false',
       KICI_IN_PLACE: 'true',
     });
+
+    // Every trusted label set carries the mandatory taint label (validator
+    // invariant: a mandatory label must appear in every label set of its scaler).
+    for (const ls of trusted!.labelSets) {
+      expect(ls.labels).toContain(TRUSTED_ROUTING_LABEL);
+    }
+  });
+
+  it('no label set uses a reserved kici: label', () => {
+    freshRoot();
+    for (const ls of allLabelSets(parseScalers())) {
+      expect(ls.labels.some((l) => l.startsWith('kici:'))).toBe(false);
+    }
+  });
+
+  // Security invariant (regression guard for the non-trusted ambient-env leak):
+  // a bare `default` run must be UNABLE to reach any trusted label set. Every
+  // pool whose label-set env sets KICI_TRUSTED_ENV=true MUST be tainted with a
+  // mandatoryLabel that `['default']` does not satisfy — so the orchestrator's
+  // agent-registry gate (and the scaler spawn matcher) both keep a sandboxed
+  // job off every trusted agent, even a lingering idle one.
+  it('every trusted (KICI_TRUSTED_ENV=true) pool is tainted against a bare default job', () => {
+    freshRoot();
+    const scalers = parseScalers();
+    const defaultRunLabels = ['default'];
+
+    let trustedPools = 0;
+    for (const scaler of scalers) {
+      const isTrustedPool = scaler.labelSets.some((ls) => ls.env?.KICI_TRUSTED_ENV === 'true');
+      if (!isTrustedPool) continue;
+      trustedPools++;
+      const mandatory = scaler.mandatoryLabels ?? [];
+      expect(mandatory.length).toBeGreaterThan(0);
+      // The taint gate: at least one mandatory label is absent from a default
+      // run's runsOn, so the gate rejects it.
+      const gatePasses = mandatory.every((m) =>
+        defaultRunLabels.map((l) => l.toLowerCase()).includes(m.toLowerCase()),
+      );
+      expect(gatePasses).toBe(false);
+    }
+    // Guard the guard: there IS a trusted pool to check.
+    expect(trustedPools).toBeGreaterThan(0);
   });
 });

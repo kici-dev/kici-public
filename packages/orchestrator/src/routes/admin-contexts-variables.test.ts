@@ -24,6 +24,7 @@ function buildMockDb(opts: {
   insertExecute: ReturnType<typeof vi.fn>;
   deleteExecute: ReturnType<typeof vi.fn>;
   insertValues: ReturnType<typeof vi.fn>;
+  deleteWhere3: ReturnType<typeof vi.fn>;
 } {
   const envExecuteTakeFirst = vi.fn().mockResolvedValue(opts.envRow ?? null);
   const envWhere2 = vi.fn();
@@ -64,7 +65,7 @@ function buildMockDb(opts: {
     }),
   };
 
-  return { db, insertExecute, deleteExecute, insertValues };
+  return { db, insertExecute, deleteExecute, insertValues, deleteWhere3 };
 }
 
 function buildTestApp(deps: { db: any; rbac: RbacEnforcer }) {
@@ -200,6 +201,82 @@ describe('admin context variables CRUD', () => {
       const body = await res.json();
       expect(body).toEqual({ deleted: true });
       expect(deleteExecute).toHaveBeenCalled();
+    });
+  });
+
+  // A variable key is a single already-decoded Hono path param. The handlers
+  // must NOT decode it a second time — a second decode either throws a
+  // URIError (500) when the literal key carries a stray `%`, or silently
+  // collapses a `%NN`-looking key onto a DIFFERENT key (wrong-key write or
+  // delete). The `:key` path param has no charset validation (only the request
+  // body is schema-checked), so a variable literally keyed `100%done` is
+  // creatable and both failure modes are reachable.
+  describe('variable :key path param is decoded exactly once (no double-decode)', () => {
+    it('PUT forwards a literal-% key verbatim (was a 500 under double-decode)', async () => {
+      const { db, insertValues } = buildMockDb({ envRow: env });
+      const app = buildTestApp({ db, rbac: new RbacEnforcer() });
+
+      // URL segment `100%25done` decodes (once, by Hono) to the literal `100%done`.
+      const res = await app.request(
+        `http://localhost/contexts/production/variables/100%25done?orgId=${orgId}`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ value: 'v' }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      expect(insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ key: '100%done', value: 'v' }),
+      );
+    });
+
+    it('DELETE forwards a literal-% key verbatim', async () => {
+      const { db, deleteWhere3 } = buildMockDb({ envRow: env });
+      const app = buildTestApp({ db, rbac: new RbacEnforcer() });
+
+      const res = await app.request(
+        `http://localhost/contexts/production/variables/100%25done?orgId=${orgId}`,
+        { method: 'DELETE' },
+      );
+
+      expect(res.status).toBe(200);
+      expect(deleteWhere3).toHaveBeenCalledWith('key', '=', '100%done');
+    });
+
+    it('PUT does not collapse a %NN-looking key onto a different key', async () => {
+      const { db, insertValues } = buildMockDb({ envRow: env });
+      const app = buildTestApp({ db, rbac: new RbacEnforcer() });
+
+      // URL `a%2520b` → Hono decodes ONCE → `a%20b` (a five-char key). A second
+      // decode would wrongly yield `a b` and write a different variable.
+      const res = await app.request(
+        `http://localhost/contexts/production/variables/a%2520b?orgId=${orgId}`,
+        {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ value: 'v' }),
+        },
+      );
+
+      expect(res.status).toBe(200);
+      expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ key: 'a%20b' }));
+      expect(insertValues).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'a b' }));
+    });
+
+    it('DELETE does not collapse a %NN-looking key onto a different key', async () => {
+      const { db, deleteWhere3 } = buildMockDb({ envRow: env });
+      const app = buildTestApp({ db, rbac: new RbacEnforcer() });
+
+      const res = await app.request(
+        `http://localhost/contexts/production/variables/a%2520b?orgId=${orgId}`,
+        { method: 'DELETE' },
+      );
+
+      expect(res.status).toBe(200);
+      expect(deleteWhere3).toHaveBeenCalledWith('key', '=', 'a%20b');
+      expect(deleteWhere3).not.toHaveBeenCalledWith('key', '=', 'a b');
     });
   });
 });

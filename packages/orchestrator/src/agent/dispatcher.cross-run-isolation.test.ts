@@ -37,7 +37,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Dispatcher, type DispatchMetrics } from './dispatcher.js';
 import { AgentRegistry } from './registry.js';
-import type { JobQueue, QueuedJob } from '../queue/job-queue.js';
+import type { JobQueue, QueuedJob, QueuedJobInput } from '../queue/job-queue.js';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 
 /**
@@ -81,7 +81,10 @@ function mockQueue(jobs: QueuedJob[] = []): JobQueue {
   let dequeueIndex = 0;
   return {
     enqueue: vi.fn().mockResolvedValue('enqueued-job-id'),
-    insertDispatched: vi.fn().mockImplementation(async () => crypto.randomUUID()),
+    insertDispatched: vi.fn().mockImplementation(async (input: QueuedJobInput) => ({
+      id: input.jobId ?? crypto.randomUUID(),
+      inserted: true,
+    })),
     dequeueForLabels: vi
       .fn()
       .mockImplementation(async () => (dequeueIndex < jobs.length ? jobs[dequeueIndex++] : null)),
@@ -111,7 +114,7 @@ function mockQueue(jobs: QueuedJob[] = []): JobQueue {
   } as unknown as JobQueue;
 }
 
-describe('§5.7 cross-run isolation — agent authority bounded by ownership windows', () => {
+describe('cross-run isolation — agent authority bounded by ownership windows', () => {
   let registry: AgentRegistry;
   let metrics: DispatchMetrics;
   let onDispatch: ReturnType<typeof vi.fn>;

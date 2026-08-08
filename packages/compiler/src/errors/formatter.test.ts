@@ -1,5 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { formatError, compilerError, isCompilerError } from './formatter.js';
+import {
+  formatError,
+  compilerError,
+  isCompilerError,
+  DiagnosticSeverity,
+  PURITY_FALLBACK_CODE,
+} from './formatter.js';
+
+/** Strip ANSI color codes so assertions match regardless of picocolors' TTY detection. */
+function plain(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\[[0-9;]*m/g, '');
+}
 
 describe('compilerError', () => {
   it('creates a CompilerError with code and message', () => {
@@ -93,5 +105,25 @@ describe('formatError', () => {
     });
     const output = formatError(err);
     expect(output).toContain('Suggestion: Run kici init');
+  });
+});
+
+describe('formatError severity', () => {
+  it('renders a warning-severity diagnostic with "warning" and its code', () => {
+    const out = plain(
+      formatError({
+        code: PURITY_FALLBACK_CODE,
+        message: 'job "build": context function is not pure (async functions cannot be inlined)',
+        severity: DiagnosticSeverity.Warning,
+      }),
+    );
+    expect(out).toContain('warning');
+    expect(out).toContain(`[${PURITY_FALLBACK_CODE}]`);
+    expect(out).not.toContain('error');
+  });
+
+  it('defaults to error severity when severity is omitted', () => {
+    const out = plain(formatError({ code: 'E102', message: 'boom' }));
+    expect(out).toContain('error');
   });
 });

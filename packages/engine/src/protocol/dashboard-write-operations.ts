@@ -385,42 +385,124 @@ export function getDashboardWriteOperationsBySensitivity(
 }
 
 /**
- * Map of operation → enabled flag. Omitted operations default to true
- * (permissive). The orch persists this shape verbatim as JSONB; the
- * Platform mirrors it in its per-org cache.
+ * Per-operation dashboard-write posture.
+ *
+ *   - `permissive` — the write is accepted and its plaintext value transits
+ *     the hosted Platform process (today's default; the absent-key default).
+ *   - `encrypted` — the write is accepted but the value is sealed in the
+ *     browser to the orchestrator's published X25519 key, so the Platform
+ *     relays only opaque ciphertext. Valid ONLY for `plaintext`-sensitivity
+ *     operations (`secrets.set`, `variables.set`) — an operation with no
+ *     plaintext payload has nothing to seal.
+ *   - `disabled` — the write is refused; the operator must use the CLI.
+ *
+ * Absent from the sparse map ⇒ `permissive`.
  */
-export type DashboardWritePolicyMap = Partial<Record<DashboardWriteOperation, boolean>>;
+export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'disabled']);
+export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
 
 /**
- * Validates a sparse policy map. Use this where the value is required
- * but may be empty (e.g. the JSONB column on the orch). For optional
- * fields on outer schemas, embed `dashboardWritePolicyMap` directly
- * with `.optional()` so omission stays as `undefined` rather than being
- * coerced to `{}`.
+ * Coerce a single stored / on-the-wire policy value to a
+ * {@link DashboardWritePolicyState}. Older orchestrators (and pre-migration
+ * JSONB rows) carry the legacy boolean shape: `true` (enabled/permissive) and
+ * `false` (disabled). New peers carry the enum string directly. This keeps the
+ * protected wire + storage surfaces backward-compatible during the deprecation
+ * window — a boolean is never rejected, it is translated.
  */
-export const dashboardWritePolicyMap = z.partialRecord(DashboardWriteOperation, z.boolean());
+export function coerceDashboardWritePolicyValue(value: unknown): DashboardWritePolicyState {
+  if (value === true) return 'permissive';
+  if (value === false) return 'disabled';
+  const parsed = DashboardWritePolicyState.safeParse(value);
+  return parsed.success ? parsed.data : 'permissive';
+}
+
+/**
+ * Map of operation → posture. Omitted operations default to `permissive`.
+ * The orch persists this shape verbatim as JSONB; the Platform mirrors it in
+ * its per-org cache.
+ */
+export type DashboardWritePolicyMap = Partial<
+  Record<DashboardWriteOperation, DashboardWritePolicyState>
+>;
+
+/**
+ * Validates a sparse policy map. Accepts BOTH the enum-string shape and the
+ * legacy boolean shape (coerced), so an older orchestrator's boolean map and a
+ * pre-migration JSONB row both parse. `encrypted` is rejected for any operation
+ * whose sensitivity is not `plaintext` (nothing to seal without a plaintext
+ * payload; the signing half that would cover authority/dispatch ops is a
+ * separate feature). Use this where the value is required but may be empty
+ * (e.g. the JSONB column on the orch). For optional fields on outer schemas,
+ * embed `dashboardWritePolicyMap` directly with `.optional()` so omission stays
+ * as `undefined` rather than being coerced to `{}`.
+ */
+export const dashboardWritePolicyMap = z
+  .partialRecord(DashboardWriteOperation, z.union([z.boolean(), DashboardWritePolicyState]))
+  .transform((map) => {
+    const out: DashboardWritePolicyMap = {};
+    for (const [op, value] of Object.entries(map)) {
+      out[op as DashboardWriteOperation] = coerceDashboardWritePolicyValue(value);
+    }
+    return out;
+  })
+  .superRefine((map, ctx) => {
+    for (const [op, state] of Object.entries(map)) {
+      if (state !== 'encrypted') continue;
+      const descriptor = DASHBOARD_WRITE_OPERATIONS_BY_NAME.get(op as DashboardWriteOperation);
+      if (descriptor?.sensitivity !== 'plaintext') {
+        ctx.addIssue({
+          code: 'custom',
+          message: `"encrypted" is only valid for plaintext operations, not "${op}"`,
+          path: [op],
+        });
+      }
+    }
+  });
 
 export const dashboardWritePolicyMapSchema = dashboardWritePolicyMap.default({});
 
 /**
- * Resolve the effective state of an operation given a (possibly sparse)
- * policy map. Treats `undefined` as enabled by the permissive default.
+ * Resolve the effective posture of an operation given a (possibly sparse)
+ * policy map. Treats `undefined` as the permissive default.
+ */
+export function resolvePolicyState(
+  policy: DashboardWritePolicyMap | null | undefined,
+  op: DashboardWriteOperation,
+): DashboardWritePolicyState {
+  const raw = policy?.[op];
+  if (raw === undefined) return 'permissive';
+  // Coerce defensively: a policy map that reached this resolver without going
+  // through the schema (e.g. a raw legacy-boolean map cached from an older
+  // orchestrator) must still resolve `false` → disabled, never fail-open.
+  return coerceDashboardWritePolicyValue(raw);
+}
+
+/**
+ * Resolve the effective enabled state of an operation. `true` unless the
+ * posture is `disabled`. Convenience for the many read-only "may this write
+ * proceed at all?" call sites.
  */
 export function isDashboardWriteOperationEnabled(
   policy: DashboardWritePolicyMap | null | undefined,
   op: DashboardWriteOperation,
 ): boolean {
-  if (!policy) return true;
-  const explicit = policy[op];
-  return explicit === undefined ? true : explicit;
+  return resolvePolicyState(policy, op) !== 'disabled';
+}
+
+/** True only when the operation's posture is `encrypted`. */
+export function isEncryptedState(
+  policy: DashboardWritePolicyMap | null | undefined,
+  op: DashboardWriteOperation,
+): boolean {
+  return resolvePolicyState(policy, op) === 'encrypted';
 }
 
 /**
- * Expand a (possibly sparse) policy map into the full effective state
- * for all 27 operations. Operations the policy doesn't mention come
- * back as `true` (permissive). Used by the orch HTTP admin response,
- * the WS `orch.capabilities` broadcast, and the dashboard's policy
- * page so consumers see the full picture, not the sparse storage shape.
+ * Expand a (possibly sparse) policy map into the full effective enabled
+ * boolean for all 27 operations. Operations the policy doesn't mention come
+ * back as `true` (permissive). Retained for existing consumers that only need
+ * the enabled/disabled bit; {@link resolveFullPolicyStateView} exposes the
+ * richer tri-state.
  */
 export function resolveFullPolicyView(
   policy: DashboardWritePolicyMap | null | undefined,
@@ -428,6 +510,23 @@ export function resolveFullPolicyView(
   const out = {} as Record<DashboardWriteOperation, boolean>;
   for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
     out[descriptor.name] = isDashboardWriteOperationEnabled(policy, descriptor.name);
+  }
+  return out;
+}
+
+/**
+ * Expand a (possibly sparse) policy map into the full tri-state posture for
+ * all 27 operations. Used by the orch HTTP admin response, the WS
+ * `orch.capabilities` broadcast, and the dashboard's policy page so consumers
+ * see the full picture (including which plaintext ops are `encrypted`), not the
+ * sparse storage shape.
+ */
+export function resolveFullPolicyStateView(
+  policy: DashboardWritePolicyMap | null | undefined,
+): Record<DashboardWriteOperation, DashboardWritePolicyState> {
+  const out = {} as Record<DashboardWriteOperation, DashboardWritePolicyState>;
+  for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
+    out[descriptor.name] = resolvePolicyState(policy, descriptor.name);
   }
   return out;
 }

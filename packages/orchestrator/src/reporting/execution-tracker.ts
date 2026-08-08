@@ -21,10 +21,14 @@ import {
   ExecutionRunStatus,
   ExecutionStepStatus,
   type InitFailure,
+  RunFailureClass,
   ScalerEventType,
   TERMINAL_JOB_STATES,
+  TERMINAL_RUN_STATES,
   CheckMode,
   CheckStepOutcome,
+  OrchLogPhase,
+  isFailureStatus,
 } from '@kici-dev/engine';
 import { executionsTotal, executionDurationSeconds } from '../metrics/prometheus.js';
 import type { ObserverRegistry } from '../ws/observer-registry.js';
@@ -37,6 +41,26 @@ const logger = createLogger({ prefix: 'execution-tracker' });
 
 /** How long to keep completed runs in memory before pruning (ms). */
 const PRUNE_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * True when a status-clobber-guarded write actually changed a row.
+ *
+ * Every terminal `execution_runs` write in this file is guarded so it cannot
+ * overwrite a run that already finished. A rejected write means the status the
+ * caller computed is NOT this orchestrator's record of the run, so the caller
+ * must not forward it to the Platform either — the Platform mirrors whatever it
+ * is told and never revisits a terminal mirror row, so one unguarded forward
+ * diverges the two planes permanently.
+ *
+ * Accepts both shapes Kysely returns: `numUpdatedRows` (UPDATE) and
+ * `numInsertedOrUpdatedRows` (INSERT ... ON CONFLICT DO UPDATE).
+ */
+function guardedWriteApplied(
+  result: { numUpdatedRows?: bigint; numInsertedOrUpdatedRows?: bigint } | undefined,
+): boolean {
+  if (!result) return false;
+  return (result.numUpdatedRows ?? result.numInsertedOrUpdatedRows ?? 0n) > 0n;
+}
 
 /** Context passed to onExecutionComplete for commit status updates. */
 export interface ExecutionContext {
@@ -71,6 +95,12 @@ export interface ExecutionContext {
   triggerActorUsername?: string | null;
   /** Immutable provider user id of the triggering actor (preferred for resolution). */
   triggerActorUserId?: string | null;
+  /**
+   * Why a terminal run failed (`RunFailureClass`). Set on terminal-failed /
+   * cancelled runs; forwarded to the Platform on `execution.status` so managed
+   * subscriptions can match on it. Null/undefined for success or non-terminal.
+   */
+  failureClass?: RunFailureClass | null;
   /** Workflow-level concurrency config from the lock file. */
   concurrency?: {
     cancelInProgress?: boolean;
@@ -87,6 +117,8 @@ interface WorkflowCompleteCallbackData {
   jobResults: Array<{ name: string; status: string }>;
   routingKey?: string;
   repo: string;
+  /** Why the run failed (`RunFailureClass`); carried onto the `__workflow_complete` event. */
+  failureClass?: string;
 }
 
 /** Data passed to the onJobComplete callback. */
@@ -98,6 +130,11 @@ interface JobCompleteCallbackData {
   routingKey?: string;
   repo: string;
   workflowName: string;
+  /**
+   * Job payload carried by the status update (step results, error, duration).
+   * Feeds the enriched check-run summary and the failure description.
+   */
+  data?: Record<string, unknown>;
 }
 
 export interface ExecutionTrackerDeps {
@@ -202,13 +239,41 @@ export interface ExecutionTrackerDeps {
     metadata?: Record<string, unknown>;
     durationMs?: number | null;
   }) => void;
+  /**
+   * Optional live forward of orchestration/provisioning log lines to Platform,
+   * fired in addition to persisting them to `logStorage`. Platform fans these
+   * out to run-detail browser subscribers as `orch-log.lines`. Best-effort:
+   * a push failure must never break dispatch.
+   *
+   * SECURITY: like `onRunEventEmit`, this payload MUST NOT carry an `orgId`.
+   * The Platform attributes the tenant from `authState.orgId`.
+   */
+  onOrchLog?: (chunk: {
+    runId: string;
+    jobId: string;
+    phase: OrchLogPhase;
+    lines: string[];
+    ts: number;
+  }) => void;
   /** Optional log storage for writing per-job orchestration logs (JSONL). */
   logStorage?: LogStorage;
   /** Org ID for this orchestrator instance (used in run.event emission). */
   orgId?: string;
   /** Optional job queue for cascading run failures to dispatch_queue entries. */
   jobQueue?: JobQueue;
+  /**
+   * Resolves a routing key to its owning org (customer_id), used to populate
+   * `execution_runs.customer_id` at insert time so the concurrency-gate running
+   * count is scoped per tenant. Injected (bound to `(rk) => resolveOrgId(db, rk)`
+   * at construction) to keep the tracker free of a pipeline import cycle. When
+   * absent — or when a run has no routing key — the row falls back to the
+   * `'__default__'` column default (the no-source fallback org).
+   */
+  resolveOrgId?: (routingKey: string) => Promise<string>;
 }
+
+/** The org used when no routing key / resolver is available (matches the column DEFAULT). */
+const DEFAULT_CUSTOMER_ID = '__default__';
 
 /** In-memory state for a single execution run. */
 interface RunState {
@@ -240,6 +305,16 @@ interface RunState {
   driftDetected?: boolean;
   startedAt: number;
   completedAt?: number;
+  /**
+   * Number of outstanding "jobs are still to be registered" tokens. While it is
+   * above zero `isRunComplete` is false regardless of the jobs already tracked.
+   * Incremented by `holdRunForPendingJobs`, decremented by
+   * `releasePendingJobsHold`. It is a count rather than a flag because several
+   * independent registrations can be in flight at once — the source-pack build
+   * window plus one token per deferred init job and per deferred dynamic entry
+   * — and each must hold the run open until its own jobs land.
+   */
+  pendingJobRegistrations?: number;
   jobs: Map<
     string,
     {
@@ -312,9 +387,11 @@ export class ExecutionTracker {
   private readonly onExecutionStatusChange?: ExecutionTrackerDeps['onExecutionStatusChange'];
   private readonly onJobStatusChange?: ExecutionTrackerDeps['onJobStatusChange'];
   private readonly onRunEventEmit?: ExecutionTrackerDeps['onRunEventEmit'];
+  private readonly onOrchLog?: ExecutionTrackerDeps['onOrchLog'];
   private readonly logStorage?: LogStorage;
   private readonly orgId?: string;
   private readonly jobQueue?: JobQueue;
+  private readonly resolveOrgIdFn?: ExecutionTrackerDeps['resolveOrgId'];
   private readonly runs = new Map<string, RunState>();
   /**
    * Per-run async-mutex chain. `onJobStatus` and `addJobsToRun` mutate the same
@@ -360,9 +437,21 @@ export class ExecutionTracker {
     this.onExecutionStatusChange = deps.onExecutionStatusChange;
     this.onJobStatusChange = deps.onJobStatusChange;
     this.onRunEventEmit = deps.onRunEventEmit;
+    this.onOrchLog = deps.onOrchLog;
     this.logStorage = deps.logStorage;
     this.orgId = deps.orgId;
     this.jobQueue = deps.jobQueue;
+    this.resolveOrgIdFn = deps.resolveOrgId;
+  }
+
+  /**
+   * Resolve the owning org for an `execution_runs` row from its routing key.
+   * Falls back to the `'__default__'` org (the column default) when the run has
+   * no routing key or no resolver is injected (single-tenant / test contexts).
+   */
+  private async resolveCustomerId(routingKey: string | null | undefined): Promise<string> {
+    if (routingKey == null || !this.resolveOrgIdFn) return DEFAULT_CUSTOMER_ID;
+    return this.resolveOrgIdFn(routingKey);
   }
 
   /**
@@ -431,6 +520,8 @@ export class ExecutionTracker {
     triggerActorUserId?: string | null,
     /** Agent provenance label when triggered through an agent credential. */
     triggeredByAgentLabel?: string | null,
+    /** Pull-request number for PR-triggered runs; null/omitted for non-PR runs. */
+    prNumber?: number | null,
   ): Promise<void> {
     const now = new Date();
 
@@ -488,11 +579,13 @@ export class ExecutionTracker {
 
     // DB: insert execution run (ON CONFLICT DO NOTHING handles the case where
     // the run was already created by the deferred-init early-creation path)
+    const customerId = await this.resolveCustomerId(routingKey);
     await this.db
       .insertInto('execution_runs')
       .values({
         run_id: runId,
         routing_key: routingKey ?? null,
+        customer_id: customerId,
         workflow_name: workflowName,
         status: ExecutionRunStatus.enum.pending,
         provider,
@@ -509,6 +602,7 @@ export class ExecutionTracker {
         ...(triggeredByAgentLabel != null && {
           triggered_by_agent_label: triggeredByAgentLabel,
         }),
+        ...(prNumber != null && { pr_number: prNumber }),
         ...((triggerActorUsername != null || triggerActorUserId != null) && {
           trigger_actor_provider: provider,
         }),
@@ -538,7 +632,7 @@ export class ExecutionTracker {
 
     // Write orchestration log for each dispatched job
     for (const job of jobs) {
-      this.writeOrchLog(runId, job.jobId, 'dispatch', 'Job dispatched to queue');
+      this.writeOrchLog(runId, job.jobId, OrchLogPhase.enum.dispatch, 'Job dispatched to queue');
     }
 
     // Fire status change callback for Platform forwarding (pending)
@@ -841,7 +935,7 @@ export class ExecutionTracker {
 
     // Write orchestration log for each new job
     for (const job of jobs) {
-      this.writeOrchLog(runId, job.jobId, 'dispatch', 'Job dispatched to queue');
+      this.writeOrchLog(runId, job.jobId, OrchLogPhase.enum.dispatch, 'Job dispatched to queue');
     }
 
     // Fire status change callback with updated job count (preserve current status)
@@ -1028,6 +1122,7 @@ export class ExecutionTracker {
         routingKey: run.routingKey,
         repo: run.repoIdentifier,
         workflowName: run.workflowName,
+        data,
       });
     }
 
@@ -1040,13 +1135,16 @@ export class ExecutionTracker {
       await this.runWaveSchedulerHook(runId, jobId, state);
     }
 
-    // Check for run completion (with stuck-jobs invariant enforcement)
-    if (TERMINAL_JOB_STATES.has(state) && run && this.isRunComplete(runId)) {
+    // Check for run completion (with stuck-jobs invariant enforcement). The
+    // `completedAt` guard makes finalization idempotent: a late status update
+    // for an already-finalized run must not roll it up a second time, posting a
+    // duplicate provider check and forwarding a second terminal run status.
+    if (TERMINAL_JOB_STATES.has(state) && run && !run.completedAt && this.isRunComplete(runId)) {
       const stopAfterStuckCheck = await this.enforceSchedulerInvariantOrFail(runId);
       if (stopAfterStuckCheck) return;
     }
 
-    if (TERMINAL_JOB_STATES.has(state) && run && this.isRunComplete(runId)) {
+    if (TERMINAL_JOB_STATES.has(state) && run && !run.completedAt && this.isRunComplete(runId)) {
       await this.finalizeRunCompletion(run, runId, timestamp, now);
     }
   }
@@ -1089,6 +1187,14 @@ export class ExecutionTracker {
       // Run not found in DB either — it was cleaned up (e.g. warm-start purge).
       // Skip this job status update entirely; there's nothing to track.
       logger.warn('Run not found in DB, skipping job status update', { runId, jobId, state });
+      return null;
+    }
+
+    if (dbRun.status === ExecutionRunStatus.enum.held) {
+      // A held run is paused at the install gate and tracks no jobs; it resumes
+      // into a fresh dispatch. Rehydrating it would let a late status from the
+      // pre-hold dispatch roll it up as complete while it is still waiting.
+      logger.warn('Run is held, skipping job status update', { runId, jobId, state });
       return null;
     }
 
@@ -1434,7 +1540,7 @@ export class ExecutionTracker {
           jobId,
           metadata: { agentId, jobName: job.name },
         });
-        this.writeOrchLog(runId, jobId, 'setup', `Agent ${agentId} assigned`);
+        this.writeOrchLog(runId, jobId, OrchLogPhase.enum.setup, `Agent ${agentId} assigned`);
       }
       // Job started event
       this.emitRunEvent(runId, 'orchestrator.job.started', {
@@ -1444,7 +1550,7 @@ export class ExecutionTracker {
       this.writeOrchLog(
         runId,
         jobId,
-        'setup',
+        OrchLogPhase.enum.setup,
         `Job execution started on agent ${agentId ?? 'unknown'}`,
       );
     } else if (TERMINAL_JOB_STATES.has(state) && job) {
@@ -1454,7 +1560,12 @@ export class ExecutionTracker {
         durationMs: jobDuration,
         metadata: { status: state, agentId },
       });
-      this.writeOrchLog(runId, jobId, 'teardown', `Job completed with status ${state}`);
+      this.writeOrchLog(
+        runId,
+        jobId,
+        OrchLogPhase.enum.teardown,
+        `Job completed with status ${state}`,
+      );
     }
   }
 
@@ -1833,6 +1944,8 @@ export class ExecutionTracker {
           ? { failure_reason: failureReason }
           : {};
 
+    const failureClass = this.computeFailureClass(overallStatus, [...run.jobs.values()]);
+
     // Do not override a run that was already marked failed due to a build
     // failure — the build agent may still complete its job but the run's
     // terminal state should be preserved.
@@ -1843,6 +1956,7 @@ export class ExecutionTracker {
         completed_at: now,
         duration_ms: durationMs,
         log_bytes: runLogBytesTotal,
+        failure_class: failureClass,
         ...failureReasonUpdate,
       })
       .where('run_id', '=', runId)
@@ -1903,6 +2017,7 @@ export class ExecutionTracker {
         triggeredByAgentLabel: run.triggeredByAgentLabel,
         triggerActorUsername: run.triggerActorUsername,
         triggerActorUserId: run.triggerActorUserId,
+        failureClass,
       },
       run.jobs.size,
       startedAt,
@@ -1925,6 +2040,7 @@ export class ExecutionTracker {
       jobResults,
       routingKey: run.routingKey,
       repo: run.repoIdentifier,
+      ...(failureClass && { failureClass }),
     });
 
     // Broadcast run completion to observers (test runs only)
@@ -1935,13 +2051,7 @@ export class ExecutionTracker {
       });
     }
 
-    // Schedule memory pruning
-    setTimeout(() => {
-      this.runs.delete(runId);
-      this.testRunIds.delete(runId);
-      this.jobLogBytes.delete(runId);
-      this.onRunPruned?.(runId);
-    }, PRUNE_DELAY_MS);
+    this.scheduleRunPrune(runId);
   }
 
   /**
@@ -2046,11 +2156,13 @@ export class ExecutionTracker {
     const now = new Date();
     const reason = failureReason ?? 'Build job timed out before execution tracking started';
 
+    const customerId = await this.resolveCustomerId(routingKey);
     await this.db
       .insertInto('execution_runs')
       .values({
         run_id: runId,
         routing_key: routingKey,
+        customer_id: customerId,
         workflow_name: workflowName,
         provider,
         repo_identifier: repoIdentifier,
@@ -2075,12 +2187,17 @@ export class ExecutionTracker {
   }
 
   /**
-   * Insert a `failed` execution_runs row directly for an init failure that
-   * occurred BEFORE onExecutionStarted ran (so no in-memory state exists
-   * and no jobs were dispatched). Also writes the structured init_failure
-   * signal and fires onExecutionStatusChange so Platform's projection picks
-   * it up via the normal forward path. Idempotent: if a row already exists
-   * for this runId, the insert is a no-op (ON CONFLICT DO NOTHING).
+   * Write a `failed` execution_runs row directly for an init failure, and drop
+   * any in-memory run so the recorded failure is the run's final word. Also
+   * writes the structured init_failure signal and fires onExecutionStatusChange
+   * so Platform's projection picks it up via the normal forward path.
+   *
+   * An existing row for this runId is overwritten while it is still live —
+   * dispatch may already have registered the run before init failed — and left
+   * alone once it is terminal, so a run that genuinely finished is never
+   * rewritten as failed. When the guard leaves the row alone, the failure
+   * metric and the Platform forward are suppressed with it: this orchestrator
+   * did not record the init failure, so it must not report one.
    *
    * Closes the silent pre-run-failure gap — without this helper, secret /
    * install-secret / all-jobs-rejected early-exits in dispatch-matched-workflow
@@ -2101,11 +2218,13 @@ export class ExecutionTracker {
     commitMessage?: string;
   }): Promise<void> {
     const now = new Date();
-    await this.db
+    const customerId = await this.resolveCustomerId(args.routingKey);
+    const applied = await this.db
       .insertInto('execution_runs')
       .values({
         run_id: args.runId,
         routing_key: args.routingKey,
+        customer_id: customerId,
         workflow_name: args.workflowName,
         provider: args.provider,
         repo_identifier: args.repoIdentifier,
@@ -2118,10 +2237,40 @@ export class ExecutionTracker {
         completed_at: now,
         status: ExecutionRunStatus.enum.failed,
         failure_reason: args.initFailure.message,
+        failure_class: RunFailureClass.enum.never_started,
         init_failure: JSON.stringify(args.initFailure),
       })
-      .onConflict((oc) => oc.column('run_id').doNothing())
-      .execute();
+      // Overwrite a non-terminal row: dispatch may already have registered the
+      // run as `pending` before init failed, and leaving that row untouched
+      // would strand the run mid-flight. The guard keeps an already-terminal
+      // row — a run that genuinely finished must not be rewritten as failed.
+      .onConflict((oc) =>
+        oc
+          .column('run_id')
+          .doUpdateSet({
+            completed_at: now,
+            // The conflicting row carries the real start, so measure from it
+            // rather than stamping the zero duration the insert path uses.
+            duration_ms: sql<number>`extract(epoch from (${now} - execution_runs.started_at)) * 1000`,
+            status: ExecutionRunStatus.enum.failed,
+            failure_reason: args.initFailure.message,
+            failure_class: RunFailureClass.enum.never_started,
+            init_failure: JSON.stringify(args.initFailure),
+          })
+          .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
+      )
+      .executeTakeFirst();
+
+    // The conflict guard keeps an already-terminal row. When it does, this run
+    // did NOT fail on init as far as our own record is concerned, so neither the
+    // failure metric nor the Platform forward may claim it did — see
+    // `guardedWriteApplied`.
+    if (!guardedWriteApplied(applied)) {
+      logger.debug('Init-failure record skipped: run already terminal in DB', {
+        runId: args.runId,
+      });
+      return;
+    }
 
     executionsTotal.add(1, { status: ExecutionRunStatus.enum.failed });
 
@@ -2137,6 +2286,7 @@ export class ExecutionTracker {
         ref: args.ref,
         triggerEvent: args.triggerEvent,
         commitMessage: args.commitMessage,
+        failureClass: RunFailureClass.enum.never_started,
       },
       0,
       now.getTime(),
@@ -2153,6 +2303,18 @@ export class ExecutionTracker {
       category: args.initFailure.category,
       scope: args.initFailure.scope,
     });
+
+    // Stamp any in-memory run complete so a late job status cannot roll it up
+    // and overwrite this failure with a rolled-up status. Stamped rather than
+    // dropped: a dropped run is rehydrated from the DB by the next status, and
+    // rehydration resets a non-build failure back to `running`, which would
+    // undo the record this method just wrote. Pruning follows the same delay as
+    // a normally-finalized run so late traffic still finds the completed run.
+    const memRun = this.runs.get(args.runId);
+    if (memRun) {
+      memRun.completedAt = now.getTime();
+      this.scheduleRunPrune(args.runId);
+    }
   }
 
   /**
@@ -2161,7 +2323,11 @@ export class ExecutionTracker {
    * `execution_runs` row in the `held` state — alive and resumable — so the
    * dashboard run list surfaces the paused workflow. No jobs are tracked: the
    * workflow-scoped held_runs row + pending workflow context (written by the
-   * caller) keep the run from being counted complete. Idempotent on runId.
+   * caller) keep the run from being counted complete, and any in-memory run is
+   * dropped so jobs registered before the gate cannot roll it up.
+   *
+   * An existing row for this runId is flipped to `held` while it is still live
+   * and left alone once it is terminal — a finished run is never re-held.
    */
   async recordRunHeld(args: {
     runId: string;
@@ -2177,13 +2343,25 @@ export class ExecutionTracker {
     reason: string;
     triggerEvent?: string;
     commitMessage?: string;
+    /**
+     * Pull-request number for PR-triggered holds; null/omitted for non-PR runs.
+     * Stamped so PR-scoped `/kici approve|reject` (which joins `execution_runs`
+     * on `pr_number`) can attribute the held run to its PR — a NULL leaves a
+     * security hold fail-closed unreachable by the comment path.
+     */
+    prNumber?: number | null;
   }): Promise<void> {
     const now = new Date();
+    // Populate customer_id here too: the resume path reuses this held row
+    // (onExecutionStarted is a no-op via ON CONFLICT), so the concurrency gate
+    // must see the resumed run's real org, not the '__default__' fallback.
+    const customerId = await this.resolveCustomerId(args.routingKey);
     await this.db
       .insertInto('execution_runs')
       .values({
         run_id: args.runId,
         routing_key: args.routingKey,
+        customer_id: customerId,
         workflow_name: args.workflowName,
         provider: args.provider,
         repo_identifier: args.repoIdentifier,
@@ -2195,8 +2373,22 @@ export class ExecutionTracker {
         started_at: now,
         status: ExecutionRunStatus.enum.held,
         ...(args.contextName && { context: args.contextName }),
+        ...(args.prNumber != null && { pr_number: args.prNumber }),
       })
-      .onConflict((oc) => oc.column('run_id').doNothing())
+      // Overwrite a non-terminal row: dispatch may already have registered the
+      // run as `pending` before the install gate held it, and leaving that row
+      // untouched would hide the hold from the dashboard run list. The guard
+      // keeps an already-terminal row — a finished run is never re-held.
+      .onConflict((oc) =>
+        oc
+          .column('run_id')
+          .doUpdateSet({
+            status: ExecutionRunStatus.enum.held,
+            ...(args.contextName && { context: args.contextName }),
+            ...(args.prNumber != null && { pr_number: args.prNumber }),
+          })
+          .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
+      )
       .execute();
 
     this.onExecutionStatusChange?.(
@@ -2222,6 +2414,12 @@ export class ExecutionTracker {
       context: args.contextName,
       reason: args.reason,
     });
+
+    // A held run tracks no jobs and resumes into a fresh dispatch, so drop any
+    // in-memory run. Left behind, the jobs already registered before the gate
+    // held the run could satisfy the completion check and finalize a run that
+    // is paused, not finished.
+    this.runs.delete(args.runId);
   }
 
   /**
@@ -2254,6 +2452,10 @@ export class ExecutionTracker {
         status: ExecutionRunStatus.enum.cancelled,
         completed_at: now,
         failure_reason: reason,
+        // Same as computeFailureClass: a cancelled run carries the `cancelled`
+        // class, so the install-gate rejection stays consistent with every
+        // other cancel path (and matches a class-scoped subscription).
+        failure_class: RunFailureClass.enum.cancelled,
       })
       .where('run_id', '=', runId)
       .where('status', '=', ExecutionRunStatus.enum.held)
@@ -2273,6 +2475,7 @@ export class ExecutionTracker {
         sha: row.sha ?? '',
         routingKey: row.routing_key ?? undefined,
         ref: row.ref ?? '',
+        failureClass: RunFailureClass.enum.cancelled,
       },
       0,
       row.started_at ? new Date(row.started_at).getTime() : now.getTime(),
@@ -2305,6 +2508,9 @@ export class ExecutionTracker {
         completed_at: now,
         duration_ms: durationMs,
         failure_reason: reason,
+        // A run that never executed a step (init failure / no agent) is
+        // `never_started` — the infra-class failure customers most want alerts on.
+        failure_class: RunFailureClass.enum.never_started,
         ...(initFailure && { init_failure: JSON.stringify(initFailure) }),
       })
       .where('run_id', '=', runId)
@@ -2349,6 +2555,7 @@ export class ExecutionTracker {
           triggeredByAgentLabel: run.triggeredByAgentLabel,
           triggerActorUsername: run.triggerActorUsername,
           triggerActorUserId: run.triggerActorUserId,
+          failureClass: RunFailureClass.enum.never_started,
         },
         run.jobs.size,
         run.startedAt,
@@ -2358,6 +2565,22 @@ export class ExecutionTracker {
         undefined,
         initFailure,
       );
+
+      // Plane B parity: a never-started run must also emit workflow_complete so
+      // global workflows (workflowComplete triggers) react to it exactly like a
+      // normal completion. Same shape as the normal-path emit; orchestrator-core's
+      // onWorkflowComplete wiring forwards it to the __workflow_complete event.
+      this.onWorkflowComplete?.({
+        runId,
+        workflowName: run.workflowName,
+        status: ExecutionRunStatus.enum.failed,
+        duration: completedAt - run.startedAt,
+        jobResults: Array.from(run.jobs.values()).map((j) => ({ name: j.name, status: j.status })),
+        routingKey: run.routingKey,
+        repo: run.repoIdentifier,
+        failureClass: RunFailureClass.enum.never_started,
+      });
+
       this.runs.delete(runId);
       this.jobLogBytes.delete(runId);
     }
@@ -2510,12 +2733,84 @@ export class ExecutionTracker {
   isRunComplete(runId: string): boolean {
     const run = this.runs.get(runId);
     if (!run) return false;
+    // Jobs are still to be registered for this run (see holdRunForPendingJobs)
+    // — the jobs it knows about are not the jobs it will end up with, so "all
+    // terminal" says nothing yet.
+    if ((run.pendingJobRegistrations ?? 0) > 0) return false;
     for (const job of run.jobs.values()) {
       if (!TERMINAL_JOB_STATES.has(job.status)) {
         return false;
       }
     }
     return run.jobs.size > 0;
+  }
+
+  /**
+   * Take a token holding a run open while some of its jobs are still to be
+   * registered. Returns true when a token was taken, false for an unknown or
+   * already-completed run (nothing to hold).
+   *
+   * Three registration windows need this. A run whose source-pack `__build__`
+   * job is dispatched first is registered with that job ALONE, and its real
+   * jobs are only dispatched once the build finishes. A deferred init job and a
+   * deferred dynamic entry each register their jobs from a fire-and-forget task
+   * that outlives the dispatch call. In every case, without a token the already
+   * -registered jobs reaching a terminal state satisfies {@link isRunComplete},
+   * so the run is finalized early: a terminal run status is written, the
+   * provider check is posted, and the status is forwarded to the Platform — all
+   * before a single real job has run.
+   *
+   * The hold is a counter on the in-memory run, read only by
+   * {@link isRunComplete} — deliberately NOT a synthetic entry in the run's job
+   * map. The job map is what every outward projection enumerates (the Platform
+   * `state.replay` snapshot and its `execution_jobs` mirror, the reported job
+   * count, the workflow-complete job results, the active-run summary), so a
+   * marker parked there would surface as a phantom pending job on the dashboard
+   * and an off-by-one job count for the length of the window. A counter holds
+   * the completion check open without being visible to any of them, and it
+   * writes no `execution_jobs` row, so it never surfaces as a phantom job.
+   * A token whose holder never settles keeps the run `running` until the stale
+   * detector reaps it — the same backstop that covers a job that never
+   * reports.
+   *
+   * Each token must be paired with exactly one {@link releasePendingJobsHold}.
+   */
+  holdRunForPendingJobs(runId: string): boolean {
+    const run = this.runs.get(runId);
+    if (!run || run.completedAt) return false;
+    run.pendingJobRegistrations = (run.pendingJobRegistrations ?? 0) + 1;
+    return true;
+  }
+
+  /**
+   * Drop one token taken by {@link holdRunForPendingJobs}, and finalize the run
+   * if dropping the LAST one left every remaining job terminal.
+   *
+   * The re-evaluation matters for the same reason it does in `addJobsToRun`:
+   * once the last token is gone nothing else drives a completion check (no
+   * further `job.status` messages are coming for already-finished jobs), so a
+   * run whose jobs all finished while a token was held would otherwise hang in
+   * `running` forever. Only the last release may finalize — while any other
+   * token is outstanding more jobs are still on their way.
+   *
+   * Idempotent — a no-op when no token is outstanding. The count clamps at
+   * zero so a stray extra release cannot drive it negative, which would
+   * permanently un-hold the run and stop a genuinely outstanding token from
+   * holding it open.
+   */
+  async releasePendingJobsHold(runId: string): Promise<void> {
+    if ((this.runs.get(runId)?.pendingJobRegistrations ?? 0) <= 0) return;
+    await this.withRunLock(runId, async () => {
+      const run = this.runs.get(runId);
+      if (!run || (run.pendingJobRegistrations ?? 0) <= 0) return;
+      run.pendingJobRegistrations = Math.max(0, (run.pendingJobRegistrations ?? 0) - 1);
+      if (run.pendingJobRegistrations > 0) return;
+      if (run.completedAt || !this.isRunComplete(runId)) return;
+      const stopAfterStuckCheck = await this.enforceSchedulerInvariantOrFail(runId);
+      if (!stopAfterStuckCheck && !run.completedAt && this.isRunComplete(runId)) {
+        await this.finalizeRunCompletion(run, runId, Date.now(), new Date());
+      }
+    });
   }
 
   /**
@@ -2637,9 +2932,11 @@ export class ExecutionTracker {
         ) {
           completed++;
         } else if (
-          job.status === ExecutionJobStatus.enum.failed ||
-          job.status === ExecutionJobStatus.enum.cancelled ||
-          job.status === ExecutionJobStatus.enum.timed_out_stale
+          // Shared classification, not a hand-listed set: a terminal job that
+          // never ran (`drift_dropped`, `unroutable`) must not be counted as
+          // still running in the live in-flight summary.
+          isFailureStatus(job.status) ||
+          job.status === ExecutionJobStatus.enum.cancelled
         ) {
           failed++;
         } else {
@@ -2683,6 +2980,7 @@ export class ExecutionTracker {
     triggeredBy?: string | null;
     triggeredByAgentLabel?: string | null;
     failureReason?: string;
+    failureClass?: RunFailureClass;
     jobCount: number;
     startedAt: number;
     completedAt?: number;
@@ -2730,6 +3028,9 @@ export class ExecutionTracker {
     for (const [runId, run] of this.runs) {
       const isComplete = this.isRunComplete(runId);
       const status = isComplete ? this.computeRunStatus(run) : run.status;
+      const failureClass = isComplete
+        ? this.computeFailureClass(status, [...run.jobs.values()])
+        : null;
       const durationMs = run.completedAt ? run.completedAt - run.startedAt : undefined;
 
       const jobs: Array<{
@@ -2770,6 +3071,7 @@ export class ExecutionTracker {
         triggeredBy: run.triggeredBy,
         triggeredByAgentLabel: run.triggeredByAgentLabel,
         ...(run.failureReason && { failureReason: run.failureReason }),
+        ...(failureClass && { failureClass }),
         jobCount: run.jobs.size,
         startedAt: run.startedAt,
         completedAt: run.completedAt,
@@ -2822,6 +3124,7 @@ export class ExecutionTracker {
       triggered_by: string | null;
       triggered_by_agent_label: string | null;
       failure_reason: string | null;
+      failure_class: string | null;
     }> = [];
 
     try {
@@ -2843,6 +3146,7 @@ export class ExecutionTracker {
           'triggered_by',
           'triggered_by_agent_label',
           'failure_reason',
+          'failure_class',
         ])
         .where('status', 'in', [
           ExecutionRunStatus.enum.success,
@@ -2903,6 +3207,7 @@ export class ExecutionTracker {
         triggeredBy: r.triggered_by,
         triggeredByAgentLabel: r.triggered_by_agent_label,
         ...(r.failure_reason && { failureReason: r.failure_reason }),
+        ...(r.failure_class && { failureClass: r.failure_class as RunFailureClass }),
         jobCount: jobs.length,
         startedAt: r.started_at.getTime(),
         ...(r.completed_at && { completedAt: r.completed_at.getTime() }),
@@ -3078,6 +3383,11 @@ export class ExecutionTracker {
    * stale detector when memRun is still tracked locally — writes the
    * execution_runs terminal row, fires Platform-forwarding +
    * workflow-complete callbacks, and schedules in-memory pruning.
+   *
+   * The terminal write is clobber-guarded. If the guard rejects it (the run
+   * already finished through the normal path), only the pruning happens: the
+   * recomputed status is not this orchestrator's record of the run, so neither
+   * the callbacks nor the completion metrics may claim it.
    */
   private async completeRunFromMemoryState(memRun: RunState, runId: string): Promise<void> {
     const overallStatus = this.computeRunStatus(memRun);
@@ -3089,12 +3399,15 @@ export class ExecutionTracker {
         ? 'Run completed via stale detection (no heartbeat received)'
         : undefined;
 
-    await this.db
+    const failureClass = this.computeFailureClass(overallStatus, [...memRun.jobs.values()]);
+
+    const applied = await this.db
       .updateTable('execution_runs')
       .set({
         status: overallStatus,
         completed_at: new Date(),
         duration_ms: durationMs,
+        failure_class: failureClass,
       })
       .where('run_id', '=', runId)
       .where('status', 'in', [
@@ -3102,7 +3415,26 @@ export class ExecutionTracker {
         ExecutionRunStatus.enum.running,
         ExecutionRunStatus.enum.cancelling,
       ])
-      .execute();
+      .executeTakeFirst();
+
+    // The guard above rejects a run that already reached a terminal state via
+    // the normal completion path. When it rejects, the recomputed
+    // `overallStatus` is NOT this orchestrator's record of the run — a job
+    // marked `timed_out_stale` in memory after the run finished green
+    // recomputes to `failed` while the row still (correctly) reads `success`.
+    // Forwarding it would hand the Platform a terminal status our own DB
+    // refused, and the Platform never revisits a terminal mirror row, so the
+    // two planes would disagree permanently. Emit nothing: the normal path
+    // already forwarded the real status, and a mirror still stuck non-terminal
+    // is exactly what the Platform's run-mirror reconciler re-pulls.
+    if (!guardedWriteApplied(applied)) {
+      logger.debug('Stale-detector completion skipped: run already terminal in DB', {
+        runId,
+        recomputedStatus: overallStatus,
+      });
+      this.scheduleRunPrune(runId);
+      return;
+    }
 
     // Only stamp the generic stale reason if nothing more specific
     // (e.g. a scaler provisioning error or an agent step-failure) was
@@ -3165,6 +3497,7 @@ export class ExecutionTracker {
         triggeredByAgentLabel: memRun.triggeredByAgentLabel,
         triggerActorUsername: memRun.triggerActorUsername,
         triggerActorUserId: memRun.triggerActorUserId,
+        failureClass,
       },
       memRun.jobs.size,
       memRun.startedAt,
@@ -3186,11 +3519,27 @@ export class ExecutionTracker {
       jobResults: staleJobResults,
       routingKey: memRun.routingKey,
       repo: memRun.repoIdentifier,
+      ...(failureClass && { failureClass }),
     });
 
-    // Schedule memory pruning
+    this.scheduleRunPrune(runId);
+  }
+
+  /**
+   * Drop a finished run's in-memory state after a grace period, so a late
+   * status/heartbeat arriving just after completion still finds its run.
+   *
+   * This is the single owner of run-lifetime state teardown, so every
+   * run-lifetime map is cleared here — including `testRunIds`: a run finished by
+   * the stale detector rather than the normal completion path would otherwise
+   * leave its observer-broadcast marker behind for the process's lifetime.
+   * (`runLockTails` is deliberately not touched: it is keyed by runId but scoped
+   * to a lock's holders, and `withRunLock` drops its own entry on release.)
+   */
+  private scheduleRunPrune(runId: string): void {
     setTimeout(() => {
       this.runs.delete(runId);
+      this.testRunIds.delete(runId);
       this.jobLogBytes.delete(runId);
       this.onRunPruned?.(runId);
     }, PRUNE_DELAY_MS);
@@ -3201,6 +3550,11 @@ export class ExecutionTracker {
    * pruned runs). Loads jobs + run row from execution_jobs/execution_runs,
    * checks the all-terminal predicate + run-state guard, then writes the
    * terminal row and fires Platform-forwarding callbacks.
+   *
+   * The run-state read and the terminal write are separate statements, so the
+   * write carries its own clobber guard. If that guard rejects it — a
+   * concurrent normal completion landed in between — the callbacks and the
+   * completion metrics are suppressed with it.
    */
   private async completeRunFromDbFallback(runId: string): Promise<void> {
     const jobs = await this.db
@@ -3212,12 +3566,13 @@ export class ExecutionTracker {
     const allTerminal = jobs.length > 0 && jobs.every((j) => TERMINAL_JOB_STATES.has(j.status));
     if (!allTerminal) return;
 
-    // Compute overall status from DB rows
-    const hasFailed = jobs.some(
-      (j) =>
-        j.status === ExecutionJobStatus.enum.failed ||
-        j.status === ExecutionJobStatus.enum.timed_out_stale,
-    );
+    // Compute overall status from DB rows. Reads the engine's shared
+    // classification — the same table `computeRunStatus` uses on the in-memory
+    // path — so the two paths cannot disagree about what "failed" means. A
+    // hand-listed set here silently reported success for a run whose only
+    // non-success job was `drift_dropped` or `unroutable`: a declared job that
+    // never ran, rendered as a green run.
+    const hasFailed = jobs.some((j) => isFailureStatus(j.status));
     const hasCancelled = jobs.some((j) => j.status === ExecutionJobStatus.enum.cancelled);
     const overallStatus: Extract<ExecutionRunStatus, 'success' | 'failed' | 'cancelled'> = hasFailed
       ? ExecutionRunStatus.enum.failed
@@ -3264,12 +3619,15 @@ export class ExecutionTracker {
         ? 'Run recovered from orphaned state (DB-fallback completion)'
         : undefined;
 
-    await this.db
+    const failureClass = this.computeFailureClass(overallStatus, jobs);
+
+    const applied = await this.db
       .updateTable('execution_runs')
       .set({
         status: overallStatus,
         completed_at: now,
         duration_ms: durationMs,
+        failure_class: failureClass,
       })
       .where('run_id', '=', runId)
       .where('status', 'in', [
@@ -3277,7 +3635,19 @@ export class ExecutionTracker {
         ExecutionRunStatus.enum.running,
         ExecutionRunStatus.enum.cancelling,
       ])
-      .execute();
+      .executeTakeFirst();
+
+    // The `dbRun` read above is not in the same transaction as this write, so a
+    // concurrent normal completion can turn the row terminal in between. When
+    // the guard then rejects the write, `overallStatus` is not our record of the
+    // run and must not be forwarded — see `guardedWriteApplied`.
+    if (!guardedWriteApplied(applied)) {
+      logger.debug('DB-fallback completion skipped: run already terminal in DB', {
+        runId,
+        recomputedStatus: overallStatus,
+      });
+      return;
+    }
 
     // Only stamp the generic orphan reason if nothing more specific
     // (e.g. a scaler provisioning error or an agent step-failure) was
@@ -3309,14 +3679,10 @@ export class ExecutionTracker {
     const installationId =
       typeof providerCtx.installationId === 'number' ? providerCtx.installationId : undefined;
 
-    // Build description from DB job rows
-    const failedJobNames = jobs
-      .filter(
-        (j) =>
-          j.status === ExecutionJobStatus.enum.failed ||
-          j.status === ExecutionJobStatus.enum.timed_out_stale,
-      )
-      .map((j) => j.job_name);
+    // Build description from DB job rows, off the same shared classification as
+    // `buildRunDescription` on the in-memory path — otherwise a run that failed
+    // solely on a job that never ran gets `Failed jobs:` with nothing in it.
+    const failedJobNames = jobs.filter((j) => isFailureStatus(j.status)).map((j) => j.job_name);
     const description =
       overallStatus !== ExecutionRunStatus.enum.success && failedJobNames.length > 0
         ? `Failed jobs: ${failedJobNames.join(', ')}`
@@ -3354,6 +3720,7 @@ export class ExecutionTracker {
         triggeredByAgentLabel: dbRun.triggered_by_agent_label ?? undefined,
         triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
         triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
+        failureClass,
       },
       jobs.length,
       new Date(dbRun.started_at).getTime(),
@@ -3418,7 +3785,19 @@ export class ExecutionTracker {
       },
     });
 
-    // 2. Write to provisioning log file for the log viewer's provisioning section
+    // 2. Live forward to Platform for run-detail streaming (provisioning phase),
+    // in addition to persistence. Best-effort, gated on orgId like run.event.
+    if (this.onOrchLog && this.orgId) {
+      this.onOrchLog({
+        runId,
+        jobId,
+        phase: OrchLogPhase.enum.provisioning,
+        lines: [event.detail],
+        ts: event.timestampMs,
+      });
+    }
+
+    // 3. Write to provisioning log file for the log viewer's provisioning section
     if (this.logStorage) {
       const line = JSON.stringify({
         ts: event.timestampMs,
@@ -3437,7 +3816,7 @@ export class ExecutionTracker {
       });
     }
 
-    // 3. On a failure, persist the detail to the dispatch_queue row so the
+    // 4. On a failure, persist the detail to the dispatch_queue row so the
     // queue-timeout reaper can surface the real cause (survives a leader
     // switch). `jobId` is the dispatch_queue row id. Fire-and-forget like the
     // provisioning.jsonl write; a failure here must not break dispatch.
@@ -3462,9 +3841,16 @@ export class ExecutionTracker {
    * Log format is JSONL for structured parsing on the frontend.
    * Path convention: executions/{runId}/jobs/{jobId}/orchestration.jsonl
    */
-  private writeOrchLog(runId: string, jobId: string, phase: string, message: string): void {
+  private writeOrchLog(runId: string, jobId: string, phase: OrchLogPhase, message: string): void {
+    const ts = Date.now();
+    // Live forward to Platform for run-detail streaming (in addition to
+    // persistence). Best-effort, gated on orgId like run.event emission so a
+    // non-platform-bound orchestrator doesn't push ambiguous tenant frames.
+    if (this.onOrchLog && this.orgId) {
+      this.onOrchLog({ runId, jobId, phase, lines: [message], ts });
+    }
     if (!this.logStorage) return;
-    const line = JSON.stringify({ ts: Date.now(), phase, message });
+    const line = JSON.stringify({ ts, phase, message });
     const logPath = `executions/${runId}/jobs/${jobId}/orchestration.jsonl`;
     this.logStorage.append(logPath, line + '\n').catch((err) => {
       logger.warn('Failed to write orchestration log', {
@@ -3492,11 +3878,7 @@ export class ExecutionTracker {
 
     const failedNames: string[] = [];
     for (const job of run.jobs.values()) {
-      if (
-        job.status === ExecutionJobStatus.enum.failed ||
-        job.status === ExecutionJobStatus.enum.timed_out_stale ||
-        job.status === ExecutionJobStatus.enum.drift_dropped
-      ) {
+      if (isFailureStatus(job.status)) {
         failedNames.push(job.name);
       }
     }
@@ -3513,7 +3895,7 @@ export class ExecutionTracker {
    *
    * Per locked decision:
    * - success ONLY if ALL jobs pass (skipped jobs count as success)
-   * - failed if ANY job failed or timed_out_stale
+   * - failed if ANY job ended in a failure status (see `STATUS_FAILURE_CLASS`)
    * - cancelled if ANY job cancelled (and none failed)
    */
   private computeRunStatus(
@@ -3529,11 +3911,7 @@ export class ExecutionTracker {
     let hasCancelled = false;
 
     for (const job of run.jobs.values()) {
-      if (
-        job.status === ExecutionJobStatus.enum.failed ||
-        job.status === ExecutionJobStatus.enum.timed_out_stale ||
-        job.status === ExecutionJobStatus.enum.drift_dropped
-      ) {
+      if (isFailureStatus(job.status)) {
         hasFailed = true;
       } else if (job.status === ExecutionJobStatus.enum.cancelled) {
         hasCancelled = true;
@@ -3543,5 +3921,35 @@ export class ExecutionTracker {
     if (hasFailed) return ExecutionRunStatus.enum.failed;
     if (hasCancelled) return ExecutionRunStatus.enum.cancelled;
     return ExecutionRunStatus.enum.success;
+  }
+
+  /**
+   * Derive the failure class from a terminal run's job statuses. Null for
+   * success (and any non-terminal status). `timed_out_stale` / `drift_dropped`
+   * / `unroutable` jobs — a job that never dispatched, whose `runsOn` matched no
+   * agent, whose agent went silent, or that was dropped by a topology reroute —
+   * are infra-class and collapse to `timed_out`; any other `failed` run is a
+   * `step_failure` (a job actually ran and failed). `never_started` (init
+   * failure) and `dead_orchestrator` (Platform-detected) are stamped by their
+   * own paths, not here.
+   */
+  // The infra-vs-step split below is deliberately narrower than
+  // `isFailureStatus`: it separates a job that never really ran
+  // (`timed_out_stale` / `drift_dropped` / `unroutable`) from one that ran and
+  // failed. Classifying an unroutable job as `step_failure` would point the
+  // operator at logs that do not exist — no step ever ran.
+  private computeFailureClass(
+    status: ExecutionRunStatus,
+    jobs: Array<{ status: string }>,
+  ): RunFailureClass | null {
+    if (status === ExecutionRunStatus.enum.cancelled) return RunFailureClass.enum.cancelled;
+    if (status !== ExecutionRunStatus.enum.failed) return null;
+    const timedOut = jobs.some(
+      (j) =>
+        j.status === ExecutionJobStatus.enum.timed_out_stale ||
+        j.status === ExecutionJobStatus.enum.drift_dropped ||
+        j.status === ExecutionJobStatus.enum.unroutable,
+    );
+    return timedOut ? RunFailureClass.enum.timed_out : RunFailureClass.enum.step_failure;
   }
 }

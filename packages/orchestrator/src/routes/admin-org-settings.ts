@@ -13,12 +13,14 @@ import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { canonicalizeCapability, isKnownCapability } from '@kici-dev/engine';
 import { repoPatternEntrySchema } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import type { RepoPatternEntry } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import {
   DashboardWriteOperation,
   dashboardWritePolicyMapSchema,
   resolveFullPolicyView,
+  resolveFullPolicyStateView,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import type { Database, OrgSettings } from '../db/types.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
@@ -65,11 +67,40 @@ const updateSchema = z.object({
   // default; a positive integer sets a per-org value.
   userCacheQuotaBytes: z.number().int().positive().nullable().optional(),
   userCacheTtlMs: z.number().int().positive().nullable().optional(),
+  artifactQuotaBytes: z.number().int().positive().nullable().optional(),
+  artifactTtlMs: z.number().int().positive().nullable().optional(),
+  // Per-org per-artifact size cap (bytes) + per-run artifact count cap. null
+  // clears the override → cluster-wide default; a positive integer sets it.
+  artifactMaxBytes: z.number().int().positive().nullable().optional(),
+  artifactMaxPerRun: z.number().int().positive().nullable().optional(),
   dispatchAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  // Per-org webhook-ingest concurrency cap. null clears the override (fall back
+  // to the cluster-wide default); a positive integer sets a per-org value.
+  ingestMaxConcurrency: z.number().int().min(1).nullable().optional(),
+  // Per-org scaler spawn deadline (ms). null clears the override → cluster
+  // default; a value >= 1000 sets a per-org override.
+  scalerSpawnTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  // Reroute tunables. null clears the per-org override (fall back to the
+  // cluster-wide config default); a positive value sets a per-org override.
+  rerouteSpawnWindowMs: z.number().int().min(1000).nullable().optional(),
+  rerouteAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  rerouteMaxHops: z.number().int().min(1).nullable().optional(),
+  // Per-org DB-backup freshness WARN threshold (hours). null clears the
+  // override (fall back to the cluster-wide config default).
+  backupStalenessWarnHours: z.number().int().min(1).nullable().optional(),
+  // Per-org dispatch-queue job timeout (ms). null clears the override → cluster
+  // default (config.queueTimeoutMs). 0 = indefinite (no expiry).
+  queueTimeoutMs: z.number().int().min(0).nullable().optional(),
   // Approval policy. Both have NOT NULL defaults in the DB, so they are not
   // nullable here — a value always replaces the current one.
   approvalExpirySeconds: z.number().int().min(1).optional(),
   allowSelfApproval: z.boolean().optional(),
+  // Container-sandbox escape-hatch allow-list. null clears the override →
+  // deny-all default; an array sets the allowed Linux capabilities (each
+  // validated as a real capability and stored canonicalized). A boolean toggles
+  // whether a workflow may request `sandbox: { network: 'host' }`.
+  sandboxAllowedCapabilities: z.array(z.string()).nullable().optional(),
+  sandboxAllowHostNetwork: z.boolean().nullable().optional(),
 });
 
 interface ProjectedSettings {
@@ -83,12 +114,38 @@ interface ProjectedSettings {
   userCacheQuotaBytes: number | null;
   /** Per-org user-cache entry TTL (ms); null = cluster-wide default. */
   userCacheTtlMs: number | null;
+  /** Per-org artifact byte quota; null = cluster-wide default. */
+  artifactQuotaBytes: number | null;
+  /** Per-org artifact TTL (ms); null = cluster-wide default. */
+  artifactTtlMs: number | null;
+  /** Per-org per-artifact size cap (bytes); null = cluster-wide default. */
+  artifactMaxBytes: number | null;
+  /** Per-org per-run artifact count cap; null = cluster-wide default. */
+  artifactMaxPerRun: number | null;
   /** Per-org dispatch-acknowledgment deadline (ms); null = cluster-wide default. */
   dispatchAckTimeoutMs: number | null;
+  /** Per-org webhook-ingest concurrency cap; null = cluster-wide default. */
+  ingestMaxConcurrency: number | null;
+  /** Per-org scaler spawn deadline (ms); null = cluster-wide default. */
+  scalerSpawnTimeoutMs: number | null;
+  /** Per-org reroute spawn window (ms); null = cluster-wide default. */
+  rerouteSpawnWindowMs: number | null;
+  /** Per-org reroute ACK timeout (ms); null = cluster-wide default. */
+  rerouteAckTimeoutMs: number | null;
+  /** Per-org reroute max hops; null = cluster-wide default. */
+  rerouteMaxHops: number | null;
+  /** Per-org backup-freshness WARN threshold (hours); null = cluster default. */
+  backupStalenessWarnHours: number | null;
+  /** Per-org dispatch-queue job timeout (ms); null = cluster default. */
+  queueTimeoutMs: number | null;
   /** Per-org held-approval expiry (seconds). */
   approvalExpirySeconds: number;
   /** Whether a run's triggerer may self-approve its held elements. */
   allowSelfApproval: boolean;
+  /** Container-sandbox capabilities a workflow may request; [] = deny all. */
+  sandboxAllowedCapabilities: string[];
+  /** Whether a workflow may request host networking; false = deny. */
+  sandboxAllowHostNetwork: boolean;
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -109,11 +166,24 @@ function projectRow(customerId: string, row: OrgSettings | undefined): Projected
       allowHttpNpmRegistries: false,
       userCacheQuotaBytes: null,
       userCacheTtlMs: null,
+      artifactQuotaBytes: null,
+      artifactTtlMs: null,
+      artifactMaxBytes: null,
+      artifactMaxPerRun: null,
       dispatchAckTimeoutMs: null,
+      ingestMaxConcurrency: null,
+      scalerSpawnTimeoutMs: null,
+      rerouteSpawnWindowMs: null,
+      rerouteAckTimeoutMs: null,
+      rerouteMaxHops: null,
+      backupStalenessWarnHours: null,
+      queueTimeoutMs: null,
       // Mirror the DB column defaults so a customer with no row reads the
       // same effective policy a fresh row would carry.
       approvalExpirySeconds: 86400,
       allowSelfApproval: true,
+      sandboxAllowedCapabilities: [],
+      sandboxAllowHostNetwork: false,
       createdAt: null,
       updatedAt: null,
     };
@@ -127,9 +197,22 @@ function projectRow(customerId: string, row: OrgSettings | undefined): Projected
     allowHttpNpmRegistries: row.allow_http_npm_registries,
     userCacheQuotaBytes: bigintToNumber(row.user_cache_quota_bytes),
     userCacheTtlMs: bigintToNumber(row.user_cache_ttl_ms),
+    artifactQuotaBytes: bigintToNumber(row.artifact_quota_bytes),
+    artifactTtlMs: bigintToNumber(row.artifact_ttl_ms),
+    artifactMaxBytes: bigintToNumber(row.artifact_max_bytes),
+    artifactMaxPerRun: bigintToNumber(row.artifact_max_per_run),
     dispatchAckTimeoutMs: bigintToNumber(row.dispatch_ack_timeout_ms),
+    ingestMaxConcurrency: bigintToNumber(row.ingest_max_concurrency),
+    scalerSpawnTimeoutMs: bigintToNumber(row.scaler_spawn_timeout_ms),
+    rerouteSpawnWindowMs: bigintToNumber(row.reroute_spawn_window_ms),
+    rerouteAckTimeoutMs: bigintToNumber(row.reroute_ack_timeout_ms),
+    rerouteMaxHops: row.reroute_max_hops,
+    backupStalenessWarnHours: row.backup_staleness_warn_hours,
+    queueTimeoutMs: bigintToNumber(row.queue_timeout_ms),
     approvalExpirySeconds: row.approval_expiry_seconds,
     allowSelfApproval: row.allow_self_approval,
+    sandboxAllowedCapabilities: row.sandbox_allowed_capabilities ?? [],
+    sandboxAllowHostNetwork: row.sandbox_allow_host_network ?? false,
     createdAt:
       row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
     updatedAt:
@@ -193,12 +276,36 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         existing?.user_cache_quota_bytes ?? null,
       );
       let userCacheTtlMs: number | null = bigintToNumber(existing?.user_cache_ttl_ms ?? null);
+      let artifactQuotaBytes: number | null = bigintToNumber(
+        existing?.artifact_quota_bytes ?? null,
+      );
+      let artifactTtlMs: number | null = bigintToNumber(existing?.artifact_ttl_ms ?? null);
+      let artifactMaxBytes: number | null = bigintToNumber(existing?.artifact_max_bytes ?? null);
+      let artifactMaxPerRun: number | null = bigintToNumber(existing?.artifact_max_per_run ?? null);
       let dispatchAckTimeoutMs: number | null = bigintToNumber(
         existing?.dispatch_ack_timeout_ms ?? null,
       );
+      let ingestMaxConcurrency: number | null = bigintToNumber(
+        existing?.ingest_max_concurrency ?? null,
+      );
+      let scalerSpawnTimeoutMs: number | null = bigintToNumber(
+        existing?.scaler_spawn_timeout_ms ?? null,
+      );
+      let rerouteSpawnWindowMs: number | null = bigintToNumber(
+        existing?.reroute_spawn_window_ms ?? null,
+      );
+      let rerouteAckTimeoutMs: number | null = bigintToNumber(
+        existing?.reroute_ack_timeout_ms ?? null,
+      );
+      let rerouteMaxHops: number | null = existing?.reroute_max_hops ?? null;
+      let backupStalenessWarnHours: number | null = existing?.backup_staleness_warn_hours ?? null;
+      let queueTimeoutMs: number | null = bigintToNumber(existing?.queue_timeout_ms ?? null);
       // NOT NULL columns: fall back to the DB defaults when no row exists yet.
       let approvalExpirySeconds: number = existing?.approval_expiry_seconds ?? 86400;
       let allowSelfApproval: boolean = existing?.allow_self_approval ?? true;
+      let sandboxAllowedCapabilities: string[] | null =
+        existing?.sandbox_allowed_capabilities ?? null;
+      let sandboxAllowHostNetwork: boolean | null = existing?.sandbox_allow_host_network ?? null;
 
       if (body.enabled !== undefined) enabled = body.enabled;
       if (body.allowedRepos !== undefined) allowedRepos = body.allowedRepos;
@@ -210,10 +317,38 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       // cluster-wide default), so distinguish it from undefined (leave as-is).
       if (body.userCacheQuotaBytes !== undefined) userCacheQuotaBytes = body.userCacheQuotaBytes;
       if (body.userCacheTtlMs !== undefined) userCacheTtlMs = body.userCacheTtlMs;
+      if (body.artifactQuotaBytes !== undefined) artifactQuotaBytes = body.artifactQuotaBytes;
+      if (body.artifactTtlMs !== undefined) artifactTtlMs = body.artifactTtlMs;
+      if (body.artifactMaxBytes !== undefined) artifactMaxBytes = body.artifactMaxBytes;
+      if (body.artifactMaxPerRun !== undefined) artifactMaxPerRun = body.artifactMaxPerRun;
       if (body.dispatchAckTimeoutMs !== undefined) dispatchAckTimeoutMs = body.dispatchAckTimeoutMs;
+      if (body.ingestMaxConcurrency !== undefined) ingestMaxConcurrency = body.ingestMaxConcurrency;
+      if (body.scalerSpawnTimeoutMs !== undefined) scalerSpawnTimeoutMs = body.scalerSpawnTimeoutMs;
+      if (body.rerouteSpawnWindowMs !== undefined) rerouteSpawnWindowMs = body.rerouteSpawnWindowMs;
+      if (body.rerouteAckTimeoutMs !== undefined) rerouteAckTimeoutMs = body.rerouteAckTimeoutMs;
+      if (body.rerouteMaxHops !== undefined) rerouteMaxHops = body.rerouteMaxHops;
+      if (body.backupStalenessWarnHours !== undefined)
+        backupStalenessWarnHours = body.backupStalenessWarnHours;
+      if (body.queueTimeoutMs !== undefined) queueTimeoutMs = body.queueTimeoutMs;
       if (body.approvalExpirySeconds !== undefined)
         approvalExpirySeconds = body.approvalExpirySeconds;
       if (body.allowSelfApproval !== undefined) allowSelfApproval = body.allowSelfApproval;
+      if (body.sandboxAllowHostNetwork !== undefined)
+        sandboxAllowHostNetwork = body.sandboxAllowHostNetwork;
+      if (body.sandboxAllowedCapabilities !== undefined) {
+        if (body.sandboxAllowedCapabilities === null) {
+          sandboxAllowedCapabilities = null;
+        } else {
+          // Reject an operator typo loudly (an allow-listed garbage cap would
+          // silently never match) and store the canonical bare uppercase form
+          // so the reader/resolver compare canonical-to-canonical.
+          const bad = body.sandboxAllowedCapabilities.find((cap) => !isKnownCapability(cap));
+          if (bad !== undefined) {
+            return c.json({ error: `unknown Linux capability '${bad}'` }, 400);
+          }
+          sandboxAllowedCapabilities = body.sandboxAllowedCapabilities.map(canonicalizeCapability);
+        }
+      }
 
       const allowedJson = serializeJsonbList(allowedRepos);
       const deniedJson = serializeJsonbList(deniedRepos);
@@ -230,9 +365,22 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           allow_http_npm_registries: allowHttpNpmRegistries,
           user_cache_quota_bytes: userCacheQuotaBytes,
           user_cache_ttl_ms: userCacheTtlMs,
+          artifact_quota_bytes: artifactQuotaBytes,
+          artifact_ttl_ms: artifactTtlMs,
+          artifact_max_bytes: artifactMaxBytes,
+          artifact_max_per_run: artifactMaxPerRun,
           dispatch_ack_timeout_ms: dispatchAckTimeoutMs,
+          ingest_max_concurrency: ingestMaxConcurrency,
+          scaler_spawn_timeout_ms: scalerSpawnTimeoutMs,
+          reroute_spawn_window_ms: rerouteSpawnWindowMs,
+          reroute_ack_timeout_ms: rerouteAckTimeoutMs,
+          reroute_max_hops: rerouteMaxHops,
+          backup_staleness_warn_hours: backupStalenessWarnHours,
+          queue_timeout_ms: queueTimeoutMs,
           approval_expiry_seconds: approvalExpirySeconds,
           allow_self_approval: allowSelfApproval,
+          sandbox_allowed_capabilities: sandboxAllowedCapabilities,
+          sandbox_allow_host_network: sandboxAllowHostNetwork,
         })
         .onConflict((oc) =>
           oc.column('customer_id').doUpdateSet({
@@ -243,9 +391,22 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
             allow_http_npm_registries: allowHttpNpmRegistries,
             user_cache_quota_bytes: userCacheQuotaBytes,
             user_cache_ttl_ms: userCacheTtlMs,
+            artifact_quota_bytes: artifactQuotaBytes,
+            artifact_ttl_ms: artifactTtlMs,
+            artifact_max_bytes: artifactMaxBytes,
+            artifact_max_per_run: artifactMaxPerRun,
             dispatch_ack_timeout_ms: dispatchAckTimeoutMs,
+            ingest_max_concurrency: ingestMaxConcurrency,
+            scaler_spawn_timeout_ms: scalerSpawnTimeoutMs,
+            reroute_spawn_window_ms: rerouteSpawnWindowMs,
+            reroute_ack_timeout_ms: rerouteAckTimeoutMs,
+            reroute_max_hops: rerouteMaxHops,
+            backup_staleness_warn_hours: backupStalenessWarnHours,
+            queue_timeout_ms: queueTimeoutMs,
             approval_expiry_seconds: approvalExpirySeconds,
             allow_self_approval: allowSelfApproval,
+            sandbox_allowed_capabilities: sandboxAllowedCapabilities,
+            sandbox_allow_host_network: sandboxAllowHostNetwork,
             updated_at: sql<Date>`now()`,
           }),
         )
@@ -280,6 +441,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         customerId,
         stored,
         effective: resolveFullPolicyView(stored),
+        states: resolveFullPolicyStateView(stored),
       });
     } catch (err) {
       return handleAdminError(c, err, logger);
@@ -329,6 +491,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         customerId: body.customerId,
         stored,
         effective: resolveFullPolicyView(stored),
+        states: resolveFullPolicyStateView(stored),
       });
     } catch (err) {
       logger.error('Failed to update dashboard-write policy', { error: toErrorMessage(err) });

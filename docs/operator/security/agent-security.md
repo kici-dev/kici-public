@@ -23,14 +23,14 @@ The user identity that spawned processes run as depends on the scaler backend. T
 
 | Backend                | Orchestrator runs as                         | Spawned agent/workflow runs as                                                                                             | Privilege drop?                                                  |
 | ---------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| **Container**          | Any user with container socket access        | Container image's default user (typically `root` inside container, isolated by namespaces)                                 | Container runtime handles isolation                              |
+| **Container**          | Any user with container socket access        | Container image's default user (typically `root` inside container, but with all capabilities dropped + no-new-privileges)  | Container runtime isolation + hardened HostConfig (cap-drop ALL) |
 | **Bare-metal**         | Any user                                     | **Same user as orchestrator** (no privilege dropping)                                                                      | No — no setuid, no su, no sudo                                   |
 | **Bare-metal + bwrap** | Any user                                     | **Same user as orchestrator**, but namespace-isolated (PID, IPC, filesystem, network)                                      | Partial — bwrap adds namespace isolation but does not change UID |
 | **Firecracker**        | Must be root (TAP device, bridge management) | Jailer drops to configured `uid:gid` before exec'ing Firecracker; inside VM, agent runs as the rootfs image's default user | Yes — jailer enforces privilege drop                             |
 
 ### Implications of running the orchestrator as root
 
-- **Container backend:** Low risk. The container runtime already provides process/filesystem/network isolation. The orchestrator user identity doesn't propagate into containers.
+- **Container backend:** Low risk. The container runtime provides process/filesystem/network isolation, and each job container additionally drops all Linux capabilities, sets no-new-privileges, and enforces pids/memory/CPU cgroup caps by default. The orchestrator user identity doesn't propagate into containers.
 - **Bare-metal backend (no bwrap):** **High risk.** Spawned agent processes inherit root privileges. Customer workflow code runs as root with full host filesystem and network access. Only acceptable for fully trusted, internal-only workflows.
 - **Bare-metal backend (with bwrap):** **Medium risk.** bwrap provides namespace isolation (PID, IPC, filesystem read-only mounts, network loopback-only), but the process UID is still root inside the namespace. A bwrap escape would give root on the host.
 - **Firecracker backend:** **Expected.** Root is required for TAP device and bridge management. The jailer drops privileges to the configured `uid:gid` before running Firecracker, so the VM process itself does not run as root.
@@ -92,7 +92,59 @@ The container backend provides the strongest practical isolation for most deploy
 - Network isolation (container networking)
 - Process isolation (container PID namespace)
 - Environment isolation (sanitized env only, no KICI\_\* variables)
-- Resource limits via container runtime (CPU, memory, disk)
+
+**Hardened by default.** Every per-job container is created with a secure-by-default posture (matching the bwrap backend's capability/privilege stance and exceeding it with cgroup caps):
+
+| Protection           | Default                                           | Knob                                    |
+| -------------------- | ------------------------------------------------- | --------------------------------------- |
+| Linux capabilities   | all dropped (`CapDrop: ALL`, no add-back)         | per-job `sandbox:` escape hatch (below) |
+| Privilege escalation | blocked (`no-new-privileges`)                     | —                                       |
+| PID / fork-bomb DoS  | `KICI_SANDBOX_PIDS_LIMIT` (512)                   | raise the env value                     |
+| Memory DoS           | `KICI_SANDBOX_MEMORY_BYTES` (2 GiB)               | raise the env value                     |
+| CPU DoS              | `KICI_SANDBOX_NANO_CPUS` (2 CPUs)                 | raise the env value                     |
+| Writable /tmp        | private tmpfs mounted at `/tmp`                   | —                                       |
+| Read-only rootfs     | off (many images write outside `/workspace`)      | `KICI_SANDBOX_READONLY_ROOTFS=true`     |
+| Container user       | image's configured user, never silently rewritten | `KICI_SANDBOX_USER=<uid[:gid]\|name>`   |
+
+Container networking keeps the runtime's default (bridge — outbound egress works), so package installs and registry access are unaffected by the defaults above. Set `KICI_SANDBOX_NETWORK=host` to run each job container on the host network namespace instead; the agent then also binds the host's `/etc/hosts` (and `/etc/nsswitch.conf`) read-only into the container so a host-resolved-only registry name is reachable inside the job. A local `file://` clone source is always bound into the container read-only so the in-container clone can read it.
+
+`KICI_SANDBOX_HARDENED=false` is a documented-temporary rollback affordance that reproduces the legacy unhardened posture across every job on that agent. Prefer the per-job `sandbox:` escape hatch below when a specific workflow needs one dropped capability — it re-grants exactly that capability for exactly that job, leaving every other job fully hardened. Raise the resource caps for heavy builds rather than disabling hardening wholesale.
+
+#### Per-job escape hatch (`sandbox:`)
+
+A workflow job can request extra Linux capabilities or a different network posture for its container via the SDK `sandbox:` field:
+
+```ts
+job('build', {
+  runsOn: 'kici:os:linux',
+  container: 'node:20',
+  sandbox: {
+    capabilities: ['NET_ADMIN'], // added back on top of CapDrop: ALL
+    network: 'host', // share the host network namespace
+  },
+  steps: [/* ... */],
+});
+```
+
+The **orchestrator is the single enforcement point.** At dispatch it resolves each request against a per-org allow-list you control, so a workflow author can never escalate beyond what you approved:
+
+- **`sandboxAllowedCapabilities`** — the capabilities a job may request. Empty by default, so **every** capability request is denied until you allow-list it.
+- **`sandboxAllowHostNetwork`** — whether a job may request `network: 'host'`. `false` by default. (`network: 'none'` and the default bridge never need approval — they do not escalate.)
+
+Manage both with the orchestrator admin CLI:
+
+```bash
+# Allow NET_ADMIN (and SYS_PTRACE) for jobs in this org:
+kici-admin org-settings sandbox-allowlist set-capabilities NET_ADMIN,SYS_PTRACE --org <org>
+# Permit host networking:
+kici-admin org-settings sandbox-allowlist allow-host-network true --org <org>
+# Inspect the current allow-list:
+kici-admin org-settings sandbox-allowlist show --org <org>
+# Clear it back to the safe deny-all default:
+kici-admin org-settings sandbox-allowlist reset --org <org>
+```
+
+**Deny is loud and total.** A request for a capability (or host networking) that is not allow-listed **fails the run at dispatch** with a reason naming the offending capability and the knob that gates it — the job never runs, and a disallowed capability is never silently stripped. The agent applies only the grant the orchestrator resolved and never reads the allow-list itself. Grants are strictly additive: a job with no `sandbox:` request keeps the fully hardened default (all capabilities dropped). `privileged` mode and workflow-requested resource limits are deliberately not offered.
 
 **When to use:** Most deployments. Recommended for untrusted or semi-trusted workloads where you need strong isolation without the overhead of microVMs.
 
@@ -289,7 +341,7 @@ When using the container backend, the container image must have:
 - **git** installed (for repository cloning)
 - Standard POSIX utilities (sh, mkdir, rm, etc.)
 
-The workflow runner script is bind-mounted read-only into the container at `/opt/kici/workflow-runner.js` -- it does not need to be baked into the image.
+The workflow runner and its TypeScript loader hook are bind-mounted read-only into the container at `/opt/kici/workflow-runner.js` and `/opt/kici/ts-loader-hook.js` -- neither needs to be baked into the image. Both are self-contained bundles, so the image only needs Node.js, git, and standard POSIX utilities (above); the runner clones the repository, installs dependencies, compiles, and runs each step inside the container.
 
 Recommended base images:
 
@@ -312,12 +364,12 @@ The orchestrator validates `bwrap` availability at **startup** when `KICI_AGENT_
 
 #### Network mode
 
-`KICI_SANDBOX_NETWORK` controls the network namespace when bwrap is enabled:
+`KICI_SANDBOX_NETWORK` controls the sandbox network namespace. It governs both backends: the bwrap network namespace when bwrap is enabled, and the container backend's job-container network:
 
-| Value      | Behavior                                                                                                                                                                       |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `isolated` | Default. `bwrap --unshare-net` — loopback only, no external connectivity. Strongest isolation; breaks workflows that need to reach package registries (npm, pip, cargo, etc.). |
-| `host`     | Keep the host network namespace. Workflows can talk to the network. Use this when workflows need `npm install`, `git clone https://`, or other outbound traffic.               |
+| Value      | Behavior                                                                                                                                                                                                                                                                                                             |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `isolated` | Default. bwrap: `--unshare-net` — loopback only, no external connectivity. Strongest isolation; breaks workflows that need to reach package registries (npm, pip, cargo, etc.). The container backend keeps the runtime's default bridge (outbound egress works).                                                    |
+| `host`     | Keep the host network namespace. Workflows can talk to the network. Use this when workflows need `npm install`, `git clone https://`, or other outbound traffic. On the container backend this also binds the host's `/etc/hosts` read-only so a host-resolved-only registry name resolves inside the job container. |
 
 ```bash
 # Strongest: PID/IPC/filesystem isolation AND no network
@@ -359,20 +411,22 @@ apt install slirp4netns
 
 ### Filesystem mount details
 
-| Host Path          | Container Path   | Mode            |
-| ------------------ | ---------------- | --------------- |
-| /usr               | /usr             | read-only       |
-| /lib               | /lib             | read-only       |
-| /lib64 (if exists) | /lib64           | read-only       |
-| /bin               | /bin             | read-only       |
-| /sbin              | /sbin            | read-only       |
-| /etc/resolv.conf   | /etc/resolv.conf | read-only       |
-| /etc/ssl           | /etc/ssl         | read-only       |
-| Node.js binary dir | (same path)      | read-only       |
-| Workspace          | /workspace       | read-write      |
-| (new)              | /dev             | private         |
-| (new)              | /proc            | private         |
-| (new)              | /tmp             | private (tmpfs) |
+| Host Path                      | Container Path     | Mode            |
+| ------------------------------ | ------------------ | --------------- |
+| /usr                           | /usr               | read-only       |
+| /lib                           | /lib               | read-only       |
+| /lib64 (if exists)             | /lib64             | read-only       |
+| /bin                           | /bin               | read-only       |
+| /sbin                          | /sbin              | read-only       |
+| /etc/resolv.conf               | /etc/resolv.conf   | read-only       |
+| /etc/ssl                       | /etc/ssl           | read-only       |
+| /etc/hosts (if exists)         | /etc/hosts         | read-only       |
+| /etc/nsswitch.conf (if exists) | /etc/nsswitch.conf | read-only       |
+| Node.js binary dir             | (same path)        | read-only       |
+| Workspace                      | /workspace         | read-write      |
+| (new)                          | /dev               | private         |
+| (new)                          | /proc              | private         |
+| (new)                          | /tmp               | private (tmpfs) |
 
 ## Execution mode selection
 

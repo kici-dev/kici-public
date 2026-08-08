@@ -12,7 +12,7 @@ export const miseInit = workflow('mise-init', {
   on: [push()],
   jobs: [
     job('build', {
-      runsOn: 'linux',
+      runsOn: 'kici:os:linux',
       init: {
         run: `
           set -euo pipefail

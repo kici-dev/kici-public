@@ -19,7 +19,12 @@ export function formatMatrixSuffix(matrixValues: MatrixValues): string {
   return defined.map(([, v]) => v).join(', ');
 }
 
-/** Expanded child job name: `${baseName} (${suffix})`. MUST match the local executor. */
+/**
+ * Expanded child job name: `${baseName} (${suffix})`. The `(...)` wrapper is
+ * load-bearing, not decoration: `variantLabelOf` (fanout/materialize.ts) and
+ * `buildMatrixOutputsEnvelope` (the orchestrator's `byMatrix` key) both recover
+ * the suffix by slicing it back out of the name.
+ */
 export function formatExpandedJobName(baseName: string, matrixValues: MatrixValues): string {
   return `${baseName} (${formatMatrixSuffix(matrixValues)})`;
 }

@@ -12,7 +12,7 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { toErrorMessage } from '@kici-dev/shared';
+import { toErrorMessage, diagnoseExitCode, type DiagnoseResponse } from '@kici-dev/shared';
 
 /** ANSI color codes for terminal output. */
 const COLORS = {
@@ -23,20 +23,6 @@ const COLORS = {
   dim: '\x1b[2m',
   bold: '\x1b[1m',
 } as const;
-
-interface DiagnoseResult {
-  name: string;
-  status: 'pass' | 'warn' | 'fail';
-  message: string;
-  details?: Record<string, unknown>;
-  durationMs: number;
-}
-
-interface DiagnoseResponse {
-  status: 'healthy' | 'degraded' | 'unhealthy';
-  checks: DiagnoseResult[];
-  timestamp: string;
-}
 
 /**
  * Colorize a status string for terminal output.
@@ -86,15 +72,6 @@ function formatDiagnoseTable(response: DiagnoseResponse): string {
   return lines.join('\n');
 }
 
-/**
- * Determine exit code from diagnostic results.
- */
-function getExitCode(checks: DiagnoseResult[]): number {
-  if (checks.some((c) => c.status === 'fail')) return 2;
-  if (checks.some((c) => c.status === 'warn')) return 1;
-  return 0;
-}
-
 export function registerDiagnoseCommand(program: Command, getClient: () => AdminApiClient): void {
   program
     .command('diagnose')
@@ -110,7 +87,7 @@ export function registerDiagnoseCommand(program: Command, getClient: () => Admin
           console.log(formatDiagnoseTable(response));
         }
 
-        const exitCode = getExitCode(response.checks);
+        const exitCode = diagnoseExitCode(response.checks);
         if (exitCode > 0) {
           process.exit(exitCode);
         }

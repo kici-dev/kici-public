@@ -1,15 +1,20 @@
 import { describe, it, expect } from 'vitest';
 import {
   DashboardWriteOperation,
+  DashboardWritePolicyState,
   DASHBOARD_WRITE_OPERATIONS,
   DASHBOARD_WRITE_OPERATIONS_BY_NAME,
   DASHBOARD_WRITE_OPERATIONS_BY_WIRE_TYPE,
   DASHBOARD_WRITE_OPERATION_VALUES,
+  coerceDashboardWritePolicyValue,
   dashboardWritePolicyMapSchema,
   getDashboardWriteOperationDescriptor,
   getDashboardWriteOperationsByCategory,
   getDashboardWriteOperationsBySensitivity,
   isDashboardWriteOperationEnabled,
+  isEncryptedState,
+  resolvePolicyState,
+  resolveFullPolicyStateView,
 } from './dashboard-write-operations.js';
 
 describe('DashboardWriteOperation enum', () => {
@@ -100,12 +105,71 @@ describe('isDashboardWriteOperationEnabled', () => {
 
   it('returns true when the operation is not in the policy map', () => {
     expect(isDashboardWriteOperationEnabled({}, 'secrets.set')).toBe(true);
-    expect(isDashboardWriteOperationEnabled({ 'variables.set': false }, 'secrets.set')).toBe(true);
+    expect(isDashboardWriteOperationEnabled({ 'variables.set': 'disabled' }, 'secrets.set')).toBe(
+      true,
+    );
   });
 
-  it('returns the explicit value when set', () => {
-    expect(isDashboardWriteOperationEnabled({ 'secrets.set': false }, 'secrets.set')).toBe(false);
-    expect(isDashboardWriteOperationEnabled({ 'secrets.set': true }, 'secrets.set')).toBe(true);
+  it('returns true unless the operation is disabled', () => {
+    expect(isDashboardWriteOperationEnabled({ 'secrets.set': 'disabled' }, 'secrets.set')).toBe(
+      false,
+    );
+    expect(isDashboardWriteOperationEnabled({ 'secrets.set': 'permissive' }, 'secrets.set')).toBe(
+      true,
+    );
+    expect(isDashboardWriteOperationEnabled({ 'secrets.set': 'encrypted' }, 'secrets.set')).toBe(
+      true,
+    );
+  });
+});
+
+describe('three-state policy', () => {
+  it('enum has exactly permissive/encrypted/disabled', () => {
+    expect(DashboardWritePolicyState.options).toEqual(['permissive', 'encrypted', 'disabled']);
+  });
+
+  it('defaults an absent op to permissive', () => {
+    expect(resolvePolicyState({}, 'secrets.set')).toBe('permissive');
+    expect(resolvePolicyState(null, 'secrets.set')).toBe('permissive');
+  });
+
+  it('isEncryptedState true only for encrypted', () => {
+    expect(isEncryptedState({ 'secrets.set': 'encrypted' }, 'secrets.set')).toBe(true);
+    expect(isEncryptedState({ 'secrets.set': 'permissive' }, 'secrets.set')).toBe(false);
+    expect(isEncryptedState({ 'secrets.set': 'disabled' }, 'secrets.set')).toBe(false);
+  });
+
+  it('rejects encrypted on a non-plaintext op', () => {
+    const r = dashboardWritePolicyMapSchema.safeParse({ 'held_runs.approve': 'encrypted' });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts encrypted on a plaintext op', () => {
+    expect(dashboardWritePolicyMapSchema.safeParse({ 'secrets.set': 'encrypted' }).success).toBe(
+      true,
+    );
+    expect(dashboardWritePolicyMapSchema.safeParse({ 'variables.set': 'encrypted' }).success).toBe(
+      true,
+    );
+  });
+
+  it('coerces legacy boolean values (true→permissive, false→disabled)', () => {
+    expect(coerceDashboardWritePolicyValue(true)).toBe('permissive');
+    expect(coerceDashboardWritePolicyValue(false)).toBe('disabled');
+    expect(coerceDashboardWritePolicyValue('encrypted')).toBe('encrypted');
+    expect(dashboardWritePolicyMapSchema.parse({ 'secrets.set': false })).toEqual({
+      'secrets.set': 'disabled',
+    });
+    expect(dashboardWritePolicyMapSchema.parse({ 'secrets.set': true })).toEqual({
+      'secrets.set': 'permissive',
+    });
+  });
+
+  it('resolveFullPolicyStateView expands sparse map to all ops', () => {
+    const view = resolveFullPolicyStateView({ 'secrets.set': 'encrypted' });
+    expect(view['secrets.set']).toBe('encrypted');
+    expect(view['held_runs.approve']).toBe('permissive');
+    expect(Object.keys(view)).toHaveLength(DashboardWriteOperation.options.length);
   });
 });
 
@@ -115,15 +179,15 @@ describe('dashboardWritePolicyMapSchema', () => {
   });
 
   it('accepts a partial map of known operations', () => {
-    const policy = { 'secrets.set': false, 'variables.set': false };
+    const policy = { 'secrets.set': 'disabled', 'variables.set': 'disabled' } as const;
     expect(dashboardWritePolicyMapSchema.parse(policy)).toEqual(policy);
   });
 
   it('rejects unknown operation keys', () => {
-    expect(() => dashboardWritePolicyMapSchema.parse({ 'bogus.op': false })).toThrow();
+    expect(() => dashboardWritePolicyMapSchema.parse({ 'bogus.op': 'disabled' })).toThrow();
   });
 
-  it('rejects non-boolean values', () => {
+  it('rejects invalid state values', () => {
     expect(() => dashboardWritePolicyMapSchema.parse({ 'secrets.set': 'no' })).toThrow();
   });
 

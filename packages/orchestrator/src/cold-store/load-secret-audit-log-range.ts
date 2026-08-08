@@ -17,22 +17,10 @@
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
-import { minSecretAuditLogWarmDays } from '@kici-dev/engine';
 import type { Database, SecretAuditLogTable } from '../db/types.js';
 import { SYNTHETIC_ORCH_TENANT } from './load-access-log-range.js';
 
 const logger = createLogger({ prefix: 'load-secret-audit-log-range' });
-
-/**
- * Warm cutoff for secret_audit_log = the table's MINIMUM per-category TTL.
- * Sourced from the engine's per-action retention table so this constant
- * stays in lockstep with `SecretAuditLogAdapter.DEFAULT_CONFIG.warmTtlDays`.
- *
- * Lowered from a flat 90d to 30d as part of the audit per-category retention
- * work — sampled `resolve` / `resolve_named` rows can archive at 30d, while
- * mutations stay 365d via the per-row CASE on the adapter.
- */
-const SECRET_AUDIT_LOG_WARM_TTL_DAYS = minSecretAuditLogWarmDays();
 
 export type SecretAuditLogRow = Selectable<SecretAuditLogTable>;
 
@@ -68,8 +56,6 @@ export async function loadSecretAuditLogRange(
     includeArchived,
   } = args;
 
-  const warmCutoff = new Date(Date.now() - SECRET_AUDIT_LOG_WARM_TTL_DAYS * 86_400_000);
-
   // 1. Hot path mirroring AuditLogger.query().
   let hotQuery = db.selectFrom('secret_audit_log').selectAll().orderBy('timestamp', 'desc');
   if (contextName) hotQuery = hotQuery.where('context_name', '=', contextName);
@@ -81,6 +67,11 @@ export async function loadSecretAuditLogRange(
   const hotRows = (await hotQuery.limit(limit).offset(offset).execute()) as SecretAuditLogRow[];
 
   if (!includeArchived || !coldStore) return hotRows;
+  // The bound is the table's MINIMUM per-category TTL, resolved from the same
+  // adapter config the archiver uses: sampled `resolve` / `resolve_named` rows
+  // archive soonest, while mutations stay far longer via the adapter's
+  // per-row CASE, so the minimum keeps the read window as wide as any bucket.
+  const warmCutoff = coldStore.warmCutoff('secret_audit_log');
   const coldFromTs = fromTs ?? new Date(0);
   if (coldFromTs >= warmCutoff) return hotRows;
 

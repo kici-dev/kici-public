@@ -6,9 +6,9 @@
 // the returned `cleanup()` in a `finally` block to wipe the tempdir — the
 // key never touches persistent storage.
 
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
 
 export interface SshAuthSetup {
   /** Value for the `GIT_SSH_COMMAND` env var. */
@@ -49,7 +49,7 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
     throw new Error('pinned hostKeyPolicy requires knownHosts content');
   }
 
-  const tempDir = await mkdtemp(join(tmpdir(), 'kici-ssh-'));
+  const { path: tempDir, cleanup } = await makeTempDir('ssh');
   const keyPath = join(tempDir, 'id');
   const pem = opts.privateKey.endsWith('\n') ? opts.privateKey : `${opts.privateKey}\n`;
   await writeFile(keyPath, pem, { mode: 0o600 });
@@ -88,9 +88,7 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
   return {
     gitSshCommand,
     tempDir,
-    async cleanup() {
-      await rm(tempDir, { recursive: true, force: true });
-    },
+    cleanup,
   };
 }
 

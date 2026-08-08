@@ -32,6 +32,15 @@ describe('agents-md template', () => {
     expect(agentsMdTemplate).toContain("from '@kici-dev/sdk'");
     expect(agentsMdTemplate).toContain('push({');
     expect(agentsMdTemplate).toContain('pr({ target:');
-    expect(agentsMdTemplate).toContain('matrix({');
+    // The matrix is a direct job option, not GitHub Actions' strategy wrapper.
+    expect(agentsMdTemplate).toContain('matrix: {');
+  });
+
+  it('does not teach any nonexistent SDK API shapes', () => {
+    // `matrix` is not a factory export; there is no `strategy` job field.
+    expect(agentsMdTemplate).not.toContain('matrix(');
+    expect(agentsMdTemplate).not.toContain('strategy:');
+    // Secrets are read via the get/expose accessor, not dotted context access.
+    expect(agentsMdTemplate).not.toContain('secrets.production');
   });
 });

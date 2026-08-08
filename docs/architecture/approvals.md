@@ -29,6 +29,25 @@ ApproverClause = { team: string } | { user: string }
 
 When both a mandatory environment hold and an explicit hold apply to the same job, their clauses are combined into one requirement (AND), so both sources must be satisfied.
 
+## Approval holds vs security holds
+
+A third kind of hold shares the same `held_runs` storage but is **not** an approval hold: the **security hold**, raised by the CI-trust layer when an untrusted contributor's change must be vetted before it runs at all. Both kinds pause execution and both are released by a human, but they answer different questions — "should this change be promoted?" versus "is it safe to execute this contributor's code?" — and they are kept in two separate queues so a permission to do one never grants the other.
+
+|                                   | Approval hold                                                                                                     | Security hold                                                                                                                                                                     |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Queue (`held_runs.queue_type`)    | `context`                                                                                                         | `security`                                                                                                                                                                        |
+| Hold type (`held_runs.hold_type`) | `reviewer` (also `timer` and `concurrency` for the other context gates)                                           | `security`                                                                                                                                                                        |
+| Raised by                         | an `approval` gate in workflow code, or an environment's required-reviewer policy                                 | the CI trust layer: the org trust policy holds or rejects the PR (workflow change, fork PR, or unresolved contributor), or an environment's `minimumTrust` blocks the contributor |
+| Requirement                       | an `ApprovalRequirement` — an AND-list of team/user clauses with per-clause progress and per-approver attribution | a single reason (`workflow_modification`, `fork_pr`, `unknown_contributor`, `context_trust`); any sufficiently-trusted member releases it                                         |
+| Granularity                       | step, job, or workflow                                                                                            | the whole run (org trust policy) or one job (trust gate)                                                                                                                          |
+| Released by                       | `contexts:write` (a `timer` hold takes `contexts:admin`) **and** eligibility for an unsatisfied clause            | `ci_trust:write` or higher, as resolved through any per-member `ci_trust_override`                                                                                                |
+| Release channels                  | dashboard approval queue, `kici approve` / `kici reject`                                                          | dashboard CI-trust approval queue, `/kici approve` / `/kici reject` in a PR comment                                                                                               |
+| Provider status check             | a held-for-approval check naming the unsatisfied clauses                                                          | a fixed `KiCI Security` check updated in place                                                                                                                                    |
+
+The queue split is enforced at release time, not only in the UI: a release that targets the security queue asserts the row's `queue_type` matches, so a context approval can never release a security hold and vice versa.
+
+Everything below this section describes **approval** holds. For the security side see [CI security](security/ci-security.md#security-approval-queue).
+
 ## Clause evaluation
 
 A requirement is satisfied when **all** of its clauses are satisfied:
@@ -45,15 +64,15 @@ Each individual decision is recorded — the approver, the decision, and which c
 
 ## Hold lifecycle and resume
 
-A held element reuses the execution [state machine](execution/state-machine.md): the `held` state and the `HOLD` / `APPROVE` / `REJECT` / `EXPIRE` events. There are no approval-specific states — workflow- and step-level holds use the same `held` state as the existing job-level hold.
+A held element uses the shared `held` status — a non-terminal value on both `ExecutionRunStatus` and `ExecutionJobStatus`. There are no approval-specific statuses — workflow- and step-level holds use the same `held` status as the existing job-level hold, and resume, reject, and expire drive it to the ordinary run/job statuses below.
 
 ```mermaid
 stateDiagram-v2
     [*] --> pending
-    pending --> held : HOLD
-    held --> queued : APPROVE
-    held --> cancelled : REJECT
-    held --> cancelled : EXPIRE
+    pending --> held : gate triggers hold
+    held --> queued : approval satisfied
+    held --> cancelled : rejection
+    held --> cancelled : expiry
 ```
 
 On full satisfaction the held element is **resumed**, through one path shared by the dashboard and CLI approve flows:
@@ -61,7 +80,7 @@ On full satisfaction the held element is **resumed**, through one path shared by
 - **Job or workflow scope** — the released element is re-dispatched (enqueued for dispatch). A workflow-level hold gates the run's first dispatch; releasing it lets the run's jobs proceed.
 - **Step scope** — the orchestrator signals the waiting agent (see [the round-trip](#step-level-round-trip)) rather than enqueuing anything.
 
-A rejection or an expiry instead fails the element via the `REJECT` / `EXPIRE` transition, which fails the run. The stale run detector sweeps overdue holds and drives the expiry side.
+A rejection or an expiry instead drives the held element to `cancelled`, which fails the run. The stale run detector sweeps overdue holds and drives the expiry side.
 
 ## Step-level round-trip
 
@@ -95,5 +114,5 @@ Because a step-level hold keeps an agent and workspace occupied for the whole wa
 
 - [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the queue, expiry, self-approval.
-- [Execution state machine](execution/state-machine.md) — the `held` state and its transitions.
+- [Execution lifecycle](execution/state-machine.md) — the `held` status and the terminal-state rules.
 - [Orchestrator ↔ Agent messages](protocol/orchestrator-agent.md) — the protocol channel the step round-trip rides.

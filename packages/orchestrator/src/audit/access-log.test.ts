@@ -452,10 +452,12 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
       }
       return gen();
     });
-    // The real ColdStore exposes more than fetchRange, but getById only
-    // touches that one method — cast through unknown to satisfy the
-    // structural interface without stubbing the rest.
-    return { coldStore: { fetchRange } as unknown as ColdStore, fetchRange };
+    // The real ColdStore exposes more than these, but getById only touches
+    // fetchRange and the warm cutoff it resolves internally — cast through
+    // unknown to satisfy the structural interface without stubbing the rest.
+    // 30 days is `minAccessLogWarmDays()`, the value the adapter archives at.
+    const warmCutoff = vi.fn(() => new Date(Date.now() - 30 * 86_400_000));
+    return { coldStore: { fetchRange, warmCutoff } as unknown as ColdStore, fetchRange };
   }
 
   it('returns the hot row without consulting cold-store', async () => {
@@ -536,5 +538,51 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
     const out = await writer.getById('cold-1', { orgId: 'org-1' });
     expect(out).toBeNull();
     expect(fetchRange).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AccessLogWriter.recordInTransaction', () => {
+  const ENTRY = {
+    orgId: 'org-tx',
+    routingKey: null,
+    actor: { type: 'service_account', id: 'tester' } as ActorPrincipal,
+    action: 'trust_policy.updated' as const,
+    target: { type: 'org_settings', id: 'org-tx' } as const,
+    requestId: null,
+    source: 'admin_http' as const,
+    outcome: 'allowed' as const,
+  };
+
+  it('writes through the executor it is given, not the writer\u2019s own pool', async () => {
+    // If it used `this.db` the row would commit independently of the mutation
+    // it audits, which is the whole thing the transactional variant prevents.
+    const values = vi.fn().mockReturnValue({ execute: vi.fn().mockResolvedValue(undefined) });
+    const executor = { insertInto: vi.fn().mockReturnValue({ values }) };
+    const ownPool = { insertInto: vi.fn() };
+
+    const writer = new AccessLogWriter(ownPool as unknown as Kysely<Database>);
+    await writer.recordInTransaction(executor as unknown as Transaction<Database>, ENTRY);
+
+    expect(executor.insertInto).toHaveBeenCalledWith('access_log');
+    expect(ownPool.insertInto).not.toHaveBeenCalled();
+    expect(values.mock.calls[0][0]).toMatchObject({
+      org_id: 'org-tx',
+      action: 'trust_policy.updated',
+    });
+  });
+
+  it('propagates a write failure instead of swallowing it like record()', async () => {
+    // `record` is best-effort so a broken access_log cannot take down dashboard
+    // reads; the transactional variant must do the opposite, or the caller's
+    // mutation would commit unaudited.
+    const boom = new Error('insert exploded');
+    const failing = {
+      insertInto: () => ({ values: () => ({ execute: () => Promise.reject(boom) }) }),
+    } as unknown as Transaction<Database>;
+
+    const writer = new AccessLogWriter(failing as unknown as Kysely<Database>);
+    await expect(writer.recordInTransaction(failing, ENTRY)).rejects.toThrow('insert exploded');
+    // Contrast: the best-effort path swallows the same failure.
+    await expect(writer.record(ENTRY)).resolves.toBeUndefined();
   });
 });

@@ -62,66 +62,66 @@ describe('EventCircuitBreaker', () => {
   });
 
   describe('checkRateLimit', () => {
-    it('should allow the first request', () => {
-      const result = breaker.checkRateLimit('wf:ci');
+    it('should allow the first request', async () => {
+      const result = await breaker.checkRateLimit('wf:ci');
       expect(result.allowed).toBe(true);
       expect(result.retryAfterMs).toBeUndefined();
     });
 
-    it('should allow requests up to the limit', () => {
+    it('should allow requests up to the limit', async () => {
       for (let i = 0; i < 5; i++) {
-        const result = breaker.checkRateLimit('wf:ci');
+        const result = await breaker.checkRateLimit('wf:ci');
         expect(result.allowed).toBe(true);
       }
     });
 
-    it('should reject when rate limit is exceeded', () => {
+    it('should reject when rate limit is exceeded', async () => {
       // Fill up the limit
       for (let i = 0; i < 5; i++) {
-        breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:ci');
       }
 
       // 6th request should be rejected
-      const result = breaker.checkRateLimit('wf:ci');
+      const result = await breaker.checkRateLimit('wf:ci');
       expect(result.allowed).toBe(false);
       expect(result.retryAfterMs).toBeGreaterThan(0);
     });
 
-    it('should track different workflows independently', () => {
+    it('should track different workflows independently', async () => {
       // Fill up one workflow
       for (let i = 0; i < 5; i++) {
-        breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:ci');
       }
 
       // Another workflow should still be allowed
-      const result = breaker.checkRateLimit('wf:deploy');
+      const result = await breaker.checkRateLimit('wf:deploy');
       expect(result.allowed).toBe(true);
     });
 
-    it('should allow requests after the sliding window expires', () => {
+    it('should allow requests after the sliding window expires', async () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
       // Fill up the limit
       for (let i = 0; i < 5; i++) {
-        breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:ci');
       }
 
       // Advance time past the 60s window
       vi.spyOn(Date, 'now').mockReturnValue(now + 61_000);
 
       // Should be allowed again
-      const result = breaker.checkRateLimit('wf:ci');
+      const result = await breaker.checkRateLimit('wf:ci');
       expect(result.allowed).toBe(true);
     });
 
-    it('should clean expired timestamps on each check', () => {
+    it('should clean expired timestamps on each check', async () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
       // Add some requests
       for (let i = 0; i < 3; i++) {
-        breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:ci');
       }
 
       // Advance time so the first 3 expire
@@ -129,46 +129,68 @@ describe('EventCircuitBreaker', () => {
 
       // Should be able to add 5 more (old ones cleaned)
       for (let i = 0; i < 5; i++) {
-        const result = breaker.checkRateLimit('wf:ci');
+        const result = await breaker.checkRateLimit('wf:ci');
         expect(result.allowed).toBe(true);
       }
 
       // 6th should be rejected
-      const result = breaker.checkRateLimit('wf:ci');
+      const result = await breaker.checkRateLimit('wf:ci');
       expect(result.allowed).toBe(false);
     });
 
-    it('should return retryAfterMs >= 1', () => {
+    it('should return retryAfterMs >= 1', async () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
       for (let i = 0; i < 5; i++) {
-        breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:ci');
       }
 
-      const result = breaker.checkRateLimit('wf:ci');
+      const result = await breaker.checkRateLimit('wf:ci');
       expect(result.retryAfterMs).toBeGreaterThanOrEqual(1);
+    });
+
+    it('resolves the per-workflow limit from cluster_settings (override wins)', async () => {
+      // Cluster override lowers the limit to 2/min regardless of config's 5.
+      const overridden = new EventCircuitBreaker(config, {
+        getNumber: async (_col: string, _fallback: number) => 2,
+      } as unknown as import('../cluster/cluster-settings-reader.js').ClusterSettingsReader);
+      expect((await overridden.checkRateLimit('wf:ci')).allowed).toBe(true);
+      expect((await overridden.checkRateLimit('wf:ci')).allowed).toBe(true);
+      // 3rd exceeds the override of 2.
+      expect((await overridden.checkRateLimit('wf:ci')).allowed).toBe(false);
+    });
+
+    it('falls back to the configured limit when the cluster column is null', async () => {
+      // Reader returns the caller fallback (config limit 5) → 6th is rejected.
+      const fallbackBreaker = new EventCircuitBreaker(config, {
+        getNumber: async (_col: string, fallback: number) => fallback,
+      } as unknown as import('../cluster/cluster-settings-reader.js').ClusterSettingsReader);
+      for (let i = 0; i < 5; i++) {
+        expect((await fallbackBreaker.checkRateLimit('wf:ci')).allowed).toBe(true);
+      }
+      expect((await fallbackBreaker.checkRateLimit('wf:ci')).allowed).toBe(false);
     });
   });
 
   describe('reset', () => {
-    it('should clear all rate limit state', () => {
+    it('should clear all rate limit state', async () => {
       // Fill up multiple workflows
       for (let i = 0; i < 5; i++) {
-        breaker.checkRateLimit('wf:ci');
-        breaker.checkRateLimit('wf:deploy');
+        await breaker.checkRateLimit('wf:ci');
+        await breaker.checkRateLimit('wf:deploy');
       }
 
       // Both should be at limit
-      expect(breaker.checkRateLimit('wf:ci').allowed).toBe(false);
-      expect(breaker.checkRateLimit('wf:deploy').allowed).toBe(false);
+      expect((await breaker.checkRateLimit('wf:ci')).allowed).toBe(false);
+      expect((await breaker.checkRateLimit('wf:deploy')).allowed).toBe(false);
 
       // Reset
       breaker.reset();
 
       // Both should be allowed again
-      expect(breaker.checkRateLimit('wf:ci').allowed).toBe(true);
-      expect(breaker.checkRateLimit('wf:deploy').allowed).toBe(true);
+      expect((await breaker.checkRateLimit('wf:ci')).allowed).toBe(true);
+      expect((await breaker.checkRateLimit('wf:deploy')).allowed).toBe(true);
     });
   });
 });

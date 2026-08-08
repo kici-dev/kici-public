@@ -16,7 +16,7 @@ Per-orchestrator settings loaded from a YAML file. These are instance-specific a
 ```typescript
 interface LocalConfig {
   database: { url: string };
-  instance?: { id?: string; mode?: 'platform' | 'hybrid' | 'independent' };
+  instance?: { id?: string; mode?: 'platform' | 'hybrid' | 'independent' | 'observed' };
   server?: { port?: number; basePath?: string; logLevel?: string };
   scaler?: { configPath?: string; configDir?: string };
 }
@@ -53,7 +53,7 @@ The merged result type used throughout the codebase. Combines `LocalConfig` + `S
 ```typescript
 interface AppConfig {
   instanceId: string; // From local config or auto-generated
-  mode: 'platform' | 'hybrid' | 'independent';
+  mode: 'platform' | 'hybrid' | 'independent' | 'observed';
   databaseUrl: string; // Flattened from database.url
   port: number; // Flattened from server.port
   basePath: string;

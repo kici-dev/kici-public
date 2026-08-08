@@ -71,6 +71,16 @@ export class SystemdServiceManager implements ServiceManager {
       lines.push(`X-KiCI-InstanceDir=${config.instanceDir}`);
     }
     lines.push('After=network.target postgresql.service');
+    // Start rate limit. `StartLimitIntervalSec=` and `StartLimitBurst=` are
+    // [Unit] directives: systemd has no [Service] key for
+    // `StartLimitIntervalSec=`, so a copy in [Service] is discarded with an
+    // "Unknown key ... ignoring" warning and the window silently falls back to
+    // the manager-wide default. `Restart=` / `RestartSec=` are [Service]
+    // directives and stay in that section below.
+    if (config.restartPolicy.enabled) {
+      lines.push(`StartLimitBurst=${config.restartPolicy.maxRetries}`);
+      lines.push(`StartLimitIntervalSec=${config.restartPolicy.windowSeconds}`);
+    }
     lines.push('');
 
     // [Service] section
@@ -95,12 +105,11 @@ export class SystemdServiceManager implements ServiceManager {
       lines.push(`Group=${config.user}`);
     }
 
-    // Restart policy
+    // Restart policy — the [Service] half. The StartLimit* rate limit that
+    // bounds these restarts lives in [Unit] above.
     if (config.restartPolicy.enabled) {
       lines.push('Restart=on-failure');
       lines.push(`RestartSec=${config.restartPolicy.delays[0]}s`);
-      lines.push(`StartLimitBurst=${config.restartPolicy.maxRetries}`);
-      lines.push(`StartLimitIntervalSec=${config.restartPolicy.windowSeconds}`);
     }
 
     // Security hardening (system-level only — user services lack privileges)

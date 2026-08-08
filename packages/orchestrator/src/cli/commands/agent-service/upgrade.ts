@@ -36,6 +36,10 @@ export function registerAgentUpgradeCommand(parent: Command): void {
     .option('--cleanup', 'Remove old versions (keeps current and previous)')
     .option('--rollback', 'Roll back to the previous version')
     .option('--pick', 'Interactively pick an installed version to activate')
+    .option(
+      '--restart-only',
+      'Restart the already-installed package without installing (skip self-drive)',
+    )
     .action(
       async (opts: {
         platform?: ServicePlatform;
@@ -49,6 +53,7 @@ export function registerAgentUpgradeCommand(parent: Command): void {
         cleanup?: boolean;
         rollback?: boolean;
         pick?: boolean;
+        restartOnly?: boolean;
       }) => {
         await performVersionedUpgrade('agent', opts);
       },

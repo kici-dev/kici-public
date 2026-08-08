@@ -1,6 +1,7 @@
 /**
  * Wait timer gate -- checks wait timer configuration.
  */
+import { HoldType } from '@kici-dev/engine';
 import type { Context, ProtectionGateResult } from '@kici-dev/engine';
 
 /** Evaluate wait timer for the context. */
@@ -13,7 +14,7 @@ export function evaluateWaitTimerGate(env: Context): ProtectionGateResult {
 
   return {
     action: 'wait',
-    holdType: 'timer',
+    holdType: HoldType.enum.timer,
     holdUntil,
     reason: `Wait timer: ${env.waitTimerSeconds}s`,
   };

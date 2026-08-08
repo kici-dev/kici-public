@@ -44,6 +44,38 @@ Agent                          Orchestrator                      GitHub Checks A
   |                               |    (completed, failure)           |
 ```
 
+The diagram shows the common case, where the agent reports the job's terminal
+status. The completion update is not driven from that message, though: it is
+driven from the execution tracker's terminal-job hook, which fires for every job
+the tracker moves to a terminal status. That covers far more than agent-reported
+completions — a job the orchestrator itself settles as `skipped` (a `needs` edge
+whose upstream did not succeed) or `drift_dropped`, and completions relayed from
+a worker peer in a clustered deployment, all reach the reporter through it.
+
+Two sweeps terminalize a job by writing its row directly instead of going
+through the tracker, so the hook never fires for them and each resolves the
+check run itself:
+
+- the **stale-run detector**, for a dispatched job whose agent stopped
+  heartbeating (`timed_out_stale`);
+- the **queue-expiry sweep**, for a job that was never dispatched — because
+  nothing in the fleet matched its `runsOn` (`unroutable`) or because nothing
+  ever freed up to run it (`timed_out_stale`).
+
+Two further paths also write a terminal job row directly, and do **not** yet
+resolve the job's own check run — a job they settle keeps a `queued` job check
+run even though the workflow check run completes with the run:
+
+- **whole-run cancellation** (`cancel/cancel-run.ts`), which marks pending and
+  queued rows `cancelled` — and, when no agent held outstanding work, every
+  remaining non-terminal row too;
+- **cluster orphan recovery** (`cluster/orphan-recovery.ts`), which marks a
+  job whose coordinator crashed `failed` once its heartbeat goes stale.
+
+Resolving the check run matters because one left `queued` is not cosmetic:
+branch protection that requires it can never be satisfied, and it reads as "CI
+is still running" indefinitely with no failure to point at.
+
 ## Components
 
 ### StepLogBuffer (`step-log-buffer.ts`)
@@ -65,13 +97,13 @@ Central coordinator for all GitHub Checks API interactions. Manages:
 
 Key methods:
 
-| Method                   | When Called                | GitHub Status  |
-| ------------------------ | -------------------------- | -------------- |
-| `setPending()`           | Trigger match              | `queued`       |
-| `updateStepProgress()`   | Step starts/completes      | `in_progress`  |
-| `updateJobStatus()`      | Job reaches terminal state | `completed`    |
-| `updateWorkflowStatus()` | All jobs complete          | `completed`    |
-| `cleanupRun()`           | Run pruned from memory     | (cleanup only) |
+| Method                   | When Called                    | GitHub Status  |
+| ------------------------ | ------------------------------ | -------------- |
+| `setPending()`           | Trigger match                  | `queued`       |
+| `updateStepProgress()`   | Step starts/completes          | `in_progress`  |
+| `updateJobStatus()`      | Job reaches any terminal state | `completed`    |
+| `updateWorkflowStatus()` | All jobs complete              | `completed`    |
+| `cleanupRun()`           | Run pruned from memory         | (cleanup only) |
 
 ### Summary/annotation builders (`check-run-summary.ts`)
 

@@ -36,6 +36,23 @@ export {
 // Cluster join-token manager (consumed by e2e tests)
 export { JoinTokenManager, createJoinTokenManagerFromUrl } from './cluster/join-token.js';
 
+// Held-run store (consumed by e2e tests that exercise PR-scoped hold selection).
+// `SecurityHoldReason` travels with it so a test asserting on a persisted
+// `held_runs.reason` compares against the writer's own vocabulary rather than a
+// bare string literal.
+export {
+  HeldRunStore,
+  createHeldRunStoreFromUrl,
+  SecurityHoldReason,
+} from './contexts/held-runs.js';
+export {
+  TrustPolicyStore,
+  createTrustPolicyStoreFromUrl,
+  TrustPolicySource,
+  DEFAULT_TRUST_POLICY,
+  type StoredTrustPolicy,
+} from './security/trust-policy-store.js';
+
 // Admin API client + GitHub App manifest setup (consumed by e2e tests that
 // drive the one-click setup orchestration against a deployed orchestrator with
 // the GitHub API boundary stubbed).

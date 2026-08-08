@@ -683,6 +683,38 @@ describe('buildBwrapArgs', () => {
     expect(joined).toContain('--ro-bind /bin /bin');
   });
 
+  it('binds host name-resolution files so sandboxed workflows resolve /etc/hosts names', async () => {
+    // existsSync returns true for every optional path (x86_64 host with all files).
+    mockExistsSync.mockReturnValue(true);
+    const { buildBwrapArgs } = await import('./fork-runner.js');
+
+    const args = buildBwrapArgs('/tmp/workdir', '/usr/bin/node', false);
+    assertBindInvariant(args);
+
+    const joined = args.join(' ');
+    // /etc/hosts must be exposed read-only: bwrap auto-creates /etc with only the
+    // explicitly-bound files, so without it a host-net sandbox cannot resolve names
+    // that live only in /etc/hosts (e.g. verdaccio.local -> 127.0.0.1). Absent the
+    // bind, glibc's nsswitch falls through to mDNS/DNS and resolves the name to a
+    // DIFFERENT host, so `npm install` hits the wrong registry and the run fails.
+    expect(joined).toContain('--ro-bind /etc/hosts /etc/hosts');
+    // nsswitch drives the files->dns lookup order; bind it when present so the
+    // sandbox honours the host's `files`-first resolution.
+    expect(joined).toContain('--ro-bind /etc/nsswitch.conf /etc/nsswitch.conf');
+  });
+
+  it('omits optional name-resolution binds that do not exist on the host', async () => {
+    // Minimal host: /etc/nsswitch.conf absent, everything else present.
+    const { buildBwrapArgs } = await import('./fork-runner.js');
+    mockExistsSync.mockImplementation((p: string) => p !== '/etc/nsswitch.conf');
+
+    const args = buildBwrapArgs('/tmp/workdir', '/usr/bin/node', false);
+    assertBindInvariant(args);
+    expect(args).not.toContain('/etc/nsswitch.conf');
+    // /etc/hosts is present, so it is still bound.
+    expect(args.join(' ')).toContain('--ro-bind /etc/hosts /etc/hosts');
+  });
+
   it('omits --unshare-net when networkIsolation=false', async () => {
     mockExistsSync.mockReturnValue(true);
     const { buildBwrapArgs } = await import('./fork-runner.js');
@@ -942,5 +974,31 @@ describe('buildBwrapArgs', () => {
     // /usr is already mounted ro-bind; we must not double-mount its subdirs.
     expect(joined.split('/usr/share/foo').length - 1).toBeLessThanOrEqual(0);
     expect(joined.split('/workspace/sub').length - 1).toBeLessThanOrEqual(0);
+  });
+});
+
+// --- fileCloneSourceBinds tests ---
+//
+// The clone-source derivation is shared by the bare-metal (bwrap) and container
+// backends: only a local `file://` source needs its dir bound into the sandbox
+// so the in-sandbox `git clone` can read it. https/ssh remotes and malformed
+// URLs must yield no bind (the clone surfaces the real error itself).
+describe('fileCloneSourceBinds', () => {
+  it('returns the source dir for a file:// URL', async () => {
+    const { fileCloneSourceBinds } = await import('./fork-runner.js');
+    expect(fileCloneSourceBinds('file:///home/me/repo')).toEqual(['/home/me/repo']);
+  });
+
+  it('returns [] for https and ssh remotes', async () => {
+    const { fileCloneSourceBinds } = await import('./fork-runner.js');
+    expect(fileCloneSourceBinds('https://github.com/o/r.git')).toEqual([]);
+    expect(fileCloneSourceBinds('git@github.com:o/r.git')).toEqual([]);
+  });
+
+  it('returns [] for undefined or a malformed file:// URL', async () => {
+    const { fileCloneSourceBinds } = await import('./fork-runner.js');
+    expect(fileCloneSourceBinds(undefined)).toEqual([]);
+    // A file:// URL with an empty path yields no bind.
+    expect(fileCloneSourceBinds('file://')).toEqual([]);
   });
 });

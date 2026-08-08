@@ -23,7 +23,9 @@ import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing
 import type { AppConfig } from '../config.js';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import { registerProviderBundleForSource } from '../webhook/register-source-bundle.js';
+import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-events' });
 
@@ -49,6 +51,8 @@ interface AdminEventRouteDeps {
   /** Required for universal-git source registration — `null` is allowed;
    *  rows with `git_config` are skipped + metric-bumped in that case. */
   secretResolver: SecretResolver | null;
+  /** Fleet-wide settings reader; threads the live lock-file cap into newly-registered universal-git sources. */
+  clusterSettings?: ClusterSettingsReader;
   /**
    * Optional — when provided, the `POST /api/v1/admin/events/emit` route is
    * mounted so operators can INSERT into `kici_events` + `pg_notify` via HTTP.
@@ -142,21 +146,10 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEve
   const app = new Hono<AdminEventEnv>();
 
   // -- Bearer token auth middleware --
-  const authMiddleware = async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (!authHeader?.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing authorization' }, 401);
-    }
-    const token = authHeader.slice(7);
-    const tokenInfo = await deps.tokenManager.validate(token);
-    if (!tokenInfo) {
-      return c.json({ error: 'Invalid or expired token' }, 401);
-    }
-    c.set('role', tokenInfo.role);
-    c.set('userId', tokenInfo.id);
-    c.set('routingKey', tokenInfo.routingKey);
-    await next();
-  };
+  const authMiddleware = createBearerAuthMiddleware({
+    tokenManager: deps.tokenManager,
+    scope: 'admin-events',
+  });
   app.use('/api/v1/admin/generic-sources', authMiddleware);
   app.use('/api/v1/admin/generic-sources/*', authMiddleware);
   app.use('/api/v1/admin/trust', authMiddleware);
@@ -184,6 +177,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEve
         providerRegistry: deps.providerRegistry,
         config: deps.config,
         secretResolver: deps.secretResolver,
+        clusterSettings: deps.clusterSettings,
       });
       return c.json({ source }, 201);
     } catch (err) {
@@ -252,6 +246,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEve
         providerRegistry: deps.providerRegistry,
         config: deps.config,
         secretResolver: deps.secretResolver,
+        clusterSettings: deps.clusterSettings,
       });
       return c.json({ source }, 200);
     } catch (err) {
@@ -308,6 +303,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEve
         providerRegistry: deps.providerRegistry,
         config: deps.config,
         secretResolver: deps.secretResolver,
+        clusterSettings: deps.clusterSettings,
       });
       return c.json({ enabled: true }, 200);
     } catch (err) {

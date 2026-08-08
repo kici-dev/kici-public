@@ -8,7 +8,7 @@ The **Notifications** page (in the org sidebar) has two tabs. **My notifications
 ## My notifications
 
 
-My notifications are scoped to the organization you are viewing — they match that org's runs and are emailed to your account address. Each user manages their own; you never see another member's notifications, and they never see yours.
+My notifications are scoped to the organization you are viewing — they match that org's runs and are delivered only to you (your account email or your own Slack direct message). Each user manages their own; you never see another member's notifications, and they never see yours.
 
 ## Organization
 
@@ -23,4 +23,8 @@ My notifications are scoped to the organization you are viewing — they match t
 
 
 ### Delivery log
+
+
+### Actor tagging roster
+
 

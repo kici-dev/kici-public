@@ -87,11 +87,12 @@ describe('InMemoryJobQueue', () => {
     expect(await queue.getDepth()).toBe(1);
   });
 
-  it('insertDispatched returns a UUID string', async () => {
+  it('insertDispatched returns a UUID id and inserted:true', async () => {
     const queue = new InMemoryJobQueue();
-    const id = await queue.insertDispatched(makeInput());
-    expect(typeof id).toBe('string');
-    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    const result = await queue.insertDispatched(makeInput(), 'agent-1');
+    expect(result.inserted).toBe(true);
+    expect(typeof result.id).toBe('string');
+    expect(result.id).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it('markDispatched, markFailed, markCompleted are no-ops', async () => {

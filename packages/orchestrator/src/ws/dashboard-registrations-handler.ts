@@ -80,9 +80,7 @@ interface RegistrationDeleteMessage {
 }
 
 type RegistrationMessage =
-  | RegistrationsListMessage
-  | RegistrationDisableMessage
-  | RegistrationDeleteMessage;
+  RegistrationsListMessage | RegistrationDisableMessage | RegistrationDeleteMessage;
 
 /**
  * Handler for dashboard registration WS messages (list, disable, delete).
@@ -519,10 +517,16 @@ export class DashboardRegistrationsHandler {
 
       if (scheduleRegIds.length > 0) {
         try {
+          // A registration may have several schedule() triggers → one
+          // cron_last_fired row per schedule. "Last triggered from cron" means
+          // the most recent fire across all of them, so aggregate to MAX per
+          // registration.
           const cronRows = await this.deps.db
             .selectFrom('cron_last_fired')
-            .select(['registration_id', 'last_fired_at'])
+            .select(['registration_id'])
+            .select((eb) => eb.fn.max('last_fired_at').as('last_fired_at'))
             .where('registration_id', 'in', scheduleRegIds)
+            .groupBy('registration_id')
             .execute();
 
           for (const row of cronRows) {

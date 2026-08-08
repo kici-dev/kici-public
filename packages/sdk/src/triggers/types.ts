@@ -196,13 +196,7 @@ export interface ReviewCommentConfigInput {
 // --- Release trigger ---
 
 export type ReleaseAction =
-  | 'published'
-  | 'unpublished'
-  | 'created'
-  | 'edited'
-  | 'deleted'
-  | 'prereleased'
-  | 'released';
+  'published' | 'unpublished' | 'created' | 'edited' | 'deleted' | 'prereleased' | 'released';
 
 /**
  * Configuration for a release trigger.
@@ -255,8 +249,7 @@ export interface DispatchConfigInput {
    * closed dispatch-input subset.
    */
   readonly inputs?:
-    | DispatchInputsMap
-    | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
+    DispatchInputsMap | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
 }
 
 // --- Create trigger ---
@@ -492,6 +485,32 @@ export interface WorkflowCompleteTriggerConfig {
   readonly description?: string;
 }
 
+// --- Workflows failed batch trigger ---
+
+/**
+ * Input configuration for workflowsFailedBatch() factory function.
+ * Accumulate failed workflow completions over a window, notify once.
+ */
+export interface WorkflowsFailedBatchConfigInput {
+  /** Accumulation window in milliseconds; the window opens on the first failure. */
+  readonly accumulateFor: number;
+  readonly name?: string;
+  readonly source?: string;
+  readonly description?: string;
+}
+
+/**
+ * Configuration for a workflows-failed-batch trigger.
+ */
+export interface WorkflowsFailedBatchTriggerConfig {
+  readonly _tag: 'WorkflowsFailedBatchTrigger';
+  /** Accumulation window in milliseconds; the window opens on the first failure. */
+  readonly accumulateFor: number;
+  readonly name?: string;
+  readonly source?: string;
+  readonly description?: string;
+}
+
 // --- Job complete trigger ---
 
 /**
@@ -602,8 +621,7 @@ export interface ScheduleConfigInput {
    * (enforced at compile time).
    */
   readonly inputs?:
-    | DispatchInputsMap
-    | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
+    DispatchInputsMap | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
 }
 
 /**
@@ -624,10 +642,7 @@ export interface ScheduleTriggerConfig {
  * Lifecycle event types for cross-workflow orchestration.
  */
 export type LifecycleEvent =
-  | 'workflow_complete'
-  | 'job_complete'
-  | 'job_failed'
-  | 'registration_updated';
+  'workflow_complete' | 'job_complete' | 'job_failed' | 'registration_updated';
 
 /**
  * Input configuration for lifecycle() factory function.
@@ -698,6 +713,7 @@ export type TriggerConfig =
   | WebhookTriggerConfig
   | KiciEventTriggerConfig
   | WorkflowCompleteTriggerConfig
+  | WorkflowsFailedBatchTriggerConfig
   | JobCompleteTriggerConfig
   | GenericWebhookTriggerConfig
   | ScheduleTriggerConfig

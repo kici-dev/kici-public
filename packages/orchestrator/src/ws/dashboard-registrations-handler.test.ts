@@ -195,10 +195,11 @@ describe('DashboardRegistrationsHandler', () => {
       ]),
     };
 
-    // Mock cron_last_fired query
+    // Mock cron_last_fired query (grouped MAX per registration)
     const cronQueryChain = {
       select: vi.fn().mockReturnThis(),
       where: vi.fn().mockReturnThis(),
+      groupBy: vi.fn().mockReturnThis(),
       execute: vi.fn().mockResolvedValue([]),
     };
 
@@ -232,6 +233,58 @@ describe('DashboardRegistrationsHandler', () => {
     expect(response.registrations[0].workflowName).toBe('deploy');
     expect(response.registrations[0].lastTriggeredAt).toBe('2026-01-15T10:00:00.000Z');
     expect(response.registryVersion).toBe(5);
+  });
+
+  it('reports cron last-triggered from the grouped MAX across a registrations schedules', async () => {
+    // A workflow with two schedule() triggers has multiple cron_last_fired
+    // rows; the handler queries their per-registration MAX. Simulate the DB
+    // returning that grouped row and assert it surfaces as lastTriggeredAt.
+    const row = makeRegistrationRow({
+      lock_entry: makeLockWorkflow({
+        triggers: [
+          { _type: 'schedule', cronExpression: '0 9 * * 1', timezone: 'UTC' } as any,
+          { _type: 'schedule', cronExpression: '0 18 * * 5', timezone: 'UTC' } as any,
+        ],
+      }),
+    });
+    registrationStore.getAll.mockResolvedValue([row]);
+
+    // No last-triggered from execution_runs.
+    const execQueryChain = {
+      select: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      groupBy: vi.fn().mockReturnThis(),
+      execute: vi.fn().mockResolvedValue([]),
+    };
+    // Grouped MAX(last_fired_at) — the later of the two schedules' fires.
+    const cronQueryChain = {
+      select: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      groupBy: vi.fn().mockReturnThis(),
+      execute: vi
+        .fn()
+        .mockResolvedValue([
+          { registration_id: 'reg-1', last_fired_at: new Date('2026-01-16T18:00:00Z') },
+        ]),
+    };
+    const versionQueryChain = {
+      selectAll: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      executeTakeFirst: vi
+        .fn()
+        .mockResolvedValue({ version: 1, updated_at: new Date('2026-01-01') }),
+    };
+    db.selectFrom = vi.fn().mockImplementation((table: string) => {
+      if (table === 'execution_runs') return execQueryChain;
+      if (table === 'cron_last_fired') return cronQueryChain;
+      if (table === 'registry_versions') return versionQueryChain;
+      return execQueryChain;
+    });
+
+    await handler.handle({ type: 'dashboard.registrations.list', requestId: 'req-max' });
+
+    const response = send.mock.calls[0][0];
+    expect(response.registrations[0].lastTriggeredAt).toBe('2026-01-16T18:00:00.000Z');
   });
 
   it('computes next_fire for schedule triggers using croner', async () => {
@@ -536,6 +589,7 @@ describe('DashboardRegistrationsHandler', () => {
       const cronChain = {
         select: vi.fn().mockReturnThis(),
         where: vi.fn().mockReturnThis(),
+        groupBy: vi.fn().mockReturnThis(),
         execute: vi.fn().mockResolvedValue([]),
       };
       const versionChain = {

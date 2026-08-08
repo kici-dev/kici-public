@@ -23,7 +23,7 @@ import type {
   ResourceRequest,
   LabelMatcher,
 } from '@kici-dev/engine';
-import { TERMINAL_JOB_STATES } from '@kici-dev/engine';
+import { TERMINAL_JOB_STATES, ExecutionJobStatus, ScalerEventType } from '@kici-dev/engine';
 import type { PeerRegistry, PeerInfo } from './peer-registry.js';
 import type { PeerClient } from './peer-client.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
@@ -38,6 +38,15 @@ const DEFAULT_ACK_TIMEOUT_MS = 15_000;
 
 /** Maximum allowed hops for rerouted jobs to prevent routing loops. */
 const DEFAULT_MAX_HOPS = 3;
+
+/**
+ * Default reroute spawn window (90s): how long the coordinator waits after a
+ * peer ACKs a reroute before treating "accepted but no progress" as a spawn
+ * failure and re-dispatching. Fallback when no per-org / cluster reader is
+ * wired (tests, minimal deps); production reads it from
+ * `org_settings.reroute_spawn_window_ms` / `config.rerouteSpawnWindowMs`.
+ */
+const DEFAULT_REROUTE_SPAWN_WINDOW_MS = 90_000;
 
 // --- Types ---
 
@@ -115,6 +124,41 @@ export interface RunCoordinatorDeps {
   ackTimeoutMs?: number;
   /** Stale peer timeout in ms. Default: 60000 (60s). */
   staleTimeoutMs?: number;
+  /**
+   * Per-job reroute spawn window (ms): the post-ACK re-dispatch backstop
+   * window. Resolves the job's org override from
+   * `org_settings.reroute_spawn_window_ms`, else the cluster default. When
+   * absent, {@link DEFAULT_REROUTE_SPAWN_WINDOW_MS} is used.
+   */
+  getRerouteSpawnWindowMs?: (job: JobToRoute) => Promise<number>;
+  /**
+   * Per-job reroute ACK timeout (ms) for the `sendAndWaitAck` deadline. When
+   * absent, falls back to `ackTimeoutMs` / {@link DEFAULT_ACK_TIMEOUT_MS}.
+   */
+  getRerouteAckTimeoutMs?: (job: JobToRoute) => Promise<number>;
+  /**
+   * Per-job maximum peer hops for a rerouted job. When absent, falls back to
+   * {@link DEFAULT_MAX_HOPS}.
+   */
+  getRerouteMaxHops?: (job: JobToRoute) => Promise<number>;
+}
+
+/**
+ * In-memory tracking for a job rerouted to a peer. Retains everything the
+ * post-ACK re-dispatch backstop needs to re-run the routing decision (to
+ * another peer or a local fallback) when the receiving peer accepts the
+ * reroute but never reports progress (async spawn failure, peer crash).
+ */
+interface RerouteTracking {
+  peerId: string;
+  jobName: string;
+  runContext: RunContext;
+  job: JobToRoute;
+  labelSets: string[][];
+  /** Connections already tried (this instance + every failed peer), for loop prevention. */
+  triedConnections: string[];
+  /** Armed spawn-window timer; cleared on first progress or terminal cleanup. */
+  windowTimer: NodeJS.Timeout | undefined;
 }
 
 /** NAK backoff base delay (1s). */
@@ -141,15 +185,16 @@ export class RunCoordinator {
     msg: PeerToPeerMessage,
   ) => boolean;
   private readonly ackTimeoutMs: number;
+  private readonly getRerouteSpawnWindowMs: (job: JobToRoute) => Promise<number>;
+  private readonly getRerouteAckTimeoutMs: (job: JobToRoute) => Promise<number>;
+  private readonly getRerouteMaxHops: (job: JobToRoute) => Promise<number>;
 
   /**
    * Tracks which jobs have been rerouted to which peers, keyed by runId.
-   * Used for cancel propagation and progress tracking.
+   * Used for cancel propagation, progress tracking, and the post-ACK spawn
+   * re-dispatch backstop.
    */
-  private readonly reroutedJobs = new Map<
-    string,
-    Map<string, { peerId: string; jobName: string }>
-  >();
+  private readonly reroutedJobs = new Map<string, Map<string, RerouteTracking>>();
 
   /**
    * NAK tracking per peer: count of consecutive NAKs and backoff-until timestamp.
@@ -170,6 +215,10 @@ export class RunCoordinator {
     this.sendAndWaitAckViaHandler = deps.sendAndWaitAckViaHandler;
     this.sendToPeerViaHandler = deps.sendToPeerViaHandler;
     this.ackTimeoutMs = deps.ackTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS;
+    this.getRerouteSpawnWindowMs =
+      deps.getRerouteSpawnWindowMs ?? (async () => DEFAULT_REROUTE_SPAWN_WINDOW_MS);
+    this.getRerouteAckTimeoutMs = deps.getRerouteAckTimeoutMs ?? (async () => this.ackTimeoutMs);
+    this.getRerouteMaxHops = deps.getRerouteMaxHops ?? (async () => DEFAULT_MAX_HOPS);
   }
 
   /**
@@ -389,6 +438,13 @@ export class RunCoordinator {
     if (result.status === 'rejected') {
       return { accepted: false, reason: 'Dispatch rejected: ' + (result as any).reason };
     }
+    if (result.status === 'duplicate') {
+      // A dispatch_queue row for this jobId already exists here — a concurrent
+      // reroute from the sibling coordinator, or a duplicate delivery. The job is
+      // already tracked; accept the reroute without re-registering local execution
+      // tracking or double-dispatching. (Idempotent no-op, not an error.)
+      return { accepted: true };
+    }
 
     // Register the execution run locally so this orchestrator's ExecutionTracker
     // can track job completion and update the GitHub check run. Without this,
@@ -435,8 +491,51 @@ export class RunCoordinator {
    * this split, every job-level event was silently funnelled into
    * `onStepStatus` and the run stayed in `running` forever.
    */
-  onPeerJobProgress(msg: JobProgress, reply?: (m: JobProgressAck) => void): void {
-    if (this.executionTracker) {
+  onPeerJobProgress(
+    msg: JobProgress,
+    fromPeerId: string,
+    reply?: (m: JobProgressAck) => void,
+  ): void {
+    const tracked = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
+    const isJobTerminal = msg.kind === 'job' && TERMINAL_JOB_STATES.has(msg.state);
+    // A terminal relayed by a peer that is NOT the one this job is currently
+    // tracked against is a stray signal from a superseded peer after a reroute
+    // moved the job to a replacement. Ignoring its apply + cleanup keeps it from
+    // (1) terminalizing the run while the replacement is still executing and
+    // (2) stripping the replacement's spawn-window backstop. We still ACK it
+    // (below) so the superseded peer prunes its durable outbox and stops
+    // re-sending — a re-send after the replacement's own cleanup would otherwise
+    // find no tracked entry and fall through to the unconditional apply.
+    const isSupersededTerminal =
+      isJobTerminal && tracked !== undefined && tracked.peerId !== fromPeerId;
+
+    // First progress from the tracked reroute TARGET means its spawn succeeded —
+    // disarm the post-ACK spawn-window backstop so it does not re-dispatch a
+    // healthy job. Gate on the source peer: a stray progress relayed for the same
+    // jobId by a superseded/cancelled peer must NOT disarm the replacement peer's
+    // window timer (that would strip the backstop off a job still spawning).
+    if (tracked?.windowTimer && tracked.peerId === fromPeerId) {
+      clearTimeout(tracked.windowTimer);
+      tracked.windowTimer = undefined;
+    }
+
+    if (isSupersededTerminal) {
+      logger.warn('Ignoring stray terminal job update from superseded peer', {
+        runId: msg.runId,
+        jobId: msg.jobId,
+        state: msg.state,
+        fromPeerId,
+        trackedPeerId: tracked?.peerId,
+      });
+      // Ack without applying, so the superseded peer prunes its durable outbox
+      // and stops re-sending this stale terminal.
+      reply?.({
+        type: 'job.progress.ack',
+        runId: msg.runId,
+        jobId: msg.jobId,
+        state: msg.state,
+      });
+    } else if (this.executionTracker) {
       const trackerCall =
         msg.kind === 'job'
           ? this.executionTracker.onJobStatus(
@@ -470,9 +569,13 @@ export class RunCoordinator {
           // peer and force-fail it the moment its heartbeat goes stale.
           // Idempotent and cheap; skipped on terminal updates (the marker is
           // moot once the job is done, and reroutedJobs is cleared below).
-          const tracked = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
-          if (tracked && this.executionTracker && !TERMINAL_JOB_STATES.has(msg.state)) {
-            await this.executionTracker.markJobReroutedToPeer(msg.runId, msg.jobId, tracked.peerId);
+          const trackedNow = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
+          if (trackedNow && this.executionTracker && !TERMINAL_JOB_STATES.has(msg.state)) {
+            await this.executionTracker.markJobReroutedToPeer(
+              msg.runId,
+              msg.jobId,
+              trackedNow.peerId,
+            );
           }
 
           // ACK a terminal job-level update back to the worker only after the
@@ -500,11 +603,14 @@ export class RunCoordinator {
 
     // Clean up rerouted-job tracking on terminal job-level updates so
     // cancel propagation and any "all jobs done" probes see the right
-    // residual set. The previous code path waited for an unwired
-    // `peer.job.complete` message that never arrived.
-    if (msg.kind === 'job' && TERMINAL_JOB_STATES.has(msg.state)) {
+    // residual set. Skipped for a superseded-peer terminal: the replacement
+    // peer still owns the job, so its tracking entry (and spawn-window timer)
+    // must survive.
+    if (isJobTerminal && !isSupersededTerminal) {
       const runJobs = this.reroutedJobs.get(msg.runId);
       if (runJobs) {
+        const entry = runJobs.get(msg.jobId);
+        if (entry?.windowTimer) clearTimeout(entry.windowTimer);
         runJobs.delete(msg.jobId);
         if (runJobs.size === 0) {
           this.reroutedJobs.delete(msg.runId);
@@ -529,14 +635,57 @@ export class RunCoordinator {
    * coordinator's ExecutionTracker persists the event (provisioning log
    * line + dispatch-queue last-error column) just as it would for a
    * locally-emitted scaler event.
+   *
+   * Layer B fast path: a `scaler.failed` for a tracked rerouted job whose spawn
+   * window is still armed is the worker's NAK-after-accept — the peer accepted
+   * the reroute but its agent spawn failed asynchronously before reporting any
+   * progress. Re-dispatch immediately (the same routine the spawn-window timer
+   * runs) instead of waiting the window out. Idempotent with the Layer A timer:
+   * whichever fires first removes the tracking entry.
+   *
+   * Two guards make the re-dispatch safe. First, source provenance: the failure
+   * must come from `fromPeerId === tracked.peerId` (the authenticated connection
+   * identity), so a late `scaler.failed` relayed for the same jobId by a
+   * superseded peer after an earlier re-dispatch is ignored rather than bouncing
+   * the healthy replacement. Second, the armed-window check: once the first
+   * progress disarms the timer (`windowTimer` cleared to undefined), the job is
+   * executing and a stale failure must NOT cancel the running job. Persistence
+   * (`emitScalerEvent`) stays unconditional — it is keyed on `(runId, jobId)` and
+   * correct regardless of which peer relayed the event.
    */
-  onPeerScalerEvent(msg: PeerScalerEvent): void {
+  onPeerScalerEvent(msg: PeerScalerEvent, fromPeerId: string): void {
     this.executionTracker?.emitScalerEvent(msg.runId, msg.jobId, {
       agentId: msg.agentId,
       eventType: msg.eventType,
       detail: msg.detail,
       timestampMs: msg.timestampMs,
     });
+
+    // Layer B NAK fast path — gated on source provenance AND an armed window.
+    // Re-dispatch only when the failure comes from the peer this job is actually
+    // tracked against: a late scaler.failed relayed for the same jobId by a
+    // superseded peer (after an earlier re-dispatch moved the job) must NOT
+    // bounce the healthy replacement. The armed-window check additionally keeps
+    // a failure that arrives after first progress from cancelling a running job.
+    const tracked = this.reroutedJobs.get(msg.runId)?.get(msg.jobId);
+    if (
+      msg.eventType === ScalerEventType.enum['scaler.failed'] &&
+      tracked?.windowTimer !== undefined &&
+      tracked.peerId === fromPeerId
+    ) {
+      logger.warn('Worker relayed scaler.failed for a rerouted job — re-dispatching', {
+        runId: msg.runId,
+        jobId: msg.jobId,
+        detail: msg.detail,
+      });
+      void this.handleRerouteSpawnTimeout(msg.runId, msg.jobId).catch((err) => {
+        logger.error('Reroute NAK-fast-path handler failed', {
+          runId: msg.runId,
+          jobId: msg.jobId,
+          error: toErrorMessage(err),
+        });
+      });
+    }
   }
 
   /**
@@ -564,9 +713,11 @@ export class RunCoordinator {
         });
     }
 
-    // Clean up rerouted job tracking
+    // Clean up rerouted job tracking (disarm any live spawn-window timer first)
     const runJobs = this.reroutedJobs.get(runId);
     if (runJobs) {
+      const entry = runJobs.get(jobId);
+      if (entry?.windowTimer) clearTimeout(entry.windowTimer);
       runJobs.delete(jobId);
       if (runJobs.size === 0) {
         this.reroutedJobs.delete(runId);
@@ -584,9 +735,14 @@ export class RunCoordinator {
     const runJobs = this.reroutedJobs.get(runId);
     if (!runJobs) return;
 
-    // Group jobs by peer for efficient messaging
+    // Group jobs by peer for efficient messaging; disarm each job's spawn-window
+    // timer so a cancelled run cannot trigger a spurious re-dispatch.
     const peerJobs = new Map<string, string[]>();
     for (const [jobId, info] of runJobs) {
+      if (info.windowTimer) {
+        clearTimeout(info.windowTimer);
+        info.windowTimer = undefined;
+      }
       let jobs = peerJobs.get(info.peerId);
       if (!jobs) {
         jobs = [];
@@ -673,58 +829,57 @@ export class RunCoordinator {
   // --- Private ---
 
   /**
-   * Attempt to reroute a job to a peer with matching capacity.
-   * Tries peers in order of available capacity (most capacity first).
-   * Returns on first successful ACK.
+   * Attempt to reroute a job to a peer with matching capacity. Allocates the
+   * sender-side jobId (so the caller can register execution rows under the id
+   * the worker reports back against) and delegates to {@link attemptPeerRoute}.
    */
   private async rerouteJob(
     runContext: RunContext,
     job: JobToRoute,
     labelSets: string[][],
   ): Promise<{ success: boolean; peerId?: string; jobId?: string; reason?: string }> {
+    // Pre-allocate the jobId on the sender side so we can register the
+    // execution_runs + execution_jobs rows before the worker reports back.
+    // Without this, the worker generates its own jobId and the first
+    // peer.job.progress arriving at this coord finds no matching run+job row
+    // (recoverRunFromDb returns null) and is silently dropped — leaving the
+    // run stalled at `running` forever.
+    const allocatedJobId = randomUUID();
+    return this.attemptPeerRoute(runContext, job, labelSets, allocatedJobId, [this.instanceId]);
+  }
+
+  /**
+   * Try each peer with matching capacity (most capacity first) for a single
+   * job under a fixed `jobId`, returning on the first ACK. Reused by initial
+   * routing and by the post-ACK spawn re-dispatch backstop — the caller passes
+   * the accumulated `triedConnections` (this instance + any failed peers) so a
+   * re-dispatch never re-selects a peer that already failed and the receiving
+   * peer's loop-prevention stays correct.
+   */
+  private async attemptPeerRoute(
+    runContext: RunContext,
+    job: JobToRoute,
+    labelSets: string[][],
+    jobId: string,
+    triedConnections: string[],
+  ): Promise<{ success: boolean; peerId?: string; jobId?: string; reason?: string }> {
     const peers = this.peerRegistry.findPeersWithCapacity(labelSets);
 
     if (peers.length === 0) {
-      // Differentiate between "no peer handles this label" vs "peers exist but at capacity"
-      const peersWithLabels = this.peerRegistry.findPeersWithLabels(labelSets);
-
-      // Debug: log peer registry state when reroute fails
-      const allPeers = this.peerRegistry.getConnectedPeers();
-      logger.debug('Reroute failed — peer registry state', {
-        jobName: job.jobName,
-        requiredLabels: labelSets,
-        connectedPeers: allPeers.map((p) => ({
-          id: p.instanceId,
-          connected: p.connected,
-          draining: p.draining,
-          agents: p.agents.length,
-          scalerCapacity: p.scalerCapacity?.map((sc) => ({
-            labelSets: sc.labelSets,
-            active: sc.activeCount,
-            max: sc.maxAgents,
-          })),
-        })),
-        peersWithLabelsCount: peersWithLabels.length,
-      });
-
-      if (peersWithLabels.length > 0) {
-        return {
-          success: false,
-          reason: `Peers with matching labels exist but are at capacity`,
-        };
-      }
-      return {
-        success: false,
-        reason: `No orchestrator in cluster handles labels: ${labelSets.map((ls) => ls.join(',')).join(' | ')}`,
-      };
+      return this.noCapacityResult(job, labelSets);
     }
 
     // Sort by available capacity (most capacity first)
     const sortedPeers = this.sortPeersByCapacity(peers, labelSets);
-
+    const maxHops = await this.getRerouteMaxHops(job);
+    const ackTimeoutMs = await this.getRerouteAckTimeoutMs(job);
     const now = Date.now();
 
     for (const peer of sortedPeers) {
+      // Skip peers already tried for this job (the sender itself, or a peer that
+      // accepted then failed to spawn) so a re-dispatch fans out to a new backend.
+      if (triedConnections.includes(peer.instanceId)) continue;
+
       // Check NAK backoff: skip peers that are in backoff period
       const nakEntry = this.nakTracker.get(peer.instanceId);
       if (nakEntry && nakEntry.backoffUntil > now) {
@@ -746,80 +901,43 @@ export class RunCoordinator {
         continue;
       }
 
-      // Pre-allocate the jobId on the sender side so we can register the
-      // execution_runs + execution_jobs rows before the worker reports
-      // back. Without this, the worker generates its own jobId and the
-      // first peer.job.progress arriving at this coord finds no matching
-      // run+job row (recoverRunFromDb returns null) and is silently
-      // dropped — leaving the run stalled at `running` forever.
-      const allocatedJobId = randomUUID();
-      const rerouteMsg: JobReroute = {
-        type: 'job.reroute',
-        messageId: randomUUID(),
-        jobId: allocatedJobId,
-        runId: runContext.runId,
-        deliveryId: runContext.deliveryId,
-        routingKey: runContext.routingKey,
-        event: runContext.event,
-        action: runContext.action,
-        payload: runContext.payload,
-        jobName: job.jobName,
-        workflowName: runContext.workflowName,
-        runsOnLabels: labelSets,
-        excludeLabels: job.excludeLabels,
-        // Thread the glob/regex selectors so a pattern-bearing job keeps its
-        // matchers on the receiving peer (a pure-regex job has no exact labels
-        // and would otherwise match any local agent).
-        runsOnPatterns: job.runsOnPatterns,
-        excludePatterns: job.excludePatterns,
-        triedConnections: [this.instanceId],
-        maxHops: DEFAULT_MAX_HOPS,
-        coordinatorId: this.instanceId,
-        requestId: runContext.requestId,
-        traceId: runContext.traceId,
-        // Include resolved job data so the receiving orch can dispatch directly
-        jobConfig: job.jobConfig,
-        repoUrl: job.repoUrl,
-        ref: job.ref,
-        sha: job.sha,
-        provider: runContext.provider,
-        providerContext: runContext.installationId
-          ? { installationId: runContext.installationId }
-          : {},
-        sourceTarUrl: job.sourceTarUrl,
-        sourceTarHash: job.sourceTarHash,
-        depsUrl: job.depsUrl,
-        depsHash: job.depsHash,
-        // Include pre-resolved clone token for workers without provider credentials
-        cloneToken: runContext.cloneToken,
-      };
+      const rerouteMsg = this.buildRerouteMessage(runContext, job, labelSets, jobId, {
+        triedConnections,
+        maxHops,
+      });
 
       const accepted = client
-        ? await client.sendAndWaitAck(rerouteMsg, this.ackTimeoutMs)
-        : await this.sendAndWaitAckViaHandler!(peer.instanceId, rerouteMsg, this.ackTimeoutMs);
+        ? await client.sendAndWaitAck(rerouteMsg, ackTimeoutMs)
+        : await this.sendAndWaitAckViaHandler!(peer.instanceId, rerouteMsg, ackTimeoutMs);
 
       if (accepted) {
         // ACK: reset NAK tracking for this peer
         this.nakTracker.delete(peer.instanceId);
 
-        // Track rerouted job under the *allocated* jobId (not the wire
-        // messageId) so cancel propagation and the onPeerJobProgress
-        // residual-cleanup path see the same key the worker reports back.
-        // This records the in-memory reroute mapping; the durable
+        // Track rerouted job under the *fixed* jobId so cancel propagation, the
+        // onPeerJobProgress residual-cleanup path, and the spawn-window backstop
+        // all key off the same id the worker reports back. The durable
         // `rerouted_to_peer` marker is (re)asserted in onPeerJobProgress once
-        // the worker's first status creates the execution_jobs row (the row
-        // does not exist yet at reroute-ACK time, so a marker write here would
-        // be a no-op UPDATE).
-        await this.trackReroutedJob(runContext.runId, allocatedJobId, peer.instanceId, job.jobName);
+        // the worker's first status creates the execution_jobs row (the row does
+        // not exist yet at reroute-ACK time, so a marker write here would be a
+        // no-op UPDATE).
+        await this.trackReroutedJob(
+          runContext,
+          job,
+          labelSets,
+          jobId,
+          peer.instanceId,
+          triedConnections,
+        );
 
         logger.info('Job rerouted to peer', {
           runId: runContext.runId,
           jobName: job.jobName,
-          jobId: allocatedJobId,
+          jobId,
           peerId: peer.instanceId,
         });
 
-        return { success: true, peerId: peer.instanceId, jobId: allocatedJobId };
+        return { success: true, peerId: peer.instanceId, jobId };
       }
 
       // NAK: increment count and set exponential backoff
@@ -843,6 +961,92 @@ export class RunCoordinator {
     return {
       success: false,
       reason: 'All peers with capacity rejected or timed out',
+    };
+  }
+
+  /** Build the failure result when no peer has matching capacity (with debug log). */
+  private noCapacityResult(
+    job: JobToRoute,
+    labelSets: string[][],
+  ): { success: false; reason: string } {
+    // Differentiate between "no peer handles this label" vs "peers exist but at capacity"
+    const peersWithLabels = this.peerRegistry.findPeersWithLabels(labelSets);
+
+    // Debug: log peer registry state when reroute fails
+    const allPeers = this.peerRegistry.getConnectedPeers();
+    logger.debug('Reroute failed — peer registry state', {
+      jobName: job.jobName,
+      requiredLabels: labelSets,
+      connectedPeers: allPeers.map((p) => ({
+        id: p.instanceId,
+        connected: p.connected,
+        draining: p.draining,
+        agents: p.agents.length,
+        scalerCapacity: p.scalerCapacity?.map((sc) => ({
+          labelSets: sc.labelSets,
+          active: sc.activeCount,
+          max: sc.maxAgents,
+        })),
+      })),
+      peersWithLabelsCount: peersWithLabels.length,
+    });
+
+    if (peersWithLabels.length > 0) {
+      return { success: false, reason: `Peers with matching labels exist but are at capacity` };
+    }
+    return {
+      success: false,
+      reason: `No orchestrator in cluster handles labels: ${labelSets.map((ls) => ls.join(',')).join(' | ')}`,
+    };
+  }
+
+  /** Assemble the `job.reroute` wire message for a single routing attempt. */
+  private buildRerouteMessage(
+    runContext: RunContext,
+    job: JobToRoute,
+    labelSets: string[][],
+    jobId: string,
+    routing: { triedConnections: string[]; maxHops: number },
+  ): JobReroute {
+    return {
+      type: 'job.reroute',
+      messageId: randomUUID(),
+      jobId,
+      runId: runContext.runId,
+      deliveryId: runContext.deliveryId,
+      routingKey: runContext.routingKey,
+      event: runContext.event,
+      action: runContext.action,
+      payload: runContext.payload,
+      jobName: job.jobName,
+      workflowName: runContext.workflowName,
+      runsOnLabels: labelSets,
+      excludeLabels: job.excludeLabels,
+      // Thread the glob/regex selectors so a pattern-bearing job keeps its
+      // matchers on the receiving peer (a pure-regex job has no exact labels
+      // and would otherwise match any local agent).
+      runsOnPatterns: job.runsOnPatterns,
+      excludePatterns: job.excludePatterns,
+      triedConnections: routing.triedConnections,
+      maxHops: routing.maxHops,
+      coordinatorId: this.instanceId,
+      requestId: runContext.requestId,
+      traceId: runContext.traceId,
+      // Include resolved job data so the receiving orch can dispatch directly
+      jobConfig: job.jobConfig,
+      repoUrl: job.repoUrl,
+      ref: job.ref,
+      sha: job.sha,
+      provider: runContext.provider,
+      providerContext: runContext.installationId
+        ? { installationId: runContext.installationId }
+        : {},
+      sourceTarUrl: job.sourceTarUrl,
+      sourceTarHash: job.sourceTarHash,
+      depsUrl: job.depsUrl,
+      depsHash: job.depsHash,
+      // Include pre-resolved clone token for workers without provider credentials
+      cloneToken: runContext.cloneToken,
     };
   }
 
@@ -886,25 +1090,198 @@ export class RunCoordinator {
   }
 
   /**
-   * Track a rerouted job for cancel propagation, and durably tag the projected
-   * `execution_jobs` row with the owning worker peer so run-recovery sweepers
-   * do not force-fail the job while its worker is connected.
+   * Track a rerouted job for cancel propagation, arm the post-ACK spawn-window
+   * backstop timer, and durably tag the projected `execution_jobs` row with the
+   * owning worker peer so run-recovery sweepers do not force-fail the job while
+   * its worker is connected.
    */
   private async trackReroutedJob(
-    runId: string,
+    runContext: RunContext,
+    job: JobToRoute,
+    labelSets: string[][],
     jobId: string,
     peerId: string,
-    jobName: string,
+    triedConnections: string[],
   ): Promise<void> {
+    const runId = runContext.runId;
     let runJobs = this.reroutedJobs.get(runId);
     if (!runJobs) {
       runJobs = new Map();
       this.reroutedJobs.set(runId, runJobs);
     }
-    runJobs.set(jobId, { peerId, jobName });
+
+    // Arm the spawn-window backstop: if the peer accepted the reroute but never
+    // reports progress within the window (async spawn failure, peer crash), the
+    // timer fires handleRerouteSpawnTimeout to re-dispatch instead of stranding
+    // the run until the ~20-min stale detector. Cleared on the first progress
+    // (onPeerJobProgress) or on terminal cleanup.
+    const window = await this.getRerouteSpawnWindowMs(job);
+    const windowTimer = setTimeout(() => {
+      void this.handleRerouteSpawnTimeout(runId, jobId).catch((err) => {
+        logger.error('Reroute spawn-window handler failed', {
+          runId,
+          jobId,
+          error: toErrorMessage(err),
+        });
+      });
+    }, window);
+
+    runJobs.set(jobId, {
+      peerId,
+      jobName: job.jobName,
+      runContext,
+      job,
+      labelSets,
+      triedConnections: [...triedConnections],
+      windowTimer,
+    });
 
     if (this.executionTracker) {
       await this.executionTracker.markJobReroutedToPeer(runId, jobId, peerId);
+    }
+  }
+
+  /**
+   * Post-ACK spawn-window backstop. Fires when a rerouted job's peer accepted
+   * but produced no progress within the window (Layer A), or immediately when a
+   * worker relays a `scaler.failed` for the job (Layer B, via onPeerScalerEvent).
+   * Best-effort cancels the original peer (double-execution guard against a
+   * slow-but-healthy spawn), then re-runs routing to another peer, then a local
+   * fallback, and finally records the job failed rather than leaving it pending.
+   * Idempotent: whichever trigger fires first removes the tracking entry, so the
+   * other no-ops.
+   */
+  private async handleRerouteSpawnTimeout(runId: string, jobId: string): Promise<void> {
+    const runJobs = this.reroutedJobs.get(runId);
+    const tracked = runJobs?.get(jobId);
+    if (!runJobs || !tracked) return; // Progress arrived / already re-dispatched.
+
+    // Remove tracking + clear the timer BEFORE re-dispatch so a concurrent
+    // trigger (Layer A window vs. Layer B NAK) sees the entry gone and no-ops.
+    if (tracked.windowTimer) clearTimeout(tracked.windowTimer);
+    runJobs.delete(jobId);
+    if (runJobs.size === 0) this.reroutedJobs.delete(runId);
+
+    logger.warn('Rerouted job produced no progress — re-dispatching', {
+      runId,
+      jobId,
+      jobName: tracked.jobName,
+      failedPeerId: tracked.peerId,
+    });
+
+    // Double-execution guard: best-effort cancel the original peer's job so a
+    // slow-but-healthy spawn cannot run alongside the re-dispatch.
+    this.cancelPeerJob(tracked.peerId, runId, jobId, 'reroute spawn window elapsed');
+
+    // Re-run routing with the failed peer appended so it is never re-selected.
+    const nextTried = [...tracked.triedConnections, tracked.peerId];
+    const result = await this.attemptPeerRoute(
+      tracked.runContext,
+      tracked.job,
+      tracked.labelSets,
+      jobId,
+      nextTried,
+    );
+    if (result.success) return;
+
+    // No peer accepted → try a local dispatch (the coordinator may itself have
+    // capacity now), keeping the same jobId so the execution row is reused.
+    const localOk = await this.tryLocalRedispatch(tracked.runContext, tracked.job, jobId);
+    if (localOk) return;
+
+    // Unroutable everywhere → fail the job instead of leaving it pending until
+    // the stale detector.
+    await this.failUnroutableJob(runId, jobId, tracked.jobName);
+  }
+
+  /** Best-effort cancel a single job on a peer (double-execution guard). */
+  private cancelPeerJob(peerId: string, runId: string, jobId: string, reason: string): void {
+    const cancelMsg: PeerJobCancel = { type: 'peer.job.cancel', runId, jobId, reason };
+    const client = this.getPeerClient(peerId);
+    const sent = client
+      ? client.send(cancelMsg)
+      : (this.sendToPeerViaHandler?.(peerId, cancelMsg as PeerToPeerMessage) ?? false);
+    if (!sent) {
+      logger.warn('Failed to send re-dispatch cancel to peer', { peerId, runId, jobId });
+    }
+  }
+
+  /**
+   * Local fallback for a re-dispatch: dispatch the job on this coordinator under
+   * the existing jobId. Returns true when the local dispatcher accepts it.
+   */
+  private async tryLocalRedispatch(
+    runContext: RunContext,
+    job: JobToRoute,
+    jobId: string,
+  ): Promise<boolean> {
+    const flatLabels = job.runsOnLabels.length > 0 ? job.runsOnLabels[0] : [];
+    const jobInput: QueuedJobInput = {
+      jobId,
+      runId: runContext.runId,
+      workflowName: runContext.workflowName,
+      jobName: job.jobName,
+      runsOnLabels: flatLabels,
+      runsOnPatterns: job.runsOnPatterns,
+      excludePatterns: job.excludePatterns,
+      excludeLabels: job.excludeLabels,
+      jobConfig: job.jobConfig,
+      repoUrl: job.repoUrl,
+      ref: job.ref,
+      sha: job.sha,
+      deliveryId: runContext.deliveryId,
+      provider: runContext.provider,
+      providerContext: runContext.installationId
+        ? { installationId: runContext.installationId }
+        : {},
+      routingKey: runContext.routingKey,
+      sourceTarUrl: job.sourceTarUrl,
+      sourceTarHash: job.sourceTarHash,
+      depsUrl: job.depsUrl,
+      depsHash: job.depsHash,
+      requestId: runContext.requestId,
+      ...(job.resources && { resources: job.resources }),
+    };
+    const result = await this.dispatcher.dispatch(jobInput);
+    if (result.status === 'duplicate') {
+      // Row already present (idempotent no-op) — the job is queued/dispatched
+      // under this jobId already. Treat as a successful local re-dispatch.
+      return true;
+    }
+    if (result.status === 'rejected' || result.status === 'queued-no-backend') {
+      if (result.status === 'queued-no-backend') {
+        // Cancel the no-backend fallback entry; it would sit queued forever.
+        await this.dispatcher.cancelQueuedJob(result.jobId, 'reroute re-dispatch unroutable');
+      }
+      return false;
+    }
+    logger.info('Rerouted job re-dispatched locally', {
+      runId: runContext.runId,
+      jobId,
+      jobName: job.jobName,
+    });
+    return true;
+  }
+
+  /** Mark a job failed when no backend (peer or local) can run it after re-dispatch. */
+  private async failUnroutableJob(runId: string, jobId: string, jobName: string): Promise<void> {
+    logger.error('Rerouted job unroutable after spawn failure — failing it', {
+      runId,
+      jobId,
+      jobName,
+    });
+    if (this.executionTracker) {
+      await this.executionTracker
+        .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
+          reason: 'reroute re-dispatch found no available backend after spawn failure',
+        })
+        .catch((err) => {
+          logger.error('Failed to record unroutable-job failure', {
+            runId,
+            jobId,
+            error: toErrorMessage(err),
+          });
+        });
     }
   }
 }

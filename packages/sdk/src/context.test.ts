@@ -1,5 +1,11 @@
 import { describe, it, expect, expectTypeOf } from 'vitest';
-import type { StepSecretsTyped, KnownSecretKeys, RepoInfo, StepContext } from './context.js';
+import type {
+  StepSecretsTyped,
+  AugmentedStepSecrets,
+  KnownSecretKeys,
+  RepoInfo,
+  StepContext,
+} from './context.js';
 import { isMatrixJobOutputs, isHostJobOutputs } from './context.js';
 import type { StepSecrets } from './secrets.js';
 
@@ -73,6 +79,29 @@ describe('context types', () => {
 
     it('StepSecretsTyped equals StepSecrets when unaugmented', () => {
       expectTypeOf<StepSecretsTyped>().toEqualTypeOf<StepSecrets>();
+    });
+  });
+
+  describe('AugmentedStepSecrets (augmented via kici types)', () => {
+    // Simulate the augmented branch without globally augmenting KnownSecretKeys
+    // (that would flip StepSecretsTyped for every other test in this file).
+    type Aug = AugmentedStepSecrets<{ FOO: string; BAR: string }>;
+
+    it('narrows get/expose to the known key set', () => {
+      expectTypeOf<Aug['get']>().parameter(0).toEqualTypeOf<'FOO' | 'BAR'>();
+      expectTypeOf<Aug['expose']>().parameter(0).toEqualTypeOf<'FOO' | 'BAR'>();
+      expectTypeOf<Aug['get']>().returns.toEqualTypeOf<Promise<string>>();
+    });
+
+    it('preserves has/getMeta/list/mountFile/exposeFile verbatim from StepSecrets', () => {
+      // Regression guard: augmentation must never drop the file-mount accessors.
+      // These vanished once because the augmented branch was a hand-maintained
+      // inline object literal that fell out of sync with StepSecrets.
+      expectTypeOf<Aug['has']>().toEqualTypeOf<StepSecrets['has']>();
+      expectTypeOf<Aug['getMeta']>().toEqualTypeOf<StepSecrets['getMeta']>();
+      expectTypeOf<Aug['list']>().toEqualTypeOf<StepSecrets['list']>();
+      expectTypeOf<Aug['mountFile']>().toEqualTypeOf<StepSecrets['mountFile']>();
+      expectTypeOf<Aug['exposeFile']>().toEqualTypeOf<StepSecrets['exposeFile']>();
     });
   });
 

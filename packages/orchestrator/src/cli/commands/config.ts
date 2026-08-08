@@ -437,9 +437,12 @@ instance:
   # Default: auto-generated from hostname
   # id: "orch-1"
 
-  # Operating mode: platform | hybrid | independent
+  # Operating mode: platform | hybrid | observed | independent
   # - platform: connects to KiCI Platform relay for webhook routing
   # - hybrid: Platform relay + direct webhook ingestion
+  # - observed: direct webhook ingestion only (nothing transits KiCI), but keeps
+  #   the Platform connection for the hosted dashboard. Requires
+  #   KICI_WEBHOOK_PUBLIC_URL; GitHub-App sources are unsupported.
   # - independent: standalone, direct webhook ingestion only
   mode: "platform"
 
@@ -468,7 +471,7 @@ server:
 # the database and shared across all orchestrator instances.
 #
 # platform:
-#   url: "wss://relay.kici.dev"
+#   url: "wss://api.kici.dev/ws"
 #   # token injected via KICI_PLATFORM_TOKEN
 #
 # storage:

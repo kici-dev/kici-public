@@ -18,6 +18,18 @@ import {
   InMemoryIpAllocator,
 } from './ip-allocator.js';
 
+/**
+ * A Postgres unique-violation on `ip_allocations_pkey`, shaped like the raw
+ * driver error `DbIpAllocator.allocate()` catches (SQLSTATE `23505` + the
+ * primary-key constraint name).
+ */
+function pkeyConflict(): Error {
+  return Object.assign(
+    new Error('duplicate key value violates unique constraint "ip_allocations_pkey"'),
+    { code: '23505', constraint: 'ip_allocations_pkey' },
+  );
+}
+
 // ── Helper function tests ──────────────────────────────────────
 
 describe('ipToNumber', () => {
@@ -314,6 +326,69 @@ describe('DbIpAllocator', () => {
       expect(result.mac).toMatch(/^06:00:AC:/);
       expect(result.gateway).toBe('10.0.0.1');
       expect(result.netmask).toBe('255.255.255.0');
+    });
+
+    it('retries on an ip_allocations_pkey conflict and allocates the next free IP', async () => {
+      const db = createMockAllocatorDb({ allocatedIps: [] });
+      // First insert loses the race; the second succeeds.
+      db._mocks.insertExecute.mockRejectedValueOnce(pkeyConflict()).mockResolvedValue(undefined);
+      // First select sees an empty pool; after the race, 10.0.0.2 is taken by
+      // the winner, so the re-pick lands on the next free address.
+      db._mocks.selectExecute.mockResolvedValueOnce([]).mockResolvedValue([{ ip: '10.0.0.2' }]);
+
+      const allocator = new DbIpAllocator({
+        db,
+        cidr: '10.0.0.0/24',
+        gateway: '10.0.0.1',
+        netmask: '255.255.255.0',
+      });
+
+      const result = await allocator.allocate('vm-001', 'fc-scaler');
+
+      expect(result.ip).toBe('10.0.0.3'); // 10.0.0.2 now taken → next free is .3
+      expect(result.mac).toBe(generateMac('10.0.0.3')); // MAC re-derived from the re-picked IP
+      expect(db._mocks.insertExecute).toHaveBeenCalledTimes(2);
+    });
+
+    it('rethrows a non-conflict DB error without retrying', async () => {
+      const db = createMockAllocatorDb({ allocatedIps: [] });
+      // A not-null violation is a real error, not a concurrent-allocation race.
+      db._mocks.insertExecute.mockRejectedValue(
+        Object.assign(new Error('not null'), { code: '23502' }),
+      );
+
+      const allocator = new DbIpAllocator({
+        db,
+        cidr: '10.0.0.0/24',
+        gateway: '10.0.0.1',
+        netmask: '255.255.255.0',
+      });
+
+      await expect(allocator.allocate('vm-001', 'fc-scaler')).rejects.toMatchObject({
+        code: '23502',
+      });
+      expect(db._mocks.insertExecute).toHaveBeenCalledTimes(1);
+    });
+
+    it('gives up after the retry bound on persistent conflicts', async () => {
+      const db = createMockAllocatorDb({ allocatedIps: [] });
+      // Every insert conflicts and every re-read sees the same empty pool, so
+      // each attempt re-picks 10.0.0.2 and re-conflicts — the exhaustion path.
+      db._mocks.insertExecute.mockRejectedValue(pkeyConflict());
+
+      const allocator = new DbIpAllocator({
+        db,
+        cidr: '10.0.0.0/24',
+        gateway: '10.0.0.1',
+        netmask: '255.255.255.0',
+      });
+
+      await expect(allocator.allocate('vm-001', 'fc-scaler')).rejects.toThrow(
+        /consecutive ip_allocations_pkey conflicts/,
+      );
+      // One insert attempt per retry — matches MAX_ALLOC_CONFLICT_RETRIES (16).
+      // If the constant changes, this assertion is the intended tripwire.
+      expect(db._mocks.insertExecute).toHaveBeenCalledTimes(16);
     });
   });
 

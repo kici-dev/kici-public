@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
 import { executeJob, executeWorkflow } from './job-executor.js';
-import { step, job, workflow, rule, getStepOutputsMap, getJobOutputsMap } from '@kici-dev/sdk';
+import { step, job, workflow, rule, getStepOutputsMap, getJobOutputsMap, z } from '@kici-dev/sdk';
 import type { SimulatedEvent } from '@kici-dev/engine';
 
 describe('job-executor', () => {
@@ -91,6 +92,74 @@ describe('job-executor', () => {
       expect(result.status).toBe('success');
       expect(result.steps[0].outputs).toBeDefined();
     });
+
+    it('stores id-less step outputs under their assigned step-N names (no collision)', async () => {
+      // Two id-less steps with outputs in one job each get a distinct step-N key (no '' collision).
+      const a = step({ run: async () => ({ v: 1 }), outputs: { v: z.number() } });
+      const b = step({ run: async () => ({ v: 2 }), outputs: { v: z.number() } });
+      const probe = step('probe', async () => ({
+        sum: (a.result.v as number) + (b.result.v as number),
+      }));
+
+      const testJob = job('idless-job', {
+        runsOn: 'kici:os:linux',
+        steps: [a, b, probe],
+      });
+
+      const result = await executeJob(testJob, 'test-workflow', mockEvent, TEST_REPO_ROOT);
+
+      expect(result.status).toBe('success');
+      expect(result.steps.find((r) => r.name === 'probe')?.outputs).toEqual({ sum: 3 });
+      expect(a.name).toBe('step-1');
+      expect(b.name).toBe('step-2');
+    });
+  });
+
+  describe('ctx.mktemp cleanup', () => {
+    it('cleans ctx.mktemp dirs when a local job ends', async () => {
+      let capturedPath: string | undefined;
+      const mktempStep = step('mk', async (ctx) => {
+        const handle = await ctx.mktemp('loc');
+        capturedPath = handle.path;
+        // The temp dir exists while the step runs.
+        expect(fs.existsSync(handle.path)).toBe(true);
+        return { path: handle.path };
+      });
+
+      const testJob = job('temp-job', {
+        runsOn: 'kici:os:linux',
+        steps: [mktempStep],
+      });
+
+      const result = await executeJob(testJob, 'test-workflow', mockEvent, TEST_REPO_ROOT);
+
+      expect(result.status).toBe('success');
+      expect(capturedPath).toBeDefined();
+      // After the job ends the scope is drained — the dir is gone (ENOENT).
+      expect(fs.existsSync(capturedPath!)).toBe(false);
+    });
+
+    it('drains ctx.mktemp dirs even when the job fails mid-step', async () => {
+      let capturedPath: string | undefined;
+      const mktempThenThrow = step('mk-fail', async (ctx) => {
+        const handle = await ctx.mktemp('loc');
+        capturedPath = handle.path;
+        expect(fs.existsSync(handle.path)).toBe(true);
+        throw new Error('boom after mktemp');
+      });
+
+      const testJob = job('temp-fail-job', {
+        runsOn: 'kici:os:linux',
+        steps: [mktempThenThrow],
+      });
+
+      const result = await executeJob(testJob, 'test-workflow', mockEvent, TEST_REPO_ROOT);
+
+      expect(result.status).toBe('failure');
+      expect(capturedPath).toBeDefined();
+      // The `finally` drain reclaims the dir on the failure path too.
+      expect(fs.existsSync(capturedPath!)).toBe(false);
+    });
   });
 
   describe('executeJob with rules', () => {
@@ -144,6 +213,26 @@ describe('job-executor', () => {
       expect(result.ruleResults).toHaveLength(1); // Should stop after first failure
       expect(result.ruleResults?.[0].label).toBe('rule-1');
     });
+
+    it('should FAIL (not skip) the job when a rule check() throws', async () => {
+      const throwingRule = rule('main only', () => {
+        throw new TypeError('cannot read endsWith of undefined');
+      });
+
+      const testJob = job('test-job', {
+        runsOn: 'kici:os:linux',
+        steps: [step('test', async () => {})],
+        rules: [throwingRule],
+      });
+
+      const result = await executeJob(testJob, 'test-workflow', mockEvent, TEST_REPO_ROOT);
+
+      expect(result.status).toBe('failure');
+      expect(result.steps).toHaveLength(0);
+      expect(result.error?.message).toContain('cannot read endsWith');
+      expect(result.error?.message).toContain('main only');
+      expect(result.ruleResults?.[0].error).toContain('cannot read endsWith');
+    });
   });
 
   describe('executeWorkflow', () => {
@@ -162,6 +251,29 @@ describe('job-executor', () => {
       expect(result.status).toBe('success');
       expect(result.jobs).toHaveLength(1);
       expect(result.jobs[0].status).toBe('success');
+    });
+
+    it('should FAIL (not skip) the workflow when a workflow rule check() throws', async () => {
+      const testWorkflow = workflow('test', {
+        rules: [
+          rule('main only', () => {
+            throw new TypeError('boom in workflow rule');
+          }),
+        ],
+        jobs: [
+          job('job-1', {
+            runsOn: 'kici:os:linux',
+            steps: [step('step-1', async () => {})],
+          }),
+        ],
+      });
+
+      const result = await executeWorkflow(testWorkflow, mockEvent, TEST_REPO_ROOT);
+
+      expect(result.status).toBe('failure');
+      expect(result.jobs).toHaveLength(0);
+      expect(result.error?.message).toContain('boom in workflow rule');
+      expect(result.error?.message).toContain('main only');
     });
 
     it('should execute parallel jobs', async () => {

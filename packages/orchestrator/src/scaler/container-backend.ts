@@ -21,7 +21,7 @@ import {
   removeIsolationRules,
 } from './nftables.js';
 import { parseMemoryString } from './config.js';
-import { ScalerEventType } from './types.js';
+import { ImagePullPolicy, ScalerEventType } from './types.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type {
   ScalerBackend,
@@ -163,6 +163,12 @@ export interface ContainerScalerBackendOptions {
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
+  /**
+   * Live resolver for the ephemeral agent-token TTL (ms). When set, called per
+   * spawn so the leader can serve the fleet-wide
+   * `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
+   */
+  tokenTtlProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   roles?: string[];
 }
@@ -188,6 +194,8 @@ export class ContainerScalerBackend implements ScalerBackend {
   private readonly tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms */
   private readonly tokenTtlMs: number;
+  /** Live per-spawn resolver for the ephemeral agent-token TTL (ms). */
+  private readonly tokenTtlProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   private readonly roles: string[] | undefined;
 
@@ -218,6 +226,7 @@ export class ContainerScalerBackend implements ScalerBackend {
     this.networkIsolation = options.networkIsolation !== false;
     this.tokenStore = options.tokenStore;
     this.tokenTtlMs = options.tokenTtlMs ?? 3_600_000; // 1 hour default
+    this.tokenTtlProvider = options.tokenTtlProvider;
     this.roles = options.roles;
     this.resolvedSocketPath = socketPath;
     this.detectedRuntime = runtime;
@@ -407,10 +416,15 @@ export class ContainerScalerBackend implements ScalerBackend {
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
     spawnContext?: SpawnContext,
+    signal?: AbortSignal,
   ): Promise<ManagedAgent> {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
     };
+    // A container created before an abort/failure; removed best-effort in the
+    // catch with a fresh (unsignalled) request so cleanup isn't cancelled by
+    // the same abort that triggered the failure path.
+    let createdContainer: Docker.Container | undefined;
 
     // Find matching label set config
     const normalizedTarget = normalizeLabelSet(labelSet);
@@ -459,7 +473,8 @@ export class ContainerScalerBackend implements ScalerBackend {
       // Create ephemeral agent token if token store is available
       let agentToken: string | undefined;
       if (this.tokenStore) {
-        agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, this.tokenTtlMs);
+        const tokenTtlMs = this.tokenTtlProvider ? await this.tokenTtlProvider() : this.tokenTtlMs;
+        agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
       }
 
       // Build env array
@@ -506,13 +521,19 @@ export class ContainerScalerBackend implements ScalerBackend {
         }
       }
 
-      // Pull image based on pull policy
-      const pullPolicy = matchedLabelSet.imagePullPolicy ?? 'Always';
-      let shouldPull = pullPolicy === 'Always';
+      // Pull image based on pull policy. Default IfNotPresent: KiCI agent
+      // images are pinned + immutable, so re-pulling on every spawn only storms
+      // the registry/socket. A label set on a moving tag sets `Always`.
+      const pullPolicy = matchedLabelSet.imagePullPolicy ?? ImagePullPolicy.enum.IfNotPresent;
+      let shouldPull = pullPolicy === ImagePullPolicy.enum.Always;
 
-      if (pullPolicy === 'IfNotPresent') {
+      if (pullPolicy === ImagePullPolicy.enum.IfNotPresent) {
         try {
-          await this.docker.getImage(matchedLabelSet.image!).inspect();
+          await this.docker.getImage(matchedLabelSet.image!).inspect({
+            abortSignal: signal,
+          } as Docker.ImageInspectOptions & {
+            abortSignal?: AbortSignal;
+          });
           shouldPull = false;
         } catch {
           shouldPull = true;
@@ -520,8 +541,14 @@ export class ContainerScalerBackend implements ScalerBackend {
       }
 
       if (shouldPull) {
+        // A spawn already past its deadline before the pull begins would
+        // otherwise start a long image pull that only unwinds on the next
+        // abortable await; reject up front so the semaphore slot frees promptly.
+        if (signal?.aborted) throw signal.reason ?? new Error('scaler spawn aborted');
         emit(ScalerEventType.enum['scaler.provisioning'], `pulling image ${matchedLabelSet.image}`);
-        const stream = await this.docker.pull(matchedLabelSet.image!);
+        const stream = await this.docker.pull(matchedLabelSet.image!, {
+          abortSignal: signal,
+        });
         await new Promise<void>((resolve, reject) => {
           this.docker.modem.followProgress(stream, (err: Error | null) => {
             if (err) reject(err);
@@ -534,6 +561,7 @@ export class ContainerScalerBackend implements ScalerBackend {
       emit(ScalerEventType.enum['scaler.provisioning'], 'creating container');
       const normalizedLabelSetStr = normalizeLabelSet(labelSet);
       const container = await this.docker.createContainer({
+        abortSignal: signal,
         Image: matchedLabelSet.image!,
         Env: env,
         Labels: {
@@ -563,21 +591,24 @@ export class ContainerScalerBackend implements ScalerBackend {
         }),
       });
 
+      createdContainer = container;
+
       // Emit network event if network isolation is enabled
       if (this.networkIsolation) {
         emit(ScalerEventType.enum['scaler.network'], 'configuring network isolation');
       }
 
       // Start container
-      await container.start();
+      await container.start({ abortSignal: signal } as Docker.ContainerStartOptions);
       emit(ScalerEventType.enum['scaler.ready'], 'container started');
 
       // Apply per-container nftables isolation rules based on container IP
       if (this.networkIsolation) {
-        const info = await this.docker.getContainer(container.id).inspect();
+        const info = await this.docker
+          .getContainer(container.id)
+          .inspect({ abortSignal: signal } as Docker.ContainerInspectOptions);
         const containerIp = info.NetworkSettings?.Networks?.[ISOLATED_NETWORK_NAME]?.IPAddress as
-          | string
-          | undefined;
+          string | undefined;
         if (containerIp) {
           this.containerIps.set(managed.id, containerIp);
           await addIsolationRules(
@@ -630,6 +661,16 @@ export class ContainerScalerBackend implements ScalerBackend {
         }
         this.containerIps.delete(managed.id);
       }
+      // A hung/aborted provision may have created a container before failing;
+      // remove it best-effort with a fresh (unsignalled) request so cleanup
+      // itself isn't cancelled by the same abort that triggered this path.
+      if (createdContainer) {
+        try {
+          await createdContainer.remove({ force: true });
+        } catch {
+          // Best effort — container may not exist or already be gone.
+        }
+      }
       // Clean up tracking on failure
       this.agents.delete(managed.id);
       throw err;
@@ -649,7 +690,7 @@ export class ContainerScalerBackend implements ScalerBackend {
       backendType: 'container',
       scalerName: this.name,
       image: matchedLabelSet?.image,
-      imagePullPolicy: matchedLabelSet?.imagePullPolicy ?? 'Always',
+      imagePullPolicy: matchedLabelSet?.imagePullPolicy ?? ImagePullPolicy.enum.IfNotPresent,
       runtime: this.detectedRuntime,
       resources: matchedLabelSet?.resources ?? this.defaultResources,
       networkIsolation: this.networkIsolation,
