@@ -313,6 +313,55 @@ describe('admin routes', () => {
     });
   });
 
+  // ── Secret-key validation ─────────────────────────────────────
+  // The at-rest AAD is `orgId:scope:key`. A `:` in the key makes it ambiguous
+  // (scope 'b' + key 'c:d' renders the same AAD as scope 'b:c' + key 'd'), so
+  // the write path rejects it. Reads and deletes stay unvalidated on purpose.
+  describe('secret-key validation', () => {
+    it('PUT /secrets/:orgId/:scope/:key rejects a colon-bearing key with 400', async () => {
+      // 'c%3Ad' decodes to the literal key 'c:d' at the handler.
+      const res = await request(app, 'PUT', '/secrets/org-1/aws%2Fprod/c%3Ad', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({
+        error: 'Secret key may only contain letters, digits, and _ . - characters',
+      });
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+
+    it('PUT /secrets/:orgId/:scope/:key rejects a slash-bearing key with 400', async () => {
+      const res = await request(app, 'PUT', '/secrets/org-1/aws%2Fprod/a%2Fb', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(400);
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+    });
+
+    it('PUT /secrets/:orgId/:scope/:key still accepts a conforming key', async () => {
+      (deps.secretStore.setSecret as any).mockResolvedValue(undefined);
+      const res = await request(app, 'PUT', '/secrets/org-1/aws%2Fprod/API_KEY', {
+        token: validToken,
+        body: { value: 'v' },
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'aws/prod', 'API_KEY', 'v');
+    });
+
+    it('DELETE /secrets/:orgId/:scope/:key still accepts a colon-bearing key', async () => {
+      // A secret stored before this rule must stay deletable — that asymmetry
+      // is what keeps existing data reachable.
+      (deps.secretStore.deleteSecret as any).mockResolvedValue(undefined);
+      const res = await request(app, 'DELETE', '/secrets/org-1/aws%2Fprod/c%3Ad', {
+        token: validToken,
+      });
+      expect(res.status).toBe(200);
+      expect(deps.secretStore.deleteSecret).toHaveBeenCalledWith('org-1', 'aws/prod', 'c:d');
+    });
+  });
+
   // ── Backend-qualified scopes ──────────────────────────────────
   describe('backend-qualified scopes', () => {
     it('PUT /secrets accepts a pg: qualifier and stores the BARE path', async () => {

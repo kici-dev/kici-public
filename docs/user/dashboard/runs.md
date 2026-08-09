@@ -122,7 +122,7 @@ The left panel shows a tree of jobs and their steps:
 - Each step shows a **status dot**, **name**, and **duration**
 - Click a step to select it and view its individual logs
 
-**Status dot colours** -- green = success; red = failed or timed out; amber = running or cancelling; orange = recovering (the job's agent disconnected and the job is waiting for it to reconnect before its recovery deadline); yellow = queued, pending, or held; gray = cancelled, skipped, or drift dropped (the executing agent re-evaluated the workflow and no longer produced this job, so it never ran). Hover a dot for the status name.
+**Status dot colours** -- green = success; red = failed, timed out, or unroutable (the job's `runsOn` matched no agent, so it never ran — a fleet or label misconfiguration to fix, deliberately not shown in the gray "nothing happened" family); amber = running or cancelling; orange = recovering (the job's agent disconnected and the job is waiting for it to reconnect before its recovery deadline); yellow = queued, pending, or held; gray = cancelled, skipped, or drift dropped (the executing agent re-evaluated the workflow and no longer produced this job, so it never ran). Hover a dot for the status name.
 
 **Job-level selection** -- clicking a job row selects it and shows combined logs from all of its steps, with sticky step headers separating each step's output. This provides a unified view of the entire job's execution without needing to click through steps individually.
 

@@ -38,7 +38,7 @@ import type { JoinTokenManager } from '../cluster/join-token.js';
 import type { BackendRegistry } from '../secrets/backend-registry.js';
 import type { BackendHealthChecker } from '../secrets/backend-health.js';
 import type { BackendSyncManager, OrchestratorMode } from '@kici-dev/engine';
-import { validateScopeName } from '@kici-dev/engine';
+import { validateScopeName, validateSecretKey } from '@kici-dev/engine';
 import {
   loadRoutableStores,
   resolveScope,
@@ -402,6 +402,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       const resolved = await routeScope(scope);
       const scopeError = validateScopeName(resolved.path);
       if (scopeError) return c.json({ error: scopeError }, 400);
+      // Write-path only. A `:` in the key would make the at-rest AAD
+      // `orgId:scope:key` ambiguous, so two locations could share one binding.
+      // Read and delete stay unvalidated so a key stored before this rule
+      // remains readable and deletable.
+      const keyError = validateSecretKey(key);
+      if (keyError) return c.json({ error: keyError }, 400);
       await resolved.store.setSecret(orgId, resolved.path, key, parsed.value);
 
       await deps.auditLogger.log({

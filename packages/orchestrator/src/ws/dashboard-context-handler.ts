@@ -54,6 +54,7 @@ import {
   HeldRunQueueType,
   HoldScope,
   assertValidScopeName,
+  assertValidSecretKey,
   normalizePersistedHoldType,
 } from '@kici-dev/engine';
 import { ContextDeleteBlockedError } from '../contexts/context-store.js';
@@ -1268,6 +1269,11 @@ export class DashboardContextHandler {
     try {
       const { store, scope } = await this.resolveStoreForScope(msg.scope);
       assertValidScopeName(scope);
+      // Write-path only, mirroring the HTTP admin route. A `:` in the key would
+      // make the at-rest AAD `orgId:scope:key` ambiguous. The wire schema stays
+      // `key: z.string()` on purpose — a strict schema on a relayed dashboard
+      // message fails the whole message instead of degrading one field.
+      assertValidSecretKey(msg.key);
       await store.setSecret(this.deps.orgId, scope, msg.key, resolved.plaintext);
       this.recordAccess(
         msg.actor,

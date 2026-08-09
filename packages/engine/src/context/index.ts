@@ -48,3 +48,11 @@ export {
   SCOPE_SEGMENT_PATTERN,
   SCOPE_NAME_MAX_LENGTH,
 } from './scope-name.js';
+
+export {
+  validateSecretKey,
+  assertValidSecretKey,
+  SecretKeyError,
+  SECRET_KEY_PATTERN,
+  SECRET_KEY_MAX_LENGTH,
+} from './secret-key.js';

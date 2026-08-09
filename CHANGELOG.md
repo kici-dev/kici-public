@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.4.0 — 2026-08-09
+
+### Fixes
+
+- Reject secret keys outside [A-Za-z0-9._-] on every write path, so the at-rest encryption binding cannot be made ambiguous
+
 ## v0.3.0 — 2026-08-09
 
 ### Features

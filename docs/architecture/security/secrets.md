@@ -56,6 +56,8 @@ AAD = "orgId:scope:key"
 
 This prevents cross-scope secret swaps -- a ciphertext encrypted for scope A with key "TOKEN" cannot be decrypted under scope B or key "PASSWORD", even with the same master key.
 
+The AAD is a plain concatenation, so it identifies exactly one `(orgId, scope, key)` triple only while neither the scope nor the key can contain the `:` separator. Both are validated against `[A-Za-z0-9._-]` on every write path for that reason: without it, a key of `c:d` in scope `b` renders the same AAD as a key of `d` in scope `b:c`, and a ciphertext written at one location authenticates at the other. Validation is write-side only -- reads, listings and deletes accept any name, so a key stored before the rule existed stays readable and deletable. See [Secrets management > Key naming](../../operator/security/secrets.md#key-naming).
+
 ### Key derivation
 
 The master key (`KICI_SECRET_KEY`) supports two input formats:

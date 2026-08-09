@@ -873,6 +873,44 @@ describe('DashboardContextHandler', () => {
       expect(resp.requestId).toBe('r4');
       expect(resp.error).toEqual(expect.any(String));
     });
+
+    it('rejects setting a secret whose key would make the at-rest AAD ambiguous', async () => {
+      // The AAD is `orgId:scope:key`. scope 'b' + key 'c:d' renders the same
+      // string as scope 'b:c' + key 'd', so a ciphertext written at one
+      // location would authenticate at the other.
+      deps.secretStore.setSecret = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.set',
+        requestId: 'r5',
+        scope: 'pg:prod',
+        key: 'c:d',
+        value: 'V',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
+      const resp = deps.sent[0] as any;
+      expect(resp.requestId).toBe('r5');
+      expect(resp.error).toMatch(/letters, digits/);
+    });
+
+    it('still deletes a secret whose key predates the key rule', async () => {
+      // Delete stays unvalidated so a key stored before the rule existed
+      // remains removable.
+      deps.secretStore.deleteSecret = vi.fn().mockResolvedValue(undefined);
+
+      await handler.handleMessage({
+        type: 'dashboard.contexts.secrets.delete',
+        requestId: 'r6',
+        scope: 'pg:prod',
+        key: 'c:d',
+      } as DashboardPlatformToOrchMessage);
+
+      expect(deps.secretStore.deleteSecret).toHaveBeenCalledWith('org-1', 'prod', 'c:d');
+      const resp = deps.sent[0] as any;
+      expect(resp.requestId).toBe('r6');
+      expect(resp.error).toBeUndefined();
+    });
   });
 
   describe('unknown messages', () => {

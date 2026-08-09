@@ -1,6 +1,6 @@
 ---
 title: 'Agent: configuration reference'
-description: Environment variables, labels, Docker executor setup
+description: Environment variables, labels, container executor setup
 ---
 
 > **See also:** [Environment variable reference](../env-reference.md) — shared env vars; agent-specific vars are listed below. Regenerate the generated table with `pnpm docs:env`. Unknown `KICI_*` env vars cause the agent to refuse to start (typo catcher); set `KICI_DEV=true` for warn-only behaviour during local development.
@@ -53,11 +53,11 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 The agent exposes three HTTP endpoints on the configured `KICI_PORT`:
 
-| Endpoint   | Purpose            | Response                                                                     |
-| ---------- | ------------------ | ---------------------------------------------------------------------------- |
-| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, and `connected` status. |
-| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.               |
-| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                  |
+| Endpoint   | Purpose            | Response                                                                                                                                                                                                                                          |
+| ---------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`  | Liveness probe     | Always `200`. Body includes `agentId`, `activeJobs`, `connected` status, and the build identity (`version`, `buildCommit`, plus the SDK / shared / engine versions and bundle hashes) so operators can correlate deployed builds across services. |
+| `/ready`   | Readiness probe    | `200` when connected to orchestrator, `503` when disconnected.                                                                                                                                                                                    |
+| `/metrics` | Prometheus metrics | Prometheus text format with `kici_agent_` prefixed metrics.                                                                                                                                                                                       |
 
 ## Label-based routing
 
@@ -125,24 +125,26 @@ An ops agent holding the `kici:capability:ssh-transport` capability stages a sel
 | `KICI_AGENT_PAYLOAD_DIR` | Local directory holding version-keyed payloads (`<dir>/<version>/kici-agent-<platform>.tar.gz`) as produced by `kici-admin agent package`. When set, the payload is read from disk instead of pulled from object storage — the air-gapped path. |
 | `KICI_AGENT_COMMAND`     | Golden-image escape hatch: a fixed command that starts the init-runner on a target that already ships `kici-agent` and a Node runtime at a known path. When set, payload staging is skipped entirely.                                           |
 
-## Docker job requirements
+## Container job requirements
 
-For workflows that specify `container` in their job configuration, the agent executes steps inside Docker containers.
+For workflows that specify `container` in their job configuration, the agent executes the job inside a disposable Docker or Podman container.
 
 Requirements:
 
-- Docker must be installed and accessible on the agent host
-- The Docker socket must be mounted into the agent container:
+- A container runtime (Docker or Podman) must be installed and accessible on the agent host
+- When the agent itself runs in a container, the runtime socket must be mounted into it:
 
 ```yaml
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
+Podman exposes its socket at a different path (`/run/podman/podman.sock` rootful, or `/run/user/<uid>/podman/podman.sock` rootless). Mount that path instead and point `DOCKER_HOST` at it; the agent talks to whichever socket that variable resolves to, falling back to `/var/run/docker.sock`.
+
 The agent:
 
 1. Creates a job container from the specified image (already-present images are used as-is; a missing image is pulled on demand first) with `/workspace` as a container-owned volume
-2. Starts the workflow runner inside the container via a single `docker exec` — the repository clone, dependency install, and every step all run inside the container
+2. Starts the workflow runner inside the container via a single exec — the repository clone, dependency install, and every step all run inside the container
 3. Removes the container (and its workspace volume) after job completion
 
 Job containers are hardened by default: all Linux capabilities dropped, no-new-privileges, cgroup PID/memory/CPU caps, and a private tmpfs `/tmp`, tunable via the `KICI_SANDBOX_*` variables above. See [Agent security](../security/agent-security.md) for the full isolation model and the per-job `sandbox:` escape hatch.
@@ -220,7 +222,7 @@ If the WebSocket connection to the orchestrator drops, the agent automatically r
 - Jitter: 0-50% randomness
 - Maximum delay: 60 seconds
 
-Messages generated during disconnection are buffered (up to 10,000 log lines) and flushed on reconnection. This preserves job status and log data even during brief network interruptions.
+Messages generated during disconnection are buffered and flushed on reconnection: up to 10,000 log lines and up to 5,000 other events (job status, heartbeats). This preserves job status and log data even during brief network interruptions.
 
 ## Example configurations
 

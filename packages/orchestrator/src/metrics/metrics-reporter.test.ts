@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import type { OrchMetrics } from '@kici-dev/engine';
 
 // Mock getPrometheusExporter before importing the module under test
@@ -20,12 +20,21 @@ describe('MetricsReporter', () => {
   let MetricsReporter: typeof import('./metrics-reporter.js').MetricsReporter;
   let getPrometheusExporter: ReturnType<typeof vi.fn>;
 
-  beforeEach(async () => {
-    vi.useFakeTimers();
+  // Load the modules ONCE, outside the fake clock. `@kici-dev/shared` pulls in
+  // the OpenTelemetry exporter, so resolving it is real I/O measured in seconds
+  // on a loaded machine. Doing that per-test inside `beforeEach` — and with the
+  // clock already frozen — blew the 10s hook budget intermittently, producing a
+  // timeout with no assertion behind it. ES modules are cached, so one load
+  // serves every test, and each test installs its own mock return value anyway.
+  beforeAll(async () => {
     const shared = await import('@kici-dev/shared');
     getPrometheusExporter = shared.getPrometheusExporter as ReturnType<typeof vi.fn>;
     const mod = await import('./metrics-reporter.js');
     MetricsReporter = mod.MetricsReporter;
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
   });
 
   afterEach(() => {

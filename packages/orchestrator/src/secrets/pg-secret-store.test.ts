@@ -68,6 +68,84 @@ describe('PgSecretStore', () => {
       expect(db.insertInto).toHaveBeenCalledWith('scoped_secrets');
     });
 
+    // ── AAD unambiguity (the binding this store depends on) ──────
+    //
+    // The AAD is the plain concatenation `orgId:scope:key`. It only binds a
+    // ciphertext to one location if the concatenation decomposes back to one
+    // triple. Scope segments already exclude `:`; setSecret rejects a `:` in
+    // the key so the tail is two colon-free fields.
+
+    it('setSecret rejects a key that would make the AAD ambiguous', async () => {
+      const db = createMockDb({});
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+
+      await expect(store.setSecret('org-001', 'aws/prod', 'c:d', 'v')).rejects.toThrow(
+        /letters, digits/,
+      );
+      expect(db.insertInto).not.toHaveBeenCalled();
+    });
+
+    it('setSecret rejects an ambiguous key even for an internal scope', async () => {
+      // The guard runs ahead of the customerSecretsEnabled gate, so the
+      // reserved `__source__/` scopes get no exemption.
+      const db = createMockDb({});
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+      store.customerSecretsEnabled = false;
+
+      await expect(store.setSecret('__system__', '__source__/abc', 'a:b', 'v')).rejects.toThrow(
+        /letters, digits/,
+      );
+      expect(db.insertInto).not.toHaveBeenCalled();
+    });
+
+    it('setSecret still accepts the internal key names the product writes', async () => {
+      const db = createMockDb({});
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+
+      for (const key of ['privateKey', 'webhookSecret', 'pat']) {
+        await store.setSecret('__system__', '__source__/abc', key, 'v');
+      }
+      expect(db.insertInto).toHaveBeenCalledTimes(3);
+    });
+
+    it('getSecrets still round-trips a legacy key containing a colon', async () => {
+      // Validation is write-only. A key stored before the rule existed must
+      // stay readable, so nothing already in the database becomes unreachable.
+      const orgId = 'org-001';
+      const scope = 'aws/prod';
+      const key = 'a:b';
+      const aad = `${orgId}:${scope}:${key}`;
+      const encrypted = encrypt('legacy-value', testKey, testKeyVersion, aad);
+
+      const rows = [
+        {
+          id: 'sec-legacy',
+          org_id: orgId,
+          scope,
+          key,
+          encrypted_value: encrypted.data,
+          key_version: encrypted.keyVersion,
+          backend_type: 'pg',
+          created_at: new Date(),
+          updated_at: new Date(),
+        },
+      ];
+
+      const db = createMockDb({ selectRows: rows });
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+
+      expect(await store.getSecrets(orgId, scope)).toEqual({ 'a:b': 'legacy-value' });
+    });
+
+    it('deleteSecret still accepts a legacy key containing a colon', async () => {
+      const db = createMockDb({});
+      const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);
+
+      await store.deleteSecret('org-001', 'aws/prod', 'a:b');
+
+      expect(db.deleteFrom).toHaveBeenCalledWith('scoped_secrets');
+    });
+
     it('getSecrets decrypts values with correct AAD (orgId:scope:key)', async () => {
       const orgId = 'org-001';
       const scope = 'aws/prod';

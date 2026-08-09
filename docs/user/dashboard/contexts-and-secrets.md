@@ -32,7 +32,7 @@ Permission-gated: `secrets:read` to view scopes, `secrets:write` to add or delet
 
 Secret values are stored in the orchestrator's secret store and authorized through the orchestrator's RBAC. The dashboard surfaces secret **names** and scope membership for every secret regardless of where the value was entered.
 
-Whether secret **values** can be set from the dashboard depends on the orchestrator's [dashboard-write policy](/operator/security/dashboard-write-policy):
+Whether secret **values** can be set from the dashboard depends on the orchestrator's [dashboard-write policy](../../operator/security/dashboard-write-policy.md):
 
 - **Permissive (default):** the "Add secret" and "Edit value" controls accept plaintext directly in the dashboard. This is how a typical SaaS CI tool works and is the right default for small teams.
 - **`secrets.set` disabled by policy:** the controls render with a lock icon, grayed out. Hovering or keyboard-focusing the lock shows the exact `kici-admin secret set` invocation needed; a copy button puts it on the clipboard. The control is inert — it leaves the tab order entirely and the dashboard issues no mutating request. Use the CLI to enter values; the dashboard refreshes within ~30 seconds and shows the new secret name.
@@ -43,7 +43,7 @@ The policy state is visible at three layers in the UI:
 - A **per-page banner** on any page containing at least one disabled operation, listing every disabled op on that page and its CLI equivalent.
 - The **Security policy page**, which renders the whole policy as one matrix.
 
-The Security policy page (Settings → Security → Dashboard policy) renders the full 27-row read-only matrix with the current state and the `kici-admin` command for each row. The policy itself cannot be changed from the dashboard — the orchestrator operator manages it via `kici-admin org-settings dashboard-writes`. See [Dashboard-write policy](/operator/security/dashboard-write-policy) for the operator-side details.
+The Security policy page (Settings → Security → Dashboard policy) renders the full 27-row read-only matrix with the current state and the `kici-admin` command for each row. The policy itself cannot be changed from the dashboard — the orchestrator operator manages it via `kici-admin org-settings dashboard-writes`. See [Dashboard-write policy](../../operator/security/dashboard-write-policy.md) for the operator-side details.
 
 ## Approval queue
 

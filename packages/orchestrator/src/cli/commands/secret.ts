@@ -11,6 +11,7 @@ import type { Command } from 'commander';
 import type { Kysely } from 'kysely';
 import type { AdminApiClient } from '../api-client.js';
 import { setContextSecretDirect, toErrorMessage } from '@kici-dev/shared';
+import { assertValidSecretKey } from '@kici-dev/engine';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
 import { createPool, createDb } from '../../db/client.js';
 import { PgSecretStore, SecretScopeExistsError } from '../../secrets/pg-secret-store.js';
@@ -268,6 +269,11 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
 
           const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
           if (dbUrl) {
+            // The direct-DB branch writes the row itself, bypassing the admin
+            // route, the dashboard handler and PgSecretStore — so it needs its
+            // own guard against a key that would make the at-rest AAD
+            // ambiguous. The HTTP branch below is covered by the route.
+            assertValidSecretKey(key);
             await setContextSecretDirect(dbUrl, {
               orgId,
               context: scope,

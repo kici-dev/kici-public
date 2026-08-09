@@ -9,6 +9,7 @@
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { SecretStore } from '@kici-dev/engine';
+import { assertValidSecretKey } from '@kici-dev/engine';
 import { encrypt, decrypt, type EncryptedValue } from '@kici-dev/shared';
 import type { AuditLogger } from './audit-logger.js';
 
@@ -122,10 +123,6 @@ export class PgSecretStore implements SecretStore {
     return result;
   }
 
-  /**
-   * Set (create or update) a secret in a scope.
-   * Encrypts the value with AAD = "orgId:scope:key".
-   */
   /** Check if a scope is internal/operational (always allowed regardless of toggle). */
   private isInternalScope(scope: string): boolean {
     // Strip backend prefix if present (e.g., 'pg:__source__/...')
@@ -134,7 +131,31 @@ export class PgSecretStore implements SecretStore {
     return path.startsWith('__source__/') || path.startsWith('__webhook__/');
   }
 
+  /**
+   * Set (create or update) a secret in a scope.
+   * Encrypts the value with AAD = "orgId:scope:key".
+   *
+   * Rejects a key outside `[A-Za-z0-9._-]` before doing anything else. The AAD
+   * is a plain concatenation, so a `:` in the key would let two distinct
+   * locations render one AAD (scope 'b' + key 'c:d' equals scope 'b:c' + key
+   * 'd') and a ciphertext written at one would authenticate at the other. The
+   * check sits ahead of the customerSecretsEnabled gate so internal scopes get
+   * no exemption — the binding has to hold for every writer.
+   *
+   * Callers pass a bare scope path, so the AAD's middle field is colon-free
+   * too: the admin route and the dashboard handler both run the scope
+   * validator immediately before calling in, and `source-store` builds its
+   * scope from a uuid. That precondition is what makes the whole triple
+   * recoverable, and it is the caller's to keep — this method does not
+   * re-check it.
+   *
+   * Write-path only: getSecrets, listKeys, deleteSecret, deleteScope,
+   * renameScope, getAllSecrets and createScope stay unvalidated, which is what
+   * keeps a key stored before this rule readable and deletable.
+   */
   async setSecret(orgId: string, scope: string, key: string, value: string): Promise<void> {
+    assertValidSecretKey(key);
+
     if (!this.customerSecretsEnabled && !this.isInternalScope(scope)) {
       throw new Error(
         'PG customer secrets are disabled. Use an external secret backend or enable pgCustomerSecrets in config.',

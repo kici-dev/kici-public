@@ -166,6 +166,26 @@ describe('kici-admin secret CLI', () => {
       });
       expect(stdout).toContain('(direct)');
     });
+
+    it('refuses a direct-DB write whose key would make the AAD ambiguous', async () => {
+      // Direct-DB writes the row itself, so it never reaches the admin route or
+      // PgSecretStore — it needs its own guard.
+      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
+      const { stderr, exitCode } = await runCommand([
+        'secret',
+        'set',
+        'org-1',
+        'staging',
+        'a:b',
+        '--value',
+        'ciphertext',
+        '--database-url',
+        'postgres://x',
+      ]);
+      expect(exitCode).toBe(1);
+      expect(stderr).toMatch(/letters, digits/);
+      expect(mockSetContextSecretDirect).not.toHaveBeenCalled();
+    });
   });
 
   // ── sugar form ───────────────────────────────────────────────────────────

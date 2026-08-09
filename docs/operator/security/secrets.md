@@ -173,6 +173,32 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/<org-id>/production/KICI_DAT
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN"
 ```
 
+#### Key naming
+
+A secret key may contain letters, digits, `_`, `.` and `-`, up to 256
+characters. Every write plane enforces this -- the CLI, the admin API, the
+dashboard's add-secret form, and the `.kici/secrets.yaml` / `.kici/.secrets`
+seeding that `kici run local` performs -- and a key outside the set is refused
+before anything is stored:
+
+```
+Secret key may only contain letters, digits, and _ . - characters
+```
+
+The restriction exists because each value is encrypted with its
+`<org-id>:<scope>:<key>` location bound in as authenticated data, which is what
+stops a stored value from being moved to a different scope or key. A `:` inside
+the key would make that binding ambiguous -- a key of `c:d` in scope `b` binds
+to the same string as a key of `d` in scope `b:c` -- so the two locations would
+no longer be distinguishable. `/` is excluded for the same reason it separates
+scope segments: a key is a single segment, not a path.
+
+The rule applies to **writes only**. Reading, listing and deleting accept any
+key, so a secret stored under a non-conforming key by an older orchestrator
+keeps resolving in workflows and can still be deleted. To bring one into line,
+write the value under a conforming key and delete the old one -- there is no
+migration command, and none is needed.
+
 ### Environment scope bindings
 
 An environment owns a set of scope-pattern bindings over the secret tree. When a job targets an environment, every secret whose scope matches a binding is resolved into the flat map shipped to the agent (read via `ctx.secrets.get('KEY')`). Bind a scope pattern to an environment with:

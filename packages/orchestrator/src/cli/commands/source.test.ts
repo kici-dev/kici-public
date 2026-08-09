@@ -419,6 +419,51 @@ describe('kici-admin source add local', () => {
     );
   });
 
+  it('updates --clone-url-base alone, preserving the stored repoBasePath', async () => {
+    // The regression: --clone-url-base used to apply only inside the --path
+    // branch, so this exact invocation exited "no fields to update" and changed
+    // nothing — while --help advertised the flag. Switching a local source from
+    // file:// to a git daemon changes only the clone base, so this was the one
+    // edit the flag exists for.
+    const received: Array<{ id: string; data: Record<string, unknown> }> = [];
+    const client: Partial<AdminApiClient> = {
+      getGenericSource: async () =>
+        ({
+          source: fakeGenericSourceResponse({
+            provider_type: 'local',
+            git_config: JSON.stringify({ repoBasePath: '/stored/path' }),
+          }),
+        }) as any,
+      updateGenericSource: async (id, data) => {
+        received.push({ id, data: data as Record<string, unknown> });
+        return { source: fakeGenericSourceResponse() as any };
+      },
+    };
+    const { exitCode } = await runCommand(
+      ['source', 'update-local', 'g-local', '--clone-url-base', 'git://host:9418/repo'],
+      client,
+    );
+    expect(exitCode).toBeNull();
+    expect(received).toHaveLength(1);
+    expect(received[0].data.localConfig).toEqual({
+      repoBasePath: '/stored/path',
+      cloneUrlBase: 'git://host:9418/repo',
+    });
+  });
+
+  it('still errors when no updatable field is given', async () => {
+    let called = false;
+    const client: Partial<AdminApiClient> = {
+      updateGenericSource: async () => {
+        called = true;
+        return { source: fakeGenericSourceResponse() as any };
+      },
+    };
+    const { exitCode } = await runCommand(['source', 'update-local', 'g-local'], client);
+    expect(called).toBe(false);
+    expect(exitCode).toBe(1);
+  });
+
   it('rejects a relative --path before any API call', async () => {
     let called = false;
     const client: Partial<AdminApiClient> = {

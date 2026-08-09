@@ -181,6 +181,26 @@ function parseLocalConfig(
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * Read a local source's stored config over whichever transport the caller is
+ * already on — direct DB when `--database-url` / KICI_DATABASE_URL is in play,
+ * otherwise the admin API. Used to preserve `repoBasePath` when only the clone
+ * base is being changed; returns null when the id names no local source.
+ */
+async function readLocalSourceConfig(
+  id: string,
+  databaseUrl: string | undefined,
+  getClient: () => AdminApiClient,
+): Promise<{ repoBasePath: string; cloneUrlBase?: string } | null> {
+  const dbUrl = resolveDirectDbUrl(databaseUrl);
+  if (dbUrl) {
+    const row = await withGenericManager(dbUrl, (mgr) => mgr.getById(id));
+    return row ? parseLocalConfig(row as unknown as GenericSourceResponse) : null;
+  }
+  const { source } = await getClient().getGenericSource(id);
+  return parseLocalConfig(source);
+}
+
 function safeParse(value: string): unknown {
   try {
     return JSON.parse(value);
@@ -1152,19 +1172,37 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           localConfig?: { repoBasePath: string; cloneUrlBase?: string };
         } = {};
         if (opts.name) data.name = opts.name;
-        if (opts.path !== undefined) {
-          if (!path.isAbsolute(opts.path)) {
-            console.error(`Error: --path must be an absolute path: ${opts.path}`);
+        // `--clone-url-base` used to be applied only inside the `--path` branch,
+        // so passing it alone silently updated nothing and the command exited
+        // "no fields to update" — while still advertising the flag in --help.
+        // Switching a local source from file:// to a git daemon changes only the
+        // clone base, which made the one edit the flag exists for impossible
+        // without re-supplying the unchanged path.
+        if (opts.path !== undefined || opts.cloneUrlBase !== undefined) {
+          let repoBasePath: string | undefined = opts.path;
+          if (repoBasePath === undefined) {
+            // Keep the stored path when only the clone base is being changed.
+            const existing = await readLocalSourceConfig(id, opts.databaseUrl, getClient);
+            if (!existing) {
+              console.error(`Error: no local source with id ${id}`);
+              process.exit(1);
+            }
+            repoBasePath = existing.repoBasePath;
+          }
+          if (!path.isAbsolute(repoBasePath)) {
+            console.error(`Error: --path must be an absolute path: ${repoBasePath}`);
             process.exit(1);
           }
           const localConfig: { repoBasePath: string; cloneUrlBase?: string } = {
-            repoBasePath: opts.path,
+            repoBasePath,
           };
           if (opts.cloneUrlBase) localConfig.cloneUrlBase = opts.cloneUrlBase;
           data.localConfig = localConfig;
         }
         if (Object.keys(data).length === 0) {
-          console.error('Error: no fields to update. Provide --path and/or --name.');
+          console.error(
+            'Error: no fields to update. Provide --path, --name, and/or --clone-url-base.',
+          );
           process.exit(1);
         }
 
