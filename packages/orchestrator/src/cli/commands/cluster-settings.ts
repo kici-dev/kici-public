@@ -131,6 +131,12 @@ const KNOBS: KnobSpec[] = [
     min: 100,
     label: 'Ownership DB check timeout (ms)',
   },
+  {
+    field: 'unroutableGraceMs',
+    flag: 'unroutable-grace-ms',
+    min: 0,
+    label: 'Unroutable fast-fail grace (ms)',
+  },
 ];
 
 /** The cluster-global text knobs. */

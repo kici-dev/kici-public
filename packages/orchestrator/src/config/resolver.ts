@@ -200,6 +200,7 @@ function flattenToAppConfig(merged: Record<string, unknown>): Record<string, unk
   const queue = merged.queue as Record<string, unknown> | undefined;
   flat.queueMaxDepth = queue?.maxDepth ?? 1000;
   flat.queueTimeoutMs = queue?.timeoutMs ?? 3_600_000;
+  flat.unroutableGraceMs = queue?.unroutableGraceMs ?? 120_000;
   flat.queueBackpressureThreshold = queue?.backpressureThreshold ?? 100;
 
   // Lockfile cache

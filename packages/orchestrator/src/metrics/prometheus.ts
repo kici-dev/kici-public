@@ -1173,6 +1173,14 @@ export const dispatchQueueRowsPrunedTotal = lazyCounter(
   { description: 'Terminal dispatch_queue rows deleted by the retention sweep' },
 );
 
+export const unroutableFastFailedTotal = lazyCounter(
+  'kici_orch_unroutable_fast_failed_total',
+  {
+    description:
+      'Jobs terminalized as unroutable by the fast-fail probe (not the queue timeout)',
+  },
+);
+
 /**
  * Step-log objects deleted by the retention sweep (the cleanup tick's
  * `pruneExpiredLogs`, S3 backend only).

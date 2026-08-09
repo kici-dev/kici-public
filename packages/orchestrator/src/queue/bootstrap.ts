@@ -31,6 +31,8 @@ export interface OrchestratorScheduledJobsDeps {
  */
 export interface OrchestratorScheduledJobRegistrations {
   cleanup?: { intervalMs: number; handler: () => Promise<void> };
+  /** Short-tick probe that fast-fails jobs nothing in the fleet can route. */
+  unroutableProbe?: { intervalMs: number; handler: () => Promise<void> };
   orphanSecretCleanup?: { intervalMs: number; handler: () => Promise<void> };
   tokenCleanup?: { intervalMs: number; handler: () => Promise<void> };
   coldStoreArchive?: { intervalMs: number; handler: () => Promise<void> };
@@ -55,6 +57,16 @@ export function bootstrapOrchestratorScheduledJobs(
         name: 'cleanup',
         intervalMs: registrations.cleanup.intervalMs,
         handler: registrations.cleanup.handler,
+      }),
+    );
+  }
+  if (registrations.unroutableProbe) {
+    handles.push(
+      registerOrchestratorScheduledJob({
+        ...common,
+        name: 'unroutable-probe',
+        intervalMs: registrations.unroutableProbe.intervalMs,
+        handler: registrations.unroutableProbe.handler,
       }),
     );
   }

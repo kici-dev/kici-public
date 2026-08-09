@@ -190,7 +190,8 @@ Orchestrator
 Agent
   |
   |  proceed: continue execution
-  |  wait: release agent back to pool (queued state)
+  |  wait: hold the job and long-poll the same connection for a
+  |        follow-up ack (the agent stays connected)
   |  cancel: report job cancelled with superseded reason
 ```
 
@@ -210,8 +211,10 @@ When `cancelInProgress: false`, the orchestrator holds the new run:
 1. New run joins group
 2. Orchestrator finds active run with same group key
 3. New run receives `job.concurrency.ack { action: 'wait', reason: 'Waiting for deploy-main (1 ahead)' }`
-4. Agent releases back to pool
-5. When prior run completes, orchestrator dispatches the queued run
+4. The agent keeps the job and blocks on the same WebSocket connection, waiting for a follow-up ack
+5. When the prior run completes, the orchestrator pushes an unsolicited `job.concurrency.ack { action: 'proceed' }` to that waiting agent, which resumes the job it was already holding
+
+The wait is capped by `KICI_CONCURRENCY_WAIT_TIMEOUT_MS` (default 1 hour), overridable fleet-wide via the `concurrency_wait_timeout_ms` cluster setting; exceeding it fails the job. If the agent disconnects while queued, the orchestrator cancels its queued run rather than leaving the slot claimed.
 
 ### Timeouts
 

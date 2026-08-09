@@ -17,15 +17,22 @@ Lifecycle _logic_ — deciding when a run is complete, rolling job outcomes up i
 
 A run is the top-level unit of work. Its status is one of:
 
-| Status       | Description                                                                                     | Terminal |
-| ------------ | ----------------------------------------------------------------------------------------------- | -------- |
-| `pending`    | Created, not yet dispatched.                                                                    | No       |
-| `running`    | One or more jobs are executing.                                                                 | No       |
-| `cancelling` | Graceful cancellation in progress (cancel hooks running).                                       | No       |
-| `held`       | Paused at a workflow install-gate protection rule (awaiting reviewer approval or a wait timer). | No       |
-| `success`    | All jobs succeeded.                                                                             | Yes      |
-| `failed`     | At least one job failed.                                                                        | Yes      |
-| `cancelled`  | Cancelled before or during execution (no job failed).                                           | Yes      |
+| Status       | Description                                                                                    | Terminal |
+| ------------ | ---------------------------------------------------------------------------------------------- | -------- |
+| `pending`    | Created, not yet dispatched.                                                                   | No       |
+| `running`    | One or more jobs are executing.                                                                | No       |
+| `cancelling` | Graceful cancellation in progress (cancel hooks running).                                      | No       |
+| `held`       | Paused at a gate — either a workflow install-gate protection rule or an org trust-policy hold. | No       |
+| `success`    | All jobs succeeded.                                                                            | Yes      |
+| `failed`     | At least one job failed.                                                                       | Yes      |
+| `cancelled`  | Cancelled before or during execution (no job failed).                                          | Yes      |
+
+Two distinct gates put a run in `held`, and both record it the same way — a `held` run row that tracks no jobs:
+
+- **The workflow install gate.** A `registries:` or `installEnv:` protection rule returned hold, wait, or queue. Release comes from a reviewer approving, a wait timer expiring, or a concurrency slot freeing up, and the run resumes into a fresh dispatch that flips it back to `pending`.
+- **An org trust-policy hold.** The org's trust policy held the run pending approval, in the security queue rather than the context queue. Resolution is a `/kici approve` or `/kici reject` comment on the pull request (which records the decision and posts the corresponding check status) or expiry by the stale detector.
+
+Rejecting either kind of hold moves the run to `cancelled` with the `cancelled` failure class.
 
 ### Job status (`ExecutionJobStatus`)
 
@@ -59,16 +66,17 @@ A step is one command within a job. Steps report independently so the run timeli
 | `pending`   | A parallel-group child queued behind the group's `maxParallel` limit, not yet launched. |
 | `cancelled` | A parallel-group sibling aborted by fail-fast. This is **not** a failure.               |
 
-There is no terminal-state constant for steps: a step's outcome is read directly from its status, and only runs and jobs carry the terminal sets described below.
+A `TERMINAL_STEP_STATES` constant sits alongside the run and job terminal sets described below (`success`, `failed`, `skipped`, `cancelled`), but no lifecycle logic consults it — a step's outcome is read directly from its status.
 
 Each step also carries a concurrency role (`StepConcurrencyKind`) that explains which of those values it can take: `sequential` for an ordinary step in the flat step sequence, `parallel-child` for a member of a `parallel()` group running concurrently with its siblings, and `parallel-group` for the structural group wrapper the dashboard renders as an aggregate band. The `pending` and `cancelled` statuses only ever appear on parallel-group children.
 
 ## Terminal states
 
-A status is **terminal** when the entity has reached a final outcome and will not change again. The terminal sets live alongside the enums in `execution-status.ts` as two constants, and they deliberately differ:
+A status is **terminal** when the entity has reached a final outcome and will not change again. The terminal sets live alongside the enums in `execution-status.ts` as three constants, and the run and job sets deliberately differ:
 
 - **`TERMINAL_RUN_STATES`** = `success`, `failed`, `cancelled`.
 - **`TERMINAL_JOB_STATES`** = `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`.
+- **`TERMINAL_STEP_STATES`** = `success`, `failed`, `skipped`, `cancelled`. Exported for completeness; the lifecycle paths read a step's status directly instead.
 
 The four extra job-terminal values — `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` — are **job-level verdicts**. They describe how an individual job settled, and they roll up into the run's aggregate outcome rather than appearing on the run directly. A run whose only unfinished job is skipped still settles on `success` or `failed` based on its other jobs; it never carries a `skipped` status of its own. Keeping the two sets separate is what makes a run-level terminal check use the 3-value set and a job-level check use the 7-value set.
 
@@ -89,7 +97,7 @@ That rollup is only as correct as the set of jobs the run knows about, so the tr
 - **Jobs gated behind another job** (a `needs` dependency, a rolling-wave hold) are registered up front as non-terminal placeholder rows and swapped for the real job when it is dispatched.
 - **Jobs whose registration is still pending.** Several windows leave a run registered with fewer jobs than it will end up with, and the tracker holds the run open across each one. A workflow whose source must be packed first runs its build job alone while the run's real jobs wait. A job whose environment or matrix is resolved by an init step, and a dynamic job function that generates its jobs at run time, both register their jobs from work that continues after the dispatch call returns. Without a hold, the jobs registered so far reaching a terminal state would read as the run finishing — posting a green check to the provider and forwarding a terminal status to the Platform before the jobs it was still registering had run. The hold counts the outstanding registrations rather than flagging one window, so overlapping windows each keep the run open until their own jobs land, and it is a property of the in-memory run rather than a placeholder job, so it never appears as a phantom job or inflates the run's reported job count.
 
-A run paused at a workflow install gate is likewise never rolled up complete: it tracks no jobs and resumes into a fresh dispatch, so the jobs registered before the gate held it cannot satisfy the completion check.
+A `held` run is likewise never rolled up complete: the tracker drops its in-memory run when it records the hold, so the jobs registered before the gate held it cannot satisfy the completion check.
 
 ## Ordering tolerance
 

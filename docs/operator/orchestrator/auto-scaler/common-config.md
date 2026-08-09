@@ -32,6 +32,7 @@ firecracker: # Optional. Global Firecracker network configuration (shared across
   gateway: '10.0.0.1' # Optional. Gateway IP address (assigned to bridge). Default: '10.0.0.1'.
   netmask: '255.255.255.0' # Optional. Subnet mask for guest networking. Default: '255.255.255.0'.
   table: 'kici' # Optional. nftables table name for this host bridge (disjoint per bridge). Default: 'kici'.
+  autoProvisionHost: true # Optional. Verify + provision this host bridge on startup (self-heal). Default: true.
 ```
 
 The `firecracker:` top-level key configures Firecracker VM networking and is documented on the [Firecracker backend](./firecracker.md) page.

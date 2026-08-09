@@ -118,6 +118,12 @@ const baseSchema = z.object({
   queueMaxDepth: z.coerce.number().default(1000),
   queueTimeoutMs: z.coerce.number().default(3_600_000), // 1 hour, 0 = indefinite
   /**
+   * Grace a job may stay continuously unroutable (nothing in the fleet matches
+   * its selectors) before it is terminalized. Cluster default; the live value
+   * is the `unroutable_grace_ms` cluster setting. 0 = fast-fail disabled.
+   */
+  unroutableGraceMs: z.coerce.number().default(120_000),
+  /**
    * Operator-facing backpressure warning threshold for the dispatch queue.
    * When pending-queue depth stays at or above this value for at least two
    * consecutive refresher ticks (~10s), the orchestrator emits a
@@ -874,6 +880,7 @@ export const envDef = defineEnv({
     lockfileCacheMaxBytes: 'KICI_LOCKFILE_CACHE_MAX_BYTES',
     queueMaxDepth: 'KICI_QUEUE_MAX_DEPTH',
     queueTimeoutMs: 'KICI_QUEUE_TIMEOUT_MS',
+    unroutableGraceMs: 'KICI_UNROUTABLE_GRACE_MS',
     queueBackpressureThreshold: 'KICI_QUEUE_BACKPRESSURE_THRESHOLD',
     workerConcurrency: 'KICI_WORKER_CONCURRENCY',
     concurrencyWaitTimeoutMs: 'KICI_CONCURRENCY_WAIT_TIMEOUT_MS',

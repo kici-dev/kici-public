@@ -38,6 +38,17 @@ import { HostRosterStore } from './agent/host-roster.js';
 import { HostRosterReaper } from './agent/host-roster-reaper.js';
 import { JobQueue, DispatchQueueStatus, type QueuedJob } from './queue/job-queue.js';
 import { createCleanupHandler } from './queue/cleanup.js';
+import {
+  type CanRouteLabels,
+  terminalizeUnroutableJob,
+} from './queue/terminalize-unroutable.js';
+import {
+  createUnroutableProbeHandler,
+  DEFAULT_UNROUTABLE_GRACE_MS,
+  makeRoutingReasonWriter,
+  probeTickIntervalMs,
+} from './queue/unroutable-probe.js';
+import { unroutableFastFailedTotal } from './metrics/prometheus.js';
 import { bootstrapOrchestratorScheduledJobs } from './queue/bootstrap.js';
 import type { OrchestratorScheduledJobHandle } from './queue/scheduled-job.js';
 import {
@@ -3120,6 +3131,15 @@ export async function bootstrapOrchestrator(
   // secret cleanup (hourly), and agent-token cleanup (every 60s) —
   // all three emit uniform `kici_orch_job_*` metrics and write an
   // access_log row on failure.
+  // ONE routability predicate, consulted at two different moments: the
+  // unroutable probe's short tick (grace-gated) and the queue-expiry sweep
+  // (the backstop). A registered agent means the labels route regardless of
+  // capacity; a scaler backend means one could be spawned, which is what keeps
+  // a scale-from-zero pool out of the unroutable bucket.
+  const canRouteLabels: CanRouteLabels = (labels, patterns, excludeLabels, excludePatterns) =>
+    agentRegistry.hasMatchingAgent(labels, patterns, excludeLabels, excludePatterns) ||
+    (scalerManager?.hasBackendForLabels(labels, excludeLabels) ?? false);
+
   const scheduledJobHandles: OrchestratorScheduledJobHandle[] = bootstrapOrchestratorScheduledJobs(
     { db, instanceId: config.instanceId },
     {
@@ -3145,9 +3165,42 @@ export async function bootstrapOrchestrator(
           // `CleanupExtras`. A scaler-managed pool at zero has no registered
           // agent, so the backend half is what keeps scale-from-zero out of the
           // unroutable bucket.
-          canRouteLabels: (labels, patterns, excludeLabels, excludePatterns) =>
-            agentRegistry.hasMatchingAgent(labels, patterns, excludeLabels, excludePatterns) ||
-            (scalerManager?.hasBackendForLabels(labels, excludeLabels) ?? false),
+          canRouteLabels,
+        }),
+      },
+      // The unroutable probe asks the SAME predicate on a short tick, so a job
+      // nothing can run is surfaced in seconds and failed after a grace window
+      // instead of waiting out the hourly sweep against a 1-hour timeout.
+      //
+      // ALWAYS registered, including when the env default is 0 (disabled). The
+      // handler re-reads `unroutable_grace_ms` live and no-ops while it is 0,
+      // so registering unconditionally is what makes the cluster setting work
+      // in BOTH directions: gating registration on the env default meant an
+      // orchestrator started with KICI_UNROUTABLE_GRACE_MS=0 could never be
+      // re-enabled without a restart, while `cluster-settings.md` promises the
+      // value takes effect within a cache window. A disabled tick costs one
+      // cached settings read per interval.
+      unroutableProbe: {
+        // The cadence is fixed at startup, so a 0 default derives it from the
+        // shipped default instead — an operator who enables the knob later gets
+        // a sane interval rather than the 5s floor.
+        intervalMs: probeTickIntervalMs(
+          config.unroutableGraceMs > 0 ? config.unroutableGraceMs : DEFAULT_UNROUTABLE_GRACE_MS,
+        ),
+        handler: createUnroutableProbeHandler({
+          queue,
+          getGraceMs: () =>
+            clusterSettings.getNumber('unroutable_grace_ms', config.unroutableGraceMs),
+          canRouteLabels,
+          setRoutingReason: makeRoutingReasonWriter(db),
+          terminalize: async (job) => {
+            await terminalizeUnroutableJob(
+              { db, executionTracker, checkRunReporter, canRouteLabels },
+              job,
+            );
+            await executionTracker.completeRunIfAllJobsTerminal(job.runId);
+          },
+          onFastFailed: () => unroutableFastFailedTotal.add(1),
         }),
       },
       orphanSecretCleanup: {

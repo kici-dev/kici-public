@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { aggregateRunDetail, buildRunDetailJobs } from './run-aggregator.js';
+import { visibleRoutingReason, aggregateRunDetail, buildRunDetailJobs } from './run-aggregator.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
@@ -251,5 +251,29 @@ describe('buildRunDetailJobs', () => {
     expect(jobs[0].secretOutputKeys).toEqual(['TOKEN']);
     expect(jobs[0].needs).toEqual([{ upstreamName: 'lint', runOn: ['success'] }]);
     expect(jobs[0].steps[0].stepName).toBe('compile');
+  });
+});
+
+describe('visibleRoutingReason', () => {
+  it('shows the reason while the job is still waiting to be routed', () => {
+    expect(visibleRoutingReason('pending', 'no agent matches runsOn [gpu]')).toBe(
+      'no agent matches runsOn [gpu]',
+    );
+    expect(visibleRoutingReason('queued', 'no agent matches runsOn [gpu]')).toBe(
+      'no agent matches runsOn [gpu]',
+    );
+  });
+
+  it('hides a stale reason on a job that has since left the queue', () => {
+    // More than twenty call sites move a job out of pending/queued and most do
+    // not know this column exists, so the guard has to live at the read
+    // boundary — a finished job must never render as "waiting for an agent".
+    for (const status of ['running', 'success', 'failed', 'cancelled', 'unroutable', 'skipped']) {
+      expect(visibleRoutingReason(status, 'no agent matches runsOn [gpu]')).toBeNull();
+    }
+  });
+
+  it('returns null when there is no reason at all', () => {
+    expect(visibleRoutingReason('pending', null)).toBeNull();
   });
 });

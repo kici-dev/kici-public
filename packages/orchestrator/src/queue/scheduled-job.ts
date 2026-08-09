@@ -40,6 +40,7 @@ export const OrchestratorScheduledJobName = z.enum([
   'token-cleanup',
   'cold-store-archive',
   'cold-store-purge',
+  'unroutable-probe',
 ]);
 export type OrchestratorScheduledJobName = z.infer<typeof OrchestratorScheduledJobName>;
 

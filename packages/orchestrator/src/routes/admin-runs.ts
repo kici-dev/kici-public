@@ -35,6 +35,7 @@ import { aggregateRunDetail } from '../reporting/run-aggregator.js';
 import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import { readStepLogLines, toAgentStepLogs } from '../reporting/step-log-reader.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import { visibleRoutingReason } from '../reporting/run-aggregator.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
 
 const logger = createLogger({ prefix: 'admin-runs' });
@@ -380,6 +381,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
           'completed_at',
           'duration_ms',
           'error_message',
+          'routing_reason',
           'runs_on_labels',
           'created_at',
         ])
@@ -450,6 +452,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
               completedAt: job.completed_at?.toISOString() ?? null,
               durationMs: job.duration_ms,
               errorMessage: job.error_message,
+              routingReason: visibleRoutingReason(job.status, job.routing_reason),
               runsOnLabels: safeJsonParse(job.runs_on_labels as string | null),
               createdAt: job.created_at.toISOString(),
               needs: needsByJob.get(job.job_name) ?? null,

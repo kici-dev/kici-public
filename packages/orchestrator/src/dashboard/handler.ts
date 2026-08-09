@@ -484,6 +484,7 @@ export class DashboardHandler {
           'completed_at',
           'duration_ms',
           'error_message',
+          'routing_reason',
           'runs_on_labels',
           'contexts',
           'skipped_contexts',
@@ -3293,6 +3294,7 @@ export class DashboardHandler {
       completed_at: Date | null;
       duration_ms: number | null;
       error_message: string | null;
+      routing_reason: string | null;
       runs_on_labels: string | null;
       outputs: string | null;
       init_failure: InitFailure | null;
@@ -3338,6 +3340,7 @@ export class DashboardHandler {
         completed_at: Date | null;
         duration_ms: number | null;
         error_message: string | null;
+        routing_reason: string | null;
         runs_on_labels: string | null;
         outputs: string | null;
         init_failure: InitFailure | null;
@@ -3419,6 +3422,7 @@ export class DashboardHandler {
       completed_at: coerceToDate(r.completed_at),
       duration_ms: typeof r.duration_ms === 'number' ? r.duration_ms : null,
       error_message: typeof r.error_message === 'string' ? r.error_message : null,
+      routing_reason: typeof r.routing_reason === 'string' ? r.routing_reason : null,
       runs_on_labels: typeof r.runs_on_labels === 'string' ? r.runs_on_labels : null,
       contexts: typeof r.contexts === 'string' ? r.contexts : null,
       skipped_contexts: typeof r.skipped_contexts === 'string' ? r.skipped_contexts : null,

@@ -702,6 +702,20 @@ describe('JobQueue', () => {
       expect(attempts).toBeNull();
     });
 
+    it('clears the unroutable grace clock when requeueing', async () => {
+      const db = createMockDb({ updateReturning: { dispatch_attempts: 2 } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.requeue('job-1');
+
+      // The job was routable at dispatch time, so a clock stamped before it is
+      // spent. Carrying it over would let the probe fail the requeued job on
+      // its very next tick with no fresh grace window.
+      expect(db._mocks.set).toHaveBeenCalledWith(
+        expect.objectContaining({ unroutable_since: null }),
+      );
+    });
+
     it('clears the ack deadline columns when requeueing', async () => {
       const db = createMockDb({ updateReturning: { dispatch_attempts: 2 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
@@ -896,6 +910,102 @@ describe('JobQueue', () => {
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       expect(await queue.getFullJobById('nope')).toBeNull();
+    });
+  });
+
+  describe('unroutable grace clock', () => {
+    it('lists pending jobs with their routing selectors and grace clock', async () => {
+      const rows = [
+        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: ['gpu'] },
+        {
+          id: 'q-2',
+          run_id: 'run-2',
+          job_name: 'test',
+          runs_on_labels: '["linux"]',
+          unroutable_since: '2026-08-08T10:00:00.000Z',
+        },
+      ];
+      const db = createMockDb({ selectRows: rows as any });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      const result = await queue.listUnroutableCandidates(50);
+
+      expect(result).toHaveLength(2);
+      // A job that has never read unroutable carries a null clock.
+      expect(result[0]).toEqual({
+        id: 'q-1',
+        runId: 'run-1',
+        jobName: 'build',
+        lastProvisioningError: null,
+        runsOnLabels: ['gpu'],
+        runsOnPatterns: [],
+        excludeLabels: [],
+        excludePatterns: [],
+        unroutableSince: null,
+      });
+      // A stamped clock comes back as a Date, and the selectors parse
+      // identically to markExpired's (both go through rowToExpiredJobInfo).
+      expect(result[1].runsOnLabels).toEqual(['linux']);
+      expect(result[1].unroutableSince).toEqual(new Date('2026-08-08T10:00:00.000Z'));
+    });
+
+    it('caps the listing at the requested limit', async () => {
+      const db = createMockDb({ selectRows: [] });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.listUnroutableCandidates(25);
+
+      expect(db._mocks.limit).toHaveBeenCalledWith(25);
+    });
+
+    it('stamps the grace clock only while it is still null', async () => {
+      const db = createMockDb({ updateResult: { numUpdatedRows: 1n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+      const at = new Date('2026-08-08T10:00:00.000Z');
+
+      await queue.markUnroutableSince('q-1', at);
+
+      expect(db._mocks.set).toHaveBeenCalledWith({ unroutable_since: at });
+      // The null guard is what stops two non-leader-gated coordinators from
+      // re-stamping `now` every tick and pushing the deadline outward forever.
+      expect(db._mocks.updateWhere).toHaveBeenCalledWith('unroutable_since', 'is', null);
+    });
+
+    it('clears the grace clock unconditionally on recovery', async () => {
+      const db = createMockDb({ updateResult: { numUpdatedRows: 1n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await queue.clearUnroutableState('q-1');
+
+      expect(db._mocks.set).toHaveBeenCalledWith({ unroutable_since: null });
+      expect(db._mocks.updateWhere).toHaveBeenCalledWith('id', '=', 'q-1');
+      // No null guard here — recovery must always clear, whatever the clock read.
+      expect(db._mocks.updateWhere).not.toHaveBeenCalledWith('unroutable_since', 'is', null);
+    });
+
+    it('claims a pending row for fast-fail, taking it out of the queue', async () => {
+      const db = createMockDb({ updateResult: { numUpdatedRows: 1n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.claimUnroutable('q-1')).resolves.toBe(true);
+
+      // Same terminal status markExpired uses: a row left pending is still
+      // dispatchable, and the probe would re-list it every tick.
+      expect(db._mocks.set).toHaveBeenCalledWith({ status: DispatchQueueStatus.Expired });
+      expect(db._mocks.updateWhere).toHaveBeenCalledWith(
+        'status',
+        '=',
+        DispatchQueueStatus.Pending,
+      );
+    });
+
+    it('reports a lost claim when the row is no longer pending', async () => {
+      // Ticks are not leader-gated: the coordinator whose UPDATE matches zero
+      // rows must not forward a terminal status or move the fast-fail metric.
+      const db = createMockDb({ updateResult: { numUpdatedRows: 0n } });
+      const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
+
+      await expect(queue.claimUnroutable('q-1')).resolves.toBe(false);
     });
   });
 

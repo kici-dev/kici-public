@@ -61,6 +61,43 @@ path.
 | `--agent-token-ttl-ms`                              | 1 h     | milliseconds | Lifetime of the ephemeral agent token minted when the orchestrator spawns an agent. Honored on both tiers: the leader resolves it live at spawn, and DB-less workers pull the value from the leader over the peer channel.                                                                                                                                                                                                                                                                                        |
 | `--ownership-db-check-timeout-ms`                   | 5 s     | milliseconds | Deadline for one database lookup resolving whether an agent owns the job named in the message it just sent. Past the deadline the lookup is undecided: the message is refused, but no ownership violation is counted against the agent, so a slow database cannot disconnect the fleet.                                                                                                                                                                                                                           |
 | `--dashboard-verified-issuer`                       | unset   | http(s) URL  | Origin the web UI fetches your orchestrator's encryption key from directly for [encrypted dashboard writes](../security/encrypted-dashboard-writes.md). When it is unset, the Verified tier is not offered. Setting a build-attestation issuer (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`) does not enable the tier, and the tier does not require one — the encryption key is published either way. `set` probes the origin's JWKS afterwards and warns (without failing) when no encryption key is published there. |
+| `--unroutable-grace-ms`                             | 2 min   | milliseconds | How long a job whose `runsOn` matches nothing in the fleet may keep waiting before it is failed as `unroutable`. The reason appears on the queued job immediately; only a job that stays unmatched for this whole window is failed, so a scaler reload or an agent reconnect costs it nothing. `0` disables fast-fail, leaving the queue timeout as the only backstop — see below. |
+
+### Jobs nothing in the fleet can run
+
+When a job's `runsOn` matches no connected agent **and** no scaler backend that
+could spawn one, nothing will ever pick it up. Rather than let it sit until the
+queue timeout, the orchestrator checks pending jobs on a short interval and:
+
+1. records the reason on the job straight away — visible on the run in the web
+   UI, in `kici runs show`, and in `kici-admin runs show`, naming the exact
+   selectors that went unmatched; then
+2. fails the job as `unroutable` once it has stayed unmatched for the whole
+   `--unroutable-grace-ms` window.
+
+The two halves are deliberate. A pool scaled to zero has no agent connected but
+can still spawn one, so it is never treated as unroutable; and a job that
+becomes routable inside the window — an operator adds the missing pool, an agent
+reconnects — has its reason cleared and its clock reset. Only a *continuously*
+unmatched job is failed.
+
+A job whose scaler tried to start an agent and failed is **not** unroutable:
+its labels did route, so it keeps the provisioning error as its cause and the
+queue timeout as its deadline.
+
+Setting `--unroutable-grace-ms` takes effect within the usual cache window in
+both directions, including turning fast-fail back on for an orchestrator that
+started with it disabled. The *check interval* is derived once at startup, so a
+cluster that starts disabled checks on the interval of the shipped default
+(2 minutes) once you enable it — the grace you set is still honoured, it is just
+measured on that cadence. Restart the orchestrator if you want the interval to
+track a much smaller grace.
+
+**Known limitation:** a `runsOn` written purely as patterns, with no exact
+labels, is always treated as routable when a scaler is configured, because
+scaler label sets are matched exactly. Such a job is never failed early — it
+falls back to the queue timeout. This errs toward waiting, never toward failing
+a job that would have run.
 
 ### Check-run tracking retention and long approval holds
 

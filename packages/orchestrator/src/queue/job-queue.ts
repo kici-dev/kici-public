@@ -28,6 +28,50 @@ export interface ExpiredJobInfo {
 }
 
 /**
+ * A pending job as the unroutable probe sees it: the same routing facts the
+ * expiry sweep reads, plus the persisted grace clock.
+ */
+export interface UnroutableCandidate extends ExpiredJobInfo {
+  /** When this job first read unroutable; null while it reads routable. */
+  unroutableSince: Date | null;
+}
+
+/** The dispatch_queue columns both the expiry sweep and the probe select. */
+interface ExpiryRowShape {
+  id: string;
+  run_id: string;
+  job_name: string;
+  last_provisioning_error: string | null;
+  runs_on_labels: unknown;
+  runs_on_patterns: unknown;
+  exclude_labels: unknown;
+  exclude_patterns: unknown;
+}
+
+/**
+ * Shared row -> {@link ExpiredJobInfo} mapping, so the expiry sweep and the
+ * unroutable probe can never read a job's selectors differently.
+ */
+function rowToExpiredJobInfo(r: ExpiryRowShape): ExpiredJobInfo {
+  return {
+    id: r.id,
+    runId: r.run_id,
+    jobName: r.job_name,
+    lastProvisioningError: r.last_provisioning_error ?? null,
+    runsOnLabels: parseSelectorColumnForExpiry<string>(r.runs_on_labels, 'runs_on_labels'),
+    runsOnPatterns: parseSelectorColumnForExpiry<LabelMatcher>(
+      r.runs_on_patterns,
+      'runs_on_patterns',
+    ),
+    excludeLabels: parseSelectorColumnForExpiry<string>(r.exclude_labels, 'exclude_labels'),
+    excludePatterns: parseSelectorColumnForExpiry<LabelMatcher>(
+      r.exclude_patterns,
+      'exclude_patterns',
+    ),
+  };
+}
+
+/**
  * Point-in-time breakdown of dispatch_queue depth used for Prometheus gauges
  * and operator-facing depth warnings.
  *
@@ -668,22 +712,7 @@ export class JobQueue {
       )
       .execute();
 
-    return rows.map((r) => ({
-      id: r.id,
-      runId: r.run_id,
-      jobName: r.job_name,
-      lastProvisioningError: r.last_provisioning_error ?? null,
-      runsOnLabels: parseSelectorColumnForExpiry<string>(r.runs_on_labels, 'runs_on_labels'),
-      runsOnPatterns: parseSelectorColumnForExpiry<LabelMatcher>(
-        r.runs_on_patterns,
-        'runs_on_patterns',
-      ),
-      excludeLabels: parseSelectorColumnForExpiry<string>(r.exclude_labels, 'exclude_labels'),
-      excludePatterns: parseSelectorColumnForExpiry<LabelMatcher>(
-        r.exclude_patterns,
-        'exclude_patterns',
-      ),
-    }));
+    return rows.map((r) => rowToExpiredJobInfo(r));
   }
 
   /**
@@ -1053,6 +1082,11 @@ export class JobQueue {
         ack_deadline: null,
         ack_agent_id: null,
         agent_id: null,
+        // A job that got dispatched was routable at that moment, so any grace
+        // clock stamped before the dispatch is spent. Leaving it set would let
+        // the probe fail a requeued job on its very next tick with no fresh
+        // window — the clock must measure a CONTINUOUS unroutable stretch.
+        unroutable_since: null,
       })
       .where('id', '=', jobId)
       .where('status', '=', DispatchQueueStatus.Dispatched)
@@ -1226,6 +1260,78 @@ export class JobQueue {
   async listPending(limit: number): Promise<QueuedJob[]> {
     const rows = await this.pendingOldestFirstQuery().limit(limit).execute();
     return rows.map((row) => this.rowToQueuedJob(row));
+  }
+
+  /**
+   * Pending, non-expired jobs with the facts the unroutable probe needs:
+   * routing selectors, any recorded provisioning error, and the grace clock.
+   *
+   * Read-only — no claim, no `FOR UPDATE`; the probe never dispatches. Reuses
+   * the shared pending query so it inherits the same FIFO ordering and
+   * not-yet-expired filter the rest of the queue uses.
+   */
+  async listUnroutableCandidates(limit: number): Promise<UnroutableCandidate[]> {
+    const rows = await this.pendingOldestFirstQuery().limit(limit).execute();
+    return rows.map((row) => ({
+      ...rowToExpiredJobInfo(row as unknown as ExpiryRowShape),
+      unroutableSince: row.unroutable_since ? new Date(row.unroutable_since) : null,
+    }));
+  }
+
+  /**
+   * Stamp the grace clock the first time a job reads unroutable.
+   *
+   * The `unroutable_since IS NULL` guard is load-bearing, not defensive: the
+   * cleanup/probe ticks are NOT leader-gated, so without it two coordinators
+   * would each re-stamp `now` on every tick, pushing the deadline outward
+   * forever and preventing the grace from ever elapsing.
+   */
+  async markUnroutableSince(id: string, at: Date): Promise<void> {
+    await this.db
+      .updateTable('dispatch_queue')
+      .set({ unroutable_since: at })
+      .where('id', '=', id)
+      .where('unroutable_since', 'is', null)
+      .execute();
+  }
+
+  /** Clear the grace clock after the job reads routable again. */
+  async clearUnroutableState(id: string): Promise<void> {
+    await this.db
+      .updateTable('dispatch_queue')
+      .set({ unroutable_since: null })
+      .where('id', '=', id)
+      .execute();
+  }
+
+  /**
+   * Claim a still-pending row for fast-fail, moving it out of the queue.
+   *
+   * Mirrors {@link markExpired}: the queue row has to leave `Pending` in the
+   * same breath the job is terminalized, and for the same two reasons.
+   * A row left pending is still dispatchable, so an agent connecting later
+   * would pick up a job whose `execution_jobs` row already reads terminal; and
+   * the probe re-lists it on every tick, re-running the whole terminalize path
+   * (and re-counting the fast-fail metric) until the queue timeout finally
+   * expires it.
+   *
+   * The `status = Pending` guard is also the concurrency arbiter — probe ticks
+   * are NOT leader-gated, so exactly one coordinator's UPDATE hits a row and
+   * the losers get `false` and move on.
+   *
+   * @returns true when this call claimed the row, false when it was already
+   *   dispatched, cancelled, expired, or claimed by another coordinator.
+   */
+  async claimUnroutable(id: string): Promise<boolean> {
+    const result = await this.db
+      .updateTable('dispatch_queue')
+      .set({ status: DispatchQueueStatus.Expired })
+      .where('id', '=', id)
+      .where('status', '=', DispatchQueueStatus.Pending)
+      .executeTakeFirst();
+    this.depthCache = null;
+    this.breakdownCache = null;
+    return Number(result.numUpdatedRows ?? 0) > 0;
   }
 
   // ── Internal ──────────────────────────────────────────────────────

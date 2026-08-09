@@ -29,6 +29,7 @@
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
+import { ExecutionJobStatus } from '@kici-dev/engine';
 
 /** Run summary shape returned by GET /api/v1/admin/runs. */
 interface RunSummaryDTO {
@@ -89,6 +90,8 @@ interface JobDTO {
   completedAt: string | null;
   durationMs: number | null;
   errorMessage: string | null;
+  /** Why this job cannot be routed; present only while it waits, unroutable. */
+  routingReason?: string | null;
   runsOnLabels: string[] | null;
   createdAt: string;
   /** Present only when ?includeSteps=true. */
@@ -366,6 +369,25 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           String(j.steps?.length ?? 0),
         ]);
         console.log(renderTable(jobHeaders, jobRows));
+
+        // A queued job nothing in the fleet can route says so here, while it is
+        // still waiting — the reason names the exact unmatched selectors, which
+        // is the one thing an operator needs to fix the `runsOn` or the fleet.
+        // Gated on the job still waiting: `routingReason` is not cleared by
+        // every path that takes a job out of the queue, and a terminal job
+        // states its cause in `errorMessage` (already rendered above).
+        const unroutableJobs = jobs.filter(
+          (j) =>
+            j.routingReason &&
+            (j.status === ExecutionJobStatus.enum.pending ||
+              j.status === ExecutionJobStatus.enum.queued),
+        );
+        if (unroutableJobs.length > 0) {
+          console.log('');
+          for (const job of unroutableJobs) {
+            console.log(`  ! ${job.jobName}: ${job.routingReason}`);
+          }
+        }
 
         // Steps per job (only show if any job has steps)
         const jobsWithSteps = jobs.filter((j) => (j.steps?.length ?? 0) > 0);

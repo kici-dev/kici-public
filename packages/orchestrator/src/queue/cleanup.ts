@@ -1,12 +1,10 @@
-import { type Kysely, sql } from 'kysely';
-import { ExecutionJobStatus, type LabelMatcher } from '@kici-dev/engine';
+import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import type { CheckRunTrackingStore } from '../reporting/check-run-tracking-store.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
-import { reportJobCheckRunCompletion } from '../reporting/job-check-run-completion.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import { pruneExpiredLogs } from '../reporting/log-retention.js';
 import { pruneRequestIdempotency } from '../pipeline/request-idempotency.js';
@@ -15,34 +13,10 @@ import {
   dispatchQueueRowsPrunedTotal,
   stepLogsPrunedTotal,
 } from '../metrics/prometheus.js';
-import { type ExpiredJobInfo, JobQueue } from './job-queue.js';
+import { JobQueue } from './job-queue.js';
+import { type CanRouteLabels, terminalizeUnroutableJob } from './terminalize-unroutable.js';
 
 const logger = createLogger({ prefix: 'cleanup' });
-
-/**
- * The operator-facing reason an expired job is `unroutable`, naming the exact
- * selectors that went unmatched. Regex matchers are rendered as their source so
- * the message stays readable rather than printing `[object Object]`.
- */
-function renderMatcher(m: LabelMatcher): string {
-  return m.kind === 'exact' ? m.value : `/${m.source}/${m.flags}`;
-}
-
-function unroutableMessage(job: ExpiredJobInfo): string {
-  const required = [...job.runsOnLabels, ...job.runsOnPatterns.map(renderMatcher)];
-  const excluded = [...job.excludeLabels, ...job.excludePatterns.map(renderMatcher)];
-  // `currently`, and both halves of the probe, because the same verdict covers a
-  // fleet that is merely empty right now — a lone static agent that dropped off
-  // for the whole window reaches this line too, and a message asserting the
-  // labels are wrong would send its operator chasing a correct `runsOn`.
-  const selector =
-    required.length > 0
-      ? `runsOn [${required.join(', ')}]`
-      : 'this job (it declares no runsOn, so any agent would do)';
-  const parts = [selector];
-  if (excluded.length > 0) parts.push(`excluding [${excluded.join(', ')}]`);
-  return `No connected agent or scaler backend currently matches ${parts.join(' ')} — the job was never dispatched`;
-}
 
 /**
  * Optional cleanup dependencies + retention knobs. Present in platform/hybrid
@@ -92,21 +66,18 @@ export interface CleanupExtras {
    * registered agent yet still routes perfectly well, so asking only the agent
    * registry would report every failed spawn as a bad `runsOn`.
    *
-   * Asked at expiry rather than at dispatch so a label satisfied moments later
-   * by an autoscaled agent is not mislabelled unroutable. Absent → every expiry
-   * stays `timed_out_stale`, the behaviour before the split existed.
+   * Asked both on the unroutable probe's short tick (where a grace window
+   * absorbs a label satisfied moments later by an autoscaled agent) and again
+   * at expiry, which stays the backstop when fast-fail is disabled. Absent →
+   * every expiry stays `timed_out_stale`, the behaviour before the split
+   * existed.
    *
    * The predicate is allowed to answer "routable" conservatively (the scaler
    * half matches exact labels only, so a pattern-only `runsOn` reads routable on
    * a scaler-configured orchestrator). That costs precision on the status, never
    * safety: the job is terminal either way and the run fails either way.
    */
-  canRouteLabels?: (
-    requiredLabels: string[],
-    requiredPatterns: LabelMatcher[],
-    excludeLabels: string[],
-    excludePatterns: LabelMatcher[],
-  ) => boolean;
+  canRouteLabels?: CanRouteLabels;
 }
 
 /**
@@ -221,124 +192,18 @@ export async function runCleanup(
   // 3. Forward terminal status to Platform for each expired job
   if (extras && expiredJobs.length > 0) {
     const affectedRunIds = new Set<string>();
-    const genericMessage = 'Queue timeout expired (job was never dispatched to an agent)';
 
     for (const job of expiredJobs) {
-      // A job nothing in the fleet could ever have run — no agent, no scaler
-      // backend — is `unroutable`, not a capacity timeout. Naming the
-      // unsatisfied `runsOn` is the whole point: a typo or a retired label lands
-      // here and the message has to say which selectors went unmatched. Without
-      // the probe wired in, every expiry keeps its historical `timed_out_stale`.
-      //
-      // A recorded provisioning error settles it on its own: the scaler got far
-      // enough to attempt (and fail) a spawn, so the labels DID route and the
-      // real cause is that failure. Calling that unroutable would send an
-      // operator to fix a `runsOn` that is already correct.
-      const unroutable =
-        job.lastProvisioningError === null &&
-        extras.canRouteLabels !== undefined &&
-        !extras.canRouteLabels(
-          job.runsOnLabels,
-          job.runsOnPatterns,
-          job.excludeLabels,
-          job.excludePatterns,
-        );
-      const status = unroutable
-        ? ExecutionJobStatus.enum.unroutable
-        : ExecutionJobStatus.enum.timed_out_stale;
-      // An unroutable job has no provisioning error by construction (see the
-      // guard above), so the two branches never contend.
-      const errorMessage = unroutable
-        ? unroutableMessage(job)
-        : (job.lastProvisioningError ?? genericMessage);
-      try {
-        // Update the orchestrator's local execution_jobs row
-        const ejResult = await extras.db
-          .updateTable('execution_jobs')
-          .set({
-            status,
-            completed_at: new Date(),
-            error_message: errorMessage,
-          })
-          .where('run_id', '=', sql<string>`${job.runId}::uuid`)
-          .where('job_name', '=', job.jobName)
-          .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])
-          .executeTakeFirst();
-
-        if (ejResult.numUpdatedRows && ejResult.numUpdatedRows > 0n) {
-          // Surface the provisioning error as the run-level failure reason so
-          // `kici status`, `kici-admin runs show`, and the dashboard banner
-          // show the real cause. Only set it when no real step-failure reason
-          // has been recorded yet — never clobber an existing reason.
-          // An unroutable job's message carries the same weight: it is the only
-          // statement of WHICH selectors went unmatched, and a run whose reason
-          // stayed NULL would render the generic `Failed jobs: <name>` roll-up
-          // on every surface the comment above names.
-          const runReason = unroutable ? errorMessage : job.lastProvisioningError;
-          if (runReason) {
-            await extras.db
-              .updateTable('execution_runs')
-              .set({ failure_reason: runReason })
-              .where('run_id', '=', sql<string>`${job.runId}::uuid`)
-              .where('failure_reason', 'is', null)
-              .execute();
-          }
-
-          // Look up the job_id (dispatch_queue.id ≠ execution_jobs.job_id)
-          const ejRow = await extras.db
-            .selectFrom('execution_jobs')
-            .select(['job_id'])
-            .where('run_id', '=', sql<string>`${job.runId}::uuid`)
-            .where('job_name', '=', job.jobName)
-            .executeTakeFirst();
-
-          if (ejRow) {
-            extras.executionTracker.updateInMemoryJob(job.runId, ejRow.job_id, status);
-
-            extras.executionTracker.forwardJobTerminalStatus(
-              job.runId,
-              ejRow.job_id,
-              job.jobName,
-              status,
-              errorMessage,
-            );
-
-            extras.executionTracker.emitInfraEvent(job.runId, 'orchestrator.job.queue_expired', {
-              jobId: ejRow.job_id,
-              metadata: { jobName: job.jobName, reason: errorMessage },
-            });
-
-            // Resolve the job's check run — see `CleanupExtras.checkRunReporter`
-            // for why this path has to post it itself. `errorMessage` is passed
-            // as the description because it is the only text naming the
-            // unmatched `runsOn` selectors (or the provisioning failure).
-            if (extras.checkRunReporter) {
-              reportJobCheckRunCompletion(
-                {
-                  checkRunReporter: extras.checkRunReporter,
-                  getExecutionContext: (runId) =>
-                    extras.executionTracker.getExecutionContext(runId),
-                },
-                {
-                  runId: job.runId,
-                  jobId: ejRow.job_id,
-                  jobName: job.jobName,
-                  status,
-                  description: errorMessage,
-                },
-              );
-            }
-          }
-
-          affectedRunIds.add(job.runId);
-        }
-      } catch (err) {
-        logger.error('Failed to forward expired job status', {
-          runId: job.runId,
-          jobName: job.jobName,
-          error: toErrorMessage(err),
-        });
-      }
+      const runId = await terminalizeUnroutableJob(
+        {
+          db: extras.db,
+          executionTracker: extras.executionTracker,
+          checkRunReporter: extras.checkRunReporter,
+          canRouteLabels: extras.canRouteLabels,
+        },
+        job,
+      );
+      if (runId) affectedRunIds.add(runId);
     }
 
     // Check run completion for all affected runs

@@ -141,6 +141,8 @@ export async function cancelRunWithReason(
       status: ExecutionJobStatus.enum.cancelled,
       completed_at: new Date(),
       error_message: reason,
+      // Leaving the queue: the routing reason no longer describes anything.
+      routing_reason: null,
     })
     .where('run_id', '=', runId)
     .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])

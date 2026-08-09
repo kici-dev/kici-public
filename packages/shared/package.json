@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",

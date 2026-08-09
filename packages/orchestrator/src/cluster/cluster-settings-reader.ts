@@ -22,7 +22,8 @@ export type ClusterNumberColumn =
   | 'check_run_tracking_ttl_days'
   | 'concurrency_wait_timeout_ms'
   | 'agent_token_ttl_ms'
-  | 'ownership_db_check_timeout_ms';
+  | 'ownership_db_check_timeout_ms'
+  | 'unroutable_grace_ms';
 
 /** Text columns on cluster_settings readable via {@link ClusterSettingsReader}. */
 export type ClusterStringColumn = 'dashboard_verified_issuer';

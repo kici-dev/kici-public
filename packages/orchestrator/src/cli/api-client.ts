@@ -71,6 +71,68 @@ export interface GenericSourceResponse {
   git_config?: string | GenericSourceGitConfigPayload | null;
 }
 
+/**
+ * `fetch` rejects with a bare `TypeError: fetch failed` when it cannot reach the
+ * host — it names neither the address dialled nor the knob that sets it. Printed
+ * through the CLI's `Error: ${message}` handler that becomes `Error: fetch
+ * failed`, which reads like a fault in the subcommand rather than a misaddressed
+ * client, and sends the operator debugging the wrong thing.
+ *
+ * The trap is sharpened by two details of this CLI. The base URL comes from
+ * `KICI_ADMIN_URL`, not the `KICI_ORCHESTRATOR_URL` an operator is likelier to
+ * have exported; and subcommands accepting `--database-url` fall back to direct
+ * DB access, so on a host with `KICI_DATABASE_URL` set they keep working while
+ * the HTTP-only ones fail — making it look like specific subcommands are broken.
+ *
+ * So: name the address, name the variable, and name the near-miss.
+ */
+/**
+ * Best-effort one-line detail from a rejected `fetch`. Returns '' when nothing
+ * useful is available, so the caller can omit the parenthetical rather than
+ * print an empty one.
+ */
+export function firstCauseMessage(err: unknown): string {
+  if (!(err instanceof Error)) return '';
+  const cause: unknown = err.cause;
+  if (!(cause instanceof Error)) return '';
+  if (cause.message) return cause.message;
+  // AggregateError: one entry per address attempted (IPv6 then IPv4, …).
+  const nested: unknown = (cause as { errors?: unknown }).errors;
+  if (Array.isArray(nested)) {
+    for (const e of nested) {
+      if (e instanceof Error && e.message) return e.message;
+    }
+  }
+  return '';
+}
+
+export async function fetchAdminApi(
+  url: string,
+  init: RequestInit,
+  baseUrl: string,
+): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err) {
+    // undici puts the actionable detail (ECONNREFUSED, EAI_AGAIN, …) on `cause`,
+    // but not always usefully: the cause is sometimes an Error with an empty
+    // message, and sometimes an AggregateError whose detail sits in `.errors`
+    // (one entry per address tried for a multi-homed host). Take the first
+    // non-empty message available and omit the parenthetical entirely when none
+    // is — ` ()` in a diagnostic is worse than no parenthetical at all.
+    const detail = firstCauseMessage(err);
+    const cause = detail ? ` (${detail})` : '';
+    throw new Error(
+      `cannot reach the orchestrator admin API at ${baseUrl}${cause}. ` +
+        `Set KICI_ADMIN_URL to the orchestrator's HTTP address, or pass --base-url where the ` +
+        `subcommand accepts it. Note KICI_ORCHESTRATOR_URL is NOT read by this CLI; if other ` +
+        `subcommands appear to work, they are using the --database-url / KICI_DATABASE_URL ` +
+        `direct-DB path rather than HTTP.`,
+      { cause: err },
+    );
+  }
+}
+
 export class AdminApiClient {
   constructor(
     private readonly baseUrl: string,
@@ -87,11 +149,15 @@ export class AdminApiClient {
       'Content-Type': 'application/json',
     };
 
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    const res = await fetchAdminApi(
+      url,
+      {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      },
+      this.baseUrl,
+    );
 
     if (!res.ok) {
       const text = await res.text();
@@ -153,10 +219,11 @@ export class AdminApiClient {
    */
   async getText(path: string): Promise<string> {
     const url = `${this.baseUrl}${path}`;
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${this.token}` },
-    });
+    const res = await fetchAdminApi(
+      url,
+      { method: 'GET', headers: { Authorization: `Bearer ${this.token}` } },
+      this.baseUrl,
+    );
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${await res.text()}`);
     }
@@ -178,11 +245,15 @@ export class AdminApiClient {
     body: { selectors: string[]; logWindowHours?: number; timeoutSeconds?: number },
     outPath: string,
   ): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/admin/fleet-bundle`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const res = await fetchAdminApi(
+      `${this.baseUrl}/admin/fleet-bundle`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      this.baseUrl,
+    );
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${await res.text()}`);
     }

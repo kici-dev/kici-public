@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.3.0 — 2026-08-09
+
+### Features
+
+- Jobs whose runsOn matches no agent or scaler now surface the reason immediately and fail within a short grace window instead of waiting out the queue timeout
+
 ## v0.2.0 — 2026-08-08
 
 ### Features

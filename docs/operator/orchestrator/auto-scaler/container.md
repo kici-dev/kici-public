@@ -249,7 +249,7 @@ podman ps -a --filter "label=kici-managed=true" --format "{{.ID}}" | xargs podma
 
 **Cause:** Container image pull on first use. Large images can take minutes to download.
 
-**Solution:** Use warm pools to pre-pull images. Or use a local registry mirror to reduce pull times. The scaler does not time out during spawns -- it lets the container runtime handle the pull.
+**Solution:** Use warm pools to pre-pull images. Or use a local registry mirror to reduce pull times. Each spawn runs under a deadline — 5 minutes by default, generous enough for a legitimate cold-cache pull of a large image. A spawn that exceeds it is aborted so it cannot hold its `maxConcurrentSpawns` slot forever; see [Common configuration → Spawn timeout](./common-config.md#spawn-timeout) for how to tune it.
 
 ### Container socket permission errors
 

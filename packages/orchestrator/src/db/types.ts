@@ -301,6 +301,13 @@ export interface DispatchQueueTable {
    * real provisioning cause; cleared on dispatch. NULL when none recorded.
    */
   last_provisioning_error: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * When this job first read unroutable — no registered agent and no scaler
+   * backend matched its selectors. NULL once it reads routable again, so the
+   * grace clock only ever measures a CONTINUOUS unroutable window. Persisted
+   * rather than in-memory so a restart mid-grace resumes the same clock.
+   */
+  unroutable_since: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
   /** Times this job was returned to pending for re-dispatch (job.reject / pre-start agent loss). */
   dispatch_attempts: Generated<number>;
   /**
@@ -552,6 +559,13 @@ export interface ExecutionJobTable {
   job_name: string;
   /** Job status: pending | running | success | failed | cancelled | skipped */
   status: Generated<string>;
+  /**
+   * Operator-facing reason this job cannot currently be routed to any agent.
+   * Written by the unroutable probe while the job is still queued, so the cause
+   * is visible long before the job terminalizes; cleared when a matching agent
+   * or scaler backend appears. NULL whenever the job is routable.
+   */
+  routing_reason: ColumnType<string | null, string | null | undefined, string | null>;
   /** Matrix values JSON (e.g. {"node": "18"}) */
   matrix_values: string | null;
   /** Agent ID that ran this job */
@@ -1872,6 +1886,12 @@ export interface ClusterSettingsTable {
    * NULL ⇒ the orchestrator's configured default.
    */
   check_run_tracking_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Grace window (ms) a job may stay continuously unroutable before it is
+   * terminalized as `unroutable`. NULL = the orchestrator's configured default;
+   * 0 disables fast-fail, leaving `queue_timeout_ms` as the only backstop.
+   */
+  unroutable_grace_ms: ColumnType<number | null, number | null | undefined, number | null>;
   concurrency_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   agent_token_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**

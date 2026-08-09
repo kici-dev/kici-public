@@ -114,7 +114,7 @@ Remote runs are offered by the Platform; an orchestrator with no Platform connec
 
 KiCI runs two orchestrator-side caches — the **source tarball cache** (raw `.kici/` directory minus `node_modules/`) and the **dependency tarball cache** (packed `node_modules/`). Both use a build-then-execute pattern: the orchestrator checks the caches before dispatching execution jobs, and if the source cache is cold a build agent populates both in one pass.
 
-With the shared TypeScript loader hook plus source tarball, execution agents do not run `git clone` or compile anything at runtime — they perform exactly two S3 GETs (source + deps) and extract.
+With the shared TypeScript loader hook plus source tarball, execution agents never install or compile `.kici/` at runtime — they restore the workflow directory and its `node_modules` with two S3 GETs and extract. The workspace checkout is unaffected: an execution job still clones the repository at the dispatch ref unless it sets `checkout: false`, and the source tarball is restored over that clone.
 
 ### Cache miss flow
 
@@ -162,7 +162,7 @@ Execution Job Dispatch --> Execution Agent
 Done <-----------------------+
 ```
 
-The execution agent never clones the repo. The source tarball IS the workflow repo's `.kici/` directory.
+The execution agent never rebuilds `.kici/`. The source tarball IS the workflow repo's `.kici/` directory, extracted over the checkout.
 
 ### Cache hit flow
 
@@ -211,7 +211,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 31.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 32.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -222,7 +222,7 @@ When multiple webhooks trigger simultaneously for the same repository state, the
 
 If cache storage is unavailable or a download fails:
 
-- **Source tarball download failure:** Hard failure today — the agent does not fall back to `git clone` on the execution path. (The build path is where cloning happens.) In practice this is rare because the same orchestrator that issued the pre-signed URL controls the cache backend.
+- **Source tarball download failure:** Hard failure today — the agent does not fall back to rebuilding `.kici/` from the checkout. In practice this is rare because the same orchestrator that issued the pre-signed URL controls the cache backend.
 - **Dep tarball download failure:** Agent falls back to running `npm ci` / `npm install` inline.
 - **Dep tarball hash mismatch:** Agent retries the download twice (3 total attempts), then fails the job (no fallback for integrity failures).
 - **Source tarball drift (extracted `contentHash` ≠ lock file):** Hard failure with "Lock file is out of date: workflow source changed without regenerating kici.lock.json" — see [Lock file and drift](../user/lock-file-and-drift.md).

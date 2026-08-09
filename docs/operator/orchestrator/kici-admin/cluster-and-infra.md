@@ -194,6 +194,7 @@ Synopsis: `kici-admin cluster-settings reset [options]`
 | `--concurrency-wait-timeout-ms`                     |         | Clear only Concurrency wait timeout (ms)      |
 | `--agent-token-ttl-ms`                              |         | Clear only Agent token TTL (ms)               |
 | `--ownership-db-check-timeout-ms`                   |         | Clear only Ownership DB check timeout (ms)    |
+| `--unroutable-grace-ms`                             |         | Clear only Unroutable fast-fail grace (ms)    |
 | `--dashboard-verified-issuer`                       |         | Clear only Dashboard verified issuer          |
 
 ### `kici-admin cluster-settings set`
@@ -224,6 +225,7 @@ Synopsis: `kici-admin cluster-settings set [options]`
 | `--concurrency-wait-timeout-ms <value>`                     |         | Concurrency wait timeout (ms) (integer >= 1000)     |
 | `--agent-token-ttl-ms <value>`                              |         | Agent token TTL (ms) (integer >= 1000)              |
 | `--ownership-db-check-timeout-ms <value>`                   |         | Ownership DB check timeout (ms) (integer >= 100)    |
+| `--unroutable-grace-ms <value>`                             |         | Unroutable fast-fail grace (ms) (integer >= 0)      |
 | `--dashboard-verified-issuer <value>`                       |         | Dashboard verified issuer (an absolute http(s) URL) |
 
 ### `kici-admin cluster-settings show`

@@ -112,6 +112,7 @@ import * as m104 from './migrations/104_check_run_terminal_sent.js';
 import * as m105 from './migrations/105_org_trust_policy.js';
 import * as m106 from './migrations/106_cluster_settings_check_run_tracking_ttl_days.js';
 import * as m107 from './migrations/107_check_run_tracking_updated_at_index.js';
+import * as m108 from './migrations/108_unroutable_fast_fail.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -224,6 +225,7 @@ export function createMigrationProvider(): MigrationProvider {
         '105_org_trust_policy': m105,
         '106_cluster_settings_check_run_tracking_ttl_days': m106,
         '107_check_run_tracking_updated_at_index': m107,
+        '108_unroutable_fast_fail': m108,
       };
     },
   };

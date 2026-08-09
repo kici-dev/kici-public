@@ -13,7 +13,7 @@
  * is warm-only in v1.)
  */
 import type { Kysely } from 'kysely';
-import type { ExecutionJobStatus, InitFailure } from '@kici-dev/engine';
+import { ExecutionJobStatus, type InitFailure } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from '../dashboard/needs-edges.js';
 
@@ -69,6 +69,7 @@ export interface RunDetailJobRow {
   duration_ms: number | null;
   agent_id: string | null;
   error_message: string | null;
+  routing_reason: string | null;
   runs_on_labels: unknown;
   contexts: unknown;
   skipped_contexts: unknown;
@@ -82,6 +83,26 @@ export interface RunDetailJobLookups {
   stepsByJob: Map<string, RunDetailStepRow[]>;
   secretKeysByJob: Map<string, string[]>;
   needsByJob: Map<string, Array<{ upstreamName: string; runOn: ExecutionJobStatus[] }>>;
+}
+
+/**
+ * The routing reason as a reader should see it.
+ *
+ * `routing_reason` is only meaningful while the job is still waiting to be
+ * routed, and more than twenty call sites move a job out of `pending`/`queued`
+ * — dispatch, cancel, the run-level failure cascades, the stale detector.
+ * Requiring every one of them to also null the column would be fragile in the
+ * one direction that matters: the site somebody forgets renders a finished job
+ * as "waiting for an agent".
+ *
+ * So the guard lives here, at the read boundary both projections share, where
+ * it cannot be forgotten by a writer that does not know this column exists.
+ * The stale bytes may linger in the row; they are never shown.
+ */
+export function visibleRoutingReason(status: string, routingReason: string | null): string | null {
+  const stillWaiting =
+    status === ExecutionJobStatus.enum.pending || status === ExecutionJobStatus.enum.queued;
+  return stillWaiting ? (routingReason ?? null) : null;
 }
 
 /** Map queried job + step rows into the dashboard run-detail job DTO shape. */
@@ -104,6 +125,7 @@ export function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJo
       agentId: job.agent_id ?? null,
       orchestratorId: null,
       errorMessage: job.error_message ?? null,
+      routingReason: visibleRoutingReason(job.status, job.routing_reason ?? null),
       runsOnLabels: (job.runs_on_labels as string[] | null) ?? null,
       contexts: job.contexts
         ? typeof job.contexts === 'string'

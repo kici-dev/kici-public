@@ -184,6 +184,7 @@ export const appConfigSchema = z
     rosterTtlMs: z.coerce.number().default(1_800_000),
     queueMaxDepth: z.coerce.number().default(1000),
     queueTimeoutMs: z.coerce.number().default(3_600_000),
+    unroutableGraceMs: z.coerce.number().default(120_000),
     /**
      * Operator-facing backpressure warning threshold. See `configSchema` in
      * `packages/orchestrator/src/config.ts` for the user-facing prose.

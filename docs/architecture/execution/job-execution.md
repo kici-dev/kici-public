@@ -104,7 +104,7 @@ The sandbox performs a shallow `git clone` at the dispatch ref. For private repo
 
 On execution jobs the sandbox performs exactly two cache fetches:
 
-1. **Source tarball** — downloads the `.kici/` source tarball at `sourceTarUrl` and extracts it into the work directory. No `git clone` happens on the execution path; the source tarball IS the workflow source at the target SHA. Build jobs are the only code path that still clones.
+1. **Source tarball** — downloads the `.kici/` source tarball at `sourceTarUrl` and extracts it over the cloned workflow root, so the loaded workflow's `contentHash` matches the lock file exactly. The tarball replaces the install-and-compile of `.kici/`, not the checkout: the clone above still runs unless the job sets `checkout: false`.
 2. **Dependency tarball** — downloads the `node_modules` tarball at `depsUrl` with streaming SHA-256 verification against `depsHash` and extracts it into `.kici/node_modules/`. If `depsUrl` is absent (dep cache miss), the sandbox falls back to inline `npm ci`.
 
 > See [Source and dependency caching flow](../data-flows.md#source-and-dependency-caching-flow) for the full cache architecture.

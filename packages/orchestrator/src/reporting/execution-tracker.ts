@@ -2085,6 +2085,10 @@ export class ExecutionTracker {
         status: ExecutionJobStatus.enum.failed,
         completed_at: now,
         error_message: failureReason,
+        // The job is leaving the queue, so its routing reason no longer
+        // describes anything. The read boundary already hides it
+        // (`visibleRoutingReason`); clearing it here keeps the row honest too.
+        routing_reason: null,
       })
       .where('run_id', '=', runId)
       .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])
@@ -2523,6 +2527,10 @@ export class ExecutionTracker {
         status: ExecutionJobStatus.enum.failed,
         completed_at: now,
         error_message: reason,
+        // The job is leaving the queue, so its routing reason no longer
+        // describes anything. The read boundary already hides it
+        // (`visibleRoutingReason`); clearing it here keeps the row honest too.
+        routing_reason: null,
       })
       .where('run_id', '=', runId)
       .where('status', 'in', [ExecutionJobStatus.enum.pending, ExecutionJobStatus.enum.queued])

@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { AdminApiClient } from './api-client.js';
+import { AdminApiClient, fetchAdminApi, firstCauseMessage } from './api-client.js';
 
 const BASE_URL = 'http://localhost:8080';
 const TOKEN = 'test-token-123';
@@ -241,5 +241,79 @@ describe('AdminApiClient', () => {
     await client.listScopes('org:special');
 
     expect(fetchMock.mock.calls[0][0]).toContain('orgId=org%3Aspecial');
+  });
+});
+
+describe('fetchAdminApi — unreachable-host diagnostics', () => {
+  const BASE = 'http://127.0.0.1:4000';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * The bare `TypeError: fetch failed` this replaces reads as a fault in the
+   * subcommand rather than a misaddressed client. Each assertion below pins one
+   * piece of information an operator needs to self-serve, and every one of them
+   * can only be present if the wrapper actually ran — a plain `fetch` rejection
+   * carries none of them.
+   */
+  it('names the address it dialled', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    await expect(fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE)).rejects.toThrow(BASE);
+  });
+
+  it('names KICI_ADMIN_URL as the knob, and KICI_ORCHESTRATOR_URL as the near-miss', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain('KICI_ADMIN_URL');
+    // The direct-DB fallback is what makes some subcommands keep working while
+    // HTTP-only ones fail, which is the misleading part worth spelling out.
+    expect(err.message).toContain('KICI_ORCHESTRATOR_URL');
+    expect(err.message).toContain('KICI_DATABASE_URL');
+  });
+
+  it('surfaces the underlying cause detail (ECONNREFUSED and friends)', async () => {
+    const inner = new TypeError('fetch failed');
+    (inner as { cause?: unknown }).cause = new Error('connect ECONNREFUSED 127.0.0.1:4000');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain('ECONNREFUSED');
+    expect(err.cause).toBe(inner);
+  });
+
+  it('passes a reachable response straight through', async () => {
+    const res = new Response('{}', { status: 200 });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(res));
+    await expect(fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE)).resolves.toBe(res);
+  });
+});
+
+describe('firstCauseMessage', () => {
+  it('returns the cause message when present', () => {
+    const e = new TypeError('fetch failed');
+    (e as { cause?: unknown }).cause = new Error('connect ECONNREFUSED 127.0.0.1:4000');
+    expect(firstCauseMessage(e)).toBe('connect ECONNREFUSED 127.0.0.1:4000');
+  });
+
+  it('digs into AggregateError.errors when the cause message is empty', () => {
+    const agg = new AggregateError([new Error('connect EHOSTUNREACH ::1:4000')], '');
+    const e = new TypeError('fetch failed');
+    (e as { cause?: unknown }).cause = agg;
+    expect(firstCauseMessage(e)).toBe('connect EHOSTUNREACH ::1:4000');
+  });
+
+  it('returns empty string when nothing useful is available', () => {
+    const e = new TypeError('fetch failed');
+    (e as { cause?: unknown }).cause = new Error('');
+    // Drives the ` ()` defect this exists to prevent: an empty detail must
+    // produce no parenthetical at all.
+    expect(firstCauseMessage(e)).toBe('');
+    expect(firstCauseMessage(new TypeError('fetch failed'))).toBe('');
+    expect(firstCauseMessage('not an error')).toBe('');
   });
 });

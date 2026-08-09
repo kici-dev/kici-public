@@ -57,6 +57,7 @@ const COLUMNS = {
   concurrencyWaitTimeoutMs: 'concurrency_wait_timeout_ms',
   agentTokenTtlMs: 'agent_token_ttl_ms',
   ownershipDbCheckTimeoutMs: 'ownership_db_check_timeout_ms',
+  unroutableGraceMs: 'unroutable_grace_ms',
 } as const;
 
 type CamelKnob = keyof typeof COLUMNS;
@@ -93,6 +94,8 @@ const updateSchema = z.object({
   concurrencyWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
   agentTokenTtlMs: z.number().int().min(1000).nullable().optional(),
   ownershipDbCheckTimeoutMs: z.number().int().min(100).nullable().optional(),
+  /** 0 disables unroutable fast-fail, so the floor is 0, not 1000. */
+  unroutableGraceMs: z.number().int().min(0).nullable().optional(),
   /**
    * Verified-tier origin for browser-sealed dashboard writes. Must be an
    * absolute http(s) origin (the dashboard fetches `<issuer>/.well-known/jwks.json`

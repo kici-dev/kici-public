@@ -165,6 +165,16 @@ export const dashboardJobDetailSchema = z.object({
   agentId: z.string().nullable(),
   orchestratorId: z.string().nullable().optional(),
   errorMessage: z.string().nullable(),
+  /**
+   * Why this job cannot currently be routed to any agent, present only while it
+   * is still queued and nothing in the fleet matches its `runsOn`; cleared once
+   * a matching agent or scaler backend appears.
+   *
+   * OPTIONAL, and must stay optional: the wire protocol is compatibility-
+   * protected, so an orchestrator that predates the unroutable probe simply
+   * omits it.
+   */
+  routingReason: z.string().nullable().optional(),
   /** Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). */
   runsOnLabels: z.array(z.string()).nullable().optional(),
   /**

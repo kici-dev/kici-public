@@ -84,7 +84,10 @@ describe('buildClusterReset', () => {
     expect(patch.dashboardVerifiedIssuer).toBeNull();
     expect(patch.ownershipDbCheckTimeoutMs).toBeNull();
     expect(patch.checkRunTrackingTtlDays).toBeNull();
-    expect(Object.keys(patch)).toHaveLength(18);
+    expect(patch.unroutableGraceMs).toBeNull();
+    // Count guard: a knob added to KNOBS/STRING_KNOBS without a reset path (or
+    // vice versa) shows up here rather than as a knob an operator cannot clear.
+    expect(Object.keys(patch)).toHaveLength(19);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {

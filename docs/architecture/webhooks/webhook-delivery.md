@@ -128,7 +128,8 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
 3. **Sandbox setup:** Prepare the execution environment (container: create + start; bare-metal: validate; firecracker: detect)
 4. **Emit context:** Send `job.context` with runtime details (Node version, OS, arch, sandbox type)
 5. **Sandbox execution (child process):**
-   - Restore source: download cached `.kici/` source tarball (`sourceTarUrl`) and extract it into the work directory. Build jobs do a `git clone` + checkout; execution jobs do not.
+   - Clone repo: shallow `git clone` at the dispatch ref, unless the job sets `checkout: false`
+   - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`) and extract it over the cloned workflow root, so no `npm ci` or compile of `.kici/` is needed at execution time
    - Restore deps: download cached dependency tarball (`depsUrl`) with SHA-256 verification, or fall back to `npm ci` inline if the cache missed
    - Load workflow: register the shared `@kici-dev/shared/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
    - Evaluate rules: run job-level rules sequentially with fail-fast (if any rule fails, job is skipped)
@@ -166,7 +167,7 @@ When a workflow's `contentHash` is found in the cache:
 1. The orchestrator retrieves the source tarball URL from the cache storage (`S3CacheStorage`)
 2. The URL is a pre-signed S3 GET URL (15-minute expiry); the `touch-on-read` refreshes the entry's TTL
 3. The `sourceTarUrl` and `sourceTarHash` (the workflow's `contentHash`, not the tarball-bytes hash) are included in the `job.dispatch` message. The dep cache provides `depsUrl`/`depsHash` the same way.
-4. The execution agent downloads and extracts the tarball, registers the shared TypeScript loader hook, and dynamic-imports the workflow `.ts` directly — no `git clone`, no runtime bundler.
+4. The execution agent downloads and extracts the tarball over its checkout, registers the shared TypeScript loader hook, and dynamic-imports the workflow `.ts` directly — no `npm ci` of `.kici/`, no runtime bundler.
 
 ### Cache miss
 
@@ -182,7 +183,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 31; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 32; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 

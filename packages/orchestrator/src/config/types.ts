@@ -156,6 +156,8 @@ export interface AppConfig {
   /** Queue settings */
   queueMaxDepth: number;
   queueTimeoutMs: number;
+  /** Grace before a continuously-unroutable job is failed; 0 = disabled. */
+  unroutableGraceMs: number;
   /**
    * Pending-depth threshold for operator backpressure warnings. When the
    * pending dispatch_queue depth stays at or above this for two consecutive
