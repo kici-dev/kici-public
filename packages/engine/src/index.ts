@@ -159,9 +159,15 @@ export * from './protocol/messages/orchestrator-agent.js';
 // --- Trigger matching ---
 export * from './sandbox/capabilities.js';
 export * from './trigger/types.js';
+export * from './trigger/text-match.js';
 export * from './trigger/trigger-event-type.js';
 export * from './trigger/decision-trace.js';
 export * from './trigger/matcher.js';
+// Exported so the orchestrator's org-level repo policy matches repo
+// identifiers by the same rules a workflow's own `repos:` patterns do. A
+// second, subtly different repo matcher is how a deny-list pattern came to
+// mean one thing in the policy and another in the trigger.
+export { getRepoGlobMatcher } from './trigger/compiled-matchers.js';
 export * from './trigger/event-buckets.js';
 export { scheduleTriggerKey } from './trigger/schedule-key.js';
 
@@ -232,6 +238,7 @@ export {
   SSH_TRANSPORT_CAPABILITY,
   INIT_LABEL,
   PRIVILEGED_ROOT_LABEL,
+  INIT_RUNNER_ROLE_LABEL,
 } from './labels.js';
 export type { NormalizedRunsOn } from './labels.js';
 export type { AgentRole } from './labels.js';

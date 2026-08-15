@@ -5,6 +5,7 @@ import {
   buildClusterReset,
   checkVerifiedIssuerPublishes,
   registerClusterSettingsCommands,
+  unpairedEvalTimeoutWarnings,
 } from './cluster-settings.js';
 import type { AdminApiClient } from '../api-client.js';
 
@@ -72,6 +73,69 @@ describe('buildClusterPatch', () => {
     expect(() => buildClusterPatch({ webhookDedupTtlMs: '500' })).toThrow('exit');
     exit.mockRestore();
   });
+
+  it('exits when a cache entry-count exceeds its ceiling, naming both bounds', () => {
+    // The ceiling is a boot-safety bound: the LRU allocates its index arrays
+    // eagerly from `max`, so an accepted over-ceiling value crashes the
+    // orchestrator at construction — before the admin API this CLI talks to is
+    // listening. Rejecting here is the good error message.
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('exit');
+    });
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const field of ['lockfileCacheMax', 'contentCacheMax', 'globalEvalCacheMax']) {
+      err.mockClear();
+      expect(() => buildClusterPatch({ [field]: '5000000000' })).toThrow('exit');
+      expect(err.mock.calls[0]?.[0]).toContain('between 1 and 100000');
+    }
+    exit.mockRestore();
+  });
+
+  it('accepts a cache entry-count at the ceiling', () => {
+    expect(buildClusterPatch({ lockfileCacheMax: '100000' })).toEqual({
+      lockfileCacheMax: 100_000,
+    });
+    expect(buildClusterPatch({ contentCacheMax: '100000' })).toEqual({ contentCacheMax: 100_000 });
+  });
+});
+
+describe('unpairedEvalTimeoutWarnings', () => {
+  // The server rejects an inverted pair only when BOTH effective values are
+  // stored; a NULL column means "the configured default applies" and the route
+  // does not know that number. Setting one alone is exactly that blind spot.
+  it('warns when only the wait ceiling is set', () => {
+    const lines = unpairedEvalTimeoutWarnings({ globalEvalWaitTimeoutMs: 60_000 });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('--global-eval-round-timeout-ms');
+  });
+
+  it('warns about both unpaired axes when only the round budget is set', () => {
+    // The round budget is one half of TWO ordered pairs: the wait ceiling must
+    // stay above it, and the per-candidate budget must stay below it. Setting
+    // it alone leaves both unchecked.
+    const lines = unpairedEvalTimeoutWarnings({ globalEvalRoundTimeoutMs: 300_000 });
+    expect(lines).toHaveLength(2);
+    expect(lines.join('\n')).toContain('--global-eval-wait-timeout-ms');
+    expect(lines.join('\n')).toContain('--global-eval-candidate-timeout-ms');
+  });
+
+  it('warns when only the candidate budget is set', () => {
+    const lines = unpairedEvalTimeoutWarnings({ globalEvalCandidateTimeoutMs: 20_000 });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('--global-eval-round-timeout-ms');
+    expect(lines[0]).toContain('suppress every other');
+  });
+
+  it('stays silent when a pair is set (the server checks it) or nothing is', () => {
+    expect(
+      unpairedEvalTimeoutWarnings({
+        globalEvalRoundTimeoutMs: 120_000,
+        globalEvalWaitTimeoutMs: 240_000,
+        globalEvalCandidateTimeoutMs: 20_000,
+      }),
+    ).toEqual([]);
+    expect(unpairedEvalTimeoutWarnings({ queueMaxDepth: 500 })).toEqual([]);
+  });
 });
 
 describe('buildClusterReset', () => {
@@ -85,9 +149,16 @@ describe('buildClusterReset', () => {
     expect(patch.ownershipDbCheckTimeoutMs).toBeNull();
     expect(patch.checkRunTrackingTtlDays).toBeNull();
     expect(patch.unroutableGraceMs).toBeNull();
-    // Count guard: a knob added to KNOBS/STRING_KNOBS without a reset path (or
-    // vice versa) shows up here rather than as a knob an operator cannot clear.
-    expect(Object.keys(patch)).toHaveLength(19);
+    expect(patch.ingestOverflowClaimTimeoutMs).toBeNull();
+    expect(patch.lockfileCacheMax).toBeNull();
+    expect(patch.contentCacheMaxBytes).toBeNull();
+    expect(patch.globalEvalRoundTimeoutMs).toBeNull();
+    expect(patch.globalEvalCacheMax).toBeNull();
+    expect(patch.globalWorkflowsEnabled).toBeNull();
+    // Count guard: a knob added to KNOBS/STRING_KNOBS/BOOLEAN_KNOBS without a
+    // reset path (or vice versa) shows up here rather than as a knob an operator
+    // cannot clear.
+    expect(Object.keys(patch)).toHaveLength(31);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {
@@ -103,6 +174,39 @@ describe('buildClusterReset', () => {
   it('clears only the flagged knobs', () => {
     const patch = buildClusterReset({ queueMaxDepth: true });
     expect(patch).toEqual({ queueMaxDepth: null });
+  });
+});
+
+describe('boolean knobs', () => {
+  it('buildClusterPatch parses --global-workflows-enabled true', () => {
+    expect(buildClusterPatch({ globalWorkflowsEnabled: 'true' })).toEqual({
+      globalWorkflowsEnabled: true,
+    });
+  });
+
+  it('buildClusterPatch parses --global-workflows-enabled false as false, not as unset', () => {
+    expect(buildClusterPatch({ globalWorkflowsEnabled: 'false' })).toEqual({
+      globalWorkflowsEnabled: false,
+    });
+  });
+
+  it('buildClusterPatch exits 1 on a non-boolean value', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
+      throw new Error('exit');
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(() => buildClusterPatch({ globalWorkflowsEnabled: 'yes' })).toThrow('exit');
+    exit.mockRestore();
+  });
+
+  it('buildClusterReset --global-workflows-enabled clears only that knob', () => {
+    expect(buildClusterReset({ globalWorkflowsEnabled: true })).toEqual({
+      globalWorkflowsEnabled: null,
+    });
+  });
+
+  it('an unflagged reset clears the boolean knob too', () => {
+    expect(buildClusterReset({})).toHaveProperty('globalWorkflowsEnabled', null);
   });
 });
 

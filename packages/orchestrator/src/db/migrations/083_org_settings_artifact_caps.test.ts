@@ -39,7 +39,7 @@ describeDb('migration 083_org_settings_artifact_caps', () => {
     // org_settings must exist before the column add — apply migrations 001..083.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await db.destroy();

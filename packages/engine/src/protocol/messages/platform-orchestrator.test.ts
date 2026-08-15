@@ -20,7 +20,9 @@ import {
   collectDiscriminatorTypes,
   ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
+  staleCheckrunCleanupSchema,
 } from './platform-orchestrator.js';
+import { REPO_IDENTIFIER_MAX } from './execution-status.js';
 import { sourceRegistrationSchema, sourceRegistrationAckSchema } from './source-registration.js';
 import { logPullPlatformToOrchSchema } from './log-pull.js';
 import { dashboardPlatformToOrchSchema } from './dashboard.js';
@@ -1264,5 +1266,62 @@ describe('trustPolicySchema approvalExpiryHours validation', () => {
     expect(trustPolicySchema.safeParse({ ...validPolicy, approvalExpiryHours: -1 }).success).toBe(
       false,
     );
+  });
+});
+
+describe('staleCheckrunCleanupSchema workflow repository attribution', () => {
+  const baseRun = {
+    runId: 'run-1',
+    provider: 'github',
+    routingKey: 'github:42',
+    repoIdentifier: 'acme/app',
+    sha: 'deadbeef',
+    workflowName: 'ci',
+    jobNames: ['test'],
+  };
+
+  it('carries the repository that defines a global workflow', () => {
+    // Without this the orchestrator's stale cleanup can only name the
+    // unqualified check, which for a cross-repository global run belongs to
+    // the acted-on repository's own workflow — see `workflowLabel`.
+    const parsed = staleCheckrunCleanupSchema.parse({
+      type: 'stale.checkrun.cleanup',
+      runs: [{ ...baseRun, workflowRepoIdentifier: 'acme/ci-defs' }],
+    });
+
+    expect(parsed.runs[0].workflowRepoIdentifier).toBe('acme/ci-defs');
+  });
+
+  it('survives the platform-to-orchestrator union', () => {
+    const parsed = platformToOrchestratorMessageSchema.parse({
+      type: 'stale.checkrun.cleanup',
+      runs: [{ ...baseRun, workflowRepoIdentifier: 'acme/ci-defs' }],
+    });
+
+    expect(parsed).toMatchObject({
+      type: 'stale.checkrun.cleanup',
+      runs: [{ workflowRepoIdentifier: 'acme/ci-defs' }],
+    });
+  });
+
+  it('stays valid when an older Platform omits the field', () => {
+    // The field is additive and optional: a Platform that predates it must
+    // keep producing a frame a newer orchestrator accepts.
+    const parsed = staleCheckrunCleanupSchema.parse({
+      type: 'stale.checkrun.cleanup',
+      runs: [baseRun],
+    });
+
+    expect(parsed.runs[0].workflowRepoIdentifier).toBeUndefined();
+  });
+
+  it('bounds the field at the shared repository-identifier maximum', () => {
+    const tooLong = 'a'.repeat(REPO_IDENTIFIER_MAX + 1);
+    expect(
+      staleCheckrunCleanupSchema.safeParse({
+        type: 'stale.checkrun.cleanup',
+        runs: [{ ...baseRun, workflowRepoIdentifier: tooLong }],
+      }).success,
+    ).toBe(false);
   });
 });

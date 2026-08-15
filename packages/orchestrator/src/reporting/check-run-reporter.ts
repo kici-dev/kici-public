@@ -116,6 +116,15 @@ interface SetPendingOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /**
+   * The repository that DEFINES the workflow, when that is not the repository
+   * the run acted on — an organization-wide workflow dispatched against
+   * another repository. Qualifies the check-run name so the run cannot share a
+   * check run with a same-named workflow of the acted-on repository; see
+   * `workflowLabel`. Passing the acted-on repository here is a no-op, so a
+   * caller cannot change a per-repository run's name by accident.
+   */
+  workflowRepoIdentifier?: string;
   jobNames: string[];
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
@@ -135,6 +144,8 @@ interface SetBuildPendingOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
   routingKey?: string;
@@ -153,6 +164,8 @@ interface SetBuildCompleteOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
   status: TerminalJobStatus;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
@@ -173,6 +186,8 @@ interface UpdateJobStatusOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
   jobName: string;
   state: TerminalJobStatus;
   installationId?: number;
@@ -200,6 +215,8 @@ interface UpdateWorkflowStatusOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
   overallStatus: TerminalJobStatus;
   installationId?: number;
   /** Routing key for per-app credential lookup (e.g., "github:12345"). */
@@ -220,6 +237,8 @@ interface UpdateStepProgressOptions {
   repo: string;
   sha: string;
   workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
   jobName: string;
   stepIndex: number;
   stepName: string;
@@ -403,6 +422,8 @@ export class CheckRunReporter {
     repo: string;
     sha: string;
     workflowName: string;
+    /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+    workflowRepoIdentifier?: string;
     jobNames: string[];
   }): void {
     this.doCleanupStaleCheckRuns(opts).catch((err) => {
@@ -442,10 +463,11 @@ export class CheckRunReporter {
    * Separate from execution check runs so users see build progress independently.
    * Fire-and-forget: errors are logged but don't block the pipeline.
    *
-   * Check run name format: kici/{workflowName}/setup
+   * Check run name format: kici/{workflowName}/setup — prefixed with the
+   * defining repository for a cross-repository global run, see `workflowLabel`.
    */
   setBuildPending(opts: SetBuildPendingOptions): void {
-    const buildCheckName = `kici/${opts.workflowName}/setup`;
+    const buildCheckName = `kici/${this.workflowLabel(opts)}/setup`;
     const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, buildCheckName);
 
     // Stamp the DB-backed pending marker BEFORE kicking off the create.
@@ -588,17 +610,27 @@ export class CheckRunReporter {
    * Read-through helper: look up a check-run ID. Checks L1 first, falls
    * through to the store on miss, caches the result on hit. Returns
    * undefined when neither layer has the ID — the caller logs + skips.
+   *
+   * The same row also rehydrates the `terminalSent` latch. Both L1 entries are
+   * dropped together by `cleanupRun`, and only one of them used to come back:
+   * the id reloaded from here while the latch did not, which is exactly the
+   * pair that lets a late step-progress update resolve a check run and PATCH
+   * `status: in_progress` over its completion. Reading `terminal_sent_at` off
+   * the row this query already selects costs nothing and closes that gap.
    */
   private async resolveCheckRunId(key: string): Promise<number | undefined> {
     const cached = this.checkRunIds.get(key);
     if (cached !== undefined) return cached;
     if (!this.deps.trackingStore) return undefined;
     try {
-      const fromDb = await this.deps.trackingStore.getCheckRunId(this.parseKey(key));
-      if (fromDb !== undefined) {
-        this.checkRunIds.set(key, fromDb);
+      const state = await this.deps.trackingStore.getState(this.parseKey(key));
+      if (state?.terminalSentAt) {
+        this.terminalSent.add(key);
       }
-      return fromDb;
+      if (state?.checkRunId !== undefined) {
+        this.checkRunIds.set(key, state.checkRunId);
+      }
+      return state?.checkRunId;
     } catch (err) {
       logger.warn('Failed to read check_run_tracking row; treating as miss', {
         key,
@@ -718,6 +750,38 @@ export class CheckRunReporter {
   }
 
   /**
+   * The workflow label every check-run name and title is built from.
+   *
+   * A check run's identity is `(owner, repo, sha, check name)` — on the
+   * provider, in `check_run_tracking`'s primary key, and in this class's L1
+   * keys. There is no run id anywhere in it. Two per-repository runs cannot
+   * collide on that identity, because one lock file cannot define a workflow
+   * name twice. An organization-wide workflow can: it is defined in ANOTHER
+   * repository, so its name is free to equal a workflow name of the repository
+   * it was dispatched against, and on the same commit the two runs then resolve
+   * to one check run. The global run's conclusion would complete the acted-on
+   * repository's check — the signal branch protection reads — and point its
+   * `details_url` at the wrong run, while `cleanupRun` would evict the other
+   * run's check-run id and terminal latch on prune.
+   *
+   * Qualifying the label with the defining repository keeps them apart. The
+   * "differs from the acted-on repository" narrowing lives here rather than at
+   * the call sites, so a per-repository run's name — which is customer-visible
+   * and may sit in a branch-protection required-check list — cannot move
+   * because a caller passed the field where it did not apply.
+   */
+  private workflowLabel(opts: {
+    owner: string;
+    repo: string;
+    workflowName: string;
+    workflowRepoIdentifier?: string;
+  }): string {
+    const definedIn = opts.workflowRepoIdentifier;
+    if (!definedIn || definedIn === `${opts.owner}/${opts.repo}`) return opts.workflowName;
+    return `${definedIn}/${opts.workflowName}`;
+  }
+
+  /**
    * Build the `details_url` for a check run pointing at the dashboard's
    * public-alias resolver (`/r/orgs/<oal_xxx>/runs/<runId>`). Returns
    * `undefined` when either the dashboard URL or the alias is missing,
@@ -757,7 +821,8 @@ export class CheckRunReporter {
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
     // Create overall workflow check run
-    const workflowCheckName = `kici/${opts.workflowName}`;
+    const label = this.workflowLabel(opts);
+    const workflowCheckName = `kici/${label}`;
     const workflowKey = this.checkRunKey(opts.owner, opts.repo, opts.sha, workflowCheckName);
     const result = await this.createCheckRun(octokit, {
       owner: opts.owner,
@@ -766,7 +831,7 @@ export class CheckRunReporter {
       head_sha: opts.sha,
       status: 'queued',
       output: {
-        title: `KiCI: ${opts.workflowName}`,
+        title: `KiCI: ${label}`,
         summary: this.appendTraceIds('Waiting for agent...', traceIds),
       },
       ...(detailsUrl && { details_url: detailsUrl }),
@@ -779,7 +844,7 @@ export class CheckRunReporter {
 
     // Create per-job check runs
     for (const jobName of opts.jobNames) {
-      const jobCheckName = `kici/${opts.workflowName}/job/${jobName}`;
+      const jobCheckName = `kici/${label}/job/${jobName}`;
       const jobKey = this.checkRunKey(opts.owner, opts.repo, opts.sha, jobCheckName);
       const jobResult = await this.createCheckRun(octokit, {
         owner: opts.owner,
@@ -788,7 +853,7 @@ export class CheckRunReporter {
         head_sha: opts.sha,
         status: 'queued',
         output: {
-          title: `KiCI: ${opts.workflowName}/${jobName}`,
+          title: `KiCI: ${label}/${jobName}`,
           summary: this.appendTraceIds('Waiting for agent...', traceIds),
         },
         ...(detailsUrl && { details_url: detailsUrl }),
@@ -815,7 +880,8 @@ export class CheckRunReporter {
       return;
     }
 
-    const checkName = `kici/${opts.workflowName}/job/${opts.jobName}`;
+    const label = this.workflowLabel(opts);
+    const checkName = `kici/${label}/job/${opts.jobName}`;
     const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, checkName);
     const checkRunId = await this.resolveCheckRunId(key);
     if (!checkRunId) {
@@ -923,7 +989,7 @@ export class CheckRunReporter {
         conclusion,
         completed_at: new Date().toISOString(),
         output: {
-          title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+          title: `KiCI: ${label}/${opts.jobName}`,
           summary,
           annotations,
         },
@@ -948,7 +1014,8 @@ export class CheckRunReporter {
       return;
     }
 
-    const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, `kici/${opts.workflowName}`);
+    const label = this.workflowLabel(opts);
+    const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, `kici/${label}`);
     const checkRunId = await this.resolveCheckRunId(key);
     if (!checkRunId) {
       logger.warn('Check run ID not found for workflow update, skipping', { key });
@@ -973,7 +1040,7 @@ export class CheckRunReporter {
         conclusion,
         completed_at: new Date().toISOString(),
         output: {
-          title: `KiCI: ${opts.workflowName}`,
+          title: `KiCI: ${label}`,
           summary: this.appendTraceIds(description, traceIds),
         },
         ...(detailsUrl && { details_url: detailsUrl }),
@@ -990,6 +1057,8 @@ export class CheckRunReporter {
     repo: string;
     sha: string;
     workflowName: string;
+    /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+    workflowRepoIdentifier?: string;
     jobNames: string[];
   }): Promise<void> {
     if (opts.provider !== 'github') {
@@ -1031,12 +1100,26 @@ export class CheckRunReporter {
 
     const octokit = createInstallationOctokit(githubConfig, installationId);
 
-    // Build the set of check names we expect for this workflow
+    // Build the set of check names we expect for this workflow, through the
+    // same naming seam every other site uses. The run metadata arrives from the
+    // Platform on `stale.checkrun.cleanup`, which carries the defining
+    // repository for a cross-repository global run — so the names this matches
+    // are the ones that run actually created, and a cleanup cannot reach the
+    // acted-on repository's own same-named check.
+    //
+    // The Platform sends the field on exactly the condition that recorded it —
+    // only when the two repositories differ — so an absent field and a value
+    // equal to the acted-on repository are one case, and `workflowLabel` maps
+    // both to the unqualified name. That is also what a Platform predating the
+    // field produces, which is why absence keeps cleaning the unqualified check
+    // rather than skipping: an older Platform omits the field for every run,
+    // and skipping would leave an ordinary run's check stuck `in_progress`.
+    const label = this.workflowLabel(opts);
     const expectedNames = new Set<string>();
-    expectedNames.add(`kici/${opts.workflowName}`);
-    expectedNames.add(`kici/${opts.workflowName}/setup`);
+    expectedNames.add(`kici/${label}`);
+    expectedNames.add(`kici/${label}/setup`);
     for (const jobName of opts.jobNames) {
-      expectedNames.add(`kici/${opts.workflowName}/job/${jobName}`);
+      expectedNames.add(`kici/${label}/job/${jobName}`);
     }
 
     // List check runs for this commit and find stuck ones
@@ -1105,13 +1188,18 @@ export class CheckRunReporter {
     const githubConfig = this.resolveGithubConfig(opts.routingKey);
     if (!githubConfig || !opts.installationId) return;
 
-    const checkName = `kici/${opts.workflowName}/job/${opts.jobName}`;
+    const label = this.workflowLabel(opts);
+    const checkName = `kici/${label}/job/${opts.jobName}`;
     const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, checkName);
     // The job is already reported. Publishing progress now would reopen a
     // resolved check run — see `terminalSent`.
     if (this.terminalSent.has(key)) return;
     const checkRunId = await this.resolveCheckRunId(key);
     if (!checkRunId) return;
+    // Re-checked after the resolve, which rehydrates the latch from
+    // `check_run_tracking`: after `cleanupRun` the first guard cannot see a
+    // terminal state that only the row remembers.
+    if (this.terminalSent.has(key)) return;
 
     // Track this key for runId-based cleanup
     this.trackRunKey(opts.runId, key);
@@ -1164,7 +1252,7 @@ export class CheckRunReporter {
           check_run_id: checkRunId,
           status: 'in_progress',
           output: {
-            title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+            title: `KiCI: ${label}/${opts.jobName}`,
             summary: progressText,
           },
           ...(detailsUrl && { details_url: detailsUrl }),
@@ -1203,6 +1291,8 @@ export class CheckRunReporter {
       repo: string;
       sha: string;
       workflowName: string;
+      /** See `workflowLabel` — carried so a flush names the same check run. */
+      workflowRepoIdentifier?: string;
       jobName: string;
       installationId?: number;
       routingKey?: string;
@@ -1216,6 +1306,9 @@ export class CheckRunReporter {
     const checkRunId = await this.resolveCheckRunId(key);
     const githubConfig = this.resolveGithubConfig(opts.routingKey);
     if (!checkRunId || !githubConfig || !opts.installationId) return;
+    // Re-checked after the resolve, which rehydrates the latch from
+    // `check_run_tracking` — see `resolveCheckRunId`.
+    if (this.terminalSent.has(key)) return;
 
     const steps = this.stepProgress.get(key);
     if (!steps) return;
@@ -1233,7 +1326,7 @@ export class CheckRunReporter {
         check_run_id: checkRunId,
         status: 'in_progress',
         output: {
-          title: `KiCI: ${opts.workflowName}/${opts.jobName}`,
+          title: `KiCI: ${this.workflowLabel(opts)}/${opts.jobName}`,
           summary: progressText,
         },
         ...(detailsUrl && { details_url: detailsUrl }),
@@ -1261,7 +1354,8 @@ export class CheckRunReporter {
     }
 
     const octokit = createInstallationOctokit(githubConfig, opts.installationId);
-    const buildCheckName = `kici/${opts.workflowName}/setup`;
+    const label = this.workflowLabel(opts);
+    const buildCheckName = `kici/${label}/setup`;
     const traceIds = this.resolveTraceIds(opts);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
 
@@ -1272,7 +1366,7 @@ export class CheckRunReporter {
       head_sha: opts.sha,
       status: 'queued',
       output: {
-        title: `KiCI: ${opts.workflowName}/setup`,
+        title: `KiCI: ${label}/setup`,
         summary: this.appendTraceIds('Building dependencies and compiling workflow...', traceIds),
       },
       ...(detailsUrl && { details_url: detailsUrl }),
@@ -1298,7 +1392,8 @@ export class CheckRunReporter {
       return;
     }
 
-    const buildCheckName = `kici/${opts.workflowName}/setup`;
+    const label = this.workflowLabel(opts);
+    const buildCheckName = `kici/${label}/setup`;
     const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, buildCheckName);
 
     // Wait for in-flight setBuildPending to complete before looking up the ID
@@ -1328,7 +1423,7 @@ export class CheckRunReporter {
         conclusion,
         completed_at: new Date().toISOString(),
         output: {
-          title: `KiCI: ${opts.workflowName}/setup`,
+          title: `KiCI: ${label}/setup`,
           summary: this.appendTraceIds(description, traceIds),
         },
         ...(detailsUrl && { details_url: detailsUrl }),

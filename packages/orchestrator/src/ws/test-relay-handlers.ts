@@ -42,13 +42,10 @@ export interface TestRelayHandlerDeps extends ProcessingDeps {
   agentRegistry: NonNullable<ProcessingDeps['agentRegistry']>;
   cacheStorage?: CacheStorage;
   logStorage?: LogStorage;
-  /**
-   * Log writer that owns the in-flight append tracking. The logs cursor
-   * handler drains its pending appends for a terminal run before computing the
-   * `done` flag, so the final (fire-and-forget) log chunk can't be lost to a
-   * race with the run-status transition.
-   */
-  logWriter?: { drain(runId: string): Promise<void> };
+  // `logWriter` (with `drain` + `appendChunk`) is inherited from ProcessingDeps.
+  // The logs cursor handler drains its pending appends for a terminal run before
+  // computing the `done` flag, so the final (fire-and-forget) log chunk can't be
+  // lost to a race with the run-status transition.
   accessLog?: AccessLogWriter;
   /** Canonical org id this orchestrator is bound to (for access_log attribution). */
   orgId?: string | null;
@@ -153,6 +150,10 @@ export async function handleTestTrigger(
       target: msg.target,
       dispatchInputs: msg.dispatchInputs,
       requestId: msg.requestId,
+      // Attribution, not authorization. The orchestrator records who the
+      // Platform says initiated the run; it does not gate on the answer — see
+      // the ownership note on `handleTestRunStatus` below.
+      actor: msg.actor,
     },
     deps,
   );
@@ -191,7 +192,41 @@ export interface TestRunStatusPayload {
   done: boolean;
 }
 
-/** Snapshot a run's status + per-job status. `done` is true at a terminal run state. */
+/**
+ * Snapshot a run's status + per-job status. `done` is true at a terminal run state.
+ *
+ * ## Why this does not check ownership, even though the run now records an owner
+ *
+ * `handleTestTrigger` records the initiator on `execution_runs.triggered_by`,
+ * so comparing `msg.actor` against it here looks like free defence in depth. It
+ * is not, for three reasons that are worth writing down because the idea
+ * recurs.
+ *
+ * **The orchestrator cannot authenticate the actor.** It is asserted by the
+ * Platform over the authenticated control-plane connection; nothing here can
+ * verify it. A Platform that is lying can name any principal and pass the
+ * check, so enforcing would defend only against a Platform that reports the
+ * actor faithfully and forgets to check ownership — not against a hostile one.
+ *
+ * **The two gates would disagree.** The Platform deliberately admits a caller
+ * with unrestricted repository scope alongside the creator, because such a
+ * caller can already read these runs through the dashboard run plane. Repo
+ * patterns do not exist on this tier — only the actor arrives — so an
+ * organization owner reading a developer's run would be allowed there and
+ * refused here. Closing that would mean the Platform asserting "this caller is
+ * unrestricted", which is the first problem again with extra steps.
+ *
+ * **The version skew runs the wrong way.** This component is customer-deployed
+ * and versions independently of the Platform, so an orchestrator upgraded to
+ * enforce would start refusing legitimate reads against a Platform that has not
+ * changed — a break the customer triggers and we cannot roll back. Fail-closed
+ * is right for a security control and wrong for a compatibility surface, and
+ * this is both.
+ *
+ * So the actor is recorded, not enforced. Enforcing here needs the caller's
+ * effective authorization scope on the wire (so one policy is evaluated rather
+ * than two), and an actor this tier can establish independently.
+ */
 export async function handleTestRunStatus(
   msg: TestRelayRunStatusRequest,
   deps: TestRelayHandlerDeps,

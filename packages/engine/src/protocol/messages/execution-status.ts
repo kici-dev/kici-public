@@ -287,6 +287,15 @@ export const executionStatusSchema = z.object({
   routingKey: z.string().max(STATUS_ID_MAX).optional(),
   repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
+   * The repository that DEFINES the workflow, when that is not
+   * `repoIdentifier` — a global workflow authored in one repository and
+   * dispatched against another. Absent for every per-repository run, where the
+   * two are the same repository, so "present" is a precise marker for a
+   * cross-repository global run. Optional for backward compatibility with an
+   * older orchestrator that never sends it.
+   */
+  workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
+  /**
    * Run-level repo provider (origin host: `github` / `gitlab` / `bitbucket` /
    * `local`). Distinct from the routing-key-derived source provider; drives the
    * dashboard's provider-aware repo links.
@@ -410,6 +419,13 @@ export const stateReplayRunSchema = z.object({
   status: ExecutionRunStatus,
   routingKey: z.string().max(STATUS_ID_MAX).optional(),
   repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
+  /**
+   * The repository that DEFINES the workflow, when that is not
+   * `repoIdentifier`. Same meaning and same absent-for-per-repository-runs
+   * contract as on `execution.status`; carried here so a run that reaches the
+   * Platform only through the reconnect replay keeps its attribution.
+   */
+  workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   sha: z.string().max(STATUS_ID_MAX).optional(),
   ref: z.string().max(STATUS_ID_MAX).optional(),
   triggerEvent: z.string().max(STATUS_ID_MAX).optional(),

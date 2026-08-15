@@ -7,6 +7,7 @@ import {
   type TestTriggerInput,
 } from './test-pipeline.js';
 import type { ProcessingDeps } from './processor.js';
+import type { ActorPrincipal } from '@kici-dev/engine';
 
 describe('repoIdentityFromInlineInput', () => {
   it('derives identity from the event payload, never the routing key', () => {
@@ -145,6 +146,7 @@ function createMockInput(overrides: Partial<TestTriggerInput> = {}): TestTrigger
     },
     routingKey: 'github:42',
     requestId: 'req-123',
+    actor: { type: 'user', sub: 'kc-sub-123' },
     ...overrides,
   };
 }
@@ -181,6 +183,7 @@ describe('processTestTrigger', () => {
 
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       markTestRun: vi.fn(),
@@ -401,6 +404,7 @@ describe('processTestTrigger', () => {
     const markTestRun = vi.fn();
     deps.executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       markTestRun,
@@ -1344,43 +1348,17 @@ describe('processTestTrigger', () => {
       ]);
     }
 
-    it('skips a non-test-allowed bound env resolved from an inline name (skip-on-test)', async () => {
-      const lockFile = createMockLockFile([inlineEnvWorkflow()]);
-      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
-      deps.db = makeInlineDb({ 'test-db': { allow_local_execution: false } }) as any;
-      deps.contextStore = makeInlineEnvStore('test-db', false);
-
-      const dispatch = vi
-        .fn()
-        .mockResolvedValue({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' });
-      (deps.dispatcher as any).dispatch = dispatch;
-
-      const input = createMockInput({
-        routingKey: 'github:42',
-        workflowName: 'ci',
-        event: { type: 'push', targetBranch: 'master', payload: {} },
-      });
-
-      const result = await processTestTrigger(input, deps);
-
-      // Skip-on-test: the run is accepted (not rejected), and the dispatched job
-      // carries no context vars (the only bound env disallows test runs); the
-      // inline-resolved name is still recorded as the run context.
-      expect(result.status).toBe('accepted');
-      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
-      expect(jobConfig.context).toBe('test-db');
-      expect(jobConfig.contextVars).toBeUndefined();
-    });
-
-    it('resolves B1 secrets via the resolved inline context name', async () => {
+    it('does not resolve a pure inline context in-process (deferred to the init round)', async () => {
+      // The orchestrator no longer evaluates the inline expression at dispatch;
+      // the field is resolved by the agent's init job, exactly like an impure
+      // dynamic context. So no context gate query runs and no per-context secret
+      // resolution happens in-process — the run is still accepted.
       const lockFile = createMockLockFile([inlineEnvWorkflow()]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
       deps.db = makeInlineDb({ 'test-db': { allow_local_execution: true } }) as any;
       deps.contextStore = makeInlineEnvStore('test-db');
 
-      const resolveForJob = vi.fn(async (_org: string, env: string) =>
-        env === 'test-db' ? { DB_URL: 'x' } : {},
-      );
+      const resolveForJob = vi.fn(async () => ({ DB_URL: 'x' }));
       deps.secretResolver = { resolveForJob } as any;
 
       const dispatch = vi
@@ -1397,10 +1375,46 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       expect(result.status).toBe('accepted');
-      // The third argument is the host context, absent for an inline test run.
-      expect(resolveForJob).toHaveBeenCalledWith(INLINE_ORG, 'test-db', undefined);
-      const jobConfig = dispatch.mock.calls[0][0].jobConfig;
-      expect(jobConfig.secrets.DB_URL).toBe('x');
+      // No in-process context resolution: the inline name never becomes a bound
+      // context, so its secrets are not resolved here.
+      expect(resolveForJob).not.toHaveBeenCalled();
+      const jobConfig = dispatch.mock.calls[0]?.[0]?.jobConfig;
+      expect(jobConfig.context).toBeUndefined();
+      expect(jobConfig.secrets).toBeUndefined();
+    });
+
+    it('accepts a run whose inline context expression would throw (no in-process eval)', async () => {
+      // A throwing inline expression is never executed at dispatch, so it cannot
+      // reject the run — the agent's init job is the only place it runs.
+      const failingWorkflow = createMockWorkflow('ci', [
+        {
+          _type: 'static' as const,
+          name: 'broken-job',
+          runsOn: [{ kind: 'exact', value: 'default' }],
+          steps: [{ name: 'deploy', run: 'echo deploy' }],
+          needs: [],
+          rules: [],
+          contexts: [
+            {
+              value: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
+              dynamic: true,
+            },
+          ],
+        },
+      ]);
+      const lockFile = createMockLockFile([failingWorkflow]);
+      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+      deps.db = makeInlineDb({}) as any;
+
+      const input = createMockInput({
+        routingKey: 'github:42',
+        workflowName: 'ci',
+        event: { type: 'push', targetBranch: 'master', payload: {} },
+      });
+
+      const result = await processTestTrigger(input, deps);
+
+      expect(result.status).toBe('accepted');
     });
 
     it('marks the run root jobs needs_satisfied through the chained update', async () => {
@@ -1482,39 +1496,6 @@ describe('processTestTrigger', () => {
       expect(envQueries).toEqual([]);
       // resolveForJob was never called with a context for this job.
       expect(resolveForJob).not.toHaveBeenCalled();
-    });
-
-    it('rejects the run when inline context evaluation fails', async () => {
-      const failingWorkflow = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
-          name: 'broken-job',
-          runsOn: [{ kind: 'exact', value: 'default' }],
-          steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
-          rules: [],
-          contexts: [
-            {
-              value: { _type: 'inline' as const, expression: '(event) => event.nope.deref' },
-              dynamic: true,
-            },
-          ],
-        },
-      ]);
-      const lockFile = createMockLockFile([failingWorkflow]);
-      (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
-      deps.db = makeInlineDb({}) as any;
-
-      const input = createMockInput({
-        routingKey: 'github:42',
-        workflowName: 'ci',
-        event: { type: 'push', targetBranch: 'master', payload: {} },
-      });
-
-      const result = await processTestTrigger(input, deps);
-
-      expect(result.status).toBe('rejected');
-      expect(result.reason).toContain('broken-job');
     });
   });
 
@@ -1654,7 +1635,10 @@ describe('processTestTrigger', () => {
       expect(deps.variableStore!.getResolvedVars).toHaveBeenCalledWith(ORG, 'env-1', 'github:42');
     });
 
-    it('also passes inline-evaluated jobEnv', async () => {
+    it('does not resolve an inline jobEnv in-process (deferred to the init round)', async () => {
+      // The orchestrator no longer evaluates the inline env expression at
+      // dispatch; the agent's init job resolves it. So the dispatched job carries
+      // no in-process jobEnv — the field takes the init marker.
       const inlineEnvJobWorkflow = createMockWorkflow('ci', [
         {
           _type: 'static' as const,
@@ -1684,7 +1668,7 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       expect(result.status).toBe('accepted');
-      expect(getJobConfig().jobEnv).toEqual({ BRANCH: 'master' });
+      expect(getJobConfig().jobEnv).toBeUndefined();
     });
 
     it('omits contextVars when no variable store is wired', async () => {
@@ -1717,5 +1701,99 @@ describe('processTestTrigger', () => {
       expect(jobConfig.context).toBe('test-db');
       expect(jobConfig.jobEnv).toEqual({ FOO: 'bar' });
     });
+  });
+});
+
+/**
+ * Attribution of a remote test run onto `execution_runs`.
+ *
+ * `triggered_by` existed and was documented as "user identity that triggered
+ * this run", but the relayed test path never populated it — no actor reached
+ * this pipeline at all — so a `kici run remote` run was the one run shape with
+ * no initiator recorded anywhere in the orchestrator.
+ *
+ * The rendering deliberately reuses the pair the dashboard re-run path already
+ * uses (`stringifyActor` + `agentLabelOf`), rather than inventing a second one:
+ * two renderings of one identity is how they drift.
+ */
+describe('processTestTrigger records the triggering actor', () => {
+  let deps: ProcessingDeps;
+  beforeEach(() => {
+    deps = createMockDeps();
+  });
+
+  /**
+   * Positional indices into `onExecutionStarted`, whose signature is a long
+   * positional list. Read off the call sites in `dispatch-matched-workflow.ts`,
+   * which label the agent-label argument in a trailing comment. If the
+   * signature is ever reordered these assertions fail rather than silently
+   * reading a neighbouring argument, which is the right failure direction.
+   */
+  const TRIGGERED_BY_ARG = 15;
+  const TRIGGERED_BY_AGENT_LABEL_ARG = 23;
+
+  function trackerAndDb() {
+    const executionTracker = {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+      markTestRun: vi.fn(),
+    };
+    const db = {
+      selectFrom: vi.fn(() => ({
+        select: vi.fn(() => ({
+          where: vi.fn(() => ({ executeTakeFirst: vi.fn().mockResolvedValue(undefined) })),
+        })),
+      })),
+      insertInto: vi.fn(() => ({
+        values: vi.fn(() => ({
+          onConflict: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
+          execute: vi.fn().mockResolvedValue(undefined),
+        })),
+      })),
+      updateTable: makeUpdateTableMock(() => {}),
+    };
+    return { executionTracker, db };
+  }
+
+  async function runWithActor(actor: ActorPrincipal) {
+    const lockFile = createMockLockFile([createMockWorkflow('ci')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+    const { executionTracker, db } = trackerAndDb();
+    deps.executionTracker = executionTracker as any;
+    deps.db = db as any;
+
+    const result = await processTestTrigger(createMockInput({ actor }), deps);
+    expect(result.status).toBe('accepted');
+    expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
+    return executionTracker.onExecutionStarted.mock.calls[0];
+  }
+
+  it('records a plain user actor as triggered_by with no agent label', async () => {
+    const args = await runWithActor({ type: 'user', sub: 'kc-sub-123' });
+    expect(args[TRIGGERED_BY_ARG]).toBe('user:kc-sub-123');
+    // Null, not the string "null" and not a stray label: the column is the
+    // provenance half and a non-agent run genuinely has none.
+    expect(args[TRIGGERED_BY_AGENT_LABEL_ARG]).toBeNull();
+  });
+
+  it('splits an agent-kind actor across triggered_by and the agent label', async () => {
+    const args = await runWithActor({
+      type: 'user',
+      sub: 'kc-sub-123',
+      agent: { patId: 'pat-9', label: 'ci' },
+    });
+    expect(args[TRIGGERED_BY_ARG]).toBe('user:kc-sub-123 via agent:ci');
+    expect(args[TRIGGERED_BY_AGENT_LABEL_ARG]).toBe('ci');
+  });
+
+  it('records an API-key actor by its key id', async () => {
+    const args = await runWithActor({
+      type: 'api_key',
+      keyId: 'key-1',
+      ownerSub: 'kc-sub-123',
+    });
+    expect(args[TRIGGERED_BY_ARG]).toBe('api_key:key-1');
   });
 });

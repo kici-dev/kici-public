@@ -19,14 +19,68 @@ export type ClusterNumberColumn =
   | 'event_router_rate_limit_per_workflow_per_minute'
   | 'cache_max_tarball_bytes'
   | 'cache_ttl_days'
+  | 'lockfile_cache_max'
+  | 'lockfile_cache_max_bytes'
+  | 'lockfile_cache_ttl_ms'
+  | 'content_cache_max'
+  | 'content_cache_max_bytes'
+  | 'content_cache_ttl_ms'
+  | 'global_eval_round_timeout_ms'
+  | 'global_eval_candidate_timeout_ms'
+  | 'global_eval_cache_max'
+  | 'global_eval_wait_timeout_ms'
   | 'check_run_tracking_ttl_days'
   | 'concurrency_wait_timeout_ms'
   | 'agent_token_ttl_ms'
   | 'ownership_db_check_timeout_ms'
-  | 'unroutable_grace_ms';
+  | 'unroutable_grace_ms'
+  | 'ingest_overflow_claim_timeout_ms';
 
 /** Text columns on cluster_settings readable via {@link ClusterSettingsReader}. */
 export type ClusterStringColumn = 'dashboard_verified_issuer';
+
+/** Boolean columns on cluster_settings readable via {@link ClusterSettingsReader}. */
+export type ClusterBooleanColumn = 'global_workflows_enabled';
+
+/**
+ * Ceiling for the three LRU entry-count knobs — `lockfile_cache_max`,
+ * `content_cache_max`, and `global_eval_cache_max`.
+ *
+ * This is a boot-safety bound, not a policy preference. The underlying LRU
+ * allocates its index arrays eagerly from `max` — several typed arrays plus the
+ * TTL and size arrays the caches ask for — so the cost is paid at construction
+ * with zero entries cached. Measured on the shipped version: an empty cache at
+ * `max` 5,000,000 costs ~191 MB, and at 5,000,000,000 the constructor throws
+ * `RangeError: Invalid array length`.
+ *
+ * That throw is what makes an unbounded knob dangerous rather than merely
+ * wasteful. All three caches are built inside `bootstrapOrchestrator`, so a bad
+ * stored value crashes the orchestrator before its admin API is listening —
+ * and the admin API is the only way `kici-admin cluster-settings` can reach the
+ * stored value. The knob would brick the very tool needed to un-brick it.
+ *
+ * 100,000 is 200x the shipped default of 500 and costs ~4 MB per empty cache,
+ * so it is far above any plausible operator setting while keeping boot bounded.
+ */
+export const CACHE_MAX_ENTRIES_CEILING = 100_000;
+
+/**
+ * Bound a stored entry-count knob to something the LRU constructor survives.
+ *
+ * Applied at the read site rather than only at the write site, because the
+ * write-side validation cannot reach a value that is already in the database —
+ * set before the ceiling shipped, or written by any path other than the admin
+ * route. Clamping here is what actually guarantees a stored value cannot
+ * prevent boot.
+ *
+ * A value that is not a usable positive count (NaN, non-finite, below 1) falls
+ * back to the configured default rather than clamping to 1: a 1-entry cache
+ * thrashes silently, which is harder to diagnose than simply ignoring garbage.
+ */
+export function clampCacheMaxEntries(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value < 1) return fallback;
+  return Math.min(Math.floor(value), CACHE_MAX_ENTRIES_CEILING);
+}
 
 /**
  * A knob read that keeps "the operator never set this" separate from "we could
@@ -139,6 +193,27 @@ export class ClusterSettingsReader {
     if (!readable) return { ok: false };
     const value = row?.[column];
     return { ok: true, value: typeof value === 'string' && value.length > 0 ? value : null };
+  }
+
+  /**
+   * Resolve a fleet-wide boolean knob without collapsing a read failure into a
+   * default.
+   *
+   * There is deliberately no `getBoolean(column, fallback)` companion. The
+   * security gate that consumes this must tell the reader's outcomes apart
+   * itself: a stored `false` and a NULL both deny today, but they deny for
+   * different reasons, and `{ ok: false }` must deny regardless of what the
+   * configured default happens to be. A convenience wrapper that folded the
+   * failure into the default would be safe only for as long as that default
+   * stayed `false`. A caller that only needs a display value (the dashboard
+   * status badge) folds `{ ok: false }` into the default explicitly at its own
+   * site, where getting it wrong misreports a badge rather than opening a gate.
+   */
+  async tryGetBoolean(column: ClusterBooleanColumn): Promise<ClusterSettingRead<boolean>> {
+    const { row, readable } = await this.loadSnapshot();
+    if (!readable) return { ok: false };
+    const value = row?.[column];
+    return { ok: true, value: typeof value === 'boolean' ? value : null };
   }
 
   /**

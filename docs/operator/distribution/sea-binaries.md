@@ -1,6 +1,6 @@
 ---
 title: KiCI packaging guide
-description: ''
+description: Build, distribute, and install the full and light KiCI packages for each supported platform
 ---
 
 This guide covers building, distributing, and using KiCI packages for deployment.

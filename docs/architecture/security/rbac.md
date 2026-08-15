@@ -83,6 +83,27 @@ A registration is matched on the repository it was **registered from**. For a
 workflow that runs against other repositories, that authoring repository is what
 the patterns are checked against.
 
+**A run of an organization-wide workflow belongs to two repositories.** Such a
+workflow lives in one repository and fires on events from many others, so its
+runs carry both: the repository the run acted on, and the repository that
+defines the workflow. A member scoped to **either** repository reaches the run —
+the team that triggered it and the team that authored the workflow both see it,
+in the run list, the filter dropdown (which offers both repositories), the
+`?repository=` filter, every run sub-resource, and the equivalent MCP tools.
+Cancelling is granted on the same either-repository rule, so the team whose
+workflow is running can always stop it. Releasing a **held** run is the one
+exception: approving or rejecting a hold permits code to execute against the
+repository the run acts on, so it stays with a member scoped to that repository.
+The held-runs **list** is scoped the same narrow way, so it keeps agreeing with
+the approve and reject routes — a member scoped only to the defining repository
+sees the run itself but not its hold, rather than seeing a hold they would then
+be refused.
+
+The widened rule applies only to a run whose two repositories genuinely differ.
+An ordinary run records no separate workflow repository, so it is matched on its
+own repository exactly as before, and a member scoped to neither repository is
+refused in every case.
+
 **Secrets are NOT repo-scoped.** Scoped secrets are keyed by context /
 environment on the customer's orchestrator, so there is no repository to scope
 against: a role's repo patterns do not narrow secret access. Access to secrets
@@ -93,9 +114,11 @@ with the context the secret is bound to.
 
 - `computeEffectivePermissions()` merges repo patterns from all assigned roles using union semantics (deduplicated). If any role has `*`, the effective pattern is `['*']` (unrestricted).
 - On the HTTP plane the `repoPatterns` array is stored on the request context alongside `effectivePermissions`. The developer MCP plane has no request context — it resolves the org per tool call — so it resolves the same patterns per call and threads them into the shared operation layer.
-- **List endpoints** (e.g., `GET /runs`, `GET /registrations`, `GET /held-runs`, and the MCP `list_runs` / `list_workflows` / `cancel_runs_by_branch` tools): narrow the result to the repositories the caller may see. For runs this is a `WHERE repo_identifier IN (...)` filter, which keeps pagination counts correct; for registrations and held runs, which the control plane relays rather than stores, the relayed set is filtered on return. A held run carries no repository of its own, so its owning run is resolved against the Platform's mirrored `execution_runs` and a hold whose run has not been mirrored yet is dropped — the filter fails closed. Either way a repo-restricted caller cancelling a shared branch never reaches another repository's runs.
+- **List endpoints** (e.g., `GET /runs`, `GET /registrations`, `GET /held-runs`, and the MCP `list_runs` / `list_workflows` / `cancel_runs_by_branch` tools): narrow the result to the repositories the caller may see. For runs this is a SQL filter over both of a run's repositories, which keeps pagination counts correct; for registrations and held runs, which the control plane relays rather than stores, the relayed set is filtered on return. A held run carries no repository of its own, so its owning run is resolved against the Platform's mirrored `execution_runs` and a hold whose run has not been mirrored yet is dropped — the filter fails closed. Either way a repo-restricted caller cancelling a shared branch never reaches another repository's runs.
 - **Single-resource endpoints** (e.g., `GET /runs/:runId`, `POST /registrations/:id/trigger`, `POST /held-runs/:heldRunId/approve`): apply the check after resolving the target's repository, returning 403 if it does not match. The denial also writes an `authz.denied` audit row with `target_type = 'repo'`, the same way an insufficient-permission denial is recorded. On the held-run approve and reject routes the repo check runs **before** the hold-type branch, and its refusal names neither the hold type nor the permission that type would have required — otherwise the refusal itself would tell the caller what kind of hold they are not allowed to see.
 - **Single-resource MCP tools** (`get_run`, `get_step_logs`, `cancel_run`, `rerun_run`, `trigger_run`, `approve_run`, `reject_run`): apply the same policy after resolving the target, but report the denial as an indistinguishable "not found" rather than an explicit refusal — an agent surface must not become an enumeration oracle for repositories the caller cannot see. The `authz.denied` audit row still records the real reason and the repository.
+- **Live run subscriptions** (the dashboard's WebSocket plane): the live step-log and provisioning-log subscriptions resolve the caller's patterns against the run's repositories when the subscription is accepted, and a run outside them is refused with the same indistinguishable response a run in another organization gets. The organization-level status stream is not run-scoped, so it is matched per message instead: a repo-restricted subscriber receives status, step and context updates only for runs it may see. The patterns are re-resolved periodically, so narrowing a member's scope — or removing them from the organization — stops an already-open stream without waiting for them to close the page.
+- **The `kici run remote` control plane** (`/orgs/:customerId/test/*`) is scoped by **ownership**, not by repository. A remote test run of a local working tree carries the synthetic identifier `local/<name>`, which matches no member's patterns, and the Platform's mirrored run row has not arrived when the CLI makes its first status poll — so a repository check there would deny the developer their own run. The Platform records the triggering principal when it relays the trigger, and the status, logs and cancel routes admit that principal, plus any caller whose patterns are `['*']` (who can already read these runs on the dashboard run plane, where they are mirrored and rendered). A run with no recorded owner is refused: the check fails closed. Denials are an indistinguishable "run not found" and write an `authz.denied` audit row with `target_type = 'run'`.
 - **API keys and service accounts** always get `['*']` — repo scoping applies only to role-based human users. This holds on both planes: a user agent PAT inherits the minting user's patterns, while an org agent API key is unrestricted within its permission level.
 - Patterns are matched as globs: `*` does not cross a `/` separator (so `org/*` covers `org/backend` but not `org/sub/deep`), and matching is case-sensitive. The orchestrator's context bindings use the same glob semantics.
 

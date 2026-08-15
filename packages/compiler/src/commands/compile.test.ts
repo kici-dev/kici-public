@@ -64,7 +64,7 @@ describe('kici compile: dep-reinstall gate', () => {
   });
 });
 
-describe('kici compile: impure dynamic-value warnings', () => {
+describe('kici compile: dynamic-value functions', () => {
   let tempDir: string;
   let originalCwd: string;
   let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -73,7 +73,7 @@ describe('kici compile: impure dynamic-value warnings', () => {
     originalCwd = process.cwd();
     process.env.CI = 'true';
     const packageDir = path.resolve(import.meta.dirname, '..', '..');
-    tempDir = await fs.mkdtemp(path.join(packageDir, '.test-compile-purity-'));
+    tempDir = await fs.mkdtemp(path.join(packageDir, '.test-compile-dynamic-'));
     process.chdir(tempDir);
     warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
   });
@@ -84,15 +84,15 @@ describe('kici compile: impure dynamic-value warnings', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it('surfaces an impure context function as a W101 warning and still succeeds', async () => {
+  it('compiles a function context to a dynamic marker (no inline expression, no purity warning)', async () => {
     expect(await initCommand({ skipInstall: true })).toBe(true);
-    // Replace the scaffolded workflow with one whose context function is impure (async).
+    // Replace the scaffolded workflow with one whose context is a function.
     const workflowsDir = path.join(tempDir, '.kici', 'workflows');
     for (const f of await fs.readdir(workflowsDir)) {
       await fs.rm(path.join(workflowsDir, f));
     }
     await fs.writeFile(
-      path.join(workflowsDir, 'impure.ts'),
+      path.join(workflowsDir, 'dynamic.ts'),
       [
         "import { workflow, job, step, push } from '@kici-dev/sdk';",
         "export default workflow('ci', {",
@@ -100,7 +100,7 @@ describe('kici compile: impure dynamic-value warnings', () => {
         '  jobs: [',
         "    job('build', {",
         '      runsOn: ["self-hosted"],',
-        '      context: async (event) => event.targetBranch,',
+        '      context: (event) => event.targetBranch,',
         "      steps: [step('run', async ({ $ }) => { await $`echo hi`; })],",
         '    }),',
         '  ],',
@@ -110,17 +110,20 @@ describe('kici compile: impure dynamic-value warnings', () => {
       'utf-8',
     );
 
-    // Remove the scaffolded tsconfig so --check skips the tsc type-check pass
-    // (this test exercises the W101 purity warning, not type-checking, and the
-    // workspace has no installed typescript under skipInstall).
-    await fs.rm(path.join(tempDir, '.kici', 'tsconfig.json'));
-
-    const ok = await compileCommand({ check: true, verbose: false });
+    const ok = await compileCommand({ check: false, verbose: false });
     expect(ok).toBe(true);
 
+    // The function context is serialized as a dynamic marker, never an inline
+    // expression — the agent init round resolves it.
+    const lockPath = path.join(tempDir, '.kici', 'kici.lock.json');
+    const lockJson = await fs.readFile(lockPath, 'utf-8');
+    expect(lockJson).not.toContain('_type": "inline"');
+    const lock = JSON.parse(lockJson);
+    expect(lock.workflows[0].jobs[0].contexts).toEqual([{ value: '', dynamic: true }]);
+
+    // No purity / init-job warning is emitted (the notion no longer exists).
     const warnLines = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
-    expect(warnLines).toContain('W101');
-    expect(warnLines).toContain('is not pure');
-    expect(warnLines).toContain('~5-10s');
+    expect(warnLines).not.toContain('is not pure');
+    expect(warnLines).not.toContain('~5-10s');
   });
 });

@@ -2,7 +2,15 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { buildKiciApi, createStepSecrets } from '@kici-dev/sdk';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { LogMasker } from './log-masker.js';
-import type { Step, StepContext, Job, HookFn, HookConfig, OutcomeMetadata } from '@kici-dev/sdk';
+import type {
+  Step,
+  StepContext,
+  Job,
+  HookFn,
+  HookConfig,
+  OutcomeMetadata,
+  EventPayload,
+} from '@kici-dev/sdk';
 import { buildMergedFlatSecrets } from './secret-merge.js';
 import type {
   RunnerToAgentMessage,
@@ -24,10 +32,14 @@ import {
   sanitizeTempLabel,
   drainJobTempScope,
   buildSandboxShell,
+  setupGlobalWorkflowEnv,
+  buildStepLoopRuleInputs,
   type CoerceState,
+  buildConcurrencyGroupContext,
 } from './workflow-runner.js';
 import { createTempScope } from '@kici-dev/core/tmp';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
 import type { RuleEvaluationResult } from '../rule-evaluator.js';
 import type { JobExecutionRequest } from './ipc-protocol.js';
@@ -1585,6 +1597,133 @@ describe('resolveChangedFilesForRules', () => {
   });
 });
 
+describe('setupGlobalWorkflowEnv', () => {
+  const keys = [
+    'KICI_IS_GLOBAL_WORKFLOW',
+    'KICI_WORKFLOW_REPO_PATH',
+    'KICI_SOURCE_REPO_PATH',
+    'KICI_SOURCE_REPO',
+    'KICI_SOURCE_BRANCH',
+    'KICI_SOURCE_SHA',
+    'KICI_WORKFLOW_REPO',
+  ];
+  beforeEach(() => {
+    for (const k of keys) delete process.env[k];
+  });
+  afterEach(() => {
+    for (const k of keys) delete process.env[k];
+  });
+
+  const request = {
+    repoUrl: 'https://github.com/o/src.git',
+    ref: 'main',
+    sha: 'aaa',
+    workflowRepoIdentifier: 'o/wf',
+    workflowRef: 'trunk',
+    workflowSha: 'bbb',
+  } as unknown as JobExecutionRequest;
+
+  it('injects the source-repo env and returns the repo pair for a global workflow', () => {
+    const pair = setupGlobalWorkflowEnv(request, true, '/w/workflow', '/w/source');
+    expect(process.env.KICI_SOURCE_REPO_PATH).toBe('/w/source');
+    expect(process.env.KICI_WORKFLOW_REPO_PATH).toBe('/w/workflow');
+    expect(process.env.KICI_SOURCE_REPO).toBe('o/src');
+    expect(pair?.sourceRepo).toEqual({
+      identifier: 'o/src',
+      path: '/w/source',
+      ref: 'main',
+      sha: 'aaa',
+    });
+    expect(pair?.workflowRepo).toEqual({
+      identifier: 'o/wf',
+      path: '/w/workflow',
+      ref: 'trunk',
+      sha: 'bbb',
+    });
+  });
+
+  it('is a no-op for a non-global job', () => {
+    expect(setupGlobalWorkflowEnv(request, false, '/w', '/w')).toBeUndefined();
+    expect(process.env.KICI_SOURCE_REPO_PATH).toBeUndefined();
+  });
+});
+
+describe('buildStepLoopRuleInputs', () => {
+  const request = {
+    event: { type: 'push' },
+    dispatchInputs: { flavor: 'nightly' },
+  } as unknown as JobExecutionRequest;
+  const repos = {
+    sourceRepo: { identifier: 'o/src', path: '/w/source', ref: 'main', sha: 'aaa' },
+    workflowRepo: { identifier: 'o/wf', path: '/w/workflow', ref: 'trunk', sha: 'bbb' },
+  };
+
+  it('carries the repo pair through to the step loop for a global workflow', () => {
+    const inputs = buildStepLoopRuleInputs(request, repos);
+    expect(inputs.sourceRepo).toEqual(repos.sourceRepo);
+    expect(inputs.workflowRepo).toEqual(repos.workflowRepo);
+    expect(inputs.event).toEqual({ type: 'push' });
+    expect(inputs.dispatchInputs).toEqual({ flavor: 'nightly' });
+  });
+
+  it('leaves both repo keys absent on a non-global job', () => {
+    const inputs = buildStepLoopRuleInputs(request, undefined);
+    expect('sourceRepo' in inputs).toBe(false);
+    expect('workflowRepo' in inputs).toBe(false);
+  });
+
+  it('is the single source the step loop reads its rule inputs from', () => {
+    // Source-level: main() must thread the pair into executeStepLoop through this
+    // helper. Threading only the job rules (maybeSkipJobOnRules) leaves a step
+    // rule seeing `undefined` through the identical RuleContext type.
+    const src = readFileSync(
+      fileURLToPath(new URL('./workflow-runner.ts', import.meta.url)),
+      'utf8',
+    );
+    const loopAt = src.indexOf('await executeStepLoop({');
+    expect(loopAt).toBeGreaterThan(-1);
+    expect(src.slice(loopAt, loopAt + 900)).toContain(
+      '...buildStepLoopRuleInputs(request, globalRepoInfo)',
+    );
+  });
+});
+
+describe('prepare-phase ordering: global repo pair precedes generator + rules', () => {
+  // The property under test is an ORDERING inside main(), which no unit test can
+  // observe without driving a whole sandbox job. Assert it at the source level
+  // instead: the env injection + repo-pair construction must sit ahead of both
+  // consumers. A generator re-evaluated without KICI_SOURCE_REPO_PATH sees a
+  // different world than the pre-dispatch evaluation did, and
+  // extractStepsFromDynamicJob fails the job when the target job goes missing.
+  const source = readFileSync(
+    fileURLToPath(new URL('./workflow-runner.ts', import.meta.url)),
+    'utf8',
+  );
+
+  const setupAt = source.indexOf('const globalRepoInfo = setupGlobalWorkflowEnv(');
+  const extractAt = source.indexOf('await extractAndNormalizeSteps(');
+  const rulesAt = source.indexOf('await maybeSkipJobOnRules(');
+
+  it('finds all three call sites (positive control — guards against a vacuous pass)', () => {
+    expect(setupAt).toBeGreaterThan(-1);
+    expect(extractAt).toBeGreaterThan(-1);
+    expect(rulesAt).toBeGreaterThan(-1);
+  });
+
+  it('sets up the global-workflow env before the dynamic-job extraction', () => {
+    expect(setupAt).toBeLessThan(extractAt);
+  });
+
+  it('sets up the global-workflow env before job-rule evaluation', () => {
+    expect(setupAt).toBeLessThan(rulesAt);
+  });
+
+  it('forwards the repo pair to both consumers', () => {
+    expect(source.slice(extractAt, extractAt + 200)).toContain('globalRepoInfo');
+    expect(source.slice(rulesAt, rulesAt + 200)).toContain('globalRepoInfo');
+  });
+});
+
 describe('buildSandboxShell same-step env visibility', () => {
   afterEach(() => {
     delete process.env.KICI_SAMESTEP_TEST;
@@ -1600,5 +1739,64 @@ describe('buildSandboxShell same-step env visibility', () => {
     process.env.KICI_SAMESTEP_TEST = 'live-value';
     const out = await shell`echo "$KICI_SAMESTEP_TEST"`;
     expect(out.stdout.trim()).toBe('live-value');
+  });
+});
+
+describe('buildConcurrencyGroupContext', () => {
+  /** The dispatch request for one global job, minus the fields under test. */
+  function req(over: Partial<JobExecutionRequest>): JobExecutionRequest {
+    return {
+      ref: 'headsha',
+      branch: 'main',
+      isGlobalWorkflow: true,
+      ...over,
+    } as JobExecutionRequest;
+  }
+
+  /**
+   * A group an author scopes per source repository — the shape a global
+   * workflow needs, since one workflow runs on events from many repositories.
+   */
+  const perRepoGroup = (ctx: { branch: string; event: EventPayload }): string =>
+    `${(ctx.event as { sourceRepo?: string }).sourceRepo}:${ctx.branch}`;
+
+  it('carries the event envelope through to the group function', () => {
+    const ctx = buildConcurrencyGroupContext(
+      req({ event: { type: 'push', sourceRepo: 'acme/app', targetBranch: 'main' } }),
+    );
+
+    expect(ctx.branch).toBe('main');
+    expect(ctx.event).toEqual({ type: 'push', sourceRepo: 'acme/app', targetBranch: 'main' });
+  });
+
+  it('lets two source repos on the same branch resolve to distinct groups', () => {
+    const a = perRepoGroup(
+      buildConcurrencyGroupContext(req({ event: { sourceRepo: 'acme/app' } })),
+    );
+    const b = perRepoGroup(
+      buildConcurrencyGroupContext(req({ event: { sourceRepo: 'acme/web' } })),
+    );
+
+    expect(a).toBe('acme/app:main');
+    expect(b).toBe('acme/web:main');
+    expect(a).not.toBe(b);
+  });
+
+  it('collapses both source repos into one group when the event is absent', () => {
+    // The state a global job was dispatched in before the orchestrator wrote
+    // `event` into its job config: the author has only `branch` to key on, so
+    // every source repo pushing its default branch shares one group — and with
+    // `cancelInProgress` (the orchestrator's default) one repo's push cancels
+    // another's in-flight run. This is the failure the populated event removes,
+    // asserted directly rather than inferred.
+    const a = perRepoGroup(buildConcurrencyGroupContext(req({ event: undefined })));
+    const b = perRepoGroup(buildConcurrencyGroupContext(req({ event: undefined })));
+
+    expect(a).toBe(b);
+    expect(a).toBe('undefined:main');
+  });
+
+  it('falls back to the ref when no branch is supplied', () => {
+    expect(buildConcurrencyGroupContext(req({ branch: undefined })).branch).toBe('headsha');
   });
 });

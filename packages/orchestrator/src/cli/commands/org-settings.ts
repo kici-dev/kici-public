@@ -67,7 +67,6 @@ interface SettingsResponse {
 
 interface PatchBody {
   customerId: string;
-  enabled?: boolean;
   allowedRepos?: RepoPatternEntry[] | null;
   deniedRepos?: RepoPatternEntry[] | null;
   elevatedRepos?: RepoPatternEntry[] | null;
@@ -99,7 +98,7 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
   if (format === 'json') return JSON.stringify(s, null, 2);
   const lines: string[] = [];
   lines.push(`Customer/org id:       ${s.customerId}`);
-  lines.push(`Enabled:               ${s.enabled}`);
+  lines.push(`Enabled (cluster-wide): ${s.enabled}`);
   lines.push(
     `Allowed authors:       ${s.allowedRepos === null ? '(any repo)' : formatList(s.allowedRepos)}`,
   );
@@ -223,31 +222,6 @@ export function registerOrgSettingsCommands(
       const customerId = resolveCustomerId(opts);
       try {
         const settings = await fetchSettings(getClient(), customerId);
-        console.log(formatSettings(settings, opts.format));
-      } catch (err) {
-        console.error(`Error: ${toErrorMessage(err)}`);
-        process.exit(1);
-      }
-    });
-
-  // ── set-enabled ──────────────────────────────────────────────────
-  gw.command('set-enabled <value>')
-    .description('Toggle the master enable switch (true|false)')
-    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
-    .option('--org <id>', 'Alias for --customer-id')
-    .option('--format <format>', 'Output format: json|table', 'table')
-    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
-      const enabled = value === 'true' ? true : value === 'false' ? false : undefined;
-      if (enabled === undefined) {
-        console.error('Error: value must be "true" or "false"');
-        process.exit(1);
-      }
-      const customerId = resolveCustomerId(opts);
-      try {
-        const settings = await patchSettings(getClient(), {
-          customerId,
-          enabled,
-        });
         console.log(formatSettings(settings, opts.format));
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
@@ -1291,7 +1265,12 @@ function resolveCustomerId(opts: { customerId?: string; org?: string }): string 
 function label(prefix: Prefix): string {
   if (prefix === 'allow') return 'workflow-author allow-list';
   if (prefix === 'deny') return 'source-repo deny-list';
-  return 'elevated-access list';
+  // The elevated-access list is stored but never consulted — an
+  // organization-wide workflow's job is dispatched with no secret material, so
+  // there is nothing for the list to widen. Say so in the command's own help
+  // text rather than only in the docs, since the CLI is where an operator most
+  // plausibly reaches for it.
+  return 'elevated-access list (DEPRECATED: not enforced, removed at v1.0.0)';
 }
 
 // ─── dashboard-writes ───────────────────────────────────────────────

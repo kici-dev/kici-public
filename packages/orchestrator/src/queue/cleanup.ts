@@ -14,7 +14,11 @@ import {
   stepLogsPrunedTotal,
 } from '../metrics/prometheus.js';
 import { JobQueue } from './job-queue.js';
-import { type CanRouteLabels, terminalizeUnroutableJob } from './terminalize-unroutable.js';
+import {
+  type CanRouteLabels,
+  type TerminalizeDeps,
+  terminalizeUnroutableJob,
+} from './terminalize-unroutable.js';
 
 const logger = createLogger({ prefix: 'cleanup' });
 
@@ -78,6 +82,12 @@ export interface CleanupExtras {
    * safety: the job is terminal either way and the run fails either way.
    */
   canRouteLabels?: CanRouteLabels;
+  /**
+   * The Tier-2 global-eval tracker, forwarded to
+   * {@link terminalizeUnroutableJob} so a round job this sweep settles also
+   * settles the webhook request awaiting its verdict.
+   */
+  pendingGlobalEvals?: TerminalizeDeps['pendingGlobalEvals'];
 }
 
 /**
@@ -200,6 +210,7 @@ export async function runCleanup(
           executionTracker: extras.executionTracker,
           checkRunReporter: extras.checkRunReporter,
           canRouteLabels: extras.canRouteLabels,
+          pendingGlobalEvals: extras.pendingGlobalEvals,
         },
         job,
       );

@@ -13,21 +13,14 @@ import { register, createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 import { normalizeLineEndings, sha256 } from '@kici-dev/shared';
-import type {
-  Workflow,
-  Job,
-  StepInput,
-  DynamicJobFn,
-  EventPayload,
-  OutputsMap,
-  StepRefMap,
-} from '@kici-dev/sdk';
+import type { Workflow, Job, StepInput, DynamicJobFn, OutputsMap, StepRefMap } from '@kici-dev/sdk';
 import {
   isDynamicJobFn,
   setStepOutputsMap as setStepOutputsMapBundled,
   setStepRefMap as setStepRefMapBundled,
   setJobOutputsMap as setJobOutputsMapBundled,
 } from '@kici-dev/sdk';
+import { buildGeneratorContext, type GeneratorRepoPair } from './generator-context.js';
 
 /**
  * SDK output-map setters resolved from a specific `@kici-dev/sdk` instance.
@@ -325,6 +318,12 @@ export async function extractStepsFromDynamicJob(
   upstreamSnapshot?: import('@kici-dev/engine').UpstreamSnapshot,
   /** Declared upstream needs that shape ctx.needs. */
   declaredNeeds?: readonly unknown[],
+  /**
+   * The source / workflow repo pair for a global workflow. Must match what the
+   * first evaluation saw, or a generator that reads the source tree produces a
+   * different job list here and the determinism check below fails the job.
+   */
+  repos?: GeneratorRepoPair,
 ): Promise<{ steps: readonly StepInput[]; droppedJobs: string[] }> {
   const dynamicFn = extractDynamicJobFn(workflow, dynamicIndex);
 
@@ -348,20 +347,20 @@ export async function extractStepsFromDynamicJob(
       )
     : undefined;
 
-  const generatedJobs = await dynamicFn({
-    $,
-    // Boundary cast: the wire `event` is untyped JSON that, per the unified
-    // event protocol, always carries the normalized event envelope. This is
-    // where it enters the DynamicJobFn's user context for re-evaluation.
-    ctx: {
-      workflow: { name: workflow.name },
-      event: event as EventPayload,
+  // Built through the shared builder so this re-evaluation and the first
+  // evaluation (job-runner.ts, or the global eval round) cannot drift apart.
+  const generatedJobs = await dynamicFn(
+    buildGeneratorContext({
+      workflowName: workflow.name,
+      event,
+      env,
+      ...(repos && { repos }),
       ...(needs && { needs }),
-    },
-    log,
-    env,
-    kici,
-  });
+      $,
+      log,
+      kici,
+    }),
+  );
 
   const actualNames = generatedJobs.map((j) => (j as Job).name);
 

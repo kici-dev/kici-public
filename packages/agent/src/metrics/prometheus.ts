@@ -19,7 +19,7 @@ const meter = createMeter('kici-agent');
  * Total completed jobs.
  * Labels:
  * - status: success | failed | cancelled
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const jobsTotal = meter.createCounter('kici_agent_jobs_total', {
   description: 'Total number of completed jobs',
@@ -28,7 +28,7 @@ export const jobsTotal = meter.createCounter('kici_agent_jobs_total', {
 /**
  * Currently running jobs.
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const jobsActive = meter.createUpDownCounter('kici_agent_jobs_active', {
   description: 'Number of currently running jobs',
@@ -40,7 +40,7 @@ export const jobsActive = meter.createUpDownCounter('kici_agent_jobs_active', {
  * Total completed steps.
  * Labels:
  * - status: success | failed | skipped
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const stepsTotal = meter.createCounter('kici_agent_steps_total', {
   description: 'Total number of completed steps',
@@ -50,7 +50,7 @@ export const stepsTotal = meter.createCounter('kici_agent_steps_total', {
  * Step execution duration in seconds.
  * Advisory boundaries cover sub-second steps through 30-minute long-running steps.
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const stepDurationSeconds = meter.createHistogram('kici_agent_step_duration_seconds', {
   description: 'Step execution duration in seconds',
@@ -65,7 +65,7 @@ export const stepDurationSeconds = meter.createHistogram('kici_agent_step_durati
  * Git clone duration in seconds.
  * Advisory boundaries cover fast shallow clones through large repo clones.
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const cloneDurationSeconds = meter.createHistogram('kici_agent_clone_duration_seconds', {
   description: 'Git clone duration in seconds',
@@ -79,7 +79,7 @@ export const cloneDurationSeconds = meter.createHistogram('kici_agent_clone_dura
 /**
  * Total log bytes streamed back to orchestrator.
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const logBytesTotal = meter.createCounter('kici_agent_log_bytes_total', {
   description: 'Total log bytes streamed',
@@ -98,7 +98,7 @@ export const logBytesTotal = meter.createCounter('kici_agent_log_bytes_total', {
  * Labels:
  * - mode: `pause` (producer paused, no data loss) | `drop` (lines
  *   discarded with a `[N lines dropped due to backpressure]` marker)
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const logBackpressureEventsTotal = meter.createCounter(
   'kici_agent_log_backpressure_events_total',
@@ -117,7 +117,7 @@ export const logBackpressureEventsTotal = meter.createCounter(
  * producer.
  *
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const logLinesDroppedTotal = meter.createCounter('kici_agent_log_lines_dropped_total', {
   description: 'Total log lines dropped due to backpressure',
@@ -137,7 +137,7 @@ export const logLinesDroppedTotal = meter.createCounter('kici_agent_log_lines_dr
  *
  * Labels:
  * - mode: `pause` | `drop`
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const logBackpressureActive = meter.createUpDownCounter(
   'kici_agent_log_backpressure_active',
@@ -153,7 +153,7 @@ export const logBackpressureActive = meter.createUpDownCounter(
  * Use add(1) for connected, add(-1) for disconnected.
  *
  * Labels:
- * - scaler: injected by orch-side AgentMetricsAggregator (Phase 5b); `stateful` for static agents, backend name (`container` / `firecracker` / `bare-metal`) for scaler-managed
+ * - scaler: injected by orch-side AgentMetricsAggregator; `stateful` for static agents, backend type (`container` / `firecracker` / `bare-metal`) for scaler-managed
  */
 export const connectionStatus = meter.createUpDownCounter('kici_agent_connection_status', {
   description: 'Orchestrator WebSocket connection status (0=disconnected, 1=connected)',

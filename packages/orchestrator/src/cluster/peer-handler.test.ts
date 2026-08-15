@@ -1387,7 +1387,7 @@ describe('PeerHandler', () => {
         source: 'peer',
         stepLogBuffer: { addLines } as unknown as StepLogBuffer,
         logWriter: { appendChunk } as unknown as LogWriter,
-        executionTracker: { getJobName: () => 'build' },
+        executionTracker: { resolveJobName: () => Promise.resolve('build') },
         forwardToPlatform,
       });
 
@@ -1414,6 +1414,10 @@ describe('PeerHandler', () => {
       };
 
       ws.simulateRawMessage(encryptMessage(JSON.stringify(chunk), sessionKey));
+
+      // The sink resolves the storage job name asynchronously before persisting,
+      // so the appendChunk calls land on a later microtask — wait for them.
+      await vi.waitFor(() => expect(appendChunk).toHaveBeenCalledTimes(2));
 
       expect(addLines).toHaveBeenCalledTimes(2);
       expect(appendChunk).toHaveBeenNthCalledWith(

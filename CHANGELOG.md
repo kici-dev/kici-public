@@ -2,6 +2,94 @@
 
 Release notes for the public KiCI packages.
 
+## v0.5.0 — 2026-08-15
+
+### Features
+
+- A succeeded init step with no log output now reads as an affirmative green check in the run log viewer, instead of a neutral gray "No log output" line — so a dynamic env/context/concurrencyGroup field that resolved with no output is visibly confirmed rather than looking blank.
+- Add a `requires` content-filter field to the push, pr, and tag triggers: filter workflows by the JSON/YAML/text contents of a source file at the event ref before dispatch.
+- Lock-file and content cache sizes and TTLs are now cluster-configurable via kici-admin cluster-settings (applied at the next orchestrator restart)
+- SDK: workflow-level `filter` predicate, plus `sourceRepo` / `workflowRepo` on the generator and rule contexts
+- Lock schema v34 records whether a workflow declares a filter predicate
+- A global workflow can declare a filter predicate and generate jobs per source repo, evaluated once per push before any run is created
+- The global eval round budgets and its result-cache size are cluster-configurable
+- A failed organization-workflow evaluation is surfaced as an errored run and a commit check
+- Organization workflow evaluation now records why a workflow was excluded, and reports round timing, verdicts, and cache behavior as metrics
+- A workflow in the repo it runs against can declare a filter predicate, evaluated before any of its jobs is dispatched
+- kici-admin runs logs prints a page of one step's log lines, including the evaluation round of an organization-wide workflow — the only path to that output, since such a round records no run of its own
+- Run detail names the repo that defines an organization-wide workflow in a new Defined in row, so a cross-repo global run is distinguishable from an ordinary one
+- New cluster setting: kici-admin cluster-settings --ingest-overflow-claim-timeout-ms bounds how long a queued webhook delivery's claim may stand before the drain pass reclaims and retries it
+- Triggers can now gate on the commit message with commitMessage (contains, notContains, matches, notMatches), evaluated by the orchestrator with no evaluation job; requires gains the same literal contains / notContains / notMatches keys for file contents
+
+### Fixes
+
+- kici types output is now deterministic (no generation timestamp), so regenerating never produces a spurious diff
+- Dynamic env/context/concurrencyGroup functions are now always resolved on the eval agent; the orchestrator no longer evaluates any workflow code in-process. The W101 purity-fallback compiler warning is removed.
+- Trigger branch/tag/repo patterns, comment bodyMatch, and embedded JSONPath /re/ regexes are now ReDoS-checked and rejected at lock registration if catastrophic, matching label selectors
+- Global-workflow generators and job rules now receive the source and workflow repo pair before they run
+- Step-level rules on a global workflow now receive the source and workflow repo pair, matching job-level rules
+- Global workflows now dispatch the jobs their generators produce instead of silently dropping them
+- A stuck global eval round no longer blocks the webhook delivery that triggered it
+- A global eval round that fails transiently is retried once instead of skipping the workflows
+- An organization-workflow evaluation that finishes without deciding anything is now retried and reported
+- orchestrator scheduled-job health metrics for the unroutable-probe job are no longer dropped by the Platform, so JobConsecutiveFailures can alert on it
+- upgrade agents to v0.5.0 before the orchestrator — an older init-runner cannot evaluate a global workflow, and the orchestrator now says so instead of timing out
+- an abandoned organization-workflow evaluation no longer leaves an orphan job queued, and a queue-side fast-fail now settles the waiting delivery immediately
+- an organization-workflow evaluation that leaves only SOME workflows undecided now posts the same failing check as one that fails outright, naming just those workflows
+- the global eval candidate budget is now validated against the round budget, and a wait ceiling too close to the round budget is raised or refused instead of silently failing every round
+- kici compile now refuses an approval gate on an organization-wide workflow (E124) — it was silently ignored, so the job ran with no human release
+- an organization-wide workflow authored in a repo behind a different provider than the event's source repo now evaluates — its pre-run round built the workflow repo's clone URL from the wrong provider, so the checkout failed and no filter ran
+- an organization-wide workflow's dispatched jobs now clone the workflow repo from its own provider — when the workflow repo sat behind a different provider than the event's source repo, the job was handed a clone URL built by the wrong provider and the checkout failed
+- An organization-wide workflow that declares repos: ['**'] now also applies to repositories whose identifier starts with a dot, and a `!`-prefixed exclusion whose wildcard covers such a repo now correctly excludes it
+- An organization-wide workflow dropped because the event's repository does not match its repos patterns is now reported in the orchestrator log — one line per delivery naming every dropped workflow, its repo and its declared patterns — instead of disappearing silently
+- Step logs from an organization-wide workflow's evaluation round are now readable through the orchestrator admin API — a round that admits its candidates records no run of its own, so its logs previously returned 404
+- An organization-wide workflow that runs against another repository now creates a run, so its jobs appear in `kici runs list` / `kici runs show` and the dashboard, report their status, and can be cancelled — previously they executed with no run recorded at all
+- An organization-wide workflow that dispatches more than one job no longer finalizes its run before the rest of its jobs are registered, so the run reports the status and duration of every job rather than of whichever one finished first; and a run whose dispatch fails outright is now recorded as failed instead of sitting `pending` forever with nothing able to cancel or reap it
+- Re-running a run of an organization-wide workflow that executed against another repository is now refused — from the dashboard and from the orchestrator alike — with an error naming the repository that declares the workflow and the one the run executed against, so you know where to re-trigger it from. The re-run previously resolved the workflow from the repository the run executed against: it failed with a misleading force-push message, or, where that repository declared a workflow of the same name, silently ran that one instead
+- The three organization-wide workflow repository lists (blocked source repos, allowed author repos, elevated access) now match a dot-prefixed repository name the same way a workflow's own `repos:` patterns do — a repository identifier is an owner/name pair, not a file path, so `myorg/*` covers `myorg/.github` and `**` covers every repository in the org. A blocked-source entry written with a wildcard previously admitted such a repository; review any list entry that relies on a wildcard to reach or to spare a dot-prefixed name
+- A global workflow refused registration by the organization policy is now reported by name, with the organization it was denied under and how to fix it
+- A failure while releasing an organization-wide workflow run's pending-jobs hold no longer fails the webhook delivery that dispatched it. Releasing the hold can finalize the run — writing its terminal status, posting the provider check and forwarding to the Platform — so it can fail; that failure previously replaced whatever the dispatch was about to return or raise, turning a completed dispatch into a delivery error and hiding the original fault. Because the delivery id is already claimed for deduplication, a redelivery was then dropped as a duplicate, so the event was lost and any remaining organization-wide workflows for it were skipped. The failure is now logged and the dispatch's own outcome stands
+- A run of an organization-wide workflow is now visible to members scoped to the repository that defines the workflow, as well as to the repository it ran against
+- A run of an organization-wide workflow no longer completes or reopens the GitHub check run of a same-named workflow in the repository it ran against
+- An organization-wide workflow now reports its last-triggered time in the dashboard, and deleting its registration cancels its own in-flight runs rather than none — while deleting a same-named registration in another repository no longer cancels them
+- An organization-wide workflow run now stores the webhook payload that triggered it, so its run-detail Payload tab shows the source repo's event instead of failing to load
+- The run-detail Workflow link on an organization-wide run now opens the workflow file in the repo that defines it, on that repo's default branch, instead of pointing at the source repo at the source commit
+- An organization-wide workflow now receives the event that triggered it in ctx.event, so a workflow author can read the source repository's payload and scope a concurrency group by it
+- The Elevated access list for organization-wide workflows is deprecated: it was never enforced, and an organization-wide workflow's job runs with no secrets at all, so clearing the list takes nothing away
+- A run that starts past your monthly run cap is now recorded and shown instead of silently missing from the dashboard, and your run usage appears as a meter on the billing settings tab
+- Bitbucket run links in the dashboard now resolve — the workflow-file, commit and branch links were built with GitHub's path shapes, so all three returned 404 on every Bitbucket run
+- The pull-request link on a GitLab run now opens the merge request instead of a GitLab path that does not exist
+- The billing settings tab no longer goes blank when the Platform reports a different set of usage meters than the dashboard expects; an unreported meter is simply omitted
+- A team scoped to the repository that defines a global workflow now sees that workflow's historical runs immediately, instead of waiting for the next run to make the repository visible
+- Live run subscriptions on the dashboard now honour repository scope: a member restricted to a subset of an organization's repositories no longer receives the live logs, provisioning logs, or status stream of a run outside those repositories, and a cross-repository global run reaches the team that defines the workflow as well as the team that triggered it
+- Recovering a dead orchestrator's stuck check runs no longer times out a running check of the same name on the repository an organization-wide workflow acted against
+- A `kici run remote` test run is now scoped to the developer who started it: its status, its log stream, and its cancellation are reachable by that developer and by a caller with unrestricted repository scope, instead of by every organization member holding the `runs` permission
+- A `kici run remote` test run now records who started it, so the orchestrator dashboard, `kici runs show` and `kici-admin` attribute it to the developer instead of showing no initiator
+- Webhook deliveries are acknowledged as soon as they are durably queued, so a slow build no longer times out the provider's delivery attempt; the 202 now means accepted and stored, and pipeline outcomes surface in the event log and structured logs
+- A workflow run is now recorded before its first job is handed to an agent, so a job that finishes immediately can no longer have its status dropped and leave the run hanging
+- A pre-signed upload that stalls on a wedged socket now fails its attempt after five minutes and retries, instead of hanging until the job timeout kills the step
+- A job whose dependency finished almost instantly no longer stalls the run: the orchestrator now re-checks the dependency gates once a run's dependency graph is stored, so a dependency that completed before the graph was written still releases everything waiting on it
+- A transient object-storage error no longer fails a build: the agent retries an upload that was answered with an overload or throttling response, and still fails fast on a rejection that cannot succeed on a retry
+- A dispatched job can no longer be claimed and executed by two agents at once, which ran a job's steps — and every side effect they perform — twice
+- A webhook for a generic or local source is no longer accepted and then silently discarded when the orchestrator has not yet loaded that source's provider settings — the source is now looked up and applied before the delivery is matched
+- A completed check run is no longer pushed back to `in_progress` by a step update that arrives after its run finished, which left the check permanently unresolved on the commit despite carrying a conclusion
+- The orchestrator now reports why a free agent took no work while jobs were still queued, instead of returning silently on each of the five paths that can decline
+- A lost dispatch that is requeued now reliably reaches a connected idle agent: a per-coordinator safety-net re-drive re-attempts delivery through the atomic claim, so a requeued job the one-shot redispatch transiently missed no longer stalls until it expires
+- Early step-log lines are no longer lost when a job's logs start streaming before its dispatch record is fully registered
+- A test run whose only jobs use a dynamic environment now dispatches correctly and no longer reports 'no jobs dispatched', and a non-test environment's secrets are never merged into a test run resolved through the deferred-init path
+- Agent packaging now retries the vendored Node runtime download on a transient network failure and reports the underlying cause instead of an opaque 'fetch failed'
+- In an HA cluster, a worker-dispatched job's early step-log lines are no longer lost — the coordinator now records the job name at reroute time so persisted logs land under a readable path
+- A test run of a workflow with a dynamic environment now materializes its workspace from the uploaded overlay instead of attempting an empty git clone, so the init job resolves against the real source tree
+- When a test run skips a non-test environment resolved through a dynamic context, the 'unavailable for this test run' warning is now surfaced to the CLI and persisted on the run, matching the synchronous dispatch path
+- The run-mirror reconciler now retires an orphaned run (one whose owning orchestrator no longer has it, e.g. after an orchestrator database reset) to a terminal cancelled state instead of leaving it non-terminal forever
+- The auto-scaler no longer leaks resource-cap capacity when an agent is spawned but never registers: its reservation is now released when the stale spawning entry is pruned, so a scaler can no longer drift into a permanent at-capacity state that stops all further scale-up after a leader failover or restart
+- Agent metrics (kici_agent_*) and agent runtime metrics are no longer dropped by the hosted Platform when a scaler is named differently from its backend type — the scaler label now carries the backend type
+- kici run remote no longer 504s on large repos: the Platform gives the trigger relay its own longer timeout
+
+### Other
+
+- The global workflows master switch is now cluster-wide: enable it with kici-admin cluster-settings set --global-workflows-enabled true. It is off by default after upgrade, the per-org switch and its dashboard toggle are removed, and the per-org allow, deny and elevated repo lists are unchanged
+
 ## v0.4.0 — 2026-08-09
 
 ### Fixes

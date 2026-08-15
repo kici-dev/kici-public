@@ -173,4 +173,49 @@ describe('GitHubCheckStatusPoster', () => {
       );
     });
   });
+
+  describe('postGlobalEvalFailedCheck', () => {
+    it('creates a failing check under its own name, never touching the security check', async () => {
+      await poster.postGlobalEvalFailedCheck(
+        'owner/repo',
+        'abc123',
+        'Evaluating the organization workflows failed: `org-ci`, `org-lint`.',
+        {},
+      );
+
+      expect(mockOctokit.checks.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: 'owner',
+          repo: 'repo',
+          name: 'KiCI: Organization workflow evaluation',
+          head_sha: 'abc123',
+          status: 'completed',
+          conclusion: 'failure',
+          output: {
+            title: 'Organization workflow evaluation failed',
+            summary: expect.stringContaining('org-lint'),
+          },
+        }),
+      );
+
+      // The security hold owns the single "KiCI Security" run per commit, which
+      // an approve / reject later completes. Writing this notice through it
+      // would resolve a still-held run's check and unblock a branch protection
+      // rule that requires it — so this method must neither look that run up
+      // nor update it.
+      expect(mockOctokit.checks.listForRef).not.toHaveBeenCalled();
+      expect(mockOctokit.checks.update).not.toHaveBeenCalled();
+      const name = mockOctokit.checks.create.mock.calls[0][0].name;
+      expect(name).not.toBe('KiCI Security');
+      expect(name).not.toBe('KiCI: Organization workflows');
+    });
+
+    it('throws on API error', async () => {
+      mockOctokit.checks.create.mockRejectedValue(new Error('403 Forbidden'));
+
+      await expect(poster.postGlobalEvalFailedCheck('o/r', 'sha', 's', {})).rejects.toThrow(
+        '403 Forbidden',
+      );
+    });
+  });
 });

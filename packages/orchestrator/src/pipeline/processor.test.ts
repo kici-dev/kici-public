@@ -417,10 +417,13 @@ describe('processWebhook', () => {
 
   it('feeds matrixValues into the execution tracker per matrix child', async () => {
     const onExecutionStarted = vi.fn().mockResolvedValue(undefined);
+    // The run is registered before the dispatch loop, so its jobs land in
+    // `addJobsToRun` rather than in the `onExecutionStarted` call.
+    const addJobsToRun = vi.fn().mockResolvedValue(undefined);
     const deps = createDeps({
       executionTracker: {
         onExecutionStarted,
-        addJobsToRun: vi.fn(),
+        addJobsToRun,
         holdRunForPendingJobs: vi.fn(() => true),
         releasePendingJobsHold: vi.fn(),
       } as any,
@@ -457,7 +460,8 @@ describe('processWebhook', () => {
     await processWebhook(basePrInfo(), deps);
 
     expect(onExecutionStarted).toHaveBeenCalledTimes(1);
-    const dispatchedArg = onExecutionStarted.mock.calls[0][9] as Array<{
+    expect(addJobsToRun).toHaveBeenCalledTimes(1);
+    const dispatchedArg = addJobsToRun.mock.calls[0][1] as Array<{
       jobName: string;
       matrixValues?: Record<string, unknown>;
     }>;
@@ -812,6 +816,7 @@ describe('processWebhook', () => {
   function makeDynamicTrackerMock() {
     return {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
@@ -1300,6 +1305,7 @@ describe('processWebhook', () => {
   it('calls executionTracker.onExecutionStarted() when provided', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1323,10 +1329,9 @@ describe('processWebhook', () => {
       'delivery-123', // deliveryId
       { installationId: 42 }, // credentials
       expect.any(Object), // decision summary
-      expect.arrayContaining([
-        expect.objectContaining({ jobName: 'build' }),
-        expect.objectContaining({ jobName: 'test' }),
-      ]), // dispatchedJobs
+      // The run is registered before the dispatch loop, so it starts with no
+      // jobs; they arrive through `addJobsToRun` once every dispatch returned.
+      [], // dispatchedJobs
       'github:12345', // routingKey
       undefined, // dispatchedContexts (no contexts declared)
       expect.any(String), // triggerEvent
@@ -1343,6 +1348,13 @@ describe('processWebhook', () => {
       undefined, // triggeredByAgentLabel (webhook-triggered, not agent)
       null, // prNumber (no PR number in the test fixture)
     );
+    expect(mockTracker.addJobsToRun).toHaveBeenCalledTimes(1);
+    expect(mockTracker.addJobsToRun.mock.calls[0][1]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ jobName: 'build' }),
+        expect.objectContaining({ jobName: 'test' }),
+      ]),
+    );
   });
 
   it('passes workflow concurrency config to executionTracker', async () => {
@@ -1355,6 +1367,7 @@ describe('processWebhook', () => {
     };
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1670,6 +1683,7 @@ describe('processWebhook', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1687,7 +1701,8 @@ describe('processWebhook', () => {
 
     // Execution tracker should be called with locally dispatched jobs
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
-    const dispatchedJobs = mockTracker.onExecutionStarted.mock.calls[0][9];
+    // Jobs are registered after the dispatch loop, via `addJobsToRun`.
+    const dispatchedJobs = mockTracker.addJobsToRun.mock.calls[0][1];
     expect(dispatchedJobs).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ jobName: 'build' }),
@@ -1755,6 +1770,7 @@ describe('processWebhook', () => {
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1822,6 +1838,7 @@ describe('processWebhook', () => {
   it('records a lock_resolution init-failure run when the inbound lock is corrupt', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1869,6 +1886,7 @@ describe('processWebhook', () => {
   it('does NOT record a run for a plain absent lock file (miss path unchanged)', async () => {
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1901,6 +1919,7 @@ describe('processWebhook', () => {
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn(),
@@ -1971,6 +1990,7 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
@@ -2054,6 +2074,7 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
@@ -2155,6 +2176,7 @@ describe('processWebhook', () => {
     });
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
@@ -2221,6 +2243,7 @@ describe('processWebhook', () => {
     const mockAgentRegistry = createMockAgentRegistry([{ platform: 'linux', arch: 'x64' }]);
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
@@ -3300,12 +3323,13 @@ describe('processWebhook — cross-source webhook dispatch (phase 28.4)', () => 
     recordSpy.mockRestore();
   });
 
-  // CS-10 — dynamic-fn workflow cross-source delivery queues a __dynamic__
-  // eval job. Regression guard for 28.4-VERIFICATION.md Gap 1: a dynamic-fn
-  // workflow cross-source delivered MUST queue a __dynamic__ eval job.
-  // Before the 28.4-06 refactor, the cross-source branch iterated
-  // `crossWorkflow.jobs.filter(isLockStaticJob)` only, so dynamic-fn
-  // workflows produced zero dispatches and zero runs.
+  // CS-10 — a dynamic-fn workflow delivered cross-source MUST queue a
+  // `__dynamic__` eval job: the generator is the only thing that knows which
+  // jobs the workflow has, so a delivery that dispatched nothing would be a
+  // workflow that silently never runs.
+  //
+  // The org-global path reaches the same guarantee by a different route — the
+  // Tier-2 eval round, covered in `process-webhook-globals-eval-round.test.ts`.
   it('CS-10: dynamic-fn workflow cross-source delivered queues __dynamic__ eval job', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs10',
@@ -3996,6 +4020,7 @@ describe('processWebhook — context integration', () => {
     };
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       onJobStatus: vi.fn().mockResolvedValue(undefined),
@@ -4691,6 +4716,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
@@ -4753,6 +4779,7 @@ describe('init job dispatch (dynamic fields)', () => {
 
     const mockTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
@@ -4945,7 +4972,7 @@ describe('inline evaluation (pure dynamic functions)', () => {
     }
   }
 
-  it('skips init job dispatch when context has inline value', async () => {
+  it('dispatches an init job for an inline context (deferred to the eval agent)', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
     const deps = createDeps({
@@ -4955,15 +4982,15 @@ describe('inline evaluation (pure dynamic functions)', () => {
     });
 
     await processWebhook(basePushInfo(), deps);
+    await waitForDeferredInits();
 
-    // Should dispatch execution job directly -- no init job needed
-    expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
-    const call = mockDispatcher.dispatch.mock.calls[0][0];
-    expect(call.jobName).toBe('deploy-job');
-    // No init-related fields
-    expect(call.jobConfig.initOnly).toBeUndefined();
-    // pendingInits.track should NOT have been called
-    expect(mockPendingInits.track).not.toHaveBeenCalled();
+    // The orchestrator no longer evaluates the inline expression in-process; the
+    // agent's init job resolves it, exactly like an impure dynamic context.
+    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
+      (call: any) => call[0].jobConfig?.initOnly,
+    );
+    expect(initCalls).toHaveLength(1);
+    expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 
   it('dispatches init job when dynamicContext is true but context is undefined (impure, )', async () => {
@@ -4986,17 +5013,24 @@ describe('inline evaluation (pure dynamic functions)', () => {
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 
-  it('fails job when inline expression throws at eval time', async () => {
+  it('does not evaluate a throwing inline expression in-process (deferred to init)', async () => {
     const mockDispatcher = createMockDispatcher();
+    const mockPendingInits = createMockPendingInits();
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
       lockFileCache: createMockLockFileCache(inlineContextErrorLockFile()) as any,
+      pendingInits: mockPendingInits as any,
     });
 
-    // processWebhook should throw or the run should fail
-    await expect(processWebhook(basePushInfo(), deps)).rejects.toThrow(
-      /Inline context evaluation failed/,
+    // The inline expression is never run at dispatch, so a throwing expression
+    // cannot fail the run here — it defers to the agent's init job.
+    await expect(processWebhook(basePushInfo(), deps)).resolves.not.toThrow();
+    await waitForDeferredInits();
+
+    const initCalls = mockDispatcher.dispatch.mock.calls.filter(
+      (call: any) => call[0].jobConfig?.initOnly,
     );
+    expect(initCalls).toHaveLength(1);
   });
 
   it('dispatches init job for non-inline dynamic field in mixed scenario', async () => {
@@ -5018,7 +5052,7 @@ describe('inline evaluation (pure dynamic functions)', () => {
     expect(initCalls).toHaveLength(1);
     // Init job should indicate dynamicEnv needs resolution
     expect(initCalls[0][0].jobConfig.dynamicEnv).toBe(true);
-    // But dynamicContext should still be flagged (even though resolved inline)
+    // The inline context is deferred to the same init job, not resolved in-orch.
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 });

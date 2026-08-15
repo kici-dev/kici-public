@@ -3,62 +3,44 @@
  *
  * A job binds an ordered list of contexts (`LockJob.contexts`). This
  * module resolves that list into concrete context names (static values
- * verbatim, pure-inline dynamic elements evaluated against the event) and folds
- * the per-context secrets/variables last-wins. It keeps the heavy fold logic
+ * verbatim; every dynamic element is resolved by the agent's init job) and
+ * folds the per-context secrets/variables last-wins. It keeps the heavy fold logic
  * out of `dispatchMatchedWorkflow`, which must stay under the function-length cap.
  */
-import {
-  isLockInlineValue,
-  mergeOrderedMaps,
-  type Context,
-  type HostFacts,
-  type LockJob,
-} from '@kici-dev/engine';
+import { mergeOrderedMaps, type Context, type HostFacts, type LockJob } from '@kici-dev/engine';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 
 /**
- * Placeholder written into the persisted bound-env list for an impure dynamic
- * element the orchestrator cannot resolve at dispatch. The agent's init eval
- * later overwrites the list with the resolved name.
+ * Placeholder written into the persisted bound-env list for a dynamic element
+ * the orchestrator does not resolve at dispatch. The agent's init eval later
+ * overwrites the list with the resolved name.
  */
 export const DYNAMIC_ENV_PLACEHOLDER = '(dynamic)';
 
 /** Ordered resolved context names plus whether any element still needs agent init. */
 export interface ResolvedJobContexts {
-  /** Resolved static + pure-inline names, in order. */
+  /** Resolved static names, in order. */
   names: string[];
-  /** True when an impure dynamic element must be resolved by an agent init job. */
+  /** True when a dynamic element must be resolved by an agent init job. */
   needsInit: boolean;
 }
 
 /**
  * Resolve the ordered bound-context names from a lock job. Static elements
- * use their value verbatim; pure-inline dynamic elements use the matching
- * pre-evaluated inline name (aligned by index); an impure dynamic element cannot
- * be resolved here and flags `needsInit`.
+ * use their value verbatim; any dynamic element (inline or impure) is resolved
+ * by the agent's init job and flags `needsInit`.
  */
-export function resolveJobContextNames(
-  lockJob: LockJob,
-  inlineNames: ReadonlyArray<string | undefined>,
-): ResolvedJobContexts {
+export function resolveJobContextNames(lockJob: LockJob): ResolvedJobContexts {
   const names: string[] = [];
   let needsInit = false;
-  const envs = lockJob.contexts ?? [];
-  for (let i = 0; i < envs.length; i++) {
-    const e = envs[i];
+  for (const e of lockJob.contexts ?? []) {
     if (!e.dynamic) {
       if (typeof e.value === 'string') names.push(e.value);
       continue;
     }
-    if (isLockInlineValue(e.value)) {
-      const resolved = inlineNames[i];
-      if (resolved) names.push(resolved);
-      else needsInit = true;
-    } else {
-      // Impure dynamic element — the agent's init job resolves every element.
-      needsInit = true;
-    }
+    // Any dynamic element (inline or impure) is resolved by the agent init job.
+    needsInit = true;
   }
   return { names, needsInit };
 }
@@ -66,22 +48,16 @@ export function resolveJobContextNames(
 /**
  * Build the ordered bound-context display list for persistence at dispatch.
  * Unlike {@link resolveJobContextNames}, this never drops an unresolved
- * element: a static element uses its value, a pure-inline element uses its
- * resolved name when known, and any element the orchestrator cannot resolve at
- * dispatch (impure dynamic, or an unresolved pure-inline) becomes the
- * `(dynamic)` placeholder — so the persisted column reflects every declared
- * slot in order. Returns an empty array when the job binds no context.
+ * element: a static element uses its value, and any dynamic element (which the
+ * orchestrator no longer resolves at dispatch) becomes the `(dynamic)`
+ * placeholder — so the persisted column reflects every declared slot in order.
+ * The deferred-init flow-back overwrites the placeholder once the agent
+ * resolves the name. Returns an empty array when the job binds no context.
  */
-export function buildJobContextDisplayNames(
-  lockJob: LockJob,
-  inlineNames: ReadonlyArray<string | undefined>,
-): string[] {
-  const envs = lockJob.contexts ?? [];
-  return envs.map((e, i) => {
-    if (!e.dynamic) return typeof e.value === 'string' ? e.value : DYNAMIC_ENV_PLACEHOLDER;
-    if (isLockInlineValue(e.value)) return inlineNames[i] ?? DYNAMIC_ENV_PLACEHOLDER;
-    return DYNAMIC_ENV_PLACEHOLDER;
-  });
+export function buildJobContextDisplayNames(lockJob: LockJob): string[] {
+  return (lockJob.contexts ?? []).map((e) =>
+    !e.dynamic && typeof e.value === 'string' ? e.value : DYNAMIC_ENV_PLACEHOLDER,
+  );
 }
 
 /** Merged secrets/variables across an ordered list of resolved contexts. */

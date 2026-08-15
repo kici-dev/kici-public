@@ -100,3 +100,59 @@ describe('backfillRunToPlatform', () => {
     expect(status?.routingKey).toBeUndefined();
   });
 });
+
+/**
+ * The backfill re-sends a run the Platform missed while it was down. A
+ * cross-repository global run whose only delivery is this path must not land in
+ * the mirror with a NULL workflow repo — that silently reclassifies it as
+ * per-repository for every consumer keyed on the marker.
+ */
+describe('backfillRunToPlatform workflow repo attribution', () => {
+  const WORKFLOW_REPO = 'acme/org-workflows';
+
+  function runRow(overrides: Partial<BackfillRunRow> = {}): BackfillRunRow {
+    return {
+      run_id: 'r1',
+      workflow_name: 'ci',
+      status: 'success',
+      routing_key: 'github:42',
+      repo_identifier: 'acme/source-app',
+      workflow_repo_identifier: null,
+      provider: 'github',
+      local_working_tree: false,
+      sha: 'deadbeef',
+      ref: 'main',
+      job_count: 1,
+      started_at: new Date(0),
+      completed_at: new Date(1000),
+      duration_ms: 1000,
+      ...overrides,
+    };
+  }
+
+  async function statusFrame(row: BackfillRunRow): Promise<Record<string, unknown> | undefined> {
+    const send = vi.fn();
+    await backfillRunToPlatform(
+      { send, loadRun: async () => row, loadJobs: async () => [] },
+      row.run_id,
+    );
+    return send.mock.calls
+      .map((c) => c[0] as Record<string, unknown>)
+      .find((m) => m.type === 'execution.status');
+  }
+
+  it('carries the workflow repo a backfilled global run recorded', async () => {
+    const status = await statusFrame(runRow({ workflow_repo_identifier: WORKFLOW_REPO }));
+    expect(status?.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+    // The source repo is untouched — a global run belongs to both.
+    expect(status?.repoIdentifier).toBe('acme/source-app');
+  });
+
+  it('omits the workflow repo for an ordinary per-repository run', async () => {
+    // The column is NULL for every per-repository run, and the frame must stay
+    // silent rather than echoing the source repo — otherwise "present" stops
+    // marking a cross-repository run.
+    const status = await statusFrame(runRow({ workflow_repo_identifier: null }));
+    expect(status?.workflowRepoIdentifier).toBeUndefined();
+  });
+});

@@ -1,6 +1,6 @@
 ---
 title: Webhook pipeline
-description: ''
+description: The provider-agnostic pipeline that turns an inbound webhook into dispatched workflow runs
 ---
 
 The orchestrator's webhook processing pipeline turns inbound provider webhooks

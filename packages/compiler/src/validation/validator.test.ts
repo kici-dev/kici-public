@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { job, step, workflow, isDynamicJobFn, dynamicJob, dynamicGroup } from '@kici-dev/sdk';
+import { job, step, workflow, push, isDynamicJobFn, dynamicJob, dynamicGroup } from '@kici-dev/sdk';
 import type { DynamicJobFn, Job } from '@kici-dev/sdk';
 import { validateConfig } from './validator.js';
 import type { WorkflowWithSource } from '../types.js';
@@ -180,5 +180,76 @@ describe('validateConfig error locations', () => {
     if (res.valid) return;
     const err = res.errors.find((e) => e.code === 'E107');
     expect(err!.location).toEqual({ file: '/repo/.kici/workflows/b.ts', line: 1, column: 1 });
+  });
+});
+
+describe('E124 approval on an organization-wide workflow', () => {
+  const gate = { approvers: [] } as never;
+
+  it('rejects a workflow-level approval when a trigger carries repos', () => {
+    // The approval hold lives entirely in the per-repository dispatch path; the
+    // global path never consults it. So the gate is silently ignored and the
+    // author believes a human had to release a job that ran immediately.
+    const w = workflow('org-deploy', {
+      on: [push({ repos: ['myorg/*'] })],
+      approval: gate,
+      jobs: [job('deploy', { runsOn: 'kici:os:linux', steps: [dummyStep] })],
+    });
+    const res = validateConfig([wrap(w, '/repo/.kici/workflows/org.ts')]);
+    expect(res.valid).toBe(false);
+    if (res.valid) return;
+    const err = res.errors.find((e) => e.code === 'E124');
+    expect(err!.message).toContain('org-deploy');
+    expect(err!.suggestion).toContain('per-repository workflows only');
+  });
+
+  it('rejects a job-level approval on a global workflow, anchored to the job', () => {
+    const w = workflow('org-deploy', {
+      on: [push({ repos: ['myorg/*'] })],
+      jobs: [
+        job('safe', { runsOn: 'kici:os:linux', steps: [dummyStep] }),
+        job('deploy', { runsOn: 'kici:os:linux', steps: [dummyStep], approval: gate }),
+      ],
+    });
+    const res = validateConfig([wrap(w, '/repo/.kici/workflows/org.ts')]);
+    expect(res.valid).toBe(false);
+    if (res.valid) return;
+    const errs = res.errors.filter((e) => e.code === 'E124');
+    expect(errs).toHaveLength(1);
+    expect(errs[0].message).toContain('"deploy"');
+    // Anchored to the job via its first step's captured call site, like every
+    // other job-scoped error — which in a test is this file, not the wrapper's
+    // synthetic workflow path.
+    expect(errs[0].location?.file).toContain('validator.test.ts');
+  });
+
+  it('leaves a per-repository workflow alone', () => {
+    // Positive control: the same gate on a workflow with no `repos:` is
+    // enforced for real, so it must still compile.
+    const w = workflow('deploy', {
+      on: [push({ branches: ['main'] })],
+      approval: gate,
+      jobs: [job('deploy', { runsOn: 'kici:os:linux', steps: [dummyStep], approval: gate })],
+    });
+    expect(validateConfig([wrap(w, '/repo/.kici/workflows/ci.ts')]).valid).toBe(true);
+  });
+
+  it('leaves a global workflow with no approval alone', () => {
+    const w = workflow('org-lint', {
+      on: [push({ repos: ['myorg/*'] })],
+      jobs: [job('lint', { runsOn: 'kici:os:linux', steps: [dummyStep] })],
+    });
+    expect(validateConfig([wrap(w, '/repo/.kici/workflows/org.ts')]).valid).toBe(true);
+  });
+
+  it('does not read an empty repos array as global', () => {
+    // `repos: []` classifies nowhere else either — the lock generator omits the
+    // field entirely — so it must not trip this check.
+    const w = workflow('deploy', {
+      on: [push({ repos: [] })],
+      approval: gate,
+      jobs: [job('deploy', { runsOn: 'kici:os:linux', steps: [dummyStep] })],
+    });
+    expect(validateConfig([wrap(w, '/repo/.kici/workflows/ci.ts')]).valid).toBe(true);
   });
 });

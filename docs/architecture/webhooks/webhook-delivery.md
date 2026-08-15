@@ -99,9 +99,10 @@ The orchestrator reassembles the body from the chunked stream, verifies the sign
 9. **Registration extraction (default-branch push):** On pushes to the default branch, extract registerable workflows and persist them for cluster-wide event matching
 10. **Event router notification:** After the registrations are persisted, if event routing is active, emit a `registration.updated` event via `eventRouter.emit()`. Workflow event subscriptions are the persisted registrations themselves; the event router matches emitted events against them through the registration index
 11. **Changed files:** Use the provider's `ChangedFilesFetcher` to get files changed in this push/PR (for path-based trigger filtering; skipped when no workflow uses path filters)
-12. **Trigger matching:** Evaluate all workflows in the lock file against the event using `matchAllWorkflows()` from `@kici-dev/engine`
-13. **Source and dep cache check:** For each matched workflow, check the source tarball cache by `contentHash` and dep cache by `lockfileHash` (see [Source tarball caching flow](#source-tarball-caching-flow) below)
-14. **Job dispatch:** For each matched workflow, dispatch static jobs to agents via the agent dispatcher (with `sourceTarUrl`/`depsUrl` if cache hit)
+12. **Trigger matching:** Evaluate the lock file's workflows against the event using `matchWorkflowsForEvent()` from `@kici-dev/engine` -- an event-type-bucketed candidate scan that only evaluates workflows subscribed to this event type (the single-registration global / cross-source paths evaluate one lock entry at a time via `matchAllWorkflows()`)
+13. **Content-requirements filter:** For each matched trigger that declares `requires`, read the named source files at the event's ref via the provider's `FileContentsFetcher` (deduplicated per `(repo, sha, path)` by an LRU cache) and evaluate the declarative requirement. A candidate that fails, or that cannot be evaluated at all (unreadable or oversize content, a fetch error, no fetcher wired), is dropped before dispatch with the concrete reason logged -- an indeterminate file never passes silently. No workflow code runs here; `requires` is data the orchestrator interprets. Skipped entirely when no matched trigger declares `requires`
+14. **Source and dep cache check:** For each surviving workflow, check the source tarball cache by `contentHash` and dep cache by `lockfileHash` (see [Source tarball caching flow](#source-tarball-caching-flow) below)
+15. **Job dispatch:** For each surviving workflow, dispatch static jobs to agents via the agent dispatcher (with `sourceTarUrl`/`depsUrl` if cache hit)
 
 > Source: `packages/orchestrator/src/pipeline/process-webhook.ts` -- `processWebhook()`
 
@@ -131,7 +132,7 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
    - Clone repo: shallow `git clone` at the dispatch ref, unless the job sets `checkout: false`
    - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`) and extract it over the cloned workflow root, so no `npm ci` or compile of `.kici/` is needed at execution time
    - Restore deps: download cached dependency tarball (`depsUrl`) with SHA-256 verification, or fall back to `npm ci` inline if the cache missed
-   - Load workflow: register the shared `@kici-dev/shared/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
+   - Load workflow: register the shared `@kici-dev/core/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
    - Evaluate rules: run job-level rules sequentially with fail-fast (if any rule fails, job is skipped)
    - Execute steps: run each step sequentially with timeout and abort support
 6. **Stream logs:** Send `log.chunk` messages to the orchestrator during execution (batched by `LogStreamer`)
@@ -183,7 +184,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 32; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 34; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 

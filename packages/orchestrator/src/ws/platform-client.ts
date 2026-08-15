@@ -132,8 +132,14 @@ import type { ProviderSource } from '../entry-helpers.js';
  * this is treated as hung; releasing its slot (idempotently) prevents a
  * permanent slot leak that would otherwise shrink capacity for every future
  * webhook. Well above any legitimate ingest-pipeline duration.
+ *
+ * Exported because it is also the hard bound on anything a webhook waits for
+ * inline: the global eval round caps its raised wait ceiling at this value,
+ * since a ceiling past the point the relay force-releases the pipeline buys
+ * latency and no verdict. Two copies of "5 minutes" with nothing coupling them
+ * is exactly the pair that drifts.
  */
-const ADMITTED_PIPELINE_LIFETIME_MS = 5 * 60 * 1000;
+export const ADMITTED_PIPELINE_LIFETIME_MS = 5 * 60 * 1000;
 
 /**
  * How long a connection must stay open after authenticating before it counts as

@@ -31,38 +31,31 @@ function makeEnv(id: string, name: string): Context {
 
 describe('resolveJobContextNames', () => {
   it('resolves static names verbatim in order', () => {
-    const r = resolveJobContextNames(
-      {
-        contexts: [
-          { value: 'staging', dynamic: false },
-          { value: 'my-testing', dynamic: false },
-        ],
-      } as unknown as LockJob,
-      [undefined, undefined],
-    );
+    const r = resolveJobContextNames({
+      contexts: [
+        { value: 'staging', dynamic: false },
+        { value: 'my-testing', dynamic: false },
+      ],
+    } as unknown as LockJob);
     expect(r.names).toEqual(['staging', 'my-testing']);
     expect(r.needsInit).toBe(false);
   });
 
-  it('uses pre-evaluated inline names for pure dynamic elements', () => {
-    const r = resolveJobContextNames(
-      {
-        contexts: [
-          { value: 'staging', dynamic: false },
-          { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
-        ],
-      } as unknown as LockJob,
-      [undefined, 'preview'],
-    );
-    expect(r.names).toEqual(['staging', 'preview']);
-    expect(r.needsInit).toBe(false);
+  it('flags needsInit for a pure inline dynamic element and drops it from names', () => {
+    const r = resolveJobContextNames({
+      contexts: [
+        { value: 'staging', dynamic: false },
+        { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
+      ],
+    } as unknown as LockJob);
+    expect(r.names).toEqual(['staging']);
+    expect(r.needsInit).toBe(true);
   });
 
   it('flags needsInit for an impure dynamic element', () => {
-    const r = resolveJobContextNames(
-      { contexts: [{ value: '', dynamic: true }] } as unknown as LockJob,
-      [undefined],
-    );
+    const r = resolveJobContextNames({
+      contexts: [{ value: '', dynamic: true }],
+    } as unknown as LockJob);
     expect(r.needsInit).toBe(true);
     expect(r.names).toEqual([]);
   });
@@ -70,36 +63,30 @@ describe('resolveJobContextNames', () => {
 
 describe('buildJobContextDisplayNames', () => {
   it('returns an empty list when no context is bound', () => {
-    expect(buildJobContextDisplayNames({} as unknown as LockJob, [])).toEqual([]);
+    expect(buildJobContextDisplayNames({} as unknown as LockJob)).toEqual([]);
   });
 
   it('keeps static names verbatim in order', () => {
     expect(
-      buildJobContextDisplayNames(
-        {
-          contexts: [
-            { value: 'staging', dynamic: false },
-            { value: 'my-testing', dynamic: false },
-          ],
-        } as unknown as LockJob,
-        [undefined, undefined],
-      ),
+      buildJobContextDisplayNames({
+        contexts: [
+          { value: 'staging', dynamic: false },
+          { value: 'my-testing', dynamic: false },
+        ],
+      } as unknown as LockJob),
     ).toEqual(['staging', 'my-testing']);
   });
 
-  it('uses resolved inline names and a placeholder for unresolved dynamic slots', () => {
+  it('uses a placeholder for every dynamic slot', () => {
     expect(
-      buildJobContextDisplayNames(
-        {
-          contexts: [
-            { value: 'staging', dynamic: false },
-            { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
-            { value: '', dynamic: true },
-          ],
-        } as unknown as LockJob,
-        [undefined, 'preview', undefined],
-      ),
-    ).toEqual(['staging', 'preview', '(dynamic)']);
+      buildJobContextDisplayNames({
+        contexts: [
+          { value: 'staging', dynamic: false },
+          { value: { _type: 'inline', expression: '(e) => e.x' }, dynamic: true },
+          { value: '', dynamic: true },
+        ],
+      } as unknown as LockJob),
+    ).toEqual(['staging', '(dynamic)', '(dynamic)']);
   });
 });
 

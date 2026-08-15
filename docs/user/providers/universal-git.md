@@ -181,9 +181,8 @@ org-scoped (one row per `customer_id`); each list entry can optionally
 pin to a specific source via `--source <routingKey>`:
 
 ```bash
-# Enable global workflows for the org
-kici-admin org-settings global-workflows set-enabled true \
-  --customer-id <orgId>
+# Enable global workflows cluster-wide (the master switch is fleet-wide, held by the operator)
+kici-admin cluster-settings set --global-workflows-enabled true
 
 # Allow authors from any source in the org
 kici-admin org-settings global-workflows allow-add \

@@ -7,6 +7,10 @@ import {
   type LockFileFetcher,
 } from '@kici-dev/engine';
 import { LockFileCache } from './lockfile-cache.js';
+import {
+  CACHE_MAX_ENTRIES_CEILING,
+  clampCacheMaxEntries,
+} from './cluster/cluster-settings-reader.js';
 
 const SAMPLE_LOCK: LockFile = {
   schemaVersion: SCHEMA_VERSION,
@@ -187,5 +191,28 @@ describe('LockFileCache byte bound', () => {
     const stats = cache.getStats();
     expect(stats.size).toBe(2);
     expect(stats.calculatedSize).toBe(0);
+  });
+});
+
+describe('LockFileCache boot safety against an out-of-range cluster override', () => {
+  const OVER_CEILING = 5_000_000_000;
+  const CONFIG_DEFAULT = 500;
+
+  it('positive control: the raw over-ceiling value really does break the constructor', () => {
+    // Without this control the clamp test below would pass even if the LRU
+    // tolerated any `max`, proving nothing. The cache is built inside
+    // bootstrapOrchestrator, so this throw is an orchestrator that cannot
+    // start — and therefore an admin API that cannot be reached to fix the
+    // stored value.
+    expect(
+      () => new LockFileCache({ max: OVER_CEILING, ttl: 3_600_000, maxBytes: 64 * 1024 * 1024 }),
+    ).toThrow(RangeError);
+  });
+
+  it('constructs fine once the stored value goes through clampCacheMaxEntries', () => {
+    const max = clampCacheMaxEntries(OVER_CEILING, CONFIG_DEFAULT);
+    expect(max).toBe(CACHE_MAX_ENTRIES_CEILING);
+    const cache = new LockFileCache({ max, ttl: 3_600_000, maxBytes: 64 * 1024 * 1024 });
+    expect(cache.getStats().size).toBe(0);
   });
 });

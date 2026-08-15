@@ -16,7 +16,7 @@ describe('lock schema version window', () => {
   });
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
-    expect(SCHEMA_VERSION).toBe(32);
+    expect(SCHEMA_VERSION).toBe(35);
     expect(BREAKING_FLOOR).toBe(30);
   });
 
@@ -36,8 +36,8 @@ describe('lock schema version window', () => {
 });
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 32 (adds LockJob.sandbox escape-hatch request)', () => {
-    expect(SCHEMA_VERSION).toBe(32);
+  it('SCHEMA_VERSION is 35 (adds commitMessage + content-requirement text keys)', () => {
+    expect(SCHEMA_VERSION).toBe(35);
   });
 
   it('LockJob accepts includeUninitialized alongside runsOnAll', () => {

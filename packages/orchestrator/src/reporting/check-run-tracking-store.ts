@@ -88,6 +88,13 @@ export class CheckRunTrackingStore {
     await this.upsertRow(key, {
       check_run_id: checkRunId,
       ...(runId !== undefined && { run_id: runId }),
+      // A new check-run id means a NEW check run, whose terminal update has by
+      // definition not been sent — so any marker left by a previous run at this
+      // key is stale and must not outlive it. The key is
+      // (provider, owner, repo, sha, check_name), so a re-run at the same
+      // commit lands on the same row; without this reset it would inherit the
+      // previous run's completion and have its live step progress suppressed.
+      terminal_sent_at: null,
     });
   }
 
@@ -311,7 +318,8 @@ export class CheckRunTrackingStore {
       build_creation_state: string;
       step_progress_json: string;
       in_progress_sent_at: Date;
-      terminal_sent_at: Date;
+      /** `null` clears a stale marker; see `setCheckRunId`. */
+      terminal_sent_at: Date | null;
       run_id: string;
     }>,
   ): Promise<void> {

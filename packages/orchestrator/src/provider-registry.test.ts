@@ -102,6 +102,43 @@ describe('ProviderRegistry', () => {
       // getByRoutingKey should find it via fallback
       expect(registry.getByRoutingKey('github:12345')).toBe(bundle);
     });
+
+    it('never falls back to another source bundle for an unknown generic key', () => {
+      // A `generic:{orgId}:{sourceId}` key is fully qualified, so the
+      // type-prefix scan cannot mean "the single configured app" the way it
+      // does for `github:`. Handing back whichever generic bundle happens to
+      // be first in insertion order crosses sources — and, as below, orgs.
+      const registry = new ProviderRegistry();
+      const otherOrgBundle = createMockBundle();
+      registry.registerByRoutingKey('generic:org-a:source-1', otherOrgBundle);
+
+      expect(registry.getByRoutingKey('generic:org-b:source-2')).toBeUndefined();
+    });
+
+    it('falls back to the shared default bundle for an unknown generic key', () => {
+      // The one legitimate stand-in: a plain generic source has no
+      // per-routing-key bundle by design and is meant to use this one.
+      const registry = new ProviderRegistry();
+      const defaultBundle = createMockBundle();
+      registry.register('generic', defaultBundle);
+      registry.registerByRoutingKey('generic:org-a:source-1', createMockBundle());
+
+      expect(registry.getByRoutingKey('generic:org-b:source-2')).toBe(defaultBundle);
+    });
+  });
+
+  describe('hasExact', () => {
+    it('distinguishes a registered key from one only the fallback can answer', () => {
+      const registry = new ProviderRegistry();
+      registry.register('generic', createMockBundle());
+      registry.registerByRoutingKey('generic:org-a:source-1', createMockBundle());
+
+      expect(registry.hasExact('generic:org-a:source-1')).toBe(true);
+      // getByRoutingKey answers this one from the default bundle, so only
+      // hasExact can tell a caller the source's own bundle is missing.
+      expect(registry.hasExact('generic:org-b:source-2')).toBe(false);
+      expect(registry.getByRoutingKey('generic:org-b:source-2')).toBeDefined();
+    });
   });
 
   describe('has', () => {

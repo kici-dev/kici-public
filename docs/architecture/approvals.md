@@ -11,12 +11,12 @@ For authoring gates see [Approval gates (user guide)](../user/approvals.md); for
 
 Two independent sources can hold an element. They differ only in **what triggers** the hold and **where the approver requirement comes from** — both funnel into the same held-element mechanism.
 
-| Source        | Trigger                                 | Requirement source                                   | Granularity           |
-| ------------- | --------------------------------------- | ---------------------------------------------------- | --------------------- |
-| **Mandatory** | element targets a protected environment | environment policy (required reviewers)              | job                   |
-| **Explicit**  | author wrote `approval` in the SDK      | the clauses in code, resolved against operator teams | step / job / workflow |
+| Source        | Trigger                             | Requirement source                                   | Granularity           |
+| ------------- | ----------------------------------- | ---------------------------------------------------- | --------------------- |
+| **Mandatory** | element targets a protected context | context policy (required reviewers)                  | job                   |
+| **Explicit**  | author wrote `approval` in the SDK  | the clauses in code, resolved against operator teams | step / job / workflow |
 
-The explicit `approval` declaration is compiled into the lock file's `approval` block (at the matching step, job, or workflow node). The mandatory requirement is resolved at dispatch time from the environment's reviewer policy. Both normalize to one shape before the gate evaluates them:
+The explicit `approval` declaration is compiled into the lock file's `approval` block (at the matching step, job, or workflow node). The mandatory requirement is resolved at dispatch time from the context's reviewer policy. Both normalize to one shape before the gate evaluates them:
 
 ```
 ApprovalRequirement = {
@@ -27,22 +27,22 @@ ApprovalRequirement = {
 ApproverClause = { team: string } | { user: string }
 ```
 
-When both a mandatory environment hold and an explicit hold apply to the same job, their clauses are combined into one requirement (AND), so both sources must be satisfied.
+When both a mandatory context hold and an explicit hold apply to the same job, their clauses are combined into one requirement (AND), so both sources must be satisfied.
 
 ## Approval holds vs security holds
 
 A third kind of hold shares the same `held_runs` storage but is **not** an approval hold: the **security hold**, raised by the CI-trust layer when an untrusted contributor's change must be vetted before it runs at all. Both kinds pause execution and both are released by a human, but they answer different questions — "should this change be promoted?" versus "is it safe to execute this contributor's code?" — and they are kept in two separate queues so a permission to do one never grants the other.
 
-|                                   | Approval hold                                                                                                     | Security hold                                                                                                                                                                     |
-| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Queue (`held_runs.queue_type`)    | `context`                                                                                                         | `security`                                                                                                                                                                        |
-| Hold type (`held_runs.hold_type`) | `reviewer` (also `timer` and `concurrency` for the other context gates)                                           | `security`                                                                                                                                                                        |
-| Raised by                         | an `approval` gate in workflow code, or an environment's required-reviewer policy                                 | the CI trust layer: the org trust policy holds or rejects the PR (workflow change, fork PR, or unresolved contributor), or an environment's `minimumTrust` blocks the contributor |
-| Requirement                       | an `ApprovalRequirement` — an AND-list of team/user clauses with per-clause progress and per-approver attribution | a single reason (`workflow_modification`, `fork_pr`, `unknown_contributor`, `context_trust`); any sufficiently-trusted member releases it                                         |
-| Granularity                       | step, job, or workflow                                                                                            | the whole run (org trust policy) or one job (trust gate)                                                                                                                          |
-| Released by                       | `contexts:write` (a `timer` hold takes `contexts:admin`) **and** eligibility for an unsatisfied clause            | `ci_trust:write` or higher, as resolved through any per-member `ci_trust_override`                                                                                                |
-| Release channels                  | dashboard approval queue, `kici approve` / `kici reject`                                                          | dashboard CI-trust approval queue, `/kici approve` / `/kici reject` in a PR comment                                                                                               |
-| Provider status check             | a held-for-approval check naming the unsatisfied clauses                                                          | a fixed `KiCI Security` check updated in place                                                                                                                                    |
+|                                   | Approval hold                                                                                                     | Security hold                                                                                                                                                                |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Queue (`held_runs.queue_type`)    | `context`                                                                                                         | `security`                                                                                                                                                                   |
+| Hold type (`held_runs.hold_type`) | `reviewer` (also `timer` and `concurrency` for the other context gates)                                           | `security`                                                                                                                                                                   |
+| Raised by                         | an `approval` gate in workflow code, or a context's required-reviewer policy                                      | the CI trust layer: the org trust policy holds or rejects the PR (workflow change, fork PR, or unresolved contributor), or a context's `minimumTrust` blocks the contributor |
+| Requirement                       | an `ApprovalRequirement` — an AND-list of team/user clauses with per-clause progress and per-approver attribution | a single reason (`workflow_modification`, `fork_pr`, `unknown_contributor`, `context_trust`); any sufficiently-trusted member releases it                                    |
+| Granularity                       | step, job, or workflow                                                                                            | the whole run (org trust policy) or one job (trust gate)                                                                                                                     |
+| Released by                       | `contexts:write` (a `timer` hold takes `contexts:admin`) **and** eligibility for an unsatisfied clause            | `ci_trust:write` or higher, as resolved through any per-member `ci_trust_override`                                                                                           |
+| Release channels                  | dashboard approval queue, `kici approve` / `kici reject`                                                          | dashboard CI-trust approval queue, `/kici approve` / `/kici reject` in a PR comment                                                                                          |
+| Provider status check             | a held-for-approval check naming the unsatisfied clauses                                                          | a fixed `KiCI Security` check updated in place                                                                                                                               |
 
 The queue split is enforced at release time, not only in the UI: a release that targets the security queue asserts the row's `queue_type` matches, so a context approval can never release a security hold and vice versa.
 
@@ -114,5 +114,5 @@ Because a step-level hold keeps an agent and workspace occupied for the whole wa
 
 - [Approval gates (user guide)](../user/approvals.md) — authoring `approval`.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the queue, expiry, self-approval.
-- [Execution lifecycle](execution/state-machine.md) — the `held` status and the terminal-state rules.
+- [Execution status vocabulary](execution/state-machine.md) — the `held` status and the terminal-state rules.
 - [Orchestrator ↔ Agent messages](protocol/orchestrator-agent.md) — the protocol channel the step round-trip rides.

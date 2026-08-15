@@ -89,7 +89,7 @@ The agent is the execution worker. It runs on customer infrastructure and has fu
 Shared business logic used by all three tiers. Single source of truth for cross-tier concerns. Has no internal `@kici-dev/*` dependencies -- only a handful of third-party libraries.
 
 - Protocol message schemas (Zod-based, direction-specific unions including dashboard REST-over-WS, browser live streaming, the test-relay control plane, log pull, run events, peer-to-peer, cluster join, and source registration)
-- Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, CloneTokenProvider, RepoUrlBuilder, ContributorResolver, CheckStatusPoster)
+- Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, FileContentsFetcher, CloneTokenProvider, RepoUrlBuilder, ContributorResolver, CheckStatusPoster)
 - Trigger matching engine (branch, path, event evaluation)
 - Dispatch inputs (input descriptors, extraction from the trigger event, and coercion to typed values)
 - Matrix expansion and fanout (combination expansion with include/exclude, job-name suffix formatting, and materialization of one matrix or multi-host job into N dispatchable children)
@@ -105,11 +105,16 @@ Shared business logic used by all three tiers. Single source of truth for cross-
 - Build provenance (in-toto statement schema, DSSE envelope, attestation bundle, verification)
 - Artifact name contract (the shared filesystem/URL-safe name schema the orchestrator, agent, and SDK all validate against)
 - Developer MCP tool schemas (argument schemas for the AI-agent tool surface)
+- Developer-operations contract (one row per workflow-developer operation declaring which entrypoints expose it -- the shared REST API behind the web UI and the `kici` CLI, the AI-agent tool surface, and a curated UI flag -- asserted against each real surface by congruence tests)
 - Label utilities (platform label derivation, runsOn normalization, `kici:*` set-only reserved namespace, role labels)
 - Host inventory (the canonical queryable host-roster schema shared by the orchestrator's roster store, the agent-facing inventory API, and the SDK's `ctx.kici.inventory`)
 - Audit policy and retention (per-action access-log sampling, warm-retention windows for cold-store eligibility, federated activity row schema)
 - Scaler backend type enum (`container`, `bare-metal`, `firecracker`, `kubernetes`)
 - Registration trigger type enum (registerable trigger discriminator)
+- Sandbox capability set (the Linux capability names a container sandbox may add or drop, shared by the SDK validator, the compiler, and the dispatch resolver)
+- Plan tier vocabulary (the hosted plan tiers and the purchasable subset, shared by the Platform and the browser dashboard)
+- Infrastructure alert vocabulary (the diagnostics alert types and severities the Platform mints and the dashboard and `kici` CLI render)
+- Metric catalog (the generated Prometheus metric inventory, its naming policy, and metric-kind compatibility checks)
 - Bundler config (shared bundler configuration consumed by `e2e/helpers/service-deploy.ts`; the agent runtime uses the `@kici-dev/core/ts-loader-hook` to transform TypeScript on import, with no runtime bundler step)
 
 > Source: `packages/engine/src/`
@@ -233,6 +238,6 @@ KiCI uses application-level tenant isolation. The Platform dashboard API accepts
 ## See also
 
 - [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md) -- P2P clustering, Raft consensus, job rerouting
-- [Execution lifecycle](./execution/state-machine.md) -- run, job, and step status vocabularies and the tracker that owns lifecycle state
+- [Execution status vocabulary](./execution/state-machine.md) -- run, job, and step status vocabularies and the tracker that owns lifecycle state
 - [Protocol Messages](protocol-messages.md) -- WebSocket message schemas for all three layers
 - [Webhook Delivery](./webhooks/webhook-delivery.md) -- end-to-end trace of a webhook through all three tiers

@@ -34,6 +34,7 @@ import { executionsTotal, executionDurationSeconds } from '../metrics/prometheus
 import type { ObserverRegistry } from '../ws/observer-registry.js';
 import type { LogStorage } from './log-storage.js';
 import type { JobQueue } from '../queue/job-queue.js';
+import { ROUND_JOB_PREFIX } from '../pipeline/global-eval-round.js';
 import { evaluateDownstreams, checkSchedulerInvariant } from '../pipeline/needs-scheduler.js';
 import { evaluateWave } from '../pipeline/wave-scheduler.js';
 
@@ -62,6 +63,26 @@ function guardedWriteApplied(
   return (result.numUpdatedRows ?? result.numInsertedOrUpdatedRows ?? 0n) > 0n;
 }
 
+/**
+ * The value `execution_runs.workflow_repo_identifier` takes for a run: the
+ * repository that defines the workflow, but only when it is not the repository
+ * the run acted on.
+ *
+ * The narrowing has to happen exactly once per recording site, because the
+ * column and the `execution.status` forward are written from the same result —
+ * two narrowings are two chances for the DB and the wire to disagree about what
+ * "global" means. `undefined` (never `''`, never `null`) so the caller can
+ * spread it conditionally into both.
+ */
+function crossRepoWorkflowRepoOf(args: {
+  repoIdentifier: string;
+  workflowRepoIdentifier?: string | null;
+}): string | undefined {
+  return args.workflowRepoIdentifier != null && args.workflowRepoIdentifier !== args.repoIdentifier
+    ? args.workflowRepoIdentifier
+    : undefined;
+}
+
 /** Context passed to onExecutionComplete for commit status updates. */
 export interface ExecutionContext {
   workflowName: string;
@@ -73,6 +94,14 @@ export interface ExecutionContext {
   installationId?: number;
   requestId?: string;
   routingKey?: string;
+  /**
+   * The repository that DEFINES the workflow, when that is not
+   * `repoIdentifier` — a global workflow authored in one repository and
+   * dispatched against another. Set only when the two differ, so "present"
+   * marks a cross-repository global run; forwarded to the Platform on
+   * `execution.status`.
+   */
+  workflowRepoIdentifier?: string;
   /** Git branch or tag (e.g. "main", "feature/foo"). */
   ref?: string;
   /** Trigger event type (e.g. "push", "pr:open"). */
@@ -282,6 +311,13 @@ interface RunState {
   workflowName: string;
   provider: string;
   repoIdentifier: string;
+  /**
+   * The repository that DEFINES the workflow, held only when it differs from
+   * `repoIdentifier` — see {@link ExecutionContext.workflowRepoIdentifier}.
+   * Narrowing to the differing case happens once, where the run is recorded, so
+   * every forward and the DB column cannot disagree about what "global" means.
+   */
+  workflowRepoIdentifier?: string;
   sha: string;
   /** True when the run executed an uploaded local working tree (`kici run remote`). */
   localWorkingTree?: boolean;
@@ -522,8 +558,25 @@ export class ExecutionTracker {
     triggeredByAgentLabel?: string | null,
     /** Pull-request number for PR-triggered runs; null/omitted for non-PR runs. */
     prNumber?: number | null,
+    /**
+     * The repository that DEFINES the workflow, when that is not
+     * `repoIdentifier` — an organization-wide workflow authored in one
+     * repository and dispatched against another. Omitted/null for every
+     * per-repository run, where the two are the same repository.
+     */
+    workflowRepoIdentifier?: string | null,
   ): Promise<void> {
     const now = new Date();
+
+    // Narrow "a workflow repository was supplied" to "it is a DIFFERENT
+    // repository" exactly once. Everything downstream — the run row, the
+    // in-memory state, and every Platform forward built from it — reads this
+    // one value, so a null keeps meaning "the workflow lives in this run's own
+    // repository" for every per-repository run.
+    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf({
+      repoIdentifier,
+      workflowRepoIdentifier,
+    });
 
     // In-memory state
     const jobMap = new Map<
@@ -557,6 +610,7 @@ export class ExecutionTracker {
       workflowName,
       provider,
       repoIdentifier,
+      ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
       sha,
       ...(localWorkingTree && { localWorkingTree: true }),
       installationId,
@@ -610,6 +664,12 @@ export class ExecutionTracker {
         ...(triggerActorUserId != null && { trigger_actor_user_id: triggerActorUserId }),
         ...(workflowTimeoutMs != null && { workflow_timeout_ms: workflowTimeoutMs }),
         ...(checkMode != null && { check_mode: checkMode }),
+        // Only recorded when it differs from the repository the run acted on;
+        // a null keeps "the workflow lives in this run's own repo" as the
+        // meaning of the column for every per-repository run.
+        ...(crossRepoWorkflowRepo && {
+          workflow_repo_identifier: crossRepoWorkflowRepo,
+        }),
       })
       .onConflict((oc) => oc.column('run_id').doNothing())
       .execute();
@@ -643,6 +703,7 @@ export class ExecutionTracker {
         workflowName,
         provider,
         repoIdentifier,
+        ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
         sha,
         ...(localWorkingTree && { localWorkingTree: true }),
         installationId,
@@ -946,6 +1007,7 @@ export class ExecutionTracker {
         workflowName: run.workflowName,
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         ...(run.localWorkingTree && { localWorkingTree: true }),
         installationId: run.installationId,
@@ -1179,6 +1241,7 @@ export class ExecutionTracker {
         'trigger_actor_user_id',
         'check_mode',
         'local_working_tree',
+        'workflow_repo_identifier',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -1187,6 +1250,24 @@ export class ExecutionTracker {
       // Run not found in DB either — it was cleaned up (e.g. warm-start purge).
       // Skip this job status update entirely; there's nothing to track.
       logger.warn('Run not found in DB, skipping job status update', { runId, jobId, state });
+      return null;
+    }
+
+    if (dbRun.workflow_name.startsWith(ROUND_JOB_PREFIX)) {
+      // A pre-run global eval round is not a run and never becomes one: its id
+      // exists only to correlate the queue row and, when the round fails, the
+      // errored row `recordGlobalEvalRoundFailureRun` writes. Rehydrating it
+      // would undo that record — the reset below clears any non-build failure
+      // back to `running`, and the agent's round runner reports `success` even
+      // when it decided nothing, so the round would roll up as a successful run
+      // contradicting the failing check posted on the same commit. Dropping the
+      // late status is what happened before that row existed, and it is still
+      // right: nothing downstream tracks a round as a run.
+      logger.warn('Run id belongs to a global eval round, skipping job status update', {
+        runId,
+        jobId,
+        state,
+      });
       return null;
     }
 
@@ -1228,6 +1309,9 @@ export class ExecutionTracker {
       workflowName: dbRun.workflow_name,
       provider: dbRun.provider,
       repoIdentifier: dbRun.repo_identifier,
+      ...(dbRun.workflow_repo_identifier && {
+        workflowRepoIdentifier: dbRun.workflow_repo_identifier,
+      }),
       sha: dbRun.sha,
       ...(dbRun.local_working_tree === true && { localWorkingTree: true }),
       installationId,
@@ -1439,6 +1523,7 @@ export class ExecutionTracker {
         workflowName: run.workflowName,
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         installationId: run.installationId,
         requestId: run.requestId,
@@ -1502,6 +1587,7 @@ export class ExecutionTracker {
         workflowName: run.workflowName,
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         installationId: run.installationId,
         requestId: run.requestId,
@@ -1988,6 +2074,7 @@ export class ExecutionTracker {
         workflowName: run.workflowName,
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         installationId: run.installationId,
         requestId: run.requestId,
@@ -2004,6 +2091,7 @@ export class ExecutionTracker {
         workflowName: run.workflowName,
         provider: run.provider,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         installationId: run.installationId,
         requestId: run.requestId,
@@ -2108,6 +2196,7 @@ export class ExecutionTracker {
           workflowName: run.workflowName,
           provider: run.provider,
           repoIdentifier: run.repoIdentifier,
+          ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
           sha: run.sha,
           routingKey: run.routingKey,
           ref: run.ref,
@@ -2220,9 +2309,23 @@ export class ExecutionTracker {
     initFailure: InitFailure;
     triggerEvent?: string;
     commitMessage?: string;
+    /**
+     * The repository that DEFINES the workflow this run was about to execute.
+     * REQUIRED: every run has one, and a caller that does not state it must not
+     * compile. Left optional, a global dispatch path added later would record a
+     * null marker — and a null marker does not mean "unknown", it means "the
+     * workflow lives in this run's own repository", which the whole
+     * defining-repository predicate then reads as fact.
+     *
+     * Narrowed to the differing case here, exactly as `onExecutionStarted`
+     * does, so passing `repoIdentifier` (the per-repository case) is correct
+     * and records nothing.
+     */
+    workflowRepoIdentifier: string;
   }): Promise<void> {
     const now = new Date();
     const customerId = await this.resolveCustomerId(args.routingKey);
+    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
     const applied = await this.db
       .insertInto('execution_runs')
       .values({
@@ -2243,6 +2346,7 @@ export class ExecutionTracker {
         failure_reason: args.initFailure.message,
         failure_class: RunFailureClass.enum.never_started,
         init_failure: JSON.stringify(args.initFailure),
+        ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
       // run as `pending` before init failed, and leaving that row untouched
@@ -2260,6 +2364,12 @@ export class ExecutionTracker {
             failure_reason: args.initFailure.message,
             failure_class: RunFailureClass.enum.never_started,
             init_failure: JSON.stringify(args.initFailure),
+            // Restate the marker on the conflicting row too. `onExecutionStarted`
+            // narrows identically so a row it wrote already agrees, but a row
+            // written by any other path would keep a null marker — and a null
+            // marker is read as "the workflow lives in this run's own
+            // repository", not as "unknown". Only ever set, never cleared.
+            ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
           })
           .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
       )
@@ -2285,6 +2395,7 @@ export class ExecutionTracker {
         workflowName: args.workflowName,
         provider: args.provider,
         repoIdentifier: args.repoIdentifier,
+        ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
         sha: args.sha,
         routingKey: args.routingKey,
         ref: args.ref,
@@ -2322,6 +2433,110 @@ export class ExecutionTracker {
   }
 
   /**
+   * Write one `failed` execution_runs row for a global eval round that never
+   * produced verdicts.
+   *
+   * The round decides which organization-wide workflows apply to an event, so a
+   * round that fails suppresses every workflow it was deciding on. Without a row
+   * that outcome is invisible: no run was ever created for those workflows, so
+   * there is nothing on the dashboard to explain why they did not appear.
+   *
+   * **One row for the whole round, not one per workflow.** The round exists to
+   * collapse N candidate workflows into a single pre-run job; fanning its
+   * failure back out into N rows would undo exactly that. The reason names every
+   * affected workflow instead.
+   *
+   * Its `runId` is the round job's own — the last attempt's — so the row, the
+   * `dispatch_queue` row, and the attempt's logs all carry one id. No conflict
+   * guard is needed beyond `doNothing`: the id was minted for this round and
+   * belongs to no other run.
+   */
+  async recordGlobalEvalRoundFailureRun(args: {
+    runId: string;
+    workflowName: string;
+    provider: string;
+    repoIdentifier: string;
+    ref: string;
+    sha: string;
+    deliveryId: string | null;
+    providerContext: Record<string, unknown>;
+    routingKey: string;
+    failureReason: string;
+    triggerEvent?: string;
+    /**
+     * The repository whose global workflows the round was deciding. A round is
+     * definitionally the cross-repository case, so this is normally a different
+     * repository from `repoIdentifier` — recorded, like everywhere else, only
+     * when the two actually differ.
+     */
+    workflowRepoIdentifier: string;
+  }): Promise<void> {
+    const now = new Date();
+    const customerId = await this.resolveCustomerId(args.routingKey);
+    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
+    const applied = await this.db
+      .insertInto('execution_runs')
+      .values({
+        run_id: args.runId,
+        routing_key: args.routingKey,
+        customer_id: customerId,
+        workflow_name: args.workflowName,
+        provider: args.provider,
+        repo_identifier: args.repoIdentifier,
+        ref: args.ref,
+        sha: args.sha,
+        delivery_id: args.deliveryId,
+        trigger_decision: null,
+        provider_context: JSON.stringify(args.providerContext),
+        started_at: now,
+        completed_at: now,
+        status: ExecutionRunStatus.enum.failed,
+        failure_reason: args.failureReason,
+        failure_class: RunFailureClass.enum.never_started,
+        ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+      })
+      .onConflict((oc) => oc.column('run_id').doNothing())
+      .executeTakeFirst();
+
+    if (!guardedWriteApplied(applied)) {
+      logger.debug('Global eval round failure record skipped: run id already present', {
+        runId: args.runId,
+      });
+      return;
+    }
+
+    executionsTotal.add(1, { status: ExecutionRunStatus.enum.failed });
+
+    this.onExecutionStatusChange?.(
+      args.runId,
+      ExecutionRunStatus.enum.failed,
+      {
+        workflowName: args.workflowName,
+        provider: args.provider,
+        repoIdentifier: args.repoIdentifier,
+        ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
+        sha: args.sha,
+        routingKey: args.routingKey,
+        ref: args.ref,
+        triggerEvent: args.triggerEvent,
+        failureClass: RunFailureClass.enum.never_started,
+      },
+      0,
+      now.getTime(),
+      now.getTime(),
+      0,
+      args.failureReason,
+      0,
+    );
+
+    logger.info('Recorded failed execution run for a global eval round', {
+      runId: args.runId,
+      workflowName: args.workflowName,
+      reason: args.failureReason,
+    });
+  }
+
+  /**
    * Record a run paused at the workflow install gate (a `registries:` /
    * `installEnv:` protection rule returned hold / wait / queue). Writes an
    * `execution_runs` row in the `held` state — alive and resumable — so the
@@ -2354,12 +2569,20 @@ export class ExecutionTracker {
      * security hold fail-closed unreachable by the comment path.
      */
     prNumber?: number | null;
+    /**
+     * The repository that DEFINES the held workflow. REQUIRED for the same
+     * reason as on {@link ExecutionTracker.recordInitFailureRun}: a hold is a
+     * live, resumable run, so a null marker here would misattribute it for the
+     * whole time it sits in the queue and for the run it resumes into.
+     */
+    workflowRepoIdentifier: string;
   }): Promise<void> {
     const now = new Date();
     // Populate customer_id here too: the resume path reuses this held row
     // (onExecutionStarted is a no-op via ON CONFLICT), so the concurrency gate
     // must see the resumed run's real org, not the '__default__' fallback.
     const customerId = await this.resolveCustomerId(args.routingKey);
+    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
     await this.db
       .insertInto('execution_runs')
       .values({
@@ -2378,6 +2601,7 @@ export class ExecutionTracker {
         status: ExecutionRunStatus.enum.held,
         ...(args.contextName && { context: args.contextName }),
         ...(args.prNumber != null && { pr_number: args.prNumber }),
+        ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
       // run as `pending` before the install gate held it, and leaving that row
@@ -2390,6 +2614,10 @@ export class ExecutionTracker {
             status: ExecutionRunStatus.enum.held,
             ...(args.contextName && { context: args.contextName }),
             ...(args.prNumber != null && { pr_number: args.prNumber }),
+            // See the same restatement on `recordInitFailureRun`: a marker is
+            // only ever set, never cleared, so the row cannot be left claiming
+            // the workflow lives in the repository the run acted on.
+            ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
           })
           .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
       )
@@ -2402,6 +2630,7 @@ export class ExecutionTracker {
         workflowName: args.workflowName,
         provider: args.provider,
         repoIdentifier: args.repoIdentifier,
+        ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
         sha: args.sha,
         routingKey: args.routingKey,
         ref: args.ref,
@@ -2552,6 +2781,7 @@ export class ExecutionTracker {
           workflowName: run.workflowName,
           provider: run.provider,
           repoIdentifier: run.repoIdentifier,
+          ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
           sha: run.sha,
           routingKey: run.routingKey,
           ref: run.ref,
@@ -2637,7 +2867,7 @@ export class ExecutionTracker {
       }
       perJob.set(jobId, (perJob.get(jobId) ?? 0) + logBytesStreamed);
     }
-    const jobName = this.getJobName(runId, jobId) ?? jobId;
+    const jobName = await this.resolveJobName(runId, jobId);
     const logPath = `executions/${runId}/job-${jobName}/step-${stepIndex}.log`;
     const now = new Date(timestamp);
 
@@ -2758,11 +2988,13 @@ export class ExecutionTracker {
    * registered. Returns true when a token was taken, false for an unknown or
    * already-completed run (nothing to hold).
    *
-   * Three registration windows need this. A run whose source-pack `__build__`
+   * Four registration windows need this. A run whose source-pack `__build__`
    * job is dispatched first is registered with that job ALONE, and its real
-   * jobs are only dispatched once the build finishes. A deferred init job and a
-   * deferred dynamic entry each register their jobs from a fire-and-forget task
-   * that outlives the dispatch call. In every case, without a token the already
+   * jobs are only dispatched once the build finishes; a run without a build is
+   * registered with NO jobs before its dispatch loop, so its jobs land once
+   * every dispatch has returned. A deferred init job and a deferred dynamic
+   * entry each register their jobs from a fire-and-forget task that outlives
+   * the dispatch call. In every case, without a token the already
    * -registered jobs reaching a terminal state satisfies {@link isRunComplete},
    * so the run is finalized early: a terminal run status is written, the
    * provider check is posted, and the status is forwarded to the Platform — all
@@ -2777,9 +3009,13 @@ export class ExecutionTracker {
    * and an off-by-one job count for the length of the window. A counter holds
    * the completion check open without being visible to any of them, and it
    * writes no `execution_jobs` row, so it never surfaces as a phantom job.
-   * A token whose holder never settles keeps the run `running` until the stale
+   * A token whose holder never settles keeps the run open until the stale
    * detector reaps it — the same backstop that covers a job that never
-   * reports.
+   * reports. That backstop only reaches a run that has at least one job: every
+   * sub-scan of the stale detector starts from `execution_jobs` or
+   * `dispatch_queue`. So a holder that registers NO jobs must terminalize the
+   * run itself rather than rely on the sweep — which is what
+   * `dispatchMatchedWorkflow` does when its dispatch loop throws.
    *
    * Each token must be paired with exactly one {@link releasePendingJobsHold}.
    */
@@ -2842,6 +3078,52 @@ export class ExecutionTracker {
   }
 
   /**
+   * Resolve the job name that names a step-log storage path, with a durable
+   * fallback. The step-log path is `executions/{runId}/job-{jobName}/…` and it
+   * is written from two sites — the chunk writer (`log-chunk-sink`) and the
+   * `execution_steps.log_path` upsert in `onStepStatus`. A purely in-memory
+   * lookup (`getJobName`) returns `undefined` during the brief window between
+   * dispatch and `addJobsToRun` populating `run.jobs`, so an early chunk would
+   * land under `job-{jobId}` while the reader later keys on `job-{realName}` —
+   * silently losing those lines. Both write sites go through this resolver so
+   * they cannot disagree: in-memory first, then the authoritative
+   * `dispatch_queue.job_name` (the same source `recoverJobFromDispatchQueue`
+   * trusts), and only `jobId` when the job is genuinely unknown.
+   */
+  async resolveJobName(runId: string, jobId: string): Promise<string> {
+    const cached = this.runs.get(runId)?.jobs.get(jobId)?.name;
+    if (cached) return cached;
+    const queueEntry = await this.db
+      .selectFrom('dispatch_queue')
+      .select(['job_name'])
+      .where('id', '=', jobId)
+      .executeTakeFirst();
+    return queueEntry?.job_name ?? jobId;
+  }
+
+  /**
+   * Seed the in-memory job name for a job the coordinator did not itself
+   * dispatch — a worker-rerouted job. Such a job is tracked in the cluster
+   * coordinator's own map, never enters this tracker's `run.jobs` via
+   * `addJobsToRun`, and has no coordinator-owned `dispatch_queue` row (the
+   * worker owns it under a fresh id), so `resolveJobName` would fall back to
+   * the bare `jobId` for its early log chunks while the reader keys on the real
+   * name — the same split-brain that loses lines. Seeding the name here, at
+   * reroute time, makes `resolveJobName`'s fast path correct from the first
+   * relayed chunk, independent of when the worker's `dispatch_queue` row becomes
+   * visible. In-memory only: the `execution_jobs` row is still created lazily by
+   * the worker's first status update. Guarded against clobbering an existing
+   * entry so a later terminal status is never overwritten.
+   */
+  registerJobName(runId: string, jobId: string, jobName: string): void {
+    const run = this.runs.get(runId);
+    if (!run || run.jobs.has(jobId)) return;
+    // Match the RunState.jobs shape used by recoverJobFromDispatchQueue; only
+    // name + status are needed for resolveJobName's fast path.
+    run.jobs.set(jobId, { name: jobName, status: ExecutionJobStatus.enum.pending } as any);
+  }
+
+  /**
    * Find the runId of the in-memory run that owns a given dispatched jobId.
    *
    * The agent's `event.emit` message is job-scoped (it carries only the
@@ -2868,6 +3150,7 @@ export class ExecutionTracker {
       workflowName: run.workflowName,
       provider: run.provider,
       repoIdentifier: run.repoIdentifier,
+      ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
       sha: run.sha,
       installationId: run.installationId,
       routingKey: run.routingKey,
@@ -2979,6 +3262,7 @@ export class ExecutionTracker {
     status: ExecutionRunStatus;
     routingKey?: string;
     repoIdentifier?: string;
+    workflowRepoIdentifier?: string;
     sha?: string;
     ref?: string;
     triggerEvent?: string;
@@ -3008,6 +3292,7 @@ export class ExecutionTracker {
       status: ExecutionRunStatus;
       routingKey?: string;
       repoIdentifier?: string;
+      workflowRepoIdentifier?: string;
       sha?: string;
       ref?: string;
       triggerEvent?: string;
@@ -3070,6 +3355,7 @@ export class ExecutionTracker {
         status,
         routingKey: run.routingKey,
         repoIdentifier: run.repoIdentifier,
+        ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
         sha: run.sha,
         ref: run.ref,
         triggerEvent: run.triggerEvent,
@@ -3122,6 +3408,7 @@ export class ExecutionTracker {
       status: string;
       routing_key: string | null;
       repo_identifier: string;
+      workflow_repo_identifier: string | null;
       sha: string;
       ref: string;
       started_at: Date;
@@ -3144,6 +3431,7 @@ export class ExecutionTracker {
           'status',
           'routing_key',
           'repo_identifier',
+          'workflow_repo_identifier',
           'sha',
           'ref',
           'started_at',
@@ -3208,6 +3496,9 @@ export class ExecutionTracker {
         status: r.status as ExecutionRunStatus,
         ...(r.routing_key && { routingKey: r.routing_key }),
         repoIdentifier: r.repo_identifier,
+        ...(r.workflow_repo_identifier && {
+          workflowRepoIdentifier: r.workflow_repo_identifier,
+        }),
         sha: r.sha,
         ref: r.ref,
         parentRunId: r.parent_run_id,
@@ -3474,6 +3765,9 @@ export class ExecutionTracker {
         workflowName: memRun.workflowName,
         provider: memRun.provider,
         repoIdentifier: memRun.repoIdentifier,
+        ...(memRun.workflowRepoIdentifier && {
+          workflowRepoIdentifier: memRun.workflowRepoIdentifier,
+        }),
         sha: memRun.sha,
         ...(memRun.localWorkingTree && { localWorkingTree: true }),
         installationId: memRun.installationId,
@@ -3491,6 +3785,9 @@ export class ExecutionTracker {
         workflowName: memRun.workflowName,
         provider: memRun.provider,
         repoIdentifier: memRun.repoIdentifier,
+        ...(memRun.workflowRepoIdentifier && {
+          workflowRepoIdentifier: memRun.workflowRepoIdentifier,
+        }),
         sha: memRun.sha,
         ...(memRun.localWorkingTree && { localWorkingTree: true }),
         installationId: memRun.installationId,
@@ -3607,6 +3904,7 @@ export class ExecutionTracker {
         'triggered_by_agent_label',
         'trigger_actor_username',
         'trigger_actor_user_id',
+        'workflow_repo_identifier',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -3703,6 +4001,9 @@ export class ExecutionTracker {
         workflowName: dbRun.workflow_name,
         provider: dbRun.provider,
         repoIdentifier: dbRun.repo_identifier,
+        ...(dbRun.workflow_repo_identifier && {
+          workflowRepoIdentifier: dbRun.workflow_repo_identifier,
+        }),
         sha: dbRun.sha,
         installationId,
         routingKey: dbRun.routing_key ?? undefined,
@@ -3718,6 +4019,9 @@ export class ExecutionTracker {
         workflowName: dbRun.workflow_name,
         provider: dbRun.provider,
         repoIdentifier: dbRun.repo_identifier,
+        ...(dbRun.workflow_repo_identifier && {
+          workflowRepoIdentifier: dbRun.workflow_repo_identifier,
+        }),
         sha: dbRun.sha,
         installationId,
         routingKey: dbRun.routing_key ?? undefined,

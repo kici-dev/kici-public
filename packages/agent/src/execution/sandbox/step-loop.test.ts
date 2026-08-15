@@ -430,6 +430,83 @@ describe('executeStepLoop', () => {
     expect(order).toEqual([]);
   });
 
+  it('gives a step rule the global-workflow repo pair', async () => {
+    const seen: Array<{ sourceRepo?: unknown; workflowRepo?: unknown; hasKey: boolean }> = [];
+    const gatedStep: Step = {
+      ...makeStep('gated', async () => {}),
+      rules: [
+        {
+          _tag: 'Rule',
+          label: 'sees-repos',
+          check: async (ctx: { sourceRepo?: unknown; workflowRepo?: unknown }) => {
+            seen.push({
+              sourceRepo: ctx.sourceRepo,
+              workflowRepo: ctx.workflowRepo,
+              hasKey: 'sourceRepo' in ctx,
+            });
+            return true;
+          },
+        } as any,
+      ],
+    };
+
+    const { sendIpc } = collectMessages();
+    await executeStepLoop({
+      steps: [gatedStep],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      sourceRepo: { identifier: 'o/src', path: '/w/source', ref: 'main', sha: 'aaa' },
+      workflowRepo: { identifier: 'o/wf', path: '/w/workflow', ref: 'main', sha: 'bbb' },
+      startTime: Date.now(),
+    });
+
+    expect(seen).toEqual([
+      {
+        sourceRepo: { identifier: 'o/src', path: '/w/source', ref: 'main', sha: 'aaa' },
+        workflowRepo: { identifier: 'o/wf', path: '/w/workflow', ref: 'main', sha: 'bbb' },
+        hasKey: true,
+      },
+    ]);
+  });
+
+  it('leaves the repo-pair keys absent on a non-global job', async () => {
+    let hasSourceKey = true;
+    let hasWorkflowKey = true;
+    const gatedStep: Step = {
+      ...makeStep('gated', async () => {}),
+      rules: [
+        {
+          _tag: 'Rule',
+          label: 'no-repos',
+          check: async (ctx: object) => {
+            hasSourceKey = 'sourceRepo' in ctx;
+            hasWorkflowKey = 'workflowRepo' in ctx;
+            return true;
+          },
+        } as any,
+      ],
+    };
+
+    const { sendIpc } = collectMessages();
+    await executeStepLoop({
+      steps: [gatedStep],
+      createStepContext: () => stubStepContext(),
+      sendIpc,
+      defaultTimeoutMs: 30_000,
+      outputsMap: new Map(),
+      event: {},
+      env: {},
+      startTime: Date.now(),
+    });
+
+    expect(hasSourceKey).toBe(false);
+    expect(hasWorkflowKey).toBe(false);
+  });
+
   it('invokes onFailure with stepIndex >= steps.length when a step fails', async () => {
     const calls: Array<{ stepIndex: number; stepName: string }> = [];
     const captureFactory = (stepIndex: number, stepName: string): StepContext => {

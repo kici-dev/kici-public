@@ -35,7 +35,7 @@ describeDb('migration 077_backup_runs', () => {
     await adminPool.end();
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await db.destroy();

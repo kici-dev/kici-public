@@ -29,9 +29,9 @@ Run the standalone reaper on the affected host:
 kici-admin scaler reap-orphans
 ```
 
-The command loads the orchestrator's local config, reconstructs the Firecracker
-scaler backends without a running orchestrator or database, and frees leaked
-resources. It is the supported recovery path — no manual `chown` / `rm` of chroot
+The command loads the orchestrator's local config, reconstructs the scaler
+backends without a running orchestrator or database, and frees leaked resources.
+It is the supported recovery path — no manual `chown` / `rm` of chroot
 directories is needed.
 
 What it does:
@@ -42,6 +42,11 @@ What it does:
 - **Reclaims ownership first.** On rootless nodes the reaper reclaims ownership of
   each leaked chroot before deleting it, so disk owned by the jailer's subuid is
   actually freed.
+- **Also sweeps container scalers, unconditionally.** Once the health gate has
+  passed, every `container` scaler on the host is swept too, and that sweep
+  removes **every** agent container it manages — there is no per-container
+  liveness check, unlike the Firecracker pass. The health gate is what makes this
+  safe: it only runs when the orchestrator is down.
 - **No-ops while healthy.** The command probes the local orchestrator health
   endpoint. If the orchestrator is up and healthy, the command prints a notice and
   exits without doing anything — the running orchestrator already reaps its own
@@ -50,7 +55,9 @@ What it does:
 Useful flags:
 
 - `--force` — skip the health gate and reap even if the orchestrator reports
-  healthy.
+  healthy. Use it only on a node you know is wedged: it bypasses the one check
+  that protects the unconditional container sweep, so on a healthy node it kills
+  running agent containers.
 - `--config <path>` — point at a non-default orchestrator config location (also
   honoured via the `KICI_CONFIG` environment variable).
 - `--json` — emit machine-readable counts, for scripting and host timers.

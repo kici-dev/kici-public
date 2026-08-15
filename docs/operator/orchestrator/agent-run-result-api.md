@@ -118,6 +118,12 @@ or `null` when the last line has been returned.
 }
 ```
 
+A global workflow's pre-run evaluation round is readable here too. Such a round decides
+whether a run happens at all, so when it admits its candidates it records no run of its
+own — its `runId` is resolved from the dispatch queue instead. The token's routing-key
+scope is enforced exactly the same way, and a `runId` that belongs to neither an
+execution nor the dispatch queue still returns `404`.
+
 ## Derived failure category
 
 `failureCategory` is a trusted, coarse classification derived from data KiCI already

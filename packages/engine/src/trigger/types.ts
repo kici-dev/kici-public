@@ -29,6 +29,10 @@
  * Schema version 30 (BREAKING): renames job-level `environments` to `contexts`.
  * Schema version 31 (additive): adds the workflows_failed_batch lock trigger.
  * Schema version 32 (additive): adds LockJob.sandbox (per-job escape-hatch request).
+ * Schema version 33 (additive): adds `requires` (declarative static content filter) to the push/pr/tag git-event triggers.
+ * Schema version 34 (additive): adds LockWorkflow.hasFilter (workflow-level pre-dispatch filter predicate).
+ * Schema version 35 (additive): adds `commitMessage` (LockTextMatch) to the push/pr/tag
+ *   git-event triggers, and contains/notContains/notMatches to LockContentRequirement.
  */
 
 import { z } from 'zod';
@@ -44,7 +48,7 @@ import { isFailureStatus } from '../status/presentation.js';
  * schema change (additive or breaking); the bump-history comment above records
  * which. See `BREAKING_FLOOR` for the compatibility-window semantics.
  */
-export const SCHEMA_VERSION = 32 as const;
+export const SCHEMA_VERSION = 35 as const;
 
 /**
  * Oldest lock schema version this codebase can still read correctly — the lower
@@ -58,8 +62,8 @@ export const SCHEMA_VERSION = 32 as const;
  * Bump rule: move this to the current `SCHEMA_VERSION` ONLY in the commit that
  * lands a `BREAKING` schema change (see the bump-history convention above). It
  * currently sits at 30 because v30 (`environments`→`contexts`) was the most
- * recent breaking bump; v31 and v32 were additive, so a v30 lock still reads
- * correctly.
+ * recent breaking bump; v31 through v35 were additive, so a v30 lock still
+ * reads correctly.
  */
 export const BREAKING_FLOOR = 30 as const;
 
@@ -101,6 +105,136 @@ export interface LockBranchPattern {
 }
 
 /**
+ * A declarative query over one piece of text: literal substrings and/or a
+ * regex, in either direction. Pure DATA the orchestrator interprets — never
+ * author code — so it is safe to evaluate inside the orchestrator under the
+ * execution-purity model.
+ *
+ * Every entry in a list is a CONJUNCT: `contains: [a, b]` means the text
+ * contains `a` AND contains `b`. OR is expressed by declaring two triggers,
+ * since a workflow's trigger list is already "first match wins".
+ *
+ * This is the SDK-facing shape a workflow author writes; the compiler
+ * normalizes it to {@link LockTextMatch}.
+ */
+export interface TextMatch {
+  /** Literal substring(s). Every entry must be present. */
+  readonly contains?: string | readonly string[];
+  /** Literal substring(s). No entry may be present. */
+  readonly notContains?: string | readonly string[];
+  /** Regex(es), as a RegExp or a `/pattern/flags` string. Every one must match. */
+  readonly matches?: string | RegExp | readonly (string | RegExp)[];
+  /** Regex(es). None may match. */
+  readonly notMatches?: string | RegExp | readonly (string | RegExp)[];
+  /**
+   * Case-insensitive comparison for `contains`/`notContains` ONLY. Default false.
+   * It deliberately does not touch the regex keys: a regex already carries its
+   * own flags, and injecting `i` into a pattern whose author omitted it would
+   * silently change its meaning.
+   */
+  readonly ignoreCase?: boolean;
+}
+
+/**
+ * Lock-file form of {@link TextMatch}. The compiler normalizes every key to a
+ * flat array, and every regex to a `/pattern/flags` string, so the orchestrator
+ * matcher has exactly one shape to interpret.
+ */
+export interface LockTextMatch {
+  readonly contains?: readonly string[];
+  readonly notContains?: readonly string[];
+  /** Always in `/pattern/flags` form. */
+  readonly matches?: readonly string[];
+  /** Always in `/pattern/flags` form. */
+  readonly notMatches?: readonly string[];
+  readonly ignoreCase?: boolean;
+}
+
+/**
+ * How a file's bytes are parsed before a content query runs.
+ * `auto` picks by extension: `.json` → json, `.yaml`/`.yml` → yaml, else text.
+ */
+export type ContentFormat = 'json' | 'yaml' | 'text' | 'auto';
+
+/**
+ * Declarative static content filter: a query over the bytes of one source file
+ * at the event's ref. Pure DATA the orchestrator's own matcher interprets — never
+ * author code — so it is safe to evaluate in the orchestrator (Part B of the
+ * execution-purity model). Query keys
+ * (`exists`/`match`/`not`/`contains`/`notContains`/`matches`/`notMatches`) are
+ * AND-ed within an entry; `absent` is mutually exclusive with them and passes
+ * only when the file is missing.
+ *
+ * This is the SDK-facing shape a workflow author writes, which accepts a scalar
+ * or `RegExp` where the lock form ({@link LockContentRequirement}) carries a flat
+ * array of `/pattern/flags` strings — the compiler normalizes one to the other.
+ */
+export interface ContentRequirement {
+  /** Repo-relative path of the file to query. */
+  readonly file: string;
+  /** Parse format; defaults to `auto` when unset. */
+  readonly format?: ContentFormat;
+  /** JSONPath expressions that must each resolve to ≥1 node (json/yaml only). */
+  readonly exists?: readonly string[];
+  /** JSONPath → expected-value map; every expression must match (json/yaml only). */
+  readonly match?: Record<string, unknown>;
+  /** JSONPath → value map; passes only when NONE match (json/yaml only). */
+  readonly not?: Record<string, unknown>;
+  /** Literal substring(s) that must ALL be present in the raw file text. */
+  readonly contains?: string | readonly string[];
+  /** Literal substring(s) of which NONE may be present in the raw file text. */
+  readonly notContains?: string | readonly string[];
+  /** Regex(es) that must ALL match the raw file text (RegExp or `/pattern/flags`). */
+  readonly matches?: string | RegExp | readonly (string | RegExp)[];
+  /** Regex(es) of which NONE may match the raw file text. */
+  readonly notMatches?: string | RegExp | readonly (string | RegExp)[];
+  /** Case-insensitive `contains`/`notContains`. Default false. */
+  readonly ignoreCase?: boolean;
+  /** When true, the entry passes only if the file is absent. Excludes all query keys. */
+  readonly absent?: boolean;
+}
+
+/**
+ * Lock-file form of {@link ContentRequirement}. The compiler normalizes each
+ * raw-text key to the flat {@link LockTextMatch} shape, so the orchestrator
+ * matcher has one shape to interpret.
+ */
+export interface LockContentRequirement {
+  readonly file: string;
+  readonly format?: ContentFormat;
+  readonly exists?: readonly string[];
+  readonly match?: Record<string, unknown>;
+  readonly not?: Record<string, unknown>;
+  readonly contains?: readonly string[];
+  readonly notContains?: readonly string[];
+  readonly matches?: readonly string[];
+  readonly notMatches?: readonly string[];
+  readonly ignoreCase?: boolean;
+  readonly absent?: boolean;
+}
+
+/**
+ * Resolve a content requirement's parse format to a concrete value. An explicit
+ * non-`auto` format is returned as-is; `auto` (or unset) is resolved by the file
+ * extension: `.json` → json, `.yaml`/`.yml` → yaml, everything else text.
+ *
+ * Yaml-free (pure string logic) so it lives in the browser-safe barrel and is
+ * the single source of truth for both the compiler's compile-time serializer and
+ * the orchestrator's eval-time matcher — the two can never disagree about how a
+ * file's format is picked.
+ */
+export function resolveContentFormat(
+  file: string,
+  format: ContentFormat | undefined,
+): 'json' | 'yaml' | 'text' {
+  if (format && format !== 'auto') return format;
+  const lower = file.toLowerCase();
+  if (lower.endsWith('.json')) return 'json';
+  if (lower.endsWith('.yaml') || lower.endsWith('.yml')) return 'yaml';
+  return 'text';
+}
+
+/**
  * PR trigger in lock file.
  * Optimized for orchestrator event matching - flat structure with all filters accessible.
  */
@@ -111,6 +245,10 @@ export interface LockPrTrigger {
   readonly sourceBranches: readonly LockBranchPattern[];
   readonly paths: readonly string[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: LockTextMatch;
 }
 
 /**
@@ -122,6 +260,10 @@ export interface LockPushTrigger {
   readonly branches: readonly LockBranchPattern[];
   readonly paths: readonly string[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: LockTextMatch;
 }
 
 /**
@@ -132,6 +274,10 @@ export interface LockTagTrigger {
   readonly _type: 'tag';
   readonly patterns: readonly LockBranchPattern[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: LockTextMatch;
 }
 
 /**
@@ -490,18 +636,28 @@ export function isLockParallelStep(entry: LockStepEntry): entry is LockParallelS
 }
 
 /**
- * Inline expression value for pure dynamic functions.
- * The compiler serializes pure functions as { _type: 'inline', expression: '(event) => ...' }
- * and the orchestrator evaluates them via vm.runInNewContext at dispatch time.
- * struct with discriminant and expression field.
- * _type: 'inline' alongside existing 'static' and 'dynamic' discriminants.
+ * Serialized inline expression for a dynamic env/context/concurrencyGroup
+ * field, shaped as `{ _type: 'inline', expression: '(event) => ...' }`
+ * alongside the existing 'static' and 'dynamic' discriminants.
+ *
+ * @deprecated Schema v11 inline expressions are no longer evaluated in the
+ * orchestrator. Dynamic env/context/concurrencyGroup fields are resolved on the
+ * eval agent's init-runner. The compiler no longer emits this type; readers keep
+ * recognizing it only to defer an old lock's field to the init round. Removed at
+ * the next major (v1.0.0).
  */
 export interface LockInlineValue {
   readonly _type: 'inline';
   readonly expression: string;
 }
 
-/** Type guard for inline expression values */
+/**
+ * Type guard for inline expression values.
+ *
+ * @deprecated See {@link LockInlineValue}. Retained only so a reader can
+ * recognize an old lock's inline field and defer it to the eval agent's
+ * init-runner. Removed at the next major (v1.0.0).
+ */
 export function isLockInlineValue(value: unknown): value is LockInlineValue {
   return (
     typeof value === 'object' && value !== null && (value as LockInlineValue)._type === 'inline'
@@ -691,18 +847,25 @@ export interface LockJob {
   readonly rules?: readonly LockRule[];
   readonly description?: string;
   /**
-   * Bound contexts in merge order. Each entry is a static name or inline
-   * expression (pure function); `dynamic` is set when it is a function resolved at
-   * two-phase eval. Later entries override earlier ones on name collisions.
+   * Bound contexts in merge order. Each entry is a static name; `dynamic` is set
+   * when it is a function resolved on the eval agent's init-runner. Later entries
+   * override earlier ones on name collisions. The `LockInlineValue` shape is a
+   * deprecated form still accepted from old locks (see {@link LockInlineValue}).
    */
   readonly contexts?: ReadonlyArray<{ value: string | LockInlineValue; dynamic: boolean }>;
-  /** Static environment variables or inline expression (pure function). */
+  /**
+   * Static environment variables. A deprecated `LockInlineValue` shape is still
+   * accepted from old locks (see {@link LockInlineValue}).
+   */
   readonly env?: Record<string, string> | LockInlineValue;
-  /** When true, env is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
+  /** When true, env is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicEnv?: boolean;
-  /** Concurrency group name (static string) or inline expression (pure function). */
+  /**
+   * Concurrency group name (static string). A deprecated `LockInlineValue` shape
+   * is still accepted from old locks (see {@link LockInlineValue}).
+   */
   readonly concurrencyGroup?: string | LockInlineValue;
-  /** When true, concurrencyGroup is dynamic (function) -- resolved at orchestrator two-phase eval or inline. */
+  /** When true, concurrencyGroup is dynamic (function) -- resolved on the eval agent's init-runner. */
   readonly dynamicConcurrencyGroup?: boolean;
   /** Total job wall-clock timeout in milliseconds (init + all steps + hooks). Threaded to the agent via jobConfig. */
   readonly timeout?: number;
@@ -818,6 +981,13 @@ export interface LockWorkflow {
   readonly timeout?: number;
   /** Normalized approval gate; when set the whole run is held before any job dispatches. */
   readonly approval?: LockApproval;
+  /**
+   * True when the workflow declares a `filter` predicate. A bare flag, not a
+   * source reference: `LockWorkflow.source` already identifies the module and
+   * export, so the eval agent loads it and reads `.filter` off the workflow
+   * object. Mirrors the `dynamicEnv` / `dynamicConcurrencyGroup` convention.
+   */
+  readonly hasFilter?: boolean;
 }
 
 /**
@@ -833,7 +1003,7 @@ export interface LockWorkflow {
  * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
  * v9 adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
  * v10 removes notRepos/notPaths fields; negative patterns use ! prefix in repos/paths arrays.
- * v11 adds LockInlineValue type for pure function inline evaluation.
+ * v11 adds the LockInlineValue type (deprecated; inline dynamic fields are resolved on the eval agent).
  * v12 adds workflow-level registries and installEnv for private npm registry auth.
  * v13 adds job-level and workflow-level timeout.
  */
@@ -923,6 +1093,13 @@ export interface SimulatedEvent {
    * to the previous owner.
    */
   senderUserId?: string;
+  /**
+   * Text a `commitMessage` trigger filter is tested against: the full head-commit
+   * message for push/tag, or PR title + body for pull-request events. Absent when
+   * the provider payload carries none — which a `commitMessage` filter treats as
+   * INDETERMINATE (fail-visible), never as an empty string.
+   */
+  commitMessage?: string;
   /** Repository identifier where the event occurred (e.g., "owner/repo").
    *  Used by global workflow repo pattern matching. */
   sourceRepo?: string;

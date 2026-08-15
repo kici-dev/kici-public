@@ -8,6 +8,7 @@ import {
   stepStatusForwardSchema,
   jobStatusForwardSchema,
   stateReplaySchema,
+  REPO_IDENTIFIER_MAX,
 } from './execution-status.js';
 import {
   sourceRegistrationSchema,
@@ -262,6 +263,20 @@ export const staleCheckrunCleanupSchema = z.object({
       repoIdentifier: z.string(),
       sha: z.string(),
       workflowName: z.string(),
+      /**
+       * The repository that DEFINES the workflow, when that is not the
+       * repository the run acted on — an organization-wide workflow dispatched
+       * against another repository. The orchestrator qualifies the check-run
+       * names it looks for with it, so a cleanup cannot time out the acted-on
+       * repository's own same-named check; see the orchestrator's
+       * `workflowLabel`.
+       *
+       * Additive and optional. The Platform sends it on exactly the condition
+       * that writes the mirror column — only when the two repositories differ —
+       * so an absent field and a value equal to `repoIdentifier` mean the same
+       * thing and both name the unqualified check.
+       */
+      workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
       jobNames: z.array(z.string()),
     }),
   ),

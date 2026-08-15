@@ -21,7 +21,10 @@ function makeInfo(deliveryId: string): WebhookInfo {
 function makeDeps(claim: (id: string) => Promise<boolean>) {
   return {
     dedup: { claim: vi.fn(claim), exists: vi.fn(), mark: vi.fn(), cleanup: vi.fn() },
-    providerRegistry: { getByRoutingKey: () => undefined },
+    // `getRoutingKeys` is read by the unknown-provider warn line, which names
+    // what WAS registered — the one fact that turns "we dropped your delivery"
+    // into a diagnosable event.
+    providerRegistry: { getByRoutingKey: () => undefined, getRoutingKeys: () => [] },
   } as unknown as Parameters<typeof processWebhook>[1];
 }
 

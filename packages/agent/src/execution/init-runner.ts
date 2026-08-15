@@ -1,11 +1,13 @@
-import type { Workflow, Job } from '@kici-dev/sdk';
-import { isDynamicJobFn } from '@kici-dev/sdk';
+import type { $ as Shell } from 'zx';
+import type { Workflow, Job, RepoInfo } from '@kici-dev/sdk';
+import { isDynamicJobFn, createFilterContext } from '@kici-dev/sdk';
 import {
   expandMatrix,
   applyIncludeExclude,
   matrixCombinationCount,
   MatrixShapeError,
   MAX_MATRIX_MATERIALIZATION,
+  type ChangedFilesStatus,
   type MatrixValues,
 } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
@@ -24,6 +26,91 @@ export interface InitResult {
    * The orchestrator re-materializes these into N execution jobs at dispatch.
    */
   matrixValues?: MatrixValues[];
+  /**
+   * Verdict of the workflow-level `filter`, set only when the init job was asked
+   * to evaluate one (`flags.hasFilter`). `false` means the workflow does not
+   * apply and its job must not be dispatched.
+   *
+   * Optional on purpose: an agent that predates the filter never sets it, so the
+   * orchestrator reads absence as "no verdict was reported", never as "suppress".
+   */
+  filterPassed?: boolean;
+}
+
+/**
+ * Everything a workflow-level `filter` needs beyond the workflow module and the
+ * event. Supplied by the caller because none of it is derivable here: the source
+ * tree lives wherever the init job materialized it, and the diff is ground truth
+ * from that same clone.
+ */
+export interface FilterEvalInput {
+  /** The repo whose event triggered this evaluation. */
+  sourceRepo: RepoInfo;
+  /** The repo that registered the workflow — identical to `sourceRepo` here. */
+  workflowRepo: RepoInfo;
+  changedFiles: string[];
+  changedFilesStatus: ChangedFilesStatus;
+  env?: Record<string, string | undefined>;
+  /** zx shell handed to the filter. Defaults to the ambient `$`. */
+  $?: typeof Shell;
+}
+
+/**
+ * Run a workflow's `filter` and report whether the workflow applies.
+ *
+ * Shared by both agent-side evaluation sites for a same-repo workflow: the init
+ * job that gates each static job's dispatch, and the dynamic-eval job that gates
+ * whether a generator runs at all. Both must reach the same verdict from the same
+ * inputs, so neither builds the context itself.
+ *
+ * The context is built through `createFilterContext` rather than as an object
+ * literal: the factory installs `changedFiles` as a throwing getter, so a filter
+ * that reads the diff on an event that has none fails loudly instead of seeing an
+ * empty list. A `false` verdict dispatches none of the workflow's own jobs, so a
+ * silently-empty diff would suppress it on a mistake. On this same-repo path the
+ * verdict is at least recoverable — the run row exists, carrying the `__init__*`
+ * jobs, and this evaluation's own step log records the verdict; it is the
+ * organization-wide path, which runs elsewhere, that leaves nothing behind.
+ *
+ * A throwing filter propagates: the evaluating job fails, which surfaces as a
+ * failed run. "Could not decide" is never treated as "do not run" — that would
+ * be a false green, the same reasoning `buildJobRuleCompletion` applies to a rule
+ * whose `check()` threw.
+ */
+export async function evaluateWorkflowFilter(
+  workflow: Workflow,
+  event: Record<string, unknown>,
+  input: FilterEvalInput | undefined,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (typeof workflow.filter !== 'function') {
+    throw new Error(
+      `Workflow '${workflow.name}' is recorded as declaring a filter, but its module ` +
+        `exports none — the lock file is out of date. Run 'kici compile' and commit the result.`,
+    );
+  }
+  if (!input) {
+    throw new Error(
+      `Workflow '${workflow.name}' declares a filter but the evaluating job supplied no ` +
+        `filter context (source tree / changed files) to evaluate it against.`,
+    );
+  }
+  const filterFn = workflow.filter;
+  const ctx = createFilterContext({
+    sourceRepo: input.sourceRepo,
+    workflowRepo: input.workflowRepo,
+    event,
+    changedFiles: input.changedFiles,
+    changedFilesStatus: input.changedFilesStatus,
+    ...(input.env && { env: input.env }),
+    ...(input.$ && { $: input.$ }),
+  });
+  const verdict = await withTimeout(
+    () => filterFn(ctx),
+    timeoutMs,
+    `filter for workflow '${workflow.name}'`,
+  );
+  return Boolean(verdict);
 }
 
 /**
@@ -50,11 +137,17 @@ function findJobByName(workflow: Workflow, jobName: string): Job {
  * -: If a dynamic function returns undefined/null, the field is left undefined.
  * -: Each dynamic function call is wrapped in a timeout (default 60s).
  *
+ * A workflow-level `filter` is evaluated FIRST when `flags.hasFilter` is set. A
+ * `false` verdict returns immediately: no job of that workflow will be
+ * dispatched, so evaluating this one's dynamic fields would run customer code
+ * whose result nothing can consume.
+ *
  * @param workflow - The extracted Workflow object
  * @param jobName - Name of the job whose dynamic fields to evaluate
  * @param event - Normalized event envelope — same shape every dynamic-function call site receives.
  * @param flags - Which fields are dynamic and need evaluation
  * @param timeoutMs - Timeout per dynamic function call (default 60_000ms)
+ * @param filterInput - Source tree + diff the workflow's `filter` reads. Required when `flags.hasFilter`.
  */
 export async function evaluateDynamicFields(
   workflow: Workflow,
@@ -65,11 +158,19 @@ export async function evaluateDynamicFields(
     dynamicEnv: boolean;
     dynamicConcurrencyGroup: boolean;
     dynamicMatrix?: boolean;
+    hasFilter?: boolean;
   },
   timeoutMs: number = 60_000,
+  filterInput?: FilterEvalInput,
 ): Promise<InitResult> {
-  const job = findJobByName(workflow, jobName);
   const result: InitResult = {};
+
+  if (flags.hasFilter) {
+    result.filterPassed = await evaluateWorkflowFilter(workflow, event, filterInput, timeoutMs);
+    if (!result.filterPassed) return result;
+  }
+
+  const job = findJobByName(workflow, jobName);
 
   if (flags.dynamicMatrix && typeof job.matrix === 'function') {
     const matrixContext = {

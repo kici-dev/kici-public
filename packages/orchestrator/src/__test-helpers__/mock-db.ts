@@ -84,6 +84,10 @@ export interface MockDbMocks {
   insertExecute: ReturnType<typeof vi.fn>;
   insertExecuteTakeFirstOrThrow: ReturnType<typeof vi.fn>;
   onConflict: ReturnType<typeof vi.fn>;
+  /** The upsert's ON CONFLICT DO UPDATE SET payload — shared across both the
+   *  column() and columns() shapes, so a test can assert what an existing row
+   *  is actually updated with. */
+  doUpdateSet: ReturnType<typeof vi.fn>;
 
   // Update chain
   updateTable: ReturnType<typeof vi.fn>;
@@ -273,9 +277,16 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
     innerJoin: vi.fn().mockImplementation(() => selectFromReturn),
     leftJoin: vi.fn().mockImplementation(() => selectFromReturn),
     // `.where()` applied before `.select()` (filter builders that narrow the
-    // base query) chains back to the same object so a following `.select()`
-    // still reaches the terminal.
-    where: vi.fn().mockImplementation(() => selectFromReturn),
+    // base query, and any query whose projection depends on the caller) chains
+    // back to the same object so a following `.select()` still reaches the
+    // terminal. It records through the SAME spy as the post-projection
+    // `.where()`: a predicate is a predicate whichever side of `.select()` it
+    // was added on, and a test counting predicates must not silently miss the
+    // ones added first.
+    where: vi.fn().mockImplementation((...args: any[]) => {
+      selectTerminal.where(...args);
+      return selectFromReturn;
+    }),
   };
   const selectFrom = vi.fn().mockReturnValue(selectFromReturn);
 
@@ -297,25 +308,31 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   });
 
   // Shared terminal for conflict resolution chains (doUpdateSet/doNothing)
+  // ONE shared doUpdateSet spy across both the column() and columns() shapes:
+  // a fresh spy per call is unobservable, so nothing could assert what an
+  // upsert writes on the conflict branch — which is the branch that runs
+  // whenever the row already exists, i.e. almost always.
+  const doUpdateSet = vi.fn();
   const conflictTerminal = {
     execute: vi.fn().mockResolvedValue(undefined),
     executeTakeFirst: insertExecuteTakeFirst,
     where: vi.fn(),
   } as Record<string, any>;
   conflictTerminal.where = vi.fn().mockReturnValue(conflictTerminal);
+  doUpdateSet.mockReturnValue(conflictTerminal);
 
   const onConflict = vi.fn().mockImplementation((cb: Function) => {
     if (typeof cb === 'function') {
       cb({
         column: vi.fn().mockReturnValue({
-          doUpdateSet: vi.fn().mockReturnValue(conflictTerminal),
+          doUpdateSet,
           doNothing: vi.fn().mockReturnValue({
             returning: insertReturningFn,
             executeTakeFirstOrThrow: insertExecuteTakeFirstOrThrow,
           }),
         }),
         columns: vi.fn().mockReturnValue({
-          doUpdateSet: vi.fn().mockReturnValue(conflictTerminal),
+          doUpdateSet,
           doNothing: vi.fn().mockReturnValue({
             returning: insertReturningFn,
             executeTakeFirstOrThrow: insertExecuteTakeFirstOrThrow,
@@ -407,6 +424,7 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
     insertExecute,
     insertExecuteTakeFirstOrThrow,
     onConflict,
+    doUpdateSet,
 
     updateTable,
     updateSet,

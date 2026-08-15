@@ -64,7 +64,7 @@ job('deploy-review', {
 });
 ```
 
-A pure function like the one above (see [Dynamic values](dynamic-values.md)) is evaluated inline at dispatch with no init-job overhead. Dynamic contexts that match a glob pattern (e.g., `review/*`) inherit the pattern's configuration, variables, and protection rules.
+A dynamic context function like the one above (see [Dynamic values](dynamic-values.md)) is resolved on the eval agent's init step before the job runs. Dynamic contexts that match a glob pattern (e.g., `review/*`) inherit the pattern's configuration, variables, and protection rules.
 
 ### Multiple contexts per job
 

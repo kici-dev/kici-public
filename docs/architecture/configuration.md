@@ -310,12 +310,13 @@ The `ProviderRegistry` maps routing keys to provider bundles. Each routing key (
 - `WebhookNormalizer` (required) -- normalizes incoming webhooks to a standard format
 - `LockFileFetcher` -- fetches lock files from the repository
 - `ChangedFilesFetcher` -- determines which files changed
+- `FileContentsFetcher` -- reads arbitrary repository files at a ref, for the declarative content-requirements (`requires`) filter
 - `CloneTokenProvider` -- generates clone tokens for agents
 - `RepoUrlBuilder` -- builds clone URLs and raw file URLs
 - `ContributorResolver` -- resolves contributor permissions for trust-tier gating
 - `CheckStatusPoster` -- posts check statuses (approval/hold) to the git provider
 
-A GitHub App source populates all seven. A plain generic webhook source carries only the normalizer -- it has no repository API to fetch a lock file, resolve a contributor, or post a check against -- so the pipeline skips the stages whose interface is absent rather than failing the delivery.
+A GitHub App source populates all eight -- though the file-contents capability arrives as a per-delivery factory rather than a prebuilt instance, because a GitHub client is scoped to one installation and the installation id is only known once the delivery's credentials are resolved. A plain generic webhook source carries only the normalizer -- it has no repository API to fetch a lock file, resolve a contributor, or post a check against -- so the pipeline skips the stages whose interface is absent rather than failing the delivery.
 
 Provider registrations are managed via the `sources` database table, not via `SharedConfig`. When the orchestrator connects to the Platform relay, it reads source records from the DB and sends `source.register` messages. Changes to sources (add/remove) are detected via PostgreSQL LISTEN/NOTIFY on the `sources_change` channel and pushed to the Platform via `source.secrets` and `source.register`/`source.deregister`.
 

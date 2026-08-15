@@ -114,6 +114,36 @@ const baseSchema = z.object({
   lockfileCacheMax: z.coerce.number().default(500),
   lockfileCacheTtlMs: z.coerce.number().default(3_600_000), // 1 hour
   lockfileCacheMaxBytes: z.coerce.number().default(64 * 1024 * 1024), // 64 MiB
+  // Content-requirements cache (Tier-1 `requires` static content filter). Keyed
+  // by (repo, sha, path), content-addressable by construction. Sizing mirrors
+  // the lock-file cache.
+  contentCacheMax: z.coerce.number().default(500),
+  contentCacheTtlMs: z.coerce.number().default(3_600_000), // 1 hour
+  contentCacheMaxBytes: z.coerce.number().default(64 * 1024 * 1024), // 64 MiB
+  // Tier-2 global eval round. One pre-run job per (event x workflow repo) runs
+  // each candidate global workflow's `filter` and then its generators on a
+  // shared dual checkout. The two budgets are handed to the agent on every
+  // round, so an operator override lands on the next push; the cache size is
+  // structural to its LRU and applies at the next restart.
+  globalEvalRoundTimeoutMs: z.coerce.number().default(120_000), // 2 minutes
+  globalEvalCandidateTimeoutMs: z.coerce.number().default(20_000), // 20 seconds
+  globalEvalCacheMax: z.coerce.number().default(500),
+  // The orchestrator's own ceiling on awaiting a round. The two budgets above
+  // are enforced by the AGENT and only start once the round job is running, so
+  // neither bounds a round that never reached an agent (an empty init-runner
+  // fleet queues the job, which counts as accepted) or an agent that wedged
+  // before its own budget started. Webhook processing awaits the round inline,
+  // so without this ceiling that delivery blocks forever and never reaches the
+  // event log. Set above `globalEvalRoundTimeoutMs` — 4 minutes leaves the
+  // agent its 2-minute round budget plus checkout time. ONE attempt still
+  // fires before the relay force-releases its admitted-pipeline slot at 5
+  // minutes; the round is retried once, so a group whose agent never answers
+  // spends up to 8 minutes and does cross that mark. Crossing it costs relay
+  // concurrency, not the delivery: the force-release drops the admission slot
+  // while the pipeline promise keeps running and still writes the event-log
+  // row. An operator who needs both attempts inside the 5-minute window sets
+  // this knob below 150s and lowers the round budget with it.
+  globalEvalWaitTimeoutMs: z.coerce.number().default(240_000), // 4 minutes
   // Dispatch queue
   queueMaxDepth: z.coerce.number().default(1000),
   queueTimeoutMs: z.coerce.number().default(3_600_000), // 1 hour, 0 = indefinite
@@ -123,6 +153,18 @@ const baseSchema = z.object({
    * is the `unroutable_grace_ms` cluster setting. 0 = fast-fail disabled.
    */
   unroutableGraceMs: z.coerce.number().default(120_000),
+  /**
+   * Fleet-wide default for the global-workflows master switch. Cluster default;
+   * the live value is the `global_workflows_enabled` cluster setting, and NULL
+   * there means this value applies.
+   *
+   * Defaults to false: a global workflow runs against events from repos other
+   * than the one that defines it, so it is opt-in by the operator.
+   */
+  globalWorkflowsEnabled: z
+    .union([z.boolean(), z.string()])
+    .default(false)
+    .transform((v) => (typeof v === 'boolean' ? v : v === 'true')),
   /**
    * Operator-facing backpressure warning threshold for the dispatch queue.
    * When pending-queue depth stays at or above this value for at least two
@@ -196,6 +238,14 @@ const baseSchema = z.object({
   ingestOverflowReplayBatch: z.coerce.number().int().min(1).default(50),
   // ingestOverflowMaxAttempts: replay attempts before a row goes `failed`.
   ingestOverflowMaxAttempts: z.coerce.number().int().min(1).default(10),
+  // ingestOverflowClaimTimeoutMs: how long a `replaying` claim may stand before
+  // the drain pass reclaims the row. A worker killed mid-pipeline leaves its
+  // row claimed with nothing to release it, so without this the delivery is
+  // stranded rather than durably queued. The default sits above the 600s
+  // cacheBuildTimeoutMs with headroom, because reclaiming a row whose pipeline
+  // is merely slow would re-run work still in flight. Fleet-wide override in
+  // cluster_settings.ingest_overflow_claim_timeout_ms.
+  ingestOverflowClaimTimeoutMs: z.coerce.number().int().min(60_000).default(900_000),
   // Cluster-wide defaults for the cross-peer reroute subsystem. Per-org
   // overrides live in org_settings.reroute_spawn_window_ms /
   // reroute_ack_timeout_ms / reroute_max_hops (set via kici-admin org-settings).
@@ -878,9 +928,17 @@ export const envDef = defineEnv({
     lockfileCacheMax: 'KICI_LOCKFILE_CACHE_MAX',
     lockfileCacheTtlMs: 'KICI_LOCKFILE_CACHE_TTL_MS',
     lockfileCacheMaxBytes: 'KICI_LOCKFILE_CACHE_MAX_BYTES',
+    contentCacheMax: 'KICI_CONTENT_CACHE_MAX',
+    contentCacheTtlMs: 'KICI_CONTENT_CACHE_TTL_MS',
+    contentCacheMaxBytes: 'KICI_CONTENT_CACHE_MAX_BYTES',
+    globalEvalRoundTimeoutMs: 'KICI_GLOBAL_EVAL_ROUND_TIMEOUT_MS',
+    globalEvalCandidateTimeoutMs: 'KICI_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS',
+    globalEvalCacheMax: 'KICI_GLOBAL_EVAL_CACHE_MAX',
+    globalEvalWaitTimeoutMs: 'KICI_GLOBAL_EVAL_WAIT_TIMEOUT_MS',
     queueMaxDepth: 'KICI_QUEUE_MAX_DEPTH',
     queueTimeoutMs: 'KICI_QUEUE_TIMEOUT_MS',
     unroutableGraceMs: 'KICI_UNROUTABLE_GRACE_MS',
+    globalWorkflowsEnabled: 'KICI_GLOBAL_WORKFLOWS_ENABLED',
     queueBackpressureThreshold: 'KICI_QUEUE_BACKPRESSURE_THRESHOLD',
     workerConcurrency: 'KICI_WORKER_CONCURRENCY',
     concurrencyWaitTimeoutMs: 'KICI_CONCURRENCY_WAIT_TIMEOUT_MS',
@@ -900,6 +958,7 @@ export const envDef = defineEnv({
     ingestOverflowReplayIntervalMs: 'KICI_INGEST_OVERFLOW_REPLAY_INTERVAL_MS',
     ingestOverflowReplayBatch: 'KICI_INGEST_OVERFLOW_REPLAY_BATCH',
     ingestOverflowMaxAttempts: 'KICI_INGEST_OVERFLOW_MAX_ATTEMPTS',
+    ingestOverflowClaimTimeoutMs: 'KICI_INGEST_OVERFLOW_CLAIM_TIMEOUT_MS',
     rerouteSpawnWindowMs: 'KICI_REROUTE_SPAWN_WINDOW_MS',
     rerouteAckTimeoutMs: 'KICI_REROUTE_ACK_TIMEOUT_MS',
     rerouteMaxHops: 'KICI_REROUTE_MAX_HOPS',

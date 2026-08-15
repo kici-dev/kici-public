@@ -113,6 +113,10 @@ function postJobCheckRunCompletion(
     repo,
     sha: execContext.sha,
     workflowName: execContext.workflowName,
+    // Present only for a cross-repository global run — see `workflowLabel`.
+    ...(execContext.workflowRepoIdentifier && {
+      workflowRepoIdentifier: execContext.workflowRepoIdentifier,
+    }),
     jobName: input.jobName,
     state: input.status,
     installationId: execContext.installationId,

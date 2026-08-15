@@ -13,12 +13,13 @@ companion at [Operator troubleshooting](../operator/troubleshooting.md).
 
 ## Fast triage
 
-| You see...                                                     | Jump to                                                 |
-| -------------------------------------------------------------- | ------------------------------------------------------- |
-| A run finishes with `No jobs dispatched`                       | [No jobs dispatched](#no-jobs-dispatched)               |
-| A run fails complaining the lock file is stale or incompatible | [Lock-file drift](#lock-file-drift)                     |
-| You pushed but no run ever appears                             | [The webhook never arrives](#the-webhook-never-arrives) |
-| A run is stuck "queued" and no agent ever picks it up          | [The agent won't connect](#the-agent-wont-connect)      |
+| You see...                                                     | Jump to                                                                             |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| A run finishes with `No jobs dispatched`                       | [No jobs dispatched](#no-jobs-dispatched)                                           |
+| A run fails complaining the lock file is stale or incompatible | [Lock-file drift](#lock-file-drift)                                                 |
+| You pushed but no run ever appears                             | [The webhook never arrives](#the-webhook-never-arrives)                             |
+| A run is stuck "queued" and no agent ever picks it up          | [The agent won't connect](#the-agent-wont-connect)                                  |
+| A `commitMessage`-gated workflow stops running for some events | [A `commitMessage` filter never evaluates](#a-commitmessage-filter-never-evaluates) |
 
 ## No jobs dispatched
 
@@ -157,6 +158,24 @@ a provisioning problem, the fix is on the orchestrator host (the missing binary,
 the unpullable image) — hand this to your operator with the run's failure reason.
 The full provisioning-failure playbook is in
 [Operator troubleshooting](../operator/troubleshooting.md).
+
+## A `commitMessage` filter never evaluates
+
+**Symptom.** A workflow gated on a `commitMessage` trigger filter stops running
+for some events, even though the message looks like it should match.
+
+**Cause.** The event carries no commit message. A branch-deletion push has no
+head commit, and a self-hosted forge (Gogs, or a GitLab source) may publish none
+at the configured path. The filter is **fail-visible**: when it cannot read a
+message, the workflow does not run rather than running ungated.
+
+**Diagnose.** The decision trace records the `commitMessage` check with the
+verdict `indeterminate` and the reason `no commit message in payload`. That is
+distinct from an `excluded` verdict, which the message itself caused.
+
+**Fix.** For a self-hosted forge, set the source's `commitMessage` payload path so
+the orchestrator can read the head commit's message. A branch-deletion push
+genuinely carries no message and is expected not to match.
 
 ## When to escalate to your operator
 

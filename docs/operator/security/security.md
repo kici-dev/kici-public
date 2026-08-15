@@ -52,6 +52,12 @@ This matters because a global workflow runs with **organization** credentials
 against the pull request's head commit, so letting one run for an untrusted
 event would defeat the policy that held the event in the first place.
 
+The master switch that turns global workflows on at all is **operator-held and
+fleet-wide** (`cluster_settings.global_workflows_enabled`, set with
+`kici-admin cluster-settings`). It cannot be flipped from the dashboard — an org
+admin can tune the per-org authoring / source lists, but only the orchestrator
+operator can enable the feature for the cluster.
+
 ### Allowing fork pull requests
 
 Setting fork PR policy to `allow` dispatches a fork pull request even though

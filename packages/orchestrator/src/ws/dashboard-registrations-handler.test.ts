@@ -3,6 +3,7 @@ import {
   registrationsListRequestSchema,
   registrationsListResponseSchema,
   registrationItemSchema,
+  TERMINAL_RUN_STATES,
 } from '@kici-dev/engine';
 import { DashboardRegistrationsHandler } from './dashboard-registrations-handler.js';
 import type { RegistrationStore, RegistrationRow } from '../registration/registration-store.js';
@@ -456,13 +457,15 @@ describe('DashboardRegistrationsHandler', () => {
         cancelActiveRuns: true,
       });
 
-      // Verify the status filter uses 'not in' with terminal states
+      // Verify the status filter uses 'not in' with the canonical terminal
+      // run states. Asserted as an exact set against the engine enum rather
+      // than as a literal list: the previous literal also carried 'skipped',
+      // which is not an `ExecutionRunStatus` and which no site ever writes to
+      // `execution_runs`, so the list could drift from the enum unnoticed.
       const statusFilter = capturedWhereArgs.find((args) => args[0] === 'status');
       expect(statusFilter).toBeTruthy();
       expect(statusFilter![1]).toBe('not in');
-      expect(statusFilter![2]).toEqual(
-        expect.arrayContaining(['success', 'failed', 'cancelled', 'skipped']),
-      );
+      expect(statusFilter![2]).toEqual([...TERMINAL_RUN_STATES]);
     });
   });
 

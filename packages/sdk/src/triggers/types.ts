@@ -4,6 +4,9 @@
  */
 
 import type { z } from 'zod';
+import type { ContentRequirement, TextMatch } from '@kici-dev/engine';
+
+export type { ContentRequirement, ContentFormat, TextMatch } from '@kici-dev/engine';
 
 /**
  * A declared map of typed workflow-dispatch inputs: `{ name: ZodSchema }`.
@@ -68,6 +71,10 @@ export interface PrTriggerConfig {
   readonly sourceBranches: readonly BranchPattern[];
   readonly paths: readonly string[];
   readonly repos: readonly BranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
   readonly description?: string;
 }
 
@@ -80,6 +87,10 @@ export interface PushTriggerConfig {
   readonly tags: readonly BranchPattern[];
   readonly paths: readonly string[];
   readonly repos: readonly BranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
   readonly description?: string;
 }
 
@@ -92,6 +103,10 @@ export interface TagTriggerConfig {
   readonly _tag: 'TagTrigger';
   readonly patterns: readonly BranchPattern[];
   readonly repos: readonly BranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
   readonly description?: string;
 }
 
@@ -101,6 +116,10 @@ export interface TagTriggerConfig {
 export interface TagConfigInput {
   readonly patterns?: string | RegExp | (string | RegExp)[];
   readonly repos?: string | RegExp | (string | RegExp)[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
   readonly description?: string;
 }
 
@@ -731,6 +750,11 @@ export interface PrConfigInput {
 
   readonly repos?: string | RegExp | (string | RegExp)[];
 
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
+
   readonly description?: string;
 }
 
@@ -744,6 +768,11 @@ export interface PushConfigInput {
   readonly paths?: string[];
 
   readonly repos?: string | RegExp | (string | RegExp)[];
+
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly ContentRequirement[];
+  /** Declarative static filter over the event's commit message / PR title+body. */
+  readonly commitMessage?: TextMatch;
 
   readonly description?: string;
 }

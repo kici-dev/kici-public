@@ -5,6 +5,7 @@ import type { Database } from '../db/types.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import { reportJobCheckRunCompletion } from '../reporting/job-check-run-completion.js';
+import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
 import type { ExpiredJobInfo } from './job-queue.js';
 
 const logger = createLogger({ prefix: 'terminalize-unroutable' });
@@ -29,11 +30,7 @@ export type CanRouteLabels = (
 /** The routing facts a verdict is computed from. */
 export type JobRoutingFacts = Pick<
   ExpiredJobInfo,
-  | 'lastProvisioningError'
-  | 'runsOnLabels'
-  | 'runsOnPatterns'
-  | 'excludeLabels'
-  | 'excludePatterns'
+  'lastProvisioningError' | 'runsOnLabels' | 'runsOnPatterns' | 'excludeLabels' | 'excludePatterns'
 >;
 
 /** Everything {@link terminalizeUnroutableJob} needs to settle a job. */
@@ -42,6 +39,18 @@ export interface TerminalizeDeps {
   executionTracker: ExecutionTracker;
   checkRunReporter?: Pick<CheckRunReporter, 'updateJobStatus'>;
   canRouteLabels?: CanRouteLabels;
+  /**
+   * The Tier-2 global-eval tracker, so a round job settled here also settles
+   * the webhook request awaiting its verdict.
+   *
+   * A round job is the one queue entry with an in-process awaiter and no
+   * `execution_runs` row — the round decides whether any run exists at all —
+   * so the rest of this function skips it entirely and the awaiter would
+   * otherwise wait out its full ceiling for a job the queue has already
+   * declared dead. With the shipped defaults that is a 120s definitive
+   * fast-fail followed by a 240s wait, twice.
+   */
+  pendingGlobalEvals?: Pick<PendingGlobalEvalTracker, 'reject'>;
 }
 
 const GENERIC_MESSAGE = 'Queue timeout expired (job was never dispatched to an agent)';
@@ -124,6 +133,14 @@ export async function terminalizeUnroutableJob(
   job: ExpiredJobInfo,
 ): Promise<string | null> {
   const { status, errorMessage, unroutable } = classifyUnroutable(job, deps.canRouteLabels);
+
+  // Before the `execution_jobs` update, because a global eval round has no such
+  // row and every branch below is a no-op for it. Both callers have already
+  // taken the queue row out of `Pending`, so the job can no longer dispatch and
+  // its awaiter is waiting for something that will never happen. `reject` on an
+  // id nothing tracks — every non-round job, and a round dispatched by another
+  // coordinator — is a no-op.
+  deps.pendingGlobalEvals?.reject(job.id, new Error(errorMessage));
 
   try {
     // The status guard is what makes this safe to run from several coordinators

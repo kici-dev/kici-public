@@ -762,6 +762,9 @@ describe('Dispatcher', () => {
         'bound-1',
         expect.arrayContaining(['linux']),
         [],
+        // The claiming agent, recorded as the row's owner by the claim itself
+        // so a won row is never observable as dispatched-with-no-owner.
+        'scaler-firecracker-1',
       );
       expect(queue.markDispatched).toHaveBeenCalledWith('bound-1', 'scaler-firecracker-1');
       expect(onDispatch).toHaveBeenCalledWith('scaler-firecracker-1', boundJob);
@@ -805,6 +808,158 @@ describe('Dispatcher', () => {
 
       expect(dispatched).toBe(false);
       expect(queue.dequeueById).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('redrivePendingToConnectedAgents (pending safety-net)', () => {
+    it('places a pending job onto a connected idle matching agent via the atomic claim', async () => {
+      registry.register('healthy', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(1);
+      expect(queue.dequeueById).toHaveBeenCalledWith(
+        'orphan-1',
+        expect.arrayContaining(['linux']),
+        [],
+        'healthy',
+      );
+      expect(onDispatch).toHaveBeenCalledWith('healthy', job);
+      expect(registry.get('healthy')!.activeJobs).toBe(1);
+    });
+
+    it('recovers a requeued job the one-shot redispatch missed while the agent was transiently at capacity', async () => {
+      registry.register('healthy', mockWs(), ['linux']);
+      // Simulate the healthy agent's in-flight registration drain holding its
+      // single eagerly-claimed slot at the instant the ack deadline fires.
+      registry.incrementActiveJobs('healthy');
+
+      const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'], status: 'pending' });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      queue.getFullJobById = vi.fn().mockResolvedValue(job);
+      queue.listExpiredAckDeadlines = vi
+        .fn()
+        .mockResolvedValueOnce([
+          { id: 'orphan-1', runId: 'run-1', agentId: 'suppressed', deadline: new Date(0) },
+        ])
+        .mockResolvedValue([]);
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      // Ack sweep requeues + one-shot redispatch — but the only matching agent
+      // is transiently at capacity, so the job is left pending with no
+      // re-trigger. This is the orphan the E2E flake reproduces.
+      await dispatcher.sweepExpiredAckDeadlines();
+      expect(onDispatch).not.toHaveBeenCalled();
+
+      // The in-flight drain releases its slot; the next safety-net tick delivers.
+      registry.decrementActiveJobs('healthy');
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(1);
+      expect(onDispatch).toHaveBeenCalledWith('healthy', job);
+    });
+
+    it('does not dispatch when the pending row was already claimed elsewhere (atomic-claim loser)', async () => {
+      registry.register('healthy', mockWs(), ['linux']);
+      const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'] });
+      // dequeueJobs empty => dequeueById returns null => this claim lost the row.
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(registry.get('healthy')!.activeJobs).toBe(0);
+    });
+
+    it('never routes a pinned job to a non-pinned agent even when labels match', async () => {
+      registry.register('other', mockWs(), ['linux']);
+      const job = makeQueuedJob({
+        id: 'pinned-1',
+        runsOnLabels: ['linux'],
+        pinnedAgentId: 'absent-host',
+      });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(queue.dequeueById).not.toHaveBeenCalled();
+      expect(onDispatch).not.toHaveBeenCalled();
+    });
+
+    it('delivers a pinned job to its pinned agent when that agent is connected and idle', async () => {
+      // The pinned agent is deliberately registered with a label the job does
+      // NOT require, so `findAvailable(['linux'])` returns nothing and the ONLY
+      // route to delivery is the pin branch of `selectConnectedTargetForPending`.
+      // A mutation that broke pinned delivery (the branch returning null, or
+      // falling through to the label matcher) would leave the job undelivered
+      // and trip this assertion.
+      registry.register('pinned-host', mockWs(), ['windows']);
+      const job = makeQueuedJob({
+        id: 'pinned-1',
+        runsOnLabels: ['linux'],
+        pinnedAgentId: 'pinned-host',
+      });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(1);
+      expect(queue.dequeueById).toHaveBeenCalledWith(
+        'pinned-1',
+        expect.anything(),
+        expect.anything(),
+        'pinned-host',
+      );
+      expect(onDispatch).toHaveBeenCalledWith('pinned-host', job);
+      expect(registry.get('pinned-host')!.activeJobs).toBe(1);
+    });
+
+    it('is a no-op when the queue is empty (does not even list pending)', async () => {
+      registry.register('healthy', mockWs(), ['linux']);
+      const queue = mockQueue({ depth: 0 });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(queue.listPending).not.toHaveBeenCalled();
+    });
+
+    it('does not consult the scaler even when a connected agent exists but cannot take the job', async () => {
+      // A scaler hook is wired AND a connected agent exists, but that agent
+      // cannot take the job (its labels do not match), so the sweep finds no
+      // target — the realistic "no connected agent can take the job" case, not
+      // the degenerate empty-fleet one. Spawning fresh capacity is
+      // retryPendingScaleRequests' job, not this connected-agent sweep's, so a
+      // future edit that added a scaler fallback on the no-target branch would
+      // call onNoMatchingAgent here and trip this assertion.
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      registry.register('mismatch', mockWs(), ['windows']);
+      const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'] });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(onNoMatchingAgent).not.toHaveBeenCalled();
+      expect(onDispatch).not.toHaveBeenCalled();
     });
   });
 

@@ -147,6 +147,7 @@ describe('kici-admin runs CLI commands', () => {
   let mockGetRunEphemeralKey: ReturnType<typeof vi.fn>;
   let mockGetRunSecretOutputs: ReturnType<typeof vi.fn>;
   let mockGetRunStructured: ReturnType<typeof vi.fn>;
+  let mockGet: ReturnType<typeof vi.fn>;
   let client: Partial<AdminApiClient>;
 
   beforeEach(() => {
@@ -231,7 +232,19 @@ describe('kici-admin runs CLI commands', () => {
         },
       ],
     });
+    mockGet = vi.fn().mockResolvedValue({
+      runId: 'run-eval-1',
+      jobId: 'job-eval-1',
+      stepIndex: 0,
+      totalLines: 2,
+      nextCursor: null,
+      lines: [
+        { untrusted: true, value: '[global-filter] KICI_SOURCE_REPO_PATH=/w/source' },
+        { untrusted: true, value: '[global-filter] verdict=true' },
+      ],
+    });
     client = {
+      get: mockGet as any,
       listRuns: mockListRuns as any,
       countRuns: mockCountRuns as any,
       getRun: mockGetRun as any,
@@ -551,6 +564,105 @@ describe('kici-admin runs CLI commands', () => {
       expect(stdout).toContain('compile');
       // The unwrapped human view must not leak the envelope wrapper.
       expect(stdout).not.toContain('untrusted');
+    });
+  });
+
+  describe('runs logs', () => {
+    it('R-47: default fetches step 0 with limit=500 and prints only the line values', async () => {
+      const { stdout, stderr } = await runCommand(
+        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        client,
+      );
+
+      expect(mockGet).toHaveBeenCalledWith(
+        '/api/v1/admin/runs/run-eval-1/jobs/job-eval-1/steps/0/logs?limit=500',
+      );
+      expect(stdout).toBe(
+        '[global-filter] KICI_SOURCE_REPO_PATH=/w/source\n[global-filter] verdict=true',
+      );
+      // Plain output must stay pipeable: no envelope wrapper, no hint on stdout.
+      expect(stdout).not.toContain('untrusted');
+      expect(stderr).toBe('');
+    });
+
+    it('R-48: --step, --limit and --cursor all reach the query string', async () => {
+      mockGet.mockResolvedValue({
+        runId: 'r',
+        jobId: 'j',
+        stepIndex: 3,
+        totalLines: 0,
+        nextCursor: null,
+        lines: [],
+      });
+
+      await runCommand(
+        ['runs', 'logs', 'r', '--job', 'j', '--step', '3', '--limit', '10', '--cursor', '40'],
+        client,
+      );
+
+      expect(mockGet).toHaveBeenCalledWith(
+        '/api/v1/admin/runs/r/jobs/j/steps/3/logs?limit=10&cursor=40',
+      );
+    });
+
+    it('R-49: ids are URL-encoded into the path', async () => {
+      await runCommand(['runs', 'logs', 'run/1', '--job', 'job 2', '--step', '1'], client);
+
+      expect(mockGet).toHaveBeenCalledWith(
+        '/api/v1/admin/runs/run%2F1/jobs/job%202/steps/1/logs?limit=500',
+      );
+    });
+
+    it('R-50: the pagination hint goes to stderr so stdout stays pipeable', async () => {
+      mockGet.mockResolvedValue({
+        runId: 'run-eval-1',
+        jobId: 'job-eval-1',
+        stepIndex: 0,
+        totalLines: 900,
+        nextCursor: '500',
+        lines: [{ untrusted: true, value: 'first line' }],
+      });
+
+      const { stdout, stderr } = await runCommand(
+        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        client,
+      );
+
+      expect(stdout).toBe('first line');
+      expect(stderr).toContain('--cursor 500');
+    });
+
+    it('R-51: --json emits the raw response with untrusted envelopes preserved', async () => {
+      const { stdout } = await runCommand(
+        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1', '--json'],
+        client,
+      );
+
+      const parsed = JSON.parse(stdout);
+      expect(parsed.lines[1]).toEqual({
+        untrusted: true,
+        value: '[global-filter] verdict=true',
+      });
+      expect(parsed.totalLines).toBe(2);
+    });
+
+    it('R-52: --job is required', async () => {
+      const { stderr } = await runCommand(['runs', 'logs', 'run-eval-1'], client);
+
+      expect(mockGet).not.toHaveBeenCalled();
+      expect(stderr).toContain('--job');
+    });
+
+    it('R-53: an API error is reported and exits 1', async () => {
+      mockGet.mockRejectedValue(new Error('HTTP 404: Run run-eval-1 not found'));
+
+      const { stderr, exitCode } = await runCommand(
+        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        client,
+      );
+
+      expect(stderr).toContain('Run run-eval-1 not found');
+      expect(exitCode).toBe(1);
     });
   });
 });

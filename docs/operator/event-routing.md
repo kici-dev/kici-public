@@ -22,7 +22,7 @@ System events (`workflow_complete`, `job_complete`) are emitted automatically by
 
 ### Downtime recovery
 
-On start, the orchestrator catches up on every internal event that was left unprocessed while it was down and dispatches each one. There is no cap on how many are recovered -- the catch-up pages through the entire backlog until it is drained, so an event-triggered downstream workflow fires even if a large number of events accumulated during a long outage. Events are only dropped once they pass the TTL (`eventTtlSeconds`, default 7 days).
+On start, the orchestrator catches up on every internal event that was left unprocessed while it was down and dispatches each one. There is no cap on how many are recovered: the catch-up pages through the entire backlog until it is drained. An event-triggered downstream workflow therefore fires even if many events accumulated during a long outage. Events are only dropped once they pass the TTL (`eventTtlSeconds`, default 7 days).
 
 ### Circuit breaker
 

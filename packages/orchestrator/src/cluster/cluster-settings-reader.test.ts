@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { ClusterSettingsReader } from './cluster-settings-reader.js';
+import {
+  CACHE_MAX_ENTRIES_CEILING,
+  ClusterSettingsReader,
+  clampCacheMaxEntries,
+} from './cluster-settings-reader.js';
 
 /**
  * A db whose select throws while `shouldFail()` holds and returns `row`
@@ -72,6 +76,48 @@ describe('ClusterSettingsReader', () => {
     expect(await r.getNumber('agent_token_ttl_ms', 3_600_000)).toBe(1_800_000);
     expect(await r.getNumber('cache_ttl_days', 30)).toBe(14);
     expect(await r.getNumber('max_fanout_hosts', 1024)).toBe(8);
+  });
+
+  it('reads each cache knob override in place of the config default', async () => {
+    // All six are BIGINT, so pg hands them back as strings — the coercion is
+    // part of what these cases pin.
+    const r = new ClusterSettingsReader(
+      fakeDb({
+        lockfile_cache_max: '900',
+        lockfile_cache_max_bytes: '134217728',
+        lockfile_cache_ttl_ms: '7200000',
+        content_cache_max: '999',
+        content_cache_max_bytes: '268435456',
+        content_cache_ttl_ms: '1800000',
+      }),
+      10_000,
+    );
+    expect(await r.getNumber('lockfile_cache_max', 500)).toBe(900);
+    expect(await r.getNumber('lockfile_cache_max_bytes', 67_108_864)).toBe(134_217_728);
+    expect(await r.getNumber('lockfile_cache_ttl_ms', 3_600_000)).toBe(7_200_000);
+    expect(await r.getNumber('content_cache_max', 500)).toBe(999);
+    expect(await r.getNumber('content_cache_max_bytes', 67_108_864)).toBe(268_435_456);
+    expect(await r.getNumber('content_cache_ttl_ms', 3_600_000)).toBe(1_800_000);
+  });
+
+  it('falls back to the config default for every unset cache knob', async () => {
+    const r = new ClusterSettingsReader(
+      fakeDb({
+        lockfile_cache_max: null,
+        lockfile_cache_max_bytes: null,
+        lockfile_cache_ttl_ms: null,
+        content_cache_max: null,
+        content_cache_max_bytes: null,
+        content_cache_ttl_ms: null,
+      }),
+      10_000,
+    );
+    expect(await r.getNumber('lockfile_cache_max', 500)).toBe(500);
+    expect(await r.getNumber('lockfile_cache_max_bytes', 67_108_864)).toBe(67_108_864);
+    expect(await r.getNumber('lockfile_cache_ttl_ms', 3_600_000)).toBe(3_600_000);
+    expect(await r.getNumber('content_cache_max', 500)).toBe(500);
+    expect(await r.getNumber('content_cache_max_bytes', 67_108_864)).toBe(67_108_864);
+    expect(await r.getNumber('content_cache_ttl_ms', 3_600_000)).toBe(3_600_000);
   });
 
   it('reads a text knob and falls back on null / empty / missing row / no db', async () => {
@@ -201,6 +247,37 @@ describe('ClusterSettingsReader', () => {
   });
 });
 
+describe('clampCacheMaxEntries', () => {
+  it('passes a normal value through unchanged', () => {
+    expect(clampCacheMaxEntries(500, 500)).toBe(500);
+    expect(clampCacheMaxEntries(50_000, 500)).toBe(50_000);
+    expect(clampCacheMaxEntries(CACHE_MAX_ENTRIES_CEILING, 500)).toBe(CACHE_MAX_ENTRIES_CEILING);
+  });
+
+  it('clamps a stored value above the ceiling', () => {
+    // The load-bearing case: this value can already be in the database, set
+    // before the route's `.max()` existed. Write-side validation cannot reach
+    // it, so the read site is the only thing standing between it and a
+    // constructor that throws during boot.
+    expect(clampCacheMaxEntries(5_000_000_000, 500)).toBe(CACHE_MAX_ENTRIES_CEILING);
+    expect(clampCacheMaxEntries(CACHE_MAX_ENTRIES_CEILING + 1, 500)).toBe(
+      CACHE_MAX_ENTRIES_CEILING,
+    );
+  });
+
+  it('falls back to the configured default for a value that is not a usable count', () => {
+    // Not clamped to 1 on purpose — a 1-entry cache thrashes silently, which is
+    // harder to diagnose than ignoring the garbage value outright.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(clampCacheMaxEntries(bad, 500)).toBe(500);
+    }
+  });
+
+  it('floors a fractional value so the LRU never sees a non-integer max', () => {
+    expect(clampCacheMaxEntries(500.9, 500)).toBe(500);
+  });
+});
+
 describe('ClusterSettingsReader.tryGetString', () => {
   it('reports the configured value', async () => {
     const r = new ClusterSettingsReader(
@@ -296,5 +373,50 @@ describe('ClusterSettingsReader.tryGetString', () => {
     });
     fail = true;
     expect(await r.tryGetString('dashboard_verified_issuer')).toEqual({ ok: false });
+  });
+});
+
+describe('ClusterSettingsReader.tryGetBoolean', () => {
+  it('reports a stored true', async () => {
+    const r = new ClusterSettingsReader(fakeDb({ global_workflows_enabled: true }), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: true });
+  });
+
+  it('reports a stored false as false, not as unset', async () => {
+    const r = new ClusterSettingsReader(fakeDb({ global_workflows_enabled: false }), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: false });
+  });
+
+  it('reports a NULL column as a genuine unset', async () => {
+    const r = new ClusterSettingsReader(fakeDb({ global_workflows_enabled: null }), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: null });
+  });
+
+  it('reports a missing row as a genuine unset', async () => {
+    const r = new ClusterSettingsReader(fakeDb(undefined), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: null });
+  });
+
+  it('reports a failed query as unreadable, not as unset', async () => {
+    const r = new ClusterSettingsReader(failingDb(), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
+  });
+
+  // The negative cache serves reads 2..N of a TTL window without touching the
+  // DB. Deriving "unreadable" from the catch alone would report those reads as
+  // a genuine unset -- which for a security gate means the config default
+  // instead of a deny.
+  it('keeps reporting unreadable for cached reads inside the TTL window', async () => {
+    const r = new ClusterSettingsReader(failingDb(), 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
+  });
+
+  // No db at all is a real orchestrator shape (a DB-less worker), and unset IS
+  // the truth there -- calling it unreadable would make a fail-closed caller
+  // deny forever.
+  it('reports "no database configured" as a genuine unset', async () => {
+    const r = new ClusterSettingsReader(undefined, 10_000);
+    expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: null });
   });
 });

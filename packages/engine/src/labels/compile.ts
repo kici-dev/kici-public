@@ -1,18 +1,10 @@
 import picomatch from 'picomatch';
-import safeRegex from 'safe-regex';
 import type { LabelMatcher } from '../labels-match.js';
+import { assertSafeRegex } from '../safe-regex.js';
 
-/**
- * Reject a ReDoS-prone regex. `safe-regex` is a star-height heuristic — the
- * orchestrator is single-tenant, so a slipped-through pattern only stalls the
- * author's own orchestrator. Globs are linear by construction but pass through
- * here for uniformity.
- */
-export function assertSafeRegex(source: string, flags: string, ctx: string): void {
-  if (!safeRegex(new RegExp(source, flags))) {
-    throw new Error(`${ctx}: regex /${source}/${flags} is ReDoS-prone — rejected`);
-  }
-}
+// Re-exported so existing importers of the label-compile module keep resolving
+// the shared ReDoS guard from here.
+export { assertSafeRegex };
 
 /**
  * Convert one author selector element into a `LabelMatcher`.

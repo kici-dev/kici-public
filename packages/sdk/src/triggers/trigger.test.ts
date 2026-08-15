@@ -843,3 +843,56 @@ describe('description field on all triggers', () => {
     expect(webhook({ events: ['x'], description: 'n' }).description).toBe('n');
   });
 });
+
+describe('requires content filter', () => {
+  it('threads a frozen requires list onto the push trigger config', () => {
+    const t = push({
+      branches: ['main'],
+      requires: [{ file: 'package.json', exists: ['$.scripts.ci'] }],
+    });
+    expect(t.requires).toEqual([{ file: 'package.json', exists: ['$.scripts.ci'] }]);
+    expect(Object.isFrozen(t.requires)).toBe(true);
+  });
+
+  it('threads requires onto the pr trigger config', () => {
+    const t = pr({ requires: [{ file: 'Dockerfile', format: 'text', matches: '/^FROM/m' }] });
+    expect(t.requires).toEqual([{ file: 'Dockerfile', format: 'text', matches: '/^FROM/m' }]);
+  });
+
+  it('threads requires onto the tag trigger config', () => {
+    const t = tag({ patterns: ['v*'], requires: [{ file: 'x', absent: true }] });
+    expect(t.requires).toEqual([{ file: 'x', absent: true }]);
+  });
+
+  it('omits requires when not provided', () => {
+    expect(push({ branches: ['main'] }).requires).toBeUndefined();
+    expect(pr({}).requires).toBeUndefined();
+    expect(tag({ patterns: ['v*'] }).requires).toBeUndefined();
+  });
+});
+
+describe('commitMessage on git-event triggers', () => {
+  it('is carried through push(), pr() and tag() and frozen', () => {
+    const p = push({
+      branches: 'main',
+      commitMessage: { notContains: ['[skip ci]', '[ci skip]'] },
+    });
+    expect(p.commitMessage).toEqual({ notContains: ['[skip ci]', '[ci skip]'] });
+    expect(Object.isFrozen(p)).toBe(true);
+
+    const r = pr({ commitMessage: { matches: /^feat/ } });
+    expect(r.commitMessage?.matches).toBeInstanceOf(RegExp);
+
+    const t = tag({ patterns: ['v*'], commitMessage: { contains: 'release:' } });
+    expect(t.commitMessage).toEqual({ contains: 'release:' });
+  });
+
+  it('is absent when not declared, so existing configs are unchanged', () => {
+    expect('commitMessage' in push({ branches: 'main' })).toBe(false);
+  });
+
+  it('is also carried onto the tag trigger a push({ tags }) config implies', () => {
+    const p = push({ tags: ['v*'], commitMessage: { contains: 'release:' } });
+    expect(p.commitMessage).toEqual({ contains: 'release:' });
+  });
+});

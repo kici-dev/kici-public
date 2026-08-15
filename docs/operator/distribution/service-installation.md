@@ -1,6 +1,6 @@
 ---
 title: Service installation guide
-description: ''
+description: Install and manage the orchestrator and agent as native services with the kici-admin CLI
 ---
 
 This guide covers installing and managing the KiCI orchestrator and agent as native system services using the `kici-admin` CLI.

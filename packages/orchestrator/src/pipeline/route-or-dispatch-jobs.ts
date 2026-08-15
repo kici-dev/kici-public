@@ -36,6 +36,12 @@ export interface DispatchedJobEntry {
   jobName: string;
   matrixValues?: Record<string, unknown>;
   runsOnLabels?: string[];
+  /**
+   * The unexpanded job name a materialized child came from. Persisted to
+   * `execution_jobs.base_job_name`, which is the key the rolling-wave scheduler
+   * groups a wave's children by — a NULL there makes the wave gate bail.
+   */
+  baseJobName?: string;
 }
 
 export interface RejectedJobEntry {

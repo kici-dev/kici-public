@@ -14,6 +14,7 @@ kici-admin runs structured <runId> [--json]
 kici-admin runs jobs <runId> [--include-steps] [--json]
 kici-admin runs ephemeral-key <runId> [--json]
 kici-admin runs secret-outputs <runId> [--output-key <k>] [--reveal] [--json]
+kici-admin runs logs <runId> --job <jobId> [--step <n>] [--limit <n>] [--cursor <c>] [--json]
 ```
 
 Inspects execution runs, jobs, ephemeral keys, and secret outputs. Useful for investigating run status and failures — and, with `secret-outputs --reveal`, for recovering a job's output values during incident response — without direct database access.
@@ -28,7 +29,24 @@ Answers the security-relevant question "did the per-run ephemeral key get scrubb
 
 Lists the secret outputs produced by a run's jobs. Values are **masked** by default — the row set shows `jobId`, `outputKey`, `createdAt`, and nothing that could reconstruct the secret. `--reveal` is the break-glass path for incident response only: it is always audited, requires the stricter `secret.reveal` permission, and fails with HTTP 503 if the orchestrator was started without a master key (e.g., no `KICI_SECRET_KEY`).
 
-**RBAC tokens for these commands:** `run.read` is enough for `list`, `show`, `jobs`, `ephemeral-key`, and masked `secret-outputs` (all three roles — owner, admin, auditor — carry it). `secret-outputs --reveal` additionally requires `secret.reveal`, which only owner + admin roles hold — auditor tokens get 403. Successful reveals land in `secret_audit_log` with `action = secret-outputs.reveal`, `run_id`, `user_id`, `role`, and a `metadata` JSON object summarising the revealed / failed output keys.
+Prints a page of one step's log lines. It reads the orchestrator admin route rather than the dashboard plane, and that is what lets it serve the pre-run evaluation round of an organization-wide workflow: such a round writes no execution run of its own, so neither the dashboard nor `kici runs logs` can address it, and this command is the only path to its output — including anything the workflow's `filter` printed. `--step` defaults to `0`, which is the evaluation itself. `--limit` defaults to 500 and the server caps it at 2000; a truncated page returns a cursor to pass back as `--cursor`.
+
+An evaluation round has no run entry, so its two ids come from the dispatch queue instead:
+
+```bash
+# 1. The round's workflow name is `__globaleval__<owner>/<repo>` of the repo the
+#    workflow was authored in. In the JSON rows, `id` is the job id and `run_id`
+#    is the run id — use `--json`, because the plain table abbreviates both to
+#    their first eight characters.
+kici-admin queue list --workflow-name '__globaleval__myorg/ci-pipelines' --limit 5 --json
+
+# 2. Step 0 is the evaluation itself.
+kici-admin runs logs <run_id> --job <id>
+```
+
+**Run this recipe with an owner or admin token — an auditor token cannot complete it.** The two steps sit on different permissions: step 1 reads the dispatch queue, which requires `secret.read`, so an auditor is refused with a 403 and never reaches step 2. Only step 2 falls under the `run.read` grant described next. (An operator with database access can take step 1 offline instead, via `kici-admin queue list --database-url <url>`, which bypasses the admin API and its role check entirely.)
+
+**RBAC tokens for these commands:** `run.read` is enough for `list`, `show`, `jobs`, `ephemeral-key`, `logs`, and masked `secret-outputs` (all three roles — owner, admin, auditor — carry it). `secret-outputs --reveal` additionally requires `secret.reveal`, which only owner + admin roles hold — auditor tokens get 403. Successful reveals land in `secret_audit_log` with `action = secret-outputs.reveal`, `run_id`, `user_id`, `role`, and a `metadata` JSON object summarising the revealed / failed output keys.
 
 ### execution -- execution read + maintenance
 
@@ -451,6 +469,28 @@ Synopsis: `kici-admin runs list [options]`
 | `--limit <n>`            | `20`    | Max results (default 20, max 100)                                                            |
 | `--offset <n>`           | `0`     | Skip first N results                                                                         |
 | `--json`                 |         | Emit raw JSON instead of a table                                                             |
+
+### `kici-admin runs logs`
+
+Print a page of a step log (dogfooded via /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)
+
+Synopsis: `kici-admin runs logs <runId> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `runId`  | yes      | no       |             |
+
+**Options**
+
+| Option          | Default | Description                                            |
+| --------------- | ------- | ------------------------------------------------------ |
+| `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)   |
+| `--step <n>`    | `0`     | Step index (default 0)                                 |
+| `--limit <n>`   | `500`   | Max lines to return (default 500, server caps at 2000) |
+| `--cursor <c>`  |         | Line-offset cursor from a previous page                |
+| `--json`        |         | Emit raw JSON instead of plain lines                   |
 
 ### `kici-admin runs secret-outputs`
 

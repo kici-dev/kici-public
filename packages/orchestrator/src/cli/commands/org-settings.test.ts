@@ -110,7 +110,7 @@ describe('kici-admin org-settings global-workflows', () => {
     );
     expect(stdout).toContain('Customer/org id:');
     expect(stdout).toContain(ORG);
-    expect(stdout).toContain('Enabled:');
+    expect(stdout).toContain('Enabled (cluster-wide):');
     expect(stdout).toContain('Allowed authors:');
     expect(stdout).toContain('Denied source repos:');
   });
@@ -125,36 +125,16 @@ describe('kici-admin org-settings global-workflows', () => {
     );
   });
 
-  it('set-enabled true patches the enabled flag', async () => {
-    await runCommand(
+  it('set-enabled is gone — the master switch is cluster-wide', async () => {
+    // The subcommand was removed with the per-org master switch. The point is
+    // that nothing patches the org row any more; commander reports the removed
+    // subcommand as an unknown command (exit non-zero, never 0).
+    const { exitCode } = await runCommand(
       ['org-settings', 'global-workflows', 'set-enabled', 'true', '--customer-id', ORG],
       client,
     );
-    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
-      customerId: ORG,
-      enabled: true,
-    });
-  });
-
-  it('set-enabled false patches the flag as false', async () => {
-    await runCommand(
-      ['org-settings', 'global-workflows', 'set-enabled', 'false', '--customer-id', ORG],
-      client,
-    );
-    expect(mockPatch).toHaveBeenCalledWith('/api/v1/admin/org-settings/global-workflows', {
-      customerId: ORG,
-      enabled: false,
-    });
-  });
-
-  it('set-enabled rejects a non-boolean value with exit 1', async () => {
-    const { exitCode, stderr } = await runCommand(
-      ['org-settings', 'global-workflows', 'set-enabled', 'yes', '--customer-id', ORG],
-      client,
-    );
-    expect(exitCode).toBe(1);
-    expect(stderr).toContain('must be "true" or "false"');
     expect(mockPatch).not.toHaveBeenCalled();
+    expect(exitCode).not.toBe(0);
   });
 
   it('allow-add appends a new unqualified entry', async () => {

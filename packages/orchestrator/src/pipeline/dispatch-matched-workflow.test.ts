@@ -5,6 +5,9 @@ import {
   materializeStaticJobsSafe,
   resolveHostFanoutTargets,
   dispatchMatchedWorkflow,
+  evaluateJobContexts,
+  initDispatchSuppression,
+  InitDispatchSuppression,
   findInvalidApprovalTimeout,
   buildBringupJobInput,
   hostCtxFromMat,
@@ -327,6 +330,8 @@ function makeSingleJobContext(over: {
   withDynamicEntry?: boolean;
   /** Give the static job a dynamic matrix, so its init is deferred. */
   withDeferredInit?: boolean;
+  /** Declare a workflow-level filter, so every job defers to the init round. */
+  withFilter?: boolean;
   pendingDynamics?: unknown;
   pendingInits?: unknown;
 }): { ctx: WorkflowDispatchContext; dispatched: QueuedJobInput[] } {
@@ -336,6 +341,7 @@ function makeSingleJobContext(over: {
     source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'wf-hash',
     triggers: [],
+    ...(over.withFilter ? { hasFilter: true } : {}),
     jobs: [
       {
         _type: 'static' as const,
@@ -466,6 +472,10 @@ function makeSingleJobContext(over: {
     bundle: over.bundle,
     payload: info.payload,
     repoIdentifier: 'repo',
+    // Required, and stated as the acted-on repository — the per-repository
+    // shape every real caller of this function produces. A case about a
+    // cross-repository workflow overwrites it.
+    workflowRepoIdentifier: 'repo',
     credentials: {},
     event,
     eventWithFiles: event,
@@ -570,6 +580,10 @@ function makeNeedsContext(): { ctx: WorkflowDispatchContext; dispatched: QueuedJ
     bundle: undefined,
     payload: info.payload,
     repoIdentifier: 'repo',
+    // Required, and stated as the acted-on repository — the per-repository
+    // shape every real caller of this function produces. A case about a
+    // cross-repository workflow overwrites it.
+    workflowRepoIdentifier: 'repo',
     credentials: {},
     event,
     eventWithFiles: event,
@@ -717,6 +731,56 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
     expect(recordInitFailureRun).toHaveBeenCalledTimes(1);
     expect(recordInitFailureRun.mock.calls[0][0]).toMatchObject({
       initFailure: { category: InitFailureCategory.enum.trust_policy },
+    });
+  });
+
+  it('states the defining repository on both pre-run recording paths', async () => {
+    // The two recording paths that write a run row before any job starts — a
+    // hold and an init failure — must say which repository DEFINES the
+    // workflow, not just which one the run acts on. Omitting it records a NULL
+    // marker, and a NULL marker is not "unknown": every consumer reads it as
+    // "the workflow lives in the repository this run acted on"
+    // (`registration/registration-run-match.ts`), so the authoring team's own
+    // run is filed under someone else's repository.
+    const WORKFLOW_REPO = 'acme/org-workflows';
+
+    const recordRunHeld = vi.fn().mockResolvedValue(undefined);
+    const held = makeSingleJobContext({ bundle: undefined });
+    held.ctx.repoIdentifier = 'owner/source-repo';
+    held.ctx.workflowRepoIdentifier = WORKFLOW_REPO;
+    held.ctx.securityDecision = holdDecision(SecurityHoldReason.enum.workflow_modification);
+    (held.ctx.deps as unknown as Record<string, unknown>).heldRunStore = {
+      create: vi.fn().mockResolvedValue({ id: 'held-x' }),
+    };
+    (held.ctx.deps as unknown as Record<string, unknown>).executionTracker = {
+      recordRunHeld,
+      releasePendingJobsHold: vi.fn(),
+    };
+
+    await dispatchMatchedWorkflow(held.ctx);
+
+    expect(recordRunHeld).toHaveBeenCalledTimes(1);
+    expect(recordRunHeld.mock.calls[0][0]).toMatchObject({
+      repoIdentifier: 'owner/source-repo',
+      workflowRepoIdentifier: WORKFLOW_REPO,
+    });
+
+    const recordInitFailureRun = vi.fn().mockResolvedValue(undefined);
+    const rejected = makeSingleJobContext({ bundle: undefined });
+    rejected.ctx.repoIdentifier = 'owner/source-repo';
+    rejected.ctx.workflowRepoIdentifier = WORKFLOW_REPO;
+    rejected.ctx.securityDecision = rejectDecision(SecurityHoldReason.enum.fork_pr);
+    (rejected.ctx.deps as unknown as Record<string, unknown>).executionTracker = {
+      recordInitFailureRun,
+      releasePendingJobsHold: vi.fn(),
+    };
+
+    await dispatchMatchedWorkflow(rejected.ctx);
+
+    expect(recordInitFailureRun).toHaveBeenCalledTimes(1);
+    expect(recordInitFailureRun.mock.calls[0][0]).toMatchObject({
+      repoIdentifier: 'owner/source-repo',
+      workflowRepoIdentifier: WORKFLOW_REPO,
     });
   });
 
@@ -969,7 +1033,15 @@ describe('dispatchMatchedWorkflow — a job no agent can run', () => {
             }
           },
         ),
-        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        // The run is registered before the dispatch loop, so its jobs arrive
+        // through `addJobsToRun` rather than in the `onExecutionStarted` call.
+        addJobsToRun: vi.fn(
+          async (_runId: string, jobs: Array<{ jobId: string; jobName: string }>) => {
+            for (const j of jobs) {
+              created.push({ jobId: j.jobId, jobName: j.jobName });
+            }
+          },
+        ),
         onJobStatus: vi.fn().mockResolvedValue(undefined),
         holdRunForPendingJobs: vi.fn(() => true),
         releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
@@ -983,6 +1055,121 @@ describe('dispatchMatchedWorkflow — a job no agent can run', () => {
     await dispatchMatchedWorkflow(ctx);
 
     expect(created).toEqual([{ jobId: 'queue-row-42', jobName: 'build' }]);
+  });
+});
+
+describe('dispatchMatchedWorkflow — the run exists before the first job reaches an agent', () => {
+  /**
+   * Build a tracker that records the order of every lifecycle call, plus the
+   * job list each registration carried.
+   */
+  function makeOrderRecordingTracker(callOrder: string[]) {
+    return {
+      onExecutionStarted: vi.fn(
+        async (
+          _runId: string,
+          _workflowName: string,
+          _provider: string,
+          _repoIdentifier: string,
+          _ref: string,
+          _sha: string,
+          _deliveryId: string | null,
+          _providerContext: unknown,
+          _triggerDecision: unknown,
+          jobs: Array<{ jobId: string; jobName: string }>,
+        ) => {
+          callOrder.push(`run-start:${jobs.length}`);
+        },
+      ),
+      addJobsToRun: vi.fn(
+        async (_runId: string, jobs: Array<{ jobId: string; jobName: string }>) => {
+          callOrder.push(`add-jobs:${jobs.map((j) => j.jobName).join(',')}`);
+        },
+      ),
+      onJobStatus: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => {
+        callOrder.push('hold');
+        return true;
+      }),
+      releasePendingJobsHold: vi.fn(async () => {
+        callOrder.push('release');
+      }),
+      failRun: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  it('registers the run and holds it open before the dispatch loop, releasing only once its jobs are registered', async () => {
+    // The ordering IS the fix. A root job dispatched before the run row exists
+    // reports terminal into `onJobStatus`, which misses in memory, finds no row
+    // via `recoverRunFromDb`, and DROPS the update — so no downstream is ever
+    // released and the run hangs with nothing logged as wrong. The token is the
+    // other half: without it, the first job to finish satisfies `isRunComplete`
+    // while jobs 2..N are still dispatching, and the run is finalized mid-flight.
+    const callOrder: string[] = [];
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      executionTracker: makeOrderRecordingTracker(callOrder),
+    });
+    ctx.deps.dispatcher.dispatch = async (input) => {
+      dispatched.push(input);
+      callOrder.push(`dispatch:${input.jobName}`);
+      return { status: 'dispatched' as const, jobId: 'queue-row-1' };
+    };
+
+    await dispatchMatchedWorkflow(ctx);
+
+    expect(callOrder).toEqual([
+      'run-start:0',
+      'hold',
+      'dispatch:build',
+      'add-jobs:build',
+      'release',
+    ]);
+  });
+
+  it('does not register the run a second time once it is started early', async () => {
+    // A second `onExecutionStarted` resets the in-memory job map, so a run that
+    // was started before the loop must only ever have jobs ADDED to it.
+    const callOrder: string[] = [];
+    const tracker = makeOrderRecordingTracker(callOrder);
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      executionTracker: tracker,
+    });
+    ctx.deps.dispatcher.dispatch = async (input) => {
+      dispatched.push(input);
+      return { status: 'dispatched' as const, jobId: 'queue-row-1' };
+    };
+
+    await dispatchMatchedWorkflow(ctx);
+
+    expect(tracker.onExecutionStarted).toHaveBeenCalledTimes(1);
+    expect(tracker.addJobsToRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminalizes the run when the dispatch loop throws, so a zero-job row cannot strand', async () => {
+    // A row with zero jobs can never satisfy `isRunComplete` (it ends
+    // `run.jobs.size > 0`) and no sweeper reaps one — the stale-run detector
+    // scans from `execution_jobs` / `dispatch_queue`, orphan recovery needs
+    // `running`, cold-store archival needs a terminal status. Left alone it
+    // sits `pending` forever while the deadline detector re-fires every tick.
+    const callOrder: string[] = [];
+    const tracker = makeOrderRecordingTracker(callOrder);
+    const { ctx } = makeSingleJobContext({
+      bundle: undefined,
+      fullRepo: true,
+      executionTracker: tracker,
+    });
+    ctx.deps.dispatcher.dispatch = async () => {
+      throw new Error('dispatcher exploded');
+    };
+
+    await expect(dispatchMatchedWorkflow(ctx)).rejects.toThrow('dispatcher exploded');
+
+    expect(tracker.failRun).toHaveBeenCalledTimes(1);
+    expect(tracker.failRun.mock.calls[0][1]).toContain('dispatcher exploded');
   });
 });
 
@@ -1243,11 +1430,35 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     expect(releasePendingJobsHold).toHaveBeenCalledWith('run-1');
   });
 
+  it('releases exactly the one token it took, never an unpaired one', async () => {
+    // Tokens are fungible, so an unpaired release consumes someone else's: a
+    // dispatch that released more than it took would drop a deferred init /
+    // dynamic task's token underneath it and finalize the run while that task's
+    // jobs are still being registered.
+    const releasePendingJobsHold = vi.fn().mockResolvedValue(undefined);
+    const holdRunForPendingJobs = vi.fn(() => true);
+    const { ctx } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      executionTracker: {
+        onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        onJobStatus: vi.fn().mockResolvedValue(undefined),
+        holdRunForPendingJobs,
+        releasePendingJobsHold,
+      },
+    });
+
+    // No build infra, so the token covers the plain dispatch window instead.
+    await dispatchMatchedWorkflow(ctx);
+
+    expect(holdRunForPendingJobs).toHaveBeenCalledTimes(1);
+    expect(releasePendingJobsHold).toHaveBeenCalledTimes(1);
+  });
+
   it('does not release a token it never took', async () => {
-    // Tokens are fungible, so an unpaired release consumes someone else's:
-    // a dispatch that took no build-window token must not decrement the count,
-    // or a deferred init / dynamic task's token is dropped underneath it and
-    // the run finalizes while its jobs are still being registered.
+    // A dispatch that registers no run takes no token, so it must not
+    // decrement the count on the way out.
     const releasePendingJobsHold = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -1256,12 +1467,12 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
         onExecutionStarted: vi.fn().mockResolvedValue(undefined),
         addJobsToRun: vi.fn().mockResolvedValue(undefined),
         onJobStatus: vi.fn().mockResolvedValue(undefined),
-        holdRunForPendingJobs: vi.fn(() => true),
+        // The run is unknown or already complete, so no token is available.
+        holdRunForPendingJobs: vi.fn(() => false),
         releasePendingJobsHold,
       },
     });
 
-    // No build infra, so no build window and no token.
     await dispatchMatchedWorkflow(ctx);
 
     expect(releasePendingJobsHold).not.toHaveBeenCalled();
@@ -1465,11 +1676,432 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 });
 
+/**
+ * Drive `evaluateJobContexts` directly with a single lock job and event,
+ * constructing the minimal ctx/setup/buildPrep the deferred-init path reads.
+ * `deps.pendingInits` is truthy so a dynamic field routes to the init round.
+ */
+async function runEvaluateJobContexts(over: {
+  lockJob: Record<string, unknown> & { name: string };
+  event: Partial<SimulatedEvent>;
+  /** Merged onto the lock workflow — `hasFilter` routes every job to the init round. */
+  workflow?: Record<string, unknown>;
+  /** Merged onto ctx.deps — a contextStore / heldRunStore the per-job block needs. */
+  deps?: Record<string, unknown>;
+}): ReturnType<typeof evaluateJobContexts> {
+  const lockJob = {
+    _type: 'static' as const,
+    runsOn: [{ kind: 'exact', value: 'default' }],
+    steps: [{ name: 'echo', run: 'echo hi' }],
+    needs: [],
+    rules: [],
+    ...over.lockJob,
+  };
+  const event: SimulatedEvent = {
+    type: 'push',
+    action: undefined,
+    targetBranch: 'main',
+    sourceBranch: undefined,
+    payload: {},
+    changedFiles: undefined,
+    ...over.event,
+  };
+  const mat = { lockJob, baseName: lockJob.name, expandedName: lockJob.name };
+  const ctx = {
+    runId: 'run-1',
+    workflow: { name: 'ci', source: { file: '.kici/workflows/ci.ts' }, ...over.workflow },
+    fullLockFile: { source: { file: '.kici/workflows/ci.ts' } },
+    bundle: undefined,
+    repoIdentifier: 'local/repo',
+    credentials: {},
+    event,
+    ref: 'sha',
+    resolvedOrgId: '__default__',
+    deps: { pendingInits: { has: () => false }, ...over.deps },
+  };
+  const setup = {
+    dispatcher: {
+      dispatch: async () => ({ status: 'dispatched' as const, agentId: 'a1', jobId: 'j1' }),
+    },
+    info: { provider: 'local', routingKey: 'local:repo', deliveryId: 'd' },
+    effectiveDeliveryId: 'd',
+  };
+  const buildPrep = { materializedJobs: [mat], targetPlatform: 'linux', targetArch: 'amd64' };
+  return evaluateJobContexts({ ctx, setup, buildPrep } as unknown as Parameters<
+    typeof evaluateJobContexts
+  >[0]);
+}
+
+describe('evaluateJobContexts — dynamic fields defer to the init round', () => {
+  it('defers a pure inline env to the init round instead of evaluating it in-process', async () => {
+    const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
+      lockJob: {
+        _type: 'static',
+        name: 'build',
+        env: { _type: 'inline', expression: '(event) => ({ E: event.type })' },
+        dynamicEnv: true,
+      },
+      event: { type: 'push' },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect(jobContextData.get('build')?.pendingInit).toBe(true);
+    expect(jobContextData.get('build')?.jobEnv).toBeUndefined();
+  });
+
+  it('requests an init job for a non-global workflow that declares a filter', async () => {
+    // The job itself is entirely static: without the workflow-level filter it
+    // would dispatch straight through, which is the control below.
+    const staticJob = { _type: 'static' as const, name: 'build' };
+    const { deferredInitJobs } = await runEvaluateJobContexts({
+      lockJob: staticJob,
+      event: { type: 'push' },
+      workflow: { hasFilter: true },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect(deferredInitJobs[0].initJobInput.jobConfig.hasFilter).toBe(true);
+
+    const control = await runEvaluateJobContexts({
+      lockJob: staticJob,
+      event: { type: 'push' },
+    });
+    expect(control.deferredInitJobs).toHaveLength(0);
+  });
+
+  it('omits hasFilter from the init job config when the workflow declares none', async () => {
+    // `LockWorkflow.hasFilter` is never emitted as `false`, so the init config
+    // must not invent one either — the agent reads "key absent" as "no filter".
+    const { deferredInitJobs } = await runEvaluateJobContexts({
+      lockJob: { _type: 'static', name: 'build', dynamicEnv: true },
+      event: { type: 'push' },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect('hasFilter' in deferredInitJobs[0].initJobInput.jobConfig).toBe(false);
+  });
+});
+
+describe('evaluateJobContexts — a filter defers dispatch, never the evaluation', () => {
+  // A workflow-level filter routes EVERY job through an init job, including
+  // fully static ones. Reusing the dynamic-field `continue` for that skipped the
+  // whole per-job evaluation block — so declaring a filter silently dropped a
+  // job's bound contexts, the context rules that can reject it, and its
+  // approval hold. These pin each of those to the same value with and without
+  // the filter; the no-filter run in each is the control.
+  const CONTEXT_JOB = { _type: 'static' as const, name: 'build', contexts: [{ value: 'prod' }] };
+
+  /**
+   * A context store whose `prod` config carries no rules, plus the same row with
+   * `enabled: false` so the hard-reject gate fires (`disabledRow`).
+   */
+  function contextStore() {
+    const row = (enabled: boolean) => ({
+      id: 'env-prod',
+      org_id: '__default__',
+      name: 'prod',
+      type: 'deployment',
+      glob_pattern: null,
+      branch_restrictions: null,
+      trigger_type_filters: null,
+      repo_patterns: null,
+      concurrency_limit: null,
+      concurrency_strategy: null,
+      concurrency_timeout_ms: null,
+      required_reviewers: null,
+      wait_timer_seconds: null,
+      hold_expiry_seconds: null,
+      minimum_trust: null,
+      allow_local_execution: true,
+      enabled,
+      created_at: new Date(),
+      updated_at: new Date(),
+      created_by: null,
+    });
+    return {
+      disabledRow: row(false),
+      matchContext: async (_org: string, n: string) =>
+        n === 'prod'
+          ? {
+              id: 'env-prod',
+              org_id: '__default__',
+              name: n,
+              type: 'deployment',
+              glob_pattern: null,
+              branch_restrictions: null,
+              trigger_type_filters: null,
+              repo_patterns: null,
+              concurrency_limit: null,
+              concurrency_strategy: null,
+              concurrency_timeout_ms: null,
+              required_reviewers: null,
+              wait_timer_seconds: null,
+              hold_expiry_seconds: null,
+              minimum_trust: null,
+              allow_local_execution: true,
+              enabled: true,
+              created_at: new Date(),
+              updated_at: new Date(),
+              created_by: null,
+            }
+          : null,
+    };
+  }
+
+  it('still resolves a static bound context when the workflow declares a filter', async () => {
+    const withFilter = await runEvaluateJobContexts({
+      lockJob: CONTEXT_JOB,
+      event: { type: 'push' },
+      workflow: { hasFilter: true },
+      deps: { contextStore: contextStore() },
+    });
+    const control = await runEvaluateJobContexts({
+      lockJob: CONTEXT_JOB,
+      event: { type: 'push' },
+      deps: { contextStore: contextStore() },
+    });
+
+    // The control proves the context IS resolvable in this harness, so the
+    // assertion below cannot pass vacuously.
+    expect(control.jobContextData.get('build')?.contextId).toBe('env-prod');
+    expect(control.runContextName).toBe('prod');
+
+    expect(withFilter.jobContextData.get('build')?.contextId).toBe('env-prod');
+    expect(withFilter.runContextName).toBe('prod');
+    // …and the dispatch is still deferred to the filter verdict.
+    expect(withFilter.jobContextData.get('build')?.pendingInit).toBe(true);
+    expect(withFilter.deferredInitJobs).toHaveLength(1);
+  });
+
+  it('still holds a job for approval when the workflow declares a filter', async () => {
+    const approval = { clauses: [], reason: 'ship it', when: 'always' as const };
+    const withFilter = await runEvaluateJobContexts({
+      lockJob: { _type: 'static', name: 'build', approval },
+      event: { type: 'push' },
+      workflow: { hasFilter: true },
+      deps: { heldRunStore: { create: vi.fn() } },
+    });
+
+    const envData = withFilter.jobContextData.get('build');
+    expect(envData?.held).toBe(true);
+    expect(envData?.approvalHold?.requirement.reason).toBe('ship it');
+    // A held job gets NO init job: the flow-back would otherwise dispatch it
+    // past the very hold that stopped it. Approval, not the filter, is its gate.
+    expect(withFilter.deferredInitJobs).toHaveLength(0);
+    expect(envData?.pendingInit).toBeUndefined();
+  });
+
+  it('still holds a root job for a workflow-level requireApproval under a filter', async () => {
+    const approval = { clauses: [], reason: 'workflow gate', when: 'always' as const };
+    const withFilter = await runEvaluateJobContexts({
+      lockJob: { _type: 'static', name: 'build' },
+      event: { type: 'push' },
+      workflow: { hasFilter: true, approval },
+      deps: { heldRunStore: { create: vi.fn() } },
+    });
+
+    expect(withFilter.jobContextData.get('build')?.held).toBe(true);
+    expect(withFilter.deferredInitJobs).toHaveLength(0);
+  });
+
+  it('still rejects a job by context rule when the workflow declares a filter', async () => {
+    // The rejection half of the same boundary as the approval hold: a disabled
+    // context hard-rejects the job, and a filter must not make that evaluation
+    // (or its `rejected` verdict) disappear.
+    const disabledContext = {
+      matchContext: async (_org: string, n: string) =>
+        n === 'prod' ? { ...contextStore().disabledRow, name: n } : null,
+    };
+    const withFilter = await runEvaluateJobContexts({
+      lockJob: CONTEXT_JOB,
+      event: { type: 'push' },
+      workflow: { hasFilter: true },
+      deps: { contextStore: disabledContext },
+    });
+    const control = await runEvaluateJobContexts({
+      lockJob: CONTEXT_JOB,
+      event: { type: 'push' },
+      deps: { contextStore: disabledContext },
+    });
+
+    // The control proves the rejection is the context's doing, not the filter's.
+    expect(control.jobContextData.get('build')?.rejected).toBe(true);
+    expect(withFilter.jobContextData.get('build')?.rejected).toBe(true);
+    // A rejected job gets NO init job: it is not dispatching either way, and the
+    // flow-back would otherwise carry it past the rule that rejected it.
+    expect(withFilter.deferredInitJobs).toHaveLength(0);
+    expect(withFilter.jobContextData.get('build')?.pendingInit).toBeUndefined();
+  });
+
+  it('keeps deferring a dynamic job before its evaluation, as it must', async () => {
+    // The dynamic path is unchanged: its values are unknowable here, so the
+    // whole block IS skipped and the init result drives it.
+    const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
+      lockJob: { _type: 'static', name: 'build', contexts: [{ value: 'prod' }], dynamicEnv: true },
+      event: { type: 'push' },
+      deps: { contextStore: contextStore() },
+    });
+    expect(deferredInitJobs).toHaveLength(1);
+    expect(jobContextData.get('build')?.pendingInit).toBe(true);
+    expect(jobContextData.get('build')?.contextId).toBeUndefined();
+  });
+});
+
+describe('initDispatchSuppression', () => {
+  // The flow-back's own guard. `evaluateJobContexts` never gives a rejected or
+  // held job an init job, so the Gated branch is unreachable through
+  // dispatchMatchedWorkflow — which is exactly why the predicate is exported and
+  // tested directly. An untestable security check is one nobody can prove works.
+  const filtered = { hasFilter: true } as const;
+
+  it('suppresses on a false verdict from a workflow that declares a filter', () => {
+    expect(initDispatchSuppression(filtered, { filterPassed: false }, {})).toBe(
+      InitDispatchSuppression.Filter,
+    );
+  });
+
+  it('ignores a false verdict when the workflow declares no filter', () => {
+    expect(initDispatchSuppression({}, { filterPassed: false }, {})).toBeNull();
+  });
+
+  it('does not suppress on a passing verdict, or on no verdict at all', () => {
+    expect(initDispatchSuppression(filtered, { filterPassed: true }, {})).toBeNull();
+    // An agent that predates the filter reports nothing; reading that absence as
+    // "suppress" would stop every dispatch it handles.
+    expect(initDispatchSuppression(filtered, {}, {})).toBeNull();
+  });
+
+  it('refuses to dispatch a rejected or held job', () => {
+    expect(initDispatchSuppression({}, {}, { rejected: true })).toBe(InitDispatchSuppression.Gated);
+    expect(initDispatchSuppression({}, {}, { held: true })).toBe(InitDispatchSuppression.Gated);
+    // …including when the filter itself passed: the hold outranks the verdict.
+    expect(initDispatchSuppression(filtered, { filterPassed: true }, { held: true })).toBe(
+      InitDispatchSuppression.Gated,
+    );
+  });
+
+  it('dispatches an ungated job with nothing to suppress it', () => {
+    expect(initDispatchSuppression({}, {}, {})).toBeNull();
+  });
+});
+
+describe('dispatchMatchedWorkflow — a non-global workflow filter', () => {
+  const INIT_JOB_NAME = '__init__ci__build';
+
+  /** A pendingInits stub whose init result carries the given filter verdict. */
+  function makePendingInits(initResult: Record<string, unknown>) {
+    return {
+      track: vi.fn(async () => initResult),
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      cleanup: vi.fn(),
+    };
+  }
+
+  async function dispatchWith(initResult: Record<string, unknown>): Promise<string[]> {
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      withFilter: true,
+      pendingInits: makePendingInits(initResult),
+    });
+    await dispatchMatchedWorkflow(ctx);
+    // Let the fire-and-forget deferred-init task settle.
+    await new Promise((r) => setTimeout(r, 50));
+    return dispatched.map((d) => d.jobName);
+  }
+
+  it('suppresses dispatch when the init result reports filterPassed:false', async () => {
+    const names = await dispatchWith({ filterPassed: false });
+    // The init job itself still ran — that is where the verdict came from — but
+    // the workflow's own job never reached the dispatcher.
+    expect(names).toEqual([INIT_JOB_NAME]);
+  });
+
+  it('dispatches the job when the filter passes', async () => {
+    // Positive control for the assertion above: the identical setup, differing
+    // only in the verdict, does reach the dispatcher.
+    const names = await dispatchWith({ filterPassed: true });
+    expect(names).toEqual([INIT_JOB_NAME, 'build']);
+  });
+
+  it('carries hasFilter on the dynamic eval job so a generator cannot bypass the filter', async () => {
+    // A generator-only workflow has no static job to carry the filter, and a
+    // mixed one would half-dispatch. The eval job has to gate the generator.
+    const pendingDynamics = {
+      track: vi.fn(async () => []),
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      cleanup: vi.fn(),
+    };
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      withDynamicEntry: true,
+      withFilter: true,
+      pendingDynamics,
+    });
+    await dispatchMatchedWorkflow(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const evalJob = dispatched.find((d) => d.jobName.startsWith('__dynamic__'));
+    expect(evalJob).toBeDefined();
+    expect(evalJob!.jobConfig.hasFilter).toBe(true);
+  });
+
+  it('omits hasFilter from the dynamic eval job when the workflow declares none', async () => {
+    const pendingDynamics = {
+      track: vi.fn(async () => []),
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      cleanup: vi.fn(),
+    };
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      withDynamicEntry: true,
+      pendingDynamics,
+    });
+    await dispatchMatchedWorkflow(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+
+    const evalJob = dispatched.find((d) => d.jobName.startsWith('__dynamic__'));
+    expect(evalJob).toBeDefined();
+    expect('hasFilter' in evalJob!.jobConfig).toBe(false);
+  });
+
+  it('ignores a filterPassed:false from an agent when the workflow declares no filter', async () => {
+    // Defence against a buggy or rogue agent inventing the field: the verdict is
+    // only honoured for a workflow that actually declares a filter.
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
+      fullRepo: true,
+      // No withFilter — but the job still defers, via a dynamic matrix.
+      withDeferredInit: true,
+      pendingInits: makePendingInits({ filterPassed: false, matrixValues: [{ variant: 'a' }] }),
+    });
+    await dispatchMatchedWorkflow(ctx);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(dispatched.map((d) => d.jobName)).toContain('build (a)');
+  });
+
+  it('dispatches when the agent reports no verdict at all', async () => {
+    // An agent that predates the filter sends an init result with no
+    // `filterPassed` key. Reading that absence as "suppress" would stop every
+    // dispatch such an agent handles, so only an explicit `false` suppresses.
+    const names = await dispatchWith({});
+    expect(names).toEqual([INIT_JOB_NAME, 'build']);
+  });
+});
+
 describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
   it('stamps is_test_run + fixture_id when ctx.testRun is present', async () => {
     const { db, updates } = makeUpdateRecordingDb();
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
     };
     const { ctx } = makeSingleJobContext({
@@ -1489,6 +2121,8 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     const { db, updates } = makeUpdateRecordingDb();
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
     };
     const { ctx } = makeSingleJobContext({
@@ -1531,6 +2165,8 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
     };
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
       releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
     };
     const { ctx } = makeSingleJobContext({
@@ -1575,7 +2211,12 @@ describe('dispatchMatchedWorkflow — checkMode threading', () => {
     const { ctx } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
-      executionTracker: { onExecutionStarted, releasePendingJobsHold: vi.fn() },
+      executionTracker: {
+        onExecutionStarted,
+        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        holdRunForPendingJobs: vi.fn(() => true),
+        releasePendingJobsHold: vi.fn(),
+      },
       checkMode: 'check-fail-on-drift',
     });
     await dispatchMatchedWorkflow(ctx);
@@ -1588,7 +2229,12 @@ describe('dispatchMatchedWorkflow — checkMode threading', () => {
     const { ctx } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
-      executionTracker: { onExecutionStarted, releasePendingJobsHold: vi.fn() },
+      executionTracker: {
+        onExecutionStarted,
+        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        holdRunForPendingJobs: vi.fn(() => true),
+        releasePendingJobsHold: vi.fn(),
+      },
     });
     await dispatchMatchedWorkflow(ctx);
     expect(onExecutionStarted).toHaveBeenCalled();

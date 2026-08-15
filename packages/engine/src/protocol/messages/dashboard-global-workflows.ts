@@ -17,7 +17,8 @@
  * Three independent policy axes (see GlobalWorkflowPolicy in the orchestrator):
  *   - `allowedRepos` restricts which repos may AUTHOR global workflows.
  *   - `deniedRepos` blocks global dispatches for events FROM these SOURCE repos.
- *   - `elevatedRepos` lists workflow-author repos with access to source secrets.
+ *   - `elevatedRepos` is DEPRECATED and not enforced — see the field comments
+ *     below and `docs/user/deprecations.md`.
  */
 import { z } from 'zod';
 import { actorPrincipalSchema } from './actor.js';
@@ -36,9 +37,20 @@ export type RepoPatternEntry = z.infer<typeof repoPatternEntrySchema>;
 /** Projected org-level global workflow settings. */
 export const globalWorkflowSettingsSchema = z.object({
   customerId: z.string(),
+  /**
+   * The effective fleet-wide master switch
+   * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
+   * cluster-settings`). Read-only here — the dashboard renders it as a status
+   * badge; it is not a per-org value and cannot be flipped from the dashboard.
+   */
   enabled: z.boolean(),
   allowedRepos: z.array(repoPatternEntrySchema).nullable(),
   deniedRepos: z.array(repoPatternEntrySchema).nullable(),
+  /**
+   * @deprecated Stored and echoed back, but never enforced: an organization-wide
+   * workflow's job is dispatched with no secret material at all, so there is no
+   * secret access for this list to widen. Removal at v1.0.0.
+   */
   elevatedRepos: z.array(repoPatternEntrySchema).nullable(),
   createdAt: z.string().nullable(),
   updatedAt: z.string().nullable(),
@@ -60,16 +72,23 @@ export const globalWorkflowsGetRequestSchema = z.object({
  *
  * Every field is optional. `null` clears the corresponding list column
  * (e.g., `allowedRepos: null` means "all repos pass the allow-list").
+ *
+ * The master enable switch is NOT here: it is fleet-wide
+ * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
+ * cluster-settings`), not per-org. `.strict()` so a client that still sends
+ * `enabled` gets a validation failure instead of a silently dropped field.
  */
-export const globalWorkflowsUpdateRequestSchema = z.object({
-  type: z.literal('dashboard.global-workflows.update'),
-  requestId: z.string(),
-  actor: actorPrincipalSchema,
-  enabled: z.boolean().optional(),
-  allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-  deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-  elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-});
+export const globalWorkflowsUpdateRequestSchema = z
+  .object({
+    type: z.literal('dashboard.global-workflows.update'),
+    requestId: z.string(),
+    actor: actorPrincipalSchema,
+    allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    /** @deprecated Accepted and stored, but never enforced. Removal at v1.0.0. */
+    elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+  })
+  .strict();
 
 // --- Orchestrator -> Platform: response messages ---
 

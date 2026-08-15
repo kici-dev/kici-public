@@ -8,7 +8,9 @@ function makeDeps() {
   return {
     stepLogBuffer: { addLines: vi.fn() },
     logWriter: { appendChunk: vi.fn().mockResolvedValue(undefined) },
-    executionTracker: { getJobName: vi.fn<(runId: string, jobId: string) => string | undefined>() },
+    executionTracker: {
+      resolveJobName: vi.fn<(runId: string, jobId: string) => Promise<string>>(),
+    },
     forwardToPlatform: vi.fn(),
   };
 }
@@ -34,10 +36,10 @@ const chunk: NormalizedLogChunk = {
 };
 
 describe('createLogChunkSink', () => {
-  it('buffers, persists with the resolved job name, and forwards', () => {
+  it('buffers, persists with the resolved job name, and forwards', async () => {
     const deps = makeDeps();
-    deps.executionTracker.getJobName.mockReturnValue('build');
-    createLogChunkSink(sinkDeps(deps, 'peer'))(chunk);
+    deps.executionTracker.resolveJobName.mockResolvedValue('build');
+    await createLogChunkSink(sinkDeps(deps, 'peer'))(chunk);
 
     expect(deps.stepLogBuffer.addLines).toHaveBeenCalledWith(
       { runId: 'run-1', jobId: 'job-1', stepIndex: 2 },
@@ -56,10 +58,12 @@ describe('createLogChunkSink', () => {
     expect(deps.forwardToPlatform).toHaveBeenCalledWith(chunk);
   });
 
-  it('falls back to the job id when the job name is unknown', () => {
+  it('falls back to the job id when the job name is unknown', async () => {
     const deps = makeDeps();
-    deps.executionTracker.getJobName.mockReturnValue(undefined);
-    createLogChunkSink(sinkDeps(deps, 'local'))(chunk);
+    // The resolver itself performs the durable fallback, returning the job id
+    // when neither in-memory state nor dispatch_queue names the job.
+    deps.executionTracker.resolveJobName.mockResolvedValue('job-1');
+    await createLogChunkSink(sinkDeps(deps, 'local'))(chunk);
 
     expect(deps.logWriter.appendChunk).toHaveBeenCalledWith(
       'run-1',

@@ -32,41 +32,42 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 
 ### Trigger types
 
-| Type                            | Description                                                           |
-| ------------------------------- | --------------------------------------------------------------------- |
-| `Trigger`                       | Trigger definition (trigger config + source location)                 |
-| `TriggerConfig`                 | Union of all 23 trigger config types                                  |
-| `PrTriggerConfig`               | PR trigger configuration (from `pr()`)                                |
-| `PushTriggerConfig`             | Push trigger configuration (from `push()`)                            |
-| `TagTriggerConfig`              | Tag trigger configuration (from `tag()`)                              |
-| `CommentTriggerConfig`          | Comment trigger configuration (from `comment()`)                      |
-| `ReviewTriggerConfig`           | Review trigger configuration (from `review()`)                        |
-| `ReviewCommentTriggerConfig`    | Review comment trigger configuration (from `reviewComment()`)         |
-| `ReleaseTriggerConfig`          | Release trigger configuration (from `release()`)                      |
-| `DispatchTriggerConfig`         | Repository dispatch trigger configuration (from `dispatch()`)         |
-| `CreateTriggerConfig`           | Ref creation trigger configuration (from `create()`)                  |
-| `DeleteTriggerConfig`           | Ref deletion trigger configuration (from `delete()`)                  |
-| `StatusTriggerConfig`           | Commit status trigger configuration (from `status()`)                 |
-| `WorkflowRunTriggerConfig`      | Workflow run trigger configuration (from `workflowRun()`)             |
-| `ForkTriggerConfig`             | Fork trigger configuration (from `fork()`)                            |
-| `StarTriggerConfig`             | Star trigger configuration (from `star()`)                            |
-| `WatchTriggerConfig`            | Watch trigger configuration (from `watch()`)                          |
-| `WebhookTriggerConfig`          | Catch-all webhook trigger configuration (from `webhook()`)            |
-| `KiciEventTriggerConfig`        | Custom event trigger configuration (from `kiciEvent()`)               |
-| `WorkflowCompleteTriggerConfig` | Workflow completion trigger configuration (from `workflowComplete()`) |
-| `JobCompleteTriggerConfig`      | Job completion trigger configuration (from `jobComplete()`)           |
-| `GenericWebhookTriggerConfig`   | Generic webhook trigger configuration (from `genericWebhook()`)       |
-| `ScheduleTriggerConfig`         | Schedule trigger configuration (from `schedule()`)                    |
-| `LifecycleTriggerConfig`        | Lifecycle trigger configuration (from `lifecycle()`)                  |
-| `PrConfigInput`                 | Config object for `pr()` factory                                      |
-| `PushConfigInput`               | Config object for `push()` factory                                    |
-| `BranchPattern`                 | `{ type: 'glob', pattern } \| { type: 'regex', pattern, flags? }`     |
-| `PrEvent`                       | PR event string literal union (17 event types)                        |
-| `GenericWebhookConfigInput`     | Config object for `genericWebhook()` factory                          |
-| `GenericWebhookAuth`            | Union of generic webhook auth types (HMAC or API key)                 |
-| `GenericWebhookHmacAuth`        | HMAC-SHA256 auth configuration for generic webhooks                   |
-| `GenericWebhookApiKeyAuth`      | API key auth configuration for generic webhooks                       |
-| `GenericWebhookAuthMethod`      | Auth method string literal (`'hmac-sha256' \| 'api-key'`)             |
+| Type                                | Description                                                                    |
+| ----------------------------------- | ------------------------------------------------------------------------------ |
+| `Trigger`                           | Trigger definition (trigger config + source location)                          |
+| `TriggerConfig`                     | Union of all 23 trigger config types                                           |
+| `PrTriggerConfig`                   | PR trigger configuration (from `pr()`)                                         |
+| `PushTriggerConfig`                 | Push trigger configuration (from `push()`)                                     |
+| `TagTriggerConfig`                  | Tag trigger configuration (from `tag()`)                                       |
+| `CommentTriggerConfig`              | Comment trigger configuration (from `comment()`)                               |
+| `ReviewTriggerConfig`               | Review trigger configuration (from `review()`)                                 |
+| `ReviewCommentTriggerConfig`        | Review comment trigger configuration (from `reviewComment()`)                  |
+| `ReleaseTriggerConfig`              | Release trigger configuration (from `release()`)                               |
+| `DispatchTriggerConfig`             | Repository dispatch trigger configuration (from `dispatch()`)                  |
+| `CreateTriggerConfig`               | Ref creation trigger configuration (from `create()`)                           |
+| `DeleteTriggerConfig`               | Ref deletion trigger configuration (from `delete()`)                           |
+| `StatusTriggerConfig`               | Commit status trigger configuration (from `status()`)                          |
+| `WorkflowRunTriggerConfig`          | Workflow run trigger configuration (from `workflowRun()`)                      |
+| `ForkTriggerConfig`                 | Fork trigger configuration (from `fork()`)                                     |
+| `StarTriggerConfig`                 | Star trigger configuration (from `star()`)                                     |
+| `WatchTriggerConfig`                | Watch trigger configuration (from `watch()`)                                   |
+| `WebhookTriggerConfig`              | Catch-all webhook trigger configuration (from `webhook()`)                     |
+| `KiciEventTriggerConfig`            | Custom event trigger configuration (from `kiciEvent()`)                        |
+| `WorkflowCompleteTriggerConfig`     | Workflow completion trigger configuration (from `workflowComplete()`)          |
+| `WorkflowsFailedBatchTriggerConfig` | Batched workflow-failure trigger configuration (from `workflowsFailedBatch()`) |
+| `JobCompleteTriggerConfig`          | Job completion trigger configuration (from `jobComplete()`)                    |
+| `GenericWebhookTriggerConfig`       | Generic webhook trigger configuration (from `genericWebhook()`)                |
+| `ScheduleTriggerConfig`             | Schedule trigger configuration (from `schedule()`)                             |
+| `LifecycleTriggerConfig`            | Lifecycle trigger configuration (from `lifecycle()`)                           |
+| `PrConfigInput`                     | Config object for `pr()` factory                                               |
+| `PushConfigInput`                   | Config object for `push()` factory                                             |
+| `BranchPattern`                     | `{ type: 'glob', pattern } \| { type: 'regex', pattern, flags? }`              |
+| `PrEvent`                           | PR event string literal union (17 event types)                                 |
+| `GenericWebhookConfigInput`         | Config object for `genericWebhook()` factory                                   |
+| `GenericWebhookAuth`                | Union of generic webhook auth types (HMAC or API key)                          |
+| `GenericWebhookHmacAuth`            | HMAC-SHA256 auth configuration for generic webhooks                            |
+| `GenericWebhookApiKeyAuth`          | API key auth configuration for generic webhooks                                |
+| `GenericWebhookAuthMethod`          | Auth method string literal (`'hmac-sha256' \| 'api-key'`)                      |
 
 ### Rule types
 

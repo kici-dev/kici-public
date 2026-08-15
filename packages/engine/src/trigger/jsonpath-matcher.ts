@@ -7,6 +7,7 @@
  * Uses jsonpath-plus for JSONPath evaluation.
  */
 import { JSONPath } from 'jsonpath-plus';
+import { assertSafeRegex } from '../safe-regex.js';
 
 /**
  * Match all JSONPath expressions in `match` against `payload`.
@@ -109,6 +110,9 @@ function valueEquals(result: unknown, expected: unknown): boolean {
     // Check for regex pattern: /pattern/ or /pattern/flags
     const regexMatch = /^\/(.+)\/([gimsuy]*)$/.exec(expected);
     if (regexMatch) {
+      // Author-supplied `/re/flags` from lock-file data — ReDoS-check before
+      // compiling so a catastrophic pattern is rejected, never silently run.
+      assertSafeRegex(regexMatch[1], regexMatch[2], 'jsonpath match');
       const regex = new RegExp(regexMatch[1], regexMatch[2]);
       return regex.test(result);
     }

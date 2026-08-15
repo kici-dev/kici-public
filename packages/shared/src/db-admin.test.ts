@@ -17,8 +17,11 @@ import {
   setContextSecretDirect,
   waitForPlatformRegistrationsDirect,
   waitForExecutionRunReachesStatusSinceDirect,
+  latestExecutionRunByStatusDirect,
   seedCiSecurityFixturesDirect,
+  seedWebhookSecretDirect,
   listCheckRunTrackingDirect,
+  deleteWorkflowRegistrationsDirect,
 } from './db-admin.js';
 import { HoldType, unknownContributorHoldReason } from '@kici-dev/engine';
 
@@ -182,6 +185,41 @@ function installPoolMock(responses: MockQueryResult[]): {
     },
   };
 }
+
+describe('deleteWorkflowRegistrationsDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  it('bumps the registry version after a delete that removed rows', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 3 }, // DELETE FROM workflow_registrations
+      { rows: [], rowCount: 1 }, // UPDATE registry_versions
+    ]);
+    const result = await deleteWorkflowRegistrationsDirect('postgresql://u:p@h:5432/d', {
+      repoIdentifier: 'org/repo',
+    });
+    expect(result).toEqual({ deleted: 3 });
+    expect(pool.calls.map((c) => c.sql)).toEqual([
+      'DELETE FROM workflow_registrations WHERE repo_identifier = $1',
+      `UPDATE registry_versions SET version = version + 1, updated_at = NOW() WHERE id = 'default'`,
+    ]);
+    expect(pool.calls[0].params).toEqual(['org/repo']);
+    expect(pool.endCalls).toBe(1);
+  });
+
+  it('does NOT bump the version when nothing was deleted', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 0 }, // DELETE FROM workflow_registrations — no match
+    ]);
+    const result = await deleteWorkflowRegistrationsDirect('postgresql://u:p@h:5432/d', {
+      routingKey: 'generic:org:src',
+    });
+    expect(result).toEqual({ deleted: 0 });
+    expect(pool.calls.map((c) => c.sql)).toEqual([
+      'DELETE FROM workflow_registrations WHERE routing_key = $1',
+    ]);
+  });
+});
 
 describe('purgeContextsDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
@@ -857,6 +895,71 @@ describe('waitForExecutionRunReachesStatusSinceDirect', () => {
     expect(result).toEqual({ status: null });
     expect(pool.endCalls).toBe(1);
   });
+
+  // A `since` window alone cannot identify a run: a neighbouring workflow that
+  // happens to reach a terminal state inside the same window is indistinguishable
+  // from the caller's own. `deliveryId` is the exact identity the caller controls.
+  it('scopes the poll to one delivery when deliveryId is given', async () => {
+    pool = installPoolMock([{ rows: [{ status: 'success' }] }]);
+    const since = new Date('2026-07-17T00:00:00.000Z');
+    const result = await waitForExecutionRunReachesStatusSinceDirect('postgresql://u:p@h:5432/db', {
+      since,
+      statuses: ['success', 'failed', 'cancelled'],
+      deliveryId: 'e2e-my-test-abc',
+      timeoutMs: 1_000,
+      intervalMs: 5,
+    });
+    expect(result).toEqual({ status: 'success' });
+    expect(pool.calls[0].sql).toMatch(/delivery_id LIKE \$3/);
+    expect(pool.calls[0].params).toEqual([
+      since,
+      ['success', 'failed', 'cancelled'],
+      '%e2e-my-test-abc',
+    ]);
+  });
+
+  it('omits the delivery predicate entirely when no deliveryId is given', async () => {
+    pool = installPoolMock([{ rows: [{ status: 'success' }] }]);
+    await waitForExecutionRunReachesStatusSinceDirect('postgresql://u:p@h:5432/db', {
+      since: new Date('2026-07-17T00:00:00.000Z'),
+      statuses: ['success'],
+      timeoutMs: 1_000,
+      intervalMs: 5,
+    });
+    expect(pool.calls[0].sql).not.toMatch(/delivery_id/);
+    expect(pool.calls[0].params).toHaveLength(2);
+  });
+});
+
+describe('latestExecutionRunByStatusDirect', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  // Same hazard as the poll above: "the newest success run" is not necessarily
+  // the caller's, so the run_id it hands back can belong to another test.
+  it('scopes to one delivery when deliveryId is given', async () => {
+    pool = installPoolMock([
+      { rows: [{ run_id: 'r1', workflow_name: 'wf', status: 'success' }] },
+      { rows: [{ job_id: 'j1', job_name: 'build', status: 'success' }] },
+    ]);
+    const result = await latestExecutionRunByStatusDirect('postgresql://u:p@h:5432/db', {
+      status: 'success',
+      deliveryId: 'e2e-my-test-abc',
+    });
+    expect(result?.run.run_id).toBe('r1');
+    expect(pool.calls[0].sql).toMatch(/delivery_id LIKE \$2/);
+    expect(pool.calls[0].params).toEqual(['success', '%e2e-my-test-abc']);
+  });
+
+  it('omits the delivery predicate when no deliveryId is given', async () => {
+    pool = installPoolMock([
+      { rows: [{ run_id: 'r1', workflow_name: 'wf', status: 'success' }] },
+      { rows: [] },
+    ]);
+    await latestExecutionRunByStatusDirect('postgresql://u:p@h:5432/db', { status: 'success' });
+    expect(pool.calls[0].sql).not.toMatch(/delivery_id/);
+    expect(pool.calls[0].params).toEqual(['success']);
+  });
 });
 
 describe('seedCiSecurityFixturesDirect', () => {
@@ -1125,6 +1228,146 @@ describe('listCheckRunTrackingDirect', () => {
     });
     expect(rows[0].check_run_id).toBe('42');
     expect(rows[0].terminal_sent_at).toBeNull();
+  });
+});
+
+/**
+ * The org a seeded source belongs to.
+ *
+ * `sources.customer_id` carries a column DEFAULT of `'__default__'`, so a seed
+ * that omits the org does not leave the column unset — it lands the row on the
+ * plane's no-tenant anchor. `resolveOrgId` then reports `'__default__'` for
+ * every event on that routing key, and the org-scoped decisions downstream
+ * (global-workflow registration, the multi-provider lock fallback) deny with a
+ * reason that names the anchor rather than the seed that produced it. That is
+ * the whole distance between the defect and its symptom, which is why the org
+ * has to be written where the row is created rather than repaired afterwards.
+ */
+describe('seedWebhookSecretDirect customer_id', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  const OPTS = {
+    routingKey: 'github:2848097',
+    webhookSecret: 'whsec',
+    encryptFn: () => 'ciphertext',
+  };
+
+  /** The bind params of the single `INSERT INTO sources` the helper issues. */
+  function sourceInsertParams(calls: QueryCall[]): unknown[] {
+    const insert = calls.find((c) => /INSERT INTO sources/.test(c.sql));
+    if (!insert) throw new Error('no INSERT INTO sources issued');
+    return insert.params;
+  }
+
+  it('writes customer_id when it creates the sources row', async () => {
+    pool = installPoolMock([
+      { rows: [] }, // SELECT id FROM sources -> absent
+      { rows: [] }, // INSERT INTO sources
+      { rows: [{ id: 'src-1' }] }, // refetch
+      { rows: [] }, // INSERT INTO scoped_secrets
+    ]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      customerId: 'org_kiciStg00001',
+    });
+
+    const insert = pool.calls.find((c) => /INSERT INTO sources/.test(c.sql))!;
+    expect(insert.sql).toMatch(/customer_id/);
+    expect(sourceInsertParams(pool.calls)).toContain('org_kiciStg00001');
+  });
+
+  it('omits customer_id entirely when no org is given', async () => {
+    // The non-vacuity control for the case above AND the compatibility
+    // guarantee for the one caller that genuinely has no org: the column must
+    // fall through to its DEFAULT rather than being bound to undefined, which
+    // pg would send as NULL against a NOT NULL column.
+    pool = installPoolMock([{ rows: [] }, { rows: [] }, { rows: [{ id: 'src-1' }] }, { rows: [] }]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    const insert = pool.calls.find((c) => /INSERT INTO sources/.test(c.sql))!;
+    expect(insert.sql).not.toMatch(/customer_id/);
+    expect(insert.params).toHaveLength(5);
+  });
+
+  it('repairs an existing row that is still on the default anchor', async () => {
+    // The path that actually reaches a live staging DB. A warm E2E start finds
+    // the source row already there — created by an earlier cold start that had
+    // no org to write — so an insert-time-only fix would never take effect and
+    // the row would stay on the anchor across every subsequent run.
+    pool = installPoolMock([
+      { rows: [{ id: 'src-existing' }] }, // SELECT id FROM sources -> present
+      { rows: [] }, // UPDATE sources SET customer_id
+      { rows: [] }, // INSERT INTO scoped_secrets
+    ]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      customerId: 'org_kiciStg00001',
+    });
+
+    const update = pool.calls.find((c) => /UPDATE sources/.test(c.sql));
+    expect(update, 'an existing source row was left on whatever org it had').toBeDefined();
+    expect(update!.params).toEqual(['org_kiciStg00001', 'github:2848097']);
+    // No insert — the row already existed.
+    expect(pool.calls.some((c) => /INSERT INTO sources/.test(c.sql))).toBe(false);
+  });
+
+  it('repairs the conflicting row when the insert races another seed', async () => {
+    // The SELECT found nothing, so the reassert branch above was skipped — but
+    // a concurrent seed can still win the insert. `DO NOTHING` would leave that
+    // winner on whatever org it had, which is the exact hole the reassert
+    // exists to close, reachable only through the race.
+    pool = installPoolMock([{ rows: [] }, { rows: [] }, { rows: [{ id: 'src-1' }] }, { rows: [] }]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      customerId: 'org_kiciStg00001',
+    });
+
+    const insert = pool.calls.find((c) => /INSERT INTO sources/.test(c.sql))!;
+    expect(insert.sql).toMatch(/ON CONFLICT \(routing_key\) DO UPDATE SET customer_id/);
+    expect(insert.sql).toMatch(/EXCLUDED\.customer_id/);
+  });
+
+  it('leaves a conflicting row alone when no org is given', async () => {
+    // Control for the case above: with no org there is nothing to reassert, so
+    // the conflict arm must stay a no-op rather than writing a NULL over a
+    // NOT NULL column.
+    pool = installPoolMock([{ rows: [] }, { rows: [] }, { rows: [{ id: 'src-1' }] }, { rows: [] }]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    const insert = pool.calls.find((c) => /INSERT INTO sources/.test(c.sql))!;
+    expect(insert.sql).toMatch(/ON CONFLICT \(routing_key\) DO NOTHING/);
+    expect(insert.sql).not.toMatch(/DO UPDATE/);
+  });
+
+  it('bumps updated_at when it repairs an existing row', async () => {
+    // Matches the CLI's own `kici-admin source update --customer-id`, which
+    // sets `updated_at = now()` alongside the org. A repair that leaves the
+    // timestamp stale makes the row read as untouched since its last real edit.
+    pool = installPoolMock([{ rows: [{ id: 'src-existing' }] }, { rows: [] }, { rows: [] }]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', {
+      ...OPTS,
+      customerId: 'org_kiciStg00001',
+    });
+
+    const update = pool.calls.find((c) => /UPDATE sources/.test(c.sql))!;
+    expect(update.sql).toMatch(/updated_at = now\(\)/);
+  });
+
+  it('leaves an existing row untouched when no org is given', async () => {
+    // Control for the repair above: the update is driven by the caller
+    // supplying an org, not by the row existing.
+    pool = installPoolMock([{ rows: [{ id: 'src-existing' }] }, { rows: [] }]);
+
+    await seedWebhookSecretDirect('postgresql://u:p@h:5432/d', OPTS);
+
+    expect(pool.calls.some((c) => /UPDATE sources/.test(c.sql))).toBe(false);
   });
 });
 

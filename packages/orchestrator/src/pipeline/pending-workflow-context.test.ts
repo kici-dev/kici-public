@@ -133,7 +133,7 @@ describe('pending-workflow-context', () => {
   });
 
   it('does not carry the pending-jobs token flag into the stored context', () => {
-    // `buildWindowTokenHeld` records that ONE dispatch call is holding a token,
+    // `dispatchWindowTokenHeld` records that ONE dispatch call is holding a token,
     // which it releases before returning. Persisting it would make the resumed
     // dispatch release a token it never took — stealing the one held by a
     // deferred init / dynamic task and un-holding the run mid-registration.
@@ -141,12 +141,12 @@ describe('pending-workflow-context', () => {
       ...makeInputs(),
       deps: {},
       bundle: {},
-      buildWindowTokenHeld: true,
+      dispatchWindowTokenHeld: true,
     };
 
     const stored = toSerializableInputs(ctx as never) as Record<string, unknown>;
 
-    expect('buildWindowTokenHeld' in stored).toBe(false);
+    expect('dispatchWindowTokenHeld' in stored).toBe(false);
     expect('deps' in stored).toBe(false);
     expect('bundle' in stored).toBe(false);
     expect(stored.runId).toBe('run1');

@@ -57,6 +57,7 @@ function createMockExecutionTracker() {
     updateJobHeartbeat: vi.fn().mockResolvedValue(undefined),
     getExecutionContext: vi.fn(),
     getJobName: vi.fn(),
+    registerJobName: vi.fn(),
     isRunComplete: vi.fn().mockReturnValue(false),
     getRunStatus: vi.fn().mockReturnValue('running'),
     updateInMemoryJob: vi.fn(),

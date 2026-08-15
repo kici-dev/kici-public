@@ -2,10 +2,12 @@
  * Dashboard global-workflows handler for the orchestrator.
  *
  * Responds to `dashboard.global-workflows.*` WS messages from Platform by
- * reading or upserting the `org_settings` row keyed by `customer_id`. The
- * row holds the org-level global-workflow policy: master enable, plus the
- * three repo-pattern lists (allow / deny / elevate). Each list entry is a
- * `{routingKey?, pattern}` object that may optionally pin to one source.
+ * reading or upserting the `org_settings` row keyed by `customer_id`. The row
+ * holds the three per-org repo-pattern lists (allow / deny / elevate); each
+ * entry is a `{routingKey?, pattern}` object that may optionally pin to one
+ * source. The master enable switch is fleet-wide
+ * (`cluster_settings.global_workflows_enabled`) and read-only here — projected
+ * onto the response as `enabled`, never written from this handler.
  *
  * The handler binds a single `customerId` at construction time (via the
  * sources / generic_webhook_sources lookup at server startup) and updates
@@ -27,6 +29,7 @@ import type {
 } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import type { Database, OrgSettings } from '../db/types.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   assertDashboardWriteAllowed,
@@ -42,6 +45,10 @@ interface DashboardGlobalWorkflowsHandlerDeps {
   /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
   db: Kysely<Database>;
+  /** Reads the fleet-wide master switch for the read-only `enabled` projection. */
+  clusterSettings: ClusterSettingsReader;
+  /** Applies when the cluster column is NULL — `config.globalWorkflowsEnabled`. */
+  globalWorkflowsEnabledDefault: boolean;
   /** Access log writer — records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
 }
@@ -161,7 +168,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.deps.send({
         type: 'dashboard.global-workflows.get.response',
         requestId: msg.requestId,
-        settings: rowToSettings(this.deps.customerId, row),
+        settings: rowToSettings(this.deps.customerId, row, await this.effectiveEnabled()),
       });
     } catch (err) {
       this.recordAccess(
@@ -203,7 +210,7 @@ export class DashboardGlobalWorkflowsHandler {
       this.deps.send({
         type: 'dashboard.global-workflows.update.response',
         requestId: msg.requestId,
-        settings: rowToSettings(this.deps.customerId, updated),
+        settings: rowToSettings(this.deps.customerId, updated, await this.effectiveEnabled()),
       });
     } catch (err) {
       this.recordAccess(
@@ -226,6 +233,25 @@ export class DashboardGlobalWorkflowsHandler {
       .executeTakeFirst();
   }
 
+  /**
+   * The effective fleet-wide master switch, for the read-only projection the
+   * dashboard renders as a status badge.
+   *
+   * Uses the shared 10s-cached reader — unlike the admin route, which reads
+   * uncached because an operator does set-then-show. A dashboard badge that is
+   * up to 10s stale is fine; a second uncached read on every dashboard poll is
+   * not.
+   *
+   * An unreadable row resolves to the configured default here rather than
+   * failing closed. This value only decides what the UI displays; the actual
+   * gate is `GlobalWorkflowPolicy`, which does fail closed.
+   */
+  private async effectiveEnabled(): Promise<boolean> {
+    const read = await this.deps.clusterSettings.tryGetBoolean('global_workflows_enabled');
+    if (!read.ok) return this.deps.globalWorkflowsEnabledDefault;
+    return read.value ?? this.deps.globalWorkflowsEnabledDefault;
+  }
+
   private async upsertRow(patch: NormalizedPatch): Promise<void> {
     // jsonb columns: pass arrays through the Kysely json helper. The
     // OrgSettingsTable type accepts `string` on insert (a stringified jsonb
@@ -238,14 +264,12 @@ export class DashboardGlobalWorkflowsHandler {
       .insertInto('org_settings')
       .values({
         customer_id: this.deps.customerId,
-        global_workflows_enabled: patch.enabled,
         global_workflow_allowed_repos: allowed,
         global_workflow_denied_repos: denied,
         global_workflow_elevated_repos: elevated,
       })
       .onConflict((oc) =>
         oc.column('customer_id').doUpdateSet({
-          global_workflows_enabled: patch.enabled,
           global_workflow_allowed_repos: allowed,
           global_workflow_denied_repos: denied,
           global_workflow_elevated_repos: elevated,
@@ -268,7 +292,6 @@ export class DashboardGlobalWorkflowsHandler {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 interface NormalizedPatch {
-  enabled: boolean;
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
   elevatedRepos: RepoPatternEntry[] | null;
@@ -284,13 +307,11 @@ export function buildPatch(
   msg: GlobalWorkflowsUpdateRequest,
 ): NormalizedPatch {
   const start: NormalizedPatch = {
-    enabled: existing?.global_workflows_enabled ?? false,
     allowedRepos: existing?.global_workflow_allowed_repos ?? null,
     deniedRepos: existing?.global_workflow_denied_repos ?? null,
     elevatedRepos: existing?.global_workflow_elevated_repos ?? null,
   };
 
-  if (msg.enabled !== undefined) start.enabled = msg.enabled;
   if (msg.allowedRepos !== undefined) start.allowedRepos = msg.allowedRepos;
   if (msg.deniedRepos !== undefined) start.deniedRepos = msg.deniedRepos;
   if (msg.elevatedRepos !== undefined) start.elevatedRepos = msg.elevatedRepos;
@@ -299,18 +320,20 @@ export function buildPatch(
 }
 
 /**
- * Project a row into the public settings shape. Returns a defaulted "disabled"
- * settings object when the row does not yet exist, so callers always get a
- * renderable state.
+ * Project a row into the public settings shape. `enabled` is the effective
+ * fleet-wide master switch, supplied by the caller (read-only here). When the
+ * row does not yet exist, the three per-org lists project as null so callers
+ * always get a renderable state.
  */
 export function rowToSettings(
   customerId: string,
   row: OrgSettings | undefined,
+  enabled: boolean,
 ): GlobalWorkflowSettings {
   if (!row) {
     return {
       customerId,
-      enabled: false,
+      enabled,
       allowedRepos: null,
       deniedRepos: null,
       elevatedRepos: null,
@@ -320,7 +343,7 @@ export function rowToSettings(
   }
   return {
     customerId,
-    enabled: row.global_workflows_enabled,
+    enabled,
     allowedRepos: row.global_workflow_allowed_repos,
     deniedRepos: row.global_workflow_denied_repos,
     elevatedRepos: row.global_workflow_elevated_repos,

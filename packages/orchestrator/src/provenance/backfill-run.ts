@@ -19,6 +19,12 @@ export interface BackfillRunRow {
   status: string;
   routing_key: string | null;
   repo_identifier: string | null;
+  /**
+   * The repository that DEFINES the workflow, recorded only when it differs
+   * from `repo_identifier`. A cross-repository global run backfilled without it
+   * lands in the Platform mirror as an ordinary per-repository run.
+   */
+  workflow_repo_identifier: string | null;
   provider: string | null;
   local_working_tree: boolean | null;
   sha: string | null;
@@ -51,7 +57,10 @@ const ms = (d: Date | null | undefined): number | undefined => (d ? d.getTime() 
 
 /**
  * Send one `execution.status` (terminal) followed by one `job.status.forward`
- * per job, populating exactly the fields the Platform's `handler.ts` upserts.
+ * per job, populating the run and job fields the Platform's `handler.ts` upserts
+ * that the local rows can answer for (the trigger metadata a live run carries in
+ * memory — trigger event, commit message, re-run lineage — has no column here
+ * and is left to the live path).
  * Ordered execution.status FIRST so the run row exists before the job rows
  * reference it. A no-op (throws) when the run is not found locally — the caller
  * leaves the pending row `deferred` with a clear error.
@@ -70,6 +79,9 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
     status: run.status,
     ...(run.routing_key ? { routingKey: run.routing_key } : {}),
     ...(run.repo_identifier ? { repoIdentifier: run.repo_identifier } : {}),
+    ...(run.workflow_repo_identifier
+      ? { workflowRepoIdentifier: run.workflow_repo_identifier }
+      : {}),
     ...(run.provider ? { repoProvider: run.provider } : {}),
     ...(run.local_working_tree != null ? { localWorkingTree: run.local_working_tree } : {}),
     ...(run.sha ? { sha: run.sha } : {}),

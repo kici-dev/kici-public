@@ -383,6 +383,17 @@ export async function recomputeNeedsSatisfied(
     if (check.action === 'skip') {
       results.push({ jobName, action: 'skip', reason: check.reason });
     } else {
+      // NOTE: unlike evaluateDownstreams, this reports `dispatch` whether or
+      // not it won the conditional UPDATE. That looks like a double-dispatch
+      // hazard and is not one today, because dispatchReadyJob consumes the
+      // pending job context (deleting it in the same read), so a second
+      // dispatch of the same job finds nothing and no-ops with a warning.
+      //
+      // Do NOT "fix" this by skipping on a lost claim without also giving
+      // dispatchReadyJob a way to hand the claim back. A job whose claim was
+      // won but whose dispatch then dropped (no pending context) is currently
+      // recoverable by a later recompute; honouring the claim here removes that
+      // recovery, and that interaction is unverified.
       const now = new Date();
       await db
         .updateTable('execution_jobs')

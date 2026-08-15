@@ -258,6 +258,11 @@ export type {
 
 export { isMatrixJobOutputs, isHostJobOutputs } from './context.js';
 
+// Workflow-level pre-dispatch filter
+export type { FilterContext, FilterFn } from './filter.js';
+export { createFilterContext } from './filter-context.js';
+export type { CreateFilterContextInput } from './filter-context.js';
+
 export type { FanoutPosition } from './fanout-context.js';
 
 // KiCI API types (agent private API over WS)

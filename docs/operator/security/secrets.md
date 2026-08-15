@@ -5,12 +5,12 @@ description: Configure and manage encrypted secrets for KiCI workflows
 
 
 
-KiCI provides encrypted secrets management so workflows can access sensitive values (API keys, deploy tokens, credentials) without storing them in code or environment variables. Secrets are organized by org and scope, with access controlled by environment bindings and protection rules.
+KiCI provides encrypted secrets management so workflows can access sensitive values (API keys, deploy tokens, credentials) without storing them in code or environment variables. Secrets are organized by org and scope, with access controlled by context bindings and protection rules.
 
 Key properties:
 
 - **Encrypted at rest** -- AES-256-GCM encryption with additional authenticated data (AAD) to prevent cross-scope swaps
-- **Scope-based** -- secrets are organized by org ID and scope (e.g., environment name, repo pattern), bound to environments via scope bindings
+- **Scope-based** -- secrets are organized by org ID and scope (e.g., context name, repo pattern), bound to contexts via scope bindings
 - **RBAC-protected** -- role-based access control for admin operations (owner, admin, auditor)
 - **Audit-logged** -- all secret operations are recorded with user, action, and outcome
 - **Multi-backend** -- PostgreSQL (default) or HashiCorp Vault for secret storage
@@ -20,7 +20,7 @@ Key properties:
 Secret values are written into the store either through the dashboard or through `kici-admin`. Which surfaces accept value writes is decided per-orchestrator by the [dashboard-write policy](./dashboard-write-policy.md). The default at first-boot is **permissive**: both surfaces accept writes.
 
 - Customers preparing for SOC2 or running regulated workloads typically flip `secrets.set` (and `variables.set`) to CLI-only, which routes plaintext exclusively through the orchestrator's HTTP admin API. The control plane never receives the plaintext value in that mode.
-- The dashboard remains usable for secret-name CRUD, scope CRUD, environment bindings, and read paths regardless of the policy. Only the value-entry path moves to the CLI.
+- The dashboard remains usable for secret-name CRUD, scope CRUD, context bindings, and read paths regardless of the policy. Only the value-entry path moves to the CLI.
 
 The matching `kici-admin secret set` invocation accepts five input modes (interactive prompt, stdin pipe, file, env var, argv); see [CLI input modes](#cli-input-modes) below.
 
@@ -125,7 +125,7 @@ Each operation below is driven by `kici-admin`; the `kici-admin` subcommand wrap
 
 ### Scoped secret management
 
-Secrets are organized by org ID and scope (e.g., environment name, repo pattern).
+Secrets are organized by org ID and scope (e.g., context name, repo pattern).
 
 **List scopes:**
 
@@ -199,16 +199,18 @@ keeps resolving in workflows and can still be deleted. To bring one into line,
 write the value under a conforming key and delete the old one -- there is no
 migration command, and none is needed.
 
-### Environment scope bindings
+### Context scope bindings
 
-An environment owns a set of scope-pattern bindings over the secret tree. When a job targets an environment, every secret whose scope matches a binding is resolved into the flat map shipped to the agent (read via `ctx.secrets.get('KEY')`). Bind a scope pattern to an environment with:
+A context owns a set of scope-pattern bindings over the secret tree. When a job targets a context, every secret whose scope matches a binding is resolved into the flat map shipped to the agent (read via `ctx.secrets.get('KEY')`). Bind a scope pattern to a context with:
 
 ```bash
 kici-admin context bind --org <org-id> --env production --scope "aws/prod/**"
 ```
 
+(the flag is still spelled `--env`; its value is the context name.)
+
 ```bash
-curl -X POST $KICI_ADMIN_URL/api/v1/admin/environments/production/bind \
+curl -X POST $KICI_ADMIN_URL/api/v1/admin/contexts/production/bind \
   -H "Authorization: Bearer $KICI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"orgId": "<org-id>", "scopePattern": "aws/prod/**"}'
@@ -356,7 +358,7 @@ kici-admin secret set --scope production DB_PASSWORD --prompt \
 
 ## RBAC roles
 
-The orchestrator secrets admin API enforces a fixed three-role model (`owner`, `admin`, `auditor`) defined in `packages/orchestrator/src/secrets/rbac.ts`. There is no `member` role at this layer -- workflow-author secret access happens via the environment/scope binding flow, not via an admin token.
+The orchestrator secrets admin API enforces a fixed three-role model (`owner`, `admin`, `auditor`) defined in `packages/orchestrator/src/secrets/rbac.ts`. There is no `member` role at this layer -- workflow-author secret access happens via the context/scope binding flow, not via an admin token.
 
 | Role        | Permissions                                                                                                                                                                                                                                                                                                                 | Use case                    |
 | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
@@ -366,23 +368,23 @@ The orchestrator secrets admin API enforces a fixed three-role model (`owner`, `
 
 ## Access control
 
-Secret access is controlled by environments, not by the secrets subsystem directly. Each environment defines protection rules (branch restrictions, trigger type filters, repository patterns) that gate job execution. When a job targets an environment, the protection pipeline evaluates these rules before dispatch. Only after the environment gates pass are secrets resolved for that environment's scope bindings.
+Secret access is controlled by contexts, not by the secrets subsystem directly. Each context defines protection rules (branch restrictions, trigger type filters, repository patterns) that gate job execution. When a job targets a context, those gates are evaluated before dispatch. Only after they pass are secrets resolved for that context's scope bindings.
 
-Configure access restrictions on environments in **Settings > Environments > [env] > Protection**.
+Configure access restrictions on a context in the dashboard under **Contexts > [context] > Protection**.
 
 ### Test-run access (`allowLocalExecution`)
 
-`kici run remote` lets a developer trigger a test run that resolves test-scoped secrets — the developer's own local values (uploaded encrypted) merged with secrets from environments you have explicitly opted into test access. That opt-in is the per-environment `allowLocalExecution` flag (default `false`):
+`kici run remote` lets a developer trigger a test run that resolves test-scoped secrets — the developer's own local values (uploaded encrypted) merged with secrets from contexts you have explicitly opted into test access. That opt-in is the per-context `allowLocalExecution` flag (default `false`):
 
-- An environment with the flag off is never resolvable for a test run, and a test run targeting it is rejected before dispatch. A fixture that maps a secret context to a missing or non-test environment also rejects the run (fail-closed).
-- On a key collision, the developer's uploaded local value wins over the environment's stored value, so a test run never leaks a production credential through an accidental name match.
+- A context with the flag off is never resolvable for a test run, and a test run targeting it is rejected before dispatch. A fixture that maps a secret context to a missing or non-test context also rejects the run (fail-closed).
+- On a key collision, the developer's uploaded local value wins over the context's stored value, so a test run never leaks a production credential through an accidental name match.
 
-Recommended posture: leave **all production environments at `false`**, and create a dedicated test environment with `allowLocalExecution: true` that binds only **test-only** secret scopes (throwaway databases, sandbox API keys). Test runs then reach exactly those credentials and nothing else.
+Recommended posture: leave **all production contexts at `false`**, and create a dedicated test context with `allowLocalExecution: true` that binds only **test-only** secret scopes (throwaway databases, sandbox API keys). Test runs then reach exactly those credentials and nothing else.
 
 Set the flag with `kici-admin`:
 
 ```bash
-# Enable test-run access on a dedicated test environment
+# Enable test-run access on a dedicated test context
 kici-admin context set-policy --env test-database --allow-local-execution true
 
 # Keep production locked down (explicit, though false is the default)
@@ -643,7 +645,7 @@ kici-admin secret scopes org-1 --all-backends
 
 A backend that is unreachable at that moment is skipped with a warning rather
 than failing the whole listing. `--all-backends` becomes the default at v1.0.0
-(see [Deprecations](/user/deprecations/)).
+(see [Deprecations](../../user/deprecations.md)).
 
 ### Repairing scopes stored with a stale qualifier
 
@@ -761,7 +763,7 @@ If expected scopes don't appear after sync:
 - Check orchestrator logs for sync errors
 
 **Data migration:**
-When upgrading to multi-backend support, existing PG scopes are automatically prefixed with `pg:` during the database migration. Environment bindings are also updated. No manual intervention required.
+When upgrading to multi-backend support, existing PG scopes are automatically prefixed with `pg:` during the database migration. Context bindings are also updated. No manual intervention required.
 
 ## Troubleshooting
 
@@ -802,9 +804,9 @@ window) and retry once the orchestrator's database is healthy.
 
 ### Secrets not appearing in workflows
 
-- Verify the job targets an environment that has secret scope bindings configured
+- Verify the job targets a context that has secret scope bindings configured
 - Check that secrets exist in the expected scope for the org
-- Verify the environment protection rules allow the branch, trigger type, and repository
+- Verify the context protection rules allow the branch, trigger type, and repository
 - Check the audit log for denied access entries
 
 ## Cross-job secret outputs
@@ -819,7 +821,7 @@ KiCI supports passing secret values between jobs in the same workflow run. This 
 
 3. **Orchestrator-side decryption and re-encryption:** The orchestrator decrypts the agent's envelope using the run's private key, then re-encrypts the value with `KICI_SECRET_KEY` and stores it in `run_secret_outputs`.
 
-4. **Downstream injection:** When dispatching a downstream job that depends on the producing job (via `needs`), the orchestrator decrypts the stored secret outputs and injects them into the agent's secrets alongside environment-scoped secrets.
+4. **Downstream injection:** When dispatching a downstream job that depends on the producing job (via `needs`), the orchestrator decrypts the stored secret outputs and injects them into the agent's secrets alongside context-scoped secrets.
 
 5. **Cleanup:** When the run completes (all jobs finished), the ephemeral private key and all secret output rows are deleted.
 

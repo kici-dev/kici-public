@@ -25,3 +25,10 @@ export { PendingBuildTracker } from './pending-builds.js';
 export { PendingInitTracker } from './pending-inits.js';
 export type { InitResult } from './pending-inits.js';
 export { PendingDynamicTracker } from './pending-dynamics.js';
+export { PendingGlobalEvalTracker } from './pending-global-evals.js';
+export {
+  GlobalEvalRoundCache,
+  globalEvalRoundCacheKey,
+  isCacheableRoundResult,
+} from './global-eval-round-cache.js';
+export { parseGlobalEvalResult } from './pending-global-evals.js';

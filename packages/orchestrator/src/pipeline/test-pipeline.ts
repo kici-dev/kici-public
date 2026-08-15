@@ -32,16 +32,16 @@ import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type {
   LockFile as FullLockFile,
-  LockJob,
   LockWorkflow,
   ProviderType,
   SimulatedEvent,
   WorkflowDecision,
 } from '@kici-dev/engine';
-import { isLockStaticJob, matchAllWorkflows, createWorkflowDecision } from '@kici-dev/engine';
+import { matchAllWorkflows, createWorkflowDecision } from '@kici-dev/engine';
+import { agentLabelOf, stringifyActor, type ActorPrincipal } from '@kici-dev/engine';
 import { coerceDispatchInputs } from '@kici-dev/engine';
 import type { CheckMode, HostTargetSelector, InputsDescriptorMap } from '@kici-dev/engine';
-import { evaluateInlineFields } from './inline-eval.js';
+import { webhookPayloadPath } from './webhook-payload-store.js';
 
 const logger = createLogger({ prefix: 'test-pipeline' });
 
@@ -80,6 +80,17 @@ export interface TestTriggerInput {
   };
   /** Request trace ID from the HTTP request. */
   requestId: string;
+  /**
+   * The principal that initiated this run, relayed by the Platform on
+   * `test.relay.trigger` (where the wire schema has always required it).
+   *
+   * Required rather than optional: the relay handler is the only production
+   * caller, so there is no path that legitimately lacks an actor, and an
+   * optional field would let a future caller silently drop attribution — which
+   * is exactly how `execution_runs.triggered_by` stayed NULL for every remote
+   * test run while the column claimed to hold the initiator.
+   */
+  actor: ActorPrincipal;
   /** JSON-stringified lock file content for local repos with no remote. */
   inlineLockFile?: string;
   /** When true, repo has no remote -- skip provider lookup, skip clone. */
@@ -237,35 +248,6 @@ function selectMatchedDecisions(
 }
 
 /**
- * Validate each matched static job's pure inline dynamic fields once per test
- * run by evaluating them against the fixture's simulated event (the normalized
- * envelope — the same argument production dispatch passes). Inline evaluation
- * failures reject the run (no fallback), matching production's immediate-failure
- * semantics. Non-test-allowed bound contexts are NOT rejected here: the
- * shared dispatch core skips them for test runs (skip-on-test).
- */
-function validateInlineFieldsForRun(
-  fullLockFile: FullLockFile,
-  matchedDecisions: WorkflowDecision[],
-  simulatedEvent: SimulatedEvent,
-): { ok: true } | { rejected: string } {
-  for (const decision of matchedDecisions) {
-    const workflow = fullLockFile.workflows.find(
-      (w: LockWorkflow) => w.name === decision.workflowName,
-    );
-    if (!workflow) continue;
-    for (const job of workflow.jobs.filter(isLockStaticJob)) {
-      try {
-        evaluateInlineFields(job as LockJob, simulatedEvent);
-      } catch (err) {
-        return { rejected: toErrorMessage(err) };
-      }
-    }
-  }
-  return { ok: true };
-}
-
-/**
  * Persist the test fixture payload to object storage so the payload viewer
  * can resolve it the same way it does for real webhook runs. Failures are
  * logged but do not abort the run.
@@ -276,7 +258,7 @@ async function storeFixturePayload(
   runId: string,
 ): Promise<void> {
   if (!deps.logStorage) return;
-  const payloadPath = `executions/${runId}/webhook-payload.json`;
+  const payloadPath = webhookPayloadPath(runId);
   try {
     await deps.logStorage.append(payloadPath, JSON.stringify(input.event.payload));
   } catch (err) {
@@ -452,6 +434,9 @@ function buildTestDispatchContext(
     bundle: shared.bundle,
     payload: shared.simulatedEvent.payload,
     repoIdentifier: shared.repoIdentifier,
+    // A test run drives the repository's own lock file (fetched or inline), so
+    // the workflow is defined by the repository the run acts on.
+    workflowRepoIdentifier: shared.repoIdentifier,
     credentials: {},
     event: shared.simulatedEvent,
     eventWithFiles: shared.simulatedEvent,
@@ -465,6 +450,11 @@ function buildTestDispatchContext(
     lockFileSource: undefined,
     localWorkingTree: shared.input.inlineLockFile != null,
     crossSource: false,
+    // `stringifyActor` + `agentLabelOf` is the same pair the dashboard re-run
+    // path uses for these two columns. Two renderings of one identity is how
+    // they drift, so this reuses that one rather than minting another.
+    triggeredBy: stringifyActor(shared.input.actor),
+    triggeredByAgentLabel: agentLabelOf(shared.input.actor),
     // `kici run` is operator-initiated against a synthetic event, so there is
     // no pull-request provenance for the org trust policy to evaluate: no
     // external contributor, no fork, no base-vs-head workflow diff. The
@@ -532,11 +522,6 @@ export async function processTestTrigger(
   // namespaced-secret resolution, and the dispatch core.
   const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
 
-  const fieldsResult = validateInlineFieldsForRun(fullLockFile, matchedDecisions, simulatedEvent);
-  if ('rejected' in fieldsResult) {
-    return { runId, status: 'rejected', reason: fieldsResult.rejected, jobIds: [] };
-  }
-
   // Authoritative dispatch-input validation: coerce + default + validate the
   // operator's raw --input pairs against the matched workflows' lock descriptor.
   // Rejected at the relay — no agent dispatched.
@@ -595,6 +580,7 @@ export async function processTestTrigger(
 
   const jobIds: string[] = [];
   const warnings: string[] = [];
+  let deferredJobCount = 0;
   for (const decision of matchedDecisions) {
     const workflow = fullLockFile.workflows.find(
       (w: LockWorkflow) => w.name === decision.workflowName,
@@ -603,10 +589,15 @@ export async function processTestTrigger(
     const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
     const result = await dispatchMatchedWorkflow(ctx);
     jobIds.push(...result.dispatchedJobIds);
+    deferredJobCount += result.deferredJobCount ?? 0;
     if (result.envWarnings?.length) warnings.push(...result.envWarnings);
   }
 
-  if (jobIds.length === 0) {
+  // A workflow whose only jobs have a dynamic context (or a deferred-init job)
+  // dispatches nothing synchronously — those jobs are dispatched by the agent
+  // init round — so `jobIds` is empty even though real work is queued. Only
+  // reject when there is neither a dispatched job nor pending deferred work.
+  if (jobIds.length === 0 && deferredJobCount === 0) {
     return {
       runId,
       status: 'rejected',

@@ -50,6 +50,8 @@ export function push(config?: PushConfigInput): PushTriggerConfig {
     tags: Object.freeze([...tags]),
     paths: Object.freeze([...paths]),
     repos: Object.freeze([...repos]),
+    ...(config?.requires !== undefined && { requires: Object.freeze([...config.requires]) }),
+    ...(config?.commitMessage !== undefined && { commitMessage: config.commitMessage }),
     ...(config?.description !== undefined && { description: config.description }),
   };
 

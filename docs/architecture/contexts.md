@@ -126,15 +126,13 @@ Each job's ordered bound-context name list is persisted on its `execution_jobs.c
 
 ### Dynamic field resolution
 
-When a lock file job has dynamic fields (`dynamicContext`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. There are two resolution paths:
+When a lock file job has dynamic fields (`dynamicContext`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. It never evaluates workflow code in-process — every dynamic function runs on the eval agent's init runner.
 
-#### Inline evaluation (schema v11+, `LockInlineValue`)
+`LockInlineValue` (`_type: 'inline'`) is a **deprecated, read-only-recognized** lock shape. An already-deployed lock may still carry a dynamic field serialized as `{ _type: 'inline', expression: … }`; the orchestrator recognizes the shape but **never evaluates it** — it defers the field to the init step exactly like any other dynamic field. The compiler no longer emits it (see [deprecations](../user/deprecations.md)).
 
-When a dynamic field's value is a `LockInlineValue` (a pure function serialized as an inline expression), the orchestrator evaluates it directly without dispatching a separate init job. The processor checks `isLockInlineValue()` on `context`, `env`, and `concurrencyGroup` fields and evaluates the inline expression at the orchestrator. This is the preferred path for simple pure functions.
+#### Init model
 
-#### Two-phase init model (complex dynamic functions)
-
-When a dynamic field is `true` but its value is not a `LockInlineValue`, the orchestrator uses a two-phase init model:
+To resolve dynamic fields, the orchestrator uses a two-phase init model:
 
 **Phase 1 -- Init:**
 
@@ -146,14 +144,11 @@ When a dynamic field is `true` but its value is not a `LockInlineValue`, the orc
 
 **Phase 2 -- Resolution + execution:** 6. Orchestrator treats resolved values as static -- full context lookup, protection rules, secret resolution, variable merge all proceed normally 7. A fresh execution job is dispatched with everything resolved
 
-**Key properties (both paths):**
+**Key properties:**
 
 - All dynamic fields resolved before dispatch
 - Mixed static/dynamic fields are supported (e.g., static `context` + dynamic `env`)
 - Hold/wait/queue behavior is identical to static contexts (orchestrator handles after resolution)
-
-**Key properties (two-phase init only):**
-
 - All dynamic fields resolved in a single init call (no separate callbacks per field)
 - Init runner runs in its own agent process -- user code never executes in the orchestrator
 - Dynamic function evaluation has a 60-second timeout (configurable per-job)
@@ -244,7 +239,7 @@ Each context carries an `allow_local_execution` flag (default `false`) that gate
 
 When the orchestrator resolves secrets for a test run, it combines the developer's CLI-uploaded local secrets (sent encrypted with the run) with test-context secrets resolved from `scoped_secrets`. The test-context side is filtered by `allow_local_execution`:
 
-- The job's own declared `context` and each fixture `secrets: { ctx: envName }` mapping resolve secrets **only** when the target context has `allow_local_execution = true`. Static strings and pure inline `context` expressions both participate — the inline expression is evaluated against the fixture's simulated event and the resolved name goes through the same gate. Impure dynamic contexts (init-job marker) are not evaluated for test runs and contribute no context-resolved secrets.
+- The job's own declared `context` and each fixture `secrets: { ctx: envName }` mapping resolve secrets **only** when the target context has `allow_local_execution = true`. Only a statically-named `context` participates — the static name goes through the same gate. Dynamic contexts (resolved on the agent's init step) are not evaluated for test runs and contribute no context-resolved secrets.
 - The gate applies to **all** remote test runs: a run whose matched workflow targets an context with the flag off is rejected before dispatch.
 - A fixture mapping that points a context at a missing context, or at one whose flag is off, **rejects the run** (fail-closed).
 - On a key collision, the CLI-uploaded local value wins over the test-context value, giving a per-run override.
@@ -296,7 +291,7 @@ Context management in the dashboard goes through the same REST-over-WS proxy pat
 
 ## Lock file schema
 
-The lock file (v6+) includes per-job context fields. Schema v11 added `LockInlineValue` as an alternative to the two-phase init model for pure function evaluation:
+The lock file (v6+) includes per-job context fields:
 
 ```json
 {
@@ -314,9 +309,9 @@ The lock file (v6+) includes per-job context fields. Schema v11 added `LockInlin
 }
 ```
 
-- `context` -- static context name (`string`) or inline expression (`LockInlineValue`, schema v11+)
-- `dynamicContext` -- `true` when context is a function (resolved via inline evaluation or two-phase init)
-- `env` -- static environment variables (`Record<string, string>`) or inline expression (`LockInlineValue`, schema v11+)
+- `context` -- static context name (`string`); an older lock may carry a deprecated `LockInlineValue`, which the orchestrator defers to the init step rather than evaluating
+- `dynamicContext` -- `true` when context is a function (resolved on the agent's init step)
+- `env` -- static environment variables (`Record<string, string>`); an older lock may carry a deprecated `LockInlineValue`, deferred to the init step
 - `dynamicEnv` -- `true` when env is a function
-- `concurrencyGroup` -- static concurrency group name (`string`) or inline expression (`LockInlineValue`, schema v11+)
+- `concurrencyGroup` -- static concurrency group name (`string`); an older lock may carry a deprecated `LockInlineValue`, deferred to the init step
 - `dynamicConcurrencyGroup` -- `true` when concurrencyGroup is a function

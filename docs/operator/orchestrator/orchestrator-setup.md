@@ -1,6 +1,6 @@
 ---
 title: Orchestrator setup guide
-description: ''
+description: End-to-end orchestrator setup — database migration, source configuration, and operational management
 ---
 
 This guide covers the end-to-end setup of a KiCI orchestrator, including database migration, source configuration, and operational management.

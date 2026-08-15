@@ -28,6 +28,7 @@ For failures that happen **inside** a step (a command exited non-zero, a script 
 
 - Dashboard → run detail → select the failed job/step → **Logs** tab (live for running steps, historical for completed ones).
 - `kici runs logs <runId> --job <name>` from the CLI.
+- `kici-admin runs logs <runId> --job <jobId>` from the operator plane. Reach for this when the other two cannot see the step at all — most often the pre-run evaluation round of an organization-wide workflow, which records no execution run, so the dashboard has nothing to show and `kici runs logs` cannot resolve the id. Find the round's ids in the dispatch queue first: `kici-admin queue list --workflow-name '__globaleval__<owner>/<repo>' --limit 5 --json`, where `<owner>/<repo>` is the repo the workflow was authored in; each JSON row carries the job id as `id` and the run id as `run_id`. Use an owner or admin token for both steps: the queue lookup requires `secret.read`, so an auditor token is refused with a 403 before it reaches the logs call (which needs only `run.read`). See [kici-admin: runs, execution & events](./orchestrator/kici-admin/runs-execution-events.md).
 
 ### 3. Low-level provisioning / agent-init failures
 
@@ -149,12 +150,24 @@ status. A missing run maps to one of these terminal statuses:
   than silently skipping (so this one DOES produce a failed run — see
   [Lock-file drift at the orchestrator](#lock-file-drift-at-the-orchestrator)).
 - `duplicate` — the dedup cache rejected a re-delivered event.
+- `received` — the delivery never reached trigger matching at all. Three things
+  produce it: the routing key resolved to no provider, the provider does not map
+  that event type to a trigger (a GitHub `check_suite` is the common one, and is
+  normal), or the payload carried no repository the source's provider could read.
 
 ### Diagnose
 
 `kici-admin event-log` lists recent deliveries with their status and
 `matched_count`. Find the delivery in question and read its status: it tells you
 directly which of the above happened.
+
+For a `received` delivery, the orchestrator log names which of the three it was,
+one line per delivery: `Unknown provider, skipping` also lists the routing keys
+that WERE registered, and `Missing repository info in payload, skipping` names
+the provider whose normalizer read the payload. Compare that provider against
+the source's own type — a `local` or universal-git source answered by the
+`generic` provider means the source's settings had not been applied to that
+delivery.
 
 ### Fix
 
@@ -163,6 +176,9 @@ directly which of the above happened.
 - `lockfile_missing`: no action unless a run WAS expected — then the lock file is
   not committed at that ref.
 - `duplicate`: expected on provider retries; no action.
+- `received`: no action when the event type simply has no trigger. When a run
+  WAS expected, check the source resolves — `kici-admin source list --org <orgId>`
+  — and confirm the routing key in the delivery matches the source's own.
 
 ## Agent won't connect or register
 

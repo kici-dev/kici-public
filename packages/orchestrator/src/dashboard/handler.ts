@@ -92,6 +92,7 @@ import type { ArtifactStore } from '../artifacts/artifact-store.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { EventStore } from '../events/event-store.js';
 import { loadEventLogByDeliveryId } from '../cold-store/load-event-log-range.js';
+import { webhookPayloadPath } from '../pipeline/webhook-payload-store.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   assertDashboardWriteAllowed,
@@ -2043,7 +2044,7 @@ export class DashboardHandler {
    */
   async handlePayload(msg: DashboardPayloadRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
-    const payloadPath = `executions/${msg.runId}/webhook-payload.json`;
+    const payloadPath = webhookPayloadPath(msg.runId);
     const backend = this.logStorage.constructor.name;
     logger.info('Dashboard payload request received', {
       requestId: msg.requestId,

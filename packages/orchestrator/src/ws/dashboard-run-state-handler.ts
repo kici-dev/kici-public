@@ -47,6 +47,7 @@ export async function handleRunState(
       'status',
       'routing_key',
       'repo_identifier',
+      'workflow_repo_identifier',
       'sha',
       'ref',
       'started_at',
@@ -80,6 +81,13 @@ export async function handleRunState(
     status: row.status as ExecutionRunStatus,
     ...(row.routing_key && { routingKey: row.routing_key }),
     repoIdentifier: row.repo_identifier,
+    // Recorded only when it differs from `repo_identifier`, so its presence
+    // marks a cross-repository global run. The reconciler drives this
+    // projection through `upsertRunMirror`, so dropping it here would recover a
+    // global run into the mirror as an ordinary per-repository one.
+    ...(row.workflow_repo_identifier && {
+      workflowRepoIdentifier: row.workflow_repo_identifier,
+    }),
     sha: row.sha,
     ref: row.ref,
     parentRunId: row.parent_run_id,

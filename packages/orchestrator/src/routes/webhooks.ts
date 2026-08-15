@@ -225,11 +225,17 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           resolvedEvent = normalized.event;
         }
 
-        // 11. Process through the pipeline. The pipeline owns the atomic dedup
-        // claim now (a single chokepoint shared by the relay, generic, and
-        // direct GitHub ingestion paths), so the route no longer does its own
-        // check-then-act — that double-deduped against the pipeline and, with an
-        // atomic claim, a second claim would falsely mark the delivery a dupe.
+        // 11. Hand the delivery to ingest. This resolves once the delivery is
+        // DURABLY QUEUED, not once it has been matched and dispatched — a
+        // provider's delivery attempt times out in seconds while one matched
+        // workflow's build phase alone may take minutes, so a response that
+        // waited for the pipeline turned a slow build into a failed delivery.
+        //
+        // The pipeline still owns the atomic dedup claim (a single chokepoint
+        // shared by the relay, generic, and direct GitHub ingestion paths), so
+        // the route does no check-then-act of its own; the `duplicate` outcome
+        // below is ingest's advisory probe of an already-known delivery id, and
+        // a genuine cross-instance race is still arbitrated by that one claim.
         const outcome = await deps.onWebhook(info);
 
         // Shed (admission control saturated): 429 + Retry-After, and crucially do
@@ -269,8 +275,15 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           dedupHitsTotal.add(1);
           return c.json({ accepted: true, deliveryId: info.deliveryId, duplicate: true }, 200);
         }
+        // 202 = accepted and durably queued. It does NOT assert that any
+        // workflow matched or dispatched — those outcomes reach the event log,
+        // the run list, and the structured logs, never this response.
         return c.json({ accepted: true, deliveryId: info.deliveryId }, 202);
       } catch (err) {
+        // Reachable for a failure BEFORE the delivery is queued (source lookup,
+        // verification, the durable write). A pipeline failure cannot land here
+        // any more — by then the response is sent — so it surfaces as a `failed`
+        // event-log row plus an `orch:ingest-accept` error line instead.
         logger.error('Generic webhook processing error', {
           orgId,
           sourceId,

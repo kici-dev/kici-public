@@ -73,13 +73,23 @@ const AGENT_SCALER_VALUES = ['stateful', 'container', 'firecracker', 'bare-metal
  */
 export const ORCH_SCALER_VALUES = ['__global__', ...AGENT_SCALER_VALUES] as const;
 
-/** Closed enum of the five scheduled jobs the orchestrator runs (mirrors `OrchestratorScheduledJobName`). */
-const ORCH_JOB_VALUES = [
+/**
+ * Closed enum of the scheduled jobs the orchestrator runs. MUST mirror
+ * `OrchestratorScheduledJobName` (`packages/orchestrator/src/queue/scheduled-job.ts`)
+ * exactly — a job missing here has its whole `kici_orch_job_*` series
+ * dropped by the Platform filter with `reason="bad_label_value"`, so the
+ * job silently loses every health metric. The engine cannot import the
+ * orchestrator (dependency runs the other way), so the parity assertion
+ * lives on the orchestrator side in `scheduled-job.test.ts`. Exported so
+ * that test can assert against it.
+ */
+export const ORCH_JOB_VALUES = [
   'cleanup',
   'orphan-secret-cleanup',
   'token-cleanup',
   'cold-store-archive',
   'cold-store-purge',
+  'unroutable-probe',
 ] as const;
 
 /**

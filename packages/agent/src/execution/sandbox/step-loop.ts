@@ -15,6 +15,7 @@ import type {
   CacheSpec,
   FanoutPosition,
   NormalizedRetry,
+  RepoInfo,
 } from '@kici-dev/sdk';
 import { normalizeCacheSpecs, normalizeApproval } from '@kici-dev/sdk';
 import { ExecutionStepStatus, CheckMode, CheckStepOutcome, LogStream } from '@kici-dev/engine';
@@ -120,6 +121,15 @@ export interface StepLoopOptions {
   dispatchInputs?: Readonly<Record<string, string | number | boolean | null>>;
   /** Fan-out position for the rule context (`ctx.fanout`); undefined on a non-fan-out job. */
   fanout?: FanoutPosition;
+  /**
+   * The repo whose event triggered this run, for the step rule context
+   * (`ctx.sourceRepo`). Present for a global workflow, absent otherwise — a
+   * step rule reads the source tree through `.path` the same way a job rule
+   * and a generator do.
+   */
+  sourceRepo?: RepoInfo;
+  /** The repo that registered the workflow, for the step rule context (`ctx.workflowRepo`). */
+  workflowRepo?: RepoInfo;
   /** Job-level hooks. */
   jobHooks?: JobHooks;
   /**
@@ -670,6 +680,10 @@ async function evaluateStepRulesAndMaybeSkip(
     env: opts.env,
     dispatchInputs: opts.dispatchInputs ?? {},
     fanout: opts.fanout,
+    // Spread conditionally: a present-but-undefined `sourceRepo` reads as
+    // "declared" to a rule that guards on the key rather than the value.
+    ...(opts.sourceRepo && { sourceRepo: opts.sourceRepo }),
+    ...(opts.workflowRepo && { workflowRepo: opts.workflowRepo }),
   });
   const ruleResult = await evaluateRules(step.rules, ruleCtx, step.name);
   if (ruleResult.allPassed) return null;

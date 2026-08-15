@@ -12,38 +12,10 @@ import {
   serializeLockFile,
   detectGitRoot,
   computeLockfileHash,
-  collectWorkflowPurityWarnings,
   schemaWindowWarning,
-  type JobPurityWarning,
 } from '../lockfile/index.js';
-import {
-  formatError,
-  isCompilerError,
-  compilerError,
-  DiagnosticSeverity,
-  PURITY_FALLBACK_CODE,
-} from '../errors/index.js';
+import { formatError, isCompilerError } from '../errors/index.js';
 import { SCHEMA_VERSION, BREAKING_FLOOR, type LockFile } from '../types.js';
-
-/**
- * Render an impure dynamic-value function as a `W101` compile warning naming the
- * job, the field, the impurity reason, and the ~5-10s agent-side init-job cost.
- */
-function formatPurityWarning(w: JobPurityWarning): string {
-  return formatError(
-    compilerError(
-      PURITY_FALLBACK_CODE,
-      `job "${w.jobName}": ${w.field} function is not pure (${w.reason}). ` +
-        'An init job will be required, adding ~5-10s delay.',
-      {
-        severity: DiagnosticSeverity.Warning,
-        suggestion:
-          `Make the ${w.field} function pure (synchronous, referencing only its parameters) ` +
-          'to inline it and skip the init job. See https://docs.kici.dev — dynamic values.',
-      },
-    ),
-  );
-}
 
 /** Options for the compile command */
 export interface CompileOptions {
@@ -157,13 +129,6 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     // 3. Generate lock file (with source tracking for better references)
     const lockFile = generateLockFile(workflowsWithSource);
     const lockJson = serializeLockFile(lockFile);
-
-    // Surface impure dynamic-value functions that force an agent-side __init__ job.
-    // Rendered via logger.warn (with a coloured `warn` level prefix) regardless of
-    // --quiet, since the init-job cost is important enough for the author to always see.
-    for (const warning of collectWorkflowPurityWarnings(workflowsWithSource)) {
-      logger.warn(formatPurityWarning(warning));
-    }
 
     // Informational: when the current schema version is itself breaking, warn
     // that orchestrators older than it cannot read this lock. Silent otherwise

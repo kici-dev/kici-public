@@ -113,6 +113,13 @@ import * as m105 from './migrations/105_org_trust_policy.js';
 import * as m106 from './migrations/106_cluster_settings_check_run_tracking_ttl_days.js';
 import * as m107 from './migrations/107_check_run_tracking_updated_at_index.js';
 import * as m108 from './migrations/108_unroutable_fast_fail.js';
+import * as m109 from './migrations/109_cluster_settings_cache_knobs.js';
+import * as m110 from './migrations/110_cluster_settings_global_eval_knobs.js';
+import * as m111 from './migrations/111_cluster_settings_global_eval_wait.js';
+import * as m112 from './migrations/112_execution_runs_workflow_repo.js';
+import * as m113 from './migrations/113_execution_runs_workflow_repo_index.js';
+import * as m114 from './migrations/114_ingest_queue_claim.js';
+import * as m115 from './migrations/115_global_workflows_cluster_switch.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -226,6 +233,13 @@ export function createMigrationProvider(): MigrationProvider {
         '106_cluster_settings_check_run_tracking_ttl_days': m106,
         '107_check_run_tracking_updated_at_index': m107,
         '108_unroutable_fast_fail': m108,
+        '109_cluster_settings_cache_knobs': m109,
+        '110_cluster_settings_global_eval_knobs': m110,
+        '111_cluster_settings_global_eval_wait': m111,
+        '112_execution_runs_workflow_repo': m112,
+        '113_execution_runs_workflow_repo_index': m113,
+        '114_ingest_queue_claim': m114,
+        '115_global_workflows_cluster_switch': m115,
       };
     },
   };

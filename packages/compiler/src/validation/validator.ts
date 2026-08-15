@@ -127,6 +127,67 @@ function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerErr
     errors.push(...matrixErrors);
   }
 
+  errors.push(...validateGlobalApproval(workflow, staticJobs, workflowFile));
+
+  return errors;
+}
+
+/** True when any trigger carries `repos:`, which is what makes a workflow global. */
+function isGlobalWorkflow(workflow: Workflow): boolean {
+  const triggers = Array.isArray(workflow.on) ? workflow.on : workflow.on ? [workflow.on] : [];
+  return triggers.some((trigger) => {
+    const repos = (trigger as { repos?: readonly unknown[] }).repos;
+    return Array.isArray(repos) && repos.length > 0;
+  });
+}
+
+/**
+ * Refuse an `approval` gate on an organization-wide workflow.
+ *
+ * The approval hold is applied by the per-repository dispatch path. The global
+ * path builds its job inputs and dispatches them without ever consulting the
+ * gate, so an `approval` declared on a global workflow is **silently ignored**:
+ * the job runs immediately and the author believes a human had to release it.
+ *
+ * Failing the compile rather than warning is the right direction for a gate an
+ * author is relying on. A silently-ignored approval is not a cosmetic problem —
+ * it is a security control the workflow claims to have and does not.
+ *
+ * Only static jobs and the workflow level are reachable here; a generated job
+ * carrying `approval` is caught at dispatch, which is the only place it exists.
+ */
+function validateGlobalApproval(
+  workflow: Workflow,
+  staticJobs: Job[],
+  workflowFile: string,
+): CompilerError[] {
+  if (!isGlobalWorkflow(workflow)) return [];
+  const errors: CompilerError[] = [];
+  const suggestion =
+    'Approval gates are supported on per-repository workflows only. Drop `approval`, ' +
+    'or move the gated jobs into a workflow whose triggers carry no `repos:`.';
+
+  if (workflow.approval) {
+    errors.push(
+      compilerError(
+        'E124',
+        `Workflow "${workflow.name}" declares \`approval\` and is organization-wide ` +
+          '(a trigger carries `repos:`). The approval would never be enforced.',
+        { location: locationForWorkflow(workflowFile), suggestion },
+      ),
+    );
+  }
+  for (const job of staticJobs) {
+    if (!job.approval) continue;
+    errors.push(
+      compilerError(
+        'E124',
+        `Job "${job.name}" in organization-wide workflow "${workflow.name}" declares ` +
+          '`approval`. The approval would never be enforced.',
+        { location: locationForJob(job, workflowFile), suggestion },
+      ),
+    );
+  }
   return errors;
 }
 

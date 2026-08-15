@@ -10,7 +10,7 @@ roster that matches a label predicate — one pinned execution per host. Use it 
 fleet-wide operations: patch every web tier, smoke-test every node, collect uptime
 from the fleet.
 
-`runsOnAll` is mutually exclusive with [`runsOn`](/user/sdk/core/): a job declares one
+`runsOnAll` is mutually exclusive with [`runsOn`](./core.md): a job declares one
 or the other. Where `runsOn` picks a **single** agent that satisfies the labels,
 `runsOnAll` targets **all** matching hosts and runs the job once on each, pinned to
 that specific host.
@@ -203,7 +203,7 @@ to a single scalar: `summary.outputs[key]` is an array of every host's value, an
 ### onUnreachable: skip | fail | hold
 
 Resolution is backed by the **declared host roster** (see the operator
-[host roster](/operator/orchestrator/host-roster/) doc), not just the live registry.
+[host roster](../../operator/orchestrator/host-roster.md) doc), not just the live registry.
 This lets KiCI surface an expected-but-absent host instead of silently fanning out to a
 partial fleet. The `onUnreachable` policy controls what happens when a **durable**
 (static) host in the roster is matched but not currently connected:
@@ -250,11 +250,11 @@ have a live agent run the steps on their own agent. One workflow converges the w
 fleet — fresh boxes get built, live boxes run the same phases.
 
 Because the steps run on already-initialized hosts too, the bootstrap phases **must be
-idempotent [check-steps](/user/sdk/core/)**: each step's `check()` reports in-sync on a
+idempotent [check-steps](./core.md)**: each step's `check()` reports in-sync on a
 live box so the partition / format / install steps **skip** there and run only on fresh
 boxes. This is the safety guard — an OS or disk-format step must never re-run on a host
 that is already built. Re-running the workflow is a no-op everywhere. See the operator
-[fresh-box bootstrap](/operator/orchestrator/host-roster/) doc for the bring-up,
+[fresh-box bootstrap](../../operator/orchestrator/host-roster.md) doc for the bring-up,
 capability gating, and lifecycle details.
 
 `includeUninitialized` is only meaningful alongside `runsOnAll`; it is ignored on a
@@ -317,7 +317,7 @@ When `--target` narrows a `runsOnAll` job to zero hosts, the run **fails** by de
 (a mistyped selector should be loud, not silently no-op). Pass `--target-allow-empty`
 to **skip** the zeroed job instead — it records a `skipped` status, and downstream jobs
 gated with `when: 'on-skip'` (or `when: 'always'`) still run, exactly as for an
-`onUnreachable: 'skip'` zero-host fan-out. See the [CLI reference](/user/cli-reference/#host-narrowing-with---target)
+`onUnreachable: 'skip'` zero-host fan-out. See the [CLI reference](../cli/runs-and-approvals.md#host-narrowing-with---target)
 for the full flag behavior and the [`needs` gating model](./core.md#job-dependencies-needs)
 for how a skipped upstream propagates.
 

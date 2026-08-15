@@ -1,15 +1,15 @@
 ---
 title: Protocol messages
-description: WebSocket message reference for KiCI tiers -- Platform, orchestrator, agent, dashboard, peer-to-peer
+description: WebSocket message reference for the orchestrator, agent, and peer-to-peer channels
 ---
 
-KiCI tiers communicate over WebSocket using Zod-validated message envelopes. The complete message reference is split across three pages.
+KiCI tiers communicate over WebSocket using Zod-validated message envelopes. The message reference is split across three pages.
 
-| Page                                                        | Covers                                                                                                                                                                                                                                   |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Overview](./protocol/overview.md)                          | Message flow, common envelopes, authentication.                                                                                                                                                                                          |
-| [Orchestrator ↔ Agent](./protocol/orchestrator-agent.md)    | Job dispatch, cancel, registration, log streaming, job / step status, heartbeats, cache upload, artifact upload / download, provenance attestation upload, event emit, fleet log collection, step approval, execution status forwarding. |
-| [Dashboard, metrics & wire format](./protocol/dashboard.md) | Concurrency events, agent metrics, agent authentication, agent private API, join, peer-to-peer, the test-relay control plane, WebSocket close codes, wire format, validation, request tracing, and capability negotiation.               |
+| Page                                                        | Covers                                                                                                                                                                                                                                                          |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Overview](./protocol/overview.md)                          | Message flow, common envelopes, authentication.                                                                                                                                                                                                                 |
+| [Orchestrator ↔ Agent](./protocol/orchestrator-agent.md)    | Job dispatch, cancel, registration, log streaming, job / step status, heartbeats, cache upload, artifact upload / download, provenance attestation upload, event emit, the agent private API, fleet log collection, step approval, execution status forwarding. |
+| [Dashboard, metrics & wire format](./protocol/dashboard.md) | Concurrency events, agent metrics, agent authentication, join, peer-to-peer, the test-relay control plane, WebSocket close codes, wire format, validation, request tracing, and capability negotiation.                                                         |
 
 ## See also
 

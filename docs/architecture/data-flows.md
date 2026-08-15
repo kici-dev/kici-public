@@ -33,10 +33,11 @@ GitHub  -->  Platform Relay  -->  Orchestrator  -->  Agent
 12. **Orchestrator extracts registrations** on default-branch pushes: persists registerable workflows (event, schedule, lifecycle triggers) for cluster-wide event matching.
 13. **Orchestrator notifies the event router** on default-branch pushes: after the registrations are persisted, emits a `registration.updated` event via `eventRouter.emit()` (if event routing is active). Workflow event subscriptions are the persisted registrations themselves, matched at emit time through the registration index.
 14. **Orchestrator fetches changed files** via the provider's `ChangedFilesFetcher` for path-based trigger filtering (skipped when no workflow uses path filters).
-15. **Orchestrator matches triggers** against lock file using `matchAllWorkflows()` from `@kici-dev/engine`.
-16. **Orchestrator checks caches** for source tarballs and dependency tarballs.
-17. **Orchestrator dispatches jobs** to agents via the job queue and WebSocket.
-18. **Orchestrator persists a delivery row** keyed by `(org_id, delivery_id)` to its own `event_log`, including a pointer to the gzipped payload in object storage. The orchestrator's delivery log is surfaced in the dashboard's Settings → Event log tab. See [`webhook-delivery.md`](./webhooks/webhook-delivery.md#delivery-log).
+15. **Orchestrator matches triggers** against the lock file using `matchWorkflowsForEvent()` from `@kici-dev/engine` -- an event-type-bucketed candidate scan that evaluates only the workflows subscribed to this event type. (The single-registration global / cross-source paths evaluate one lock entry at a time via `matchAllWorkflows()`.)
+16. **Orchestrator applies the content-requirements filter** to the matched candidates: for each trigger that declares `requires`, it reads the named source files at the event's ref through the provider's `FileContentsFetcher` (once per distinct `(repo, sha, path)` via an LRU cache) and evaluates the declarative requirement. Candidates that fail -- or that cannot be evaluated at all (unreadable or oversize content, a fetch error, no fetcher wired) -- are dropped before dispatch with the concrete reason logged. No workflow code runs at this stage. Skipped entirely when no matched trigger declares `requires`.
+17. **Orchestrator checks caches** for source tarballs and dependency tarballs.
+18. **Orchestrator dispatches jobs** to agents via the job queue and WebSocket.
+19. **Orchestrator persists a delivery row** keyed by `(org_id, delivery_id)` to its own `event_log`, including a pointer to the gzipped payload in object storage. The orchestrator's delivery log is surfaced in the dashboard's Settings → Event log tab. See [`webhook-delivery.md`](./webhooks/webhook-delivery.md#delivery-log).
 
 ## Job execution flow
 
@@ -152,7 +153,7 @@ Execution Job Dispatch --> Execution Agent
   |                          |
   |                          |-- Download source tarball (sourceTarUrl) -> extract to workDir/.kici/
   |                          |-- Download deps tarball (depsUrl) -> verify SHA-256 -> extract to .kici/node_modules/
-  |                          |-- Register @kici-dev/shared/ts-loader-hook
+  |                          |-- Register @kici-dev/core/ts-loader-hook
   |                          |-- Verify workflow contentHash against lock file (drift guard)
   |                          |-- Dynamic-import workflow .ts
   |                          |-- Execute steps
@@ -211,7 +212,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 32.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 34.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -456,7 +457,7 @@ Agent                          Orchestrator
 
 ### Registration extraction flow
 
-When code is pushed to the default branch, the orchestrator extracts event-triggered workflows from the lock file and stores them as registrations for cluster-wide event matching.
+When code is pushed to the default branch, the orchestrator extracts registerable workflows from the lock file and stores them as registrations for cluster-wide event matching. Non-Git triggers (`kici_event`, `schedule`, `generic_webhook`, …) live there because they have no per-repo lock-file pipeline to fall back on; Git-provider triggers (`push`, `pr`, `tag`, …) are indexed too, so the cross-source dispatch path can resolve them by `(customer_id, repo_identifier)` when a generic webhook targets an externally-hosted repo. For same-source Git events the per-event lock-file pipeline remains the primary matcher — registration is an additive index.
 
 ```
 Git Push to Default Branch
@@ -469,8 +470,15 @@ GitHub Webhook -> Platform Relay -> Orchestrator Processor
     |-- extractRegisterableWorkflows(fullLockFile)
     |       |-- For each workflow entry in lock file:
     |       |     Check if any trigger type is registerable
-    |       |     (kici_event, workflow_complete, job_complete,
-    |       |      generic_webhook, schedule, lifecycle)
+    |       |     (the RegisterableTriggerType enum — the non-Git
+    |       |      set kici_event, workflow_complete,
+    |       |      workflows_failed_batch, job_complete,
+    |       |      generic_webhook, schedule, lifecycle, webhook,
+    |       |      plus every Git-provider trigger: push, pr, tag,
+    |       |      comment, review, review_comment, release,
+    |       |      dispatch, create, delete, status, workflow_run,
+    |       |      fork, star, watch)
+    |       |     ... or the workflow has repo patterns (global workflow)
     |       |-- Return array of registerable workflows
     |
     |-- globalWorkflowPolicy.isWorkflowRepoAllowed() (if policy configured)
@@ -848,7 +856,7 @@ The Platform tier exposes a `/ws/browser` WebSocket endpoint for dashboard clien
 - [Architecture overview](overview.md) -- three-tier model and component responsibilities
 - [Protocol messages](protocol-messages.md) -- WebSocket message schemas
 - [Event system internals](./webhooks/event-system.md) -- event router, registration model, cron scheduler
-- [Execution lifecycle](./execution/state-machine.md) -- run, job, and step status vocabularies and terminal states
+- [Execution status vocabulary](./execution/state-machine.md) -- run, job, and step status vocabularies and terminal states
 - [Webhook delivery](./webhooks/webhook-delivery.md) -- detailed webhook processing pipeline
 - [Operator: dependency caching](../operator/dependency-caching.md) -- configuration guide
 - [Operator: monitoring & tracing](../operator/observability/monitoring.md) -- trace fields and Loki queries

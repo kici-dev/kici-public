@@ -188,6 +188,36 @@ describe('admin cluster-settings route', () => {
     expect(res.status).toBe(400);
   });
 
+  it('PATCH rejects a cache entry-count above the boot-safety ceiling (Zod)', async () => {
+    // An accepted over-ceiling value is persisted and then read at boot, where
+    // the LRU constructor throws on it — crashing the orchestrator before this
+    // very route is listening to take the correction.
+    for (const field of ['lockfileCacheMax', 'contentCacheMax']) {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request('/cluster-settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [field]: 5_000_000_000 }),
+      });
+      expect(res.status, field).toBe(400);
+    }
+  });
+
+  it('PATCH accepts a cache entry-count at the ceiling', async () => {
+    const { db } = makeClusterSettingsDbStub();
+    const app = buildApp(db);
+    const res = await app.request('/cluster-settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lockfileCacheMax: 100_000, contentCacheMax: 100_000 }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { settings: Record<string, unknown> };
+    expect(body.settings.lockfileCacheMax).toBe(100_000);
+    expect(body.settings.contentCacheMax).toBe(100_000);
+  });
+
   it('PATCH bumps version on a real settings change', async () => {
     const { db, rows } = makeClusterSettingsDbStub();
     const app = buildApp(db);
@@ -271,5 +301,183 @@ describe('admin cluster-settings route', () => {
       body: JSON.stringify({ checkRunTrackingTtlDays: -1 }),
     });
     expect(patch.status).toBe(400);
+  });
+
+  describe('global eval timeout ordering', () => {
+    // The agent's round budget starts only once the round job is RUNNING, so a
+    // wait ceiling at or below it fires on every round that merely waited for a
+    // free agent — every round fails, silently and permanently.
+    const patchJson = (body: unknown) => ({
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    it('rejects a wait ceiling at or below the round budget in one patch', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalRoundTimeoutMs: 120_000, globalEvalWaitTimeoutMs: 120_000 }),
+      );
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('globalEvalWaitTimeoutMs');
+    });
+
+    it('rejects a wait ceiling that only becomes inverted against the stored budget', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      // Control: the ordered pair lands.
+      expect(
+        (
+          await app.request(
+            '/cluster-settings',
+            patchJson({ globalEvalRoundTimeoutMs: 300_000, globalEvalWaitTimeoutMs: 400_000 }),
+          )
+        ).status,
+      ).toBe(200);
+      // Now lower ONLY the ceiling — the check is on effective values, so the
+      // stored budget is what it is compared against.
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalWaitTimeoutMs: 60_000 }),
+      );
+      expect(res.status).toBe(400);
+      // And the rejected value did not land.
+      const get = (await (await app.request('/cluster-settings')).json()) as {
+        settings: Record<string, unknown>;
+      };
+      expect(get.settings.globalEvalWaitTimeoutMs).toBe(400_000);
+    });
+
+    it('accepts a ceiling above the round budget', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalRoundTimeoutMs: 120_000, globalEvalWaitTimeoutMs: 240_000 }),
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it('rejects a candidate budget at or above the round budget', async () => {
+      // The adjacent axis: one candidate that can consume the whole round
+      // leaves every sibling in it padded indeterminate, with no retry.
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalRoundTimeoutMs: 120_000, globalEvalCandidateTimeoutMs: 120_000 }),
+      );
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain('globalEvalCandidateTimeoutMs');
+    });
+
+    it('rejects a candidate budget that only becomes inverted against the stored budget', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      expect(
+        (
+          await app.request(
+            '/cluster-settings',
+            patchJson({
+              globalEvalRoundTimeoutMs: 120_000,
+              globalEvalCandidateTimeoutMs: 20_000,
+            }),
+          )
+        ).status,
+      ).toBe(200);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalCandidateTimeoutMs: 300_000 }),
+      );
+      expect(res.status).toBe(400);
+      const get = (await (await app.request('/cluster-settings')).json()) as {
+        settings: Record<string, unknown>;
+      };
+      expect(get.settings.globalEvalCandidateTimeoutMs).toBe(20_000);
+    });
+
+    it('accepts a candidate budget below the round budget', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalEvalRoundTimeoutMs: 120_000, globalEvalCandidateTimeoutMs: 20_000 }),
+      );
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe('globalWorkflowsEnabled', () => {
+    const patchJson = (body: unknown) => ({
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    async function getSettings(app: Hono): Promise<Record<string, unknown>> {
+      const res = await app.request('/cluster-settings');
+      return ((await res.json()) as { settings: Record<string, unknown> }).settings;
+    }
+
+    it('projects a stored true', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      await app.request('/cluster-settings', patchJson({ globalWorkflowsEnabled: true }));
+      expect((await getSettings(app)).globalWorkflowsEnabled).toBe(true);
+    });
+
+    it('projects an unset column as null', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      expect((await getSettings(app)).globalWorkflowsEnabled).toBeNull();
+    });
+
+    it('PATCH sets it to false and the projection keeps false distinct from null', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalWorkflowsEnabled: false }),
+      );
+      expect(res.status).toBe(200);
+      expect((await getSettings(app)).globalWorkflowsEnabled).toBe(false);
+    });
+
+    it('PATCH null clears the override back to the cluster default', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      await app.request('/cluster-settings', patchJson({ globalWorkflowsEnabled: true }));
+      await app.request('/cluster-settings', patchJson({ globalWorkflowsEnabled: null }));
+      expect((await getSettings(app)).globalWorkflowsEnabled).toBeNull();
+    });
+
+    it('rejects a non-boolean', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({ globalWorkflowsEnabled: 'true' }),
+      );
+      expect(res.status).toBe(400);
+    });
+
+    // `version` is advertised to DB-less workers so they re-pull; a no-op PATCH
+    // must not bump it, and a real flip must.
+    it('bumps version on a real flip and not on a no-op', async () => {
+      const { db, rows } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const first = await app.request(
+        '/cluster-settings',
+        patchJson({ globalWorkflowsEnabled: true }),
+      );
+      const v1 = Number(rows.get('default')?.version);
+      await app.request('/cluster-settings', patchJson({ globalWorkflowsEnabled: true }));
+      expect(Number(rows.get('default')?.version)).toBe(v1);
+      await app.request('/cluster-settings', patchJson({ globalWorkflowsEnabled: false }));
+      expect(Number(rows.get('default')?.version)).toBe(v1 + 1);
+      expect(first.status).toBe(200);
+    });
   });
 });

@@ -353,6 +353,79 @@ describe('handleRerun', () => {
     );
   });
 
+  describe('an organization-wide run that executed against another repository', () => {
+    /**
+     * `repo_identifier` names the repository the run acted on. For an
+     * organization-wide workflow that is the SOURCE repository, while the
+     * workflow itself lives in `workflow_repo_identifier`. Everything below
+     * `loadAndValidateOriginalRun` resolves the workflow out of
+     * `repo_identifier`'s lock file, so a rerun would fetch the wrong repo.
+     */
+    const GLOBAL_RUN = {
+      ...TERMINAL_RUN,
+      workflow_name: 'org-ci',
+      repo_identifier: 'owner/source-repo',
+      workflow_repo_identifier: 'owner/org-workflows',
+    };
+
+    it('is refused, naming both repositories', async () => {
+      deps.db = makeMockDb(GLOBAL_RUN) as any;
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
+        /Cannot re-run an organization-wide workflow: 'org-ci' is defined in owner\/org-workflows but this run executed against owner\/source-repo/,
+      );
+    });
+
+    it('is refused BEFORE anything is fetched, claimed or dispatched', async () => {
+      deps.db = makeMockDb(GLOBAL_RUN) as any;
+
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
+        /Cannot re-run an organization-wide workflow/,
+      );
+
+      // The whole point of refusing: the lock fetch that would have resolved
+      // the WRONG repository's workflow never happens, so a same-named
+      // workflow in the source repository cannot be run in its place.
+      expect(providerBundle.lockFileFetcher!.fetchLockFile).not.toHaveBeenCalled();
+      expect(dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(executionTracker.onExecutionStarted).not.toHaveBeenCalled();
+      expect(executionTracker.addJobsToRun).not.toHaveBeenCalled();
+      expect(eventRouter.emit).not.toHaveBeenCalled();
+    });
+
+    it("would otherwise have silently run the source repo's same-named workflow", async () => {
+      // The positive control for the refusal above, and the record of what it
+      // prevents: with the marker absent the run is indistinguishable from a
+      // per-repository one, so the source repository's lock file resolves and
+      // its own `org-ci` is what executes.
+      const { workflow_repo_identifier: _dropped, ...unmarked } = GLOBAL_RUN;
+      deps.db = makeMockDb({ ...unmarked, workflow_name: 'ci' }) as any;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-test');
+
+      expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
+        'owner/source-repo',
+        'abc123def',
+        expect.anything(),
+      );
+      expect(dispatcher.dispatch).toHaveBeenCalled();
+    });
+
+    it('allows a rerun when the workflow lives in the repository the run acted on', async () => {
+      // A same-repo value is not a cross-repo dispatch and must not be
+      // refused — otherwise the guard would block ordinary reruns the moment
+      // anything started populating the column unconditionally.
+      deps.db = makeMockDb({
+        ...TERMINAL_RUN,
+        workflow_repo_identifier: TERMINAL_RUN.repo_identifier,
+      }) as any;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-test');
+
+      expect(dispatcher.dispatch).toHaveBeenCalled();
+    });
+  });
+
   it('throws RunArchivedNotRerunnableError on PG miss when cold-store cannot replay', async () => {
     // Phase F: PG miss now goes through cold-store replay before failing.
     // With deps.coldStore=null (the default test harness) replay is skipped

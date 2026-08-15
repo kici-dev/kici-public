@@ -9,8 +9,17 @@ import {
   resolveWhenToRunOn,
   extractInputsDescriptorMap,
   assertScheduleInputsSatisfiable,
+  resolveContentFormat,
 } from '@kici-dev/engine';
-import type { LabelMatcher, RunsOnPick } from '@kici-dev/engine';
+import type {
+  LabelMatcher,
+  RunsOnPick,
+  ContentRequirement,
+  LockContentRequirement,
+  TextMatch,
+  LockTextMatch,
+} from '@kici-dev/engine';
+import { assertSafeRegex } from '@kici-dev/engine/safe-regex';
 import type { NeedsWhenInput } from '@kici-dev/sdk';
 import {
   normalizeRunsOnToMatchers,
@@ -54,7 +63,6 @@ import {
   type LockJob,
   type LockDynamicJobFn,
   type LockJobOrFactory,
-  type LockInlineValue,
   type LockTrigger,
   type LockPrTrigger,
   type LockPushTrigger,
@@ -97,7 +105,6 @@ import {
 } from '../errors/index.js';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { resolveHashFiles } from './hash-files.js';
-import { analyzePurity } from './purity-analyzer.js';
 
 /**
  * Courtesy compatibility warning for `kici compile`.
@@ -344,6 +351,9 @@ function transformWorkflow(
         (assertNonStepApprovalScope(workflow.approval, 'workflow', locationForWorkflow(sourceFile)),
         toLockApproval(workflow.approval)),
     }),
+    // Emitted only when a filter exists: omitting the key keeps the lock for
+    // every filter-less workflow byte-identical, so no content hash churns.
+    ...(typeof workflow.filter === 'function' && { hasFilter: true }),
   };
 }
 
@@ -364,6 +374,188 @@ function reposField(
 
 type ExtractTrigger<Tag extends TriggerConfig['_tag']> = Extract<TriggerConfig, { _tag: Tag }>;
 
+/** Normalize a scalar-or-array SDK value to an array. */
+function toArray<T>(v: T | readonly T[] | undefined): readonly T[] {
+  if (v === undefined) return [];
+  return Array.isArray(v) ? v : [v as T];
+}
+
+/**
+ * Normalize one regex entry to the lock's `/pattern/flags` form, rejecting an
+ * invalid or ReDoS-prone pattern at compile time so a catastrophic pattern fails
+ * `kici compile` with author feedback instead of reaching the orchestrator.
+ */
+function serializeRegexEntry(entry: string | RegExp, ctx: string): string {
+  const source = entry instanceof RegExp ? `/${entry.source}/${entry.flags}` : entry;
+  const wrapped = /^\/(.+)\/([gimsuy]*)$/.exec(source);
+  const pattern = wrapped ? wrapped[1] : source;
+  const flags = wrapped ? wrapped[2] : '';
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, flags);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw compilerError('E123', `${ctx}: invalid regex — ${reason}`);
+  }
+  try {
+    assertSafeRegex(re.source, re.flags, ctx);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw compilerError('E123', `${ctx}: ${reason}`);
+  }
+  return `/${re.source}/${re.flags}`;
+}
+
+/**
+ * Serialize a {@link TextMatch} to its lock form: every key normalized to a flat
+ * array, every regex to `/pattern/flags`, every degenerate shape rejected.
+ *
+ * `ctx` is a human label woven into any thrown error (e.g. `push trigger
+ * 'commitMessage'`, `requires 'Dockerfile'`).
+ */
+function serializeTextMatch(m: TextMatch, ctx: string): LockTextMatch {
+  const contains = toArray(m.contains);
+  const notContains = toArray(m.notContains);
+  const matches = toArray(m.matches);
+  const notMatches = toArray(m.notMatches);
+
+  if (
+    contains.length === 0 &&
+    notContains.length === 0 &&
+    matches.length === 0 &&
+    notMatches.length === 0
+  ) {
+    throw compilerError(
+      'E122',
+      `${ctx}: no query key (contains/notContains/matches/notMatches) — nothing to check`,
+    );
+  }
+
+  for (const needle of [...contains, ...notContains]) {
+    if (needle === '') {
+      throw compilerError('E122', `${ctx}: an empty needle matches every text — remove it`);
+    }
+  }
+
+  if (m.ignoreCase !== undefined && contains.length === 0 && notContains.length === 0) {
+    throw compilerError(
+      'E122',
+      `${ctx}: 'ignoreCase' affects only contains/notContains — a regex carries its own flags`,
+    );
+  }
+
+  return {
+    ...(contains.length > 0 && { contains: [...contains] }),
+    ...(notContains.length > 0 && { notContains: [...notContains] }),
+    ...(matches.length > 0 && { matches: matches.map((e) => serializeRegexEntry(e, ctx)) }),
+    ...(notMatches.length > 0 && {
+      notMatches: notMatches.map((e) => serializeRegexEntry(e, ctx)),
+    }),
+    ...(m.ignoreCase !== undefined && { ignoreCase: m.ignoreCase }),
+  };
+}
+
+/** Emit the optional `commitMessage` field for a git-event lock trigger. */
+function commitMessageField(
+  commitMessage: TextMatch | undefined,
+  triggerLabel: string,
+): { commitMessage?: LockTextMatch } {
+  if (commitMessage === undefined) return {};
+  return { commitMessage: serializeTextMatch(commitMessage, `${triggerLabel} 'commitMessage'`) };
+}
+
+/**
+ * Serialize one SDK content requirement into its lock form, validating and
+ * resolving `format: 'auto'` by extension at compile time. A malformed filter
+ * throws (fails `kici compile`) rather than reaching the orchestrator.
+ */
+function serializeOneRequirement(req: ContentRequirement): LockContentRequirement {
+  const hasJsonQuery =
+    (req.exists !== undefined && req.exists.length > 0) ||
+    (req.match !== undefined && Object.keys(req.match).length > 0) ||
+    (req.not !== undefined && Object.keys(req.not).length > 0);
+  const textKeys = {
+    ...(req.contains !== undefined && { contains: req.contains }),
+    ...(req.notContains !== undefined && { notContains: req.notContains }),
+    ...(req.matches !== undefined && { matches: req.matches }),
+    ...(req.notMatches !== undefined && { notMatches: req.notMatches }),
+    ...(req.ignoreCase !== undefined && { ignoreCase: req.ignoreCase }),
+  } satisfies TextMatch;
+  const hasTextQuery =
+    req.contains !== undefined ||
+    req.notContains !== undefined ||
+    req.matches !== undefined ||
+    req.notMatches !== undefined;
+  const hasAnyQuery = hasJsonQuery || hasTextQuery || req.ignoreCase !== undefined;
+
+  // `absent` is mutually exclusive with every query key.
+  if (req.absent) {
+    if (hasAnyQuery) {
+      throw compilerError(
+        'E118',
+        `requires '${req.file}': 'absent' is mutually exclusive with query keys (exists/match/not/contains/notContains/matches/notMatches)`,
+      );
+    }
+    return { file: req.file, absent: true };
+  }
+
+  const format = resolveContentFormat(req.file, req.format);
+
+  // Format/query mismatch: text carries only the raw-text keys; json/yaml carry only exists/match/not.
+  if (format === 'text' && hasJsonQuery) {
+    throw compilerError(
+      'E119',
+      `requires '${req.file}': text format cannot carry a json/yaml query key (exists/match/not) — name a .json/.yaml file or set format: 'json' | 'yaml'`,
+    );
+  }
+  if (format !== 'text' && (hasTextQuery || req.ignoreCase !== undefined)) {
+    throw compilerError(
+      'E119',
+      `requires '${req.file}': '${format}' format cannot carry a raw-text key (contains/notContains/matches/notMatches/ignoreCase) — use format: 'text'`,
+    );
+  }
+
+  // A bare `{ file }` is a valid existence check; an explicit format with no query is degenerate.
+  if (!hasAnyQuery) {
+    if (req.format !== undefined) {
+      throw compilerError(
+        'E122',
+        `requires '${req.file}': format '${req.format}' declared with no query key — nothing to check`,
+      );
+    }
+    return { file: req.file };
+  }
+
+  const text = hasTextQuery ? serializeTextMatch(textKeys, `requires '${req.file}'`) : {};
+
+  return {
+    file: req.file,
+    format,
+    ...(req.exists !== undefined && { exists: req.exists }),
+    ...(req.match !== undefined && { match: req.match }),
+    ...(req.not !== undefined && { not: req.not }),
+    ...text,
+  };
+}
+
+/**
+ * Serialize a trigger's `requires` list, or `undefined` when empty (so the lock
+ * field stays absent). Each entry is validated + format-resolved at compile time.
+ */
+function serializeRequires(
+  requires: readonly ContentRequirement[] | undefined,
+): readonly LockContentRequirement[] | undefined {
+  if (!requires || requires.length === 0) return undefined;
+  return requires.map(serializeOneRequirement);
+}
+
+function requiresField(requires: readonly ContentRequirement[] | undefined): {
+  requires?: readonly LockContentRequirement[];
+} {
+  const serialized = serializeRequires(requires);
+  return serialized ? { requires: serialized } : {};
+}
+
 function toLockPr(t: ExtractTrigger<'PrTrigger'>): LockPrTrigger {
   return {
     _type: 'pr',
@@ -372,16 +564,24 @@ function toLockPr(t: ExtractTrigger<'PrTrigger'>): LockPrTrigger {
     sourceBranches: transformBranchPatterns(t.sourceBranches),
     paths: t.paths,
     ...reposField(t),
+    ...requiresField(t.requires),
+    ...commitMessageField(t.commitMessage, 'pr trigger'),
   };
 }
 
 function toLockPushAndTag(t: ExtractTrigger<'PushTrigger'>): LockTrigger[] {
+  // Resolve + validate once; the same content filter and commit-message filter
+  // apply to the push and to the tag trigger the push config additionally emits.
+  const requires = requiresField(t.requires);
+  const commitMessage = commitMessageField(t.commitMessage, 'push trigger');
   const results: LockTrigger[] = [
     {
       _type: 'push',
       branches: transformBranchPatterns(t.branches),
       paths: t.paths,
       ...reposField(t),
+      ...requires,
+      ...commitMessage,
     } satisfies LockPushTrigger,
   ];
   // Push triggers with tag patterns also emit a LockTagTrigger.
@@ -389,6 +589,8 @@ function toLockPushAndTag(t: ExtractTrigger<'PushTrigger'>): LockTrigger[] {
     results.push({
       _type: 'tag',
       patterns: transformBranchPatterns(t.tags),
+      ...requires,
+      ...commitMessage,
     } satisfies LockTagTrigger);
   }
   return results;
@@ -399,6 +601,8 @@ function toLockTag(t: ExtractTrigger<'TagTrigger'>): LockTagTrigger {
     _type: 'tag',
     patterns: transformBranchPatterns(t.patterns),
     ...reposField(t),
+    ...requiresField(t.requires),
+    ...commitMessageField(t.commitMessage, 'tag trigger'),
   };
 }
 
@@ -805,22 +1009,16 @@ function validateRunsOn(runsOn: RunsOn, jobName: string, location: SourceLocatio
 
 /**
  * Transform one context reference (static name or function) into a lock
- * `{ value, dynamic }` entry. A function element is analyzed for purity: a pure
- * function becomes an inline expression resolvable at two-phase eval; an impure
- * one carries only the `dynamic` flag (the agent runs an init job to resolve it).
+ * `{ value, dynamic }` entry. A function element carries only the `dynamic`
+ * flag (the agent resolves it in the init round); a static name carries its
+ * literal value.
  */
 function transformContextRef(ref: NonNullable<Job['contexts']>[number]): {
-  value: string | LockInlineValue;
+  value: string;
   dynamic: boolean;
 } {
   if (typeof ref === 'function') {
-    const fnSource = ref.toString();
-    const purity = analyzePurity(fnSource);
-    if (purity.pure) {
-      return { value: { _type: 'inline', expression: fnSource }, dynamic: true };
-    }
-    // Impure: fall back to the dynamic marker (empty value resolved by the
-    // agent-side __init__ job). The compiler surfaces this as a W101 warning.
+    // Dynamic context elements are resolved by the agent init job.
     return { value: '', dynamic: true };
   }
   return { value: ref, dynamic: false };
@@ -876,30 +1074,25 @@ function transformJob(
 
   // Resolve contexts into an ordered array of { value, dynamic } entries.
   // Either spelling normalizes here: `context: 'x'` becomes a one-element
-  // array; `contexts: [...]` is emitted in order. Each function element is
-  // analyzed for purity exactly like a dynamic singular context was.
+  // array; `contexts: [...]` is emitted in order. Each function element becomes
+  // a dynamic marker resolved by the agent init round.
   const contextFields: {
-    contexts?: Array<{ value: string | LockInlineValue; dynamic: boolean }>;
+    contexts?: Array<{ value: string; dynamic: boolean }>;
   } = {};
   const contextRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
   if (contextRefs !== undefined && contextRefs.length > 0) {
     contextFields.contexts = contextRefs.map((ref) => transformContextRef(ref));
   }
 
-  // Resolve env: static object, inline expression (pure function), or dynamic function marker
+  // Resolve env: static object, or dynamic function marker (resolved by the
+  // agent init round).
   const envFields: {
-    env?: Record<string, string> | LockInlineValue;
+    env?: Record<string, string>;
     dynamicEnv?: boolean;
   } = {};
   if (job.env !== undefined) {
     if (typeof job.env === 'function') {
-      const fnSource = job.env.toString();
-      const purity = analyzePurity(fnSource);
       envFields.dynamicEnv = true;
-      if (purity.pure) {
-        envFields.env = { _type: 'inline', expression: fnSource };
-      }
-      // Impure env falls back to the dynamic marker; surfaced as a W101 warning.
     } else if (typeof job.env === 'object') {
       envFields.env = { ...job.env };
     }
@@ -919,20 +1112,15 @@ function transformJob(
     }
   }
 
-  // Resolve concurrencyGroup: static string, inline expression (pure function), or dynamic function marker
+  // Resolve concurrencyGroup: static string, or dynamic function marker
+  // (resolved by the agent init round).
   const concurrencyFields: {
-    concurrencyGroup?: string | LockInlineValue;
+    concurrencyGroup?: string;
     dynamicConcurrencyGroup?: boolean;
   } = {};
   if (job.concurrencyGroup !== undefined) {
     if (typeof job.concurrencyGroup === 'function') {
-      const fnSource = job.concurrencyGroup.toString();
-      const purity = analyzePurity(fnSource);
       concurrencyFields.dynamicConcurrencyGroup = true;
-      if (purity.pure) {
-        concurrencyFields.concurrencyGroup = { _type: 'inline', expression: fnSource };
-      }
-      // Impure concurrencyGroup falls back to the dynamic marker; surfaced as a W101 warning.
     } else if (typeof job.concurrencyGroup === 'string') {
       concurrencyFields.concurrencyGroup = job.concurrencyGroup;
     }

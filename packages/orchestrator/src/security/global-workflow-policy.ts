@@ -1,6 +1,7 @@
 import type { Kysely } from 'kysely';
-import picomatch from 'picomatch';
+import { getRepoGlobMatcher } from '@kici-dev/engine';
 import type { Database, OrgSettingsRepoPatternEntry } from '../db/types.js';
+import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
 interface GlobalWorkflowPermission {
   allowed: boolean;
@@ -8,10 +9,20 @@ interface GlobalWorkflowPermission {
 }
 
 /**
- * Org-level permission enforcement for global workflows.
+ * Permission enforcement for global workflows.
  *
- * Three independent axes (each stored as a jsonb array of
- * `{routingKey?, pattern}` entries on `org_settings`):
+ * A fleet-wide master switch gates everything first:
+ * `cluster_settings.global_workflows_enabled`, held by the orchestrator
+ * operator through `kici-admin cluster-settings` (NULL ⇒ the configured
+ * `KICI_GLOBAL_WORKFLOWS_ENABLED` default, off by default). When the switch is
+ * off — or the cluster row is unreadable, which fails closed — no repo may
+ * register or dispatch a global workflow, whatever the per-org lists say.
+ *
+ * With the switch on, three independent per-org axes apply (each stored as a
+ * jsonb array of `{routingKey?, pattern}` entries on `org_settings`). A missing
+ * `org_settings` row means "no per-org restrictions" for the repo and source
+ * axes, not a denial; elevated access still requires an explicit list, so a
+ * missing row grants none.
  *
  * - Workflow-repo allow-list (`global_workflow_allowed_repos`): which repos
  *   may author global workflows. null/empty = any repo. Checked at
@@ -34,7 +45,35 @@ interface GlobalWorkflowPermission {
  * source.
  */
 export class GlobalWorkflowPolicy {
-  constructor(private readonly db: Kysely<Database>) {}
+  constructor(
+    private readonly db: Kysely<Database>,
+    private readonly clusterSettings: ClusterSettingsReader,
+    /** Applies when the cluster column is NULL — `config.globalWorkflowsEnabled`. */
+    private readonly defaultEnabled: boolean,
+  ) {}
+
+  /**
+   * The fleet-wide master gate, consulted before any per-org list.
+   *
+   * Returns `undefined` when the gate passes, or the denial to return
+   * verbatim when it does not — so all three axes share one decision and one
+   * pair of reasons.
+   *
+   * Fails closed on `{ ok: false }`. That case is a database fault, not an
+   * operator choice, and answering it from `defaultEnabled` would open the
+   * feature during an outage the moment that default is ever flipped.
+   */
+  private async clusterGate(): Promise<GlobalWorkflowPermission | undefined> {
+    const read = await this.clusterSettings.tryGetBoolean('global_workflows_enabled');
+    if (!read.ok) {
+      return { allowed: false, reason: 'Global workflows: cluster settings unreadable' };
+    }
+    const enabled = read.value ?? this.defaultEnabled;
+    if (!enabled) {
+      return { allowed: false, reason: 'Global workflows are disabled cluster-wide' };
+    }
+    return undefined;
+  }
 
   /**
    * Check whether a workflow-authoring repository is allowed to register or
@@ -42,8 +81,8 @@ export class GlobalWorkflowPolicy {
    * against each entry's optional `routingKey` qualifier.
    *
    * Decision flow:
-   * 1. No org_settings row or globally disabled → not allowed (opt-in).
-   * 2. allowed list null/empty → any repo allowed.
+   * 1. Cluster master switch off or unreadable → not allowed (fails closed).
+   * 2. allowed list null/empty (or no org_settings row) → any repo allowed.
    * 3. Entry matches when its `routingKey` is absent OR equals
    *    `workflowRoutingKey`, AND its pattern matches the workflow repo.
    * 4. Otherwise → not allowed.
@@ -53,14 +92,10 @@ export class GlobalWorkflowPolicy {
     workflowRepoIdentifier: string,
     customerId: string,
   ): Promise<GlobalWorkflowPermission> {
+    const denied = await this.clusterGate();
+    if (denied) return denied;
     const settings = await this.getSettings(customerId);
-    if (!settings) {
-      return { allowed: false, reason: 'Global workflows not enabled for this organization' };
-    }
-    if (!settings.global_workflows_enabled) {
-      return { allowed: false, reason: 'Global workflows disabled in organization settings' };
-    }
-    const allowedRepos = settings.global_workflow_allowed_repos;
+    const allowedRepos = settings?.global_workflow_allowed_repos ?? null;
     if (allowedRepos === null || allowedRepos.length === 0) {
       return { allowed: true };
     }
@@ -82,8 +117,8 @@ export class GlobalWorkflowPolicy {
    * (so a source-qualified deny only applies to that specific source).
    *
    * Decision flow:
-   * 1. No org_settings row or globally disabled → not allowed (opt-in).
-   * 2. denied list null/empty → allowed.
+   * 1. Cluster master switch off or unreadable → not allowed (fails closed).
+   * 2. denied list null/empty (or no org_settings row) → allowed.
    * 3. Any deny entry whose routing key (if set) equals the event's routing
    *    key AND whose pattern matches the source repo → not allowed.
    */
@@ -92,14 +127,10 @@ export class GlobalWorkflowPolicy {
     sourceRepoIdentifier: string,
     customerId: string,
   ): Promise<GlobalWorkflowPermission> {
+    const gate = await this.clusterGate();
+    if (gate) return gate;
     const settings = await this.getSettings(customerId);
-    if (!settings) {
-      return { allowed: false, reason: 'Global workflows not enabled for this organization' };
-    }
-    if (!settings.global_workflows_enabled) {
-      return { allowed: false, reason: 'Global workflows disabled in organization settings' };
-    }
-    const deniedRepos = settings.global_workflow_denied_repos;
+    const deniedRepos = settings?.global_workflow_denied_repos ?? null;
     if (!deniedRepos || deniedRepos.length === 0) {
       return { allowed: true };
     }
@@ -116,17 +147,30 @@ export class GlobalWorkflowPolicy {
   }
 
   /**
-   * Check whether a workflow-authoring repository has elevated access (i.e.,
-   * may read source-repo secrets during execution). The workflow's routing
-   * key is matched against each entry's optional `routingKey` qualifier.
+   * Check whether a workflow-authoring repository is on the elevated-access
+   * list. The workflow's routing key is matched against each entry's optional
+   * `routingKey` qualifier. Returns false if no org_settings row or the
+   * elevated list is null/empty.
    *
-   * Returns false if no org_settings row or the elevated list is null/empty.
+   * @deprecated Not enforced, and not enforceable in this shape. It was meant
+   * to gate a global workflow's job reading the *source* repository's secrets,
+   * but the organization-wide dispatch path resolves no secrets at all — it
+   * binds no secret contexts, and writes no secret material into a job config
+   * (asserted by `pipeline/process-webhook-globals-secrets.test.ts`). So there
+   * is no injection for a grant to widen, and this method has no caller.
+   *
+   * Granting it would not be a matter of calling this from the dispatch path:
+   * secrets are stored `(org_id, scope, key)` with no repository dimension, so
+   * "the source repository's secrets" is not a set the orchestrator can name
+   * today. The list, its admin route, its CLI mutators and its wire field are
+   * deprecated pending removal at v1.0.0 (`docs/user/deprecations.md`).
    */
   async isElevatedAccessAllowed(
     workflowRoutingKey: string,
     repoIdentifier: string,
     customerId: string,
   ): Promise<boolean> {
+    if (await this.clusterGate()) return false;
     const settings = await this.getSettings(customerId);
     if (!settings?.global_workflow_elevated_repos) return false;
     return settings.global_workflow_elevated_repos.some((entry) =>
@@ -151,9 +195,18 @@ export class GlobalWorkflowPolicy {
  *   - `entry.routingKey` equals the call-site's routing key ↦ entry applies.
  *   - Otherwise ↦ entry does not apply (and is treated as a no-op).
  *
- * The pattern match keeps the picomatch.isMatch semantics from before this
- * refactor, so a glob authored as `myorg/ci-*` still resolves to the same
- * matches it used to.
+ * The pattern is matched with the shared repo-identifier matcher, the same one
+ * a workflow's own `repos:` patterns use. A repo identifier is an owner/name
+ * pair, not a file path, so a leading dot carries no meaning of its own and a
+ * wildcard segment matches one: `myorg/*` covers `myorg/.github`.
+ *
+ * That is what an operator writing `myorg/*` means in any of the three lists,
+ * and on the deny-list it is load-bearing. Under path-glob semantics no
+ * wildcard segment matched a dot-prefixed one, so a deny entry of `myorg/*`,
+ * `myorg/**`, or even `**` silently ADMITTED `myorg/.github` — a control that
+ * did not do what its pattern said, in the one direction where failing means
+ * letting an event through. `.github` is an ordinary repository name, so this
+ * was reachable rather than theoretical.
  */
 function matchesEntry(
   entry: OrgSettingsRepoPatternEntry,
@@ -161,5 +214,5 @@ function matchesEntry(
   repoIdentifier: string,
 ): boolean {
   if (entry.routingKey !== undefined && entry.routingKey !== routingKey) return false;
-  return picomatch.isMatch(repoIdentifier, entry.pattern);
+  return getRepoGlobMatcher(entry.pattern)(repoIdentifier);
 }

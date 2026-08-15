@@ -309,9 +309,8 @@ when you want a list entry pinned to this specific App rather than
 applying to any source in the org:
 
 ```bash
-# Enable global workflows for the org
-kici-admin org-settings global-workflows set-enabled true \
-  --customer-id <orgId>
+# Enable global workflows cluster-wide (the master switch is fleet-wide, held by the operator)
+kici-admin cluster-settings set --global-workflows-enabled true
 
 # Allow the listed repo as an author for any source in the org
 kici-admin org-settings global-workflows allow-add 'my-org/ci-workflows/*' \

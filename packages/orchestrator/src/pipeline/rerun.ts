@@ -38,6 +38,7 @@ import {
 } from './route-or-dispatch-jobs.js';
 import { isLockStaticJob, TERMINAL_RUN_STATES, matrixEnvelopeFields } from '@kici-dev/engine';
 import type { LockFile as FullLockFile, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import { webhookPayloadPath } from './webhook-payload-store.js';
 
 const logger = createLogger({ prefix: 'rerun' });
 
@@ -164,7 +165,7 @@ export async function handleRerun(
   // Store payload for the new run (so it also has a payload available for the payload viewer
   // and for a future re-run of the re-run). Skip if there was no payload (cron/schedule runs).
   if (payload) {
-    const newPayloadPath = `executions/${newRunId}/webhook-payload.json`;
+    const newPayloadPath = webhookPayloadPath(newRunId);
     await deps.logStorage.append(newPayloadPath, JSON.stringify(payload));
   }
 
@@ -291,6 +292,46 @@ async function loadAndValidateOriginalRun(
     throw new Error('Test runs cannot be re-run');
   }
 
+  // 4. An organization-wide workflow that ran against another repository
+  // cannot be re-run. Everything below resolves the workflow out of
+  // `repo_identifier`'s lock file, and for such a run that column is the
+  // repository the workflow ran AGAINST, not the one that defines it. So the
+  // rerun would either fail with a misleading force-push message or — if the
+  // acted-on repository happens to define a workflow of the same name —
+  // silently run THAT workflow instead, with the acted-on repository's
+  // credentials and none of the organization-wide job configuration.
+  // Refusing is the honest answer until the rerun path can resolve a workflow
+  // from the repository that defines it.
+  //
+  // BEFORE LIFTING THIS: it is load-bearing for authorization, not only for
+  // correctness. The Platform grants re-run to a member scoped to EITHER of a
+  // global run's repositories (`checkRunRepoAccess`, and the either-repository
+  // rule in `docs/architecture/security/rbac.md`), on the basis that no caller
+  // can actually re-execute a cross-repository global run.
+  //
+  // The Platform enforces that itself — `crossRepoGlobalRerunRefusal` in
+  // `dev-ops/rerun-policy.ts` refuses the same case on its own mirrored column,
+  // on both the dashboard and MCP planes — so this refusal is defence in depth
+  // rather than the sole guarantee, and lifting it alone does not widen the
+  // grant. It still matters here: this is the tier that holds the credentials
+  // and the lock file, and it is the only one that sees a run the Platform
+  // never mirrored.
+  //
+  // A rerun path that CAN resolve the defining repository has to answer the
+  // authorization question first — which of the two repositories may re-execute
+  // this, and with whose credentials — and lift BOTH refusals deliberately.
+  // Widen them into that decision; do not simply delete this one.
+  if (
+    originalRun.workflow_repo_identifier &&
+    originalRun.workflow_repo_identifier !== originalRun.repo_identifier
+  ) {
+    throw new Error(
+      `Cannot re-run an organization-wide workflow: '${originalRun.workflow_name}' is defined in ` +
+        `${originalRun.workflow_repo_identifier} but this run executed against ` +
+        `${originalRun.repo_identifier}. Re-trigger it from ${originalRun.workflow_repo_identifier} instead.`,
+    );
+  }
+
   return originalRun as OriginalRunRow;
 }
 
@@ -303,7 +344,7 @@ async function loadWebhookPayload(
   originalRunId: string,
   deps: RerunDeps,
 ): Promise<Record<string, unknown> | null> {
-  const payloadPath = `executions/${originalRunId}/webhook-payload.json`;
+  const payloadPath = webhookPayloadPath(originalRunId);
   const payloadResult = await deps.logStorage.read(payloadPath);
   if (!payloadResult.data) return null;
   try {

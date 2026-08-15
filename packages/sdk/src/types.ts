@@ -8,7 +8,8 @@ import type {
   NeedsWhen,
   ExecutionJobStatus,
 } from '@kici-dev/engine';
-import type { StepContext, Logger } from './context.js';
+import type { StepContext, Logger, RepoInfo } from './context.js';
+import type { FilterFn } from './filter.js';
 import type { SingleNeedEntry, NeedsContext } from './needs-context.js';
 import type { TriggerConfig } from './triggers/types.js';
 import type { Rule } from './rules/types.js';
@@ -370,6 +371,14 @@ export interface DynamicJobContext {
   env: Record<string, string | undefined>;
   /** Typed KiCI API — orchestrator queries over WS (e.g., kici.infrastructure.list()) */
   kici: KiciApi;
+  /**
+   * The repo whose event triggered this run. Present for a global workflow and
+   * for any evaluation that runs with a checkout; undefined otherwise.
+   * Read through `.path`; never embed it in a job name (see FilterContext).
+   */
+  sourceRepo?: RepoInfo;
+  /** The repo that registered the workflow. Identical to `sourceRepo` outside a global workflow. */
+  workflowRepo?: RepoInfo;
 }
 
 /**
@@ -967,6 +976,23 @@ export interface Workflow {
   readonly on?: TriggerConfig[];
   /** Rules for conditional execution */
   readonly rules?: Rule[];
+  /**
+   * Pre-dispatch predicate deciding whether this workflow applies to the event's
+   * source repo. A `false` result suppresses the workflow's jobs — none is
+   * dispatched, and none is reported as skipped.
+   *
+   * An organization-wide workflow is evaluated once per (event × workflow repo)
+   * before any run row is created, so a `false` verdict produces no run. A
+   * same-repo workflow is evaluated once per job and once per job generator,
+   * after the run row exists — so a run is recorded showing the evaluation and
+   * none of the workflow's own jobs. Because it runs once per job there, the
+   * predicate must be cheap, side-effect free, and deterministic; see `FilterFn`.
+   *
+   * One same-repo exception: a job **held for approval** or **rejected by a
+   * context rule** is not filtered at all. The hold or the rule is its gate, so
+   * an approved job dispatches with no filter verdict having been taken.
+   */
+  readonly filter?: FilterFn;
   /** Optional description */
   readonly description?: string;
   /**
@@ -1019,6 +1045,26 @@ export interface WorkflowOptions {
   on?: Trigger | Trigger[];
   /** Rules that must pass for workflow to execute */
   rules?: Rule[];
+  /**
+   * Pre-dispatch predicate deciding whether this workflow applies to the event's
+   * source repo. Runs on an evaluating agent with the tree(s) on disk, and a
+   * `false` result suppresses the workflow's jobs — none is dispatched, and none
+   * is reported as skipped.
+   *
+   * An organization-wide workflow is evaluated once per (event × workflow repo)
+   * before any run row is created, so a `false` verdict produces no run. A
+   * same-repo workflow is evaluated once per job and once per job generator,
+   * after the run row exists — so a run is recorded showing the evaluation and
+   * none of the workflow's own jobs. Because it runs once per job there, the
+   * predicate must be cheap, side-effect free, and deterministic; see `FilterFn`.
+   *
+   * One same-repo exception: a job **held for approval** or **rejected by a
+   * context rule** is not filtered at all. The hold or the rule is its gate, so
+   * an approved job dispatches with no filter verdict having been taken.
+   *
+   * See `FilterContext` for what it receives and what it deliberately does not.
+   */
+  filter?: FilterFn;
   /** Optional description for documentation */
   description?: string;
   /**

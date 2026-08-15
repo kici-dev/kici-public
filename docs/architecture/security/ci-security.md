@@ -7,11 +7,11 @@ KiCI implements a 3-tier trust model for CI/CD pipeline security. Every PR-trigg
 
 ## Trust tiers
 
-| Tier    | Lock file source | Secrets access           | Execution |
-| ------- | ---------------- | ------------------------ | --------- |
-| trusted | PR head          | Full (all environments)  | Auto-run  |
-| known   | Base branch      | Restricted (env-gated)   | Auto-run  |
-| unknown | Base branch      | Denied (unless approved) | Held      |
+| Tier    | Lock file source | Secrets access             | Execution |
+| ------- | ---------------- | -------------------------- | --------- |
+| trusted | PR head          | Full (all contexts)        | Auto-run  |
+| known   | Base branch      | Restricted (context-gated) | Auto-run  |
+| unknown | Base branch      | Denied (unless approved)   | Held      |
 
 ### Tier definitions
 
@@ -136,7 +136,7 @@ The suppression is deliberately narrow: a non-fork unknown contributor is unaffe
 Security holds are stored in the `held_runs` table with `queue_type = 'security'`, separate from context approval holds (`queue_type = 'context'`). This separation ensures:
 
 - Security approvals require ci_trust:write+ permission
-- Environment approvals require contexts:write+ permission
+- Context approvals require contexts:write+ permission
 - Cross-queue approval is prevented (the `approveByQueueType` method enforces queue_type matching)
 
 ### Hold reasons
@@ -148,7 +148,7 @@ Security holds are stored in the `held_runs` table with `queue_type = 'security'
 | `unknown_contributor`   | Contributor could not be resolved to a known identity                | ci_trust:write+     |
 | `context_trust`         | Context `minimumTrust` gate blocks contributor with lower trust tier | ci_trust:write+     |
 
-The first three are raised by the org trust policy; `context_trust` is raised by an environment's `minimumTrust` gate. A PR that trips several policy arms yields exactly one hold: the arms are evaluated in the order above and any `reject` outcome takes precedence over any `hold`. The trust policy is evaluated before the context gate, so a policy-held run never also lands a competing `context_trust` hold.
+The first three are raised by the org trust policy; `context_trust` is raised by a context's `minimumTrust` gate. A PR that trips several policy arms yields exactly one hold: the arms are evaluated in the order above and any `reject` outcome takes precedence over any `hold`. The trust policy is evaluated before the context gate, so a policy-held run never also lands a competing `context_trust` hold.
 
 ### Approval channels
 
@@ -157,7 +157,7 @@ The first three are raised by the org trust policy; `context_trust` is raised by
 
 ### Approval expiry
 
-Security holds expire on a deadline set when the hold is created. A hold raised by the org trust policy — `workflow_modification`, `fork_pr`, or `unknown_contributor`, each covering a whole PR and not attached to any environment — uses the org's approval expiry (default 72 hours). A `context_trust` hold is raised by an environment rather than by the org policy, so it uses that environment's own hold expiry (`hold_expiry_seconds`, default one hour). Expired runs transition to the `expired` status. The GitHub Check is updated with a timeout explanation.
+Security holds expire on a deadline set when the hold is created. A hold raised by the org trust policy — `workflow_modification`, `fork_pr`, or `unknown_contributor`, each covering a whole PR and not attached to any context — uses the org's approval expiry (default 72 hours). A `context_trust` hold is raised by a context rather than by the org policy, so it uses that context's own hold expiry (`hold_expiry_seconds`, default one hour). Expired runs transition to the `expired` status. The GitHub Check is updated with a timeout explanation.
 
 ## GitHub Check status posting
 

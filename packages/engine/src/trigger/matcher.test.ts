@@ -9,7 +9,9 @@ import {
   matchRepoPatterns,
   matchWorkflowTriggers,
   matchAllWorkflows,
+  matchTrigger,
 } from './matcher.js';
+import type { TraceEntry } from './decision-trace.js';
 import type {
   LockBranchPattern,
   LockWorkflow,
@@ -36,6 +38,7 @@ import type {
   LockGenericWebhookTrigger,
   LockScheduleTrigger,
   LockLifecycleTrigger,
+  LockTextMatch,
   SimulatedEvent,
 } from './types.js';
 
@@ -79,6 +82,11 @@ describe('matchBranchPattern', () => {
     expect(matchBranchPattern(pattern, 'FEATURE-123')).toBe(true);
     expect(matchBranchPattern(pattern, 'feature-123')).toBe(true);
     expect(matchBranchPattern(pattern, 'bugfix-123')).toBe(false);
+  });
+
+  it('rejects a catastrophic branch-pattern regex (#1)', () => {
+    const pattern: LockBranchPattern = { type: 'regex', pattern: '(a+)+$' };
+    expect(() => matchBranchPattern(pattern, 'x')).toThrow(/unsafe|redos|regex/i);
   });
 });
 
@@ -1029,6 +1037,20 @@ describe('matchWorkflowTriggers - Comment triggers', () => {
     };
     expect(matchWorkflowTriggers(wf(trigger), match).matched).toBe(true);
     expect(matchWorkflowTriggers(wf(trigger), noMatch).matched).toBe(false);
+  });
+
+  it('rejects a catastrophic bodyMatch regex (#5)', () => {
+    const trigger: LockCommentTrigger = {
+      _type: 'comment',
+      actions: [],
+      bodyMatch: { pattern: '(a+)+$', type: 'regex' },
+    };
+    const event: SimulatedEvent = {
+      type: 'comment',
+      payload: { comment: { body: 'aaaa' } },
+      targetBranch: '',
+    };
+    expect(() => matchWorkflowTriggers(wf(trigger), event)).toThrow(/unsafe|redos|regex/i);
   });
 });
 
@@ -2538,6 +2560,52 @@ describe('matchRepoPatterns', () => {
       matchRepoPatterns([{ type: 'glob', pattern: '!myorg/secret-*' }], 'myorg/secret-repo'),
     ).toBe(false);
   });
+
+  it("matches a dot-prefixed identifier against '**'", () => {
+    // Repo identifiers are org/name pairs, not paths — a leading dot is just a
+    // character, so `repos: ['**']` ("every repo") must include it.
+    //
+    // The branch/tag matcher is the contrast, pinned here rather than in prose:
+    // it keeps picomatch's default, so it does NOT match. Repo matching used to
+    // run through it, which is exactly why `repos: ['**']` dropped this repo.
+    expect(matchBranchPattern({ type: 'glob', pattern: '**' }, '.hidden/repo')).toBe(false);
+    expect(matchRepoPatterns([{ type: 'glob', pattern: '**' }], '.hidden/repo')).toBe(true);
+    // Positive control: the ordinary identifier matched before and still does.
+    expect(matchRepoPatterns([{ type: 'glob', pattern: '**' }], 'acme/canary')).toBe(true);
+  });
+
+  it('excludes a dot-prefixed identifier via a !-prefixed wildcard pattern', () => {
+    // The exclusion arm compiles through the same matcher, so an org that
+    // excludes a dot-prefixed repo must actually exclude it. An exclusion that
+    // fails open is the dangerous direction: the workflow would run on a repo
+    // an operator deliberately excluded.
+    //
+    // The pattern's first segment must be a WILDCARD to measure anything. A
+    // pattern that spells the dot out (`!.hidden/**`) matches under picomatch's
+    // default too, so it would pass even with this arm left on the branch
+    // matcher. `*/repo` does not match `.hidden/repo` by default and does with
+    // `dot: true`, which is what makes this a real discriminator.
+    expect(
+      matchRepoPatterns(
+        [
+          { type: 'glob', pattern: '**' },
+          { type: 'glob', pattern: '!*/repo' },
+        ],
+        '.hidden/repo',
+      ),
+    ).toBe(false);
+    // Control: the exclusion is selective, not a blanket "any dot repo is out".
+    // A dot-prefixed repo the pattern does not name still matches.
+    expect(
+      matchRepoPatterns(
+        [
+          { type: 'glob', pattern: '**' },
+          { type: 'glob', pattern: '!*/repo' },
+        ],
+        '.hidden/other',
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('matchWorkflowTriggers - repo pattern filtering', () => {
@@ -2766,5 +2834,106 @@ describe('action filter with missing event.action', () => {
     };
 
     expect(matchWorkflowTriggers(workflow, event).matched).toBe(true);
+  });
+});
+
+describe('commitMessage trigger filter', () => {
+  const pushTrigger = (commitMessage: LockTextMatch): LockPushTrigger => ({
+    _type: 'push',
+    branches: [],
+    paths: [],
+    commitMessage,
+  });
+
+  const pushEvent = (commitMessage?: string): SimulatedEvent => ({
+    type: 'push',
+    targetBranch: 'main',
+    payload: {},
+    ...(commitMessage !== undefined && { commitMessage }),
+  });
+
+  it('admits an event whose message satisfies the matcher', () => {
+    const traces: TraceEntry[] = [];
+    expect(
+      matchTrigger(pushTrigger({ notContains: ['[skip ci]'] }), pushEvent('feat: thing'), traces),
+    ).toBe(true);
+  });
+
+  it('rejects an event whose message trips notContains', () => {
+    const traces: TraceEntry[] = [];
+    expect(
+      matchTrigger(pushTrigger({ notContains: ['[skip ci]'] }), pushEvent('wip [skip ci]'), traces),
+    ).toBe(false);
+    const entry = traces.find((t) => t.check === 'commitMessage');
+    expect(entry?.passed).toBe(false);
+    expect(entry?.value).toBe('excluded');
+  });
+
+  it('matches the multi-line body, not just the subject', () => {
+    const traces: TraceEntry[] = [];
+    expect(
+      matchTrigger(
+        pushTrigger({ notContains: ['[skip ci]'] }),
+        pushEvent('feat: thing\n\n[skip ci]\n'),
+        traces,
+      ),
+    ).toBe(false);
+  });
+
+  it('is INDETERMINATE — not a clean exclusion — when the event carries no message', () => {
+    const traces: TraceEntry[] = [];
+    expect(
+      matchTrigger(pushTrigger({ notContains: ['[skip ci]'] }), pushEvent(undefined), traces),
+    ).toBe(false);
+    const entry = traces.find((t) => t.check === 'commitMessage');
+    expect(entry?.value).toBe('indeterminate');
+    expect(entry?.reason).toContain('no commit message');
+  });
+
+  it('treats an empty-string message as a real value', () => {
+    const traces: TraceEntry[] = [];
+    expect(matchTrigger(pushTrigger({ notContains: ['[skip ci]'] }), pushEvent(''), traces)).toBe(
+      true,
+    );
+  });
+
+  it('records no commitMessage entry when the trigger declares none', () => {
+    const traces: TraceEntry[] = [];
+    matchTrigger({ _type: 'push', branches: [], paths: [] }, pushEvent(undefined), traces);
+    expect(traces.find((t) => t.check === 'commitMessage')).toBeUndefined();
+  });
+
+  it('applies to pr and tag triggers too', () => {
+    const prTraces: TraceEntry[] = [];
+    const prTrigger: LockPrTrigger = {
+      _type: 'pr',
+      events: ['opened'],
+      targetBranches: [],
+      sourceBranches: [],
+      paths: [],
+      commitMessage: { contains: ['deploy'] },
+    };
+    const prEvent: SimulatedEvent = {
+      type: 'pull_request',
+      action: 'opened',
+      targetBranch: 'main',
+      payload: {},
+      commitMessage: 'please deploy this',
+    };
+    expect(matchTrigger(prTrigger, prEvent, prTraces)).toBe(true);
+
+    const tagTraces: TraceEntry[] = [];
+    const tagTrigger: LockTagTrigger = {
+      _type: 'tag',
+      patterns: [],
+      commitMessage: { contains: ['rc'] },
+    };
+    const tagEvent: SimulatedEvent = {
+      type: 'tag',
+      targetBranch: 'v1.0.0',
+      payload: {},
+      commitMessage: 'cut rc build',
+    };
+    expect(matchTrigger(tagTrigger, tagEvent, tagTraces)).toBe(true);
   });
 });

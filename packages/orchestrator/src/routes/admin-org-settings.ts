@@ -40,6 +40,11 @@ interface OrgSettingsRouteDeps {
   db: Kysely<Database>;
   rbac: RbacEnforcer;
   /**
+   * Applies when `cluster_settings.global_workflows_enabled` is NULL —
+   * `config.globalWorkflowsEnabled`.
+   */
+  globalWorkflowsEnabledDefault: boolean;
+  /**
    * Optional — when wired, each `dashboard_write_policy` flip emits one
    * `access_log` row (`org_settings.dashboard_write_policy.update`)
    * carrying the operation name + prior/next state in `actor_meta`.
@@ -56,52 +61,53 @@ type AdminEnv = {
   };
 };
 
-const updateSchema = z.object({
-  customerId: z.string().min(1),
-  enabled: z.boolean().optional(),
-  allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-  deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-  elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-  allowHttpNpmRegistries: z.boolean().optional(),
-  // null clears the per-org override and falls back to the cluster-wide
-  // default; a positive integer sets a per-org value.
-  userCacheQuotaBytes: z.number().int().positive().nullable().optional(),
-  userCacheTtlMs: z.number().int().positive().nullable().optional(),
-  artifactQuotaBytes: z.number().int().positive().nullable().optional(),
-  artifactTtlMs: z.number().int().positive().nullable().optional(),
-  // Per-org per-artifact size cap (bytes) + per-run artifact count cap. null
-  // clears the override → cluster-wide default; a positive integer sets it.
-  artifactMaxBytes: z.number().int().positive().nullable().optional(),
-  artifactMaxPerRun: z.number().int().positive().nullable().optional(),
-  dispatchAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  // Per-org webhook-ingest concurrency cap. null clears the override (fall back
-  // to the cluster-wide default); a positive integer sets a per-org value.
-  ingestMaxConcurrency: z.number().int().min(1).nullable().optional(),
-  // Per-org scaler spawn deadline (ms). null clears the override → cluster
-  // default; a value >= 1000 sets a per-org override.
-  scalerSpawnTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  // Reroute tunables. null clears the per-org override (fall back to the
-  // cluster-wide config default); a positive value sets a per-org override.
-  rerouteSpawnWindowMs: z.number().int().min(1000).nullable().optional(),
-  rerouteAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
-  rerouteMaxHops: z.number().int().min(1).nullable().optional(),
-  // Per-org DB-backup freshness WARN threshold (hours). null clears the
-  // override (fall back to the cluster-wide config default).
-  backupStalenessWarnHours: z.number().int().min(1).nullable().optional(),
-  // Per-org dispatch-queue job timeout (ms). null clears the override → cluster
-  // default (config.queueTimeoutMs). 0 = indefinite (no expiry).
-  queueTimeoutMs: z.number().int().min(0).nullable().optional(),
-  // Approval policy. Both have NOT NULL defaults in the DB, so they are not
-  // nullable here — a value always replaces the current one.
-  approvalExpirySeconds: z.number().int().min(1).optional(),
-  allowSelfApproval: z.boolean().optional(),
-  // Container-sandbox escape-hatch allow-list. null clears the override →
-  // deny-all default; an array sets the allowed Linux capabilities (each
-  // validated as a real capability and stored canonicalized). A boolean toggles
-  // whether a workflow may request `sandbox: { network: 'host' }`.
-  sandboxAllowedCapabilities: z.array(z.string()).nullable().optional(),
-  sandboxAllowHostNetwork: z.boolean().nullable().optional(),
-});
+const updateSchema = z
+  .object({
+    customerId: z.string().min(1),
+    allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    allowHttpNpmRegistries: z.boolean().optional(),
+    // null clears the per-org override and falls back to the cluster-wide
+    // default; a positive integer sets a per-org value.
+    userCacheQuotaBytes: z.number().int().positive().nullable().optional(),
+    userCacheTtlMs: z.number().int().positive().nullable().optional(),
+    artifactQuotaBytes: z.number().int().positive().nullable().optional(),
+    artifactTtlMs: z.number().int().positive().nullable().optional(),
+    // Per-org per-artifact size cap (bytes) + per-run artifact count cap. null
+    // clears the override → cluster-wide default; a positive integer sets it.
+    artifactMaxBytes: z.number().int().positive().nullable().optional(),
+    artifactMaxPerRun: z.number().int().positive().nullable().optional(),
+    dispatchAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    // Per-org webhook-ingest concurrency cap. null clears the override (fall back
+    // to the cluster-wide default); a positive integer sets a per-org value.
+    ingestMaxConcurrency: z.number().int().min(1).nullable().optional(),
+    // Per-org scaler spawn deadline (ms). null clears the override → cluster
+    // default; a value >= 1000 sets a per-org override.
+    scalerSpawnTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    // Reroute tunables. null clears the per-org override (fall back to the
+    // cluster-wide config default); a positive value sets a per-org override.
+    rerouteSpawnWindowMs: z.number().int().min(1000).nullable().optional(),
+    rerouteAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
+    rerouteMaxHops: z.number().int().min(1).nullable().optional(),
+    // Per-org DB-backup freshness WARN threshold (hours). null clears the
+    // override (fall back to the cluster-wide config default).
+    backupStalenessWarnHours: z.number().int().min(1).nullable().optional(),
+    // Per-org dispatch-queue job timeout (ms). null clears the override → cluster
+    // default (config.queueTimeoutMs). 0 = indefinite (no expiry).
+    queueTimeoutMs: z.number().int().min(0).nullable().optional(),
+    // Approval policy. Both have NOT NULL defaults in the DB, so they are not
+    // nullable here — a value always replaces the current one.
+    approvalExpirySeconds: z.number().int().min(1).optional(),
+    allowSelfApproval: z.boolean().optional(),
+    // Container-sandbox escape-hatch allow-list. null clears the override →
+    // deny-all default; an array sets the allowed Linux capabilities (each
+    // validated as a real capability and stored canonicalized). A boolean toggles
+    // whether a workflow may request `sandbox: { network: 'host' }`.
+    sandboxAllowedCapabilities: z.array(z.string()).nullable().optional(),
+    sandboxAllowHostNetwork: z.boolean().nullable().optional(),
+  })
+  .strict();
 
 interface ProjectedSettings {
   customerId: string;
@@ -155,11 +161,34 @@ function bigintToNumber(v: string | null): number | null {
   return v === null || v === undefined ? null : Number(v);
 }
 
-function projectRow(customerId: string, row: OrgSettings | undefined): ProjectedSettings {
+/**
+ * The effective fleet-wide master switch.
+ *
+ * Read directly rather than through `ClusterSettingsReader`, whose 10s cache
+ * would make `org-settings global-workflows show` disagree with a
+ * `cluster-settings set` the operator just ran. This is a low-traffic admin
+ * path, so the uncached read costs nothing and read-your-writes is worth more.
+ * `admin-cluster-settings.ts` reads the same row the same way.
+ */
+async function readEffectiveEnabled(db: Kysely<Database>, fallback: boolean): Promise<boolean> {
+  const row = await db
+    .selectFrom('cluster_settings')
+    .select('global_workflows_enabled')
+    .where('id', '=', 'default')
+    .executeTakeFirst();
+  const value = row?.global_workflows_enabled;
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function projectRow(
+  customerId: string,
+  row: OrgSettings | undefined,
+  enabled: boolean,
+): ProjectedSettings {
   if (!row) {
     return {
       customerId,
-      enabled: false,
+      enabled,
       allowedRepos: null,
       deniedRepos: null,
       elevatedRepos: null,
@@ -190,7 +219,7 @@ function projectRow(customerId: string, row: OrgSettings | undefined): Projected
   }
   return {
     customerId,
-    enabled: row.global_workflows_enabled,
+    enabled,
     allowedRepos: row.global_workflow_allowed_repos,
     deniedRepos: row.global_workflow_denied_repos,
     elevatedRepos: row.global_workflow_elevated_repos,
@@ -247,7 +276,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         .selectAll()
         .where('customer_id', '=', customerId)
         .executeTakeFirst();
-      return c.json({ settings: projectRow(customerId, row) });
+      const enabled = await readEffectiveEnabled(deps.db, deps.globalWorkflowsEnabledDefault);
+      return c.json({ settings: projectRow(customerId, row, enabled) });
     } catch (err) {
       return handleAdminError(c, err, logger);
     }
@@ -265,7 +295,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         .where('customer_id', '=', body.customerId)
         .executeTakeFirst();
 
-      let enabled = existing?.global_workflows_enabled ?? false;
       let allowedRepos: RepoPatternEntry[] | null = existing?.global_workflow_allowed_repos ?? null;
       let deniedRepos: RepoPatternEntry[] | null = existing?.global_workflow_denied_repos ?? null;
       let elevatedRepos: RepoPatternEntry[] | null =
@@ -307,7 +336,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         existing?.sandbox_allowed_capabilities ?? null;
       let sandboxAllowHostNetwork: boolean | null = existing?.sandbox_allow_host_network ?? null;
 
-      if (body.enabled !== undefined) enabled = body.enabled;
       if (body.allowedRepos !== undefined) allowedRepos = body.allowedRepos;
       if (body.deniedRepos !== undefined) deniedRepos = body.deniedRepos;
       if (body.elevatedRepos !== undefined) elevatedRepos = body.elevatedRepos;
@@ -358,7 +386,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         .insertInto('org_settings')
         .values({
           customer_id: body.customerId,
-          global_workflows_enabled: enabled,
           global_workflow_allowed_repos: allowedJson,
           global_workflow_denied_repos: deniedJson,
           global_workflow_elevated_repos: elevatedJson,
@@ -384,7 +411,6 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         })
         .onConflict((oc) =>
           oc.column('customer_id').doUpdateSet({
-            global_workflows_enabled: enabled,
             global_workflow_allowed_repos: allowedJson,
             global_workflow_denied_repos: deniedJson,
             global_workflow_elevated_repos: elevatedJson,
@@ -417,7 +443,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         .selectAll()
         .where('customer_id', '=', body.customerId)
         .executeTakeFirst();
-      return c.json({ settings: projectRow(body.customerId, updated) });
+      const enabled = await readEffectiveEnabled(deps.db, deps.globalWorkflowsEnabledDefault);
+      return c.json({ settings: projectRow(body.customerId, updated, enabled) });
     } catch (err) {
       logger.error('Failed to update global-workflow settings', { error: toErrorMessage(err) });
       return handleAdminError(c, err, logger);

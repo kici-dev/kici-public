@@ -3,7 +3,7 @@ title: Test run architecture
 description: Architecture deep-dive on the test run pipeline
 ---
 
-This document describes the end-to-end data flow for remote test runs triggered by `kici run remote`, including the upload encryption scheme, overlay application, observer streaming, and how test runs integrate with the existing production pipeline.
+This document describes the end-to-end data flow for remote test runs triggered by `kici run remote`, including the upload encryption scheme, overlay application, log following, and how test runs integrate with the existing production pipeline.
 
 ## High-level data flow
 
@@ -26,10 +26,9 @@ Developer workstation            Orchestrator              Agent
   6. PUT signed URL (S3) -----> [Object Storage]             |
        |                              |                      |
   7. POST /test/trigger  ------------>|                      |
-       |<---- { runId,                |                      |
-       |        observeUrl } -------- |                      |
+       |<---- { runId } ------------- |                      |
        |                              |                      |
-  8. WS /observe/:runId  ------------>|                      |
+  8. Begin polling logs + status      |                      |
        |                              |                      |
        |                         9. Trigger match            |
        |                              |                      |
@@ -50,9 +49,9 @@ Developer workstation            Orchestrator              Agent
        |                              |                      |
        |                              |                16. Execute steps
        |                              |                      |
-       |<---- observe.log ------------|<---- log.chunk ------|
-       |<---- observe.step -----------|<---- step.status ----|
-       |<---- observe.complete -------|<---- job.status -----|
+       | GET /test/runs/:id/logs ---->|<---- log.chunk ------|
+       | GET /test/runs/:id --------->|<---- step.status ----|
+       |   (polled to completion)     |<---- job.status -----|
        |                              |                      |
   17. Show summary + exit code        |                      |
 ```
@@ -170,37 +169,24 @@ overlay.tar.gz
 - **deletions**: Files the developer deleted locally. The agent removes these from the clone.
 - **checksums**: SHA256 hashes of each included file. The agent verifies these after extraction to detect corruption.
 
-## Observer WebSocket channel
+## Following a test run
 
-The CLI connects to a read-only observer WebSocket endpoint to receive real-time updates during execution.
+The CLI follows a test run by **polling**, over the same HTTP surface it used to trigger it — there is no streaming socket between the CLI and the orchestrator.
 
-### Connection flow
+### Poll loop
 
-1. CLI receives `observeUrl` from the test trigger response
-2. CLI opens WebSocket to `/api/v1/observe/:runId`
-3. CLI authenticates with its API key token
-4. Orchestrator streams events as they occur
+1. The trigger response returns the `runId`.
+2. The CLI polls two endpoints in lockstep on a fixed interval: `GET /api/v1/orgs/:customerId/test/runs/:runId/logs?cursor=<n>` for the next log chunk, and `GET /api/v1/orgs/:customerId/test/runs/:runId` for the status snapshot.
+3. Each log response carries a `nextCursor`; the CLI advances a **monotonic line-offset cursor** so a chunk is never re-printed and never skipped.
+4. The run is finished only when the status is terminal **and** the log stream has drained (`logs.done`). A terminal status alone is not enough — the tail of the log can still be arriving.
 
-### Observer message types
+Because the cursor lives in the CLI and every request is an ordinary authenticated HTTP call, a network blip needs no reconnection protocol: the next poll resumes from the same cursor. `Ctrl-C` cancels the run through the same client rather than just detaching.
 
-| Message             | Direction           | Content                                                   |
-| ------------------- | ------------------- | --------------------------------------------------------- |
-| `observe.subscribe` | CLI -> Orchestrator | Run ID, auth token, optional `lastSeenTimestamp`          |
-| `observe.status`    | Orchestrator -> CLI | Run/job status updates (queued, running, success, failed) |
-| `observe.log`       | Orchestrator -> CLI | Log lines from step execution (job-prefixed)              |
-| `observe.step`      | Orchestrator -> CLI | Step start/complete events                                |
-| `observe.complete`  | Orchestrator -> CLI | Final run result with job summary table                   |
+Two grace behaviors keep the loop honest against a run the control plane has not observed yet: a `404` before the first successful read is retried until a visibility grace period elapses, and approval holds surfaced by a non-terminal tick are reported once each rather than on every poll.
 
-### Reconnection and backfill
+### Orchestrator-side broadcast
 
-If the CLI's WebSocket disconnects (network blip, laptop sleep):
-
-1. CLI reconnects to the same observer endpoint
-2. CLI sends `observe.subscribe` with `lastSeenTimestamp` of the last received message
-3. Orchestrator replays missed log chunks and status updates from persistent storage
-4. Live streaming resumes from the current point
-
-Multiple CLI clients can observe the same run simultaneously.
+Inside the orchestrator, a per-run observer registry buffers the run's `observe.log` / `observe.step` / `observe.status` / `observe.complete` messages with monotonic sequence numbers — up to 1000 messages per run, retained for five minutes after completion. The execution tracker and log writer publish into it only for runs marked as test runs. It is internal machinery: the buffer exists so a future subscriber can be backfilled from a sequence number, and nothing subscribes to it today.
 
 ## Test runs vs production runs
 
@@ -208,7 +194,7 @@ Test runs share most of the production pipeline but differ in key ways:
 
 | Aspect              | Production run                   | Test run                                            |
 | ------------------- | -------------------------------- | --------------------------------------------------- |
-| Trigger source      | GitHub webhook                   | `POST /api/v1/test/trigger`                         |
+| Trigger source      | GitHub webhook                   | `POST /api/v1/orgs/:customerId/test/trigger`        |
 | Event normalization | Provider-specific normalizer     | Synthetic event from fixture                        |
 | Trigger matching    | Lock file triggers               | Same pipeline (or bypass with `--workflow`)         |
 | Dispatch core       | Shared `dispatchMatchedWorkflow` | Same shared core (needs DAG, host fan-out, dynamic) |
@@ -216,7 +202,7 @@ Test runs share most of the production pipeline but differ in key ways:
 | Secret access       | All contexts                     | Only `allowLocalExecution: true` contexts           |
 | Tracking            | `execution_runs` table           | Same table with `is_test_run = true`                |
 | Delivery ID         | Provider-assigned                | `test:` prefix + UUID                               |
-| Observer streaming  | Not available                    | WS observer channel                                 |
+| Log following       | Dashboard / `kici runs` only     | CLI polls logs + status to completion               |
 | `ctx.isTestRun`     | `false`                          | `true`                                              |
 
 ### One dispatch core, two adapters
@@ -229,7 +215,7 @@ The test adapter:
 2. Selects matched workflow decisions (normal trigger matching, or a direct `--workflow` bypass).
 3. Enforces the `allowLocalExecution` environment gate and stores the fixture payload.
 4. Builds a dispatch context per matched workflow — a synthetic `WebhookInfo`, the test provenance fields, and a CLI-secret overlay that wins over orchestrator env secrets — and calls the shared core.
-5. Marks the execution as `isTestRun` for observer broadcasting and secret gating.
+5. Marks the execution as `isTestRun` for the orchestrator-side observer broadcast and secret gating.
 
 Because the test adapter calls the same core, a `kici run` exercises the full dispatch behavior — needs-DAG scheduling, `runsOnAll` host fan-out, matrix and fan-out edge wiring, and deferred init/dynamic job dispatch — exactly as a webhook does. A multi-job `needs` workflow run via `kici run` honors the dependency DAG (a downstream job dispatches only after its upstream reaches a matching state), and a `runsOnAll` job fans out to one pinned execution per matching roster host.
 
@@ -241,7 +227,7 @@ A test-run `job.dispatch` carries the same execution-shaping fields as a product
 
 A test run applies **two different** `allowLocalExecution` gates, deliberately, because the two declarations mean different things:
 
-- **A bound `job.context` is allow-and-warn.** A test run never rejects on a bound environment. If the environment (statically named or resolved from a pure inline expression) is a non-test environment (`allowLocalExecution: false`) or is not configured, it is **skipped** — its variables, secrets, and protection rules do not participate — and the run proceeds. A user-visible warning names the skipped environment(s), surfaced both on the `kici run remote` CLI output and on the dashboard run view. This keeps a job that deploys to a production environment in real runs still locally testable for its non-secret logic, while the `allowLocalExecution: false` boundary that keeps production secrets out of local runs is preserved (the secrets simply do not flow).
+- **A bound `job.context` is allow-and-warn.** A test run never rejects on a bound environment. If a statically-named environment is a non-test environment (`allowLocalExecution: false`) or is not configured, it is **skipped** — its variables, secrets, and protection rules do not participate — and the run proceeds. A user-visible warning names the skipped environment(s), surfaced both on the `kici run remote` CLI output and on the dashboard run view. This keeps a job that deploys to a production environment in real runs still locally testable for its non-secret logic, while the `allowLocalExecution: false` boundary that keeps production secrets out of local runs is preserved (the secrets simply do not flow).
 - **A fixture `secrets:` mapping is fail-closed.** Mapping a secret context to an environment is an explicit request for that environment's secrets. If the named environment is missing or `allowLocalExecution: false`, the run is **rejected** at trigger time with `Fixture secret context '<ctx>' maps to environment '<env>' which does not allow test runs`.
 
 ## Upload storage

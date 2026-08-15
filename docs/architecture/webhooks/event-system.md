@@ -272,20 +272,21 @@ Infrastructure events are stored upstream so the dashboard can render the run ti
 
 The following event types are emitted during a run's lifecycle:
 
-| Event type                        | Source       | Description                            |
-| --------------------------------- | ------------ | -------------------------------------- |
-| orchestrator.dispatch             | orchestrator | Run dispatched to agent(s)             |
-| orchestrator.agent.assigned       | orchestrator | Agent assigned to a job                |
-| orchestrator.job.started          | orchestrator | Job execution started                  |
-| orchestrator.job.completed        | orchestrator | Job execution completed                |
-| orchestrator.job.stale_detected   | orchestrator | Job marked stale by stale run detector |
-| orchestrator.job.orphan_recovered | orchestrator | Orphaned job recovered by Raft leader  |
-| orchestrator.run.orphan_finalized | orchestrator | Orphaned run finalized by Raft leader  |
-| agent.clone.start                 | agent        | Repository clone started (build jobs)  |
-| agent.clone.end                   | agent        | Repository clone completed             |
-| agent.execution.start             | agent        | Workflow execution started             |
-| agent.execution.end               | agent        | Workflow execution completed           |
-| agent.teardown                    | agent        | Agent teardown/cleanup                 |
+| Event type                        | Source       | Description                                                                     |
+| --------------------------------- | ------------ | ------------------------------------------------------------------------------- |
+| orchestrator.dispatch             | orchestrator | Run dispatched to agent(s)                                                      |
+| orchestrator.agent.assigned       | orchestrator | Agent assigned to a job                                                         |
+| orchestrator.job.started          | orchestrator | Job execution started                                                           |
+| orchestrator.job.completed        | orchestrator | Job execution completed                                                         |
+| orchestrator.job.stale_detected   | orchestrator | Job marked stale by stale run detector                                          |
+| orchestrator.job.queue_expired    | orchestrator | Queued job terminalized — its dispatch deadline passed without a matching agent |
+| orchestrator.job.orphan_recovered | orchestrator | Orphaned job recovered by Raft leader                                           |
+| orchestrator.run.orphan_recovered | orchestrator | Orphaned run recovered and finalized by the Raft leader                         |
+| agent.clone.start                 | agent        | Repository clone started (build jobs)                                           |
+| agent.clone.end                   | agent        | Repository clone completed                                                      |
+| agent.execution.start             | agent        | Workflow execution started                                                      |
+| agent.execution.end               | agent        | Workflow execution completed                                                    |
+| agent.teardown                    | agent        | Agent teardown/cleanup                                                          |
 
 ### Event flow
 

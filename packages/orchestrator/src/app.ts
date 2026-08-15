@@ -35,6 +35,7 @@ import type { PeerRegistry } from './cluster/peer-registry.js';
 import type { JobQueue } from './queue/job-queue.js';
 import type { DedupCache } from './webhook/dedup.js';
 import type { LockFileCache } from './lockfile-cache.js';
+import type { ContentRequirementsCache } from './content-requirements-cache.js';
 import type { PlatformClient } from './ws/platform-client.js';
 import type { ScalerManager } from './scaler/manager.js';
 import type { ProviderRegistry } from './provider-registry.js';
@@ -46,7 +47,9 @@ import type { ArtifactStore } from './artifacts/artifact-store.js';
 import type { DispatchCacheRefTracker } from './cache/index.js';
 import type { PendingBuildTracker } from './cache/index.js';
 import type { PendingInitTracker, InitResult } from './cache/index.js';
-import type { PendingDynamicTracker } from './cache/index.js';
+import type { PendingDynamicTracker, PendingGlobalEvalTracker } from './cache/index.js';
+import type { GlobalEvalRoundCache } from './cache/index.js';
+import { parseGlobalEvalResult } from './cache/pending-global-evals.js';
 import type { CacheStorage } from './storage/types.js';
 import type { ProvenanceTrustRoot } from './provenance/trust-root.js';
 import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.js';
@@ -114,6 +117,8 @@ import { processWebhook } from './pipeline/processor.js';
 import { WebhookIngestOutcome } from './pipeline/process-webhook.js';
 import type { WebhookInfo } from './webhook/handler.js';
 import type { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
+import type { IngestOverflowReplayer } from './webhook/ingest-overflow-replayer.js';
+import { acceptWebhookDelivery } from './webhook/ingest-accept.js';
 import {
   deliveryFromDirect,
   overflowDeliveryToInfo,
@@ -181,6 +186,7 @@ export interface AppDependencies {
   jobQueue: JobQueue;
   dedup: DedupCache;
   lockFileCache: LockFileCache;
+  contentRequirementsCache: ContentRequirementsCache;
   providerRegistry: ProviderRegistry;
   platformClient?: PlatformClient;
   /**
@@ -199,6 +205,13 @@ export interface AppDependencies {
    * for later replay; absent → capture disabled.
    */
   ingestOverflowBuffer?: IngestOverflowBuffer;
+  /**
+   * Drain loop for the durable ingest queue. The accept path borrows its
+   * claim-release so a failed pipeline hands the row back for retry through the
+   * same attempt ceiling the drain uses; absent → the accept path degrades to
+   * inline ingestion.
+   */
+  ingestOverflowReplayer?: IngestOverflowReplayer;
   /**
    * Fulfil deferred attestations on demand (mints in this process, which owns
    * the Platform WS). Backs `POST /api/v1/admin/attestations/retry`. Wired only
@@ -279,6 +292,8 @@ export interface AppDependencies {
   pendingInits?: PendingInitTracker;
   /** Pending dynamic tracker for DynamicJobFn evaluation coordination. */
   pendingDynamics?: PendingDynamicTracker;
+  pendingGlobalEvals?: PendingGlobalEvalTracker;
+  globalEvalCache?: GlobalEvalRoundCache;
   /** Commit status reporter for setting pending/success/failure/error on commits. Optional. */
   checkRunReporter?: CheckRunReporter;
   /** Execution tracker for DB persistence of execution state. Optional — requires database. */
@@ -322,6 +337,15 @@ export interface AppDependencies {
   eventEmitter?: EventEmitter;
   /** Generic webhook source manager. Optional -- if not set, generic webhooks are disabled. */
   genericSourceManager?: GenericSourceManager;
+  /**
+   * Re-register a generic source's provider bundle from its database row,
+   * resolving to true when a per-routing-key bundle is now registered.
+   *
+   * Built in orchestrator-core so it shares the exact dependency bag the
+   * startup enumeration and the LISTEN/NOTIFY drain already register with.
+   * Optional -- wirings without one keep the previous behaviour.
+   */
+  ensureProviderBundle?: (routingKey: string) => Promise<boolean>;
   /** GitHub direct-ingress route deps (hybrid/independent only). Optional -- if not set, the direct GitHub ingress route is not mounted. */
   githubSourceStore?: SourceStore;
   githubVerifyDeps?: VerifyInboundDeps;
@@ -777,7 +801,11 @@ export function createApp(deps: AppDependencies) {
         dispatchCacheRefs: deps.dispatchCacheRefs,
         cacheStorage: deps.cacheStorage,
         onJobStatus:
-          deps.platformClient || deps.executionTracker || deps.pendingBuilds || deps.pendingInits
+          deps.platformClient ||
+          deps.executionTracker ||
+          deps.pendingBuilds ||
+          deps.pendingInits ||
+          deps.pendingGlobalEvals
             ? (_agentId, msg) => {
                 // Resolve/reject pending builds on terminal states
                 if (deps.pendingBuilds && deps.pendingBuilds.has(msg.jobId)) {
@@ -830,6 +858,46 @@ export function createApp(deps: AppDependencies) {
                       msg.jobId,
                       new AgentJobFailedError(
                         (msg.data?.error as string) ?? `Dynamic eval ${msg.state}`,
+                        msg.data?.initFailure as InitFailure | undefined,
+                      ),
+                    );
+                  }
+                }
+
+                // Resolve/reject the pre-run global eval round on terminal states
+                if (deps.pendingGlobalEvals && deps.pendingGlobalEvals.has(msg.jobId)) {
+                  if (
+                    msg.state === ExecutionJobStatus.enum.success &&
+                    msg.data?.globalEvalComplete
+                  ) {
+                    // Parse, never cast: `msg.data` is an unvalidated record, so
+                    // a cast here would hand arbitrary agent-supplied JSON to a
+                    // consumer that dereferences it. A malformed result fails
+                    // the round rather than the process.
+                    const parsed = parseGlobalEvalResult(msg.data.globalEvalResult);
+                    if (parsed.ok) {
+                      deps.pendingGlobalEvals.resolve(msg.jobId, parsed.value);
+                    } else {
+                      deps.pendingGlobalEvals.reject(msg.jobId, new Error(parsed.error));
+                    }
+                  } else if (msg.state === ExecutionJobStatus.enum.success) {
+                    // A success carrying no `globalEvalComplete` marker settles
+                    // nothing on its own, and the round job has no later
+                    // terminal state to arrive — so the waiter would hang until
+                    // its wait ceiling fires. Reject on the spot instead: the
+                    // agent finished and told us nothing we can act on.
+                    deps.pendingGlobalEvals.reject(
+                      msg.jobId,
+                      new Error('Global eval round reported success without a result payload'),
+                    );
+                  } else if (
+                    msg.state === ExecutionJobStatus.enum.failed ||
+                    msg.state === ExecutionJobStatus.enum.cancelled
+                  ) {
+                    deps.pendingGlobalEvals.reject(
+                      msg.jobId,
+                      new AgentJobFailedError(
+                        (msg.data?.error as string) ?? `Global eval round ${msg.state}`,
                         msg.data?.initFailure as InitFailure | undefined,
                       ),
                     );
@@ -921,6 +989,11 @@ export function createApp(deps: AppDependencies) {
                 repo,
                 sha: execContext.sha,
                 workflowName: execContext.workflowName,
+                // Present only for a cross-repository global run — see
+                // `CheckRunReporter.workflowLabel`.
+                ...(execContext.workflowRepoIdentifier && {
+                  workflowRepoIdentifier: execContext.workflowRepoIdentifier,
+                }),
                 jobName: deps.executionTracker.getJobName(msg.runId, msg.jobId) ?? msg.jobId,
                 stepIndex: msg.stepIndex,
                 stepName: msg.stepName,
@@ -1004,6 +1077,7 @@ export function createApp(deps: AppDependencies) {
         pendingBuilds: deps.pendingBuilds,
         pendingInits: deps.pendingInits,
         pendingDynamics: deps.pendingDynamics,
+        pendingGlobalEvals: deps.pendingGlobalEvals,
         agentApiRegistry,
         agentMetricsAggregator,
         onSecretOutputs: deps.onSecretOutputs,
@@ -1384,116 +1458,190 @@ export function createApp(deps: AppDependencies) {
   });
 
   // Generic webhook routes (mounted when generic source manager is available)
-  // Shared inbound-webhook ingest closure. Both the generic direct-ingress
+  // Shared inbound-webhook ingest machinery. Both the generic direct-ingress
   // route and the direct GitHub ingress route feed the same universal
   // `processWebhook` pipeline (which owns the atomic dedup claim); keeping one
-  // closure means the two ingestion surfaces can never drift on the dep map or
-  // the failure event-log handling. Returns the pipeline's ingest outcome so a
-  // route can answer `{ duplicate: true }` on a dedup hit.
+  // set of closures means the two ingestion surfaces can never drift on the dep
+  // map or the failure event-log handling.
+  //
+  // Two entry points, deliberately distinct:
+  //  - `acceptWebhookIngest` (routes) acknowledges as soon as the delivery is
+  //    durably queued and runs the pipeline afterwards.
+  //  - `runWebhookIngest` (overflow replay) runs the pipeline inline, because
+  //    the replayer needs its outcome to decide the row's next state.
+
+  /** Reserve an admission slot, capturing a shed delivery when asked to. */
+  const admitIngest = async (
+    info: WebhookInfo,
+    opts?: { captureOnShed?: boolean },
+  ): Promise<AdmitResult | undefined> => {
+    if (!deps.ingestController || !deps.ingestCapReader) return undefined;
+    const { key, orgCap } = await deps.ingestCapReader.resolve(info.routingKey);
+    const admit = await deps.ingestController.admit(key, orgCap, { allowQueue: true });
+    if (admit.admitted) return admit;
+    // Additively capture the shed delivery into the durable queue for replay
+    // once capacity recovers. Best-effort: a capture failure never changes the
+    // 429 response the caller receives. Skipped for a replay re-injection
+    // (`captureOnShed: false`) — the delivery is already stored, so re-capturing
+    // on a re-shed would duplicate the row and leak the bounded cap.
+    if (
+      (opts?.captureOnShed ?? true) &&
+      deps.config.ingestOverflowEnabled &&
+      deps.ingestOverflowBuffer
+    ) {
+      try {
+        await deps.ingestOverflowBuffer.capture(deliveryFromDirect(info));
+      } catch (err) {
+        logger.warn('failed to capture shed delivery to overflow buffer', {
+          deliveryId: info.deliveryId,
+          error: toErrorMessage(err),
+        });
+      }
+    }
+    return admit;
+  };
+
+  /**
+   * Run the match-and-dispatch pipeline for one delivery. Records a `failed`
+   * event-log row before rethrowing, so a throw is visible per delivery in the
+   * dashboard whether or not any caller is still around to see the error.
+   */
+  const runWebhookPipeline = async (info: WebhookInfo): Promise<WebhookIngestOutcome> => {
+    try {
+      return await processWebhook(info, {
+        dedup: deps.dedup,
+        providerRegistry: deps.providerRegistry,
+        ensureProviderBundle: deps.ensureProviderBundle,
+        lockFileCache: deps.lockFileCache,
+        contentRequirementsCache: deps.contentRequirementsCache,
+        dispatcher: deps.dispatcher,
+        platformClient: deps.platformClient,
+        sourceCache: deps.sourceCache,
+        buildCoordinator: deps.buildCoordinator,
+        depCache: deps.depCache,
+        pendingBuilds: deps.pendingBuilds,
+        pendingInits: deps.pendingInits,
+        pendingDynamics: deps.pendingDynamics,
+        pendingGlobalEvals: deps.pendingGlobalEvals,
+        globalEvalCache: deps.globalEvalCache,
+        checkRunReporter: deps.checkRunReporter,
+        executionTracker: deps.executionTracker,
+        onSourceLocationsExtracted,
+        eventRouter: deps.eventRouter,
+        registrationStore: deps.registrationStore,
+        registrationIndex: deps.registrationIndex,
+        db: deps.db,
+        secretKey: deps.config.secretKey,
+        secretResolver: deps.secretResolver,
+        sandboxAllowListReader: deps.sandboxAllowListReader,
+        logStorage: deps.logStorage,
+        contextStore: deps.contextStore,
+        variableStore: deps.variableStore,
+        heldRunStore: deps.heldRunStore,
+        coordinator: deps.coordinator,
+        cronScheduler: deps.cronScheduler,
+        globalWorkflowPolicy: deps.globalWorkflowPolicy,
+        eventLog: deps.eventLogWriter,
+        eventLogSource: 'direct',
+        contributorCache: deps.contributorCache,
+        accessLogWriter: deps.accessLogWriter,
+        hostRosterStore: deps.hostRosterStore,
+        instanceId: deps.config.instanceId,
+        rosterGraceMs: deps.config.rosterGraceMs,
+        maxFanoutHosts: deps.config.maxFanoutHosts,
+        globalEvalRoundTimeoutMs: deps.config.globalEvalRoundTimeoutMs,
+        globalEvalCandidateTimeoutMs: deps.config.globalEvalCandidateTimeoutMs,
+        globalEvalWaitTimeoutMs: deps.config.globalEvalWaitTimeoutMs,
+        clusterSettings: deps.clusterSettings,
+      });
+    } catch (err) {
+      if (deps.eventLogWriter) {
+        try {
+          await deps.eventLogWriter.record(info, payloadFromObject(info.payload), {
+            orgId: '__default__',
+            source: 'direct',
+            status: 'failed',
+            errorMessage: toErrorMessage(err),
+          });
+        } catch (recordErr) {
+          logger.warn('Failed to record failed event-log row for direct ingest path', {
+            deliveryId: info.deliveryId,
+            error: toErrorMessage(recordErr),
+          });
+        }
+      }
+      throw err;
+    }
+  };
+
+  /**
+   * Inline ingest: admit, then run the pipeline to completion and return its
+   * outcome. Used by overflow replay, which needs the outcome to decide whether
+   * the row goes back to `buffered` or clears.
+   */
   const runWebhookIngest = async (
     info: WebhookInfo,
     opts?: { captureOnShed?: boolean },
   ): Promise<WebhookIngestOutcome> => {
     const reqId = randomUUID();
     return requestContext.run({ requestId: reqId, routingKey: info.routingKey }, async () => {
-      // Admission control: resolve the fairness key + per-org cap and admit
-      // before doing any pipeline work. When saturated the controller sheds and
-      // the route answers 429 + Retry-After (the caller redelivers). The
-      // controller/cap-reader are absent in tests / minimal wirings → no gate.
-      let admit: AdmitResult | undefined;
-      if (deps.ingestController && deps.ingestCapReader) {
-        const { key, orgCap } = await deps.ingestCapReader.resolve(info.routingKey);
-        admit = await deps.ingestController.admit(key, orgCap, { allowQueue: true });
-        if (!admit.admitted) {
-          // Additively capture the shed delivery into the durable overflow
-          // buffer for replay once capacity recovers. Best-effort: a capture
-          // failure never changes the 429 response the caller receives. Skipped
-          // for a replay re-injection (`captureOnShed: false`) — the delivery is
-          // already buffered, so re-capturing on a re-shed would duplicate the
-          // row and leak the bounded cap.
-          if (
-            (opts?.captureOnShed ?? true) &&
-            deps.config.ingestOverflowEnabled &&
-            deps.ingestOverflowBuffer
-          ) {
-            try {
-              await deps.ingestOverflowBuffer.capture(deliveryFromDirect(info));
-            } catch (err) {
-              logger.warn('failed to capture shed delivery to overflow buffer', {
-                deliveryId: info.deliveryId,
-                error: toErrorMessage(err),
-              });
-            }
-          }
-          return WebhookIngestOutcome.enum.shed;
-        }
-      }
+      const admit = await admitIngest(info, opts);
+      if (admit && !admit.admitted) return WebhookIngestOutcome.enum.shed;
       try {
-        return await processWebhook(info, {
-          dedup: deps.dedup,
-          providerRegistry: deps.providerRegistry,
-          lockFileCache: deps.lockFileCache,
-          dispatcher: deps.dispatcher,
-          platformClient: deps.platformClient,
-          sourceCache: deps.sourceCache,
-          buildCoordinator: deps.buildCoordinator,
-          depCache: deps.depCache,
-          pendingBuilds: deps.pendingBuilds,
-          pendingInits: deps.pendingInits,
-          pendingDynamics: deps.pendingDynamics,
-          checkRunReporter: deps.checkRunReporter,
-          executionTracker: deps.executionTracker,
-          onSourceLocationsExtracted,
-          eventRouter: deps.eventRouter,
-          registrationStore: deps.registrationStore,
-          registrationIndex: deps.registrationIndex,
-          db: deps.db,
-          secretKey: deps.config.secretKey,
-          secretResolver: deps.secretResolver,
-          sandboxAllowListReader: deps.sandboxAllowListReader,
-          logStorage: deps.logStorage,
-          contextStore: deps.contextStore,
-          variableStore: deps.variableStore,
-          heldRunStore: deps.heldRunStore,
-          coordinator: deps.coordinator,
-          cronScheduler: deps.cronScheduler,
-          globalWorkflowPolicy: deps.globalWorkflowPolicy,
-          eventLog: deps.eventLogWriter,
-          eventLogSource: 'direct',
-          contributorCache: deps.contributorCache,
-          accessLogWriter: deps.accessLogWriter,
-          hostRosterStore: deps.hostRosterStore,
-          instanceId: deps.config.instanceId,
-          rosterGraceMs: deps.config.rosterGraceMs,
-          maxFanoutHosts: deps.config.maxFanoutHosts,
-          clusterSettings: deps.clusterSettings,
-        });
-      } catch (err) {
-        if (deps.eventLogWriter) {
-          try {
-            await deps.eventLogWriter.record(info, payloadFromObject(info.payload), {
-              orgId: '__default__',
-              source: 'direct',
-              status: 'failed',
-              errorMessage: toErrorMessage(err),
-            });
-          } catch (recordErr) {
-            logger.warn('Failed to record failed event-log row for direct ingest path', {
-              deliveryId: info.deliveryId,
-              error: toErrorMessage(recordErr),
-            });
-          }
-        }
-        throw err;
+        return await runWebhookPipeline(info);
       } finally {
         if (admit?.admitted) admit.release();
       }
     });
   };
 
+  /**
+   * Accept ingest: acknowledge as soon as the delivery is durably queued, then
+   * run the pipeline. This is what the two direct-ingress routes call, and the
+   * reason a slow build no longer turns a provider's delivery into a timeout.
+   *
+   * The durable queue is what makes the early acknowledgement safe, so when it
+   * is unavailable — `ingestOverflowEnabled=false`, or a wiring with no buffer —
+   * the accept path degrades to the inline behaviour rather than acknowledging a
+   * delivery nothing recorded. Disabling the queue therefore also opts back in
+   * to synchronous ingestion, which is the honest trade and is documented as one.
+   */
+  const acceptWebhookIngest = async (info: WebhookInfo): Promise<WebhookIngestOutcome> => {
+    const buffer = deps.ingestOverflowBuffer;
+    const replayer = deps.ingestOverflowReplayer;
+    if (!deps.config.ingestOverflowEnabled || !buffer || !replayer) {
+      return await runWebhookIngest(info);
+    }
+    const reqId = randomUUID();
+    return requestContext.run({ requestId: reqId, routingKey: info.routingKey }, async () =>
+      acceptWebhookDelivery(info, {
+        admit: async () => {
+          const admit = await admitIngest(info);
+          if (!admit) return undefined;
+          return admit.admitted ? admit.release : null;
+        },
+        isKnownDelivery: (deliveryId) => deps.dedup.exists(deliveryId),
+        enqueue: (queued) => buffer.enqueue(deliveryFromDirect(queued)),
+        claimRow: (rowId) => buffer.claimRow(rowId),
+        markProcessed: (rowId) => buffer.markProcessed(rowId),
+        releaseClaim: (rowId, reason) => replayer.releaseClaim(rowId, reason),
+        // The background work runs after `requestContext.run` has returned, so
+        // the async context is gone — re-establish it under the same request id
+        // and routing key, otherwise every pipeline log line for an accepted
+        // delivery loses its correlation fields.
+        runPipeline: (queued) =>
+          requestContext.run({ requestId: reqId, routingKey: queued.routingKey }, () =>
+            runWebhookPipeline(queued),
+          ),
+      }),
+    );
+  };
+
   // Direct-origin overflow replay: re-inject a captured HTTP delivery through the
   // same admission-gated ingest closure. runWebhookIngest returns `shed` on a
-  // re-shed, which the replayer treats as "revert to buffered".
+  // re-shed, which the replayer treats as "revert to buffered". This one stays
+  // inline on purpose — the replayer decides the row's next state from the
+  // outcome, so it must await the pipeline rather than an acknowledgement.
   const reinjectDirect = (d: OverflowDelivery): Promise<WebhookIngestOutcome> =>
     runWebhookIngest(overflowDeliveryToInfo(d), { captureOnShed: false });
 
@@ -1502,7 +1650,7 @@ export function createApp(deps: AppDependencies) {
       '/',
       createGenericWebhookRoutes({
         sourceManager: deps.genericSourceManager,
-        onWebhook: runWebhookIngest,
+        onWebhook: acceptWebhookIngest,
       }),
     );
   }
@@ -1521,7 +1669,7 @@ export function createApp(deps: AppDependencies) {
       createGithubWebhookRoutes({
         sourceStore: deps.githubSourceStore,
         verifyDeps: deps.githubVerifyDeps,
-        onWebhook: runWebhookIngest,
+        onWebhook: acceptWebhookIngest,
         clusterSettings: deps.clusterSettings,
         maxGithubPayloadBytes: deps.config.maxGithubPayloadBytes,
       }),
@@ -1541,6 +1689,7 @@ export function createApp(deps: AppDependencies) {
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
         retryAttestations: deps.retryAttestations,
+        globalWorkflowsEnabledDefault: deps.config.globalWorkflowsEnabled,
       }),
     );
   }

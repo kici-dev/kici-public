@@ -48,7 +48,7 @@ export default workflow('build', {
 
 Per-field rules:
 
-- **`url`** — Must be HTTPS. HTTP is permitted only for `localhost` / `127.0.0.0/8` / `::1` / `*.local` hosts, or when an operator has flipped the org-level `allow_http_npm_registries` toggle (see [`kici-admin org-settings allow-http-npm`](/operator/kici-admin-cli#allow-http-npm--permit-non-https-private-npm-registries)).
+- **`url`** — Must be HTTPS. HTTP is permitted only for `localhost` / `127.0.0.0/8` / `::1` / `*.local` hosts, or when an operator has flipped the org-level `allow_http_npm_registries` toggle (see [`kici-admin org-settings allow-http-npm`](../operator/orchestrator/kici-admin/org-settings.md#allow-http-npm--permit-non-https-private-npm-registries)).
 - **`scope`** — Optional. When present, the registry serves only that scope (`@my-org`). When absent, this entry becomes the **default** registry — at most one entry may omit `scope`.
 - **`tokenSecret`** — Mandatory `<context>:<secret-name>`. The orchestrator looks up the secret in the named context via the per-context secret resolver. The bare name **must not** contain a colon.
 - **`alwaysAuth`** — Defaults to `true`. Forces npm to send the token on every request (even GETs), which is what most managed-registry providers require.
@@ -262,4 +262,4 @@ The dashboard JSON lives at `infra/terraform/modules/grafana/dashboards/install-
 
 - [Secrets](secrets.md) — how to seed the `<context>:<secret-name>` values referenced by `tokenSecret` / `installEnv`.
 - [Contexts](contexts.md) — protection rules (`branch_restrictions`, `requires_review`, `minimum_trust`) that the install gate inherits.
-- [Operator: `kici-admin org-settings`](/operator/kici-admin-cli#org-settings----org-level-security-policy) — the `allow_http_npm_registries` toggle and other org-scoped knobs.
+- [Operator: `kici-admin org-settings`](../operator/orchestrator/kici-admin/org-settings.md#org-settings----org-level-security-policy) — the `allow_http_npm_registries` toggle and other org-scoped knobs.

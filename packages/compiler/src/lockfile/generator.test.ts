@@ -35,7 +35,12 @@ import { parallel } from '@kici-dev/sdk';
 import type { Job } from '@kici-dev/sdk';
 import { generateLockFile, schemaWindowWarning, transformTriggers } from './generator.js';
 import { isCompilerError, type CompilerError } from '../errors/index.js';
-import type { LockDispatchTrigger } from '@kici-dev/engine';
+import type {
+  LockDispatchTrigger,
+  LockPushTrigger,
+  LockPrTrigger,
+  LockTagTrigger,
+} from '@kici-dev/engine';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { SCHEMA_VERSION, BREAKING_FLOOR, type WorkflowWithSource } from '../types.js';
 
@@ -541,14 +546,14 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 32', () => {
+  it('schemaVersion is 35', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(32);
-    expect(SCHEMA_VERSION).toBe(32);
+    expect(lockFile.schemaVersion).toBe(35);
+    expect(SCHEMA_VERSION).toBe(35);
   });
 
   it('serializes runsOnPick: deterministic by default and any when set', () => {
@@ -566,6 +571,26 @@ describe('generator - content hash fields', () => {
     );
     expect(byName.a.runsOnPick).toBe('deterministic');
     expect(byName.b.runsOnPick).toBe('any');
+  });
+});
+
+describe('generator - workflow filter predicate', () => {
+  it('emits hasFilter: true when the workflow declares a filter', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-ci', { jobs: [j], filter: async () => true });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+
+    expect(lockFile.workflows[0].hasFilter).toBe(true);
+  });
+
+  it('omits hasFilter entirely when no filter is declared', () => {
+    const j = job('build', { runsOn: 'linux', run: async () => {} });
+    const w = workflow('org-ci', { jobs: [j] });
+
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+
+    expect('hasFilter' in lockFile.workflows[0]).toBe(false);
   });
 });
 
@@ -588,6 +613,101 @@ describe('generator - dispatch inputs descriptors', () => {
     expect(() =>
       transformTriggers([dispatch({ types: ['x'], inputs: { bad: z.object({ a: z.string() }) } })]),
     ).toThrow(/bad/);
+  });
+});
+
+describe('generator - requires content filter', () => {
+  it('serializes requires onto the push lock trigger with format resolved by extension', () => {
+    const [t] = transformTriggers([
+      push({ repos: ['o/*'], requires: [{ file: 'package.json', exists: ['$.scripts.ci'] }] }),
+    ]);
+    expect((t as LockPushTrigger).requires).toEqual([
+      { file: 'package.json', format: 'json', exists: ['$.scripts.ci'] },
+    ]);
+  });
+
+  it('resolves .yaml/.yml to yaml and an unknown extension to text', () => {
+    const [y] = transformTriggers([
+      push({ requires: [{ file: 'c.yml', exists: ['$.services'] }] }),
+    ]);
+    expect((y as LockPushTrigger).requires?.[0].format).toBe('yaml');
+    const [txt] = transformTriggers([
+      push({ requires: [{ file: 'Dockerfile', matches: '/^FROM/m' }] }),
+    ]);
+    expect((txt as LockPushTrigger).requires?.[0].format).toBe('text');
+  });
+
+  it('serializes requires onto the pr lock trigger', () => {
+    const [t] = transformTriggers([
+      pr({ requires: [{ file: 'config.yaml', match: { '$.enabled': true } }] }),
+    ]);
+    expect((t as LockPrTrigger).requires).toEqual([
+      { file: 'config.yaml', format: 'yaml', match: { '$.enabled': true } },
+    ]);
+  });
+
+  it('serializes requires onto the tag lock trigger', () => {
+    const [t] = transformTriggers([tag({ patterns: ['v*'], requires: [{ file: 'VERSION' }] })]);
+    expect((t as LockTagTrigger).requires).toEqual([{ file: 'VERSION' }]);
+  });
+
+  it('applies a push requires to both the push and the derived tag lock trigger', () => {
+    const triggers = transformTriggers([
+      push({ tags: ['v*'], requires: [{ file: 'x', absent: true }] }),
+    ]);
+    const push0 = triggers.find((t) => t._type === 'push') as LockPushTrigger;
+    const tag0 = triggers.find((t) => t._type === 'tag') as LockTagTrigger;
+    expect(push0.requires).toEqual([{ file: 'x', absent: true }]);
+    expect(tag0.requires).toEqual([{ file: 'x', absent: true }]);
+  });
+
+  it('keeps a bare { file } existence check format-less (valid)', () => {
+    const [t] = transformTriggers([push({ requires: [{ file: 'LICENSE' }] })]);
+    expect((t as LockPushTrigger).requires).toEqual([{ file: 'LICENSE' }]);
+  });
+
+  it('omits requires when none declared', () => {
+    const [t] = transformTriggers([push({ branches: ['main'] })]);
+    expect((t as LockPushTrigger).requires).toBeUndefined();
+  });
+
+  it('rejects absent combined with a query key at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x', absent: true, exists: ['$.a'] }] })]),
+    ).toThrow(/absent.*exclusive|mutually/i);
+  });
+
+  it('rejects a text-format entry carrying a json/yaml query key', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'notes.txt', exists: ['$.a'] }] })]),
+    ).toThrow(/text format cannot carry/i);
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x', format: 'text', match: { '$.a': 1 } }] })]),
+    ).toThrow(/text format cannot carry/i);
+  });
+
+  it('rejects a json/yaml entry carrying matches', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'data.json', matches: '/x/' }] })]),
+    ).toThrow(/cannot carry a raw-text key/i);
+  });
+
+  it('rejects a degenerate format-only entry with no query', () => {
+    expect(() => transformTriggers([push({ requires: [{ file: 'x', format: 'text' }] })])).toThrow(
+      /nothing to check/i,
+    );
+  });
+
+  it('rejects a catastrophic (ReDoS-prone) matches regex at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x.txt', matches: '/(a+)+$/' }] })]),
+    ).toThrow(/ReDoS|matches/i);
+  });
+
+  it('rejects a syntactically invalid matches regex at compile time', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'x.txt', matches: '/(unterminated/' }] })]),
+    ).toThrow(/invalid regex/i);
   });
 });
 
@@ -1462,7 +1582,7 @@ describe('generator - context/env/concurrencyGroup', () => {
       }
     });
 
-    it('emits contexts[] in order, marking dynamic elements', () => {
+    it('emits contexts[] in order, marking function elements as dynamic markers', () => {
       const s = step('deploy', async () => {});
       const envFn = (event: { ref: string }) => event.ref.split('/').pop();
       const j = job('deploy', {
@@ -1476,14 +1596,13 @@ describe('generator - context/env/concurrencyGroup', () => {
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
         expect(lockJob.contexts?.[0]).toEqual({ value: 'staging', dynamic: false });
-        expect(lockJob.contexts?.[1]).toEqual({
-          value: { _type: 'inline', expression: envFn.toString() },
-          dynamic: true,
-        });
+        // A function element carries only the dynamic marker — never an inline
+        // expression. The agent init round resolves it.
+        expect(lockJob.contexts?.[1]).toEqual({ value: '', dynamic: true });
       }
     });
 
-    it('marks an impure (async) function element dynamic with no inline value', () => {
+    it('marks an async function element dynamic with no inline value', () => {
       const s = step('deploy', async () => {});
       const j = job('deploy', {
         runsOn: 'linux',
@@ -1499,9 +1618,7 @@ describe('generator - context/env/concurrencyGroup', () => {
       }
     });
 
-    it('falls back to the dynamic marker for an impure context without console.warn', () => {
-      // The impurity warning is surfaced as a W101 compile diagnostic (see
-      // purity-diagnostics + compile.ts), not a bare console.warn from the generator.
+    it('emits the dynamic marker for a function context without console.warn', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const s = step('deploy', async () => {});
       const j = job('deploy', {
@@ -1569,7 +1686,7 @@ describe('generator - context/env/concurrencyGroup', () => {
       }
     });
 
-    it('inlines pure env function as LockInlineValue', () => {
+    it('emits a dynamic marker (no inline expression) for a pure env function', () => {
       const s = step('build', async () => {});
       const envFn = (event: { env: string }) => ({ NODE_ENV: event.env });
       const j = job('build', {
@@ -1583,10 +1700,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
         expect(lockJob.dynamicEnv).toBe(true);
-        expect(lockJob.env).toEqual({
-          _type: 'inline',
-          expression: envFn.toString(),
-        });
+        // No `{ _type: 'inline', expression }` value is serialized — the agent
+        // init round resolves the function.
+        expect(lockJob.env).toBeUndefined();
       }
     });
 
@@ -1635,6 +1751,25 @@ describe('generator - context/env/concurrencyGroup', () => {
       const lockJob = lockFile.workflows[0].jobs[0];
       if (lockJob._type === 'static') {
         expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+        expect(lockJob).not.toHaveProperty('concurrencyGroup');
+      }
+    });
+
+    it('emits a dynamic marker (no inline expression) for a pure concurrencyGroup function', () => {
+      const s = step('deploy', async () => {});
+      const groupFn = (event: { ref: string }) => `deploy-${event.ref}`;
+      const j = job('deploy', {
+        runsOn: 'linux',
+        steps: [s],
+        concurrencyGroup: groupFn as unknown as () => Promise<string>,
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      if (lockJob._type === 'static') {
+        expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+        // No `{ _type: 'inline', expression }` value serialized.
         expect(lockJob).not.toHaveProperty('concurrencyGroup');
       }
     });
@@ -2642,5 +2777,98 @@ describe('generator invariant throws are coded, located CompilerErrors', () => {
     const err = thrown as CompilerError;
     expect(err.code).toBe('E108');
     expect(err.location?.line).toBeGreaterThan(1);
+  });
+});
+
+describe('TextMatch serialization', () => {
+  it('normalizes scalars to arrays and RegExp to /pattern/flags', () => {
+    const [trigger] = transformTriggers([
+      push({ branches: 'main', commitMessage: { contains: 'release:', matches: /^feat/i } }),
+    ]);
+    expect(trigger).toMatchObject({
+      _type: 'push',
+      commitMessage: { contains: ['release:'], matches: ['/^feat/i'] },
+    });
+  });
+
+  it('keeps a /pattern/flags string verbatim', () => {
+    const [trigger] = transformTriggers([
+      push({ commitMessage: { notMatches: '/^chore\\(deps\\):/' } }),
+    ]);
+    expect(trigger).toMatchObject({ commitMessage: { notMatches: ['/^chore\\(deps\\):/'] } });
+  });
+
+  it('omits commitMessage entirely when not declared', () => {
+    const [trigger] = transformTriggers([push({ branches: 'main' })]);
+    expect(trigger).not.toHaveProperty('commitMessage');
+  });
+
+  it('copies commitMessage onto the tag trigger a push({ tags }) config emits', () => {
+    const triggers = transformTriggers([
+      push({ tags: ['v*'], commitMessage: { contains: 'release:' } }),
+    ]);
+    expect(triggers).toHaveLength(2);
+    expect(triggers[1]).toMatchObject({ _type: 'tag', commitMessage: { contains: ['release:'] } });
+  });
+
+  it('rejects a matcher with no query key', () => {
+    expect(() => transformTriggers([push({ commitMessage: {} })])).toThrow(/nothing to check/);
+  });
+
+  it('rejects ignoreCase with only regex keys', () => {
+    expect(() =>
+      transformTriggers([push({ commitMessage: { matches: /x/, ignoreCase: true } })]),
+    ).toThrow(/ignoreCase/);
+  });
+
+  it('rejects an empty needle list and an empty-string needle', () => {
+    expect(() => transformTriggers([push({ commitMessage: { contains: [] } })])).toThrow(
+      /nothing to check/,
+    );
+    expect(() => transformTriggers([push({ commitMessage: { contains: [''] } })])).toThrow(/empty/);
+  });
+
+  it('rejects a ReDoS-prone regex', () => {
+    expect(() => transformTriggers([push({ commitMessage: { matches: '/(a+)+$/' } })])).toThrow(
+      /ReDoS/,
+    );
+  });
+});
+
+describe('content requirement text keys', () => {
+  it('normalizes the new keys and keeps them as raw-text queries', () => {
+    const [trigger] = transformTriggers([
+      push({ requires: [{ file: 'Dockerfile', contains: 'FROM node:', notMatches: [/-rc\d+$/] }] }),
+    ]);
+    expect(trigger).toMatchObject({
+      requires: [
+        {
+          file: 'Dockerfile',
+          format: 'text',
+          contains: ['FROM node:'],
+          notMatches: ['/-rc\\d+$/'],
+        },
+      ],
+    });
+  });
+
+  it('rejects a raw-text key on a json file', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'a.json', contains: 'x' }] })]),
+    ).toThrow(/cannot carry a raw-text key/);
+  });
+
+  it('rejects a raw-text key on a json file even when a json query coexists', () => {
+    expect(() =>
+      transformTriggers([
+        push({ requires: [{ file: 'a.json', match: { '$.version': 1 }, contains: 'x' }] }),
+      ]),
+    ).toThrow(/cannot carry a raw-text key/);
+  });
+
+  it('rejects a raw-text key combined with absent', () => {
+    expect(() =>
+      transformTriggers([push({ requires: [{ file: 'a.txt', absent: true, contains: 'x' }] })]),
+    ).toThrow(/mutually exclusive/);
   });
 });

@@ -52,10 +52,10 @@ export class AgentMetricsAggregator {
   private store = new Map<string, AgentEntry>();
   private defaultRetentionMs: number;
   /**
-   * Optional lookup: agentId → scaler backend name (e.g. `container`,
+   * Optional lookup: agentId → scaler backend type (e.g. `container`,
    * `firecracker`, `bare-metal`). Returning null marks the agent as
    * static / stateful — we then stamp the `scaler` label as `'stateful'`.
-   * Wired from ScalerManager.getBackendName in production. Tests can
+   * Wired from ScalerManager.getBackendType in production. Tests can
    * leave it undefined; in that case the `scaler` label is omitted.
    */
   private readonly getScalerForAgent?: (agentId: string) => string | null;

@@ -1,6 +1,6 @@
 ---
 title: Dynamic values
-description: ''
+description: Compute a job's context, env, and concurrencyGroup at runtime from the incoming event
 ---
 
 Dynamic values let you compute `context`, `env`, and `concurrencyGroup` at runtime based on the incoming event. Instead of hardcoding static strings, you pass a function that receives the normalized event envelope and returns the resolved value.
@@ -26,22 +26,17 @@ job('deploy', {
 
 ## How it works
 
-When you define a dynamic value as a function, the compiler analyzes it at compile time to determine whether it is **pure** (can be evaluated without cloning the repo or running an init job).
+When you define a dynamic value as a function, it is resolved on the eval agent as a short **init** step that runs before the job:
 
-### Pure functions (inline evaluation)
+1. The orchestrator dispatches a lightweight `__init__` job to an agent.
+2. The agent loads the compiled workflow bundle and calls your function with the normalized event.
+3. The agent reports the resolved values back to the orchestrator, which dispatches the real execution job with them applied.
 
-A pure function is one that:
+This resolution appears in the run timeline as an `Init:` entry. The orchestrator never evaluates workflow code — every dynamic `context`, `env`, and `concurrencyGroup` function runs agent-side, whatever it references.
 
-- Is synchronous (no `async`/`await`)
-- Only references its parameters and local variables
-- Does not import or require external modules
-- Does not access globals like `process`, `fetch`, `console`, `setTimeout`, etc.
-- Uses only safe built-in constructors: `String`, `Number`, `Boolean`, `Array`, `Object`, `JSON`, `Math`, `parseInt`, `parseFloat`, `isNaN`, `isFinite`, `encodeURIComponent`, `decodeURIComponent`, `encodeURI`, `decodeURI`
-- Does not use `this`, `new`, `class`, `throw`, `try`/`catch`, `delete`, `var`, `yield`, or mutation operators (`++`, `--`, `+=`, etc.)
+`kici preview` lists the injected `__init__` job under each affected job, so you can spot it before the first run.
 
-When the compiler detects a pure function, it serializes the function source directly into the lock file as an inline expression. At dispatch time, the orchestrator evaluates the expression in a sandboxed VM context (~0ms overhead) instead of dispatching an init job.
-
-**Examples of pure functions:**
+**Examples:**
 
 ```typescript
 // Simple branch extraction
@@ -53,63 +48,30 @@ env: (event) => ({ BRANCH: event.targetBranch });
 // Concatenation with event data
 concurrencyGroup: (event) => `deploy-${event.targetBranch}`;
 
-// Using safe globals
-env: (event) => ({ UPPER: String(event.targetBranch).toUpperCase() });
-
-// Local variables are fine
+// Local variables and safe globals
 context: (event) => {
   const parts = event.targetBranch.split('/');
   return parts[parts.length - 1];
 };
-```
 
-### Impure functions (init-job evaluation)
-
-If the compiler determines a function is impure, it prints a `warning [W101]` naming the affected field (`context`, `env`, or `concurrencyGroup`), the reason the function was judged impure, and the ~5-10 second init-job cost — and compilation still succeeds. The function falls back to the two-phase init model. This means:
-
-1. The orchestrator dispatches a special `__init__` job to a builder agent
-2. The builder agent clones the repository and evaluates the function
-3. The resolved values are sent back to the orchestrator
-4. The orchestrator dispatches the real execution job with the resolved values
-
-This adds approximately 5-10 seconds of overhead for cloning and evaluation.
-
-`kici preview` lists the injected `__init__` job under each affected job, so you can spot the init-job cost before the first run.
-
-**Examples of impure functions (will use init job):**
-
-```typescript
-// Async functions cannot be inlined
+// Async lookups, module access, and process/global reads all work
 context: async (event) => await lookupEnv(event.targetBranch);
-
-// External module references
-env: (event) => {
-  const config = require('./config');
-  return config.env;
-};
-
-// Process/global access
-context: (event) => process.env.DEFAULT_ENV || 'staging';
-
-// Dynamic imports
-env: async (event) => {
-  const m = await import('./config.js');
-  return m.default;
-};
+env: (event) => ({ DEFAULT_ENV: process.env.DEFAULT_ENV ?? 'staging' });
 ```
 
-## Performance comparison
+## Performance
 
-| Evaluation path                      | Overhead | When used                                                       |
-| ------------------------------------ | -------- | --------------------------------------------------------------- |
-| Static value (string/object literal) | ~0ms     | `context: 'staging'`                                            |
-| Inline expression (pure function)    | ~0ms     | `context: (event) => event.targetBranch`                        |
-| Init job (impure function)           | ~5-10s   | `context: async (event) => await lookupEnv(event.targetBranch)` |
+| Value                    | Overhead  | Example                                  |
+| ------------------------ | --------- | ---------------------------------------- |
+| Static value             | None      | `context: 'staging'`                     |
+| Dynamic value (function) | Init step | `context: (event) => event.targetBranch` |
+
+A static value is baked into the lock file and needs no init step. A dynamic value always resolves through the agent's init step, so reach for a function only when the value genuinely depends on the event.
 
 ## Tips
 
-- **Write pure functions whenever possible** to avoid the init-job delay. Most context and env computations only need the event payload data.
-- **Check compiler warnings** -- the compiler prints a `warning [W101]` when a function is classified as impure, naming the reason and the ~5-10s init-job cost. Run `kici preview` to see the injected `__init__` job listed under each affected job before your first run.
-- **Runtime errors in inline expressions cause immediate job failure.** There is no fallback to the init-job path. If your pure function throws at runtime (e.g., accessing a property on `undefined`), the job fails immediately.
-- **See [how your workflow code executes](./execution-model.md)** for the full picture of where pure vs. impure functions run relative to rules, hooks, and step bodies.
+- **Prefer static values when you can.** Most context and env values are the same on every event; only make them dynamic when they truly depend on the event payload.
+- **Run `kici preview`** to see the injected `__init__` job listed under each affected job before your first run.
+- **A runtime error in a dynamic function fails the job.** If your function throws when the init step runs it (e.g., accessing a property on `undefined`), the job fails immediately.
+- **See [how your workflow code executes](./execution-model.md)** for the full picture of where dynamic values run relative to rules, hooks, and step bodies.
 - **The event parameter is the normalized event envelope** — the same shape rules receive as `ctx.event`: `{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }` (see the [event payload reference](./sdk/event-payloads.md) for the complete schema). Narrow on `event.type` (`'push'`, `'pull_request'`, `'tag'`, …) to branch per trigger kind. The raw provider webhook body is nested at `event.payload` (for GitHub pushes: `payload.ref`, `payload.after`, `payload.repository`, …).

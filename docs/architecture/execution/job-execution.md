@@ -111,11 +111,11 @@ On execution jobs the sandbox performs exactly two cache fetches:
 
 ### Workflow loading
 
-The sandbox registers the shared `@kici-dev/shared/ts-loader-hook` (a Node ESM loader that transforms TypeScript on import) once per process and then dynamic-`import()`s the workflow `.ts` file directly from the extracted source tree. There is no runtime bundler — TypeScript is transformed on import, and transitive imports (`@kici-dev/sdk`, host-repo helpers) resolve against `.kici/node_modules/` via Node's normal ESM lookup.
+The sandbox registers a Node ESM loader hook that transforms TypeScript on import, once per process, and then dynamic-`import()`s the workflow `.ts` file directly from the extracted source tree. Which hook it registers depends on the backend: the bare-metal and firecracker sandboxes register `@kici-dev/core/ts-loader-hook` by bare specifier, resolved through the workspace `node_modules` they bind read-only; the container sandbox sets `KICI_TS_LOADER_HOOK_PATH` to the pure-JS hook bundle it mounts at `/opt/kici/ts-loader-hook.js`, and the runner registers that by absolute `file://` URL, because a bare specifier would need a `node_modules` tree next to the runner bundle and a bare job container has none. There is no runtime bundler — TypeScript is transformed on import, and transitive imports (`@kici-dev/sdk`, host-repo helpers) resolve against `.kici/node_modules/` via Node's normal ESM lookup.
 
 The lock file's `source.file` and `source.exportName` identify the exact workflow and export to load from the imported module.
 
-> See `packages/agent/src/execution/workflow-loader.ts` and `packages/shared/src/ts-loader-hook.ts` for the implementation.
+> See `packages/agent/src/execution/workflow-loader.ts`, `packages/core/src/ts-loader-hook.ts`, and `packages/agent/src/execution/sandbox/container-ts-loader-hook.ts` for the implementation.
 
 **Process:**
 
@@ -341,6 +341,6 @@ The agent supports a drain mode for graceful scaling down. When `SIGUSR1` is rec
 
 - [Reconnection and event buffering](../clustering/reconnection.md) -- WebSocket reconnection behavior during agent disconnection
 - [Protocol messages](../protocol-messages.md) -- message schemas for job.dispatch, job.status, log.chunk
-- [Execution lifecycle](state-machine.md) -- run, job, and step status vocabularies and terminal states
+- [Execution status vocabulary](state-machine.md) -- run, job, and step status vocabularies and terminal states
 - [Agent configuration](../../operator/agent/configuration.md) -- environment variables for the agent
 - [Agent getting started](../../operator/agent/getting-started.md) -- deployment guide

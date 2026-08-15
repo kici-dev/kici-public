@@ -334,6 +334,28 @@ export async function clearDispatchQueueDirect(databaseUrl: string): Promise<voi
 }
 
 /**
+ * TRUNCATE the three scaler-state tables on the orchestrator DB (direct SQL).
+ *
+ * These tables (`scaler_reservations`, `scaler_spawning_agents`,
+ * `scaler_agent_jobs`) hold in-flight scaler bookkeeping that a boot / Raft
+ * leader switch rehydrates via `ScalerManager.recoverState`. A row for an agent
+ * that spawned but never registered (or whose reservation leaked) is counted as
+ * used capacity forever, so a warm-reused orchestrator DB can accumulate stale
+ * reservations that push `used` past the resource cap and stop every future
+ * scale-up. E2E setups that reuse a warm orch DB call this before the
+ * orchestrator starts so it rehydrates a clean slate — the DB analog of
+ * allocating a fresh machine-ledger directory per run.
+ */
+export async function clearScalerStateDirect(databaseUrl: string): Promise<void> {
+  const pool = createPool(databaseUrl);
+  try {
+    await pool.query('TRUNCATE scaler_reservations, scaler_spawning_agents, scaler_agent_jobs');
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
  * DELETE orphan execution_runs + execution_jobs for routing keys other than
  * `routingKey` (and rows with NULL routing_key). Returns row counts.
  */
@@ -2110,6 +2132,18 @@ export async function seedSyntheticGithubSourceDirect(
  * encryptFn takes plaintext + AAD and returns ciphertext bytes. The
  * caller owns the crypto primitive so this helper stays decoupled from
  * the orchestrator's PgSecretStore crypto module.
+ *
+ * `customerId` is the org the source belongs to, and passing it is what makes
+ * this seed faithful to a deployed environment. `sources.customer_id` carries a
+ * column DEFAULT of `'__default__'`, so a row inserted without it lands on the
+ * no-tenant anchor — and `resolveOrgId` then reports `'__default__'` for every
+ * event on that routing key, which denies org-scoped features (global-workflow
+ * registration, the multi-provider lock fallback) for reasons that surface
+ * nowhere near the source row. Supplied on both paths so a row an earlier seed
+ * left on the default anchor is repaired rather than inherited; that is exactly
+ * what the staging deploy's own `updateSourcesCustomerId()` step does after the
+ * fact. Omit it only when the caller genuinely has no org (a single-tenant
+ * fixture), never because it is inconvenient to thread.
  */
 export async function seedWebhookSecretDirect(
   databaseUrl: string,
@@ -2117,6 +2151,8 @@ export async function seedWebhookSecretDirect(
     routingKey: string;
     webhookSecret: string;
     encryptFn: (plaintext: string, aad: string) => string | Buffer;
+    /** Org that owns the source. Written on insert and reasserted on an existing row. */
+    customerId?: string;
   },
 ): Promise<{ sourceId: string }> {
   const { randomBytes } = await import('node:crypto');
@@ -2128,19 +2164,34 @@ export async function seedWebhookSecretDirect(
     ]);
     if (sourceResult.rows.length > 0) {
       sourceId = sourceResult.rows[0].id as string;
+      if (opts.customerId) {
+        await pool.query(
+          'UPDATE sources SET customer_id = $1, updated_at = now() WHERE routing_key = $2',
+          [opts.customerId, opts.routingKey],
+        );
+      }
     } else {
       sourceId = randomBytes(16).toString('hex');
       const [provider, appId] = opts.routingKey.split(':');
       await pool.query(
-        `INSERT INTO sources (id, provider, name, routing_key, config)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (routing_key) DO NOTHING`,
+        // The conflict arm is the same repair as the update above, for the race
+        // where a concurrent seed inserts the row between our SELECT and this
+        // INSERT: the SELECT found nothing, so the reassert branch was skipped,
+        // and DO NOTHING would leave the winner on whatever org it had.
+        `INSERT INTO sources (id, provider, name, routing_key, config${opts.customerId ? ', customer_id' : ''})
+         VALUES ($1, $2, $3, $4, $5${opts.customerId ? ', $6' : ''})
+         ${
+           opts.customerId
+             ? 'ON CONFLICT (routing_key) DO UPDATE SET customer_id = EXCLUDED.customer_id, updated_at = now()'
+             : 'ON CONFLICT (routing_key) DO NOTHING'
+         }`,
         [
           sourceId,
           provider || 'github',
           `e2e-${appId}`,
           opts.routingKey,
           JSON.stringify({ appId: appId || '' }),
+          ...(opts.customerId ? [opts.customerId] : []),
         ],
       );
       const refetch = await pool.query('SELECT id FROM sources WHERE routing_key = $1', [
@@ -2909,12 +2960,22 @@ export async function seedCiSecurityFixturesDirect(
  * the landed status — a terminal failure is reported immediately rather than
  * indistinguishable from a timeout. Used by the cluster reroute tests to gate
  * on a workflow reaching a terminal state after a webhook trigger.
+ *
+ * Pass `deliveryId` to scope the poll to the caller's own delivery. A `since`
+ * window alone does NOT identify a run: any workflow reaching a terminal state
+ * inside the same window matches, so a neighbouring run — including one whose
+ * failure is the point of some other test — is reported as if it were the
+ * caller's. The stored `delivery_id` is the source-prefixed form
+ * (`generic:<org>:<source>:<caller-id>`), so the caller's id is matched as a
+ * suffix.
  */
 export async function waitForExecutionRunReachesStatusSinceDirect(
   databaseUrl: string,
   opts: {
     since: Date;
     statuses: readonly string[];
+    /** Scope to one delivery. Omit only when the caller genuinely wants "any run". */
+    deliveryId?: string;
     timeoutMs?: number;
     intervalMs?: number;
   },
@@ -2927,10 +2988,14 @@ export async function waitForExecutionRunReachesStatusSinceDirect(
     while (Date.now() < deadline) {
       const result = await pool.query<{ status: string }>(
         `SELECT status FROM execution_runs
-         WHERE started_at > $1 AND status = ANY($2)
+         WHERE started_at > $1 AND status = ANY($2)${
+           opts.deliveryId ? ' AND delivery_id LIKE $3' : ''
+         }
          ORDER BY started_at DESC
          LIMIT 1`,
-        [opts.since, [...opts.statuses]],
+        opts.deliveryId
+          ? [opts.since, [...opts.statuses], `%${opts.deliveryId}`]
+          : [opts.since, [...opts.statuses]],
       );
       if (result.rows.length > 0) return { status: result.rows[0].status };
       await new Promise((r) => setTimeout(r, intervalMs));
@@ -2945,6 +3010,10 @@ export async function waitForExecutionRunReachesStatusSinceDirect(
  * Fetch the most recent `execution_runs` row matching `status`, plus its
  * `execution_jobs`. Used by cluster reroute tests to confirm the run +
  * its jobs completed successfully.
+ *
+ * Pass `deliveryId` to scope to the caller's own delivery — "the newest run
+ * with this status" is otherwise satisfied by any concurrent workflow, so the
+ * returned `run_id` can belong to a different test.
  */
 export interface LatestExecutionRunResult {
   run: {
@@ -2957,7 +3026,11 @@ export interface LatestExecutionRunResult {
 
 export async function latestExecutionRunByStatusDirect(
   databaseUrl: string,
-  opts: { status: string },
+  opts: {
+    status: string;
+    /** Scope to one delivery. Omit only when the caller genuinely wants "any run". */
+    deliveryId?: string;
+  },
 ): Promise<LatestExecutionRunResult | null> {
   const pool = createPool(databaseUrl);
   try {
@@ -2967,9 +3040,9 @@ export async function latestExecutionRunByStatusDirect(
       status: string;
     }>(
       `SELECT run_id, workflow_name, status FROM execution_runs
-       WHERE status = $1
+       WHERE status = $1${opts.deliveryId ? ' AND delivery_id LIKE $2' : ''}
        ORDER BY started_at DESC LIMIT 1`,
-      [opts.status],
+      opts.deliveryId ? [opts.status, `%${opts.deliveryId}`] : [opts.status],
     );
     if (runResult.rows.length === 0) return null;
     const run = runResult.rows[0];
@@ -3506,7 +3579,20 @@ export async function deleteWorkflowRegistrationsDirect(
         opts.repoIdentifier,
       ]);
     }
-    return { deleted: result.rowCount ?? 0 };
+    const deleted = result.rowCount ?? 0;
+    // Bump the registry version so the orchestrator's in-memory RegistrationIndex
+    // reloads and drops these rows. The index only reloads on a version increase
+    // (refreshIfNeeded), and the insert helpers already bump on write — so a
+    // delete that did not bump left the deleted registrations live in the index
+    // until an unrelated later bump, a non-deterministic window in which a stale
+    // registration could dispatch on a following test's event. This mirrors the
+    // real orchestrator deletion path, which forces an index reload.
+    if (deleted > 0) {
+      await pool.query(
+        `UPDATE registry_versions SET version = version + 1, updated_at = NOW() WHERE id = 'default'`,
+      );
+    }
+    return { deleted };
   } finally {
     await pool.end();
   }
@@ -4035,13 +4121,16 @@ export interface OrgSettingsRepoPatternEntry {
 }
 
 /**
- * UPSERT org_settings for a customer/org id. `globalWorkflowsEnabled` is
- * required; the three list fields are each optional. Each list is a jsonb
- * array of `{routingKey?, pattern}` entries. Pass `null` to clear a list.
+ * UPSERT the per-org global-workflow repo lists for a customer/org id. The
+ * three list fields are each optional; each list is a jsonb array of
+ * `{routingKey?, pattern}` entries. Pass `null` to clear a list.
+ *
+ * The master enable switch is NOT set here: it is fleet-wide
+ * (`cluster_settings.global_workflows_enabled`) — use
+ * {@link setClusterGlobalWorkflowsEnabledDirect}.
  */
 export interface UpsertOrgSettingsOpts {
   customerId: string;
-  globalWorkflowsEnabled: boolean;
   allowedRepos?: OrgSettingsRepoPatternEntry[] | null;
   deniedRepos?: OrgSettingsRepoPatternEntry[] | null;
   elevatedRepos?: OrgSettingsRepoPatternEntry[] | null;
@@ -4055,24 +4144,56 @@ export async function upsertOrgSettingsGlobalWorkflowsDirect(
   try {
     await pool.query(
       `INSERT INTO org_settings (
-         customer_id, global_workflows_enabled,
+         customer_id,
          global_workflow_allowed_repos,
          global_workflow_denied_repos,
          global_workflow_elevated_repos
-       ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+       ) VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb)
        ON CONFLICT (customer_id) DO UPDATE SET
-         global_workflows_enabled = EXCLUDED.global_workflows_enabled,
          global_workflow_allowed_repos = EXCLUDED.global_workflow_allowed_repos,
          global_workflow_denied_repos = EXCLUDED.global_workflow_denied_repos,
          global_workflow_elevated_repos = EXCLUDED.global_workflow_elevated_repos,
          updated_at = NOW()`,
       [
         opts.customerId,
-        opts.globalWorkflowsEnabled,
         opts.allowedRepos == null ? null : JSON.stringify(opts.allowedRepos),
         opts.deniedRepos == null ? null : JSON.stringify(opts.deniedRepos),
         opts.elevatedRepos == null ? null : JSON.stringify(opts.elevatedRepos),
       ],
+    );
+  } finally {
+    await pool.end();
+  }
+}
+
+/**
+ * Set (or clear) the fleet-wide global-workflows master switch directly.
+ *
+ * Direct-DB by design, matching every other `*Direct` helper here: these exist
+ * for E2E seeding, which must set the switch BEFORE an orchestrator is up and
+ * therefore cannot go through the admin HTTP API. Operators use
+ * `kici-admin cluster-settings set --global-workflows-enabled <bool>`.
+ *
+ * Passing `null` clears the override, so the orchestrator's configured default
+ * applies. Upserts the singleton `id='default'` row, so it works against a
+ * fresh database with no cluster_settings row at all.
+ *
+ * `cluster_settings.version` is left untouched: seeding happens before any
+ * worker reads the row, so there is nothing to invalidate yet — the operator
+ * PATCH path (admin-cluster-settings.ts) owns the version bump for live changes.
+ */
+export async function setClusterGlobalWorkflowsEnabledDirect(
+  databaseUrl: string,
+  enabled: boolean | null,
+): Promise<void> {
+  const pool = createPool(databaseUrl);
+  try {
+    await pool.query(
+      `INSERT INTO cluster_settings (id, global_workflows_enabled)
+       VALUES ('default', $1)
+       ON CONFLICT (id) DO UPDATE SET
+         global_workflows_enabled = EXCLUDED.global_workflows_enabled`,
+      [enabled],
     );
   } finally {
     await pool.end();

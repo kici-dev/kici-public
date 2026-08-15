@@ -1192,17 +1192,21 @@ export class ScalerManager {
   }
 
   /**
-   * Look up the scaler backend name (e.g. `container`, `firecracker`,
+   * Look up the scaler backend TYPE (`container`, `firecracker`,
    * `bare-metal`) for a registered agent. Returns null if the agent is
-   * not scaler-managed (i.e. a static / stateful agent).
+   * not scaler-managed (a static / stateful agent).
    *
-   * Used by AgentMetricsAggregator to inject a `scaler` label on each
-   * `kici_agent_*` series so dashboards can split per-scaler instead of
-   * per-agent_id (which is too high-cardinality and doesn't tell the
-   * operator which pool is loaded).
+   * Used by AgentMetricsAggregator to stamp the `scaler` label on each
+   * kici_agent_* series. The label MUST be the backend type, not the
+   * operator-chosen scaler name: the Platform catalog filter constrains
+   * it to AGENT_SCALER_VALUES (the four types), so a free-form name is
+   * dropped as bad_label_value. `managedAgentIndex` stores the scaler
+   * name, so resolve it through `backends` to the type.
    */
-  getBackendName(agentId: string): string | null {
-    return this.managedAgentIndex.get(agentId) ?? null;
+  getBackendType(agentId: string): string | null {
+    const scalerName = this.managedAgentIndex.get(agentId);
+    if (scalerName === undefined) return null;
+    return this.backends.get(scalerName)?.type ?? null;
   }
 
   /**
@@ -1553,6 +1557,16 @@ export class ScalerManager {
       if (entry.spawnStartedAt < staleThreshold) {
         this.spawningAgents.delete(id);
         this.deleteSpawningAgentFromStore(id);
+        // Release the reservation this spawn is holding. A spawn that is pruned
+        // never registered an agent (otherwise it would have left the spawning
+        // map on WS register) and never will, so neither the spawn-failure path
+        // nor onAgentDisconnected will ever fire for it — this is the only place
+        // its reservation can be freed. Without this the per-scaler / global cap
+        // (and the persisted scaler_reservations row + machine-pool ledger slot)
+        // leak permanently, and on a boot/leader switch recoverState rehydrates
+        // the orphaned rows, inflating `used` until every future requestScale is
+        // rejected at-capacity with zero agents ever spawned.
+        this.releaseAll(id);
         logger.warn(
           `Pruned stale spawning entry for agent ${id} (spawn started ${Math.round((Date.now() - entry.spawnStartedAt) / 1000)}s ago)`,
         );

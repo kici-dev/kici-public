@@ -136,6 +136,19 @@ describe('LocalWebhookNormalizer', () => {
       });
     });
 
+    it('carries the full head-commit message onto the normalized event', () => {
+      const event = normalizer.normalizeEvent('push', null, {
+        ref: 'refs/heads/main',
+        head_commit: { message: 'feat: thing\n\n[skip ci]\n' },
+      });
+      expect(event?.commitMessage).toBe('feat: thing\n\n[skip ci]\n');
+    });
+
+    it('leaves commitMessage absent when the payload carries none', () => {
+      const event = normalizer.normalizeEvent('push', null, { ref: 'refs/heads/main' });
+      expect(event?.commitMessage).toBeUndefined();
+    });
+
     it('extracts action from payload when present', () => {
       const result = normalizer.normalizeEvent('pull_request', null, {
         action: 'opened',

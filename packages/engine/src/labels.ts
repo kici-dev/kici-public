@@ -325,6 +325,15 @@ export function roleToLabel(role: AgentRole): string {
 }
 
 /**
+ * The label every pre-run evaluation job routes to.
+ *
+ * Exported because three dispatch sites and the global eval round all target
+ * it, and each had spelled the string out. Derived from {@link roleToLabel} so
+ * it cannot drift from the prefix or from `KNOWN_ROLES`.
+ */
+export const INIT_RUNNER_ROLE_LABEL = roleToLabel('init-runner');
+
+/**
  * Resolve a roles configuration into role labels.
  *
  * - undefined → all roles (backward compat: existing agents get all capabilities)

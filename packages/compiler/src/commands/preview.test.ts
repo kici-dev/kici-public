@@ -159,7 +159,7 @@ describe('kici preview command (dry-run only)', () => {
       expect(typeof result).toBe('boolean');
     });
 
-    it('passes an impure dynamic value as a purity warning to displayDryRun', async () => {
+    it('calls displayDryRun without a purity-warnings argument for a function context', async () => {
       const { discoverWorkflows } = await import('../execution/index.js');
       const { matchAllWorkflows } = await import('@kici-dev/engine');
       const { displayDryRun } = await import('../test-runner/dry-run.js');
@@ -187,10 +187,10 @@ describe('kici preview command (dry-run only)', () => {
       await previewEvent('push', { kiciDir: '.kici' });
 
       const call = vi.mocked(displayDryRun).mock.calls.at(-1)!;
-      const purityWarnings = call[3] as Array<{ jobName: string; field: string; reason: string }>;
-      expect(purityWarnings).toHaveLength(1);
-      expect(purityWarnings[0]).toMatchObject({ jobName: 'build', field: 'context' });
-      expect(purityWarnings[0].reason).toContain('async');
+      // Dynamic values resolve in the agent init round — preview no longer
+      // computes or forwards any purity warnings.
+      expect(call).toHaveLength(3);
+      expect(call[3]).toBeUndefined();
     });
   });
 });

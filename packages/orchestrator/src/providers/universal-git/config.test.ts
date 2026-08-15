@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   UniversalGitConfigSchema,
+  UniversalGitPayloadPathsSchema,
   UNIVERSAL_GIT_PRESETS,
   expandUniversalGitConfig,
   parseUniversalGitConfig,
@@ -193,6 +194,7 @@ describe('UNIVERSAL_GIT_PRESETS', () => {
         expect(pp.commitsAdded).toMatch(/^\$\./);
         expect(pp.commitsModified).toMatch(/^\$\./);
         expect(pp.commitsRemoved).toMatch(/^\$\./);
+        expect(pp.commitMessage).toMatch(/^\$\./);
       });
 
       it('includes at least one push event name and one PR event name', () => {
@@ -202,6 +204,19 @@ describe('UNIVERSAL_GIT_PRESETS', () => {
       });
     });
   }
+
+  it('accepts a stored config that predates the commitMessage path', () => {
+    const legacy = {
+      repoIdentifier: '$.repository.full_name',
+      pushRef: '$.ref',
+      pushSha: '$.after',
+      defaultBranch: '$.repository.default_branch',
+      commitsAdded: '$.commits[*].added[*]',
+      commitsModified: '$.commits[*].modified[*]',
+      commitsRemoved: '$.commits[*].removed[*]',
+    };
+    expect(() => UniversalGitPayloadPathsSchema.parse(legacy)).not.toThrow();
+  });
 
   it('gitlab-repo uses project.path_with_namespace (not repository.full_name)', () => {
     const gl = UNIVERSAL_GIT_PRESETS['gitlab-repo'];

@@ -46,34 +46,150 @@ export default workflow('org-lint', {
 });
 ```
 
-Patterns in `repos:` use the same globbing as `branches:` / `paths:` — plain globs (`myorg/*`), a leading `!` for exclusions (`!myorg/fork-*`), and a fully-qualified `owner/repo` identity for exact matches (`myorg/platform`). A bare `**` matches every repo in the org.
+Patterns in `repos:` use the same globbing as `branches:` / `paths:` — plain globs (`myorg/*`), a leading `!` for exclusions (`!myorg/fork-*`), and a fully-qualified `owner/repo` identity for exact matches (`myorg/platform`). A bare `**` matches every repo in the org, including one whose identifier starts with a dot (`.github/workflows-config`) — a repo identifier is an owner/name pair, not a file path, so a leading dot carries no meaning of its own. Path globs in `paths:` keep the usual convention and do not match dot-prefixed files unless the pattern spells the dot out.
 
 ### At a dual-repo checkout
 
-The agent receives two sets of context during a global workflow execution:
+The agent checks out both repos. **Inside a step body**, `env` carries a pointer to each working tree:
 
 | `env` var                 | Points to                                                                                                                                    |
 | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `KICI_SOURCE_REPO_PATH`   | The **source** repo's working tree (the repo that emitted the event). This is the repo the job's `$` / `git` commands operate on by default. |
 | `KICI_WORKFLOW_REPO_PATH` | The **workflow** repo's working tree (the repo that authored the workflow). Useful for reading shared scripts or config from your CI repo.   |
 
-Source repo secrets are **not** available to a global workflow's job by default — see _Elevated access_ below.
+Both variables are step-body context. They are **not** projected into the job's process environment, so a job-level `env:` block, a container image's entrypoint, or a shell command outside a step body will not see them. Outside a step body, use the `sourceRepo` / `workflowRepo` pair on the filter, generator, and rule contexts described below.
+
+They are also set **only when there are two repos to point at**. An event from the workflow's own repo is matched from that repo's lock file rather than as a global candidate, so the workflow runs as an ordinary single-repo workflow: one checkout, and neither variable set. Read them with a fallback, as the example above does.
+
+A global workflow's job runs with **no secrets at all** — neither the source repo's nor its own. See _Secrets are not available_ below.
+
+### The triggering event
+
+`ctx.event` inside a global workflow's job is the **source** repo's normalized event — the push or PR that fired the workflow, from a repo the workflow's own author may not own. `ctx.event.sourceRepo` names that repo.
+
+That field is what makes a per-source-repo concurrency group expressible — and you have to write it. A global workflow runs on events from many repos, and their default branches share a name, so a group keyed on the branch alone puts every repo in one group, and with `cancelInProgress` (the default) one repo's push cancels another repo's in-flight run. That is still the behaviour of a branch-only group; naming the source repo in the key is what separates them:
+
+```ts
+concurrency: {
+  group: ({ branch, event }) => `${event.sourceRepo}:${branch}`,
+  cancelInProgress: true,
+},
+```
+
+### Narrowing to the repos that need it
+
+A global workflow that matches `myorg/*` will, by default, run on every repo in the org. Three mechanisms narrow it to the repos it actually applies to, in increasing order of power:
+
+1. **A `requires` content filter on the trigger** — the cheapest gate. The orchestrator checks a file's contents (a JSON-path probe over `package.json`, for example) and drops the workflow **before any agent is dispatched** when the condition is not met. See [`requires` on triggers](sdk/triggers.md#content-requirements-requires). This is provider-dependent — it needs a file-contents fetcher, which the GitHub provider supplies.
+2. **A workflow-level `filter` predicate** — arbitrary TypeScript over the checked-out source tree (below). Works with any provider that clones.
+3. **A `DynamicJobFn`** — generate the exact job set from the source repo's state ([Generating jobs per source repo](#generating-jobs-per-source-repo) below).
+
+### Narrowing with a filter
+
+Before reaching for a `filter`, check whether a declarative filter answers the question. `commitMessage` (on the trigger) and `requires` (over source files) are evaluated by the orchestrator from data it already has, so they cost no evaluation job at all — while a `filter` predicate dispatches one per (event × workflow repo). Gating on a `[skip ci]` marker, a conventional-commit prefix, or the contents of a named config file needs no predicate.
+
+A workflow can declare a `filter`: a predicate that decides whether the workflow applies to this event at all.
+
+```ts
+import { workflow, job, step, push } from '@kici-dev/sdk';
+
+export default workflow('org-container-lint', {
+  on: [push({ repos: ['myorg/*'] })],
+  filter: async ({ sourceRepo, changedFilesStatus, $ }) => {
+    // `changedFiles` throws when the diff is unavailable, so guard first.
+    if (changedFilesStatus !== 'fetched') return true;
+    const found = await $`ls ${sourceRepo.path}`;
+    return found.stdout.includes('Dockerfile');
+  },
+  jobs: [
+    job('lint-dockerfile', {
+      runsOn: ['kici:os:linux'],
+      steps: [
+        step('lint', async ({ $, env }) => $`hadolint ${env.KICI_SOURCE_REPO_PATH}/Dockerfile`),
+      ],
+    }),
+  ],
+});
+```
+
+The filter receives a `FilterContext`:
+
+| Property             | Type                                      | Description                                                                                |
+| -------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `sourceRepo`         | `RepoInfo`                                | The repo whose event triggered this evaluation, checked out on the evaluating agent.       |
+| `workflowRepo`       | `RepoInfo`                                | The repo that registered the workflow. Identical to `sourceRepo` for a same-repo workflow. |
+| `event`              | `EventPayload`                            | The normalized event envelope.                                                             |
+| `changedFiles`       | `string[]`                                | Files changed in this event. Throws when unavailable — guard with `changedFilesStatus`.    |
+| `changedFilesStatus` | `'fetched' \| 'unavailable' \| 'skipped'` | Whether `changedFiles` can be read.                                                        |
+| `env`                | `Record<string, string\|undefined>`       | Environment variables.                                                                     |
+| `$`                  | zx shell                                  | Shell executor.                                                                            |
+
+`RepoInfo` carries `path` (an absolute path to the checkout on the evaluating agent) plus optional `ref` and `sha`. **Both are optional** — an event that carries no single ref leaves them undefined, so guard before reading them.
+
+**`sourceRepo.path` is not stable across evaluations.** Its _contents_ are: the evaluating agent and the later run see the same tree at the same commit. The path itself is not — a different working directory, and possibly a different machine. Read _through_ it; never embed it in a job name, an output, or anything compared across calls.
+
+**A `filter` must be pure and deterministic.** Decide from the context alone — the event, the changed files, and the checked-out tree — so the same event always yields the same verdict.
+
+### Global and same-repo filters differ
+
+The same `filter` keyword means two different things depending on whether the workflow is global:
+
+|                                | Global workflow (`repos:` on a trigger)          | Same-repo workflow                                                        |
+| ------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------- |
+| Evaluated                      | once per (event × workflow repo)                 | once per job that reaches dispatch, and once per job generator            |
+| Evaluated relative to the run  | **before** any run row exists                    | **after** the run row exists                                              |
+| A `false` verdict leaves       | no run at all — nothing appears in the dashboard | a run whose only entries are the evaluation jobs, rolling up to `success` |
+| `sourceRepo` vs `workflowRepo` | two different repos                              | the same repo                                                             |
+
+Two consequences of the same-repo shape are worth designing for. A workflow with ten jobs calls its filter ten times for one event — each on its own agent with its own checkout and its own `$` — so anything the predicate does happens that many times: keep it cheap and side-effect free. And if the predicate can answer differently for the same event, the workflow will _partially_ dispatch, running some jobs and not others.
+
+**A held or rejected job is not filtered at all.** A job held for approval, or rejected by a context rule, already has a gate — the hold or the rule — so it never takes a filter verdict, and an approved job dispatches without one. Concretely: a path filter cannot stop an approval request for a job the change does not concern.
+
+### Generating jobs per source repo
+
+A global workflow's job generators run in the same pre-run evaluation as the filter, with both repos on disk. `sourceRepo` and `workflowRepo` are on the generator context, so one workflow repo can produce a different job set per source repo:
+
+```ts
+import { job, step, workflow, push, type DynamicJobFn } from '@kici-dev/sdk';
+import { readFile } from 'node:fs/promises';
+
+const perRepoJobs: DynamicJobFn = async ({ sourceRepo }) => {
+  if (!sourceRepo) return [];
+  const pkg = JSON.parse(await readFile(`${sourceRepo.path}/package.json`, 'utf8'));
+  return Object.keys(pkg.scripts ?? {})
+    .filter((s) => s.startsWith('ci:'))
+    .map((s) =>
+      job(s.replace(':', '-'), {
+        runsOn: ['kici:os:linux'],
+        steps: [step('run', async ({ $ }) => $`pnpm ${s}`)],
+      }),
+    );
+};
+
+export default workflow('org-ci', {
+  on: [push({ repos: ['myorg/*'] })],
+  jobs: [perRepoJobs],
+});
+```
+
+The same `sourceRepo.path` caution applies: read the tree through it, and derive job names from the repo's _contents_, never from the path.
 
 ## Enabling global workflows
 
-Global workflows are **opt-in per org**. In a fresh org, `repos:`-bearing workflows are registered but never dispatched.
+Global workflows are gated by a **fleet-wide master switch** held by the orchestrator operator, off by default. Until it is on, `repos:`-bearing workflows are registered but never dispatched.
 
-1. Open the dashboard → **Settings → Global workflows**.
-2. Turn on **Enable global workflows** (the master toggle). This is the kill-switch — every other toggle below is ignored while this is off.
-3. Decide which authoring/source controls you need:
+1. **The operator enables it cluster-wide** with `kici-admin cluster-settings set --global-workflows-enabled true`. This is the kill-switch — every per-org control below is ignored while it is off, and it cannot be flipped from the dashboard. The dashboard's **Settings → Global workflows** tab shows its current state as a read-only badge.
+2. In the dashboard → **Settings → Global workflows**, decide which authoring/source controls you need. These per-org lists stay dashboard-editable; an org that has set none means "no per-org restrictions", not a denial.
 
-| Setting              | What it controls                                                                                                                                                                                     | Typical use                                                                                  |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Allowed author repos | Restricts which repos can **author** (register) global workflows. Globs matched against the authoring repo identifier. When OFF, any repo in the org may author globals.                             | Lock authoring to `myorg/ci-*` so random product repos can't ship org-wide automation.       |
-| Blocked source repos | Blocks dispatch for events emitted from these **source** repos, regardless of authoring. Globs matched against the event source repo identifier. When OFF, events from any repo may trigger globals. | Protect against fork spam — e.g. `!myorg/*` via `myorg/fork-*`.                              |
-| Elevated access      | Authoring repos listed here get **read access to source-repo secrets** during execution. Globs matched against the authoring repo identifier.                                                        | A `myorg/ci-deploy` repo that needs to read a source repo's `NPM_TOKEN` to publish releases. |
+| Setting              | What it controls                                                                                                                                                                                     | Typical use                                                                            |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Allowed author repos | Restricts which repos can **author** (register) global workflows. Globs matched against the authoring repo identifier. When OFF, any repo in the org may author globals.                             | Lock authoring to `myorg/ci-*` so random product repos can't ship org-wide automation. |
+| Blocked source repos | Blocks dispatch for events emitted from these **source** repos, regardless of authoring. Globs matched against the event source repo identifier. When OFF, events from any repo may trigger globals. | Protect against fork spam — e.g. `!myorg/*` via `myorg/fork-*`.                        |
+| Elevated access      | **Deprecated and not enforced.** Stored and echoed back, but nothing reads it — a global workflow's job receives no secrets, so there is no access for it to grant. See _Secrets are not available_. | None. Clear the list so it does not imply a grant that is not in force.                |
 
 All three lists accept globs. Leading `!` inside a single pattern is not supported here; negation is via the list-is-implicit-deny semantics, so keep it simple (`myorg/ci-*`, `myorg/platform-*`).
+
+Patterns match repo identifiers by the same rule as `repos:` on a trigger: an identifier is an owner/name pair, not a file path, so a leading dot carries no meaning of its own and a wildcard segment matches one. `myorg/*` covers `myorg/.github`, and `**` covers every repo in the org. Review any existing entry that relies on a wildcard to reach — or to spare — a dot-prefixed repo name.
 
 ### Saving and reverting
 
@@ -86,17 +202,23 @@ The page is a two-state editor — changes are local until you click **Save chan
 A global workflow fires only if:
 
 1. **The authoring repo is allowed.** If _Allowed author repos_ is ON, the workflow's authoring repo must match at least one allow-list glob. If OFF, any repo may author. Enforced at two points:
-   - At registration time (extraction from the lock file — non-matching globals are dropped with a warning).
+   - At registration time (extraction from the lock file — non-matching globals are dropped, and the orchestrator logs `Global workflows excluded from registration` naming each one).
    - At dispatch time (defense-in-depth — policy changes after registration still take effect).
 2. **The source repo is not denied.** If the event's source repo matches any glob in _Blocked source repos_, the global workflow is skipped. Enforced at dispatch time.
 
-Both checks are logged to the orchestrator. Grep the logs for `Skipping global workflow` to see enforcement in action.
+Both checks are logged to the orchestrator. Grep for `Global workflows excluded from registration` (registration time) and `Skipping global workflow dispatch` (dispatch time) to see enforcement in action.
 
-### Elevated access (source-repo secrets)
+Both checks read the settings of the organization the **event's source** resolves to. If no webhook source maps the event's routing key to an organization, the orchestrator resolves the built-in `__default__` organization anchor instead — and since nobody has enabled global workflows for that anchor, every global workflow is refused. The registration log line carries the organization it decided against plus the remedy, so this case is distinguishable from a real opt-in that is simply switched off. See the troubleshooting table below.
 
-By default a global workflow's job runs with credentials scoped to the **workflow** repo — it can clone both repos but cannot read the source repo's scoped secrets. That's the safe default: a random workflow in `myorg/ci-pipelines` does not get read access to secrets in `myorg/backend` just because it runs on a push there.
+### Secrets are not available
 
-Adding the authoring repo to the _Elevated access_ list flips that: the job receives the source repo's secret context, so deploy and release flows that need `NPM_TOKEN` / `AWS_ROLE_ARN` / etc. from the source repo can read them. Treat elevated repos as effective owners of every source repo's CI secrets — only add repos you fully trust.
+A global workflow's job is dispatched with **no secret material** — not the source repo's, and not the workflow repo's own. The organization-wide dispatch path binds no secret contexts, so a `contexts:` declaration on a global workflow resolves to nothing and any secret the steps expect is simply absent. Plan for it: a global workflow is for checks, policy and reporting that need only the two checkouts, not for deploys that need credentials.
+
+This is about your **stored secrets**, not about repository access: the job is still handed a short-lived clone token for each repo it checks out, which is how the dual checkout works at all. What it does not get is anything from a secret context.
+
+To run something that needs secrets on a source repo's event, put those jobs in a per-repository workflow in that repo, where the workflow's `contexts:` resolve normally.
+
+The **Elevated access** setting reads as the way to lift this, and it is not: it is **deprecated and never consulted**. Nothing in the dispatch path reads the list, and adding a repo to it does not make any secret readable. It is kept only so an existing value stays visible and clearable, and is removed at the next major version — see [Deprecations](./deprecations.md).
 
 ## When does it fire?
 
@@ -104,14 +226,111 @@ Same-repo globals (a workflow in `myorg/app` with `repos: ['myorg/app']`) fire o
 
 Non-push triggers work too — `pr()`, `tag()`, `comment()`, `release()`, `workflowRun()`, etc. all accept `repos:`. `kiciEvent()` / `schedule()` / cron-like triggers have no source repo, so they're always per-org-registered regardless of `repos:`.
 
+A global workflow that declares a `filter` or a job generator is decided by one **evaluation job per (event × workflow repo)**, dispatched before any run exists. That job checks out both repos once and evaluates every candidate workflow from that repo, so ten global workflows in one CI repo cost one evaluation, not ten.
+
+When that evaluation cannot reach a verdict — it fails, breaches its budget, or never reports — the workflows it was deciding on **do not run**. On a provider that supports commit checks, that posts a `failure` check named **`KiCI: Organization workflow evaluation`** on the source commit, so the outcome is visible instead of silent. Three things to know about it:
+
+- The check is posted whether the evaluation failed **outright** or only **partly**. A per-workflow budget breach, or a `filter` that throws, leaves that one workflow undecided while its neighbours from the same repo are decided and run normally; the check then names only the undecided ones. So a broken `filter` is reported the same way whether or not other global workflows happen to share its repo.
+- Branch protection that lists required checks by name is unaffected, because the check is not on that list. Merge automation that requires _every_ check to be green will block on it.
+- **The check clears only on a new commit.** A provider redelivery of the same event is dropped as a duplicate, so re-delivering the webhook will not re-run the evaluation.
+
+## Approval gates are not supported
+
+A global workflow cannot carry an `approval` gate, at the workflow level or on a job. Approval holds are applied by the per-repository dispatch path; the global path dispatches its jobs without consulting one, so a gate declared here would never be enforced. `kici compile` refuses it with `error [E124]` rather than accepting a security control the workflow does not actually have. A job produced by a `dynamicJob` generator never passes through the compiler, so that case is caught at dispatch instead — the orchestrator logs an error naming the workflow and job, and runs it ungated.
+
+To gate a deployment behind a human, put the gated jobs in a workflow whose triggers carry no `repos:`.
+
+## Re-running is not supported
+
+A global workflow's run cannot be re-run. The rerun path resolves a workflow out of the repo the run acted on, and for a global workflow that is the **source** repo — not the workflow repo that declares it. Re-running is refused with an error naming both repos rather than resolving the wrong one, which for a source repo carrying a same-named workflow would silently run that workflow instead, with the source repo's credentials and none of the global job configuration.
+
+To run it again, push a new commit to the source repo (a provider redelivery of the same event is dropped as a duplicate), or trigger it from the workflow repo.
+
+## Requirements a filter places on the run
+
+A `filter` reads the source tree, so the evaluation must be able to obtain one. A job that restores its workflow source from the cache and has no source repository to clone from fails with an explicit error rather than evaluating the filter against an empty tree. This applies to dispatch paths that run without a source repository configured — a filter and such a path are mutually exclusive; drop one or the other.
+
 ## Troubleshooting
 
-| Symptom                                                      | Likely cause                                                                                       | Where to look                                                                                                      |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| Global workflow registered but never runs                    | Master toggle OFF, or allow-list blocks the authoring repo, or deny-list blocks the source repo    | Orchestrator log: `Skipping global workflow dispatch` / `Skipping global workflow registration: not permitted`     |
-| `repos:` has no effect — workflow only fires on its own repo | Master toggle OFF. Without opt-in, the orchestrator treats the workflow as per-repo-only.          | Dashboard → Settings → Global workflows (top toggle)                                                               |
-| Source repo secrets unavailable in a global job              | Expected default — elevate the authoring repo to grant access.                                     | Dashboard → Settings → Global workflows → _Elevated access_                                                        |
-| Dashboard shows workflow twice after registering             | Both a generic webhook source and a provider source (github, generic) re-registered the same repo. | Check `workflow_registrations` via `kici-admin workflow list` and confirm the right routing key owns the workflow. |
+| Symptom                                                                                         | Likely cause                                                                                                                                                                                                           | Where to look                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Global workflow registered but never runs                                                       | Master toggle OFF, or allow-list blocks the authoring repo, or deny-list blocks the source repo                                                                                                                        | Orchestrator log: `Skipping global workflow dispatch` (dispatch time) / `Global workflows excluded from registration` (registration time)                                                                                                                                                                                                            |
+| A global workflow is never registered at all — it is absent from `kici-admin registration list` | The push that should have registered it resolved to the `__default__` organization anchor, because no webhook source maps its routing key to an organization, or the fleet-wide master switch is off.                  | Orchestrator log: `Global workflows excluded from registration` with `"orgId": "__default__"`. Its `remedy` field names both fixes — map the source (`kici-admin source update <routingKey> --customer-id <org>`) and enable global workflows cluster-wide if it is not already (`kici-admin cluster-settings set --global-workflows-enabled true`). |
+| `repos:` has no effect — workflow only fires on its own repo                                    | The fleet-wide master switch is off. Without it, the orchestrator treats the workflow as per-repo-only.                                                                                                                | Check the fleet-wide switch with `kici-admin cluster-settings show`. The dashboard → Settings → Global workflows tab shows it as a read-only badge.                                                                                                                                                                                                  |
+| Secrets unavailable in a global job                                                             | Expected — a global workflow's job receives no secrets at all, and the _Elevated access_ list is not enforced.                                                                                                         | Move the jobs that need credentials into a per-repository workflow in the repo that owns the secrets                                                                                                                                                                                                                                                 |
+| Dashboard shows workflow twice after registering                                                | Both a generic webhook source and a provider source (github, generic) re-registered the same repo.                                                                                                                     | Check `workflow_registrations` via `kici-admin workflow list` and confirm the right routing key owns the workflow.                                                                                                                                                                                                                                   |
+| Global workflow registered, enabled, allowed — and still no run appears                         | Its `filter` returned `false`. A global filter runs before the run is created, so a suppressed workflow leaves nothing behind at all.                                                                                  | [Reading a global workflow's filter output](#reading-a-global-workflows-filter-output) — the evaluation round's own log. The orchestrator also logs `Global workflow skipped by eval round`, naming the workflow and the reason.                                                                                                                     |
+| Global workflow never fires for one particular source repo                                      | Its `repos:` patterns do not match that repo's identifier.                                                                                                                                                             | Orchestrator log: `Global workflows dropped by their repos filter` — one line per delivery, naming each dropped workflow, its repo and its patterns.                                                                                                                                                                                                 |
+| A `failure` check named `KiCI: Organization workflow evaluation` on a commit                    | The pre-run evaluation failed or timed out, so the global workflows from that repo were not run.                                                                                                                       | Orchestrator log for the evaluation job; push a new commit to re-evaluate (a redelivery is dropped as a duplicate).                                                                                                                                                                                                                                  |
+| Same-repo workflow shows a `success` run with no jobs in it                                     | Its `filter` returned `false`. A same-repo filter runs after the run exists, so the run remains, carrying only the evaluation jobs.                                                                                    | The run detail page — the evaluation job's log records the filter verdict.                                                                                                                                                                                                                                                                           |
+| Re-run is refused with "Cannot re-run an organization-wide workflow"                            | Expected — the run executed against a source repo that does not declare the workflow.                                                                                                                                  | [Re-running is not supported](#re-running-is-not-supported) — push a new commit to the source repo instead.                                                                                                                                                                                                                                          |
+| Every global workflow stopped running right after an orchestrator upgrade                       | The agents were not upgraded first. An agent older than v0.5.0 cannot evaluate a global workflow, and one containing a `dynamicJob` now needs an evaluation even without a `filter` — so its **static** jobs stop too. | The `KiCI: Organization workflow evaluation` check names the agent versions it found. Upgrade every `kici:role:init-runner` agent to v0.5.0 or newer.                                                                                                                                                                                                |
+
+### Reading a global run in the dashboard
+
+A global run is attributed to the **source** repo — the repo whose event
+triggered it, and whose code the jobs check out. Its run detail page names both
+repos, so you can tell it apart from an ordinary per-repo run:
+
+| Row          | Shows                                                                    |
+| ------------ | ------------------------------------------------------------------------ |
+| `Repository` | the source repo — the one the run acted on                               |
+| `Defined in` | the workflow repo, tagged `Organization-wide`. Absent on an ordinary run |
+| `Workflow`   | links into the **workflow** repo, on its default branch                  |
+
+The `Workflow` link points at the workflow repo's default branch rather than at
+a commit: the run's own commit belongs to the source repo, and nothing records
+which commit of the workflow repo a given run used. So the link always shows the
+file as it stands now, which may have changed since the run.
+
+The `Payload` tab shows the source repo's event — the webhook delivery the
+workflow reacted to, which for a global workflow comes from a repo you may not
+own. A global run dispatched before your orchestrator stored payloads for this
+path has none, and its tab reports that it could not load one.
+
+#### Who can see it
+
+A global run belongs to **both** repos, so a member whose role is scoped to
+either one reaches it — the team whose push triggered it, and the team that
+authored the workflow. Both see it in the run list, in the repository filter
+(which offers both names), and on the run detail page. Cancelling follows the
+same rule, so the team whose workflow is running can always stop it.
+
+Releasing a **held** run is the one exception: approving a hold permits code to
+run against the source repo, so it stays with a member scoped to that repo. A
+member scoped only to the workflow repo sees the run but not its hold.
+
+This applies only where the two repos genuinely differ. An ordinary per-repo run
+records no separate workflow repo and is scoped to its own repo exactly as
+before, and a member scoped to neither repo sees nothing in either case.
+
+### Reading a global workflow's filter output
+
+A global workflow's `filter` runs in a pre-run evaluation round, and that round
+decides whether a run exists at all — so on the path where it suppresses a
+workflow there is no run, and nothing appears in the dashboard. The round's own
+log is still recorded. Read it with the orchestrator admin CLI, in two steps:
+
+```bash
+# 1. Find the round. Its workflow name is __globaleval__<owner>/<repo> of the
+#    WORKFLOW repo. In the JSON rows, `id` is the job id and `run_id` is the
+#    run id.
+kici-admin queue list --workflow-name '__globaleval__myorg/ci-pipelines' --limit 5 --json
+
+# 2. Print the round's log (step 0 is the evaluation itself).
+kici-admin runs logs <run_id> --job <id>
+```
+
+Use `--json` on the first command: the plain table abbreviates both ids to their
+first eight characters, and the second command needs them in full.
+
+The two steps need different permissions, so run both with an **owner or admin**
+token. Step 1 reads the dispatch queue, which requires `secret.read` — an auditor
+token is refused with a 403 and never reaches step 2. Step 2 requires only
+`run.read`, which every role carries.
+
+Anything your `filter` writes with `console.log` appears there, alongside the
+per-candidate verdicts the round recorded.
 
 ## See also
 

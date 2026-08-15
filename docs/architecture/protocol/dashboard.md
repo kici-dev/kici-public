@@ -1,6 +1,6 @@
 ---
 title: Dashboard, metrics & wire format
-description: Dashboard REST-over-WS, run / concurrency events, agent and orchestrator metrics, peer-to-peer, wire format and validation
+description: Concurrency events, agent metrics and authentication, cluster join, peer-to-peer, test-relay control plane, wire format and validation
 ---
 
 This page documents the WebSocket messages that flow on the agent↔orchestrator and orchestrator↔orchestrator (peer-to-peer) channels, plus the wire format invariants every tier obeys.
@@ -111,34 +111,6 @@ Auth failure response sent by orchestrator to agent.
 | reason | string           | Yes      | Human-readable failure reason |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentAuthFailureSchema`
-
-## Agent private API messages
-
-Generic request-response envelope for typed API calls over the agent WebSocket. New methods are registered in `AgentApiRegistry` on the orchestrator side — no protocol schema changes are needed per method.
-
-> Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentApiRequestSchema`, `agentApiResponseSchema`
-
-### agent.api.request
-
-API request sent by agent to orchestrator (e.g., `infrastructure.list`).
-
-| Field     | Type                    | Required | Description                                              |
-| --------- | ----------------------- | -------- | -------------------------------------------------------- |
-| type      | `"agent.api.request"`   | Yes      | Message discriminator                                    |
-| requestId | string                  | Yes      | UUID for correlating the response                        |
-| method    | string                  | Yes      | Dot-namespaced method name (e.g., `infrastructure.list`) |
-| params    | Record<string, unknown> | No       | Method-specific parameters (defaults to `{}`)            |
-
-### agent.api.response
-
-API response sent by orchestrator to agent.
-
-| Field     | Type                   | Required | Description                              |
-| --------- | ---------------------- | -------- | ---------------------------------------- |
-| type      | `"agent.api.response"` | Yes      | Message discriminator                    |
-| requestId | string                 | Yes      | Matches the original request's requestId |
-| result    | unknown                | No       | Method result (present on success)       |
-| error     | string                 | No       | Error description (present on failure)   |
 
 ## Join messages
 
@@ -335,38 +307,42 @@ Raft leader heartbeat (no log entries — KiCI uses Raft for leader election onl
 
 Sent by the coordinator to a peer when no local agent can handle a job. Contains the full resolved job configuration so the peer can dispatch without re-resolving.
 
-| Field                      | Type                    | Required | Description                                                                                                                                                                             |
-| -------------------------- | ----------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type                       | `"job.reroute"`         | Yes      | Message discriminator                                                                                                                                                                   |
-| messageId                  | string                  | Yes      | Unique message ID for ACK correlation                                                                                                                                                   |
-| jobId                      | string                  | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under. |
-| runId                      | string                  | Yes      | Execution run identifier                                                                                                                                                                |
-| deliveryId                 | string                  | Yes      | Original webhook delivery ID                                                                                                                                                            |
-| routingKey                 | string                  | Yes      | Provider routing key                                                                                                                                                                    |
-| event, action              | string, string or null  | Yes      | Webhook event type and action                                                                                                                                                           |
-| payload                    | Record<string, unknown> | Yes      | Full webhook payload                                                                                                                                                                    |
-| jobName                    | string                  | Yes      | Job to execute                                                                                                                                                                          |
-| workflowName               | string                  | Yes      | Workflow containing the job                                                                                                                                                             |
-| runsOnLabels               | string[][]              | Yes      | Label sets the job requires                                                                                                                                                             |
-| excludeLabels              | string[]                | No       | Labels that the dispatched agent must NOT have                                                                                                                                          |
-| triedConnections           | string[]                | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                            |
-| maxHops                    | number                  | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                       |
-| coordinatorId              | string                  | Yes      | Instance ID of the run coordinator                                                                                                                                                      |
-| jobConfig                  | Record<string, unknown> | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                        |
-| repoUrl                    | string                  | No       | Repository clone URL                                                                                                                                                                    |
-| ref                        | string                  | No       | Git ref (branch name)                                                                                                                                                                   |
-| sha                        | string                  | No       | Commit SHA                                                                                                                                                                              |
-| provider                   | string                  | No       | Provider type (e.g., `github`)                                                                                                                                                          |
-| providerContext            | Record<string, unknown> | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                      |
-| sourceTarUrl               | string                  | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                             |
-| sourceTarHash              | string                  | No       | Workflow `contentHash` (used for drift verification, not tarball)                                                                                                                       |
-| depsUrl                    | string                  | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                           |
-| depsHash                   | string                  | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                 |
-| cloneToken                 | string                  | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                       |
-| encryptedSecrets           | string                  | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                               |
-| encryptedNamespacedSecrets | string                  | No       | Encrypted namespaced secrets envelope                                                                                                                                                   |
-| requestId                  | string                  | No       | Trace ID for distributed tracing                                                                                                                                                        |
-| traceId                    | string                  | No       | Additional trace context                                                                                                                                                                |
+| Field                      | Type                    | Required | Description                                                                                                                                                                                                |
+| -------------------------- | ----------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type                       | `"job.reroute"`         | Yes      | Message discriminator                                                                                                                                                                                      |
+| messageId                  | string                  | Yes      | Unique message ID for ACK correlation                                                                                                                                                                      |
+| jobId                      | string                  | Yes      | Pre-allocated job ID. The sending coordinator allocates it before reroute so its `execution_runs` / `execution_jobs` rows reference the same id the receiving peer will dispatch under.                    |
+| runId                      | string                  | Yes      | Execution run identifier                                                                                                                                                                                   |
+| deliveryId                 | string                  | Yes      | Original webhook delivery ID                                                                                                                                                                               |
+| routingKey                 | string                  | Yes      | Provider routing key                                                                                                                                                                                       |
+| event, action              | string, string or null  | Yes      | Webhook event type and action                                                                                                                                                                              |
+| payload                    | Record<string, unknown> | Yes      | Full webhook payload                                                                                                                                                                                       |
+| jobName                    | string                  | Yes      | Job to execute                                                                                                                                                                                             |
+| workflowName               | string                  | Yes      | Workflow containing the job                                                                                                                                                                                |
+| runsOnLabels               | string[][]              | Yes      | Label sets the job requires                                                                                                                                                                                |
+| excludeLabels              | string[]                | No       | Labels that the dispatched agent must NOT have                                                                                                                                                             |
+| runsOnPatterns             | LabelMatcher[]          | No       | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. Absent reads as `[]`; a pure-pattern job carries its whole selector here |
+| excludePatterns            | LabelMatcher[]          | No       | Glob/regex matchers that disqualify a candidate agent. Absent reads as `[]`                                                                                                                                |
+| triedConnections           | string[]                | Yes      | Instance IDs already tried (loop prevention)                                                                                                                                                               |
+| maxHops                    | number                  | Yes      | Maximum allowed hops (default: 3)                                                                                                                                                                          |
+| coordinatorId              | string                  | Yes      | Instance ID of the run coordinator                                                                                                                                                                         |
+| jobConfig                  | Record<string, unknown> | No       | Resolved job config (steps, rules, matrix, etc.)                                                                                                                                                           |
+| repoUrl                    | string                  | No       | Repository clone URL                                                                                                                                                                                       |
+| ref                        | string                  | No       | Git ref (branch name)                                                                                                                                                                                      |
+| sha                        | string                  | No       | Commit SHA                                                                                                                                                                                                 |
+| provider                   | string                  | No       | Provider type (e.g., `github`)                                                                                                                                                                             |
+| providerContext            | Record<string, unknown> | No       | Provider-specific context (e.g., `installationId`)                                                                                                                                                         |
+| sourceTarUrl               | string                  | No       | Pre-signed `.kici/` source tarball download URL (cache hit)                                                                                                                                                |
+| sourceTarHash              | string                  | No       | Workflow `contentHash` (used for drift verification, not tarball)                                                                                                                                          |
+| depsUrl                    | string                  | No       | Pre-signed dependency tarball URL (cache hit)                                                                                                                                                              |
+| depsHash                   | string                  | No       | SHA-256 of the dependency tarball bytes                                                                                                                                                                    |
+| cloneToken                 | string                  | No       | Pre-resolved clone token for workers without provider credentials                                                                                                                                          |
+| encryptedSecrets           | string                  | No       | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                  |
+| encryptedNamespacedSecrets | string                  | No       | Encrypted namespaced secrets envelope                                                                                                                                                                      |
+| requestId                  | string                  | No       | Trace ID for distributed tracing                                                                                                                                                                           |
+| traceId                    | string                  | No       | Additional trace context                                                                                                                                                                                   |
+
+LabelMatcher: `{ kind: "exact", value: string }` or `{ kind: "regex", source: string, flags: string }`. Globs are converted to regex at compile time, so the wire only ever carries these two forms.
 
 #### job.reroute.ack
 

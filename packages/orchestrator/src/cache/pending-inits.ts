@@ -20,6 +20,16 @@ export interface InitResult {
    * function. The dispatch path re-materializes these into N execution jobs.
    */
   matrixValues?: Array<Record<string, string | undefined>>;
+  /**
+   * Verdict of the workflow-level `filter`, reported only when the init job was
+   * asked to evaluate one. `false` means the workflow does not apply to this
+   * event and its job must not be dispatched.
+   *
+   * Optional on purpose: an agent that predates the filter never sends it, so
+   * absence means "no verdict was reported" and dispatch proceeds — only an
+   * explicit `false` suppresses.
+   */
+  filterPassed?: boolean;
 }
 
 export class PendingInitTracker extends PendingTracker<InitResult> {

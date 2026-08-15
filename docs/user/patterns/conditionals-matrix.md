@@ -69,12 +69,16 @@ export default workflow('ci', {
 
 Rule check functions receive a `RuleContext` with:
 
-| Property       | Type                                | Description                         |
-| -------------- | ----------------------------------- | ----------------------------------- |
-| `event`        | `EventPayload`                      | The triggering event data           |
-| `changedFiles` | `string[]`                          | Files changed in this event         |
-| `env`          | `Record<string, string\|undefined>` | Environment variables               |
-| `$`            | zx shell                            | Shell executor for running commands |
+| Property       | Type                                | Description                                                                                    |
+| -------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `event`        | `EventPayload`                      | The triggering event data                                                                      |
+| `changedFiles` | `string[]`                          | Files changed in this event                                                                    |
+| `sourceRepo`   | `RepoInfo \| undefined`             | The repo whose event triggered the run, when the evaluation has a checkout                     |
+| `workflowRepo` | `RepoInfo \| undefined`             | The repo that registered the workflow. The same repo as `sourceRepo` outside a global workflow |
+| `env`          | `Record<string, string\|undefined>` | Environment variables                                                                          |
+| `$`            | zx shell                            | Shell executor for running commands                                                            |
+
+`RepoInfo` carries `path` — an absolute path to that repo's checkout — plus optional `ref` and `sha`. In a [global workflow](../global-workflows.md) the two are different repos, which is what lets one rule read the source repo's tree while the workflow lives elsewhere. Read _through_ `path`: its contents are stable, but the path itself differs between the evaluation and the later run.
 
 ### Marker rules
 

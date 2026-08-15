@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, chmodSync, rmSync, existsSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import { $ } from 'zx';
-import { splitAgentPlatform, type AgentPlatform } from '@kici-dev/shared';
+import { splitAgentPlatform, serializeError, type AgentPlatform } from '@kici-dev/shared';
 
 export interface DownloadNodeOptions {
   version: string;
@@ -11,6 +12,40 @@ export interface DownloadNodeOptions {
   destBinPath: string;
   /** Overrides https://nodejs.org/dist (air-gap mirror). */
   nodeMirror?: string;
+}
+
+/**
+ * Fetch a Node dist URL, retrying transient failures. The runtime download is a
+ * bootstrap-critical step on a box that may have flaky egress (a fresh customer
+ * host, a CDN blip); a single bare `fetch` turns any transient connect/DNS/5xx
+ * hiccup into an opaque `fetch failed` that aborts the whole packaging run. We
+ * retry connection-level throws and 5xx responses with exponential backoff, and
+ * fold the underlying `cause` (e.g. `connect ETIMEDOUT …`, `UND_ERR_…`) into the
+ * final error so a genuine failure is diagnosable instead of a bare message.
+ */
+async function fetchNodeDist(url: string, attempts = 4): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const resp = await fetch(url);
+      if (resp.ok) return resp;
+      // Retry transient upstream errors; a 4xx is deterministic — fail fast.
+      if (resp.status < 500 || attempt === attempts) {
+        throw new Error(`Failed to fetch ${url}: HTTP ${resp.status}`);
+      }
+      lastErr = new Error(`HTTP ${resp.status}`);
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts) {
+        throw new Error(
+          `Failed to fetch ${url} after ${attempts} attempts: ${JSON.stringify(serializeError(err))}`,
+        );
+      }
+    }
+    await sleep(Math.min(500 * 2 ** (attempt - 1), 4000));
+  }
+  // Unreachable: the loop either returns or throws on the final attempt.
+  throw new Error(`Failed to fetch ${url}: ${JSON.stringify(serializeError(lastErr))}`);
 }
 
 /**
@@ -34,14 +69,12 @@ export async function downloadNodeBinary(opts: DownloadNodeOptions): Promise<voi
   const filename = `node-v${opts.version}-${nodeOs}-${nodeArch}.tar.gz`;
   const dir = `v${opts.version}`;
 
-  const shaResp = await fetch(`${base}/${dir}/SHASUMS256.txt`);
-  if (!shaResp.ok) throw new Error(`Failed to fetch SHASUMS256.txt: ${shaResp.status}`);
+  const shaResp = await fetchNodeDist(`${base}/${dir}/SHASUMS256.txt`);
   const shaLine = (await shaResp.text()).split('\n').find((l) => l.endsWith(filename));
   if (!shaLine) throw new Error(`No SHA-256 entry for ${filename} in SHASUMS256.txt`);
   const expected = shaLine.trim().split(/\s+/)[0];
 
-  const archiveResp = await fetch(`${base}/${dir}/${filename}`);
-  if (!archiveResp.ok) throw new Error(`Failed to download ${filename}: ${archiveResp.status}`);
+  const archiveResp = await fetchNodeDist(`${base}/${dir}/${filename}`);
   const buf = Buffer.from(await archiveResp.arrayBuffer());
   const actual = createHash('sha256').update(buf).digest('hex');
   if (actual !== expected) {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createGenericWebhookRoutes, type GenericWebhookRoutesDeps } from './webhooks.js';
 import { WebhookIngestOutcome } from '../pipeline/process-webhook.js';
+import { acceptWebhookDelivery } from '../webhook/ingest-accept.js';
 
 function createMockDeps(
   overrides: Partial<GenericWebhookRoutesDeps> = {},
@@ -542,6 +543,85 @@ describe('generic webhook routes', () => {
       expect(res.status).toBe(500);
       const json = await res.json();
       expect(json.reason).toBe('Source verification misconfigured');
+    });
+  });
+  describe('acknowledgement timing', () => {
+    /**
+     * The behaviour this whole change exists for: the response must not wait
+     * for the match-and-dispatch pipeline.
+     *
+     * The route is wired to the REAL accept seam here rather than a stub, with
+     * a pipeline that never resolves on its own. Against the previous
+     * await-the-pipeline wiring the request simply never completes, which is
+     * exactly the production failure — a provider abandons the delivery at 10
+     * seconds while a matched workflow's build phase is capped at 600.
+     */
+    it('responds while the pipeline is still running', async () => {
+      const source = {
+        id: 'src-slow',
+        customer_id: 'org-1',
+        name: 'slow-source',
+        routing_key: 'generic:org-1:src-slow',
+        enabled: true,
+        max_payload_bytes: 1048576,
+        rate_limit_rpm: 1000,
+        verification_method: 'none' as const,
+        verification_config: '{}',
+        event_type_header: 'x-event-type',
+        event_type_path: null,
+        idempotency_key_header: null,
+        idempotency_key_path: null,
+        dedup_window_seconds: 300,
+        allowed_events: null,
+        strip_headers: '[]',
+      };
+
+      let pipelineEntered = false;
+      let finishPipeline!: () => void;
+      const pipelineDone = new Promise<void>((resolve) => {
+        finishPipeline = resolve;
+      });
+
+      const deps = createMockDeps({
+        sourceManager: {
+          getByOrgAndName: vi.fn().mockResolvedValue(source),
+          getByRoutingKey: vi.fn().mockResolvedValue(source),
+          checkIdempotency: vi.fn().mockResolvedValue(false),
+          markIdempotency: vi.fn().mockResolvedValue(undefined),
+        } as any,
+        onWebhook: (info) =>
+          acceptWebhookDelivery(info, {
+            admit: async () => undefined,
+            isKnownDelivery: async () => false,
+            enqueue: async () => 1,
+            claimRow: async () => true,
+            markProcessed: async () => {},
+            releaseClaim: async () => true,
+            runPipeline: async () => {
+              pipelineEntered = true;
+              await pipelineDone;
+              return WebhookIngestOutcome.enum.processed;
+            },
+          }),
+      });
+
+      const app = createGenericWebhookRoutes(deps);
+      const res = await app.request('http://localhost/webhook/org-1/generic/slow-source', {
+        method: 'POST',
+        body: JSON.stringify({ data: 'x' }),
+        headers: { 'Content-Type': 'application/json', 'x-event-type': 'deploy' },
+      });
+
+      // The response is complete and the pipeline has not finished. Awaiting
+      // `res.json()` proves the body is fully materialised, not a pending stream.
+      expect(res.status).toBe(202);
+      expect(await res.json()).toMatchObject({ accepted: true });
+
+      // Let the scheduled worker start, then confirm it is genuinely still
+      // in-flight rather than having been skipped.
+      await new Promise((r) => setTimeout(r, 10));
+      expect(pipelineEntered).toBe(true);
+      finishPipeline();
     });
   });
 });

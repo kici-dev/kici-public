@@ -92,13 +92,12 @@ push({
 });
 ```
 
-## Lock file format (schema v9+)
+## Lock file format
 
-The lock file uses `repos` fields on trigger entries for global workflow matching (introduced in schema v9, refined in v10 to use `!` prefix for negative patterns instead of `notRepos`):
+The lock file carries a `repos` field on a trigger entry to mark it for global workflow matching. A leading `!` on a pattern is a negation:
 
 ```json
 {
-  "schemaVersion": 11,
   "workflows": [
     {
       "name": "org-lint",
@@ -150,19 +149,63 @@ the failure for that event and a second failure would double-report one decision
 
 See [Approvals](./approvals.md) for the trust policy's hold / reject vocabulary.
 
+### When the pre-run evaluation fails
+
+A global workflow that declares a `filter`, or whose jobs come from a generator,
+cannot be decided from the lock file alone — only an agent may run that code. So
+the orchestrator dispatches one pre-run evaluation job per (event × workflow
+repo) and waits for its verdicts before deciding which of those workflows apply.
+
+An evaluation that produces no usable verdicts is retried once. That covers both
+shapes it can take: the job failed outright (the agent went away, the job was
+rejected, the wait ceiling below was reached), and the job finished but decided
+nothing — every workflow came back undecided, which is what an evaluation that
+runs out of its own time budget reports. An evaluation that decided even one
+workflow is a real result: its decided workflows run, and it is not retried —
+retrying it would re-dispatch what it already decided. Its undecided workflows
+are still recorded, as a partial failure carrying only their names, so the two
+records below are produced for a partial evaluation as well as a total one.
+
+If the second attempt still produces no usable verdicts, none of the workflows it
+was deciding on run for that commit, and the outcome is recorded in two places:
+
+- **One errored run**, for the whole evaluation rather than one per workflow —
+  the evaluation exists to collapse several candidate workflows into a single
+  pre-run job, so fanning its failure back out would undo that. Its failure
+  reason names every workflow the failure suppressed.
+- **One failing commit check** on the event's commit, named
+  `KiCI: Organization workflow evaluation`. Its own name, for the same reason as
+  the skip notice above: `KiCI Security` owns the single security check run per
+  commit, so writing through it could resolve a still-held run's check.
+
+The orchestrator also applies its own ceiling on how long it waits
+(`--global-eval-wait-timeout-ms`, 4 minutes by default). The evaluation's own
+budgets are enforced by the agent and only start once the job is running, so
+neither covers an evaluation still waiting for a free agent, or an agent that
+stops responding — without the ceiling the delivery would wait indefinitely and
+never be logged at all. See
+[Cluster settings](../operator/orchestrator/cluster-settings.md) for the knob.
+
 ### Org-level permissions
 
-Global workflows require explicit opt-in via the `org_settings` table. The
-table is **org-scoped** — one row per `customer_id`, regardless of how
-many webhook sources the org has registered:
+Global workflows require explicit opt-in. The **master switch is fleet-wide**:
+`cluster_settings.global_workflows_enabled` (a single `id='default'` row,
+`BOOLEAN` nullable — `NULL` resolves to the orchestrator's configured default
+`KICI_GLOBAL_WORKFLOWS_ENABLED`, off by default). It is held by the operator
+through `kici-admin cluster-settings` and gates every org before any per-org
+list is consulted; an unreadable row fails closed.
+
+The three per-org **lists** live in the `org_settings` table, which is
+**org-scoped** — one row per `customer_id`, regardless of how many webhook
+sources the org has registered. A missing `org_settings` row means "no per-org
+restrictions" (the repo and source axes pass), not a denial:
 
 | Column                           | Type                 | Purpose                                                                                                                              |
 | -------------------------------- | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `customer_id`                    | `text` (PK)          | Organization identifier                                                                                                              |
-| `global_workflows_enabled`       | `boolean`            | Master switch for global workflows                                                                                                   |
 | `global_workflow_allowed_repos`  | `jsonb[]` (nullable) | **Authoring axis.** Entries `{routingKey?, pattern}`; repos allowed to register global workflows (null/empty = any author)           |
 | `global_workflow_denied_repos`   | `jsonb[]` (nullable) | **Source axis.** Entries `{routingKey?, pattern}`; source repos whose events must never trigger global workflows (null/empty = none) |
-| `global_workflow_elevated_repos` | `jsonb[]` (nullable) | **Authoring axis.** Entries `{routingKey?, pattern}`; repos with elevated access to source repo secrets                              |
+| `global_workflow_elevated_repos` | `jsonb[]` (nullable) | **Deprecated, not enforced.** Entries `{routingKey?, pattern}`; stored and echoed back, read by nothing                              |
 
 Each list element is an object: `{routingKey?: string, pattern: string}`.
 When `routingKey` is absent, the entry applies to events from / workflows
@@ -176,7 +219,7 @@ The `GlobalWorkflowPolicy` class (`packages/orchestrator/src/security/global-wor
 
 1. **`isWorkflowRepoAllowed(workflowRoutingKey, workflowRepo, customerId)`** — consults the allow-list. Each entry matches when `entry.routingKey` is absent OR equals `workflowRoutingKey`, AND the pattern matches the workflow repo. Applied at registration extraction (filters which workflows get stored) and at dispatch time (filters which authored workflows may run).
 2. **`isSourceRepoAllowed(eventRoutingKey, sourceRepo, customerId)`** — consults the deny-list. Each entry matches when `entry.routingKey` is absent OR equals the event's routing key, AND the pattern matches the source repo. Applied at dispatch time. Used to block events from untrusted repos (forks, public-contrib repos) before any global workflow is considered.
-3. **`isElevatedAccessAllowed(workflowRoutingKey, repo, customerId)`** — consults the elevated list, with the same source-qualifier rules.
+3. **`isElevatedAccessAllowed(workflowRoutingKey, repo, customerId)`** — consults the elevated list, with the same source-qualifier rules. **Deprecated and unused:** no code calls it, and calling it would decide nothing, because the global dispatch path resolves no secrets for it to widen (see _Elevated access_ below).
 
 Allow-list and deny-list are **orthogonal**: the allow-list restricts authors, the deny-list restricts event sources. Both can be active simultaneously — they answer different questions.
 
@@ -215,11 +258,13 @@ routing key — events are filtered by the source they actually arrived on.
 
 ### Universal-git sources
 
-Universal-git sources (Forgejo / Gitea / Gogs / GitLab / plain-GitHub webhooks, routing key `generic:<orgId>:<sourceId>`) share the same org-level row as the org's other sources. The policy code is purely string-based with no hardcoded provider checks, so a universal-git routing key works as a per-entry qualifier just like a `github:*` routing key. Enable and tune via `kici-admin org-settings global-workflows {set-enabled, allow-add, deny-add, elevate-add} --customer-id <orgId> [--source generic:<orgId>:<sourceId>]`. See the [user guide](../user/providers/universal-git.md#global-workflows) for the operator surface.
+Universal-git sources (Forgejo / Gitea / Gogs / GitLab / plain-GitHub webhooks, routing key `generic:<orgId>:<sourceId>`) share the same org-level row as the org's other sources. The policy code is purely string-based with no hardcoded provider checks, so a universal-git routing key works as a per-entry qualifier just like a `github:*` routing key. Enable cluster-wide via `kici-admin cluster-settings set --global-workflows-enabled true`, then tune the per-org lists via `kici-admin org-settings global-workflows {allow-add, deny-add} --customer-id <orgId> [--source generic:<orgId>:<sourceId>]`. See the [user guide](../user/providers/universal-git.md#global-workflows) for the operator surface.
 
-### Elevated access
+### Elevated access — deprecated, never enforced
 
-Repos listed in `global_workflow_elevated_repos` can access source repo secrets during execution. This is for trusted automation repos that need to deploy, release, or modify the source repo.
+The global dispatch path resolves **no secrets at all**: it binds no secret contexts and writes no secret material into a job config, so a global workflow's job runs with neither the source repo's secrets nor the workflow repo's own. `global_workflow_elevated_repos` was meant to widen that, and nothing reads it.
+
+Enforcing it is not a matter of calling `isElevatedAccessAllowed` from the dispatch path. Secrets are stored `(org_id, scope, key)` with no repository dimension, so "the source repo's secrets" is not a set the orchestrator can currently name — a grant would first need a repository-to-secret-context model that does not exist. The list, its admin route, its CLI mutators and its wire field are deprecated pending removal at v1.0.0.
 
 ## Agent behavior
 
@@ -257,13 +302,14 @@ The agent clones both repositories into a workspace directory:
 
 ### Enabling global workflows
 
-Global workflows are disabled by default. To enable them for an organization:
+Global workflows are disabled by default. To enable them:
 
-1. Insert a row in the `org_settings` table:
+1. Turn the fleet-wide master switch on (operator, once per cluster):
 
 ```sql
-INSERT INTO org_settings (customer_id, global_workflows_enabled)
-VALUES ('kiciStg00001', true);
+INSERT INTO cluster_settings (id, global_workflows_enabled)
+VALUES ('default', true)
+ON CONFLICT (id) DO UPDATE SET global_workflows_enabled = EXCLUDED.global_workflows_enabled;
 ```
 
 2. Optionally restrict which repos can register global workflows. The
@@ -279,24 +325,14 @@ SET global_workflow_allowed_repos = ARRAY[
 WHERE customer_id = 'kiciStg00001';
 ```
 
-3. Optionally grant elevated access:
-
-```sql
-UPDATE org_settings
-SET global_workflow_elevated_repos = ARRAY[
-  '{"pattern":"myorg/ci-deploy"}'::jsonb
-]
-WHERE customer_id = 'kiciStg00001';
-```
-
 ### Dashboard settings
 
-The org settings page exposes all three knobs through the **Global workflows** tab (`/orgs/:customerId/settings/global-workflows`), visible to any user with `org_settings:read`. Editing requires `org_settings:write`. The tab surfaces:
+The org settings page exposes these knobs through the **Global workflows** tab (`/orgs/:customerId/settings/global-workflows`), visible to any user with `org_settings:read`. Editing requires `org_settings:write`. The tab surfaces:
 
-- A master enable toggle bound to `global_workflows_enabled`.
+- A read-only master-switch badge showing the effective fleet-wide state (`cluster_settings.global_workflows_enabled`). It is set with `kici-admin cluster-settings`, not from the dashboard.
 - An **Allowed author repos** section with its own enable toggle and editable list bound to `global_workflow_allowed_repos` (the authoring axis). When the toggle is off, any repo in the org may author global workflows.
 - A **Blocked source repos** section with its own enable toggle and editable list bound to `global_workflow_denied_repos` (the source axis). Use this to protect forks and public-contrib repos from silently triggering org-wide automation.
-- An independent **Elevated access** list bound to `global_workflow_elevated_repos` with an inline security warning.
+- An **Elevated access** list bound to `global_workflow_elevated_repos`, marked not enforced and deprecated.
 
 Every list row pairs a **source picker** with the existing **pattern**
 input. The source picker defaults to "Any source" — leaving it as such
@@ -309,14 +345,15 @@ The Platform proxies reads and writes to the orchestrator via the existing dashb
 
 ### CLI management
 
-Operators can manage policy without the dashboard via `kici-admin org-settings global-workflows`:
+Operators enable the fleet-wide switch with `kici-admin cluster-settings`, then manage the per-org lists with `kici-admin org-settings global-workflows`:
 
 ```bash
+# Fleet-wide master switch (once per cluster):
+kici-admin cluster-settings set --global-workflows-enabled true
+
 kici-admin org-settings global-workflows show --customer-id kiciStg00001
-kici-admin org-settings global-workflows set-enabled true --customer-id kiciStg00001
 kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --customer-id kiciStg00001
 kici-admin org-settings global-workflows deny-add 'myorg/fork-*' --customer-id kiciStg00001
-kici-admin org-settings global-workflows elevate-add 'myorg/ci-deploy' --customer-id kiciStg00001
 
 # Pin an entry to one webhook source (qualified by routingKey):
 kici-admin org-settings global-workflows allow-add 'myorg/deploy' \

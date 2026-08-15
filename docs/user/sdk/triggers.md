@@ -94,6 +94,182 @@ workflow runs rather than being silently dropped, and the delivery is recorded
 as degraded. GitHub always provides an exact list; a transient API error fails
 loudly, not as empty.
 
+### Content requirements (`requires`)
+
+Where `paths` filters on **which files changed**, `requires` filters on **what
+those files contain**. It is a declarative filter on the `pr()`, `push()`, and
+`tag()` triggers: a list of queries over the bytes of named source files, read
+at the event's commit. The orchestrator evaluates it as pure data before
+dispatching — it reads only the referenced files, never clones the whole
+repository, and never runs any of your workflow code. A workflow whose `requires`
+does not pass is simply not dispatched.
+
+Each entry is a `ContentRequirement`:
+
+```typescript
+interface ContentRequirement {
+  file: string; // repo-relative path to query
+  format?: 'auto' | 'json' | 'yaml' | 'text'; // how to parse the file (default: 'auto')
+  exists?: string[]; // JSONPath expressions that must each resolve to ≥1 node (json/yaml)
+  match?: Record<string, unknown>; // JSONPath → expected value; every one must match (json/yaml)
+  not?: Record<string, unknown>; // JSONPath → value; passes only when NONE match (json/yaml)
+  contains?: string | string[]; // literal substrings, all of which must appear (text only)
+  notContains?: string | string[]; // literal substrings, none of which may appear (text only)
+  matches?: string | RegExp | (string | RegExp)[]; // regexes, all of which must match (text only)
+  notMatches?: string | RegExp | (string | RegExp)[]; // regexes, none of which may match (text only)
+  ignoreCase?: boolean; // applies to contains/notContains only (default: false)
+  absent?: boolean; // passes only when the file does NOT exist
+}
+```
+
+**Format.** `format: 'auto'` (the default) picks the parser by extension:
+`.json` → JSON, `.yaml` / `.yml` → YAML, everything else → text. Set `format`
+explicitly to override — e.g. treat an extensionless file as JSON, or read a
+`.json` file as raw text. JSON and YAML both parse to an object, so the JSONPath
+keys (`exists` / `match` / `not`) work identically over either; `text` files are
+queried by `contains`, `notContains`, `matches`, and `notMatches` over the raw
+bytes.
+
+**Query keys.**
+
+- **`exists`** — an array of JSONPath expressions; each must resolve to at least
+  one node in the parsed document.
+- **`match`** — a JSONPath → expected-value map; every expression must match. An
+  expected value is an exact value, a regex string in `/pattern/flags` form
+  (against a string node), or an array of acceptable values (any one matches).
+- **`not`** — the same map shape, inverted: the entry passes only when **none** of
+  the expressions match.
+- **`contains` / `notContains`** — literal substrings tested against the raw file
+  text. Every entry must be present (`contains`) or absent (`notContains`). No
+  escaping needed (text format only).
+- **`matches`** — one or several regexes (a `RegExp` or `/pattern/flags` string),
+  each of which must match the raw file text (text format only).
+- **`notMatches`** — the inverse of `matches`: the entry passes only when none of
+  the regexes match (text format only).
+- **`ignoreCase`** — case-insensitive `contains` / `notContains` only; a regex
+  carries its own flags. Default false.
+- **`absent: true`** — passes only when the file does **not** exist at the event's
+  commit. It is mutually exclusive with the query keys above.
+- A bare `{ file }` with no query key requires the file to **exist**.
+
+The keys inside one entry are AND-ed, and the entries in a `requires` list are
+AND-ed with each other. An empty or absent `requires` matches everything, exactly
+like `paths`.
+
+**Examples:**
+
+```typescript
+// Only run CI when package.json declares a `ci` script.
+push({ branches: 'main', requires: [{ file: 'package.json', exists: ['$.scripts.ci'] }] });
+
+// Deploy only when the service config enables it (YAML, matched by value).
+push({
+  branches: 'main',
+  requires: [{ file: 'service.yaml', match: { '$.deploy.enabled': true } }],
+});
+
+// Only run when the Dockerfile builds from a Node base image (raw-text regex).
+pr({ requires: [{ file: 'Dockerfile', format: 'text', matches: '/^FROM node:/m' }] });
+
+// Skip the workflow whenever a repo carries an opt-out marker file.
+push({ requires: [{ file: '.skip-ci', absent: true }] });
+
+// Combine filters: a tag build that requires a version file AND forbids a draft flag.
+tag({
+  patterns: ['v*'],
+  requires: [
+    { file: 'VERSION', matches: '/^\\d+\\.\\d+\\.\\d+$/' },
+    { file: 'release.json', not: { '$.draft': true } },
+  ],
+});
+```
+
+**Fail-visible evaluation.** Files are read at the event's commit. If a
+referenced file is larger than **1 MiB**, or fails to parse for its format, the
+requirement is **indeterminate** — the candidate workflow is dropped and does
+**not** run. A `requires` that cannot be evaluated never silently passes.
+
+**Compile-time validation.** `kici compile` rejects a malformed requirement before
+it ever reaches the orchestrator: a raw-text key that is invalid or catastrophic
+(ReDoS-prone) is rejected by a safe-regex check; a text file cannot carry a
+JSON/YAML query key (`exists` / `match` / `not`) and a JSON/YAML file cannot carry a
+raw-text key; `absent` cannot be combined with a query key; and an explicit
+`format` with no query key is rejected as having nothing to check.
+
+### Commit-message filters (`commitMessage`)
+
+Where `requires` filters on what the repository's **files** contain,
+`commitMessage` filters on what the **event** says. It is a declarative filter on
+the `pr()`, `push()`, and `tag()` triggers. The orchestrator evaluates it
+directly from the webhook payload: no file is fetched, and no repository is
+cloned. For an organization-wide workflow it dispatches no evaluation job. It is
+the cheapest gate available.
+
+The text it tests is the **full head-commit message** — subject and body — for
+`push` and `tag`, and the **title plus body** for pull-request events.
+
+```typescript
+interface TextMatch {
+  contains?: string | string[]; // every needle must be present
+  notContains?: string | string[]; // no needle may be present
+  matches?: string | RegExp | (string | RegExp)[]; // every regex must match
+  notMatches?: string | RegExp | (string | RegExp)[]; // no regex may match
+  ignoreCase?: boolean; // applies to contains/notContains only (default: false)
+}
+```
+
+**Every entry in a list is a conjunct.** `contains: ['a', 'b']` passes only when
+the text contains both, and the keys AND together. To express OR, declare two
+triggers — a workflow's trigger list already matches on the first one that fits:
+
+```typescript
+// AND — one trigger.
+push({ commitMessage: { contains: ['release:', 'approved'] } });
+
+// OR — two triggers.
+on: [
+  push({ branches: 'main', commitMessage: { contains: 'deploy:' } }),
+  push({ branches: 'main', commitMessage: { contains: 'release:' } }),
+];
+```
+
+Needles are **literal substrings** — no glob, no regex, no escaping, so a needle
+containing `.*` matches only the literal `.*`. Use `matches` / `notMatches` for a
+pattern; both accept a `RegExp` literal, and the `m` flag reaches the body:
+
+```typescript
+// The single most common use: skip marker commits.
+push({ branches: 'main', commitMessage: { notContains: ['[skip ci]', '[ci skip]'] } });
+
+// Ignore dependency-bump noise across an organization.
+push({ commitMessage: { notMatches: /^chore\(deps\):/ } });
+
+// Require a conventional-commit prefix and forbid a WIP marker.
+pr({ target: 'main', commitMessage: { matches: /^(feat|fix)\(/, notContains: 'WIP' } });
+
+// Match a trailer in the commit body.
+push({ commitMessage: { matches: /^Fixes: #\d+$/m } });
+```
+
+`ignoreCase` affects `contains` and `notContains` only — a regex already carries
+its own flags, so write `/^feat:/i` rather than expecting `ignoreCase` to reach
+it.
+
+**Fail-visible evaluation.** Some events carry no message at all. A
+branch-deletion push has no head commit, and a self-hosted forge may publish
+none. The trigger then does **not** match, and the decision trace records it as
+`indeterminate` rather than as an exclusion. A `commitMessage` filter that cannot
+be evaluated never silently passes.
+
+**Compile-time validation.** `kici compile` rejects a malformed matcher. It
+refuses:
+
+- a matcher with no query key;
+- an `ignoreCase` that would affect nothing;
+- an empty needle list;
+- an empty-string needle (it would match every text);
+- a regex that is invalid or catastrophic (ReDoS-prone).
+
 ### tag()
 
 Create a tag trigger. Returns a frozen `TagTriggerConfig`.

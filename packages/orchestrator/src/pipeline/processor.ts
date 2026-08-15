@@ -14,12 +14,14 @@
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { sql, type Kysely } from 'kysely';
+import { githubDisplayMessage } from '../providers/github/commit-message.js';
 import type { Database } from '../db/types.js';
 import type { SandboxAllowListReader } from './sandbox-allowlist-reader.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { DedupCache } from '../webhook/dedup.js';
 import type { ProviderRegistry, ProviderBundle } from '../provider-registry.js';
 import type { LockFileCache } from '../lockfile-cache.js';
+import type { ContentRequirementsCache } from '../content-requirements-cache.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { PlatformClient } from '../ws/platform-client.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
@@ -29,6 +31,8 @@ import type { DepCache } from '../cache/index.js';
 import type { PendingBuildTracker } from '../cache/index.js';
 import type { PendingInitTracker } from '../cache/pending-inits.js';
 import type { PendingDynamicTracker } from '../cache/pending-dynamics.js';
+import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
+import type { GlobalEvalRoundCache } from '../cache/global-eval-round-cache.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { AgentRegistry } from '../agent/registry.js';
@@ -37,6 +41,7 @@ import type { RunCoordinator } from '../cluster/coordinator.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 import type { TeamMembershipLookup } from '../approvals/team-membership-lookup.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import type { LogWriter } from '../reporting/log-writer.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { ContributorCache } from '../security/contributor-cache.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
@@ -641,31 +646,15 @@ export function extractInboundRepoIdentifier(payload: unknown): string | null {
 }
 
 /**
- * Extract the first line of the commit message from a webhook payload.
- * Handles push (head_commit.message) and PR (pull_request.title) events.
+ * Extract the first line of the commit message from a webhook payload, for run
+ * display. Handles push (head_commit.message), PR (pull_request.title) and
+ * issue_comment (issue.title) events.
+ *
+ * The Tier-0 `commitMessage` trigger filter deliberately reads a DIFFERENT text
+ * (the full message, and PR title + body) — see `githubFilterText`.
  */
 export function extractCommitMessage(event: string, payload: unknown): string | undefined {
-  const p = payload as Record<string, unknown>;
-  if (event === 'push') {
-    const headCommit = p.head_commit as { message?: string } | undefined;
-    if (headCommit?.message) {
-      // Take first line only
-      return headCommit.message.split('\n')[0];
-    }
-  }
-  if (
-    event === 'pull_request' ||
-    event === 'pull_request_review' ||
-    event === 'pull_request_review_comment'
-  ) {
-    const pr = p.pull_request as { title?: string } | undefined;
-    if (pr?.title) return pr.title;
-  }
-  if (event === 'issue_comment') {
-    const issue = p.issue as { title?: string } | undefined;
-    if (issue?.title) return issue.title;
-  }
-  return undefined;
+  return githubDisplayMessage(event, payload);
 }
 
 /**
@@ -759,7 +748,31 @@ export function summarizeApprovalClauses(
 export interface ProcessingDeps {
   dedup: DedupCache;
   providerRegistry: ProviderRegistry;
+  /**
+   * Re-register the provider bundle for a generic routing key from server
+   * truth, returning true when a bundle is now present.
+   *
+   * The registry is an in-memory CACHE of `generic_webhook_sources`, populated
+   * by three independent paths (startup enumeration, the admin write handler,
+   * and the LISTEN/NOTIFY drain). None of them can guarantee the entry is
+   * present for a delivery that arrives at an arbitrary moment, and a miss is
+   * not benign: `getByRoutingKey` used to substitute an unrelated `generic:`
+   * bundle whose normalizer reports "this payload has no repository", so the
+   * delivery was discarded with nothing above `debug` to say why.
+   *
+   * Optional — hand-built test deps and wirings with no generic-source manager
+   * keep the previous behaviour (a miss stays a miss, reported loudly).
+   */
+  ensureProviderBundle?: (routingKey: string) => Promise<boolean>;
   lockFileCache: LockFileCache;
+  /**
+   * Cache for the Tier-1 `requires` static content filter (source-file bytes at
+   * a ref, keyed by (repo, sha, path)). Optional so hand-built test deps and
+   * independent deployments that never use `requires` keep working; when absent,
+   * a candidate carrying `requires` is dropped fail-visible rather than
+   * dispatched unfiltered (see content-filter.ts).
+   */
+  contentRequirementsCache?: ContentRequirementsCache;
   dispatcher: Dispatcher;
   /** Null/undefined in Independent mode. send() buffers when disconnected. */
   platformClient?: PlatformClient;
@@ -777,6 +790,21 @@ export interface ProcessingDeps {
   pendingInits?: PendingInitTracker;
   /** Pending dynamic tracker -- waits for agents to evaluate DynamicJobFn and return generated LockJob[]. */
   pendingDynamics?: PendingDynamicTracker;
+  /** Pending global-eval tracker -- waits for the pre-run round that decides which global workflows apply. */
+  pendingGlobalEvals?: PendingGlobalEvalTracker;
+  /** Round-result cache for the pre-run global eval round. Optional -- if not set, every round re-runs. */
+  globalEvalCache?: GlobalEvalRoundCache;
+  /** Cluster default for the whole-round budget handed to the eval agent (ms).
+   *  The live per-cluster override is `cluster_settings.global_eval_round_timeout_ms`. */
+  globalEvalRoundTimeoutMs?: number;
+  /** Cluster default for the per-candidate budget handed to the eval agent (ms).
+   *  The live per-cluster override is `cluster_settings.global_eval_candidate_timeout_ms`. */
+  globalEvalCandidateTimeoutMs?: number;
+  /** Cluster default for the orchestrator's own ceiling on awaiting a round (ms).
+   *  Unlike the two budgets above, this one is enforced here rather than by the
+   *  agent, so it also bounds a round no agent ever picked up. The live
+   *  per-cluster override is `cluster_settings.global_eval_wait_timeout_ms`. */
+  globalEvalWaitTimeoutMs?: number;
   /** Commit status reporter for setting pending/success/failure/error on commits. Optional. */
   checkRunReporter?: CheckRunReporter;
   /** Execution tracker for DB persistence. Optional -- if not set, execution tracking is skipped. */
@@ -813,6 +841,13 @@ export interface ProcessingDeps {
   secretKey?: string;
   /** Log storage backend for persisting webhook payloads. Optional -- if not set, payload storage is skipped. */
   logStorage?: LogStorage;
+  /**
+   * Durable step-log writer. Optional -- when present, the deferred-init path
+   * uses it to surface a post-init env warning on the run's log stream so a
+   * blocking `kici run remote` test run prints it (the accept response has
+   * already been returned by the time the init round resolves).
+   */
+  logWriter?: Pick<LogWriter, 'appendChunk' | 'drain'>;
   /** Context store for looking up deployment contexts. Optional -- if not set, context features are inactive. */
   contextStore?: ContextStore;
   /** Variable store for resolving context variables. Optional -- if not set, context vars are not merged. */

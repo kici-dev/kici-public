@@ -40,7 +40,7 @@ describeDb('migration 078_org_settings_backup_staleness', () => {
     // org_settings must exist before the column add — apply migrations 001..078.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await db.destroy();

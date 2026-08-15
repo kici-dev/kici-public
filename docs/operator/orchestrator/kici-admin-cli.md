@@ -95,7 +95,7 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 
 - **owner** -- full access. Use for bootstrap and token management.
 - **admin** -- day-to-day operations (secrets, sources, config). Cannot manage tokens or rotate keys.
-- **auditor** -- read-only access to contexts, audit logs, and run status. Cannot read secret values.
+- **auditor** -- read-only access to contexts, audit logs, run status, the event log (metadata only), the access log, and the event dead-letter queue. Cannot read secret values, event-log payloads, or mutate anything.
 
 > **Note:** These roles govern the orchestrator admin API only. They are entirely separate from the SaaS dashboard RBAC system (org member roles, custom roles, permission matrices) which is managed through the dashboard UI and applies to OIDC-authenticated users.
 
@@ -109,7 +109,7 @@ The full command reference is split by area:
 - [Agents, peers & hosts](./kici-admin/agents-peers-hosts.md) — `agent`, `peer`, `join`, `host`
 - [Runs, execution & events](./kici-admin/runs-execution-events.md) — `runs`, `execution`, `check-run`, `queue`, `registration`, `workflow`, `event`, `event-dlq`
 - [Cluster & infrastructure](./kici-admin/cluster-and-infra.md) — `orchestrator`, `cluster`, `cluster-name`, `cluster-settings`, `scaler`, `firecracker`
-- [Org settings](./kici-admin/org-settings.md) — `org-settings`
+- [Org settings](./kici-admin/org-settings.md) — `org-settings`, `trust-policy`
 - [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
 
 Each area page carries a `## Guide` section (per-namespace concepts and worked examples) and a `## Reference` section (the always-current generated signature list for that area's commands).

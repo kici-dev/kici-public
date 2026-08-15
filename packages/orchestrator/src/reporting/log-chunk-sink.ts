@@ -7,9 +7,12 @@
  * behave identically — a worker-dispatched job's logs are persisted, counted
  * and forwarded exactly like a locally-dispatched one's.
  *
- * The storage key is derived from `executionTracker.getJobName`, the same call
- * `ExecutionTracker.onStepStatus` uses to fill `execution_steps.log_path`, so
- * the reader and the writer cannot disagree about the naming rule.
+ * The storage key is derived from `executionTracker.resolveJobName`, the same
+ * call `ExecutionTracker.onStepStatus` uses to fill `execution_steps.log_path`,
+ * so the reader and the writer cannot disagree about the naming rule — the
+ * resolver falls back to `dispatch_queue.job_name` during the dispatch window
+ * before in-memory job state is populated, which is what stops an early chunk
+ * from being persisted under an unreadable `job-{jobId}` path.
  */
 import type { LogStream } from '@kici-dev/engine';
 import type { LogWriter } from './log-writer.js';
@@ -36,8 +39,8 @@ export interface LogChunkSinkDeps {
   stepLogBuffer?: StepLogBuffer;
   /** Durable step-log persistence. Absent when the orchestrator has no database. */
   logWriter?: LogWriter;
-  /** Resolves the job name that names the storage path. */
-  executionTracker?: { getJobName(runId: string, jobId: string): string | undefined };
+  /** Resolves the job name that names the storage path (durable fallback). */
+  executionTracker?: { resolveJobName(runId: string, jobId: string): Promise<string> };
   /**
    * Forward to the Platform for browser fan-out. Absent in independent mode.
    * The caller wraps the chunk in the `log.chunk` envelope, which keeps this
@@ -49,7 +52,12 @@ export interface LogChunkSinkDeps {
 export function createLogChunkSink(deps: LogChunkSinkDeps): (chunk: NormalizedLogChunk) => void {
   const attrs = { source: deps.source };
 
-  return (chunk) => {
+  // Async so the storage path can resolve the job name through the durable
+  // resolver. Callers invoke this fire-and-forget (the returned promise is
+  // ignored), and the synchronous side effects — metrics, the in-memory tail
+  // buffer, Platform fan-out — all run before the first `await`, so making the
+  // sink async does not delay them.
+  return async (chunk) => {
     if (chunk.lines.length === 0) return;
 
     logChunksReceivedTotal.add(1, attrs);
@@ -59,8 +67,12 @@ export function createLogChunkSink(deps: LogChunkSinkDeps): (chunk: NormalizedLo
       chunk.lines,
     );
 
+    deps.forwardToPlatform?.(chunk);
+
     if (deps.logWriter) {
-      const jobName = deps.executionTracker?.getJobName(chunk.runId, chunk.jobId) ?? chunk.jobId;
+      const jobName = deps.executionTracker
+        ? await deps.executionTracker.resolveJobName(chunk.runId, chunk.jobId)
+        : chunk.jobId;
       deps.logWriter.appendChunk(
         chunk.runId,
         jobName,
@@ -76,7 +88,5 @@ export function createLogChunkSink(deps: LogChunkSinkDeps): (chunk: NormalizedLo
       const byteCount = chunk.lines.reduce((sum, line) => sum + line.length + 1, 0);
       logBytesStoredTotal.add(byteCount, attrs);
     }
-
-    deps.forwardToPlatform?.(chunk);
   };
 }

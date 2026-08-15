@@ -65,18 +65,34 @@ function createMockDb(
     countResult?: { count: number };
     updateResult?: { numUpdatedRows: bigint };
     updateReturning?: unknown;
+    updatedRow?: unknown;
     deleteResult?: { numDeletedRows: bigint };
     insertReturning?: unknown;
   } = {},
 ) {
   const countResult = options.countResult ?? { count: 0 };
+  const selectFirstRow = 'selectFirstRow' in options ? options.selectFirstRow : countResult;
   const { db, mocks } = _createMockDb({
     selectRows: options.selectRows ?? [],
     // Route count queries through selectFirstRow since getDepth() uses
     // selectFrom().select(fn.countAll()).where().executeTakeFirst()
     // which goes through the select terminal chain.
-    selectFirstRow: 'selectFirstRow' in options ? options.selectFirstRow : countResult,
+    selectFirstRow,
     countResult,
+    // The pattern-free drain claims in ONE statement — an UPDATE whose
+    // sub-select picks the row — so the claimed row arrives via RETURNING,
+    // not via the select chain. `selectFirstRow: <row>` still means "the queue
+    // holds this claimable row", so mirror an EXPLICIT one here by default; a
+    // test that wants to model a LOST claim overrides `updatedRow` with
+    // undefined. The implicit countResult fallback is deliberately NOT
+    // mirrored — it is a sentinel for the depth chain, and feeding it to the
+    // claim would hand the drain a row-shaped object with no id.
+    updatedRow:
+      'updatedRow' in options
+        ? options.updatedRow
+        : 'selectFirstRow' in options
+          ? options.selectFirstRow
+          : undefined,
     updateResult: options.updateResult ?? { numUpdatedRows: 0n },
     updateReturning: options.updateReturning,
     deleteResult: options.deleteResult ?? { numDeletedRows: 0n },
@@ -456,7 +472,8 @@ describe('JobQueue', () => {
   describe('pinned host-fanout drain', () => {
     it('dequeueByPinnedAgent returns the pinned row', async () => {
       const row = makeDbRow({ id: 'pinned-1', pinned_agent_id: 'a1' });
-      const db = createMockDb({ selectFirstRow: row });
+      // numUpdatedRows = 1: this caller wins the conditional claim.
+      const db = createMockDb({ selectFirstRow: row, updateResult: { numUpdatedRows: 1n } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       const result = await queue.dequeueByPinnedAgent('a1');
@@ -537,8 +554,11 @@ describe('JobQueue', () => {
       // web-09 does not match ^kici:host:box- → JS post-filter rejects it.
       const wrong = await queue.dequeueForLabels(['kici:host:web-09']);
       expect(wrong).toBeNull();
-      // The row was filtered out in JS, so no conditional claim was attempted.
-      expect(db._mocks.set).not.toHaveBeenCalled();
+      // The row was filtered out in JS, so no per-row conditional claim was
+      // attempted. `set` alone no longer distinguishes that — the fast path is
+      // itself an UPDATE now — so key on the by-id claim's own terminal, which
+      // the fast path (a `returningAll()` chain) never touches.
+      expect(db._mocks.executeTakeFirst).not.toHaveBeenCalled();
     });
 
     it('exclude pattern blocks an otherwise-matching agent', async () => {
@@ -556,7 +576,9 @@ describe('JobQueue', () => {
 
       const blocked = await queue.dequeueForLabels(['role:web', 'kici:host:web-canary']);
       expect(blocked).toBeNull();
-      expect(db._mocks.set).not.toHaveBeenCalled();
+      // No per-row conditional claim — see the sibling test for why `set` is
+      // no longer the discriminator.
+      expect(db._mocks.executeTakeFirst).not.toHaveBeenCalled();
     });
 
     it('returns null when the conditional claim loses the race', async () => {
@@ -584,7 +606,7 @@ describe('JobQueue', () => {
         runs_on_labels: [],
         runs_on_patterns: [boxPattern],
       });
-      const db = createMockDb({ selectFirstRow: row });
+      const db = createMockDb({ selectFirstRow: row, updateResult: { numUpdatedRows: 1n } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       // Agent label does not match ^kici:host:box- → null despite the SQL hit.
@@ -598,7 +620,7 @@ describe('JobQueue', () => {
   describe('dequeueById with mandatoryLabels', () => {
     it('omits the gate predicate when agentMandatoryLabels is empty', async () => {
       const row = makeDbRow({ id: 'bound-1' });
-      const db = createMockDb({ selectFirstRow: row });
+      const db = createMockDb({ selectFirstRow: row, updateResult: { numUpdatedRows: 1n } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       const result = await queue.dequeueById('bound-1', ['linux', 'docker']);
@@ -610,7 +632,7 @@ describe('JobQueue', () => {
 
     it('adds the gate predicate when agentMandatoryLabels is non-empty', async () => {
       const row = makeDbRow({ id: 'bound-gated', runs_on_labels: ['linux', 'gpu'] });
-      const db = createMockDb({ selectFirstRow: row });
+      const db = createMockDb({ selectFirstRow: row, updateResult: { numUpdatedRows: 1n } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       const result = await queue.dequeueById('bound-gated', ['linux', 'gpu'], ['gpu']);

@@ -7,6 +7,7 @@
 
 import type { WebhookNormalizer, SimulatedEvent, AccessCacheInvalidation } from '@kici-dev/engine';
 import { verifySignature as verifyHmacSignature } from '@kici-dev/engine/webhook/signature';
+import { githubFilterText } from './commit-message.js';
 
 /**
  * GitHub-specific implementation of WebhookNormalizer.
@@ -302,6 +303,7 @@ const handlePullRequest: EventHandler = (p, action, sender) => {
     prNumber: pr?.number,
     senderUsername: sender.username,
     senderUserId: sender.userId,
+    commitMessage: githubFilterText('pull_request', p),
     payload: p,
     provider: 'github',
   };
@@ -318,6 +320,7 @@ const handlePush: EventHandler = (p, _action, sender) => {
       targetBranch: ref.slice('refs/tags/'.length),
       senderUsername: sender.username,
       senderUserId: sender.userId,
+      commitMessage: githubFilterText('push', p),
       payload: p,
       provider: 'github',
     };
@@ -330,6 +333,7 @@ const handlePush: EventHandler = (p, _action, sender) => {
     targetBranch,
     senderUsername: sender.username,
     senderUserId: sender.userId,
+    commitMessage: githubFilterText('push', p),
     payload: p,
     provider: 'github',
   };

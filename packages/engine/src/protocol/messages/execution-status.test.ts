@@ -870,3 +870,86 @@ describe('executionStatusSchema routingKey (per-run source attribution)', () => 
     expect(parsed.routingKey).toBeUndefined();
   });
 });
+
+describe('workflowRepoIdentifier (the repo that defines a global workflow)', () => {
+  const WORKFLOW_REPO = 'org/pipelines';
+
+  const status = {
+    type: 'execution.status' as const,
+    messageId: 'm-wfrepo-1',
+    runId: 'r-wfrepo-1',
+    workflowName: 'wf',
+    status: ExecutionRunStatus.enum.running,
+    repoIdentifier: 'org/source-repo',
+    startedAt: 1,
+    timestamp: 2,
+  };
+
+  const replayRun = {
+    runId: 'r-wfrepo-2',
+    workflowName: 'wf',
+    status: ExecutionRunStatus.enum.running,
+    repoIdentifier: 'org/source-repo',
+    jobCount: 0,
+    startedAt: 1,
+    jobs: [],
+  };
+
+  const replay = {
+    type: 'state.replay' as const,
+    messageId: 'm-wfrepo-2',
+    runs: [replayRun],
+    timestamp: 2,
+  };
+
+  it('carries workflowRepoIdentifier on execution.status alongside repoIdentifier', () => {
+    const parsed = executionStatusSchema.parse({
+      ...status,
+      workflowRepoIdentifier: WORKFLOW_REPO,
+    });
+    expect(parsed.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+    // The source repo is untouched — a global run belongs to both.
+    expect(parsed.repoIdentifier).toBe('org/source-repo');
+  });
+
+  it('leaves workflowRepoIdentifier undefined when an older orchestrator omits it', () => {
+    expect(executionStatusSchema.parse(status).workflowRepoIdentifier).toBeUndefined();
+  });
+
+  it('bounds workflowRepoIdentifier by REPO_IDENTIFIER_MAX', () => {
+    expect(
+      executionStatusSchema.safeParse({
+        ...status,
+        workflowRepoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX),
+      }).success,
+    ).toBe(true);
+    expect(
+      executionStatusSchema.safeParse({
+        ...status,
+        workflowRepoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX + 1),
+      }).success,
+    ).toBe(false);
+  });
+
+  it('carries workflowRepoIdentifier on a state.replay run (reconnect replay)', () => {
+    const parsed = stateReplaySchema.parse({
+      ...replay,
+      runs: [{ ...replayRun, workflowRepoIdentifier: WORKFLOW_REPO }],
+    });
+    expect(parsed.runs[0]!.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+    expect(parsed.runs[0]!.repoIdentifier).toBe('org/source-repo');
+  });
+
+  it('leaves a replay run valid with workflowRepoIdentifier omitted', () => {
+    expect(stateReplaySchema.parse(replay).runs[0]!.workflowRepoIdentifier).toBeUndefined();
+  });
+
+  it('bounds a replay run workflowRepoIdentifier by REPO_IDENTIFIER_MAX', () => {
+    expect(
+      stateReplaySchema.safeParse({
+        ...replay,
+        runs: [{ ...replayRun, workflowRepoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX + 1) }],
+      }).success,
+    ).toBe(false);
+  });
+});

@@ -18,6 +18,7 @@ import {
   GitHubWebhookNormalizer,
   GitHubLockFileFetcher,
   GitHubChangedFilesFetcher,
+  GitHubFileContentsFetcher,
   GitHubCloneTokenProvider,
   GitHubRepoUrlBuilder,
   GitHubCheckStatusPoster,
@@ -236,6 +237,13 @@ export class SourceManager {
         normalizer: new GitHubWebhookNormalizer(),
         lockFileFetcher: new GitHubLockFileFetcher(ghConfig),
         changedFilesFetcher: new GitHubChangedFilesFetcher(ghConfig),
+        // A GitHub file-contents fetcher is scoped to one installation, so it is
+        // built per delivery from the webhook credentials (installation id).
+        fileContentsFetcherFactory: (credentials) => {
+          const installationId = (credentials as { installationId?: number }).installationId;
+          if (typeof installationId !== 'number') return undefined;
+          return new GitHubFileContentsFetcher(ghConfig, installationId);
+        },
         cloneTokenProvider: new GitHubCloneTokenProvider(ghConfig),
         repoUrlBuilder: new GitHubRepoUrlBuilder(),
         checkStatusPoster: new GitHubCheckStatusPoster((credentials) => {

@@ -22,7 +22,7 @@ The roster lives in the orchestrator's shared cluster database (one table, all i
 
 ## Pattern matching against roster labels
 
-A workflow's [`runsOnAll`](/user/sdk/runs-on-all/) predicate is matched against the
+A workflow's [`runsOnAll`](../../user/sdk/runs-on-all.md) predicate is matched against the
 labels recorded on each roster row. Every selector element — on both the include and the
 exclude side — can be an exact label, a glob (`kici:host:web-*`), or a regular expression
 (`/.*-canary$/`); the orchestrator infers the mode from the value. A host is in the
@@ -195,7 +195,7 @@ The fan-out then targets every declared host matching the selector **regardless 
 
 For this to be safe on already-initialized hosts, the bootstrap phases must be **idempotent [check-steps](../../user/sdk/core.md)**: each step's `check()` reports in-sync on a live, already-built box, so the partition / format / install steps **skip** there and only run on fresh boxes. "Runs on all, init-or-not" therefore means: fresh boxes get built, live boxes report in-sync and no-op. Re-running the workflow is a no-op everywhere — the now-initialized fresh box has a live agent (so its bring-up is skipped by the handoff guard) and its check-steps report in-sync.
 
-`includeUninitialized` is only meaningful alongside `runsOnAll`; it is ignored (with a warning) on a single-agent `runsOn` job. When the flag is absent, an un-agented declared host is governed by the job's [`onUnreachable`](/user/sdk/runs-on-all/) policy as before, with no bring-up attempt.
+`includeUninitialized` is only meaningful alongside `runsOnAll`; it is ignored (with a warning) on a single-agent `runsOn` job. When the flag is absent, an un-agented declared host is governed by the job's [`onUnreachable`](../../user/sdk/runs-on-all.md) policy as before, with no bring-up attempt.
 
 ### Pre-boot unlock (`preBootSend`)
 

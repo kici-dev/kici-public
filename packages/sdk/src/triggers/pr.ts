@@ -54,6 +54,8 @@ export function pr(config?: PrConfigInput): PrTriggerConfig {
     sourceBranches: Object.freeze([...sourceBranches]),
     paths: Object.freeze([...paths]),
     repos: Object.freeze([...repos]),
+    ...(config?.requires !== undefined && { requires: Object.freeze([...config.requires]) }),
+    ...(config?.commitMessage !== undefined && { commitMessage: config.commitMessage }),
     ...(config?.description !== undefined && { description: config.description }),
   };
 

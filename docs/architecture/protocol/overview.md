@@ -37,7 +37,8 @@ sequenceDiagram
 
     Note over S,O1: Webhook arrives from provider
 
-    S->>O1: webhook.relay (routingKey, deliveryId, event, payload)
+    S->>O1: webhook.relay.start (routingKey, deliveryId, event, chunkCount)
+    S->>O1: webhook.relay.chunk (sequence, data, final)
     O1->>S: webhook.ack (deliveryId)
 
     Note over O1,A: Layer 3: Orchestrator ↔ Agent

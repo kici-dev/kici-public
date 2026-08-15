@@ -1,6 +1,7 @@
 import type { $ as Shell } from 'zx';
 import type { EventPayload } from '../events/event-payloads.js';
 import type { FanoutPosition } from '../fanout-context.js';
+import type { RepoInfo } from '../context.js';
 
 // Re-export the typed discriminated union (replaces the old placeholder interface).
 export type { EventPayload } from '../events/event-payloads.js';
@@ -24,6 +25,14 @@ export interface RuleContext {
   changedFiles: string[];
   /** Availability of `changedFiles` (see `changedFiles`). */
   changedFilesStatus: import('@kici-dev/engine').ChangedFilesStatus;
+  /**
+   * The repo whose event triggered this run. Present for a global workflow and
+   * for any evaluation that runs with a checkout; undefined otherwise.
+   * Read through `.path`; never embed it in a job name (see FilterContext).
+   */
+  sourceRepo?: RepoInfo;
+  /** The repo that registered the workflow. Identical to `sourceRepo` outside a global workflow. */
+  workflowRepo?: RepoInfo;
   /** Environment variables */
   env: Record<string, string | undefined>;
   /** Operator-supplied, validated + coerced workflow-dispatch inputs. Empty when none declared. */

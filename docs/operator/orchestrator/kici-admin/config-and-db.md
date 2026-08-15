@@ -46,6 +46,10 @@ kici-admin db check-schema [--json]                            # Exit 2 on migra
 kici-admin db collation-check [--database-url <url>] [--json]   # Exit 2 on collation drift
 kici-admin db reindex --confirm --reason <text> [--database-url <url>]
 kici-admin db refresh-collation-version --reason <text> [--database-url <url>]
+
+# Backup / restore (direct DB — wraps pg_dump / pg_restore).
+kici-admin db backup [--output <path>] [--database-url <url>]
+kici-admin db restore --input <path> [--yes] [--database-url <url>]
 ```
 
 - `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
@@ -55,6 +59,11 @@ kici-admin db refresh-collation-version --reason <text> [--database-url <url>]
 - `collation-check` compares `pg_database.datcollversion` against the running libc collation version. Exit code 2 means the stamped and actual collation versions differ — a libc upgrade changed sort order out from under existing indexes.
 - `reindex` runs `REINDEX DATABASE CONCURRENTLY`, rebuilding every index under the current libc collation rules. Non-blocking but takes minutes and roughly 2× temporary disk. Requires `--confirm` and `--reason`.
 - `refresh-collation-version` runs `ALTER DATABASE … REFRESH COLLATION VERSION` — a metadata-only bump that clears the drift warning. Pair it with `db reindex` after a libc-base image rebuild so the indexes match the new collation. Requires `--reason`.
+- `backup` wraps `pg_dump -Fc` into a custom-format dump (default `./kici-orchestrator-backup-<timestamp>.dump`, override with `--output`) and writes a sidecar `<dump>.manifest.json` recording the creation time, byte size, secret-key version, Postgres server version, migrations hash, cluster id, and hostname. Each run is also recorded in the `backup_runs` table, which is what the [backup-freshness](./org-settings.md) WARN threshold reads.
+- `restore` wraps `pg_restore --clean --if-exists --no-owner` and is **destructive** — it drops and recreates the target's objects. It prompts before proceeding; pass `--yes` for scripted use. Afterwards it reports whether the dump carried encrypted secrets, because those only decrypt under the **same** `KICI_SECRET_KEY` the source orchestrator used.
+- Both require a `postgresql-client` on `PATH` whose major version is at least the server's, and both refuse rather than produce a half-usable dump when it is older. Credentials ride in `PG*` environment variables, never in argv, so the DB password never appears in the world-readable `/proc/<pid>/cmdline`.
+
+See [Database backup and restore](../db-backup-restore.md) for the full procedure, retention guidance, and the disaster-recovery drill.
 
 ## Reference
 

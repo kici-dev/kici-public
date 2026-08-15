@@ -176,3 +176,52 @@ describe('ExecutionTracker.getReplayDataWithDb', () => {
     expect(result).toEqual([]);
   });
 });
+
+/**
+ * The DB-backed half of the reconnect replay. After a restart the in-memory map
+ * is empty, so a terminal cross-repository global run reaches the Platform only
+ * through this branch — and its marker has to come off the row.
+ */
+describe('ExecutionTracker.getReplayDataWithDb cross-repo attribution', () => {
+  const SOURCE_REPO = 'org/source-repo';
+  const WORKFLOW_REPO = 'org/org-workflows';
+
+  function dbRun(workflowRepo: string | null): Record<string, unknown> {
+    return {
+      run_id: 'run-global',
+      workflow_name: 'ci',
+      status: 'success',
+      routing_key: 'github:1',
+      repo_identifier: SOURCE_REPO,
+      workflow_repo_identifier: workflowRepo,
+      sha: 'abc123',
+      ref: 'main',
+      started_at: new Date('2026-04-26T11:55:00Z'),
+      completed_at: new Date('2026-04-26T12:00:00Z'),
+      duration_ms: 300_000,
+      parent_run_id: null,
+      original_run_id: null,
+      triggered_by: null,
+      failure_reason: null,
+    };
+  }
+
+  it('carries the workflow repo of a DB-backed terminal global run', async () => {
+    const db = createMockDb({ runs: [dbRun(WORKFLOW_REPO)], jobs: [] });
+    const result = await new ExecutionTracker({ db }).getReplayDataWithDb(24);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+    // The source repo is untouched — a global run belongs to both.
+    expect(result[0].repoIdentifier).toBe(SOURCE_REPO);
+  });
+
+  it('omits the workflow repo for a DB-backed per-repository run', async () => {
+    // Positive control for the assertion above.
+    const db = createMockDb({ runs: [dbRun(null)], jobs: [] });
+    const result = await new ExecutionTracker({ db }).getReplayDataWithDb(24);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].workflowRepoIdentifier).toBeUndefined();
+  });
+});

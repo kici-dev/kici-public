@@ -381,6 +381,12 @@ export interface IngestOverflowBufferTable {
   status: Generated<string>;
   /** Last replay error, or null. */
   last_error: string | null;
+  /**
+   * When the row moved `buffered` → `replaying`; null while it is buffered.
+   * Separate from `captured_at` (which orders the FIFO drain) so a long-buffered
+   * row is not reclaimed the instant a worker picks it up.
+   */
+  claimed_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
 }
 
 // Convenience types for dispatch_queue
@@ -504,6 +510,20 @@ export interface ExecutionRunTable {
    * when resolving the actor to a KiCI user.
    */
   trigger_actor_user_id: string | null;
+  /**
+   * The repository that DEFINES this run's workflow, when that is not the
+   * repository the run acted on.
+   *
+   * `repo_identifier` is the repository the run acted on and whose code its
+   * jobs check out. For an organization-wide workflow dispatched against
+   * another repository, the workflow was authored somewhere else, and that
+   * authoring repository is recorded here. NULL means the two are the same —
+   * true of every per-repository run.
+   *
+   * Read by the rerun path, which must resolve the workflow from the
+   * repository that defines it rather than from the one it ran against.
+   */
+  workflow_repo_identifier: string | null;
   /** Human-readable reason why the run failed (null for non-failed runs). */
   failure_reason: string | null;
   /**
@@ -1642,8 +1662,6 @@ export interface OrgSettingsRepoPatternEntry {
 export interface OrgSettingsTable {
   /** Customer/org identifier (primary key) */
   customer_id: string;
-  /** Whether global workflows are enabled for this org */
-  global_workflows_enabled: ColumnType<boolean, boolean | undefined, boolean>;
   /** Repos allowed to author global workflows (null = any repo can author) */
   global_workflow_allowed_repos: ColumnType<
     OrgSettingsRepoPatternEntry[] | null,
@@ -1880,6 +1898,36 @@ export interface ClusterSettingsTable {
   >;
   cache_max_tarball_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   cache_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
+  /** LRU entry ceiling for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  lockfile_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Byte ceiling for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  lockfile_cache_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Entry TTL (ms) for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  lockfile_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /** LRU entry ceiling for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  content_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Byte ceiling for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  content_cache_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Entry TTL (ms) for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  content_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Wall-clock budget (ms) for a whole Tier-2 global eval round. NULL ⇒ the configured default. Read per round. */
+  global_eval_round_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /** Wall-clock budget (ms) for one candidate inside a round. NULL ⇒ the configured default. Read per round. */
+  global_eval_candidate_timeout_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /** LRU entry ceiling for the round-result cache. NULL ⇒ the configured default. Applies at next restart. */
+  global_eval_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * Orchestrator-side ceiling (ms) on waiting for one eval round to settle.
+   * Distinct from the two budgets above, which the agent enforces on itself: a
+   * round that never reaches an agent — or an agent that wedges before its own
+   * budget starts — is only bounded here. NULL ⇒ the configured default. Read
+   * per round.
+   */
+  global_eval_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
    * Retention window in days for `check_run_tracking` rows. The hourly cleanup
    * sweep deletes rows untouched for longer than this; 0 disables the sweep.
@@ -1892,6 +1940,24 @@ export interface ClusterSettingsTable {
    * 0 disables fast-fail, leaving `queue_timeout_ms` as the only backstop.
    */
   unroutable_grace_ms: ColumnType<number | null, number | null | undefined, number | null>;
+  /**
+   * Fleet-wide master switch for global workflows. NULL ⇒ the orchestrator's
+   * configured default (`KICI_GLOBAL_WORKFLOWS_ENABLED`, default false). Read
+   * per policy decision through `ClusterSettingsReader.tryGetBoolean`, which
+   * reports an unreadable row separately so the gate can fail closed.
+   */
+  global_workflows_enabled: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
+  /**
+   * How long a `replaying` claim on `ingest_overflow_buffer` may stand before
+   * the drain pass reclaims the row for another worker. NULL ⇒ the
+   * orchestrator's configured default. Must exceed the longest a single
+   * delivery's pipeline can legitimately run.
+   */
+  ingest_overflow_claim_timeout_ms: ColumnType<
+    number | null,
+    number | null | undefined,
+    number | null
+  >;
   concurrency_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   agent_token_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**

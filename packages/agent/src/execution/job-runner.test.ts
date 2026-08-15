@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import type { JobDispatch, AgentToOrchestratorMessage } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
 import {
@@ -6,8 +6,11 @@ import {
   type JobRunnerDeps,
   buildEvalNeedsContext,
   resolveJobWorkDir,
+  buildEvalShell,
 } from './job-runner.js';
 import type { JobExecutionResult } from './sandbox/types.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // --- vi.hoisted shared mock state ---
 
@@ -110,9 +113,11 @@ vi.mock('./workflow-loader.js', () => ({
   extractDynamicJobFn: vi.fn().mockReturnValue(async () => [{ name: 'generated-job', steps: [] }]),
 }));
 
-// Mock init-runner (used by handleInitJob to evaluate dynamic fields).
+// Mock init-runner (used by handleInitJob to evaluate dynamic fields, and by
+// handleDynamicJobFn to evaluate a workflow-level filter before the generator).
 vi.mock('./init-runner.js', () => ({
   evaluateDynamicFields: vi.fn().mockResolvedValue({}),
+  evaluateWorkflowFilter: vi.fn().mockResolvedValue(true),
 }));
 
 // Mock dynamic-job-serializer (used by handleDynamicJobFn to serialize
@@ -1102,6 +1107,77 @@ describe('JobRunner', () => {
     expect(states[states.length - 1]).toBe('success');
   });
 
+  it('dynamic eval job: a false filter verdict generates no jobs and never runs the generator', async () => {
+    // Without this the filter would be entirely inert for a workflow whose jobs
+    // are all generated, and a mixed workflow would deterministically
+    // half-dispatch: static jobs suppressed, generated jobs running.
+    const { evaluateWorkflowFilter } = await import('./init-runner.js');
+    const { extractDynamicJobFn } = await import('./workflow-loader.js');
+    (evaluateWorkflowFilter as Mock).mockResolvedValueOnce(false);
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeDynamicDispatch({ hasFilter: true }));
+
+    expect(evaluateWorkflowFilter).toHaveBeenCalledTimes(1);
+    // The generator is never reached — a suppressed workflow must not run
+    // customer code whose output nothing can consume.
+    expect(extractDynamicJobFn).not.toHaveBeenCalled();
+    const success = deps.messages.find(
+      (m) => m.type === 'job.status' && (m as { state: string }).state === 'success',
+    ) as { data?: { dynamicJobs?: unknown[]; dynamicComplete?: boolean } } | undefined;
+    expect(success?.data?.dynamicComplete).toBe(true);
+    expect(success?.data?.dynamicJobs).toEqual([]);
+  });
+
+  it('dynamic eval job: a passing filter runs the generator as usual', async () => {
+    // Positive control for the test above: identical setup, opposite verdict.
+    const { evaluateWorkflowFilter } = await import('./init-runner.js');
+    const { extractDynamicJobFn } = await import('./workflow-loader.js');
+    (evaluateWorkflowFilter as Mock).mockResolvedValueOnce(true);
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeDynamicDispatch({ hasFilter: true }));
+
+    expect(evaluateWorkflowFilter).toHaveBeenCalledTimes(1);
+    expect(extractDynamicJobFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('dynamic eval job: no filter declared means no filter call at all', async () => {
+    const { evaluateWorkflowFilter } = await import('./init-runner.js');
+    const { extractDynamicJobFn } = await import('./workflow-loader.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeDynamicDispatch());
+
+    expect(evaluateWorkflowFilter).not.toHaveBeenCalled();
+    expect(extractDynamicJobFn).toHaveBeenCalledTimes(1);
+  });
+
+  it('init job: asks evaluateDynamicFields for the filter verdict and gives it a context', async () => {
+    const { evaluateDynamicFields } = await import('./init-runner.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeInitDispatch({ hasFilter: true }));
+
+    const call = (evaluateDynamicFields as Mock).mock.calls.at(-1)!;
+    expect(call[3]).toMatchObject({ hasFilter: true });
+    // The 6th argument is the filter context; without it the evaluator throws
+    // rather than filtering against an empty tree.
+    expect(call[5]).toBeDefined();
+    expect(call[5].sourceRepo).toEqual(call[5].workflowRepo);
+  });
+
+  it('init job: no filter declared means no filter context is built', async () => {
+    const { evaluateDynamicFields } = await import('./init-runner.js');
+
+    const deps = makeDeps();
+    await new JobRunner(deps).execute(makeInitDispatch());
+
+    const call = (evaluateDynamicFields as Mock).mock.calls.at(-1)!;
+    expect(call[3]).toMatchObject({ hasFilter: false });
+    expect(call[5]).toBeUndefined();
+  });
+
   it('dynamic eval job: builds ctx.needs from the result-aware upstream snapshot', async () => {
     const { extractDynamicJobFn } = await import('./workflow-loader.js');
     let capturedCtx: any;
@@ -1310,5 +1386,98 @@ describe('resolveJobWorkDir', () => {
       '/tmp/kici-test123',
       expect.objectContaining({ recursive: true, force: true }),
     );
+  });
+});
+
+describe('global eval round: shell cwd matches the sandbox re-evaluation', () => {
+  // The property is a cross-module invariant no unit test can observe without
+  // driving a whole fork-runner, so assert it at the source level.
+  //
+  // The sandbox re-evaluation hands a generator the AMBIENT `$`
+  // (`workflow-loader.ts` does a bare `const { $ } = await import('zx')`), whose
+  // cwd is the forked runner's — `fork-runner.ts` spawns with
+  // `cwd: effectiveWorkDir`, i.e. `options.workDir`, the PARENT of `workflow/`
+  // and `source/`. If the round rooted its own shell at `workflowDir`, a
+  // generator running a relative `$` command would see the workflow repo here
+  // and an almost-empty parent directory on re-eval — two different worlds.
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+
+  const jobRunnerSrc = read('./job-runner.ts');
+  const loaderSrc = read('./workflow-loader.ts');
+  const forkRunnerSrc = read('./sandbox/fork-runner.ts');
+
+  it('finds all three call sites (positive control — guards against a vacuous pass)', () => {
+    expect(jobRunnerSrc).toContain('await buildEvalShell(');
+    expect(loaderSrc).toContain("const { $ } = await import('zx');");
+    expect(forkRunnerSrc).toContain('cwd: effectiveWorkDir || undefined');
+  });
+
+  it('roots the round shell at workDir, not workflowDir', () => {
+    expect(jobRunnerSrc).toContain('await buildEvalShell(workDir, evalStreamLine)');
+    expect(jobRunnerSrc).not.toContain('buildEvalShell(workflowDir');
+  });
+
+  it('the sandbox side derives its cwd from options.workDir', () => {
+    expect(forkRunnerSrc).toContain("const effectiveWorkDir = options.workDir ?? '/workspace'");
+  });
+});
+
+describe('buildEvalShell', () => {
+  const PROBE = 'KICI_BUILD_EVAL_SHELL_PROBE';
+  afterEach(() => {
+    delete process.env[PROBE];
+  });
+
+  it('resolves env LIVE, so a key set after the shell is built reaches a subprocess', async () => {
+    // The round applies the seven KICI_* keys INSIDE runGlobalEvalRound, after
+    // the shell is built. A `{ ...process.env }` spread snapshots at build time,
+    // so a filter that shells out would see nothing here while the sandbox
+    // re-evaluation's ambient `$` — which resolves process.env at spawn — does.
+    // Same two-worlds determinism failure as the cwd, one layer down.
+    delete process.env[PROBE];
+    const shell = await buildEvalShell(process.cwd(), () => {});
+
+    // Positive control: the key is genuinely absent at build time, so a passing
+    // assertion below cannot be explained by it having been set all along.
+    const beforeSet = (await shell`printenv ${PROBE} || true`).stdout.trim();
+    expect(beforeSet).toBe('');
+
+    process.env[PROBE] = 'set-after-build';
+    const afterSet = (await shell`printenv ${PROBE} || true`).stdout.trim();
+    expect(afterSet).toBe('set-after-build');
+  });
+
+  it('roots the shell at the cwd it is given', async () => {
+    const shell = await buildEvalShell('/tmp', () => {});
+    expect((await shell`pwd`).stdout.trim()).toBe('/tmp');
+  });
+
+  it('routes subprocess output through the caller-supplied sink, not the streamer', async () => {
+    const seen: string[] = [];
+    const shell = await buildEvalShell(process.cwd(), (line) => seen.push(line));
+
+    await shell`echo hello-from-subprocess`;
+
+    // Positive control on the sink itself: it fired at all, so the closed-guard
+    // test below is asserting suppression rather than a sink that never emits.
+    expect(seen.join('\n')).toContain('hello-from-subprocess');
+  });
+
+  it('emits nothing once the caller-supplied sink is closed', async () => {
+    // The guard the handler installs: LogStreamer.destroy() sets no closed flag
+    // and addLine buffers unconditionally, so without this a late subprocess
+    // line emits a log.chunk for a step already reported terminal.
+    const seen: string[] = [];
+    let closed = false;
+    const shell = await buildEvalShell(process.cwd(), (line) => {
+      if (!closed) seen.push(line);
+    });
+
+    await shell`echo before-close`;
+    expect(seen.join('\n')).toContain('before-close');
+
+    closed = true;
+    await shell`echo after-close`;
+    expect(seen.join('\n')).not.toContain('after-close');
   });
 });

@@ -19,7 +19,7 @@ sequenceDiagram
     Note over Orchestrator: Encrypt (AES-256-GCM)<br/>Store in scoped_secrets table
 
     Note over Orchestrator: Webhook arrives
-    Note over Orchestrator: 1. Load lock file<br/>2. Match environment for job<br/>3. Resolve scope bindings<br/>4. Fetch + decrypt secrets<br/>5. Produce secrets (flat) + namespacedSecrets (per-scope)<br/>6. Include both in job.dispatch
+    Note over Orchestrator: 1. Load lock file<br/>2. Match context for job<br/>3. Resolve scope bindings<br/>4. Fetch + decrypt secrets<br/>5. Produce secrets (flat) + namespacedSecrets (per-scope)<br/>6. Include both in job.dispatch
 
     Orchestrator->>Agent: WS job.dispatch { secrets, namespacedSecrets }
     Note over Agent: Workflow-runner IPC:<br/>buildMergedFlatSecrets()<br/>createStepSecrets() → ctx.secrets (flat)<br/>LogMasker registers all secret values
@@ -122,7 +122,7 @@ interface SecretStore {
 
 ### PG backend
 
-The default backend stores secrets in the `scoped_secrets` PostgreSQL table. Each value is AES-256-GCM encrypted with the master key. Secrets are organized by org ID and scope (e.g., environment name, repo pattern).
+The default backend stores secrets in the `scoped_secrets` PostgreSQL table. Each value is AES-256-GCM encrypted with the master key. Secrets are organized by org ID and scope (e.g., context name, repo pattern).
 
 Tables:
 
@@ -153,42 +153,48 @@ The orchestrator initializes available backends at startup and registers them in
 
 ## Access control
 
-Secret access control is handled by the environment protection pipeline, not by the secrets subsystem directly. Environments define branch restrictions, trigger type filters, and repository patterns. When a job targets an environment, the protection pipeline evaluates these rules before the job is dispatched. If the environment gates pass, the SecretResolver resolves secrets for that environment using scope bindings.
+Secret access control is handled by the context protection gates, not by the secrets subsystem directly. Contexts define branch restrictions, trigger type filters, and repository patterns (the `branch_restrictions`, `trigger_type_filters` and `repo_patterns` columns on the `contexts` table). When a job targets a context, those gates are evaluated before the job is dispatched. If they pass, the `SecretResolver` resolves secrets for that context using scope bindings.
 
-This separation means the secrets subsystem focuses on storage and encryption, while the environment system handles access policy.
+This separation means the secrets subsystem focuses on storage and encryption, while the context system handles access policy.
 
 ## Secret resolution at dispatch time
 
-The `SecretResolver` orchestrates the full resolution flow. It resolves secrets for a job by matching environment bindings against scoped secrets:
+The `SecretResolver` orchestrates the full resolution flow. It resolves secrets for a job by matching context bindings against scoped secrets:
 
 ```typescript
-resolveForJob(orgId: string, environmentName: string): Promise<Record<string, string>>
+resolveForJob(
+  orgId: string,
+  contextName: string,
+  hostCtx?: HostFacts,
+): Promise<Record<string, string>>
 ```
 
 Resolution steps:
 
-1. Look up the environment by name in the org
-2. Get secret scope bindings for that environment
-3. Load all scoped secrets for the org
-4. Match and merge using longest-path-wins semantics (via the engine's `resolveSecretsForEnvironment`)
+1. Look up the context by name in the org
+2. Get secret scope bindings for that context
+3. Load all scoped secrets for the org (across every registered backend, each scope prefixed with its backend name)
+4. Match and merge by the precedence tuple `(host specificity, scope depth)` -- a per-host binding beats a fleet-wide one, then longest scope path wins (via the engine's `resolveSecretsForContext`, which delegates precedence to `resolveSecretsWithProvenance`)
 5. Return a flat `Record<string, string>` of decrypted secrets
+
+The optional `hostCtx` carries a fan-out child's identity. When supplied, each binding is gated by its `host_pattern` and its `scope_pattern` is templated per-child (`${agentId}` / `${host}` / `${label:NAME}`); when omitted, only fleet-wide (`'**'`) non-templated bindings contribute. `resolveForJobWithMeta` returns the same resolution with per-key provenance instead of bare values.
 
 ## Test-run secret resolution
 
 `kici run remote` dispatches a test run rather than a webhook-driven run, and the orchestrator resolves secrets for it through a dedicated test-scoped branch. The result combines two sources:
 
 1. **CLI-uploaded local secrets.** The developer's local secret values (from `.kici/.secrets`, `.kici/.env.local`, `.kici/secrets.yaml`, and `--env` flags) are uploaded as an **encrypted** blob with the run. The orchestrator decrypts it only to inject the values into the agent for that run.
-2. **Test-environment secrets.** The orchestrator resolves secrets from the `scoped_secrets` store for the job's own declared `environment` (flat; static strings and pure inline `environment` expressions evaluated against the fixture event — impure dynamic environments are not evaluated for test runs) and for each fixture `secrets: { ctx: envName }` mapping (namespaced under context `ctx`).
+2. **Test-context secrets.** The orchestrator resolves secrets from the `scoped_secrets` store for the job's own declared `context` (flat; static strings and pure inline `context` expressions evaluated against the fixture event — impure dynamic contexts are not evaluated for test runs) and for each fixture `secrets: { ctx: contextName }` mapping (namespaced under context `ctx`).
 
 The two sources are merged so that **CLI-uploaded values win** on key collision, giving the developer a per-run override.
 
-**`allowLocalExecution` resolution filter.** Test-environment resolution is gated by the environment's `allow_local_execution` flag (default `false`):
+**`allowLocalExecution` resolution filter.** Test-context resolution is gated by the context's `allow_local_execution` flag (default `false`):
 
-- An environment with the flag off is never resolvable for a test run — its secrets are not loaded.
-- The gate applies to **all** remote test runs: a run whose matched workflow targets an environment with the flag off is rejected before dispatch.
-- A fixture mapping that points a context at a missing environment, or at one whose flag is off, **rejects the run** (fail-closed).
+- A context with the flag off is never resolvable for a test run — its secrets are not loaded.
+- The gate applies to **all** remote test runs: a run whose matched workflow targets a context with the flag off is rejected before dispatch.
+- A fixture mapping that points at a missing context, or at one whose flag is off, **rejects the run** (fail-closed).
 
-This keeps production secrets unreachable from test runs: only environments an operator has explicitly opted into test access (`allow_local_execution = true`) can contribute secrets, and the developer's own uploaded values stay encrypted end to end.
+This keeps production secrets unreachable from test runs: only contexts an operator has explicitly opted into test access (`allow_local_execution = true`) can contribute secrets, and the developer's own uploaded values stay encrypted end to end.
 
 ## RBAC model
 

@@ -81,6 +81,13 @@ describe('matchJsonPath', () => {
     expect(matchJsonPath(payload, { '$.status': '/^deployed$/' })).toBe(false);
   });
 
+  it('rejects a catastrophic /re/ regex (#3)', () => {
+    // Path must resolve to a string so the /re/ branch actually compiles.
+    expect(() => matchJsonPath({ x: 'aaaa' }, { '$.x': '/(a+)+$/' })).toThrow(
+      /unsafe|redos|regex/i,
+    );
+  });
+
   it('handles deeply nested objects', () => {
     const payload = {
       deployment: {

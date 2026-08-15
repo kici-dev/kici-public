@@ -1,6 +1,6 @@
 ---
 title: Dynamic job generation
-description: ''
+description: How workflows generate jobs at runtime, and how the orchestrator evaluates and schedules them
 ---
 
 ## Overview
@@ -299,9 +299,9 @@ export default workflow('ci', {
 
 `dynamicJob(groupName, fn)` tags a DynamicJobFn with a group name. One factory = one group. Generated jobs inherit the group tag automatically. If you need multiple groups from one eval context, split into multiple `dynamicJob()` calls.
 
-### `ifUpstreamFailed` option
+### The `when` edge condition
 
-By default, when an upstream job fails, all downstreams are skipped (matching GitHub Actions semantics). Override this per-edge with the object form:
+By default, when an upstream job fails, all downstreams are skipped (matching GitHub Actions semantics). Override this per-edge with the object form of `needs`:
 
 ```typescript
 const cleanup = job('cleanup', {

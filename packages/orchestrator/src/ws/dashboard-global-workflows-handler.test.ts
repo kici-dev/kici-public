@@ -6,16 +6,41 @@ import {
 } from './dashboard-global-workflows-handler.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 import type { OrgSettings } from '../db/types.js';
+import { globalWorkflowsUpdateRequestSchema } from '@kici-dev/engine/protocol/dashboard-global-workflows';
+import type {
+  ClusterSettingRead,
+  ClusterSettingsReader,
+} from '../cluster/cluster-settings-reader.js';
 
 const ORG = 'kiciStg00001';
 
-function makeHandler(row: Record<string, unknown> | undefined) {
+/** A ClusterSettingsReader stand-in that returns a fixed read outcome. */
+function fakeClusterSettings(read: ClusterSettingRead<boolean>) {
+  return { tryGetBoolean: async () => read } as unknown as ClusterSettingsReader;
+}
+
+interface HandlerOpts {
+  row?: Record<string, unknown>;
+  /** Stored cluster switch value; `null` means unset → configured default. */
+  clusterEnabled?: boolean | null;
+  /** Applies when the cluster column is NULL. */
+  defaultEnabled?: boolean;
+  /** When true, the cluster read reports `{ ok: false }`. */
+  clusterUnreadable?: boolean;
+}
+
+function makeHandler(opts: HandlerOpts = {}) {
   const sent: unknown[] = [];
-  const { db, mocks } = createMockDb({ selectFirstRow: row });
+  const { db, mocks } = createMockDb({ selectFirstRow: opts.row });
+  const read: ClusterSettingRead<boolean> = opts.clusterUnreadable
+    ? { ok: false }
+    : { ok: true, value: opts.clusterEnabled ?? null };
   const handler = new DashboardGlobalWorkflowsHandler({
     customerId: ORG,
     send: (msg) => sent.push(msg),
     db,
+    clusterSettings: fakeClusterSettings(read),
+    globalWorkflowsEnabledDefault: opts.defaultEnabled ?? false,
   });
   return { handler, sent, mocks };
 }
@@ -23,7 +48,7 @@ function makeHandler(row: Record<string, unknown> | undefined) {
 describe('DashboardGlobalWorkflowsHandler', () => {
   describe('dashboard.global-workflows.get', () => {
     it('returns defaulted settings when no row exists', async () => {
-      const { handler, sent } = makeHandler(undefined);
+      const { handler, sent } = makeHandler({ row: undefined });
       const ok = await handler.handleMessage({
         type: 'dashboard.global-workflows.get',
         requestId: 'req-1',
@@ -43,16 +68,43 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       expect('routingKey' in msg.settings).toBe(false);
     });
 
+    it('reports the effective cluster value on get, with no org row', async () => {
+      const { handler, sent } = makeHandler({ clusterEnabled: true, row: undefined });
+      await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r1' });
+      expect((sent[0] as any).settings.enabled).toBe(true);
+    });
+
+    it('reports the effective cluster value on get, ignoring the org row entirely', async () => {
+      const { handler, sent } = makeHandler({
+        clusterEnabled: false,
+        row: { customer_id: ORG, global_workflow_allowed_repos: null },
+      });
+      await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r1' });
+      expect((sent[0] as any).settings.enabled).toBe(false);
+    });
+
+    it('falls back to the configured default when the cluster column is NULL', async () => {
+      const { handler, sent } = makeHandler({
+        clusterEnabled: null,
+        defaultEnabled: true,
+        row: undefined,
+      });
+      await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r1' });
+      expect((sent[0] as any).settings.enabled).toBe(true);
+    });
+
     it('projects an existing row into the settings shape', async () => {
       const now = new Date('2026-04-17T10:00:00Z');
       const { handler, sent } = makeHandler({
-        customer_id: ORG,
-        global_workflows_enabled: true,
-        global_workflow_allowed_repos: [{ pattern: 'myorg/ci-*' }],
-        global_workflow_denied_repos: null,
-        global_workflow_elevated_repos: [{ routingKey: 'github:42', pattern: 'myorg/ci-deploy' }],
-        created_at: now,
-        updated_at: now,
+        clusterEnabled: true,
+        row: {
+          customer_id: ORG,
+          global_workflow_allowed_repos: [{ pattern: 'myorg/ci-*' }],
+          global_workflow_denied_repos: null,
+          global_workflow_elevated_repos: [{ routingKey: 'github:42', pattern: 'myorg/ci-deploy' }],
+          created_at: now,
+          updated_at: now,
+        },
       });
       await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r' });
       const msg = sent[0] as any;
@@ -72,6 +124,8 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         customerId: ORG,
         send: (msg) => sent.push(msg),
         db,
+        clusterSettings: fakeClusterSettings({ ok: true, value: null }),
+        globalWorkflowsEnabledDefault: false,
       });
       await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r' });
       const msg = sent[0] as any;
@@ -83,18 +137,16 @@ describe('DashboardGlobalWorkflowsHandler', () => {
     it('upserts and re-reads the row on update', async () => {
       const updated = {
         customer_id: ORG,
-        global_workflows_enabled: true,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [{ pattern: 'myorg/blocked-*' }],
         global_workflow_elevated_repos: null,
         created_at: new Date('2026-04-17T10:00:00Z'),
         updated_at: new Date('2026-04-17T10:00:00Z'),
       };
-      const { handler, sent, mocks } = makeHandler(updated);
+      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: updated });
       await handler.handleMessage({
         type: 'dashboard.global-workflows.update',
         requestId: 'req-1',
-        enabled: true,
         deniedRepos: [{ pattern: 'myorg/blocked-*' }],
       });
       expect(mocks.insertInto).toHaveBeenCalledWith('org_settings');
@@ -102,10 +154,22 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       const response = sent.at(-1) as any;
       expect(response.type).toBe('dashboard.global-workflows.update.response');
       expect(response.settings.deniedRepos).toEqual([{ pattern: 'myorg/blocked-*' }]);
+      // The master switch is fleet-wide and read-only, projected from the cluster.
+      expect(response.settings.enabled).toBe(true);
+    });
+
+    it('an update carrying enabled fails schema validation', () => {
+      const parsed = globalWorkflowsUpdateRequestSchema.safeParse({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'r1',
+        actor: { type: 'user', id: 'u1' },
+        enabled: true,
+      });
+      expect(parsed.success).toBe(false);
     });
 
     it('setOrgId updates the customer_id used for queries', async () => {
-      const { handler, mocks } = makeHandler(undefined);
+      const { handler, mocks } = makeHandler({ row: undefined });
       handler.setOrgId('kiciStg99999');
       await handler.handleMessage({ type: 'dashboard.global-workflows.get', requestId: 'r' });
       expect(mocks.selectWhere).toHaveBeenCalledWith('customer_id', '=', 'kiciStg99999');
@@ -115,13 +179,12 @@ describe('DashboardGlobalWorkflowsHandler', () => {
   describe('buildPatch', () => {
     const existing: OrgSettings = {
       customer_id: ORG,
-      global_workflows_enabled: true,
       global_workflow_allowed_repos: [{ pattern: 'myorg/*' }],
       global_workflow_denied_repos: null,
       global_workflow_elevated_repos: [{ pattern: 'myorg/deployer' }],
       created_at: new Date(),
       updated_at: new Date(),
-    };
+    } as unknown as OrgSettings;
 
     it('preserves existing values when no fields are patched', () => {
       const patch = buildPatch(existing, {
@@ -129,11 +192,19 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         requestId: 'r',
       });
       expect(patch).toEqual({
-        enabled: true,
         allowedRepos: [{ pattern: 'myorg/*' }],
         deniedRepos: null,
         elevatedRepos: [{ pattern: 'myorg/deployer' }],
       });
+    });
+
+    it('no longer carries an enabled field', () => {
+      const patch = buildPatch(undefined, {
+        type: 'dashboard.global-workflows.update',
+        requestId: 'r',
+        allowedRepos: [{ pattern: 'myorg/*' }],
+      });
+      expect(patch).not.toHaveProperty('enabled');
     });
 
     it('applies an explicit deniedRepos list', () => {
@@ -168,10 +239,8 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       const patch = buildPatch(undefined, {
         type: 'dashboard.global-workflows.update',
         requestId: 'r',
-        enabled: true,
       });
       expect(patch).toEqual({
-        enabled: true,
         allowedRepos: null,
         deniedRepos: null,
         elevatedRepos: null,
@@ -180,10 +249,9 @@ describe('DashboardGlobalWorkflowsHandler', () => {
   });
 
   describe('rowToSettings', () => {
-    it('projects denied entries through verbatim', () => {
-      const row: OrgSettings = {
+    it('projects denied entries through verbatim and carries the supplied enabled', () => {
+      const row = {
         customer_id: ORG,
-        global_workflows_enabled: true,
         global_workflow_allowed_repos: null,
         global_workflow_denied_repos: [
           { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/blocked-*' },
@@ -191,16 +259,17 @@ describe('DashboardGlobalWorkflowsHandler', () => {
         global_workflow_elevated_repos: null,
         created_at: new Date(),
         updated_at: new Date(),
-      };
-      const projected = rowToSettings(ORG, row);
+      } as unknown as OrgSettings;
+      const projected = rowToSettings(ORG, row, true);
+      expect(projected.enabled).toBe(true);
       expect(projected.deniedRepos).toEqual([
         { routingKey: 'generic:kiciStg00001:src-b', pattern: 'myorg/blocked-*' },
       ]);
       expect(projected.allowedRepos).toBeNull();
     });
 
-    it('returns defaulted shape when no row exists', () => {
-      const projected = rowToSettings(ORG, undefined);
+    it('returns defaulted shape when no row exists, with the supplied enabled', () => {
+      const projected = rowToSettings(ORG, undefined, false);
       expect(projected).toEqual({
         customerId: ORG,
         enabled: false,

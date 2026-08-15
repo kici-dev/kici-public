@@ -174,3 +174,86 @@ describe('UniversalGitWebhookNormalizer — gitea + gogs + github presets', () =
     expect(ev!.targetBranch).toBe('main');
   });
 });
+
+describe('universal-git commit message extraction', () => {
+  const makeNormalizer = (preset: UniversalGitConfig['preset']) =>
+    new UniversalGitWebhookNormalizer({
+      routingKey: 'generic:org:src',
+      config: baseConfig({ preset }),
+    });
+
+  it('reads head_commit.message on a gitea-preset push', () => {
+    const n = makeNormalizer('gitea');
+    const event = n.normalizeEvent('push', null, {
+      ref: 'refs/heads/main',
+      after: 'sha1',
+      repository: { full_name: 'o/r', default_branch: 'main' },
+      head_commit: { message: 'feat: thing\n\n[skip ci]\n' },
+      commits: [{ message: 'older' }, { message: 'feat: thing\n\n[skip ci]\n' }],
+    });
+    expect(event?.commitMessage).toBe('feat: thing\n\n[skip ci]\n');
+  });
+
+  it('falls back to the LAST commits[] entry on a gogs-preset push (no head_commit)', () => {
+    const n = makeNormalizer('gogs');
+    const event = n.normalizeEvent('push', null, {
+      ref: 'refs/heads/main',
+      after: 'sha1',
+      repository: { full_name: 'o/r', default_branch: 'main' },
+      commits: [{ message: 'first' }, { message: 'second (head)' }],
+    });
+    expect(event?.commitMessage).toBe('second (head)');
+  });
+
+  it('is undefined when the configured path resolves to nothing', () => {
+    const n = makeNormalizer('gogs');
+    const event = n.normalizeEvent('push', null, {
+      ref: 'refs/heads/main',
+      after: 'sha1',
+      repository: { full_name: 'o/r', default_branch: 'main' },
+      commits: [],
+    });
+    expect(event?.commitMessage).toBeUndefined();
+  });
+
+  it('joins title and body structurally for a PR, accepting the GitLab spelling', () => {
+    const gitea = makeNormalizer('gitea');
+    expect(
+      gitea.normalizeEvent('pull_request', 'opened', {
+        repository: { full_name: 'o/r', default_branch: 'main' },
+        pull_request: {
+          title: 'Add deploy',
+          body: 'closes #4',
+          base: { ref: 'main' },
+          head: { ref: 'f' },
+        },
+      })?.commitMessage,
+    ).toBe('Add deploy\ncloses #4');
+
+    const gitlab = makeNormalizer('gitlab-repo');
+    expect(
+      gitlab.normalizeEvent('Merge Request Hook', null, {
+        project: { path_with_namespace: 'o/r', default_branch: 'main' },
+        object_attributes: {
+          title: 'MR',
+          description: 'desc',
+          target_branch: 'main',
+          source_branch: 'f',
+        },
+      })?.commitMessage,
+    ).toBe('MR\ndesc');
+  });
+
+  it('normalizes (does not throw) a PR event whose object_attributes is null', () => {
+    const gitlab = makeNormalizer('gitlab-repo');
+    let event: ReturnType<typeof gitlab.normalizeEvent>;
+    expect(() => {
+      event = gitlab.normalizeEvent('Merge Request Hook', null, {
+        project: { path_with_namespace: 'o/r', default_branch: 'main' },
+        object_attributes: null,
+      });
+    }).not.toThrow();
+    expect(event!.type).toBe('pull_request');
+    expect(event!.commitMessage).toBeUndefined();
+  });
+});

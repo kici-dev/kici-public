@@ -86,12 +86,18 @@ export function workflow(name: string, options: WorkflowOptions): Workflow {
       }
     }
   }
+  if (options.filter !== undefined && typeof options.filter !== 'function') {
+    throw new Error(
+      `workflow('${name}'): filter must be a function (got: ${typeof options.filter})`,
+    );
+  }
   return {
     _tag: 'Workflow' as const,
     name,
     jobs: options.jobs,
     on: normalizeTriggers(options.on),
     rules: options.rules,
+    filter: options.filter,
     description: options.description,
     hashFiles: options.hashFiles,
     registries: options.registries,

@@ -2897,6 +2897,13 @@ export const runListItemSchema = z.object({
   workflowName: z.string(),
   status: z.string(),
   repoIdentifier: z.string().nullable(),
+  /**
+   * The repository that DEFINES this run's workflow. Non-null only when it
+   * differs from `repoIdentifier` — i.e. this is an organization-wide global
+   * run, whose workflow file lives in another repo entirely. Optional so a
+   * client parsing a response from an older Platform still validates.
+   */
+  workflowRepoIdentifier: z.string().nullable().optional(),
   sha: z.string().nullable(),
   ref: z.string().nullable(),
   triggerEvent: z.string().nullable(),

@@ -41,6 +41,9 @@ const NON_LIMIT_INGEST_KNOBS = new Set<string>([
   'KICI_INGEST_OVERFLOW_REPLAY_INTERVAL_MS',
   'KICI_INGEST_OVERFLOW_REPLAY_BATCH',
   'KICI_INGEST_OVERFLOW_MAX_ATTEMPTS',
+  // A staleness deadline for a queue claim, not a capacity cap: there is no
+  // "current claim age" gauge for a limit overlay to sit beside.
+  'KICI_INGEST_OVERFLOW_CLAIM_TIMEOUT_MS',
 ]);
 
 describe('ingest knob ↔ limit-gauge parity', () => {

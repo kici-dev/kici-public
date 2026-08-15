@@ -9,6 +9,7 @@
  *   runs list                          List execution runs (table or JSON)
  *   runs show <runId>                  Show run detail with jobs and steps
  *   runs jobs <runId>                  List jobs for a run (optional steps)
+ *   runs logs <runId> --job <jobId>    Print a page of one step's log lines
  *   runs ephemeral-key <runId>         Show scrub status of the run's key
  *   runs secret-outputs <runId>        List secret outputs (masked / reveal)
  *
@@ -29,7 +30,7 @@
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
-import { ExecutionJobStatus } from '@kici-dev/engine';
+import { ExecutionJobStatus, type AgentStepLogs } from '@kici-dev/engine';
 
 /** Run summary shape returned by GET /api/v1/admin/runs. */
 interface RunSummaryDTO {
@@ -522,6 +523,49 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             ]);
             console.log(renderTable(stepHeaders, stepRows));
           }
+        }
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  // ── runs logs <runId> ──────────────────────────────────────────
+  // The only kici-admin path to a step's log lines. It reads the admin route
+  // rather than the dashboard plane, which is what lets it serve a global eval
+  // round: that round writes no execution_runs row, so the dashboard cannot
+  // address it at all. Find the round's ids with
+  // `kici-admin queue list --workflow-name '__globaleval__<owner>/<repo>' --json`
+  // — the row's `id` is the job id and `run_id` is the run id.
+  runs
+    .command('logs <runId>')
+    .description(
+      'Print a page of a step log (dogfooded via /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
+    )
+    .requiredOption('--job <jobId>', 'Job id (the dispatch_queue row id for an eval round)')
+    .option('--step <n>', 'Step index (default 0)', '0')
+    .option('--limit <n>', 'Max lines to return (default 500, server caps at 2000)', '500')
+    .option('--cursor <c>', 'Line-offset cursor from a previous page')
+    .option('--json', 'Emit raw JSON instead of plain lines')
+    .action(async (runId: string, opts) => {
+      try {
+        const params = new URLSearchParams({ limit: String(opts.limit) });
+        if (opts.cursor) params.set('cursor', String(opts.cursor));
+        const path =
+          `/api/v1/admin/runs/${encodeURIComponent(runId)}` +
+          `/jobs/${encodeURIComponent(String(opts.job))}` +
+          `/steps/${encodeURIComponent(String(opts.step))}/logs?${params.toString()}`;
+        const response = await getClient().get<AgentStepLogs>(path);
+
+        if (opts.json) {
+          console.log(JSON.stringify(response, null, 2));
+          return;
+        }
+        // Plain mode prints only the line values so the output stays pipeable;
+        // the pagination hint goes to stderr for the same reason.
+        for (const line of response.lines) console.log(line.value);
+        if (response.nextCursor) {
+          console.error(`(more: re-run with --cursor ${response.nextCursor})`);
         }
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);

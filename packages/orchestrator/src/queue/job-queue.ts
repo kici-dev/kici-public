@@ -364,9 +364,9 @@ export class JobQueue {
     agentMandatoryLabels: string[] = [],
     agentId?: string,
   ): Promise<QueuedJob | null> {
-    // Fast path: pattern-free rows, single-row atomic claim (the 99% hot path,
-    // unchanged from the pure-exact behavior — the SELECT FOR UPDATE row is
-    // returned pending and the caller transitions it via markDispatched).
+    // Fast path: pattern-free rows, single-statement atomic claim (the 99% hot
+    // path) — the row leaves Pending in the same statement that selects it, so
+    // the caller's markDispatched only re-affirms a transition already made.
     const fast = await this.claimPatternFree(agentLabels, agentMandatoryLabels, agentId);
     if (fast) return fast;
     // Pattern path: rows carrying regex matchers, JS post-filter via the engine's
@@ -375,17 +375,62 @@ export class JobQueue {
   }
 
   /**
+   * The column writes that constitute a claim. Identical to what
+   * {@link markDispatched} sets, so a claim and the caller's follow-up
+   * markDispatched are the same transition applied twice rather than two
+   * different half-transitions — and a row is never observable as Dispatched
+   * with no owner.
+   *
+   * `agentId` is optional only because `dequeueForLabels` accepts it optionally;
+   * every production caller supplies it.
+   */
+  private claimTransition(agentId?: string): {
+    status: DispatchQueueStatus;
+    last_provisioning_error: null;
+    agent_id?: string;
+  } {
+    return {
+      status: DispatchQueueStatus.Dispatched,
+      last_provisioning_error: null,
+      ...(agentId === undefined ? {} : { agent_id: agentId }),
+    };
+  }
+
+  /**
+   * Conditionally claim one row by id: flip Pending -> Dispatched, returning
+   * whether this caller won. The `status = Pending` guard is the arbiter — a
+   * loser updates zero rows and must treat that as "someone else took it",
+   * never as an error.
+   *
+   * Used by every claim path that has to run a JS post-filter before claiming
+   * (the regex matchers), since that filter runs after the SELECT's
+   * per-statement lock window has already closed.
+   */
+  private async claimRowById(jobId: string, agentId?: string): Promise<boolean> {
+    const claimed = await this.db
+      .updateTable('dispatch_queue')
+      .set(this.claimTransition(agentId))
+      .where('id', '=', jobId)
+      .where('status', '=', DispatchQueueStatus.Pending)
+      .executeTakeFirst();
+    return (claimed.numUpdatedRows ?? 0n) > 0n;
+  }
+
+  /**
    * Build the shared drain WHERE chain (status / expiry / exact-label @> /
    * exclude-label / pin / mandatory-label gate) common to both drain passes.
    * The pattern columns are NOT filtered here — each pass adds its own
    * pattern-free / pattern-bearing guard on top.
+   *
+   * No projection is attached: the pattern-free pass selects `id` alone (it
+   * embeds this as the sub-select of its claiming UPDATE), while the pattern
+   * pass selects every column so it can run the JS matcher post-filter.
    */
   private drainBaseQuery(agentLabels: string[], agentMandatoryLabels: string[], agentId?: string) {
     const agentLabelsJson = JSON.stringify(agentLabels);
     const mandatoryLabelsJson = JSON.stringify(agentMandatoryLabels);
     let query = this.db
       .selectFrom('dispatch_queue')
-      .selectAll()
       .where('status', '=', DispatchQueueStatus.Pending)
       .where(sql<SqlBool>`(expires_at IS NULL OR expires_at >= now())`)
       .where(sql<SqlBool>`${sql.lit(agentLabelsJson)}::jsonb @> runs_on_labels`)
@@ -411,20 +456,43 @@ export class JobQueue {
   /**
    * Fast path: claim the oldest pending pattern-free row. The
    * `runs_on_patterns = '[]' AND exclude_patterns = '[]'` guard restricts this
-   * pass to rows that need no JS post-filter, so the single-row atomic claim
-   * (FOR UPDATE SKIP LOCKED) keeps the original hot-path semantics intact.
+   * pass to rows that need no JS post-filter, which is what lets the whole
+   * claim be ONE statement.
+   *
+   * Selecting a row and transitioning it in two statements is not a claim.
+   * Outside an explicit transaction the `FOR UPDATE` lock lives only for the
+   * duration of its own SELECT, so a second agent arriving between the SELECT
+   * and the UPDATE reads the row still Pending, skips nothing, and dispatches
+   * the same job — which is one job executing twice on two agents, side effects
+   * and all.
+   *
+   * So the sub-select is embedded in the claiming UPDATE: its `FOR UPDATE SKIP
+   * LOCKED` row lock is now taken inside the UPDATE's own transaction and held
+   * until commit. That buys both halves at once — exactly one claimant can win
+   * a given row, and a concurrent claimant SKIPs the locked row and takes the
+   * *next* one instead of coming back empty-handed, which a select-then-claim
+   * retry loop would not preserve. The redundant outer `status = Pending` is
+   * belt-and-braces on the arbiter.
    */
   private async claimPatternFree(
     agentLabels: string[],
     agentMandatoryLabels: string[],
     agentId?: string,
   ): Promise<QueuedJob | null> {
-    const row = await this.drainBaseQuery(agentLabels, agentMandatoryLabels, agentId)
+    const candidate = this.drainBaseQuery(agentLabels, agentMandatoryLabels, agentId)
+      .select('id')
       .where(sql<SqlBool>`runs_on_patterns = '[]'::jsonb AND exclude_patterns = '[]'::jsonb`)
       .orderBy('created_at', 'asc')
       .limit(1)
       .forUpdate()
-      .skipLocked()
+      .skipLocked();
+
+    const row = await this.db
+      .updateTable('dispatch_queue')
+      .set(this.claimTransition(agentId))
+      .where('id', '=', candidate)
+      .where('status', '=', DispatchQueueStatus.Pending)
+      .returningAll()
       .executeTakeFirst();
     return row ? this.rowToQueuedJob(row) : null;
   }
@@ -439,6 +507,9 @@ export class JobQueue {
    * Pending` makes exactly one of them win. The claim transitions the row to
    * Dispatched, matching the value the caller-side markDispatched would set
    * (which then re-sets it idempotently).
+   *
+   * Losing the claim continues to the next candidate rather than returning
+   * null, so a lost race costs this agent a candidate and not a whole drain.
    */
   private async claimWithPatterns(
     agentLabels: string[],
@@ -447,6 +518,7 @@ export class JobQueue {
   ): Promise<QueuedJob | null> {
     const labelSet = new Set(agentLabels);
     const rows = await this.drainBaseQuery(agentLabels, agentMandatoryLabels, agentId)
+      .selectAll()
       .where(sql<SqlBool>`(runs_on_patterns <> '[]'::jsonb OR exclude_patterns <> '[]'::jsonb)`)
       .orderBy('created_at', 'asc')
       .limit(10)
@@ -456,14 +528,8 @@ export class JobQueue {
     for (const row of rows) {
       const job = this.rowToQueuedJob(row);
       if (!jobPatternsSatisfiedBy(job, labelSet)) continue;
-      const claimed = await this.db
-        .updateTable('dispatch_queue')
-        .set({ status: DispatchQueueStatus.Dispatched })
-        .where('id', '=', row.id)
-        .where('status', '=', DispatchQueueStatus.Pending)
-        .executeTakeFirst();
       // Another agent may have won the conditional claim; only return on success.
-      if ((claimed.numUpdatedRows ?? 0n) > 0n) return job;
+      if (await this.claimRowById(row.id, agentId)) return job;
     }
     return null;
   }
@@ -479,6 +545,13 @@ export class JobQueue {
    * `runsOn`/`exclude` patterns no longer match the agent's current labels must
    * not be claimed. The single matching authority is the engine's
    * `matcherSatisfiedBy` (never a Postgres `~`).
+   *
+   * The claim is the conditional UPDATE, not the SELECT: the JS post-filter has
+   * to run first (claiming and then releasing a pattern-rejected row would
+   * strand it as Dispatched), which puts the filter outside the SELECT's
+   * per-statement lock window. Losing that claim returns null, and
+   * `onAgentAvailable` then falls through to the generic label drain — which
+   * also matches jobs pinned to this agent — so a lost race is not a stall.
    */
   async dequeueByPinnedAgent(agentId: string, agentLabels?: string[]): Promise<QueuedJob | null> {
     const row = await this.db
@@ -496,6 +569,7 @@ export class JobQueue {
     if (!row) return null;
     const job = this.rowToQueuedJob(row);
     if (agentLabels && !jobPatternsSatisfiedBy(job, new Set(agentLabels))) return null;
+    if (!(await this.claimRowById(job.id, agentId))) return null;
     return job;
   }
 
@@ -513,13 +587,26 @@ export class JobQueue {
    * spawned the agent and was reassigned to a different queued job).
    *
    * Returns null if the job is gone, no longer pending, expired, its label
-   * requirements are no longer satisfied by the agent, or the agent's gate
-   * is not satisfied by the job's `runsOn`.
+   * requirements are no longer satisfied by the agent, the agent's gate is not
+   * satisfied by the job's `runsOn`, or another claimant won the row first.
+   *
+   * That last case is the one this shares with every other claim path: the
+   * eager bound claim and the generic drain can target the same row moments
+   * apart, and a SELECT that returns the row still Pending lets both dispatch
+   * it. The conditional UPDATE below is the arbiter, and it runs after the JS
+   * post-filter so a pattern-rejected row is never claimed and stranded. A
+   * loser returns null, and `dispatchBoundJob` then falls back to the generic
+   * `onAgentAvailable` drain exactly as it does for an already-gone job.
+   *
+   * @param claimingAgentId Recorded as the row's durable owner as part of the
+   *   claim. Optional so existing 3-arg callers keep working; the caller's
+   *   markDispatched sets the same column immediately afterwards either way.
    */
   async dequeueById(
     jobId: string,
     agentLabels: string[],
     agentMandatoryLabels: string[] = [],
+    claimingAgentId?: string,
   ): Promise<QueuedJob | null> {
     const agentLabelsJson = JSON.stringify(agentLabels);
     const mandatoryLabelsJson = JSON.stringify(agentMandatoryLabels);
@@ -550,6 +637,7 @@ export class JobQueue {
     // labels must not be claimed.
     const job = this.rowToQueuedJob(row);
     if (!jobPatternsSatisfiedBy(job, new Set(agentLabels))) return null;
+    if (!(await this.claimRowById(job.id, claimingAgentId))) return null;
     return job;
   }
 

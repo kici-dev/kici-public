@@ -30,6 +30,8 @@ export function tag(config?: TagConfigInput): TagTriggerConfig {
     _tag: 'TagTrigger',
     patterns: Object.freeze([...patterns]),
     repos: Object.freeze([...repos]),
+    ...(config?.requires !== undefined && { requires: Object.freeze([...config.requires]) }),
+    ...(config?.commitMessage !== undefined && { commitMessage: config.commitMessage }),
     ...(config?.description !== undefined && { description: config.description }),
   };
 

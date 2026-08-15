@@ -2,7 +2,7 @@
  * Trigger matching engine for evaluating workflow triggers against webhook events.
  * Single source of truth -- replaces duplicate logic in compiler and orchestrator.
  */
-import { getCompiledRegex, getGlobMatcher } from './compiled-matchers.js';
+import { getCompiledRegex, getGlobMatcher, getRepoGlobMatcher } from './compiled-matchers.js';
 import type {
   LockTrigger,
   LockPrTrigger,
@@ -30,16 +30,20 @@ import type {
   LockLifecycleTrigger,
   LockWorkflow,
   LockBranchPattern,
+  LockTextMatch,
   SimulatedEvent,
   ChangedFilesStatus,
 } from './types.js';
 import {
+  createCommitMessageTraceEntry,
   createTraceEntry,
   createWorkflowDecision,
+  TraceCheck,
   type TraceEntry,
   type WorkflowDecision,
 } from './decision-trace.js';
 import { matchJsonPath, matchJsonPathNot } from './jsonpath-matcher.js';
+import { evaluateTextMatch } from './text-match.js';
 
 /**
  * Split a list of string patterns into include/exclude based on ! prefix.
@@ -84,8 +88,25 @@ export function matchBranchPattern(pattern: LockBranchPattern, branch: string): 
   if (pattern.type === 'glob') {
     return getGlobMatcher(pattern.pattern)(branch);
   } else {
-    return getCompiledRegex(pattern.pattern, pattern.flags).test(branch);
+    return getCompiledRegex(pattern.pattern, pattern.flags, 'branch/tag/repo pattern').test(branch);
   }
+}
+
+/**
+ * Match a repo pattern against a repository identifier.
+ *
+ * Same shape as {@link matchBranchPattern}, but glob patterns compile through
+ * {@link getRepoGlobMatcher} so a dot-prefixed identifier (`.hidden/repo`) is
+ * matched by `**`. Repo identifiers are org/name pairs, not paths, so there is
+ * no dotfile convention to respect — and `repos: ['**']` means every repo.
+ *
+ * Regex patterns are unaffected: `dot` is a glob option with no regex analogue.
+ */
+function matchRepoPattern(pattern: LockBranchPattern, repo: string): boolean {
+  if (pattern.type === 'glob') {
+    return getRepoGlobMatcher(pattern.pattern)(repo);
+  }
+  return getCompiledRegex(pattern.pattern, pattern.flags, 'branch/tag/repo pattern').test(repo);
 }
 
 /**
@@ -155,13 +176,13 @@ export function matchRepoPatterns(
 
   // Check exclusions first
   if (exclude.length > 0) {
-    if (exclude.some((p) => matchBranchPattern(p, sourceRepo))) return false;
+    if (exclude.some((p) => matchRepoPattern(p, sourceRepo))) return false;
   }
 
   // If no include patterns (all-negation array), non-excluded repo matches implicitly
   if (include.length === 0) return true;
 
-  return include.some((p) => matchBranchPattern(p, sourceRepo));
+  return include.some((p) => matchRepoPattern(p, sourceRepo));
 }
 
 /**
@@ -176,14 +197,14 @@ function evaluateRepoFilter(
 ): boolean {
   if (trigger.repos?.length) {
     if (!event.sourceRepo) {
-      traces.push(createTraceEntry('repo', 'required', '(missing)', false));
+      traces.push(createTraceEntry(TraceCheck.RepoFilter, 'required', '(missing)', false));
       return false;
     }
     const { include, exclude } = splitBranchPatterns(trigger.repos);
     const repoMatch = matchRepoPatterns(trigger.repos, event.sourceRepo);
     traces.push(
       createTraceEntry(
-        'repo',
+        TraceCheck.RepoFilter,
         `include:[${include.map((p) => p.pattern).join(',')}] exclude:[${exclude.map((p) => p.pattern).join(',')}]`,
         event.sourceRepo,
         repoMatch,
@@ -192,6 +213,48 @@ function evaluateRepoFilter(
     if (!repoMatch) return false;
   }
   return true;
+}
+
+/**
+ * Evaluate a trigger's `commitMessage` filter. Returns true when the trigger
+ * declares none (the fast path).
+ *
+ * An event with no message is INDETERMINATE, not a clean exclusion: the filter
+ * is fail-visible, mirroring the Tier-1 `requires` gate, so a workflow whose
+ * declared gate was never evaluated does not run.
+ */
+function evaluateCommitMessageFilter(
+  trigger: { readonly commitMessage?: LockTextMatch },
+  event: SimulatedEvent,
+  traces: TraceEntry[],
+): boolean {
+  const match = trigger.commitMessage;
+  if (!match) return true;
+
+  if (event.commitMessage === undefined) {
+    traces.push(
+      createCommitMessageTraceEntry({
+        match,
+        text: undefined,
+        passed: false,
+        indeterminate: true,
+        reason: 'no commit message in payload (provider carries none for this event)',
+      }),
+    );
+    return false;
+  }
+
+  const result = evaluateTextMatch(event.commitMessage, match);
+  traces.push(
+    createCommitMessageTraceEntry({
+      match,
+      text: event.commitMessage,
+      passed: result.pass,
+      indeterminate: result.indeterminate !== undefined,
+      ...(result.indeterminate !== undefined && { reason: result.indeterminate }),
+    }),
+  );
+  return result.pass;
 }
 
 /**
@@ -275,6 +338,9 @@ function matchPrTrigger(
     if (!matches) return false;
   }
 
+  // Check commit message
+  if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
+
   // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
@@ -328,6 +394,9 @@ function matchPushTrigger(
     if (!matches) return false;
   }
 
+  // Check commit message
+  if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
+
   // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
@@ -362,6 +431,9 @@ function matchTagTrigger(
     );
     if (!matches) return false;
   }
+
+  // Check commit message
+  if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
 
   // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
@@ -420,7 +492,11 @@ function matchCommentTrigger(
       traces.push(createTraceEntry('bodyMatch (glob)', trigger.bodyMatch.pattern, body, matches));
       if (!matches) return false;
     } else {
-      const regex = getCompiledRegex(trigger.bodyMatch.pattern, trigger.bodyMatch.flags);
+      const regex = getCompiledRegex(
+        trigger.bodyMatch.pattern,
+        trigger.bodyMatch.flags,
+        'comment bodyMatch',
+      );
       const matches = regex.test(body);
       traces.push(createTraceEntry('bodyMatch (regex)', trigger.bodyMatch.pattern, body, matches));
       if (!matches) return false;

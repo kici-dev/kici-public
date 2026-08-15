@@ -9,7 +9,6 @@ description: 'Org-level security policy: npm, cache, dispatch, approval, CI trus
 
 ```bash
 kici-admin org-settings global-workflows show --customer-id <id> [--format json|table]
-kici-admin org-settings global-workflows set-enabled true|false --customer-id <id> [--format json|table]
 kici-admin org-settings global-workflows allow-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
 kici-admin org-settings global-workflows allow-remove <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
 kici-admin org-settings global-workflows deny-add <pattern> --customer-id <id> [--source <routingKey>] [--format json|table]
@@ -28,16 +27,15 @@ kici-admin org-settings approval set-expiry <seconds> --customer-id <id> [--form
 kici-admin org-settings approval set-self-approval true|false --customer-id <id> [--format json|table]
 ```
 
-Manages per-org global-workflow policy (workflow-author allow-list, source-repo deny-list, elevated-access list). Settings are org-scoped — there is one row per `customer_id` regardless of how many webhook sources the org has. Each list entry can optionally pin to a specific source via `--source <routingKey>`. Calls the orchestrator admin API directly (not the Platform dashboard proxy) so it stays operable even when Platform is unavailable.
+Manages per-org global-workflow policy (workflow-author allow-list, source-repo deny-list, and the deprecated elevated-access list). Settings are org-scoped — there is one row per `customer_id` regardless of how many webhook sources the org has. Each list entry can optionally pin to a specific source via `--source <routingKey>`. Calls the orchestrator admin API directly (not the Platform dashboard proxy) so it stays operable even when Platform is unavailable.
 
 - `--customer-id <id>` (alias: `--org <id>`) selects the org row.
 - `--source <routingKey>` on `*-add` stores the entry pinned to that single webhook source. Omit for "any source in the org".
 - `--source <routingKey>` on `*-remove` matches a source-qualified entry. Omit to remove the unqualified entry.
-- `show` prints the current settings row for the given org.
-- `set-enabled` toggles the master enable switch.
+- `show` prints the current settings row for the given org. Its `Enabled (cluster-wide)` line is informational — it reports the effective fleet-wide master switch (`cluster_settings.global_workflows_enabled`), which you set with [`kici-admin cluster-settings`](./cluster-and-infra.md), not a per-org value.
 - `allow-add` / `allow-remove` mutate the workflow-author allow-list.
 - `deny-add` / `deny-remove` mutate the source-repo deny-list.
-- `elevate-add` / `elevate-remove` mutate the elevated-access list.
+- `elevate-add` / `elevate-remove` mutate the elevated-access list. **Deprecated and not enforced:** an organization-wide workflow's job is dispatched with no secret material, so the list grants nothing. Removed at v1.0.0.
 
 #### `allow-http-npm` — permit non-https private npm registries
 
@@ -52,7 +50,7 @@ Flip to `true` only when the org genuinely needs auth against a non-loopback `ht
 
 The toggle has no effect on the `installEnv:` channel (Option C) — committed `.kici/.npmrc` files are not URL-validated at the orchestrator. If you commit an `http://` registry line in your `.npmrc`, that's between you and npm.
 
-See [Private npm registries](/user/private-registries) for the workflow-side configuration.
+See [Private npm registries](../../../user/private-registries.md) for the workflow-side configuration.
 
 #### `user-cache` — per-org cache quota + entry TTL
 
@@ -71,6 +69,120 @@ Reads and writes the per-org byte quota and per-entry TTL for the user-facing ca
 - `reset-quota` / `reset-ttl` clear the override (write NULL) so the org falls back to the cluster default.
 
 This is the cluster-configurable knob for "this one tenant needs a bigger cache budget / longer retention" without editing the orchestrator unit file or redeploying. See [Storage layout: user cache](../storage-layout.md#user-cache) for the eviction + TTL mechanics.
+
+#### `artifacts` — per-org artifact quota, TTL, and size caps
+
+```bash
+kici-admin org-settings artifacts show --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts set-quota <bytes> --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts set-ttl <milliseconds> --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts set-max-bytes <bytes> --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts set-max-per-run <count> --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts reset-quota --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts reset-ttl --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts reset-max-bytes --customer-id <id> [--format json|table]
+kici-admin org-settings artifacts reset-max-per-run --customer-id <id> [--format json|table]
+```
+
+The four budget knobs for user-facing artifacts (`ctx.artifacts.upload` / `download`). Each maps to a NULLABLE `org_settings` column; NULL means the cluster-wide default applies.
+
+| Knob          | Column                 | Cluster default (env var)                      |
+| ------------- | ---------------------- | ---------------------------------------------- |
+| `quota`       | `artifact_quota_bytes` | 20 GiB (`KICI_ARTIFACT_QUOTA_BYTES`)           |
+| `ttl`         | `artifact_ttl_ms`      | 30 days (`KICI_ARTIFACT_TTL_MS`)               |
+| `max-bytes`   | `artifact_max_bytes`   | 1 GiB per artifact (`KICI_ARTIFACT_MAX_BYTES`) |
+| `max-per-run` | `artifact_max_per_run` | 50 artifacts (`KICI_ARTIFACT_MAX_PER_RUN`)     |
+
+- `show` prints the effective settings — a per-org override or the cluster default when unset.
+- Every `set-*` value must be a positive integer; `reset-*` writes NULL so the org falls back to the cluster default.
+
+#### `backup-freshness` — per-org backup staleness WARN threshold
+
+```bash
+kici-admin org-settings backup-freshness show --customer-id <id> [--format json|table]
+kici-admin org-settings backup-freshness set --hours <n> --customer-id <id> [--format json|table]
+kici-admin org-settings backup-freshness reset --customer-id <id> [--format json|table]
+```
+
+How old the newest `backup_runs` row may get before the `diagnose` backup check reports WARN. Maps to `org_settings.backup_staleness_warn_hours`; NULL means the cluster default from `KICI_BACKUP_STALENESS_WARN_HOURS` (24 hours) applies.
+
+- `set --hours <n>` takes an integer of at least 1. Raise it for an org backed up weekly; lower it for one where a missed nightly dump matters within hours.
+- `reset` clears the override.
+
+#### `ingest-concurrency` — per-org webhook ingest cap
+
+```bash
+kici-admin org-settings ingest-concurrency show --customer-id <id> [--format json|table]
+kici-admin org-settings ingest-concurrency set <count> --customer-id <id> [--format json|table]
+kici-admin org-settings ingest-concurrency reset --customer-id <id> [--format json|table]
+```
+
+The maximum number of concurrent webhook-processing pipelines the admission controller admits for this org before shedding with `429` + `Retry-After`. Maps to a NULLABLE `org_settings` column; NULL means the cluster default from `KICI_INGEST_ORG_MAX_CONCURRENCY` (32) applies.
+
+Lower it to rein in a noisy tenant that is crowding out the rest of the cluster; raise it for a high-fan-in org whose bursts are legitimate. `set` takes an integer of at least 1.
+
+#### `queue-timeout` — per-org dispatch-queue job timeout
+
+```bash
+kici-admin org-settings queue-timeout show --customer-id <id> [--format json|table]
+kici-admin org-settings queue-timeout set <milliseconds> --customer-id <id> [--format json|table]
+kici-admin org-settings queue-timeout reset --customer-id <id> [--format json|table]
+```
+
+How long a job may sit queued before it expires. The deadline resolves as `job.timeoutMs` → this org override → the cluster default from `KICI_QUEUE_TIMEOUT_MS` (1 hour), so a workflow that sets its own job timeout always wins.
+
+- `set <milliseconds>` takes an integer of at least 0; **`set 0` means indefinite** (a queued job never expires).
+- `reset` clears the override (writes NULL) so the org falls back to the cluster default.
+
+#### `reroute` — per-org cross-peer reroute tunables
+
+```bash
+kici-admin org-settings reroute show --customer-id <id> [--format json|table]
+kici-admin org-settings reroute set --customer-id <id> [--window <ms>] [--ack-timeout <ms>] [--max-hops <n>] [--format json|table]
+kici-admin org-settings reroute reset --customer-id <id> [--format json|table]
+```
+
+The three knobs governing how a coordinator hands a job to a sibling peer that can actually run it. Each maps to a NULLABLE `org_settings` column; NULL means the cluster default applies.
+
+| Flag            | Column                    | Cluster default (env var)             |
+| --------------- | ------------------------- | ------------------------------------- |
+| `--window`      | `reroute_spawn_window_ms` | 90 s (`KICI_REROUTE_SPAWN_WINDOW_MS`) |
+| `--ack-timeout` | `reroute_ack_timeout_ms`  | 15 s (`KICI_REROUTE_ACK_TIMEOUT_MS`)  |
+| `--max-hops`    | `reroute_max_hops`        | 3 hops (`KICI_REROUTE_MAX_HOPS`)      |
+
+- `set` requires at least one of the three flags and accepts several at once. `--window` / `--ack-timeout` take integer milliseconds of at least 1000; `--max-hops` takes an integer of at least 1 and exists for loop prevention.
+- `reset` clears **all three** overrides at once.
+
+See [Multi-orchestrator clustering](../../../architecture/clustering/multi-orchestrator.md) for the reroute protocol itself.
+
+#### `sandbox-allowlist` — container-sandbox escape hatches
+
+```bash
+kici-admin org-settings sandbox-allowlist show --customer-id <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist set-capabilities <capabilities> --customer-id <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist allow-host-network true|false --customer-id <id> [--format json|table]
+kici-admin org-settings sandbox-allowlist reset --customer-id <id> [--format json|table]
+```
+
+Gates the two escape hatches a container job (one with a `container:` image) can request through the SDK `sandbox:` field. **The default is deny-all** — an empty capability list and host networking off — and a non-allow-listed request **fails the run at dispatch**, naming the offending capability or knob, rather than being silently downgraded.
+
+- `set-capabilities <capabilities>` replaces the allowed Linux capability list with a comma-separated set (e.g. `NET_ADMIN,SYS_PTRACE`). Passing an empty value clears the list back to deny-all.
+- `allow-host-network true|false` toggles whether a workflow may request `sandbox: { network: 'host' }`.
+- `reset` clears both at once — no capabilities, no host networking.
+
+Every entry here widens the isolation boundary for the whole org, so grant the narrowest set that unblocks the workflow. See [Execution isolation](../../../architecture/execution/execution-isolation.md) for what the sandbox otherwise enforces.
+
+#### `scaler-spawn-timeout` — per-org scaler spawn deadline
+
+```bash
+kici-admin org-settings scaler-spawn-timeout show --customer-id <id> [--format json|table]
+kici-admin org-settings scaler-spawn-timeout set <milliseconds> --customer-id <id> [--format json|table]
+kici-admin org-settings scaler-spawn-timeout reset --customer-id <id> [--format json|table]
+```
+
+The deadline for a single scaler spawn — image pull plus container create plus start. A hung runtime or registry that blows the deadline is aborted, so it can no longer pin its per-backend spawn-semaphore slot and head-of-line block every other queued spawn.
+
+Maps to a NULLABLE `org_settings` column; NULL means the cluster default from `KICI_SCALER_SPAWN_TIMEOUT_MS` (300 s) applies. `set` takes an integer of at least 1000 milliseconds. Raise it for an org pulling very large images over a slow link; lower it to fail over faster when the registry is flaky.
 
 #### `dispatch-ack` — per-org dispatch acknowledgment deadline
 
@@ -118,6 +230,26 @@ Manages the per-orch dashboard write policy — the matrix of `dashboard.*` writ
 - `set` flips one or more operations. Pass `--op <name>=<bool>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once. The CLI prints the planned change before applying.
 - `reset` returns every operation to the permissive default.
 - `--customer-id <id>` (alias `--org`) selects the org row.
+
+### trust-policy -- CI trust policy for untrusted pull requests
+
+```bash
+kici-admin trust-policy show --customer-id <id> [--format json|table]
+kici-admin trust-policy set --customer-id <id> [--fork-policy hold|reject|allow] [--unknown-contributor-policy hold|reject] [--workflow-change-policy hold|reject|allow] [--approval-expiry-hours <n>] [--format json|table]
+```
+
+The org-wide policy deciding what happens when a pull request is not trusted on its face. Three independent knobs, each resolving to `hold` (park the run behind a security approval), `reject` (refuse it outright), or — where offered — `allow`:
+
+- `--fork-policy` — a PR from a fork of the repository.
+- `--unknown-contributor-policy` — a PR from an author with no established relationship to the repo. There is deliberately **no `allow`** here; the wire enum has no such member.
+- `--workflow-change-policy` — a PR that modifies the workflow definitions themselves.
+- `--approval-expiry-hours` — how long a security hold waits for an approval before it expires (integer, at least 1).
+
+`show` also reports an **enforcement** mode. Under `enforcement: legacy` the four fields above are omitted entirely rather than printed, because only the legacy rule is running and rendering a value nothing enforces would be false assurance.
+
+`set` works on an **independent** orchestrator only. Wherever a Platform is attached, the Platform owns the trust policy and the admin route refuses with `409`; the CLI surfaces that message verbatim, so manage the policy from the dashboard instead. Both verbs talk to the orchestrator admin API directly rather than the Platform dashboard proxy, so `show` keeps working when Platform is unavailable. They require the `ci_trust.read` / `ci_trust.admin` permissions — owner and admin only, never auditor, which sees trust-policy changes through `access_log.read` instead.
+
+See [CI security](../../../architecture/security/ci-security.md) for the threat model behind these knobs.
 
 ## Reference
 
@@ -614,7 +746,7 @@ Synopsis: `kici-admin org-settings global-workflows deny-remove <pattern> [optio
 
 ### `kici-admin org-settings global-workflows elevate-add`
 
-Add a glob pattern to the elevated-access list. Use --source to qualify the entry to one webhook source.
+Add a glob pattern to the elevated-access list (DEPRECATED: not enforced, removed at v1.0.0). Use --source to qualify the entry to one webhook source.
 
 Synopsis: `kici-admin org-settings global-workflows elevate-add <pattern> [options]`
 
@@ -635,7 +767,7 @@ Synopsis: `kici-admin org-settings global-workflows elevate-add <pattern> [optio
 
 ### `kici-admin org-settings global-workflows elevate-remove`
 
-Remove a glob pattern from the elevated-access list. Use --source to target a source-qualified entry.
+Remove a glob pattern from the elevated-access list (DEPRECATED: not enforced, removed at v1.0.0). Use --source to target a source-qualified entry.
 
 Synopsis: `kici-admin org-settings global-workflows elevate-remove <pattern> [options]`
 
@@ -653,26 +785,6 @@ Synopsis: `kici-admin org-settings global-workflows elevate-remove <pattern> [op
 | `--org <id>`            |         | Alias for --customer-id                                                        |
 | `--source <routingKey>` |         | Match an entry pinned to this routing key. Omit to match an unqualified entry. |
 | `--format <format>`     | `table` | Output format: json\|table                                                     |
-
-### `kici-admin org-settings global-workflows set-enabled`
-
-Toggle the master enable switch (true|false)
-
-Synopsis: `kici-admin org-settings global-workflows set-enabled <value> [options]`
-
-**Arguments**
-
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `value`  | yes      | no       |             |
-
-**Options**
-
-| Option               | Default | Description                      |
-| -------------------- | ------- | -------------------------------- |
-| `--customer-id <id>` |         | Customer / org id (alias: --org) |
-| `--org <id>`         |         | Alias for --customer-id          |
-| `--format <format>`  | `table` | Output format: json\|table       |
 
 ### `kici-admin org-settings global-workflows show`
 

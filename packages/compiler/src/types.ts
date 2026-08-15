@@ -25,6 +25,7 @@ import type {
   LabelMatcher,
   ExecutionJobStatus,
   InputsDescriptorMap,
+  LockContentRequirement,
 } from '@kici-dev/engine';
 
 /**
@@ -78,6 +79,8 @@ export interface LockPrTrigger {
   readonly paths: readonly string[];
 
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
 }
 
 /**
@@ -90,6 +93,8 @@ export interface LockPushTrigger {
   readonly paths: readonly string[];
 
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
 }
 
 /**
@@ -100,6 +105,8 @@ export interface LockTagTrigger {
   readonly _type: 'tag';
   readonly patterns: readonly LockBranchPattern[];
   readonly repos?: readonly LockBranchPattern[];
+  /** Declarative static content filter over source files at the event ref (AND-ed). */
+  readonly requires?: readonly LockContentRequirement[];
 }
 
 /**
@@ -466,18 +473,28 @@ export function isLockParallelStep(entry: LockStepEntry): entry is LockParallelS
 }
 
 /**
- * Inline expression value for pure dynamic functions.
- * The compiler serializes pure functions as { _type: 'inline', expression: '(event) => ...' }
- * and the orchestrator evaluates them via vm.runInNewContext at dispatch time.
- * struct with discriminant and expression field.
- * _type: 'inline' alongside existing 'static' and 'dynamic' discriminants.
+ * Serialized inline expression for a dynamic env/context/concurrencyGroup
+ * field, shaped as `{ _type: 'inline', expression: '(event) => ...' }`
+ * alongside the existing 'static' and 'dynamic' discriminants.
+ *
+ * @deprecated Schema v11 inline expressions are no longer evaluated in the
+ * orchestrator. Dynamic env/context/concurrencyGroup fields are resolved on the
+ * eval agent's init-runner. The compiler no longer emits this type; readers keep
+ * recognizing it only to defer an old lock's field to the init round. Removed at
+ * the next major (v1.0.0).
  */
 export interface LockInlineValue {
   readonly _type: 'inline';
   readonly expression: string;
 }
 
-/** Type guard for inline expression values */
+/**
+ * Type guard for inline expression values.
+ *
+ * @deprecated See {@link LockInlineValue}. Retained only so a reader can
+ * recognize an old lock's inline field and defer it to the eval agent's
+ * init-runner. Removed at the next major (v1.0.0).
+ */
 export function isLockInlineValue(value: unknown): value is LockInlineValue {
   return (
     typeof value === 'object' && value !== null && (value as LockInlineValue)._type === 'inline'
@@ -672,6 +689,13 @@ export interface LockWorkflow {
   readonly timeout?: number;
   /** Normalized approval gate; when set the whole run is held before any job dispatches. */
   readonly approval?: LockApproval;
+  /**
+   * True when the workflow declares a `filter` predicate. A bare flag, not a
+   * source reference: `LockWorkflow.source` already identifies the module and
+   * export, so the eval agent loads it and reads `.filter` off the workflow
+   * object. Mirrors the `dynamicEnv` / `dynamicConcurrencyGroup` convention.
+   */
+  readonly hasFilter?: boolean;
 }
 
 /**
@@ -686,6 +710,7 @@ export interface LockWorkflow {
  * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
  * v11 adds LockInlineValue type for pure function inline evaluation.
  * v13 adds job-level and workflow-level timeout.
+ * v34 adds LockWorkflow.hasFilter (workflow-level pre-dispatch filter predicate).
  */
 export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;

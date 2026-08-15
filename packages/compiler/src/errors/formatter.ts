@@ -2,8 +2,8 @@ import pc from 'picocolors';
 
 /**
  * Error code string. Thrown compile errors use `E<digits>` (e.g. 'E001', 'E102');
- * advisory, render-only diagnostics use `W<digits>` (e.g. 'W101'). `isCompilerError`
- * only matches the `E<digits>` family — warning codes are never thrown, only rendered.
+ * advisory, render-only diagnostics use `W<digits>`. `isCompilerError` only
+ * matches the `E<digits>` family — warning codes are never thrown, only rendered.
  */
 type ErrorCode = string;
 
@@ -12,9 +12,6 @@ export enum DiagnosticSeverity {
   Error = 'error',
   Warning = 'warning',
 }
-
-/** Warning code for the impure dynamic-value → init-job fallback. */
-export const PURITY_FALLBACK_CODE = 'W101';
 
 /** Source location for error reporting */
 export interface SourceLocation {

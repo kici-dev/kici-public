@@ -37,6 +37,7 @@ function buildTestApp(opts?: { accessLog?: Pick<AccessLogWriter, 'record'> }) {
   const inner = createOrgSettingsRoutes({
     db: {} as never,
     rbac: new RbacEnforcer(),
+    globalWorkflowsEnabledDefault: false,
     accessLog: opts?.accessLog as AccessLogWriter | undefined,
   });
   const root = new Hono();
@@ -113,9 +114,62 @@ function makeOrgSettingsDbStub() {
   return { db, rows };
 }
 
+describe('org-settings/global-workflows — enabled projection (effective cluster value)', () => {
+  const ORG = 'kiciStg00001';
+
+  function buildWithDb(db: unknown, globalWorkflowsEnabledDefault: boolean) {
+    const inner = createOrgSettingsRoutes({
+      db: db as never,
+      rbac: new RbacEnforcer(),
+      globalWorkflowsEnabledDefault,
+    });
+    const root = new Hono();
+    root.use('*', async (c, next) => {
+      c.set('role' as never, 'admin' as never);
+      c.set('userId' as never, 'tester' as never);
+      c.set('routingKey' as never, null as never);
+      await next();
+    });
+    root.route('/', inner);
+    return root;
+  }
+
+  it('reports the effective cluster value, not a per-org one', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    // Seed the singleton cluster row; no org_settings row for ORG.
+    rows.set('default', { global_workflows_enabled: true });
+    const app = buildWithDb(db, false);
+    const res = await app.request(`/org-settings/global-workflows?customerId=${ORG}`);
+    expect((await res.json()).settings.enabled).toBe(true);
+  });
+
+  it('falls back to the configured default when the cluster column is NULL', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    // No cluster override; route constructed with default false.
+    const app = buildWithDb(db, false);
+    const res = await app.request(`/org-settings/global-workflows?customerId=${ORG}`);
+    expect((await res.json()).settings.enabled).toBe(false);
+  });
+
+  it('rejects a PATCH carrying enabled', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const app = buildWithDb(db, false);
+    const res = await app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: ORG, enabled: true }),
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('org-settings/global-workflows — user-cache quota + TTL', () => {
   function buildWithDb(db: unknown) {
-    const inner = createOrgSettingsRoutes({ db: db as never, rbac: new RbacEnforcer() });
+    const inner = createOrgSettingsRoutes({
+      db: db as never,
+      rbac: new RbacEnforcer(),
+      globalWorkflowsEnabledDefault: false,
+    });
     const root = new Hono();
     root.use('*', async (c, next) => {
       c.set('role' as never, 'admin' as never);

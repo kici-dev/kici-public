@@ -68,6 +68,12 @@ export interface AdminRouteDeps {
   secretStore: PgSecretStore;
   auditLogger: AuditLogger;
   /**
+   * Fleet-wide default for the global-workflows master switch, applied when the
+   * cluster column is NULL. Optional so WS-only / test admins can omit it;
+   * omitting it means the secure default (disabled).
+   */
+  globalWorkflowsEnabledDefault?: boolean;
+  /**
    * Optional -- the coordinator drain controller. When provided, the
    * `POST`/`GET /api/v1/admin/orchestrator/drain` routes are mounted (backing
    * the `kici-admin orchestrator drain` verbs). Omitted on WS-only admins.
@@ -769,7 +775,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   if (deps.db) {
     app.route(
       '/api/v1/admin',
-      createOrgSettingsRoutes({ db: deps.db, rbac: deps.rbac, accessLog: deps.accessLog }),
+      createOrgSettingsRoutes({
+        db: deps.db,
+        rbac: deps.rbac,
+        accessLog: deps.accessLog,
+        globalWorkflowsEnabledDefault: deps.globalWorkflowsEnabledDefault ?? false,
+      }),
     );
   }
 

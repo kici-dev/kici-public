@@ -55,7 +55,7 @@ group: () => 'deploy';
 group: (ctx) => `deploy-${ctx.event.targetBranch ?? 'default'}`;
 ```
 
-The workflow-level group function is always evaluated **agent-side** at runtime -- the lock file records only that a group function exists (`hasGroup: true`), not the function itself. The agent loads the workflow source, calls the group function with `{ branch, event }`, and reports the evaluated key back to the orchestrator before step execution begins. This differs from job-level `concurrencyGroup` (see [Contexts](contexts.md#concurrency-groups)), where the compiler performs purity analysis and can inline pure functions for orchestrator-side evaluation.
+The workflow-level group function is always evaluated **agent-side** at runtime -- the lock file records only that a group function exists (`hasGroup: true`), not the function itself. The agent loads the workflow source, calls the group function with `{ branch, event }`, and reports the evaluated key back to the orchestrator before step execution begins. Job-level `concurrencyGroup` functions (see [Contexts](contexts.md#concurrency-groups)) resolve the same way — on the agent's init step, never in the orchestrator.
 
 ## cancelInProgress mode
 

@@ -267,7 +267,7 @@ LIMIT 10;
 ## See also
 
 - [Reconnection and Event Buffering](reconnection.md) -- WebSocket reconnection behavior and message buffering
-- [State Machine](../execution/state-machine.md) -- Full execution state machine reference
+- [Execution status vocabulary](../execution/state-machine.md) -- run, job, and step status vocabularies and terminal-state rules
 - [Job Execution Lifecycle](../execution/job-execution.md) -- Agent job lifecycle from dispatch to cleanup
 - [Stale Detection](../execution/stale-detection.md) -- Stale run detector behavior
 - [Orchestrator Configuration](../configuration.md) -- Orchestrator settings

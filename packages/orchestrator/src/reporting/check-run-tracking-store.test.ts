@@ -48,6 +48,26 @@ describe('CheckRunTrackingStore', () => {
       const values = mocks.insertValues.mock.calls[0]?.[0] as Record<string, unknown>;
       expect(values).not.toHaveProperty('run_id');
     });
+
+    it('clears any stale terminal marker, in the row AND on conflict', async () => {
+      // The row key is (provider, owner, repo, sha, check_name), so a re-run at
+      // the same commit lands on the row the previous run completed. A new
+      // check-run id means a new check run whose terminal update has not been
+      // sent — inheriting the old marker would suppress the new run's live step
+      // progress. The conflict branch is the one that matters (the row already
+      // exists), so both are asserted.
+      const { db, mocks } = createMockDb();
+      const store = new CheckRunTrackingStore(db);
+
+      await store.setCheckRunId(KEY, 999, 'run-2');
+
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({ terminal_sent_at: null }),
+      );
+      expect(mocks.doUpdateSet).toHaveBeenCalledWith(
+        expect.objectContaining({ terminal_sent_at: null }),
+      );
+    });
   });
 
   describe('getCheckRunId', () => {

@@ -1331,6 +1331,37 @@ describe('PlatformClient', () => {
       });
     });
 
+    it('delivers the workflow repository of a cross-repository global run', () => {
+      // The reporter qualifies the check-run names it times out with this, so
+      // a field dropped at the WS edge silently restores the wrong-repository
+      // cleanup this plumbing exists to prevent.
+      const onStaleCheckrunCleanup = vi.fn();
+      const client = createClient({ onStaleCheckrunCleanup });
+      const mock = authenticateClient(client);
+
+      simulateMessage(mock, {
+        type: 'stale.checkrun.cleanup',
+        runs: [
+          {
+            runId: 'run-global',
+            provider: 'github',
+            routingKey: 'github:42',
+            repoIdentifier: 'acme/app',
+            workflowRepoIdentifier: 'acme/ci-defs',
+            sha: 'abc123',
+            workflowName: 'ci',
+            jobNames: ['test'],
+          },
+        ],
+      });
+
+      expect(onStaleCheckrunCleanup).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runs: [expect.objectContaining({ workflowRepoIdentifier: 'acme/ci-defs' })],
+        }),
+      );
+    });
+
     it('does not crash when onStaleCheckrunCleanup is not provided', () => {
       const client = createClient();
       const mock = authenticateClient(client);

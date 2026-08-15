@@ -1,6 +1,6 @@
 ---
 title: Observability
-description: ''
+description: Monitoring, logging, and diagnostic tooling for a self-hosted KiCI deployment
 ---
 
 This guide covers monitoring, logging, and diagnostic tooling for self-hosted KiCI deployments.
@@ -311,16 +311,22 @@ grep -E '"Org-scoped webhook received"|"Webhook relay received"|"Generic webhook
 
 Key log markers and what they mean:
 
-| Message                          | Where emitted                                  | When                                                                 |
-| -------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------- |
-| `Webhook relay received`         | `ws/platform-client.ts`                        | Platform forwarded a webhook via WS (platform/hybrid modes)          |
-| `Generic webhook accepted`       | `routes/webhooks.ts` (generic handler)         | Provider posted to `POST /webhook/:orgId/generic/:sourceId`          |
-| `Webhook accepted`               | `routes/webhooks.ts` (after signature check)   | Signature + dedup passed, handed to the pipeline                     |
-| `Duplicate webhook`              | `routes/webhooks.ts` / `pipeline/processor.ts` | Delivery ID already in `dedup_cache` (in-memory fast path or DB)     |
-| `Webhook processed`              | `pipeline/processor.ts`                        | Final line: includes `deliveryId`, `event`, `matchedWorkflows`       |
-| `Cross-source webhook processed` | `pipeline/processor.ts`                        | Generic webhook fanned out to same-org webhook-trigger registrations |
+| Message                                                         | Where emitted                                  | When                                                                                                                       |
+| --------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `Webhook relay received`                                        | `ws/platform-client.ts`                        | Platform forwarded a webhook via WS (platform/hybrid modes)                                                                |
+| `Generic webhook accepted`                                      | `routes/webhooks.ts` (generic handler)         | Provider posted to `POST /webhook/:orgId/generic/:sourceId`                                                                |
+| `Webhook accepted`                                              | `routes/webhooks.ts` (after signature check)   | Signature + dedup passed, handed to the pipeline                                                                           |
+| `Duplicate webhook`                                             | `routes/webhooks.ts` / `pipeline/processor.ts` | Delivery ID already in `dedup_cache` (in-memory fast path or DB)                                                           |
+| `Webhook processed`                                             | `pipeline/processor.ts`                        | Final line: includes `deliveryId`, `event`, `matchedWorkflows`                                                             |
+| `Cross-source webhook processed`                                | `pipeline/processor.ts`                        | Generic webhook fanned out to same-org webhook-trigger registrations                                                       |
+| `webhook pipeline failed after the delivery was acknowledged`   | `webhook/ingest-accept.ts`                     | The pipeline threw for a delivery already answered `202`. Carries the error and a remedy; the delivery is queued for retry |
+| `reclaimed a stale ingest-queue claim`                          | `webhook/ingest-overflow-replayer.ts`          | A worker died mid-pipeline and the drain pass freed its delivery for retry                                                 |
+| `ingest-queue delivery abandoned past max attempts`             | `webhook/ingest-overflow-replayer.ts`          | A delivery exhausted its retries. It was already acknowledged, so this is the only place the abandonment is announced      |
+| `ingest queue at capacity — shedding rather than acknowledging` | `webhook/ingest-accept.ts`                     | The queue hit its row cap; the delivery was refused with `429` rather than acknowledged unstored                           |
 
 Each line includes `deliveryId`, `routingKey`, and usually `event` — correlate by `deliveryId` to reconstruct the full pipeline for a given webhook.
+
+A direct-ingress `202` means the delivery is durably queued, not that its pipeline finished — so `Webhook processed` (or one of the failure lines above) is what tells you the pipeline actually ran. See `docs/operator/orchestrator/configuration.md` → "Webhook ingest acknowledgement".
 
 **On-disk payload archive (opt-in)** — set `KICI_WEBHOOK_PAYLOAD_DIR` to have the orchestrator fire-and-forget every processed payload to `<dir>/<repoIdentifier>/<deliveryId>/payload.json`. Nothing reads this directory automatically; it's for offline inspection (`find $KICI_WEBHOOK_PAYLOAD_DIR -name payload.json -newer ...`). Leave unset to skip the write.
 
@@ -343,3 +349,54 @@ Each line includes `deliveryId`, `routingKey`, and usually `event` — correlate
 ### Upstream side
 
 KiCI exposes its own delivery log to the dashboard's **Settings → Event log** tab via a merge endpoint that joins the upstream side with the orchestrator's `event_log`.
+
+## Organization-workflow evaluation visibility
+
+An organization-wide workflow that declares a `filter` predicate or generates
+its jobs at runtime is decided by a pre-run evaluation job on an agent, before
+any run exists. When that evaluation excludes a workflow, nothing is created —
+no run, no check, no logs from the workflow itself — so these signals are the
+only account of what happened.
+
+**Decision trace.** An organization workflow the orchestrator declines to run
+because of its `requires` content filter or its `filter` predicate logs a
+`Global workflow decision trace` line carrying the workflow name, the verdict,
+and every check that was evaluated — including the trigger checks that passed.
+Search your log backend for that message with the workflow name to answer "why
+did nothing run?".
+
+**Repos-filter drops.** A workflow the event's repository does not match is
+reported on a different message, once per delivery rather than once per
+workflow: `Global workflows dropped by their repos filter`, carrying
+`deliveryId`, `sourceRepo`, `droppedCount`, and a `dropped[]` array of
+`{ workflow, workflowRepo, repos }`. This is the aggregated form deliberately —
+an org whose organization workflows declare `repos: ['myorg/service-*']` drops
+all of them on every delivery from every other repo, which is the steady state
+rather than an anomaly. Search for this message when a workflow is registered
+and enabled but has never run for one particular repository; the per-workflow
+decision-trace line above will not carry that case.
+
+**Prometheus metrics** (scrape `http://orchestrator:4000/metrics`):
+
+- `kici_orch_global_eval_candidates_total` — organization workflows handed to an
+  evaluation round, including those the orchestrator suppressed without running
+  one. Equal to the sum of the verdict counter below by construction, so read it
+  as the top-line rate and the denominator that breakdown divides — not as a
+  second signal to compare against it.
+- `kici_orch_global_eval_verdicts_total{outcome="run"|"filtered"|"indeterminate"}`
+  — what the round decided per workflow. `filtered` is a predicate that ran and
+  said no; `indeterminate` is a question nobody answered (a failed round, a
+  budget breach, or an orchestrator that could not run a round at all). A rising
+  `indeterminate` rate is an incident; a rising `filtered` rate is authors
+  filtering.
+- `kici_orch_global_eval_round_duration_seconds{result="success"|"error"}` — how
+  long one dispatched round took, from dispatch to settled verdicts
+- `kici_orch_global_eval_jobs_generated` — jobs the round's generators produced,
+  recorded once per settled round
+- `kici_orch_global_eval_cache_lookups_total{result="hit"|"miss"|"unkeyable"}` —
+  the redelivery cache. **A hit rate near zero is the expected reading**: the
+  cache key covers the whole event, so every genuinely new push is a miss by
+  construction. The cache exists to make a provider redelivery cheap, not to
+  reduce steady-state evaluation. `unkeyable` counts an input that could not be
+  serialized and therefore never reached the cache at all — it is kept apart
+  from `miss` so the hit rate is measured against every lookup.

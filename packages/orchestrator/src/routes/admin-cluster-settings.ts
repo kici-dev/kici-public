@@ -16,6 +16,7 @@ import { sql, type Kysely } from 'kysely';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
+import { CACHE_MAX_ENTRIES_CEILING } from '../cluster/cluster-settings-reader.js';
 import type { RbacEnforcer, Role } from '../secrets/rbac.js';
 import { handleAdminError } from './admin-errors.js';
 import { requireUnscopedToken } from '../secrets/routing-key-scope.js';
@@ -58,6 +59,17 @@ const COLUMNS = {
   agentTokenTtlMs: 'agent_token_ttl_ms',
   ownershipDbCheckTimeoutMs: 'ownership_db_check_timeout_ms',
   unroutableGraceMs: 'unroutable_grace_ms',
+  ingestOverflowClaimTimeoutMs: 'ingest_overflow_claim_timeout_ms',
+  lockfileCacheMax: 'lockfile_cache_max',
+  lockfileCacheMaxBytes: 'lockfile_cache_max_bytes',
+  lockfileCacheTtlMs: 'lockfile_cache_ttl_ms',
+  contentCacheMax: 'content_cache_max',
+  contentCacheMaxBytes: 'content_cache_max_bytes',
+  contentCacheTtlMs: 'content_cache_ttl_ms',
+  globalEvalRoundTimeoutMs: 'global_eval_round_timeout_ms',
+  globalEvalCandidateTimeoutMs: 'global_eval_candidate_timeout_ms',
+  globalEvalCacheMax: 'global_eval_cache_max',
+  globalEvalWaitTimeoutMs: 'global_eval_wait_timeout_ms',
 } as const;
 
 type CamelKnob = keyof typeof COLUMNS;
@@ -73,6 +85,18 @@ const STRING_COLUMNS = {
 } as const;
 
 type CamelStringKnob = keyof typeof STRING_COLUMNS;
+
+/**
+ * Boolean-valued cluster knobs. A third map rather than a widened
+ * {@link COLUMNS}: the numeric projection and merge stay `number | null` end to
+ * end, and a boolean `false` must never be confused with an unset `null` the
+ * way a falsy number would be.
+ */
+const BOOLEAN_COLUMNS = {
+  globalWorkflowsEnabled: 'global_workflows_enabled',
+} as const;
+
+type CamelBooleanKnob = keyof typeof BOOLEAN_COLUMNS;
 
 // Per-knob minimum floors mirroring the config.ts field constraints.
 const updateSchema = z.object({
@@ -97,6 +121,47 @@ const updateSchema = z.object({
   /** 0 disables unroutable fast-fail, so the floor is 0, not 1000. */
   unroutableGraceMs: z.number().int().min(0).nullable().optional(),
   /**
+   * Floor of 60s: reclaiming a claim sooner than a pipeline can plausibly
+   * finish makes the drain pass re-run work that is still in flight.
+   */
+  ingestOverflowClaimTimeoutMs: z.number().int().min(60_000).nullable().optional(),
+  /**
+   * Lock-file and Tier-1 content cache sizing. Structural to the underlying
+   * LRU, which is built once at boot, so a change lands at the next restart.
+   *
+   * The two entry counts are capped at {@link CACHE_MAX_ENTRIES_CEILING}: the
+   * LRU allocates its index arrays eagerly from `max`, so an unbounded value
+   * crashes `bootstrapOrchestrator` before the admin API listens — taking away
+   * the only route back to the stored value. This rejection is the good error
+   * message; `clampCacheMaxEntries` at the read site is the actual guarantee,
+   * since a bad value may already be stored.
+   */
+  lockfileCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
+  lockfileCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
+  lockfileCacheTtlMs: z.number().int().min(1000).nullable().optional(),
+  contentCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
+  contentCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
+  contentCacheTtlMs: z.number().int().min(1000).nullable().optional(),
+  /**
+   * Tier-2 global eval round budgets. Both are read per round and shipped to
+   * the agent in the round's job config, so a change lands on the next push.
+   */
+  globalEvalRoundTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  globalEvalCandidateTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  /**
+   * Round-result cache size. Capped at {@link CACHE_MAX_ENTRIES_CEILING} for the
+   * same boot-safety reason as the two cache knobs above — the LRU allocates
+   * eagerly from `max`, and this one is built during bootstrap too.
+   */
+  globalEvalCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
+  /**
+   * Orchestrator-side ceiling on waiting for a round to settle. Set it above
+   * `globalEvalRoundTimeoutMs`: the agent's own budget starts only once the
+   * round job is running, so a ceiling below it would fire on every round that
+   * merely waited for an agent.
+   */
+  globalEvalWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  /**
    * Verified-tier origin for browser-sealed dashboard writes. Must be an
    * absolute http(s) origin (the dashboard fetches `<issuer>/.well-known/jwks.json`
    * from it and shows it to the operator); null clears the override.
@@ -109,10 +174,16 @@ const updateSchema = z.object({
     })
     .nullable()
     .optional(),
+  /**
+   * Fleet-wide master switch for global workflows. null clears the override →
+   * the orchestrator's configured default (`KICI_GLOBAL_WORKFLOWS_ENABLED`).
+   */
+  globalWorkflowsEnabled: z.boolean().nullable().optional(),
 });
 
 type ProjectedClusterSettings = Record<CamelKnob, number | null> &
-  Record<CamelStringKnob, string | null>;
+  Record<CamelStringKnob, string | null> &
+  Record<CamelBooleanKnob, boolean | null>;
 
 /** Coerce a pg BIGINT/INTEGER (string | number | null) into a JS number | null. */
 function toNumber(v: string | number | null | undefined): number | null {
@@ -127,6 +198,10 @@ function projectRow(row: Record<string, unknown> | undefined): ProjectedClusterS
   for (const [camel, snake] of Object.entries(STRING_COLUMNS) as [CamelStringKnob, string][]) {
     const v = row?.[snake];
     out[camel] = typeof v === 'string' && v.length > 0 ? v : null;
+  }
+  for (const [camel, snake] of Object.entries(BOOLEAN_COLUMNS) as [CamelBooleanKnob, string][]) {
+    const v = row?.[snake];
+    out[camel] = typeof v === 'boolean' ? v : null;
   }
   return out;
 }
@@ -174,7 +249,7 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
       // to DB-less workers so they pull the new settings) bumps only on a real
       // change and never on a no-op PATCH.
       const existingRow = existing as Record<string, unknown> | undefined;
-      const merged: Record<string, number | string | null> = {};
+      const merged: Record<string, number | string | boolean | null> = {};
       let changed = false;
       for (const [camel, snake] of Object.entries(COLUMNS) as [CamelKnob, string][]) {
         const cur = toNumber(existingRow?.[snake] as string | number | null | undefined);
@@ -191,6 +266,67 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
         merged[snake] = next;
         if (provided !== undefined && next !== cur) changed = true;
       }
+      for (const [camel, snake] of Object.entries(BOOLEAN_COLUMNS) as [
+        CamelBooleanKnob,
+        string,
+      ][]) {
+        const rawCur = existingRow?.[snake];
+        const cur = typeof rawCur === 'boolean' ? rawCur : null;
+        const provided = body[camel];
+        const next = provided !== undefined ? provided : cur;
+        merged[snake] = next;
+        if (provided !== undefined && next !== cur) changed = true;
+      }
+      // The orchestrator's wait ceiling must exceed the agent's round budget:
+      // the agent's budget starts only once the round job is RUNNING, so a
+      // ceiling at or below it fires on every round that merely waited for a
+      // free agent — every round fails, silently and permanently. Checked on
+      // the EFFECTIVE values (patch overlaid on the stored row), so setting
+      // either one alone is covered.
+      //
+      // A null on either side means "the orchestrator's configured default
+      // applies", and this route does not know that number, so the pair is
+      // only comparable when both are set. That is the case an operator
+      // actually reaches by tuning one of them.
+      const roundBudget = merged[COLUMNS.globalEvalRoundTimeoutMs];
+      const waitCeiling = merged[COLUMNS.globalEvalWaitTimeoutMs];
+      if (
+        typeof roundBudget === 'number' &&
+        typeof waitCeiling === 'number' &&
+        waitCeiling <= roundBudget
+      ) {
+        return c.json(
+          {
+            error:
+              `globalEvalWaitTimeoutMs (${waitCeiling}) must be greater than ` +
+              `globalEvalRoundTimeoutMs (${roundBudget}): the agent's round budget ` +
+              'starts only once the round job is running, so a lower ceiling fails every round',
+          },
+          400,
+        );
+      }
+
+      // The adjacent axis, on the same terms. A per-candidate budget at or above
+      // the whole round's lets ONE candidate consume the entire round, after
+      // which every sibling is padded indeterminate and suppressed — and the
+      // group is decided, so nothing retries it. Same null semantics as above.
+      const candidateBudget = merged[COLUMNS.globalEvalCandidateTimeoutMs];
+      if (
+        typeof roundBudget === 'number' &&
+        typeof candidateBudget === 'number' &&
+        candidateBudget >= roundBudget
+      ) {
+        return c.json(
+          {
+            error:
+              `globalEvalCandidateTimeoutMs (${candidateBudget}) must be less than ` +
+              `globalEvalRoundTimeoutMs (${roundBudget}): a per-candidate budget that ` +
+              'can consume the whole round suppresses every sibling workflow in it',
+          },
+          400,
+        );
+      }
+
       const currentVersion = Number(
         (existingRow?.version as string | number | null | undefined) ?? 0,
       );

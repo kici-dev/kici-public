@@ -20,6 +20,7 @@ interface Row {
   replay_attempts: number;
   status: string;
   last_error: string | null;
+  claimed_at: Date | null;
 }
 
 /**
@@ -29,6 +30,13 @@ interface Row {
  *  - updateTable(...).set(patch).where(id).where(status?)...            — claim / status update
  *  - deleteFrom(...).where().execute()                                 — sweep replayed
  */
+/**
+ * Cutoff the fake's stale-reclaim arm compares against. A test that wants no
+ * reclaim leaves it at 0 (nothing is older than the epoch); a test exercising
+ * the reclaim raises it.
+ */
+let staleCutoffMs = 0;
+
 function makeFakeDb(rows: Row[]): Kysely<Database> {
   const buffered = (): Row[] =>
     rows
@@ -46,11 +54,41 @@ function makeFakeDb(rows: Row[]): Kysely<Database> {
           }),
         }),
       }),
-      // .select(countFn) → depth-gauge chain.
-      select: () => ({
-        where: () => ({
+      // .select(...) serves three chains, discriminated by what follows:
+      //  - depth gauge:      .where().executeTakeFirstOrThrow()
+      //  - stale reclaim:    .where(status).where(cb).limit(n).execute()
+      //  - releaseClaim read:.where(id).where(status).executeTakeFirst()
+      select: (cols: unknown) => ({
+        where: (col?: string, _op?: string, val?: unknown) => ({
           executeTakeFirstOrThrow: async () => ({ count: String(buffered().length) }),
+          // Stale-reclaim arm: the second `where` is a callback, not a triple.
+          where: (second: unknown, _o2?: string, v2?: unknown) => {
+            if (typeof second === 'function') {
+              return {
+                limit: (n: number) => ({
+                  execute: async () =>
+                    rows
+                      .filter(
+                        (r) =>
+                          r.status === OverflowStatus.enum.replaying &&
+                          (r.claimed_at ?? r.captured_at).getTime() < staleCutoffMs,
+                      )
+                      .slice(0, n),
+                }),
+              };
+            }
+            return {
+              executeTakeFirst: async () =>
+                rows.find(
+                  (r) =>
+                    r.id === val &&
+                    (r as unknown as Record<string, unknown>)[second as string] === v2,
+                ),
+            };
+          },
         }),
+        // Unused chains keep `cols` referenced for the type checker.
+        _cols: cols,
       }),
     }),
     updateTable: () => ({
@@ -106,6 +144,7 @@ function row(id: number, over: Partial<Row> = {}): Row {
     replay_attempts: 0,
     status: OverflowStatus.enum.buffered,
     last_error: null,
+    claimed_at: null,
     ...over,
   };
 }
@@ -119,11 +158,16 @@ function makeReplayer(rows: Row[], shedding: boolean, batchSize = 10, maxAttempt
     intervalMs: 1000,
     batchSize,
     maxAttempts,
+    claimTimeoutMs: 900_000,
   });
 }
 
 describe('IngestOverflowReplayer', () => {
-  beforeEach(() => resetIngestOverflowMetricState());
+  beforeEach(() => {
+    resetIngestOverflowMetricState();
+    // Nothing is stale by default; the reclaim tests raise this explicitly.
+    staleCutoffMs = 0;
+  });
 
   it('skips the entire pass while the controller is shedding', async () => {
     const rows = [row(1)];
@@ -187,5 +231,75 @@ describe('IngestOverflowReplayer', () => {
     r.setReinjectDirect(reinject);
     await r.runPass();
     expect(rows).toHaveLength(0); // swept as replayed
+  });
+  it('reclaims a claim a dead worker never released, so the delivery is retried', async () => {
+    // The whole basis of the accept path's durability claim: an acknowledged
+    // delivery whose worker was killed mid-pipeline leaves its row `replaying`
+    // with nothing to release it. Without this, the row is stranded forever and
+    // "durably queued" means nothing.
+    const rows = [row(1, { status: OverflowStatus.enum.replaying, claimed_at: new Date(1) })];
+    staleCutoffMs = 10_000;
+    const reinject = vi.fn(async () => WebhookIngestOutcome.enum.processed);
+    const r = makeReplayer(rows, false);
+    r.setReinjectDirect(reinject);
+
+    await r.runPass();
+
+    // Reclaimed AND re-injected in the same pass, and the abandoned attempt is
+    // counted so a row that keeps stranding eventually goes `failed`.
+    expect(reinject).toHaveBeenCalledTimes(1);
+    expect(rows).toHaveLength(0);
+  });
+
+  it('leaves a fresh claim alone', async () => {
+    const rows = [row(1, { status: OverflowStatus.enum.replaying, claimed_at: new Date() })];
+    staleCutoffMs = 0; // nothing predates the epoch
+    const reinject = vi.fn(async () => WebhookIngestOutcome.enum.processed);
+    const r = makeReplayer(rows, false);
+    r.setReinjectDirect(reinject);
+
+    await r.runPass();
+
+    // Reclaiming a live worker's row would re-run a pipeline still in flight.
+    expect(reinject).not.toHaveBeenCalled();
+    expect(rows[0]!.status).toBe(OverflowStatus.enum.replaying);
+  });
+
+  it('reclaims while the controller is shedding, without re-injecting', async () => {
+    // A stranded claim is stranded regardless of load. Freeing it under shed is
+    // safe because the freed row simply waits in `buffered`.
+    const rows = [row(1, { status: OverflowStatus.enum.replaying, claimed_at: new Date(1) })];
+    staleCutoffMs = 10_000;
+    const reinject = vi.fn(async () => WebhookIngestOutcome.enum.processed);
+    const r = makeReplayer(rows, true);
+    r.setReinjectDirect(reinject);
+
+    await r.runPass();
+
+    expect(rows[0]!.status).toBe(OverflowStatus.enum.buffered);
+    expect(rows[0]!.replay_attempts).toBe(1);
+    expect(reinject).not.toHaveBeenCalled();
+  });
+
+  it('releaseClaim hands a claimed row back for retry', async () => {
+    const rows = [row(1, { status: OverflowStatus.enum.replaying, claimed_at: new Date() })];
+    const r = makeReplayer(rows, false);
+
+    expect(await r.releaseClaim(1, 'pipeline threw')).toBe(true);
+    expect(rows[0]!.status).toBe(OverflowStatus.enum.buffered);
+    expect(rows[0]!.replay_attempts).toBe(1);
+    expect(rows[0]!.last_error).toBe('pipeline threw');
+    expect(rows[0]!.claimed_at).toBeNull();
+  });
+
+  it('releaseClaim refuses a row it does not hold', async () => {
+    // A worker whose claim was reclaimed underneath it must not yank a row a
+    // different worker now owns.
+    const rows = [row(1, { status: OverflowStatus.enum.buffered })];
+    const r = makeReplayer(rows, false);
+
+    expect(await r.releaseClaim(1, 'pipeline threw')).toBe(false);
+    expect(rows[0]!.replay_attempts).toBe(0);
+    expect(rows[0]!.last_error).toBeNull();
   });
 });

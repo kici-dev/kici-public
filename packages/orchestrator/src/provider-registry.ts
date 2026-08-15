@@ -17,6 +17,7 @@ import { createLogger } from '@kici-dev/shared';
 import type {
   WebhookNormalizer,
   LockFileFetcher,
+  FileContentsFetcher,
   ChangedFilesFetcher,
   CloneTokenProvider,
   RepoUrlBuilder,
@@ -38,6 +39,25 @@ const logger = createLogger({ prefix: 'provider-registry' });
 export interface ProviderBundle {
   normalizer: WebhookNormalizer;
   lockFileFetcher?: LockFileFetcher;
+  /**
+   * Fetches arbitrary file contents at a ref (content-match triggers). Unlike
+   * the other fetchers, a GitHub instance is scoped to one installation, so the
+   * per-delivery installation id must be known to construct it -- it is wired
+   * where that id is in scope, not in the source-level bundle build. Providers
+   * that can prebuild one (no per-delivery credential) may set this directly;
+   * providers scoped per installation supply {@link fileContentsFetcherFactory}
+   * instead.
+   */
+  fileContentsFetcher?: FileContentsFetcher;
+  /**
+   * Builds a per-delivery {@link FileContentsFetcher} from the event
+   * credentials (e.g. a GitHub installation id). Returns undefined when the
+   * credentials do not carry what the provider needs. The webhook pipeline
+   * calls this once per delivery, where the credentials are already resolved.
+   */
+  fileContentsFetcherFactory?: (
+    credentials: Record<string, unknown>,
+  ) => FileContentsFetcher | undefined;
   changedFilesFetcher?: ChangedFilesFetcher;
   cloneTokenProvider?: CloneTokenProvider;
   repoUrlBuilder?: RepoUrlBuilder;
@@ -116,15 +136,40 @@ export class ProviderRegistry {
   }
 
   /**
+   * Whether a bundle is registered at EXACTLY this routing key.
+   *
+   * `getByRoutingKey` cannot answer this: it falls back to a provider-type
+   * lookup, so it returns a bundle for a key it has never seen. A caller that
+   * needs to know whether the source's OWN bundle is present — rather than
+   * whether some bundle can be produced — has to ask here.
+   */
+  hasExact(routingKey: string): boolean {
+    return this.bundles.has(routingKey);
+  }
+
+  /**
    * Get the provider bundle by routing key.
    * Routing keys have the format "{provider}:{id}" (e.g., "github:12345").
    *
-   * Falls back to get(providerType) if exact key is not found,
-   * for backward compatibility with single-app registration.
+   * Falls back to get(providerType) if the exact key is not found, for
+   * backward compatibility with single-app registration.
+   *
+   * The fallback is deliberately narrower for a `generic:` key. Such a key is
+   * fully qualified (`generic:{orgId}:{sourceId}`), so the type-prefix scan in
+   * `get()` cannot be a "the single configured app" shortcut the way it is for
+   * `github:` — it returns whichever `generic:`-prefixed bundle happens to sit
+   * first in insertion order, which may belong to a different source, or to a
+   * different ORGANIZATION. Only the shared default bundle (`generic:default`,
+   * the one that genuinely stands in for every plain generic source) is an
+   * acceptable stand-in, so that is the only fallback offered here.
    */
   getByRoutingKey(routingKey: string): ProviderBundle | undefined {
     const exact = this.bundles.get(routingKey);
     if (exact) return exact;
+
+    if (ProviderRegistry.isGenericRoutingKey(routingKey)) {
+      return this.bundles.get('generic:default');
+    }
 
     // Fallback: try provider type lookup for backward compat
     const providerType = routingKey.split(':')[0] as ProviderType;

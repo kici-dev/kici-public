@@ -14,6 +14,27 @@ import { requestContext, createLogger, toErrorMessage } from '@kici-dev/shared';
 const logger = createLogger({ prefix: 'dispatcher' });
 
 /**
+ * Why a freed agent's queue drain claimed nothing.
+ *
+ * Named rather than inlined because the value travels: it is the `reason`
+ * field of the drain-declined log line and the assertion subject of the tests
+ * that pin each exit. The five members are the five ways
+ * `Dispatcher.drainForAgent` can return without a dispatch.
+ */
+export enum AgentDrainDecline {
+  /** The agent id is not in the in-memory registry (already disconnected). */
+  NotRegistered = 'agent-not-registered',
+  /** This coordinator is draining and must not claim new work. */
+  CoordinatorDraining = 'coordinator-draining',
+  /** The agent is already at `maxConcurrency`. */
+  NoCapacity = 'no-capacity',
+  /** The host is flagged reboot-pending, so anything dispatched would be lost. */
+  RebootPending = 'reboot-pending',
+  /** Nothing in the queue matched this agent's labels or pin. */
+  NoMatchingJob = 'no-matching-job',
+}
+
+/**
  * Default per-pass cap on how many pending jobs a capacity-freed re-drive
  * re-offers to the scaler. Bounds the burst so a single free event cannot storm
  * the scaler; the per-backend spawn semaphore bounds actual provisioning, and a
@@ -116,6 +137,13 @@ export class Dispatcher {
    * the same tick.
    */
   private redriveInFlight = false;
+
+  /**
+   * Single-flight guard for `redrivePendingToConnectedAgents`. The per-coord
+   * safety-net tick must not overlap itself, so a slow re-drive can't be
+   * re-entered by the next interval fire and double-scan the same pending rows.
+   */
+  private pendingRedriveInFlight = false;
 
   /**
    * Tracks which jobs are dispatched to which agents.
@@ -683,7 +711,12 @@ export class Dispatcher {
     this.registry.incrementActiveJobs(agentId);
     let job: QueuedJob | null = null;
     try {
-      job = await this.queue.dequeueById(jobId, [...agent.labels], [...agent.mandatoryLabels]);
+      job = await this.queue.dequeueById(
+        jobId,
+        [...agent.labels],
+        [...agent.mandatoryLabels],
+        agentId,
+      );
     } finally {
       if (!job) this.registry.decrementActiveJobs(agentId);
     }
@@ -746,11 +779,39 @@ export class Dispatcher {
   }
 
   async onAgentAvailable(agentId: string): Promise<void> {
+    const declined = await this.drainForAgent(agentId);
+    const depth = await this.queue.getDepth();
+    this.metrics.setQueueDepth(depth);
+
+    // A drain that declines while the queue is EMPTY is the steady state and
+    // says nothing; one that declines while work is waiting is the shape of a
+    // job stranded on a queue an agent could have taken. Those two used to be
+    // byte-identical in the log — five distinct exits, none of them logged —
+    // which is why a pinned, label-matching queued job sitting undrained for a
+    // full minute after a host reconnect could not be told apart from an idle
+    // orchestrator. Gated on a non-empty queue so an idle fleet stays quiet,
+    // and at `info` because a deployment running at `debug` is not the one
+    // that needs the answer.
+    if (declined !== null && depth > 0) {
+      logger.info('Agent drain declined while the queue is non-empty', {
+        agentId,
+        reason: declined,
+        queueDepth: depth,
+      });
+    }
+  }
+
+  /**
+   * Claim at most one queued job for a freed agent.
+   *
+   * Returns the reason nothing was dispatched, or null when a job was.
+   */
+  private async drainForAgent(agentId: string): Promise<AgentDrainDecline | null> {
     const agent = this.registry.get(agentId);
-    if (!agent) return;
+    if (!agent) return AgentDrainDecline.NotRegistered;
 
     // Coordinator draining: do not claim new queued work onto a freed agent.
-    if (this.isDraining()) return;
+    if (this.isDraining()) return AgentDrainDecline.CoordinatorDraining;
 
     const agentLabels = [...agent.labels];
     const agentMandatoryLabels = [...agent.mandatoryLabels];
@@ -763,46 +824,42 @@ export class Dispatcher {
     // not on the brief still-connected window after the restart job completes.
     const rebootPending = (await this.rosterStore?.isRebootPending(agentId, Date.now())) ?? false;
 
-    if (agent.activeJobs < agent.maxConcurrency) {
-      // Claim the slot before the async dequeue. Drain triggers fire
-      // concurrently (job completion, agent.status, registration); without
-      // the eager claim each racer passes the capacity check and dispatches
-      // its own job to the same single-slot agent.
-      this.registry.incrementActiveJobs(agentId);
-      let job: QueuedJob | null = null;
-      try {
-        // Pinned host-fanout children for THIS agent drain first (they can only
-        // run here), then fall back to the generic label drain (which excludes
-        // jobs pinned to a different agent). When reboot-pending, skip the
-        // pinned drain (hold the post-restart job); the generic label drain is
-        // also skipped because dispatching anything to an about-to-reboot host
-        // would be lost.
-        job = rebootPending
-          ? null
-          : ((await this.queue.dequeueByPinnedAgent(agentId, agentLabels)) ??
-            (await this.queue.dequeueForLabels(agentLabels, agentMandatoryLabels, agentId)));
-      } finally {
-        if (!job) this.registry.decrementActiveJobs(agentId);
-      }
-      if (job) {
-        // Mark dispatched in DB
-        await this.queue.markDispatched(job.id, agentId);
-        this.trackJobForAgent(agentId, job.id, job.runId);
+    if (agent.activeJobs >= agent.maxConcurrency) return AgentDrainDecline.NoCapacity;
+    if (rebootPending) return AgentDrainDecline.RebootPending;
 
-        // Notify caller to send to agent -- restore request context for queue-drained jobs
-        if (job.requestId) {
-          await requestContext.run({ requestId: job.requestId, runId: job.runId }, () =>
-            this.onDispatch(agentId, job),
-          );
-        } else {
-          await this.onDispatch(agentId, job);
-        }
-        await this.armAckDeadline(agentId, job);
-        this.metrics.incJobsDispatched('dispatched');
-      }
+    // Claim the slot before the async dequeue. Drain triggers fire
+    // concurrently (job completion, agent.status, registration); without
+    // the eager claim each racer passes the capacity check and dispatches
+    // its own job to the same single-slot agent.
+    this.registry.incrementActiveJobs(agentId);
+    let job: QueuedJob | null = null;
+    try {
+      // Pinned host-fanout children for THIS agent drain first (they can only
+      // run here), then fall back to the generic label drain (which excludes
+      // jobs pinned to a different agent).
+      job =
+        (await this.queue.dequeueByPinnedAgent(agentId, agentLabels)) ??
+        (await this.queue.dequeueForLabels(agentLabels, agentMandatoryLabels, agentId));
+    } finally {
+      if (!job) this.registry.decrementActiveJobs(agentId);
     }
+    if (!job) return AgentDrainDecline.NoMatchingJob;
 
-    await this.updateQueueDepthMetric();
+    // Mark dispatched in DB
+    await this.queue.markDispatched(job.id, agentId);
+    this.trackJobForAgent(agentId, job.id, job.runId);
+
+    // Notify caller to send to agent -- restore request context for queue-drained jobs
+    if (job.requestId) {
+      await requestContext.run({ requestId: job.requestId, runId: job.runId }, () =>
+        this.onDispatch(agentId, job),
+      );
+    } else {
+      await this.onDispatch(agentId, job);
+    }
+    await this.armAckDeadline(agentId, job);
+    this.metrics.incJobsDispatched('dispatched');
+    return null;
   }
 
   /** Record that a job began executing on its agent. */
@@ -1035,6 +1092,82 @@ export class Dispatcher {
         typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
       );
     }
+  }
+
+  /**
+   * Safety-net re-drive: deliver every pending job that a currently-connected,
+   * idle, matching agent could take, through the same atomic claim the drain
+   * uses (`dispatchBoundJob` → `dequeueById`).
+   *
+   * Runs per-coordinator and is NOT leader-gated: each coordinator drains the
+   * shared queue onto its OWN connected agents, and the atomic claim guarantees
+   * at most one agent (on any coordinator) wins each job, so concurrent ticks
+   * cannot double-dispatch.
+   *
+   * It closes the requeue re-drive gap. A job requeued by `handleAckExpiry` /
+   * `onJobRejected` / the leader ack sweep gets exactly one delivery attempt —
+   * `redispatch`'s single `findAvailable` + `dispatchBoundJob`. An idle matching
+   * agent whose own drain trigger (registration / completion / status) already
+   * fired before the requeue has no further trigger, so if that one attempt
+   * transiently misses the agent — the agent is momentarily at capacity while an
+   * in-flight drain holds its eagerly-claimed slot, or the agent is connected to
+   * a different coordinator than the one that ran the expiry — the requeued
+   * pending job would otherwise sit undelivered until it expired. This tick
+   * re-attempts delivery onto connected agents so the miss recovers on the next
+   * sweep.
+   *
+   * It never consults the scaler (that is `retryPendingScaleRequests`) and never
+   * spawns: it only places jobs onto agents already connected here.
+   *
+   * A failure propagates to the caller rather than being swallowed here — the
+   * per-coord interval wrapper is the single error-log site, matching the
+   * sibling recovery/ack sweeps that share its cadence. The `finally` only
+   * releases the single-flight guard.
+   */
+  async redrivePendingToConnectedAgents(maxJobs: number = DEFAULT_REDRIVE_BATCH): Promise<number> {
+    if (this.pendingRedriveInFlight || this.isDraining()) return 0;
+    this.pendingRedriveInFlight = true;
+    try {
+      if ((await this.queue.getDepth()) === 0) return 0;
+      const pending = await this.queue.listPending(maxJobs);
+      let placed = 0;
+      for (const job of pending) {
+        const target = this.selectConnectedTargetForPending(job);
+        if (!target) continue;
+        if (await this.dispatchBoundJob(target, job.id)) placed++;
+      }
+      if (placed > 0) {
+        logger.info('Re-drove pending jobs onto connected idle agents', {
+          placed,
+          scanned: pending.length,
+        });
+      }
+      return placed;
+    } finally {
+      this.pendingRedriveInFlight = false;
+    }
+  }
+
+  /**
+   * Pick a connected agent that may take a pending job, or null. A pinned
+   * host-fanout child may run ONLY on its pinned agent — and `dequeueById`
+   * ignores the pin — so a pinned job is routed to its own agent and never
+   * offered to `findAvailable`, which would mis-deliver it to any label match.
+   */
+  private selectConnectedTargetForPending(job: QueuedJob): string | null {
+    if (job.pinnedAgentId) {
+      const agent = this.registry.get(job.pinnedAgentId);
+      if (!agent || agent.activeJobs >= agent.maxConcurrency) return null;
+      return job.pinnedAgentId;
+    }
+    const available = this.registry.findAvailable(
+      job.runsOnLabels,
+      job.runsOnPatterns ?? [],
+      job.excludeLabels ?? [],
+      job.excludePatterns ?? [],
+    );
+    if (available.length === 0) return null;
+    return selectAgent(available, job.jobConfig).agentId;
   }
 
   /**

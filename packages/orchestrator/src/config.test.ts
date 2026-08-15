@@ -81,6 +81,29 @@ describe('orchestrator loadConfig', () => {
       expect(loadConfig().dispatchQueueTtlDays).toBe(7);
     });
 
+    describe('globalWorkflowsEnabled', () => {
+      it('defaults to false', () => {
+        expect(loadConfig().globalWorkflowsEnabled).toBe(false);
+      });
+
+      it('reads KICI_GLOBAL_WORKFLOWS_ENABLED=true as true', () => {
+        process.env.KICI_GLOBAL_WORKFLOWS_ENABLED = 'true';
+        expect(loadConfig().globalWorkflowsEnabled).toBe(true);
+      });
+
+      // The z.coerce.boolean() trap: any non-empty string coerces to true, so an
+      // operator explicitly disabling the feature would silently enable it.
+      it('reads the string "false" as false', () => {
+        process.env.KICI_GLOBAL_WORKFLOWS_ENABLED = 'false';
+        expect(loadConfig().globalWorkflowsEnabled).toBe(false);
+      });
+
+      it('reads an unrecognised string as false', () => {
+        process.env.KICI_GLOBAL_WORKFLOWS_ENABLED = 'yes';
+        expect(loadConfig().globalWorkflowsEnabled).toBe(false);
+      });
+    });
+
     // Regression guard. This knob is read at the reconnect state-replay send
     // site and was declared in no schema, so the unknown-KICI_*-var startup
     // guard made the orchestrator REFUSE TO BOOT whenever an operator set it —

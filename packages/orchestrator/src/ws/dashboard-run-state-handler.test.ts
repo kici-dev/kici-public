@@ -122,3 +122,55 @@ describe('handleRunState (dashboard.run.state system read)', () => {
     expect(mutated()).toBe(false);
   });
 });
+
+/**
+ * The Platform's `RunMirrorReconciler` drives this projection through the same
+ * `upsertRunMirror` helper the reconnect replay uses. A cross-repository global
+ * run the reconciler recovers must therefore carry its workflow repo, or the
+ * recovered mirror row reads as an ordinary per-repository run.
+ */
+describe('handleRunState workflow repo attribution', () => {
+  const WORKFLOW_REPO = 'owner/org-workflows';
+
+  function runRow(workflowRepo: string | null): Record<string, unknown> {
+    return {
+      run_id: 'run-global',
+      workflow_name: 'ci',
+      status: 'success',
+      routing_key: 'github:1',
+      repo_identifier: 'owner/source-repo',
+      workflow_repo_identifier: workflowRepo,
+      sha: 'abc',
+      ref: 'refs/heads/main',
+      started_at: new Date(1_700_000_000_000),
+      completed_at: new Date(1_700_000_005_000),
+      duration_ms: 5000,
+      parent_run_id: null,
+      original_run_id: null,
+      triggered_by: null,
+      triggered_by_agent_label: null,
+      failure_reason: null,
+      failure_class: null,
+    };
+  }
+
+  it('projects the workflow repo of a cross-repository global run', async () => {
+    const { db } = makeFakeDb({
+      runs: { 'run-global': runRow(WORKFLOW_REPO) },
+      jobs: { 'run-global': [] },
+    });
+    const resp = await handleRunState({ db }, req('run-global'));
+    expect(resp.run?.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
+    // The source repo is untouched — a global run belongs to both.
+    expect(resp.run?.repoIdentifier).toBe('owner/source-repo');
+  });
+
+  it('omits the workflow repo for an ordinary per-repository run', async () => {
+    const { db } = makeFakeDb({
+      runs: { 'run-global': runRow(null) },
+      jobs: { 'run-global': [] },
+    });
+    const resp = await handleRunState({ db }, req('run-global'));
+    expect(resp.run?.workflowRepoIdentifier).toBeUndefined();
+  });
+});

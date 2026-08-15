@@ -170,7 +170,11 @@ export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
           payload,
         };
 
-        // 8. Process through the pipeline (atomic dedup + dispatch).
+        // 8. Hand the delivery to ingest. Resolves once the delivery is DURABLY
+        // QUEUED, not once it has been matched and dispatched: GitHub abandons a
+        // delivery after 10 seconds, while one matched workflow's build phase
+        // alone may legitimately take minutes. The pipeline still owns the
+        // atomic dedup claim.
         const ingest = await deps.onWebhook(info);
         webhooksReceivedTotal.add(1, { source: 'github-direct', event });
         logger.info('Direct GitHub webhook accepted', {
@@ -192,8 +196,13 @@ export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
             429,
           );
         }
+        // 202 = accepted and durably queued; it asserts nothing about matching
+        // or dispatch. Those outcomes reach the event log and the run list.
         return c.json({ accepted: true, deliveryId }, 202);
       } catch (err) {
+        // Reachable only for a failure BEFORE the delivery is queued. A pipeline
+        // failure surfaces as a `failed` event-log row plus an
+        // `orch:ingest-accept` error line, not as a 500 here.
         logger.error('Direct GitHub webhook processing error', {
           orgId,
           sourceId,

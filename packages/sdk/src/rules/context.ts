@@ -2,31 +2,11 @@ import { $ } from 'zx';
 import type { ChangedFilesStatus } from '@kici-dev/engine';
 import type { EventPayload } from '../events/event-payloads.js';
 import type { FanoutPosition } from '../fanout-context.js';
+import type { RepoInfo } from '../context.js';
 import type { RuleContext } from './types.js';
+import { defineChangedFilesGetter, eventTypeOf } from './changed-files.js';
 
-/**
- * Thrown when a rule reads `ctx.changedFiles` but the diff is not available
- * (`changedFilesStatus !== 'fetched'`). `evaluateRules` re-throws this rather
- * than folding it into a `passed=false` skip, so the job fails loudly instead
- * of silently mis-evaluating a path-based gate.
- */
-export class ChangedFilesUnavailableError extends Error {
-  readonly changedFilesStatus: ChangedFilesStatus;
-  readonly eventType?: string;
-
-  constructor(status: ChangedFilesStatus, eventType?: string) {
-    super(
-      `ctx.changedFiles is not available (status: ${status}` +
-        (eventType ? `, event: ${eventType}` : '') +
-        `). Changed files are only defined for push / pull_request events with a ` +
-        `computable diff. Guard with ctx.changedFilesStatus before accessing, e.g. ` +
-        `\`if (ctx.changedFilesStatus !== 'fetched') return true\`.`,
-    );
-    this.name = 'ChangedFilesUnavailableError';
-    this.changedFilesStatus = status;
-    this.eventType = eventType;
-  }
-}
+export { ChangedFilesUnavailableError } from './changed-files.js';
 
 /** Input for {@link createRuleContext}. */
 export interface CreateRuleContextInput {
@@ -37,6 +17,16 @@ export interface CreateRuleContextInput {
   env?: Record<string, string | undefined>;
   dispatchInputs?: Readonly<Record<string, string | number | boolean | null>>;
   fanout?: FanoutPosition;
+  /**
+   * The repo whose event triggered this run. Supplied for a global workflow.
+   *
+   * `path` is an absolute path into the evaluating machine's work directory and
+   * is NOT stable across evaluations — read the tree through it, never compare
+   * it. `ref` / `sha` are optional on `RepoInfo`; do not assume either is set.
+   */
+  sourceRepo?: RepoInfo;
+  /** The repo that registered the workflow. Identical to `sourceRepo` outside a global workflow. */
+  workflowRepo?: RepoInfo;
 }
 
 /**
@@ -47,11 +37,6 @@ export interface CreateRuleContextInput {
  */
 export function createRuleContext(input: CreateRuleContextInput): RuleContext {
   const status: ChangedFilesStatus = input.changedFilesStatus ?? 'fetched';
-  const files = input.changedFiles ?? [];
-  const eventType =
-    typeof (input.event as { type?: unknown }).type === 'string'
-      ? (input.event as { type: string }).type
-      : undefined;
 
   const base: Omit<RuleContext, 'changedFiles'> = {
     event: input.event as EventPayload,
@@ -59,16 +44,17 @@ export function createRuleContext(input: CreateRuleContextInput): RuleContext {
     env: input.env ?? {},
     dispatchInputs: input.dispatchInputs ?? {},
     ...(input.fanout && { fanout: input.fanout }),
+    // Spread conditionally: a present-but-undefined `sourceRepo` reads as
+    // "declared" to a rule that guards on the key rather than the value.
+    ...(input.sourceRepo && { sourceRepo: input.sourceRepo }),
+    ...(input.workflowRepo && { workflowRepo: input.workflowRepo }),
     $,
   };
 
-  Object.defineProperty(base, 'changedFiles', {
-    enumerable: true,
-    configurable: true,
-    get(): string[] {
-      if (status !== 'fetched') throw new ChangedFilesUnavailableError(status, eventType);
-      return files;
-    },
+  defineChangedFilesGetter(base, {
+    files: input.changedFiles ?? [],
+    status,
+    eventType: eventTypeOf(input.event),
   });
 
   return base as RuleContext;

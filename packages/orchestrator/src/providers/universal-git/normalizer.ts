@@ -123,6 +123,7 @@ export class UniversalGitWebhookNormalizer implements WebhookNormalizer {
           targetBranch: ref.slice('refs/tags/'.length),
           senderUsername,
           senderUserId,
+          commitMessage: this.extractCommitMessage('push', p),
           payload: p,
           provider: 'generic',
         };
@@ -133,6 +134,7 @@ export class UniversalGitWebhookNormalizer implements WebhookNormalizer {
         targetBranch,
         senderUsername,
         senderUserId,
+        commitMessage: this.extractCommitMessage('push', p),
         payload: p,
         provider: 'generic',
       };
@@ -170,6 +172,7 @@ export class UniversalGitWebhookNormalizer implements WebhookNormalizer {
       isForkPR,
       senderUsername,
       senderUserId,
+      commitMessage: this.extractCommitMessage('pull_request', p),
       payload: p,
       provider: 'generic',
     };
@@ -226,6 +229,35 @@ export class UniversalGitWebhookNormalizer implements WebhookNormalizer {
   extractDefaultBranch(payload: unknown): string | null {
     const p = (payload as Record<string, unknown>) ?? {};
     return extractStringPath(p, this.paths.defaultBranch);
+  }
+
+  /**
+   * Text a `commitMessage` trigger filter is tested against.
+   *
+   * Push/tag reads the configured JSONPath, because forges genuinely differ on
+   * where the head commit lives. The PR read is STRUCTURAL rather than
+   * configured, matching how this normalizer already resolves base/head refs —
+   * `pull_request` on Gitea-family forges, `object_attributes` on GitLab, whose
+   * body field is spelled `description`.
+   */
+  private extractCommitMessage(
+    kind: 'push' | 'pull_request',
+    p: Record<string, unknown>,
+  ): string | undefined {
+    if (kind === 'push') {
+      const path = this.paths.commitMessage;
+      if (!path) return undefined;
+      return extractStringPath(p, path) ?? undefined;
+    }
+
+    const pr =
+      (p.pull_request as Record<string, unknown> | undefined) ??
+      (p.object_attributes as Record<string, unknown> | undefined);
+    const title = pr?.title;
+    if (typeof title !== 'string') return undefined;
+    const rawBody = pr?.body ?? pr?.description;
+    const body = typeof rawBody === 'string' && rawBody.length > 0 ? rawBody : undefined;
+    return body === undefined ? title : `${title}\n${body}`;
   }
 
   /** Classify the raw event header against the source's eventMapping. */

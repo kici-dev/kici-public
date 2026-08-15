@@ -128,6 +128,7 @@ import type { ProcessingDeps } from './pipeline/processor.js';
 import { provisionRemoteSource } from './pipeline/remote-source-store.js';
 import { readDeploymentIdentity } from './deployment/deployment-identity.js';
 import { dispatchTestRelay } from './ws/test-relay-handlers.js';
+import { buildExecutionStatusFrame } from './ws/execution-status-frame.js';
 import type { ReleaseSignal } from './contexts/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import type { PeerClient as PeerClientT } from './cluster/peer-client.js';
@@ -259,44 +260,22 @@ await guardStartup(logger, async () => {
         initFailure,
       ) => {
         try {
-          platformClient.send({
-            type: 'execution.status',
-            messageId: crypto.randomUUID(),
-            runId,
-            workflowName: context.workflowName,
-            status,
-            ...(context.routingKey && { routingKey: context.routingKey }),
-            repoIdentifier: context.repoIdentifier,
-            ...(context.provider && { repoProvider: context.provider }),
-            ...(context.localWorkingTree && { localWorkingTree: true }),
-            sha: context.sha,
-            ...(context.ref && { ref: context.ref }),
-            ...(context.triggerEvent && { triggerEvent: context.triggerEvent }),
-            ...(context.commitMessage && { commitMessage: context.commitMessage }),
-            ...(context.parentRunId != null && { parentRunId: context.parentRunId }),
-            ...(context.originalRunId != null && { originalRunId: context.originalRunId }),
-            ...(context.triggeredBy != null && { triggeredBy: context.triggeredBy }),
-            ...(context.triggeredByAgentLabel != null && {
-              triggeredByAgentLabel: context.triggeredByAgentLabel,
+          platformClient.send(
+            buildExecutionStatusFrame({
+              messageId: crypto.randomUUID(),
+              runId,
+              status,
+              context,
+              jobCount,
+              startedAt,
+              timestamp: Date.now(),
+              ...(completedAt !== undefined && { completedAt }),
+              ...(durationMs !== undefined && { durationMs }),
+              ...(failureReason !== undefined && { failureReason }),
+              ...(logBytes !== undefined && { logBytes }),
+              ...(initFailure && { initFailure }),
             }),
-            ...((context.triggerActorUsername != null || context.triggerActorUserId != null) &&
-              context.provider && { triggerActorProvider: context.provider }),
-            ...(context.triggerActorUsername != null && {
-              triggerActorUsername: context.triggerActorUsername,
-            }),
-            ...(context.triggerActorUserId != null && {
-              triggerActorUserId: context.triggerActorUserId,
-            }),
-            jobCount,
-            startedAt,
-            timestamp: Date.now(),
-            ...(completedAt !== undefined && { completedAt }),
-            ...(durationMs !== undefined && { durationMs }),
-            ...(failureReason !== undefined && { failureReason }),
-            ...(logBytes !== undefined && { logBytes }),
-            ...(initFailure && { initFailure }),
-            ...(context.failureClass && { failureClass: context.failureClass }),
-          });
+          );
         } catch (err) {
           logger.warn('Failed to forward execution status to Platform', {
             runId,
@@ -606,7 +585,11 @@ await guardStartup(logger, async () => {
       });
 
       // Create global workflow policy for org-level permission enforcement
-      const globalWorkflowPolicy = new GlobalWorkflowPolicy(sub.db);
+      const globalWorkflowPolicy = new GlobalWorkflowPolicy(
+        sub.db,
+        sub.clusterSettings,
+        sub.config.globalWorkflowsEnabled,
+      );
 
       // Create environment stores and DashboardContextHandler
       const contextStore = new ContextStore(sub.db);
@@ -618,7 +601,9 @@ await guardStartup(logger, async () => {
       const buildProcessingDeps = (): ProcessingDeps => ({
         dedup: sub.dedup,
         providerRegistry: sub.providerRegistry,
+        ensureProviderBundle: sub.ensureProviderBundle,
         lockFileCache: sub.lockFileCache,
+        contentRequirementsCache: sub.contentRequirementsCache,
         dispatcher: sub.dispatcher,
         platformClient,
         webhookPayloadDir: config.webhookPayloadDir,
@@ -628,6 +613,8 @@ await guardStartup(logger, async () => {
         pendingBuilds: sub.pendingBuilds,
         pendingInits: sub.pendingInits,
         pendingDynamics: sub.pendingDynamics,
+        pendingGlobalEvals: sub.pendingGlobalEvals,
+        globalEvalCache: sub.globalEvalCache,
         checkRunReporter: sub.checkRunReporter,
         executionTracker: sub.executionTracker,
         coordinator: sub.coordinator,
@@ -658,6 +645,9 @@ await guardStartup(logger, async () => {
         instanceId: config.instanceId,
         rosterGraceMs: config.rosterGraceMs,
         maxFanoutHosts: config.maxFanoutHosts,
+        globalEvalRoundTimeoutMs: config.globalEvalRoundTimeoutMs,
+        globalEvalCandidateTimeoutMs: config.globalEvalCandidateTimeoutMs,
+        globalEvalWaitTimeoutMs: config.globalEvalWaitTimeoutMs,
         clusterSettings: sub.clusterSettings,
       });
       let dashboardEnvSendFn: ((msg: unknown) => void) | null = null;
@@ -747,6 +737,8 @@ await guardStartup(logger, async () => {
         send: (msg) => dashboardGlobalWorkflowsSendFn?.(msg),
         db: sub.db,
         accessLog: sub.accessLogWriter,
+        clusterSettings: sub.clusterSettings,
+        globalWorkflowsEnabledDefault: sub.config.globalWorkflowsEnabled,
       });
 
       // Create backends handler for dashboard backend management
@@ -1303,6 +1295,12 @@ await guardStartup(logger, async () => {
               repo,
               sha: run.sha,
               workflowName: run.workflowName,
+              // Present only for a cross-repository global run, and absent from
+              // every run a Platform predating the field sends. Both cases name
+              // the unqualified check — see `workflowLabel`.
+              ...(run.workflowRepoIdentifier && {
+                workflowRepoIdentifier: run.workflowRepoIdentifier,
+              }),
               jobNames: run.jobNames,
             });
           }
@@ -1827,6 +1825,7 @@ await guardStartup(logger, async () => {
                     'status',
                     'routing_key',
                     'repo_identifier',
+                    'workflow_repo_identifier',
                     'provider',
                     'local_working_tree',
                     'sha',
@@ -1844,6 +1843,7 @@ await guardStartup(logger, async () => {
                       status: row.status,
                       routing_key: row.routing_key,
                       repo_identifier: row.repo_identifier,
+                      workflow_repo_identifier: row.workflow_repo_identifier,
                       provider: row.provider,
                       local_working_tree: row.local_working_tree,
                       sha: row.sha,

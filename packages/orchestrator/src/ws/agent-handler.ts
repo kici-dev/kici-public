@@ -66,6 +66,7 @@ import type { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracke
 import type { PendingBuildTracker } from '../cache/pending-builds.js';
 import type { PendingInitTracker } from '../cache/pending-inits.js';
 import type { PendingDynamicTracker } from '../cache/pending-dynamics.js';
+import type { PendingGlobalEvalTracker } from '../cache/pending-global-evals.js';
 import type { CacheStorage } from '../storage/types.js';
 import { setAgentsActive } from '../metrics/prometheus.js';
 import type { AgentMetricsAggregator } from '../metrics/agent-metrics-aggregator.js';
@@ -508,6 +509,8 @@ export interface AgentWsHandlerDeps {
   pendingInits?: PendingInitTracker;
   /** Optional pending dynamic tracker for cleanup on agent disconnect. */
   pendingDynamics?: PendingDynamicTracker;
+  /** Optional pending global-eval-round tracker for cleanup on agent disconnect. */
+  pendingGlobalEvals?: PendingGlobalEvalTracker;
   /** Optional callback when agent sends encrypted secret outputs on job success. */
   onSecretOutputs?: (
     runId: string,
@@ -734,6 +737,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     pendingBuilds,
     pendingInits,
     pendingDynamics,
+    pendingGlobalEvals,
     onSecretOutputs,
     onConcurrencyReport,
     onStepApproval,
@@ -2731,6 +2735,24 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             if (pendingDynamics) {
               for (const jobId of failedJobIds) {
                 pendingDynamics.cleanup(jobId);
+              }
+            }
+
+            // Clean up pending global eval rounds so the webhook pipeline doesn't hang forever.
+            //
+            // This covers SCALER-MANAGED agents only, and deliberately so: for a
+            // static agent with in-flight jobs `Dispatcher.onAgentDisconnect`
+            // routes to `startRecoveryForDisconnect`, which always returns an
+            // empty list (it keeps tracking the jobs for reconnect
+            // reconciliation instead of failing them), so this loop iterates
+            // nothing. A round left pending by a static agent's disconnect is
+            // settled by that agent's own terminal `job.status` on reconnect,
+            // or — when it never reconnects — by the orchestrator-side wait
+            // ceiling the round applies around its own await
+            // (`global_eval_wait_timeout_ms`), not from here.
+            if (pendingGlobalEvals) {
+              for (const jobId of failedJobIds) {
+                pendingGlobalEvals.cleanup(jobId);
               }
             }
 

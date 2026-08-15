@@ -9,6 +9,7 @@
  */
 
 import type { WebhookNormalizer, SimulatedEvent, AccessCacheInvalidation } from '@kici-dev/engine';
+import { githubFilterText } from '../github/commit-message.js';
 
 /**
  * Local provider implementation of WebhookNormalizer.
@@ -142,6 +143,7 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
       type: eventType,
       action,
       targetBranch,
+      commitMessage: githubFilterText(eventType, p),
       payload: p,
       provider: 'local',
     };

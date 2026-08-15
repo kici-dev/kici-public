@@ -46,7 +46,7 @@ describeDb('migration 094_dashboard_encryption_keys', () => {
     await adminPool.end();
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-  });
+  }, 60_000);
 
   afterAll(async () => {
     await db.destroy();

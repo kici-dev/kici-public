@@ -129,6 +129,8 @@ import {
   extractStepsFromDynamicJob,
 } from '../workflow-loader.js';
 import type { SdkOutputSetters } from '../workflow-loader.js';
+import type { GeneratorRepoPair } from '../generator-context.js';
+import { applyGlobalWorkflowEnv, repoIdentifierFromUrl } from '../global-workflow-env.js';
 import { restoreSource } from '../source-restore.js';
 import { evaluateRules, createRuleContext, type RuleEvaluationResult } from '../rule-evaluator.js';
 import { applyOverlay } from '../overlay-applier.js';
@@ -1986,6 +1988,31 @@ async function loadWorkflowModuleWithCapture(
 type ConcurrencyAction = 'proceed' | 'wait' | 'cancel' | 'failed';
 
 /**
+ * Build the argument the user's `concurrency.group(...)` function receives.
+ *
+ * The only inputs an author can scope a group by. `branch` alone does not
+ * separate one repository from another — an organization-wide workflow runs on
+ * events from many repositories, and their default branches share a name — so
+ * `event.sourceRepo` is what makes a per-source-repository group expressible.
+ * That is why the orchestrator writes the whole normalized envelope into every
+ * global job config: an empty `event` here silently collapses every repository
+ * into one group, and with `cancelInProgress` (the default) one repository's
+ * push then cancels another's in-flight run.
+ *
+ * Boundary cast: the wire `request.event` is untyped JSON that, per the unified
+ * event protocol, always carries the normalized event envelope.
+ */
+export function buildConcurrencyGroupContext(request: JobExecutionRequest): {
+  branch: string;
+  event: EventPayload;
+} {
+  return {
+    branch: request.branch ?? request.ref,
+    event: (request.event ?? {}) as EventPayload,
+  };
+}
+
+/**
  * Phase 4b — Evaluate the user-defined `concurrency.group(...)` function with
  * a timeout, report the resulting key to the orchestrator, and act on the
  * returned ack. `wait` and `cancel` paths exit the process directly (the run
@@ -2002,13 +2029,7 @@ async function evaluateConcurrencyGroupIfPresent(
   if (!workflow.concurrency?.group) return 'proceed';
   trace('evaluating concurrency group function');
   const concurrencyTimeoutMs = request.concurrencyEvaluationTimeoutMs ?? 30_000;
-  const groupCtx = {
-    branch: request.branch ?? request.ref,
-    // Boundary cast: the wire `request.event` is untyped JSON that, per the
-    // unified event protocol, always carries the normalized event envelope.
-    // This is the one site where it enters concurrency.group's user function.
-    event: (request.event ?? {}) as EventPayload,
-  };
+  const groupCtx = buildConcurrencyGroupContext(request);
 
   try {
     const ac = new AbortController();
@@ -2142,30 +2163,26 @@ async function evaluateConcurrencyGroupIfPresent(
 }
 
 /**
- * Phase 5 — Inject env vars and build the `RepoInfo` pair that step contexts
- * receive when the job is a global workflow. No-op for normal jobs.
+ * Phase 5 — Inject env vars and build the `RepoInfo` pair that the generator,
+ * the job rules, and step contexts receive when the job is a global workflow.
+ * No-op for normal jobs.
+ *
+ * Runs at the head of phase 5, before anything that may read the source tree:
+ * the generator's re-evaluation (phase 5) and the job rules (phase 7) both take
+ * the returned pair, and both must see what the pre-dispatch evaluation saw.
+ *
+ * `sourceRepo.path` is this sandbox's own absolute path — the same repo lives at
+ * a different path in the evaluation that produced the job list. Read through
+ * it; never compare it or embed it in a job name.
  */
-function setupGlobalWorkflowEnv(
+export function setupGlobalWorkflowEnv(
   request: JobExecutionRequest,
   isGlobal: boolean,
   workflowDir: string,
   sourceDir: string,
 ): { workflowRepo: RepoInfo; sourceRepo: RepoInfo } | undefined {
   if (!isGlobal) return undefined;
-  process.env.KICI_IS_GLOBAL_WORKFLOW = 'true';
-  process.env.KICI_WORKFLOW_REPO_PATH = workflowDir;
-  process.env.KICI_SOURCE_REPO_PATH = sourceDir;
-  const sourceRepoIdentifier = request.repoUrl
-    .replace(/\.git$/, '')
-    .replace(/^https?:\/\/[^/]+\//, '');
-  process.env.KICI_SOURCE_REPO = sourceRepoIdentifier;
-  process.env.KICI_SOURCE_BRANCH = request.ref;
-  process.env.KICI_SOURCE_SHA = request.sha;
-  process.env.KICI_WORKFLOW_REPO = request.workflowRepoIdentifier ?? '';
-  trace(
-    `global workflow env vars injected: KICI_WORKFLOW_REPO_PATH=${workflowDir}, KICI_SOURCE_REPO_PATH=${sourceDir}`,
-  );
-  return {
+  const repos = {
     workflowRepo: {
       identifier: request.workflowRepoIdentifier ?? '',
       path: workflowDir,
@@ -2173,12 +2190,22 @@ function setupGlobalWorkflowEnv(
       sha: request.workflowSha,
     },
     sourceRepo: {
-      identifier: sourceRepoIdentifier,
+      identifier: repoIdentifierFromUrl(request.repoUrl),
       path: sourceDir,
       ref: request.ref,
       sha: request.sha,
     },
   };
+  // Injected through the shared writer so this sandbox evaluation and the
+  // pre-dispatch global eval round hand the generator the same ambient env.
+  // The restorer is deliberately discarded: this process runs exactly one job
+  // and then exits, so the keys must stay set for the rest of the job. A
+  // caller in a long-lived process (the eval round, in the agent) must call it.
+  applyGlobalWorkflowEnv(repos);
+  trace(
+    `global workflow env vars injected: KICI_WORKFLOW_REPO_PATH=${workflowDir}, KICI_SOURCE_REPO_PATH=${sourceDir}`,
+  );
+  return repos;
 }
 
 /**
@@ -2384,6 +2411,12 @@ async function extractAndNormalizeSteps(
   workflow: Workflow,
   request: JobExecutionRequest,
   apiTransport: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+  /**
+   * The global-workflow repo pair, or undefined for a normal job. Forwarded to
+   * the generator's re-evaluation so it sees the same world the pre-dispatch
+   * evaluation did.
+   */
+  repos?: GeneratorRepoPair,
 ): Promise<{
   normalizedSteps: Step[];
   nodes: StepNode[];
@@ -2403,6 +2436,7 @@ async function extractAndNormalizeSteps(
       request.dynamicSource.expectedJobNames,
       request.dynamicSource.upstreamSnapshot,
       request.dynamicSource.declaredNeeds,
+      repos,
     );
     rawSteps = dynamicResult.steps;
     driftDroppedJobs = dynamicResult.droppedJobs;
@@ -2585,6 +2619,8 @@ async function maybeSkipJobOnRules(
   job: Job | undefined,
   request: JobExecutionRequest,
   normalizedSteps: Step[],
+  /** The global-workflow repo pair, or undefined for a normal job. */
+  repos?: GeneratorRepoPair,
 ): Promise<boolean> {
   if (!job?.rules || job.rules.length === 0) return false;
   const ev = (request.event ?? {}) as {
@@ -2600,6 +2636,9 @@ async function maybeSkipJobOnRules(
       Record<string, string | number | boolean | null>
     >,
     fanout: deriveFanout(request),
+    // A rule reads the source tree through `sourceRepo.path` the same way a
+    // generator does. Absent for a normal job.
+    ...(repos && { sourceRepo: repos.sourceRepo, workflowRepo: repos.workflowRepo }),
   });
   const ruleResult = await evaluateRules(job.rules, ruleCtx, request.jobName);
   const completion = buildJobRuleCompletion(ruleResult, normalizedSteps);
@@ -2609,6 +2648,36 @@ async function maybeSkipJobOnRules(
   capturePrepareActive = false;
   sendMessage(completion);
   process.exit(0);
+}
+
+/**
+ * Build the inputs the step loop turns into every step rule's `RuleContext`.
+ *
+ * Shares its source with `maybeSkipJobOnRules` so a step rule and a job rule
+ * see the same world: the same event, env, dispatch inputs, fan-out position,
+ * and — for a global workflow — the same source / workflow repo pair. A step
+ * rule that received the pair as `undefined` while the job rule beside it
+ * received the real thing would read the same `RuleContext` type two ways.
+ *
+ * The pair is spread conditionally: a present-but-undefined `sourceRepo` reads
+ * as "declared" to a rule that guards on the key rather than the value.
+ */
+export function buildStepLoopRuleInputs(
+  request: JobExecutionRequest,
+  repos: GeneratorRepoPair | undefined,
+): Pick<
+  StepLoopOptions,
+  'event' | 'env' | 'dispatchInputs' | 'fanout' | 'sourceRepo' | 'workflowRepo'
+> {
+  return {
+    event: request.event ?? {},
+    env: process.env as Record<string, string | undefined>,
+    dispatchInputs: (request.dispatchInputs ?? {}) as Readonly<
+      Record<string, string | number | boolean | null>
+    >,
+    fanout: deriveFanout(request),
+    ...(repos && { sourceRepo: repos.sourceRepo, workflowRepo: repos.workflowRepo }),
+  };
 }
 
 /**
@@ -2875,7 +2944,16 @@ async function main(): Promise<void> {
   // Phase 4: concurrency group eval (may exit the process for wait/cancel)
   await evaluateConcurrencyGroupIfPresent(workflow, request);
 
-  // Phase 5: extract steps (dynamic source eval or static lookup), normalize
+  // Phase 5: inject the global-workflow env + repo pair, then extract steps
+  // (dynamic source eval or static lookup) and normalize.
+  //
+  // The env injection runs FIRST because the generator (below) and the rules
+  // (phase 7) both receive the repo pair and both may read the source tree
+  // through it. A generator re-evaluated in a sandbox that could not see the
+  // source would produce a different job list than the pre-dispatch evaluation
+  // did, and `extractStepsFromDynamicJob` fails the job on that mismatch.
+  const globalRepoInfo = setupGlobalWorkflowEnv(request, isGlobal, workflowDir, sourceDir);
+
   const apiTransport = async (method: string, params?: Record<string, unknown>) => {
     const reqId = randomUUID();
     sendMessage({
@@ -2890,6 +2968,7 @@ async function main(): Promise<void> {
     workflow,
     request,
     apiTransport,
+    globalRepoInfo,
   );
 
   // Phase 6: build output infrastructure (operator-secret keys + outputs maps)
@@ -2903,12 +2982,11 @@ async function main(): Promise<void> {
   const jobHasRules = (job?.rules?.length ?? 0) > 0;
   const anyStepHasRules = normalizedSteps.some((s) => (s.rules?.length ?? 0) > 0);
   await resolveChangedFilesForRules(request, sourceDir, jobHasRules || anyStepHasRules);
-  await maybeSkipJobOnRules(job, request, normalizedSteps);
+  await maybeSkipJobOnRules(job, request, normalizedSteps, globalRepoInfo);
   if (aborted) abortAndExit('aborted after rules');
 
-  // Phase 8: collect job hooks + global-workflow env
+  // Phase 8: collect job hooks
   const jobHooks = collectJobHooks(job);
-  const globalRepoInfo = setupGlobalWorkflowEnv(request, isGlobal, workflowDir, sourceDir);
 
   // Phase 9: switch from prepare-phase capture to per-step capture
   flushOutputCapture();
@@ -3014,12 +3092,7 @@ async function main(): Promise<void> {
     sendIpc: maskedSend,
     defaultTimeoutMs,
     outputsMap,
-    event: request.event ?? {},
-    env: process.env as Record<string, string | undefined>,
-    dispatchInputs: (request.dispatchInputs ?? {}) as Readonly<
-      Record<string, string | number | boolean | null>
-    >,
-    fanout: deriveFanout(request),
+    ...buildStepLoopRuleInputs(request, globalRepoInfo),
     jobHooks,
     cachePhaseDeps,
     isAborted: () => aborted,

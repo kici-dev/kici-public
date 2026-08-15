@@ -450,3 +450,75 @@ describe('handleTestCancel', () => {
     expect(result).toEqual({ error: 'runId required' });
   });
 });
+
+/**
+ * Attribution of a relayed test run.
+ *
+ * The Platform has always stamped `actor` on `test.relay.trigger` — the wire
+ * schema requires it — but the handler dropped it on the floor: it wrote one
+ * `access_log` row and passed nothing into the pipeline. So the orchestrator's
+ * own `execution_runs.triggered_by` stayed NULL for every `kici run remote`
+ * run, and the orchestrator dashboard, `kici runs show` and `kici-admin` all
+ * reported no initiator for a run that plainly had one.
+ */
+describe('handleTestTrigger attribution', () => {
+  // The pipeline mock is module-scoped and shared with the describe above, so
+  // without this reset `mock.calls[0]` is that block's first call, not ours.
+  beforeEach(() => vi.mocked(testPipeline.processTestTrigger).mockReset());
+
+  /** The same agent-kind actor shape a user driving KiCI through an agent PAT mints. */
+  const AGENT_ACTOR: ActorPrincipal = {
+    type: 'user',
+    sub: 'kc-sub-123',
+    agent: { patId: 'pat-9', label: 'ci' },
+  };
+
+  function triggerDeps() {
+    const { db } = makeDbMock({});
+    return {
+      db,
+      accessLog: { record: vi.fn().mockResolvedValue(undefined) },
+    } as unknown as TestRelayHandlerDeps;
+  }
+
+  function triggerMsg(actor: ActorPrincipal) {
+    return {
+      type: 'test.relay.trigger' as const,
+      requestId: 'r-attr',
+      actor,
+      routingKey: 'remote:org_abc',
+      fixtureId: 'fix-1',
+      event: { type: 'push', targetBranch: 'main', payload: {} },
+    };
+  }
+
+  it('threads the relayed actor into the pipeline', async () => {
+    vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
+      runId: 'run-1',
+      status: 'accepted',
+      jobIds: [],
+    });
+
+    await handleTestTrigger(triggerMsg(ACTOR), triggerDeps());
+
+    const call = vi.mocked(testPipeline.processTestTrigger).mock.calls[0][0];
+    expect(call.actor).toEqual(ACTOR);
+  });
+
+  it('threads an agent-kind actor through unflattened', async () => {
+    // Provenance travels as part of the actor, not pre-rendered: the pipeline
+    // is what decides how to split it across `triggered_by` and
+    // `triggered_by_agent_label`.
+    vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
+      runId: 'run-2',
+      status: 'accepted',
+      jobIds: [],
+    });
+
+    await handleTestTrigger(triggerMsg(AGENT_ACTOR), triggerDeps());
+
+    const call = vi.mocked(testPipeline.processTestTrigger).mock.calls[0][0];
+    expect(call.actor).toEqual(AGENT_ACTOR);
+    expect(call.actor?.type === 'user' && call.actor.agent?.label).toBe('ci');
+  });
+});

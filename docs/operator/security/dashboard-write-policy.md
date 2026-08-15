@@ -21,35 +21,35 @@ Each operation carries one of three postures:
 
 Every mutating dashboard action maps to exactly one `DashboardWriteOperation`. The orchestrator ships with **27 operations** today, grouped into ten categories and three sensitivity buckets:
 
-| Category          | Operation                          | Sensitivity | `kici-admin` equivalent                                 |
-| ----------------- | ---------------------------------- | ----------- | ------------------------------------------------------- |
-| **Secrets**       | `secrets.set`                      | plaintext   | `kici-admin secret set`                                 |
-|                   | `secrets.delete`                   | authority   | `kici-admin secret delete`                              |
-|                   | `secrets.scope.create`             | authority   | `kici-admin secret scope create`                        |
-|                   | `secrets.scope.rename`             | authority   | `kici-admin secret scope rename`                        |
-|                   | `secrets.scope.delete`             | authority   | `kici-admin secret scope delete`                        |
-| **Variables**     | `variables.set`                    | plaintext   | `kici-admin variable set`                               |
-|                   | `variables.delete`                 | authority   | `kici-admin variable delete`                            |
-| **Contexts**      | `contexts.create`                  | authority   | `kici-admin context create`                             |
-|                   | `contexts.update`                  | authority   | `kici-admin context set-policy`                         |
-|                   | `contexts.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution` |
-|                   | `contexts.delete`                  | authority   | `kici-admin context delete`                             |
-| **Bindings**      | `contexts.bindings.set`            | authority   | `kici-admin context bind`                               |
-|                   | `contexts.source_overrides.set`    | authority   | `kici-admin context source-override set`                |
-|                   | `contexts.source_overrides.delete` | authority   | `kici-admin context source-override delete`             |
-| **Held runs**     | `held_runs.approve`                | dispatch    | `kici-admin runs approve`                               |
-|                   | `held_runs.reject`                 | dispatch    | `kici-admin runs reject`                                |
-| **DLQ**           | `event_dlq.retry`                  | dispatch    | `kici-admin event-dlq retry`                            |
-|                   | `event_dlq.discard`                | dispatch    | `kici-admin event-dlq discard`                          |
-| **Attestations**  | `attestations.retry`               | dispatch    | `kici-admin attestations retry`                         |
-| **Registrations** | `registration.disable`             | dispatch    | `kici-admin registration disable`                       |
-|                   | `registration.delete`              | dispatch    | `kici-admin registration delete`                        |
-| **Topology**      | `global_workflows.update`          | dispatch    | `kici-admin org-settings global-workflows set`          |
-|                   | `backends.sync`                    | dispatch    | `kici-admin backend sync`                               |
-|                   | `backends.sync_one`                | dispatch    | `kici-admin backend sync --one`                         |
-|                   | `backends.test`                    | dispatch    | `kici-admin backend test`                               |
-| **Fleet**         | `fleet.host.declare`               | dispatch    | `kici-admin host declare`                               |
-|                   | `fleet.host.remove`                | dispatch    | `kici-admin host remove`                                |
+| Category          | Operation                          | Sensitivity | `kici-admin` equivalent                                             |
+| ----------------- | ---------------------------------- | ----------- | ------------------------------------------------------------------- |
+| **Secrets**       | `secrets.set`                      | plaintext   | `kici-admin secret set`                                             |
+|                   | `secrets.delete`                   | authority   | `kici-admin secret delete`                                          |
+|                   | `secrets.scope.create`             | authority   | `kici-admin secret scope create`                                    |
+|                   | `secrets.scope.rename`             | authority   | `kici-admin secret scope rename`                                    |
+|                   | `secrets.scope.delete`             | authority   | `kici-admin secret scope delete`                                    |
+| **Variables**     | `variables.set`                    | plaintext   | `kici-admin variable set`                                           |
+|                   | `variables.delete`                 | authority   | `kici-admin variable delete`                                        |
+| **Contexts**      | `contexts.create`                  | authority   | `kici-admin context create`                                         |
+|                   | `contexts.update`                  | authority   | `kici-admin context set-policy`                                     |
+|                   | `contexts.test_access.set`         | authority   | `kici-admin context set-policy --allow-local-execution`             |
+|                   | `contexts.delete`                  | authority   | `kici-admin context delete`                                         |
+| **Bindings**      | `contexts.bindings.set`            | authority   | `kici-admin context bind`                                           |
+|                   | `contexts.source_overrides.set`    | authority   | `kici-admin context source-override set`                            |
+|                   | `contexts.source_overrides.delete` | authority   | `kici-admin context source-override delete`                         |
+| **Held runs**     | `held_runs.approve`                | dispatch    | `kici-admin runs approve`                                           |
+|                   | `held_runs.reject`                 | dispatch    | `kici-admin runs reject`                                            |
+| **DLQ**           | `event_dlq.retry`                  | dispatch    | `kici-admin event-dlq retry`                                        |
+|                   | `event_dlq.discard`                | dispatch    | `kici-admin event-dlq discard`                                      |
+| **Attestations**  | `attestations.retry`               | dispatch    | `kici-admin attestations retry`                                     |
+| **Registrations** | `registration.disable`             | dispatch    | `kici-admin registration disable`                                   |
+|                   | `registration.delete`              | dispatch    | `kici-admin registration delete`                                    |
+| **Topology**      | `global_workflows.update`          | dispatch    | `kici-admin org-settings global-workflows {allow,deny,elevate}-add` |
+|                   | `backends.sync`                    | dispatch    | `kici-admin backend sync`                                           |
+|                   | `backends.sync_one`                | dispatch    | `kici-admin backend sync --one`                                     |
+|                   | `backends.test`                    | dispatch    | `kici-admin backend test`                                           |
+| **Fleet**         | `fleet.host.declare`               | dispatch    | `kici-admin host declare`                                           |
+|                   | `fleet.host.remove`                | dispatch    | `kici-admin host remove`                                            |
 
 The **sensitivity** bucket describes the threat each operation participates in when routed through the dashboard:
 

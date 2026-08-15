@@ -11,6 +11,7 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
 import {
   SourceSubtype,
+  TERMINAL_RUN_STATES,
   type AccessLogAction,
   type AccessLogOutcome,
   type AccessLogTargetType,
@@ -20,6 +21,7 @@ import {
 import type { Database } from '../db/types.js';
 import type { RegistrationStore, RegistrationRow } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
+import { definingRepoOfRun, runsDefinedByRepos } from '../registration/registration-run-match.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { genericProviderTypeToSubtype } from '../entry-helpers.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
@@ -303,13 +305,16 @@ export class DashboardRegistrationsHandler {
         const registration = await this.deps.registrationStore.getById(msg.registrationId);
         if (registration) {
           try {
-            // Find active runs and cancel them
+            // Find active runs and cancel them. Matched on the repository that
+            // DEFINES the workflow, so a global registration reaches its own
+            // runs and a same-named registration in the acted-on repository
+            // does not — see `runsDefinedByRepos`.
             const activeRuns = await this.deps.db
               .selectFrom('execution_runs')
               .select(['run_id'])
               .where('workflow_name', '=', registration.workflow_name)
-              .where('repo_identifier', '=', registration.repo_identifier)
-              .where('status', 'not in', ['success', 'failed', 'cancelled', 'skipped'])
+              .where((eb) => runsDefinedByRepos(eb, [registration.repo_identifier]))
+              .where('status', 'not in', [...TERMINAL_RUN_STATES])
               .execute();
 
             for (const run of activeRuns) {
@@ -484,23 +489,32 @@ export class DashboardRegistrationsHandler {
       if (registrations.length > 0) {
         try {
           const repoIds = [...new Set(registrations.map((r) => r.repo_identifier))];
+          // Grouped by both repository columns and folded to the DEFINING
+          // repository below, so a global workflow's runs land under the
+          // registration that defines it rather than under the repository they
+          // acted on — see `runsDefinedByRepos`.
           const lastTriggered = await this.deps.db
             .selectFrom('execution_runs')
-            .select(['workflow_name', 'repo_identifier'])
+            .select(['workflow_name', 'repo_identifier', 'workflow_repo_identifier'])
             .select((eb) => eb.fn.max('started_at').as('last_triggered_at'))
-            .where('repo_identifier', 'in', repoIds)
-            .groupBy(['workflow_name', 'repo_identifier'])
+            .where((eb) => runsDefinedByRepos(eb, repoIds))
+            .groupBy(['workflow_name', 'repo_identifier', 'workflow_repo_identifier'])
             .execute();
 
           for (const row of lastTriggered) {
-            const key = `${row.repo_identifier}:${row.workflow_name}`;
+            const key = `${definingRepoOfRun(row)}:${row.workflow_name}`;
             if (row.last_triggered_at) {
-              lastTriggeredMap.set(
-                key,
+              const startedAt =
                 row.last_triggered_at instanceof Date
                   ? row.last_triggered_at
-                  : new Date(String(row.last_triggered_at)),
-              );
+                  : new Date(String(row.last_triggered_at));
+              // Two groups can fold onto one key (a per-repository run and a
+              // global run acting on a third repository both defined here), so
+              // keep the later of the two rather than whichever arrived last.
+              const existing = lastTriggeredMap.get(key);
+              if (!existing || startedAt > existing) {
+                lastTriggeredMap.set(key, startedAt);
+              }
             }
           }
         } catch {

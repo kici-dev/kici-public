@@ -1,6 +1,6 @@
 ---
 title: Execution isolation architecture
-description: ''
+description: How the agent separates customer workflow code from agent-internal resources via the sandbox boundary
 ---
 
 Deep-dive on the agent-code isolation model: how KiCI separates customer workflow code from agent-internal resources.

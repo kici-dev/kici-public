@@ -1,6 +1,6 @@
 ---
 title: Needs-aware dispatch scheduler
-description: ''
+description: The DB-backed scheduler that gates job dispatch on upstream completion across static and dynamic edges
 ---
 
 ## Overview

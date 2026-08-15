@@ -38,10 +38,7 @@ import { HostRosterStore } from './agent/host-roster.js';
 import { HostRosterReaper } from './agent/host-roster-reaper.js';
 import { JobQueue, DispatchQueueStatus, type QueuedJob } from './queue/job-queue.js';
 import { createCleanupHandler } from './queue/cleanup.js';
-import {
-  type CanRouteLabels,
-  terminalizeUnroutableJob,
-} from './queue/terminalize-unroutable.js';
+import { type CanRouteLabels, terminalizeUnroutableJob } from './queue/terminalize-unroutable.js';
 import {
   createUnroutableProbeHandler,
   DEFAULT_UNROUTABLE_GRACE_MS,
@@ -64,6 +61,7 @@ import { SamplingRateLimiter } from './audit/sampling-rate-limiter.js';
 import { Dispatcher, DEFAULT_REDRIVE_BATCH } from './agent/dispatcher.js';
 import { PendingScaleSweeper } from './scaler/pending-scale-sweeper.js';
 import { LockFileCache } from './lockfile-cache.js';
+import { ContentRequirementsCache } from './content-requirements-cache.js';
 import { DedupCache } from './webhook/dedup.js';
 import { ObserverRegistry } from './ws/observer-registry.js';
 import { AgentHeartbeatMonitor } from './ws/agent-heartbeat.js';
@@ -156,6 +154,8 @@ import {
   PendingBuildTracker,
   PendingInitTracker,
   PendingDynamicTracker,
+  PendingGlobalEvalTracker,
+  GlobalEvalRoundCache,
   type UserCacheOrgLimits,
   type UserCacheOrgLimitsReader,
 } from './cache/index.js';
@@ -253,7 +253,7 @@ import { decryptPrivateKey, decryptSecretOutput } from './secrets/ephemeral-keys
 import { encrypt, decrypt as pskDecrypt, deriveKey } from '@kici-dev/shared';
 import { ProviderRegistry } from './provider-registry.js';
 import { ClusterIdentity } from './cluster/cluster-identity.js';
-import { ClusterSettingsReader } from './cluster/cluster-settings-reader.js';
+import { ClusterSettingsReader, clampCacheMaxEntries } from './cluster/cluster-settings-reader.js';
 import { resolveAndPersistClusterName } from './config/cluster-name.js';
 import { getClusterId } from './config/cluster-id.js';
 import { JoinHandler } from './cluster/join-handler.js';
@@ -306,6 +306,7 @@ export interface OrchestratorSubsystems {
   pendingBuilds: PendingBuildTracker | undefined;
   pendingInits: PendingInitTracker;
   pendingDynamics: PendingDynamicTracker;
+  pendingGlobalEvals: PendingGlobalEvalTracker;
   checkRunReporter: CheckRunReporter;
   stepLogBuffer: StepLogBuffer;
   sourceLocationStore: SourceLocationStore;
@@ -329,6 +330,8 @@ export interface OrchestratorSubsystems {
   tokenStore: AgentTokenStore;
   ownershipTracker: OwnershipTracker;
   lockFileCache: LockFileCache;
+  contentRequirementsCache: ContentRequirementsCache;
+  globalEvalCache: GlobalEvalRoundCache;
   dedup: DedupCache;
   eventRouter: EventRouter;
   /**
@@ -339,6 +342,13 @@ export interface OrchestratorSubsystems {
   eventStore: EventStore;
   eventEmitter: EventEmitter;
   genericSourceManager: GenericSourceManager;
+  /**
+   * Re-register a generic source's provider bundle from its database row.
+   * The webhook pipeline calls it on an exact registry miss so the read side
+   * settles against server truth rather than a stand-in bundle. Shared by the
+   * relay path (server.ts) and the direct-ingress path (app.ts).
+   */
+  ensureProviderBundle: (routingKey: string) => Promise<boolean>;
   trustStore: TrustStore;
   registrationStore: RegistrationStore;
   registrationIndex: RegistrationIndex;
@@ -735,6 +745,7 @@ interface CacheInfra {
   pendingBuilds: PendingBuildTracker | undefined;
   pendingInits: PendingInitTracker;
   pendingDynamics: PendingDynamicTracker;
+  pendingGlobalEvals: PendingGlobalEvalTracker;
   /**
    * Filesystem backend only: base directory + HMAC secret used by the
    * `/api/v1/cache/blob/*` HTTP route to serve / receive blobs. `undefined`
@@ -798,6 +809,7 @@ function buildCacheLayers(
     pendingBuilds,
     pendingInits: new PendingInitTracker(),
     pendingDynamics: new PendingDynamicTracker(),
+    pendingGlobalEvals: new PendingGlobalEvalTracker(),
     fsCache: undefined,
   };
 }
@@ -997,6 +1009,7 @@ function initializeCacheInfra(
     pendingBuilds: undefined,
     pendingInits: new PendingInitTracker(),
     pendingDynamics: new PendingDynamicTracker(),
+    pendingGlobalEvals: new PendingGlobalEvalTracker(),
     fsCache: undefined,
   };
 }
@@ -2805,6 +2818,7 @@ export async function bootstrapOrchestrator(
     pendingBuilds,
     pendingInits,
     pendingDynamics,
+    pendingGlobalEvals,
     fsCache,
   } = initializeCacheInfra(config, db, clusterSettings);
 
@@ -2919,6 +2933,12 @@ export async function bootstrapOrchestrator(
           repo,
           sha: context.sha,
           workflowName: context.workflowName,
+          // Present only for a cross-repository global run — qualifies the
+          // check-run name so this conclusion cannot complete the acted-on
+          // repository's same-named check.
+          ...(context.workflowRepoIdentifier && {
+            workflowRepoIdentifier: context.workflowRepoIdentifier,
+          }),
           overallStatus: status,
           installationId: context.installationId,
           routingKey: context.routingKey,
@@ -3166,6 +3186,9 @@ export async function bootstrapOrchestrator(
           // agent, so the backend half is what keeps scale-from-zero out of the
           // unroutable bucket.
           canRouteLabels,
+          // A global eval round has an in-process awaiter and no run row, so
+          // this sweep is the only thing that can tell it the job is dead.
+          pendingGlobalEvals,
         }),
       },
       // The unroutable probe asks the SAME predicate on a short tick, so a job
@@ -3195,7 +3218,7 @@ export async function bootstrapOrchestrator(
           setRoutingReason: makeRoutingReasonWriter(db),
           terminalize: async (job) => {
             await terminalizeUnroutableJob(
-              { db, executionTracker, checkRunReporter, canRouteLabels },
+              { db, executionTracker, checkRunReporter, canRouteLabels, pendingGlobalEvals },
               job,
             );
             await executionTracker.completeRunIfAllJobsTerminal(job.runId);
@@ -3391,6 +3414,44 @@ export async function bootstrapOrchestrator(
     scalerBackendType: localScalerWarnBackend,
   });
   await genericSourcesChangeListener.start();
+
+  /**
+   * Re-register one generic source's provider bundle from its database row.
+   *
+   * The three population paths above — the cold-boot loops, the admin write
+   * handler, and the NOTIFY listener — are all WRITE-side. None of them can
+   * promise the registry holds a given source at the moment a delivery for it
+   * arrives: a NOTIFY can be missed while the listener reconnects, the source
+   * can be created on a peer, and a peer can boot before the row exists. The
+   * webhook pipeline calls this on an exact miss so the read side settles the
+   * question against the database instead of matching against a stand-in
+   * bundle that reports every payload as repository-less.
+   *
+   * Resolves false when the row is gone, disabled, or genuinely has no
+   * per-routing-key bundle (a plain generic source) — the caller then uses the
+   * shared default bundle, exactly as before.
+   */
+  const ensureProviderBundle = async (routingKey: string): Promise<boolean> => {
+    try {
+      const row = await genericSourceManager.getByRoutingKey(routingKey);
+      if (!row) return false;
+      registerProviderBundleForSource(row, {
+        providerRegistry,
+        config,
+        secretResolver,
+        scalerBackendType: localScalerWarnBackend,
+      });
+      return providerRegistry.hasExact(routingKey);
+    } catch (err) {
+      // A refresh failure must never fail the delivery: fall through to the
+      // registry as it stands, which is what the caller did before this seam.
+      logger.warn('Failed to refresh a provider bundle from its source row', {
+        routingKey,
+        error: toErrorMessage(err),
+      });
+      return false;
+    }
+  };
 
   const eventRouterConfig: EventRouterConfig = {
     maxChainDepth: config.eventRouterMaxChainDepth,
@@ -3633,11 +3694,54 @@ export async function bootstrapOrchestrator(
   // Start dispatcher grace window cleanup
   dispatcher.startGraceCleanup();
 
-  // 20. Create lock file cache
+  // 20. Create lock file cache. Sizes and TTL are structural to the LRU, which
+  // is constructed once here, so a cluster-settings override applies at the
+  // next orchestrator restart rather than within the settings cache window.
+  //
+  // The entry counts go through `clampCacheMaxEntries` because the LRU
+  // allocates its index arrays eagerly from `max`: an unbounded stored value
+  // throws inside the constructor, which would crash boot before the admin API
+  // is listening and leave no way to correct the value. The route's `.max()`
+  // rejects new bad writes; this clamp is what covers a value already in the
+  // database.
   const lockFileCache = new LockFileCache({
-    max: config.lockfileCacheMax,
-    ttl: config.lockfileCacheTtlMs,
-    maxBytes: config.lockfileCacheMaxBytes,
+    max: clampCacheMaxEntries(
+      await clusterSettings.getNumber('lockfile_cache_max', config.lockfileCacheMax),
+      config.lockfileCacheMax,
+    ),
+    ttl: await clusterSettings.getNumber('lockfile_cache_ttl_ms', config.lockfileCacheTtlMs),
+    maxBytes: await clusterSettings.getNumber(
+      'lockfile_cache_max_bytes',
+      config.lockfileCacheMaxBytes,
+    ),
+  });
+
+  // Tier-1 content-requirements cache: source-file bytes at a ref, keyed by
+  // (repo, sha, path). Feeds the `requires` static content filter before dispatch.
+  // Sizes and TTL are structural to the LRU, so an override applies at next restart.
+  const contentRequirementsCache = new ContentRequirementsCache({
+    max: clampCacheMaxEntries(
+      await clusterSettings.getNumber('content_cache_max', config.contentCacheMax),
+      config.contentCacheMax,
+    ),
+    ttl: await clusterSettings.getNumber('content_cache_ttl_ms', config.contentCacheTtlMs),
+    maxBytes: await clusterSettings.getNumber(
+      'content_cache_max_bytes',
+      config.contentCacheMaxBytes,
+    ),
+  });
+
+  // Tier-2 global-eval round-result cache, keyed by (workflow repo, workflow
+  // sha, source sha). Its size is structural to the LRU, so an override applies
+  // at the next restart; the two round *budgets* are read per round instead, so
+  // those land on the next push. The clamp is the same boot-safety guarantee the
+  // two caches above rely on — a stored value the route never validated must not
+  // be able to throw inside the constructor.
+  const globalEvalCache = new GlobalEvalRoundCache({
+    max: clampCacheMaxEntries(
+      await clusterSettings.getNumber('global_eval_cache_max', config.globalEvalCacheMax),
+      config.globalEvalCacheMax,
+    ),
   });
 
   // 21. Initialize cluster
@@ -3890,6 +3994,8 @@ export async function bootstrapOrchestrator(
     intervalMs: config.ingestOverflowReplayIntervalMs,
     batchSize: config.ingestOverflowReplayBatch,
     maxAttempts: config.ingestOverflowMaxAttempts,
+    claimTimeoutMs: config.ingestOverflowClaimTimeoutMs,
+    clusterSettings,
   });
   if (config.ingestOverflowEnabled) {
     ingestOverflowReplayer.start();
@@ -3923,6 +4029,7 @@ export async function bootstrapOrchestrator(
     pendingBuilds,
     pendingInits,
     pendingDynamics,
+    pendingGlobalEvals,
     checkRunReporter,
     stepLogBuffer,
     sourceLocationStore,
@@ -3939,11 +4046,14 @@ export async function bootstrapOrchestrator(
     tokenStore,
     ownershipTracker,
     lockFileCache,
+    contentRequirementsCache,
+    globalEvalCache,
     dedup,
     eventRouter,
     eventStore,
     eventEmitter: eventEmitter!,
     genericSourceManager,
+    ensureProviderBundle,
     trustStore,
     registrationStore,
     registrationIndex,
@@ -3970,13 +4080,15 @@ export async function bootstrapOrchestrator(
     // /metrics) and the WS push path (Mimir per-org via MetricsReporter)
     // both reference the same store of agent-pushed metrics. The
     // getScalerForAgent callback stamps a `scaler` label on every
-    // kici_agent_* series so dashboards split per scaler type
-    // (`stateful` for static agents, backend name otherwise) instead of
+    // kici_agent_* series so dashboards split per scaler TYPE
+    // (`stateful` for static agents, backend type otherwise) instead of
     // per-agent_id which is too high-cardinality and only useful for
-    // drill-down filtering.
+    // drill-down filtering. The label is the backend TYPE, not the
+    // operator-chosen scaler name -- the Platform catalog enum admits
+    // only the four types.
     agentMetricsAggregator: new AgentMetricsAggregator({
       getScalerForAgent: scalerManager
-        ? (agentId) => scalerManager.getBackendName(agentId)
+        ? (agentId) => scalerManager.getBackendType(agentId)
         : undefined,
     }),
     fleetCollectResponder: (msg, send) =>
@@ -4042,6 +4154,21 @@ export async function bootstrapOrchestrator(
       });
     }
   }, 30_000);
+
+  // 26b. Per-coordinator safety-net re-drive of pending jobs onto connected
+  // idle agents. Runs on EVERY coordinator (not leader-gated, unlike the ack
+  // sweep) at the same 10s cadence: a job requeued after the only matching
+  // connected agent's drain trigger already fired has no further trigger, so a
+  // one-shot `redispatch` that transiently misses that agent (in-flight drain
+  // holding the eager slot, or the agent connected to a different coordinator)
+  // would strand it. This tick re-attempts delivery through the atomic claim,
+  // so at most one agent on any coordinator wins the job. Gated internally on a
+  // non-empty queue, so an idle cluster does no work.
+  const pendingRedriveInterval = setInterval(() => {
+    dispatcher.redrivePendingToConnectedAgents().catch((err) => {
+      logger.error('Pending connected-agent re-drive failed', { error: toErrorMessage(err) });
+    });
+  }, 10_000);
 
   // 27. Create Hono app
   const clusterHealthRoutes = createClusterHealthRoutes({
@@ -4259,11 +4386,14 @@ export async function bootstrapOrchestrator(
     jobQueue: queue,
     dedup,
     lockFileCache,
+    contentRequirementsCache,
+    globalEvalCache,
     providerRegistry,
     ingestController,
     ingestCapReader,
     sandboxAllowListReader,
     ingestOverflowBuffer,
+    ingestOverflowReplayer,
     scalerManager: scalerManager ?? undefined,
     tokenStore,
     ownershipTracker,
@@ -4298,6 +4428,7 @@ export async function bootstrapOrchestrator(
     pendingBuilds,
     pendingInits,
     pendingDynamics,
+    pendingGlobalEvals,
     checkRunReporter,
     executionTracker,
     logWriter,
@@ -4311,6 +4442,7 @@ export async function bootstrapOrchestrator(
     eventStore,
     eventEmitter: eventEmitter!,
     genericSourceManager,
+    ensureProviderBundle,
     // Direct GitHub ingress deps (mounted only in hybrid/independent with a
     // configured secret store — mirrors the relay path's onVerifyInbound guard).
     githubSourceStore: pgSecretStore ? sourceStore : undefined,
@@ -4738,6 +4870,7 @@ export async function bootstrapOrchestrator(
             handle.stop();
           }
           clearInterval(registryPollInterval);
+          clearInterval(pendingRedriveInterval);
           if (cluster.recoverySweepTimerRef.current) {
             clearInterval(cluster.recoverySweepTimerRef.current);
             cluster.recoverySweepTimerRef.current = null;

@@ -40,7 +40,17 @@ export function rebuildWorkflowDispatchContext(
   if (!bundle) {
     return null;
   }
-  return { ...inputs, deps, bundle };
+  return {
+    ...inputs,
+    // A stored context is JSON cast straight back to its type, so a row written
+    // before this field existed carries no value however the type reads. Such a
+    // row can only be a per-repository or cross-source context — both define
+    // the workflow in the repository the run acts on — so the acted-on
+    // repository is the correct answer for every one of them, not a guess.
+    workflowRepoIdentifier: inputs.workflowRepoIdentifier ?? inputs.repoIdentifier,
+    deps,
+    bundle,
+  };
 }
 
 /**

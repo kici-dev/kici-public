@@ -32,14 +32,14 @@ export function toSerializableInputs(
   ctx: WorkflowDispatchContext,
 ): SerializableWorkflowDispatchInputs {
   // Strip the two non-serializable deps; everything else is JSON-safe.
-  // `buildWindowTokenHeld` also goes: it records that THIS dispatch call is
+  // `dispatchWindowTokenHeld` also goes: it records that THIS dispatch call is
   // holding a pending-jobs token, which it releases before returning. Carrying
   // it into a resumed dispatch would make that call release a token it never
   // took — stealing one held by a deferred init / dynamic task.
   const {
     deps: _deps,
     bundle: _bundle,
-    buildWindowTokenHeld: _buildWindowTokenHeld,
+    dispatchWindowTokenHeld: _dispatchWindowTokenHeld,
     ...rest
   } = ctx;
   return rest;

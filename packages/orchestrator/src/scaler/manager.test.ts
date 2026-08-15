@@ -845,6 +845,27 @@ describe('ScalerManager', () => {
     });
   });
 
+  describe('getBackendType()', () => {
+    it('returns the backend TYPE, not the operator-chosen scaler name', async () => {
+      const manager = createManager();
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
+      const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as string;
+      await vi.advanceTimersToNextTimerAsync();
+      manager.onAgentRegistered(agentId, ['linux', 'docker']);
+
+      // Scaler is named 'container-prod' but its type is 'container'. The metrics
+      // scaler label must carry the type, which is what the Platform catalog
+      // enum (AGENT_SCALER_VALUES) admits -- never the free-form name.
+      expect(manager.getBackendType(agentId)).toBe('container');
+    });
+
+    it('returns null for an agent that is not scaler-managed', () => {
+      const manager = createManager();
+      expect(manager.getBackendType('static-agent-not-managed')).toBeNull();
+    });
+  });
+
   describe('getGlobalActiveCount()', () => {
     it('sums all backends active counts without double-counting spawning', async () => {
       // Realistic mock: getActiveCount reflects spawning agents (like real backends).
@@ -1320,6 +1341,60 @@ describe('ScalerManager', () => {
         requests: { cpus: 1 },
       });
       expect(r3.action).toBe('spawning');
+    });
+
+    it('releases the reservation when a stale spawning entry is pruned', async () => {
+      // A spawn that never resolves models an agent that was created but never
+      // registered its WS — so neither the spawn-failure path nor
+      // onAgentDisconnected ever fires. The only cleanup is the stale-entry
+      // prune, which must release the held reservation or the per-scaler cap
+      // leaks capacity forever (the cross-process machine-pool E2E's real
+      // failure: a warm-reused orch DB accumulated orphaned scaler_reservations
+      // and every requestScale was rejected at-capacity with zero agents).
+      const slowBackend = createMockBackend({
+        type: 'container',
+        labelSets: [{ labels: ['linux', 'docker'], image: 'agent:latest' }],
+        maxAgents: 100,
+        spawn: vi.fn((): Promise<ManagedAgent> => new Promise(() => {})),
+      });
+      const manager = createManager(
+        {
+          globalMaxAgents: 100,
+          scalers: [
+            {
+              name: 'container-prod',
+              type: 'container',
+              maxAgents: 100,
+              resourceCap: { maxCpu: 2 },
+              labelSets: [{ labels: ['linux', 'docker'], image: 'agent:latest' }],
+            },
+          ],
+        },
+        [{ name: 'container-prod', backend: slowBackend }],
+      );
+
+      // First reservation maxes out the per-scaler cpu cap; it never registers.
+      const r1 = await manager.requestScale(['linux', 'docker'], 'job-a', 'run-test', [], {
+        requests: { cpus: 2 },
+      });
+      expect(r1.action).toBe('spawning');
+      expect(manager.getStatus().backends[0].usage.cpus).toBe(2);
+
+      // A second request is denied while the stale reservation is held.
+      const r2 = await manager.requestScale(['linux', 'docker'], 'job-b', 'run-test', [], {
+        requests: { cpus: 1 },
+      });
+      expect(r2.action).toBe('at-capacity');
+
+      // Advance past the 5-minute stale threshold, then a request prunes the
+      // stale entry — which must free its reservation so the cap math recovers.
+      vi.advanceTimersByTime(301_000);
+      const r3 = await manager.requestScale(['linux', 'docker'], 'job-c', 'run-test', [], {
+        requests: { cpus: 1 },
+      });
+      expect(r3.action).toBe('spawning');
+      // Only the freshly reserved 1 cpu remains; the pruned 2 were released.
+      expect(manager.getStatus().backends[0].usage.cpus).toBe(1);
     });
 
     it('mirrors limits-only resources into requests for cap math', async () => {

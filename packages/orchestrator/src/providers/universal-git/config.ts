@@ -78,6 +78,12 @@ export const UniversalGitPayloadPathsSchema = z.object({
   commitsModified: z.string().min(1),
   /** Path to the `removed` files array on a push event. */
   commitsRemoved: z.string().min(1),
+  /**
+   * Path to the head commit's message on a push event. Optional so a stored
+   * config written before this field stays valid; when unset, a `commitMessage`
+   * trigger filter is INDETERMINATE and the workflow does not run.
+   */
+  commitMessage: z.string().min(1).optional(),
 });
 export type UniversalGitPayloadPaths = z.infer<typeof UniversalGitPayloadPathsSchema>;
 
@@ -212,6 +218,7 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsAdded: '$.commits[*].added[*]',
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
+      commitMessage: '$.head_commit.message',
     },
     eventMapping: {
       push: ['push'],
@@ -228,6 +235,7 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsAdded: '$.commits[*].added[*]',
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
+      commitMessage: '$.head_commit.message',
     },
     eventMapping: {
       push: ['push'],
@@ -244,6 +252,11 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsAdded: '$.commits[*].added[*]',
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
+      // Gogs and GitLab push payloads carry no `head_commit` (verified 2026-08-11
+      // against go-gogs-client/repo_hook.go and the GitLab webhook-events docs),
+      // so the head is the LAST element of `commits[]`, which both forges order
+      // oldest→newest. An operator whose forge differs can override this path.
+      commitMessage: '$.commits[-1:].message',
     },
     eventMapping: {
       push: ['push'],
@@ -260,6 +273,7 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsAdded: '$.commits[*].added[*]',
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
+      commitMessage: '$.commits[-1:].message',
     },
     eventMapping: {
       push: ['Push Hook', 'push'],
@@ -276,6 +290,7 @@ export const UNIVERSAL_GIT_PRESETS: Record<
       commitsAdded: '$.commits[*].added[*]',
       commitsModified: '$.commits[*].modified[*]',
       commitsRemoved: '$.commits[*].removed[*]',
+      commitMessage: '$.head_commit.message',
     },
     eventMapping: {
       push: ['push'],

@@ -39,7 +39,6 @@ export async function typesCommand(options: TypesOptions = {}): Promise<boolean>
     const dtsContent = generateSecretsDts({
       contexts: metadata,
       endpoint: source.replace(/\/+$/, ''),
-      generatedAt: new Date(),
     });
 
     const kiciDir = options.kiciDir ?? '.kici';

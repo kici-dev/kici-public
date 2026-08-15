@@ -371,6 +371,7 @@ export class StaleRunDetector {
         'ej.rerouted_to_peer',
         'er.workflow_name',
         'er.repo_identifier',
+        'er.workflow_repo_identifier',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -425,6 +426,7 @@ export class StaleRunDetector {
         'ej.created_at',
         'er.workflow_name',
         'er.repo_identifier',
+        'er.workflow_repo_identifier',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -493,6 +495,7 @@ export class StaleRunDetector {
         'dq.status',
         'er.workflow_name',
         'er.repo_identifier',
+        'er.workflow_repo_identifier',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -606,6 +609,12 @@ export class StaleRunDetector {
             repo,
             sha: entry.sha,
             workflowName: entry.workflow_name,
+            // Present only for a cross-repository global run — qualifies the
+            // check-run name so a stale global job cannot resolve the acted-on
+            // repository's same-named check.
+            ...(entry.workflow_repo_identifier && {
+              workflowRepoIdentifier: entry.workflow_repo_identifier,
+            }),
             jobName: entry.job_name,
             state: ExecutionJobStatus.enum.timed_out_stale,
             description: errorMessage,
@@ -639,6 +648,7 @@ export class StaleRunDetector {
       rerouted_to_peer: string | null;
       workflow_name: string;
       repo_identifier: string;
+      workflow_repo_identifier: string | null;
       sha: string;
       provider: string;
       provider_context: string;
@@ -756,6 +766,11 @@ export class StaleRunDetector {
         repo,
         sha: job.sha,
         workflowName: job.workflow_name,
+        // Present only for a cross-repository global run — see
+        // `CheckRunReporter.workflowLabel`.
+        ...(job.workflow_repo_identifier && {
+          workflowRepoIdentifier: job.workflow_repo_identifier,
+        }),
         jobName: job.job_name,
         state: ExecutionJobStatus.enum.timed_out_stale,
         description: errorMessage,

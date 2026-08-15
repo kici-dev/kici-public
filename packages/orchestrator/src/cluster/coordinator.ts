@@ -410,6 +410,20 @@ export class RunCoordinator {
     // run IDs MUST be stored in memory before the job completes.
     if (this.checkRunReporter && repoIdentifier && msg.sha) {
       const [owner, repo] = repoIdentifier.split('/');
+      // The repository that DEFINES the workflow, carried per job for an
+      // organization-wide workflow. No such job can reach here today — a global
+      // candidate is enqueued straight through `dispatcher.dispatch` and never
+      // passes through `routeJobs`, which is the only sender of the peer
+      // `job.reroute` this handler answers. Read it anyway: a create whose name
+      // was not qualified would carry the acted-on repository's name and post a
+      // second check run under it — see `CheckRunReporter.workflowLabel`, which
+      // drops the qualifier when the two repositories are the same, so this is
+      // inert for every job that does reach here.
+      const rawJobConfig = jobInput.jobConfig as Record<string, unknown> | undefined;
+      const workflowRepoIdentifier =
+        typeof rawJobConfig?.workflowRepoIdentifier === 'string'
+          ? rawJobConfig.workflowRepoIdentifier
+          : undefined;
       if (owner && repo) {
         try {
           await this.checkRunReporter.setPendingAwait({
@@ -418,6 +432,7 @@ export class RunCoordinator {
             repo,
             sha: msg.sha,
             workflowName: msg.workflowName,
+            ...(workflowRepoIdentifier && { workflowRepoIdentifier }),
             jobNames: [msg.jobName],
             installationId,
             requestId: msg.requestId,
@@ -1137,6 +1152,13 @@ export class RunCoordinator {
     });
 
     if (this.executionTracker) {
+      // Seed the coordinator's in-memory job name at reroute time. The rerouted
+      // job never enters the tracker's run.jobs (it is excluded from
+      // addJobsToRun) and the coordinator owns no dispatch_queue row for the
+      // worker's fresh jobId, so without this the step-log path resolver would
+      // fall back to the bare jobId for the job's early relayed chunks and lose
+      // them under an unreadable path.
+      this.executionTracker.registerJobName(runId, jobId, job.jobName);
       await this.executionTracker.markJobReroutedToPeer(runId, jobId, peerId);
     }
   }

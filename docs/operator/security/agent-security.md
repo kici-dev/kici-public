@@ -1,6 +1,6 @@
 ---
 title: Agent execution security
-description: ''
+description: The agent execution isolation model and per-backend sandbox configuration guidance
 ---
 
 This document explains the security model for KiCI agent execution isolation and provides configuration guidance for each backend.

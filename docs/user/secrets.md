@@ -7,7 +7,7 @@ KiCI provides an explicit secrets API that gives workflow steps controlled acces
 
 ## Overview
 
-Secrets are managed per-context in the orchestrator (see [operator docs](/operator/orchestrator/configuration) for setup). When a job runs with a `context` binding, the agent receives the secret keys available for that context but does **not** inject their values into the step's process environment. Instead, steps access secrets through the `ctx.secrets` API.
+Secrets are managed per-context in the orchestrator (see [operator docs](../operator/orchestrator/configuration.md) for setup). When a job runs with a `context` binding, the agent receives the secret keys available for that context but does **not** inject their values into the step's process environment. Instead, steps access secrets through the `ctx.secrets` API.
 
 This design prevents accidental secret leakage through child processes, log output, or error messages. Only secrets you explicitly request are loaded into memory.
 
@@ -28,13 +28,13 @@ Use whichever fits the workflow — most small teams stay on the dashboard; ops 
 
 ### When the operator has disabled dashboard writes
 
-The orchestrator operator can flip `secrets.set` (and `variables.set`) to **CLI-only** as part of the [dashboard-write policy](/operator/security/dashboard-write-policy). When that flip is on:
+The orchestrator operator can flip `secrets.set` (and `variables.set`) to **CLI-only** as part of the [dashboard-write policy](../operator/security/dashboard-write-policy.md). When that flip is on:
 
 - The dashboard's "Add secret" / "Edit value" controls render with a lock icon. Hovering or keyboard-focusing the lock shows a tooltip with the exact `kici-admin secret set` invocation needed. The control itself is inert, so there is nothing to click.
 - The dashboard's secrets page still lists secret **names**, scopes, and bindings — only the value-entry path moves to the CLI.
 - `kici-admin secret set` becomes the single entry point for new and updated secret values.
 
-This configuration is common for SOC2-prep and regulated workloads, where the customer requirement is "the SaaS control plane process never receives plaintext customer secret values." The dashboard remains usable for everything else (read paths, name CRUD, environment bindings).
+This configuration is common for SOC2-prep and regulated workloads, where the customer requirement is "the SaaS control plane process never receives plaintext customer secret values." The dashboard remains usable for everything else (read paths, name CRUD, context bindings).
 
 ### CLI input modes
 
@@ -69,7 +69,7 @@ Two cross-cutting flags help every mode:
 
 `kici-admin variable set` uses the same flags for non-encrypted variables, plus `--locked` to mark a variable as immutable from subsequent dashboard writes.
 
-A full reference of input modes — including the default-mode resolution rules and the security trade-offs of each — lives in [Dashboard-write policy → CLI input modes](/operator/security/dashboard-write-policy#cli-input-modes-for-the-plaintext-path).
+A full reference of input modes — including the default-mode resolution rules and the security trade-offs of each — lives in [Dashboard-write policy → CLI input modes](../operator/security/dashboard-write-policy.md#cli-input-modes-for-the-plaintext-path).
 
 ## Accessing secrets
 
@@ -304,4 +304,4 @@ Note that `get()` is async -- you must `await` the result.
 
 When you run `kici types`, the compiler generates a `.kici/secrets.d.ts` file that provides type-safe autocompletion for your secret keys. The generated types augment the `StepSecrets` interface so that `ctx.secrets.get('...')` and `ctx.secrets.has('...')` offer suggestions for known keys.
 
-See [CLI reference](/user/cli) for the `kici types` command.
+See [CLI reference](./cli/authoring-and-local.md#kici-types) for the `kici types` command.

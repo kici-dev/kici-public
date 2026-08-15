@@ -507,15 +507,36 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
         return c.json({ error: 'Log storage not configured on this orchestrator' }, 503);
       }
 
+      // A global eval round decides whether any run exists at all, so it writes
+      // NO `execution_runs` row on success (see `buildRoundJobInput` in
+      // pipeline/global-eval-round.ts) — yet its step logs are durably stored.
+      // `dispatch_queue` carries the same run_id plus the routing_key the scope
+      // guard needs, and its rows survive until terminal-status age pruning, so
+      // it is the correct second source. The 404 and the scope guard both keep
+      // their exact meaning; only the set of ids that resolve widens. The
+      // fallback query runs only when `execution_runs` misses, so an ordinary
+      // run still costs a single lookup.
       const run = await deps.db
         .selectFrom('execution_runs')
         .select(['run_id', 'routing_key'])
         .where('run_id', '=', runId)
         .executeTakeFirst();
-      if (!run) {
+      const queued = run
+        ? undefined
+        : await deps.db
+            .selectFrom('dispatch_queue')
+            .select(['run_id', 'routing_key'])
+            .where('run_id', '=', runId)
+            .executeTakeFirst();
+      // Resolve the ROW, not the routing key: `execution_runs.routing_key` is
+      // nullable, and a found run with a null key must stay a scope decision
+      // (403 for a scoped token, allowed for an unscoped one) rather than
+      // collapsing into a 404.
+      const scopeSource = run ?? queued;
+      if (!scopeSource) {
         return c.json({ error: `Run ${runId} not found` }, 404);
       }
-      const denied = enforceRoutingKeyScope(c, run.routing_key);
+      const denied = enforceRoutingKeyScope(c, scopeSource.routing_key);
       if (denied) return denied;
 
       const limit = Math.min(parseInt(c.req.query('limit') ?? '500', 10) || 500, 2000);

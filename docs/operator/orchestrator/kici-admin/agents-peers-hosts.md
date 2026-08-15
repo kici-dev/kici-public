@@ -39,6 +39,21 @@ These commands manage the agent as a native system service. The `install --wizar
 
 Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `status`, `logs`) resolves its target through the priority chain `--instance-dir` > `--name` > manifest in the current working directory. A bare `kici-admin agent <cmd>` outside any deploy folder with no flags refuses non-zero and prints the candidate list of installed agent instances on the host.
 
+**Fresh-box bootstrap payloads:**
+
+```bash
+kici-admin agent package [--platform <list>] [--out <dir>] [--upload] [--node-mirror <url>] [--npm-registry <url>] [--node-version <ver>]
+```
+
+Produces a self-contained agent + Node payload so a fresh host can be brought up without reaching npm or nodejs.org itself.
+
+- `--platform` takes a single target, a comma-separated list, or `all` (default: `linux-x64,linux-arm64`).
+- `--out` sets the output directory (default `dist/agent-packages`).
+- `--upload` presign-uploads each payload to the orchestrator cache bucket, which is where the bare-metal scaler fetches it from.
+- `--node-version` overrides the vendored Node version (default: the Node version running the CLI); `--node-mirror` / `--npm-registry` point the build at internal mirrors.
+
+`kici-admin orchestrator upgrade` produces and uploads these payloads automatically for the new version — pass `--no-agent-packages` there to skip it, or run `agent package` by hand when you need a one-off payload.
+
 ### peer -- cluster peer management
 
 ```bash
@@ -79,10 +94,12 @@ Bootstraps a new orchestrator into an existing cluster. Connects via Platform re
 kici-admin host list [--json]
 kici-admin host get --agent-id <id> [--json]
 kici-admin host declare --agent-id <id> [--labels <labels>] [--hostname <name>]
+kici-admin host remove --agent-id <id>
 ```
 
 - `list` / `get` read the durable host roster and report each host's derived status (`ready` / `unreachable` / `stale`) from the shared last-seen + connected-instance columns.
 - `declare` pre-declares a `static` host before its agent connects — until the agent dials in, the host reads `unreachable`, making "expected but not yet here" a visible state.
+- `remove` deletes the host's roster row — the retirement path for a box that is gone for good, so it stops reading `unreachable` forever. It exits non-zero when no row matches, and every attempt writes a `fleet.host.remove` `access_log` entry.
 
 These commands read and write the orchestrator database directly (set `KICI_DATABASE_URL`). See [Host roster (declared inventory)](../host-roster.md) for the full model, derived-status table, and the `KICI_ROSTER_GRACE_MS` / `KICI_ROSTER_TTL_MS` timing knobs.
 

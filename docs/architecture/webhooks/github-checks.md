@@ -1,6 +1,6 @@
 ---
 title: GitHub checks architecture
-description: ''
+description: The enriched GitHub Check run system — real-time step progress, failure details, and source annotations
 ---
 
 **Module:** `packages/orchestrator/src/reporting/`
@@ -14,6 +14,22 @@ KiCI creates GitHub Check runs at trigger match time and updates them throughout
 - **Workflow check run** (`kici/{workflowName}`) -- overall pass/fail for the workflow
 - **Job check runs** (`kici/{workflowName}/job/{jobName}`) -- per-job detail with step progress
 - **Build check run** (`kici/{workflowName}/setup`) -- optional, for dependency installation and compilation
+
+### Naming a cross-repository run
+
+A check run's identity -- on GitHub, in the `check_run_tracking` primary key, and in the reporter's in-memory caches -- is `(owner, repo, head SHA, check name)`. No run id appears in it. Two per-repository runs cannot collide on that identity, because one lock file cannot define a workflow name twice.
+
+An organization-wide workflow can: it is defined in another repository, so its name is free to equal a workflow name of the repository it was dispatched against. On the same commit, the two runs resolve to one check run.
+
+So when the defining repository differs from the one the run acted on, every name above is qualified with it: `kici/{workflowRepo}/{workflowName}`, `kici/{workflowRepo}/{workflowName}/job/{jobName}`, `kici/{workflowRepo}/{workflowName}/setup`. The qualification is applied inside `CheckRunReporter` (`workflowLabel`), which drops it when the two repositories are the same -- a per-repository run's name cannot move because a caller supplied the field where it did not apply.
+
+**What the qualification prevents, and what it does not yet emit.** No dispatch path creates a check run for a cross-repository organization-wide run: global candidates are enqueued straight through `dispatcher.dispatch`, bypassing `dispatchMatchedWorkflow` (whose `setPending` is the create) and `coordinator.routeJobs` (whose peer reroute is the other create), and the re-run path refuses such a run outright. So a qualified name is not something a customer sees today.
+
+What the qualification does prevent is live, because completing a check run needs no creation -- only a resolution. The terminal workflow status, the terminal job status, live step progress and both stale-detector sweeps all fire for a global run, and each resolves a check-run id by name. Unqualified, they resolved the ACTED-ON repository's check run and completed it with the global run's conclusion, pointed its `details_url` at the global run, reopened it with the global run's step progress, and evicted its check-run id and terminal latch through `cleanupRun`.
+
+The stale-cleanup sweep builds its expected-name set through the same `workflowLabel` seam. Its run metadata arrives from the Platform on `stale.checkrun.cleanup`, which carries the defining repository on the optional `workflowRepoIdentifier` field — sent only when it differs from the repository the run acted on, the same condition that recorded it. So an orchestrator death during a global run times out that run's own qualified checks and leaves the acted-on repository's genuinely in-progress same-named check alone.
+
+A Platform predating that field omits it on every run, ordinary ones included. The orchestrator reads its absence the way it reads a value naming the acted-on repository: the names stay unqualified, which is what an ordinary run's checks are called. Skipping the sweep on an absent field would instead leave every stale check of every run stuck `in_progress` for as long as the two tiers differ in version.
 
 ## Data flow
 

@@ -1,11 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  formatError,
-  compilerError,
-  isCompilerError,
-  DiagnosticSeverity,
-  PURITY_FALLBACK_CODE,
-} from './formatter.js';
+import { formatError, compilerError, isCompilerError, DiagnosticSeverity } from './formatter.js';
 
 /** Strip ANSI color codes so assertions match regardless of picocolors' TTY detection. */
 function plain(s: string): string {
@@ -112,13 +106,13 @@ describe('formatError severity', () => {
   it('renders a warning-severity diagnostic with "warning" and its code', () => {
     const out = plain(
       formatError({
-        code: PURITY_FALLBACK_CODE,
-        message: 'job "build": context function is not pure (async functions cannot be inlined)',
+        code: 'W001',
+        message: 'an advisory diagnostic',
         severity: DiagnosticSeverity.Warning,
       }),
     );
     expect(out).toContain('warning');
-    expect(out).toContain(`[${PURITY_FALLBACK_CODE}]`);
+    expect(out).toContain('[W001]');
     expect(out).not.toContain('error');
   });
 

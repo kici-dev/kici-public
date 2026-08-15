@@ -20,12 +20,19 @@ import {
   CacheStepType,
   CacheRunEventType,
 } from '@kici-dev/engine';
+import type { LogStream } from '@kici-dev/engine';
+import type { ChangedFilesStatus } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
-import { gitClone } from '../checkout/git-clone.js';
+import { gitClone, type GitAuth } from '../checkout/git-clone.js';
+import { computeChangedFiles, type ChangedFilesResult } from '../checkout/changed-files.js';
 import { loadWorkflowSource, extractWorkflow } from './workflow-loader.js';
 import { packKiciSource } from './source-packer.js';
 import { restoreSource } from './source-restore.js';
-import { evaluateDynamicFields } from './init-runner.js';
+import {
+  evaluateDynamicFields,
+  evaluateWorkflowFilter,
+  type FilterEvalInput,
+} from './init-runner.js';
 import { withBootstrapInterception } from '../bootstrap/api-intercept.js';
 import { ensureInitRunner } from '../bootstrap/ensure-init-runner.js';
 import { LocalDirPayloadSource } from '../bootstrap/payload-source.js';
@@ -39,13 +46,17 @@ import {
 import { withTimeout } from './timeout-util.js';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 import { serializeJobsToLock, MatrixExpansionError } from './dynamic-job-serializer.js';
+import { buildGeneratorContext } from './generator-context.js';
+import { repoIdentifierFromUrl } from './global-workflow-env.js';
+import { runGlobalEvalRound, type GlobalEvalCandidate } from './global-eval-runner.js';
 import { buildKiciApi, buildNeedsContext } from '@kici-dev/sdk';
-import type { EventPayload, DynamicJobNeed } from '@kici-dev/sdk';
+import type { DynamicJobNeed, RepoInfo, EventPayload } from '@kici-dev/sdk';
+import type { $ as Shell } from 'zx';
 import { LogStreamer } from './log-streamer.js';
 import { runCaptured, type CaptureSink } from './console-capture.js';
 import { applyOverlay } from './overlay-applier.js';
 import { installDeps } from './dep-installer.js';
-import { restoreDeps } from './dep-restore.js';
+import { restoreDeps, excludeScratchFromGit } from './dep-restore.js';
 import { packNodeModules } from './dep-packer.js';
 import { uploadToPresignedUrl } from './download.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
@@ -82,6 +93,270 @@ async function fileExists(p: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * `jobConfig` shape of a pre-run global eval round job.
+ *
+ * `roundTimeoutMs` / `candidateTimeoutMs` are optional so an older orchestrator
+ * that does not send them still dispatches a runnable round; the agent falls
+ * back to the defaults below.
+ */
+interface GlobalEvalRoundJobConfig {
+  globalEvalRound: true;
+  candidates: GlobalEvalCandidate[];
+  event: Record<string, unknown>;
+  workflowRepoUrl: string;
+  workflowRef?: string;
+  workflowSha?: string;
+  workflowRepoIdentifier?: string;
+  roundTimeoutMs?: number;
+  candidateTimeoutMs?: number;
+}
+
+/** Agent-side fallbacks when the orchestrator sends no round budgets. */
+const DEFAULT_GLOBAL_EVAL_ROUND_TIMEOUT_MS = 120_000;
+const DEFAULT_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS = 20_000;
+
+/**
+ * Build the source / workflow repo pair the round hands to every filter and
+ * generator. Mirrors the sandbox's own `setupGlobalWorkflowEnv` construction so
+ * a generator's two evaluations see the same identifiers, refs, and shas — only
+ * the absolute paths differ, and those are never compared.
+ */
+function buildRoundRepos(
+  dispatch: JobDispatch,
+  config: GlobalEvalRoundJobConfig,
+  workflowDir: string,
+  sourceDir: string,
+): { sourceRepo: RepoInfo; workflowRepo: RepoInfo } {
+  return {
+    workflowRepo: {
+      identifier: config.workflowRepoIdentifier ?? repoIdentifierFromUrl(config.workflowRepoUrl),
+      path: workflowDir,
+      ref: config.workflowRef,
+      sha: config.workflowSha,
+    },
+    sourceRepo: {
+      identifier: repoIdentifierFromUrl(dispatch.repoUrl),
+      path: sourceDir,
+      ref: dispatch.ref,
+      sha: dispatch.sha,
+    },
+  };
+}
+
+/**
+ * Resolve the changed-files list a `filter` reads — for a global eval round and
+ * for a filter-bearing init job alike.
+ *
+ * Ground truth is the agent's own source clone; an already-`fetched` list from
+ * the orchestrator is a free fast-path. A diff-less event (schedule / tag /
+ * manual) resolves to `unavailable`, which makes `ctx.changedFiles` throw
+ * rather than read as an empty diff — a `filter` returning false produces no
+ * run at all, so a silently-empty diff would suppress the workflow with no
+ * artifact anywhere to inspect.
+ */
+async function resolveEvalChangedFiles(
+  dispatch: JobDispatch,
+  event: Record<string, unknown>,
+  sourceDir: string,
+): Promise<ChangedFilesResult> {
+  const ev = event as {
+    changedFiles?: string[];
+    changedFilesStatus?: ChangedFilesStatus;
+  };
+  if (ev.changedFilesStatus === 'fetched') {
+    return { files: ev.changedFiles ?? [], status: 'fetched' };
+  }
+  // Same auth chain the source clone used (its own credentials were ephemeral).
+  const sourceAuth = dispatch.sourceAuth ?? dispatch.workflowAuth;
+  const auth: GitAuth | undefined =
+    sourceAuth ??
+    (dispatch.token
+      ? { kind: 'basic', user: 'x-access-token', secret: dispatch.token }
+      : undefined);
+  return computeChangedFiles(sourceDir, event as EventPayload, auth);
+}
+
+/**
+ * Directory an init job clones the source repo into when the workflow declares a
+ * `filter` and the job restored `.kici/` from the cached tarball instead of
+ * cloning. Named with the `__kici` prefix so it cannot collide with a repo path.
+ */
+const FILTER_SOURCE_DIRNAME = '__kici_filter_source__';
+
+/**
+ * Materialize the source tree a non-global workflow's `filter` reads through
+ * `ctx.sourceRepo.path`.
+ *
+ * An init or dynamic-eval job normally restores only `.kici/` from the cached
+ * source tarball — enough to import the workflow module, but a directory with no
+ * repo in it. A filter that reads a file or shells out against that path would
+ * get a confidently wrong answer, and `changedFiles` could not be computed at
+ * all, so a filter-bearing job clones the source repo into a sibling directory.
+ *
+ * When no tarball was attached the job already cloned the whole repo into
+ * `workDir`, and that clone is reused rather than duplicated — including the
+ * local working-tree case, where there is no repo url and `workDir` IS the tree.
+ *
+ * A tarball with no repo url is the one combination that cannot be honoured:
+ * `workDir` holds `.kici/` alone and there is nothing to clone from. Returning it
+ * would hand the filter a directory in which every path test answers "absent" —
+ * the exact silent lie this function exists to prevent — so it throws instead.
+ */
+export async function ensureFilterSourceDir(
+  dispatch: JobDispatch,
+  workDir: string,
+): Promise<string> {
+  if (!dispatch.sourceTarUrl) return workDir;
+  if (!dispatch.repoUrl) {
+    throw new Error(
+      `Workflow declares a filter, but this job restored its source from the cache with no ` +
+        `repo url to clone from — the filter would see an empty tree. Re-run with a source ` +
+        `repository configured, or remove the filter.`,
+    );
+  }
+  const sourceDir = join(workDir, FILTER_SOURCE_DIRNAME);
+  const sourceAuth = dispatch.sourceAuth;
+  await gitClone({
+    repoUrl: dispatch.repoUrl,
+    ref: dispatch.ref,
+    sha: dispatch.sha,
+    workDir: sourceDir,
+    gitAuth: sourceAuth,
+    token: sourceAuth ? undefined : dispatch.token,
+  });
+  return sourceDir;
+}
+
+/**
+ * Restore deps, materialize the workflow source, and install `.kici/`
+ * dependencies for a dynamic-eval job — everything that has to exist before its
+ * workflow module can be imported.
+ *
+ * The init handler performs the same three steps against its own log wording and
+ * keeps its own copy: sharing one helper would have to either move that
+ * handler's `logger.info` call site (which Loki keys off) or parameterize it,
+ * and neither is worth it for twenty lines.
+ */
+async function materializeEvalWorkspace(
+  dispatch: JobDispatch,
+  workDir: string,
+  log: (msg: string) => void,
+): Promise<void> {
+  // 1. Restore deps (needed for workflow imports like @kici-dev/sdk)
+  if (dispatch.depsUrl) {
+    log('Restoring dependencies from cache');
+    await restoreDeps(workDir, dispatch.depsUrl, dispatch.depsHash);
+    log('Dependencies restored');
+  }
+
+  // 2. Materialize workflow source: extract from cached tarball if present,
+  //    otherwise clone from the source repo.
+  if (dispatch.sourceTarUrl) {
+    log('Restoring workflow source from cached tarball');
+    await restoreSource(workDir, dispatch.sourceTarUrl);
+  } else {
+    log(`Cloning ${dispatch.repoUrl} ref=${dispatch.ref}`);
+    const cloneStart = Date.now();
+    await gitClone({
+      repoUrl: dispatch.repoUrl,
+      ref: dispatch.ref,
+      sha: dispatch.sha,
+      workDir,
+      gitAuth: dispatch.sourceAuth,
+      token: dispatch.sourceAuth ? undefined : dispatch.token,
+    });
+    cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
+  }
+
+  // 3. Install deps locally if the cached tarball wasn't provided —
+  //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
+  const kiciDir = join(workDir, '.kici');
+  if (!dispatch.depsUrl && (await fileExists(join(kiciDir, 'package.json')))) {
+    log('Installing dependencies locally');
+    await installDeps(kiciDir, {
+      npmRegistries: dispatch.npmRegistries,
+      installEnvSecrets: dispatch.installEnvSecrets,
+      jobIdShort: dispatch.jobId.slice(0, 8),
+    });
+  }
+}
+
+/**
+ * Build the context a non-global workflow's `filter` is evaluated against.
+ *
+ * `sourceRepo` and `workflowRepo` are the same repo — that is what "non-global"
+ * means — so both carry the same identifier, path, ref, and sha. The zx shell is
+ * rooted at the source tree and streams into the evaluating step's log, matching
+ * what the global eval round hands its own filters.
+ *
+ * They are two distinct objects all the same. Being the same repo is a fact
+ * about their VALUES, not a licence to hand the author one object under two
+ * names: a filter that mutated `ctx.sourceRepo` would silently see
+ * `ctx.workflowRepo` change with it, which happens on no other path.
+ */
+export async function buildInitFilterInput(
+  dispatch: JobDispatch,
+  event: Record<string, unknown>,
+  workDir: string,
+  emit: (line: string, stream: LogStream) => void,
+): Promise<FilterEvalInput> {
+  const sourceDir = await ensureFilterSourceDir(dispatch, workDir);
+  const diff = await resolveEvalChangedFiles(dispatch, event, sourceDir);
+  const repo: RepoInfo = {
+    identifier: repoIdentifierFromUrl(dispatch.repoUrl),
+    path: sourceDir,
+    ref: dispatch.ref,
+    sha: dispatch.sha,
+  };
+  return {
+    sourceRepo: repo,
+    workflowRepo: { ...repo },
+    changedFiles: diff.files,
+    changedFilesStatus: diff.status,
+    env: process.env as Record<string, string | undefined>,
+    $: await buildEvalShell(sourceDir, emit),
+  };
+}
+
+/**
+ * Build the per-invocation zx `$` a global eval round hands to filters and
+ * generators, so a `await $\`…\`` inside one is visible in the eval step's log.
+ *
+ * **`env` is the LIVE `process.env` reference, never a spread.** A spread is a
+ * snapshot taken when the shell is built, which is before the round applies the
+ * seven `KICI_*` keys — so a filter that shells out (`$\`printenv
+ * KICI_SOURCE_REPO_PATH\``, or any subprocess inheriting env) would see nothing
+ * here while the sandbox re-evaluation's ambient `$` resolves `process.env`
+ * after `setupGlobalWorkflowEnv` has run and does see them. That is the same
+ * two-worlds determinism failure the cwd choice below exists to prevent, one
+ * layer down. Passing the live reference reproduces the ambient `$`'s own
+ * behaviour, which is what the sandbox uses.
+ *
+ * `verbose: true` + `makeStreamingZxLog` honors a per-call `quiet: true`, so a
+ * decrypted secret never leaks into the log.
+ *
+ * `emit` is a callback rather than the `LogStreamer` itself so the caller can
+ * route it through its own closed-guard: `LogStreamer.destroy()` sets no closed
+ * flag and `addLine` buffers unconditionally, so a subprocess line arriving
+ * after the step was reported would otherwise emit a `log.chunk` for a terminal
+ * step. That is the likeliest path for it — an orphaned candidate is usually
+ * orphaned *because* it is waiting on a subprocess.
+ */
+export async function buildEvalShell(
+  cwd: string,
+  emit: (line: string, stream: LogStream) => void,
+): Promise<typeof Shell> {
+  const { $: zx$ } = await import('zx');
+  return zx$({
+    cwd,
+    env: process.env as Record<string, string>,
+    verbose: true,
+    quiet: false,
+    log: makeStreamingZxLog(emit) as unknown as (entry: unknown) => void,
+  }) as unknown as typeof Shell;
 }
 
 /**
@@ -520,6 +795,14 @@ export class JobRunner {
     const isInitOnly = (jobConfig as { initOnly?: boolean }).initOnly === true;
     if (isInitOnly) {
       await this.handleInitJob(dispatch, workDir, abortController);
+      return true;
+    }
+
+    // Check for the pre-run global eval round (filters + generators for every
+    // candidate global workflow of one workflow repo, on one dual checkout).
+    const isGlobalEvalRound = (jobConfig as { globalEvalRound?: boolean }).globalEvalRound === true;
+    if (isGlobalEvalRound) {
+      await this.handleGlobalEvalRound(dispatch, workDir, abortController);
       return true;
     }
 
@@ -1178,6 +1461,68 @@ export class JobRunner {
   }
 
   /**
+   * Materialize the init job's workflow source into `workDir`. A test run ships
+   * its full working tree as an encrypted overlay tarball (`fullRepo`) rather
+   * than a git repo, so skip the clone and let the overlay populate the
+   * workspace — the same handling the normal execution-job path uses. Otherwise
+   * restore from the cached tarball if present, else clone. In every case, apply
+   * an attached overlay tarball afterward (test runs with uncommitted changes;
+   * for a fullRepo run this is what actually populates the workspace, so the
+   * init job resolves a dynamic context against the real source tree instead of
+   * an empty directory).
+   */
+  private async materializeInitJobSource(
+    dispatch: JobDispatch,
+    workDir: string,
+    initLog: (msg: string) => void,
+  ): Promise<void> {
+    const initJobConfig = dispatch.jobConfig as {
+      fullRepo?: boolean;
+      tarballUrl?: string;
+      cliPublicKey?: string;
+      orchestratorPrivateKey?: string;
+    };
+    if (initJobConfig.fullRepo) {
+      initLog('Test run: materializing workspace from overlay (no clone)');
+      await fs.mkdir(workDir, { recursive: true });
+    } else if (dispatch.sourceTarUrl) {
+      initLog('Restoring workflow source from cached tarball');
+      await restoreSource(workDir, dispatch.sourceTarUrl);
+    } else {
+      initLog(`Cloning ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
+      const cloneStart = Date.now();
+      await gitClone({
+        repoUrl: dispatch.repoUrl,
+        ref: dispatch.ref,
+        sha: dispatch.sha,
+        workDir,
+        gitAuth: dispatch.sourceAuth,
+        token: dispatch.sourceAuth ? undefined : dispatch.token,
+      });
+      cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
+    }
+
+    if (
+      initJobConfig.tarballUrl &&
+      initJobConfig.cliPublicKey &&
+      initJobConfig.orchestratorPrivateKey
+    ) {
+      initLog('Applying overlay tarball for test run');
+      const overlayResult = await applyOverlay({
+        tarballUrl: initJobConfig.tarballUrl,
+        cliPublicKey: initJobConfig.cliPublicKey,
+        orchestratorPrivateKey: initJobConfig.orchestratorPrivateKey,
+        repoDir: workDir,
+      });
+      logger.info('Init job: overlay applied', {
+        jobId: dispatch.jobId,
+        filesApplied: overlayResult.filesApplied,
+        filesDeleted: overlayResult.filesDeleted,
+      });
+    }
+  }
+
+  /**
    * Phase 2 of build: install dependencies locally if needed for the build,
    * and (when the orchestrator has flagged the dep cache as stale) pack
    * `.kici/node_modules/` into a tarball and upload it to the deps cache.
@@ -1304,6 +1649,247 @@ export class JobRunner {
   }
 
   /**
+   * Clone both repos for a global eval round and materialize the workflow
+   * repo's dependencies, mirroring the sandbox's own dual-clone: the workflow
+   * repo under `<workDir>/workflow`, the source repo under `<workDir>/source`.
+   *
+   * `.kici/` lives in the WORKFLOW repo for a global workflow, so deps and the
+   * scratch-dir git exclude both apply to that checkout, never the source one.
+   */
+  private async checkoutForGlobalEvalRound(
+    dispatch: JobDispatch,
+    config: GlobalEvalRoundJobConfig,
+    workflowDir: string,
+    sourceDir: string,
+    log: (msg: string) => void,
+  ): Promise<void> {
+    const workflowAuth = dispatch.workflowAuth ?? dispatch.sourceAuth;
+    const sourceAuth = dispatch.sourceAuth ?? dispatch.workflowAuth;
+
+    await fs.mkdir(workflowDir, { recursive: true });
+    await fs.mkdir(sourceDir, { recursive: true });
+
+    log(`Cloning workflow repo ${config.workflowRepoUrl} (ref: ${config.workflowRef ?? ''})`);
+    const cloneStart = Date.now();
+    await gitClone({
+      repoUrl: config.workflowRepoUrl,
+      ref: config.workflowRef ?? '',
+      sha: config.workflowSha ?? '',
+      workDir: workflowDir,
+      gitAuth: workflowAuth,
+      token: workflowAuth ? undefined : dispatch.token,
+    });
+    await excludeScratchFromGit(workflowDir);
+
+    log(`Cloning source repo ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
+    await gitClone({
+      repoUrl: dispatch.repoUrl,
+      ref: dispatch.ref,
+      sha: dispatch.sha,
+      workDir: sourceDir,
+      gitAuth: sourceAuth,
+      token: sourceAuth ? undefined : dispatch.token,
+    });
+    cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
+
+    if (dispatch.depsUrl) {
+      log('Restoring dependencies from cache');
+      await restoreDeps(workflowDir, dispatch.depsUrl, dispatch.depsHash);
+    }
+    if (dispatch.sourceTarUrl) {
+      log('Restoring workflow source from cached tarball');
+      await restoreSource(workflowDir, dispatch.sourceTarUrl);
+    }
+    const kiciDir = join(workflowDir, '.kici');
+    if (!dispatch.depsUrl && (await fileExists(join(kiciDir, 'package.json')))) {
+      log('Installing dependencies locally');
+      await installDeps(kiciDir, {
+        npmRegistries: dispatch.npmRegistries,
+        installEnvSecrets: dispatch.installEnvSecrets,
+        jobIdShort: dispatch.jobId.slice(0, 8),
+      });
+    }
+  }
+
+  /**
+   * Handle a pre-run global eval round.
+   *
+   * The round runs once per (event × workflow repo) BEFORE any run row exists:
+   * it checks out the workflow repo and the source repo, then runs each
+   * candidate global workflow's `filter` and — for a survivor — its
+   * `DynamicJobFn`s, so the orchestrator learns which workflows apply to this
+   * source repo and which jobs each one generates.
+   *
+   * A candidate that fails is reported indeterminate inside the result, not as
+   * a job failure: the round carries several unrelated org-wide workflows, and
+   * one broken filter must not suppress the rest. The job itself fails only
+   * when the checkout or the round machinery breaks.
+   */
+  private async handleGlobalEvalRound(
+    dispatch: JobDispatch,
+    workDir: string,
+    abortController: AbortController,
+  ): Promise<void> {
+    const { runId, jobId, jobConfig } = dispatch;
+    const config = jobConfig as unknown as GlobalEvalRoundJobConfig;
+    const workflowDir = join(workDir, 'workflow');
+    const sourceDir = join(workDir, 'source');
+
+    logger.info('Starting global eval round', {
+      jobId,
+      candidateCount: config.candidates.length,
+      workflowRepoIdentifier: config.workflowRepoIdentifier,
+    });
+    this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
+
+    const evalStreamer = this.createStepStreamer(dispatch, 0);
+    // The round's own deadline check bounds orphaned candidate work to one
+    // candidate, but it cannot preempt that candidate mid-`await` — so a late
+    // `console.log` can still arrive after the step is reported and the
+    // streamer destroyed. Drop those rather than buffering and emitting a
+    // `log.append` for a step already marked terminal.
+    let streamerClosed = false;
+    const evalLog = (msg: string) => {
+      if (!streamerClosed) evalStreamer.addLine(msg);
+    };
+    // The zx shell writes to the streamer directly, so it needs the same guard
+    // — and it is the path an orphaned candidate is likeliest to use, since a
+    // candidate usually outlives its budget while waiting on a subprocess.
+    const evalStreamLine = (line: string, stream: LogStream) => {
+      if (!streamerClosed) evalStreamer.addLine(line, stream);
+    };
+    const closeStreamer = async () => {
+      await evalStreamer.flush();
+      evalStreamer.destroy();
+      streamerClosed = true;
+    };
+    const evalSink: CaptureSink = { addLine: (line) => evalLog(line) };
+    this.sendStepStatus(dispatch, 0, 'global-eval', ExecutionStepStatus.enum.running);
+
+    const heartbeatTimer = setInterval(() => {
+      this.send({ type: 'job.heartbeat', runId, jobId, timestamp: Date.now() });
+    }, this.config.jobHeartbeatIntervalMs);
+
+    try {
+      if (abortController.signal.aborted) {
+        await closeStreamer();
+        this.sendStepStatus(
+          dispatch,
+          0,
+          'global-eval',
+          ExecutionStepStatus.enum.skipped,
+          undefined,
+          evalStreamer.getTotalBytes(),
+        );
+        this.sendJobStatus(dispatch, ExecutionJobStatus.enum.cancelled);
+        return;
+      }
+
+      await this.checkoutForGlobalEvalRound(dispatch, config, workflowDir, sourceDir, evalLog);
+
+      // Ground truth for the diff is the agent's own source clone; the
+      // orchestrator's already-fetched list is a free fast-path. A diff-less
+      // event resolves to `unavailable`, which makes a filter reading
+      // `ctx.changedFiles` throw rather than silently see an empty diff.
+      const diff = await resolveEvalChangedFiles(dispatch, config.event, sourceDir);
+
+      // cwd is the round's `workDir` — the PARENT of `workflow/` and `source/` —
+      // deliberately, to match what the sandbox re-evaluation hands the same
+      // generator: `workflow-loader.ts` passes the ambient `$`, whose cwd is the
+      // forked runner's `options.workDir` (`fork-runner.ts`). Rooting the round's
+      // shell at `workflowDir` instead would give a generator running a relative
+      // `$` command the workflow repo here and an almost-empty parent directory
+      // on re-eval — two different worlds, which is a determinism failure.
+      // Filters and generators should address either tree through
+      // `ctx.sourceRepo.path` / `ctx.workflowRepo.path`, never a relative path.
+      //
+      // Built BEFORE the round applies the seven KICI_* keys, which is safe only
+      // because the shell holds the live `process.env` rather than a snapshot —
+      // see buildEvalShell.
+      const evalShell = await buildEvalShell(workDir, evalStreamLine);
+      const roundResult = await runCaptured(evalSink, () =>
+        runGlobalEvalRound({
+          workflowDir,
+          sourceDir,
+          repos: buildRoundRepos(dispatch, config, workflowDir, sourceDir),
+          candidates: config.candidates,
+          event: config.event,
+          changedFiles: diff.files,
+          changedFilesStatus: diff.status,
+          roundTimeoutMs: config.roundTimeoutMs ?? DEFAULT_GLOBAL_EVAL_ROUND_TIMEOUT_MS,
+          candidateTimeoutMs: config.candidateTimeoutMs ?? DEFAULT_GLOBAL_EVAL_CANDIDATE_TIMEOUT_MS,
+          signal: abortController.signal,
+          $: evalShell,
+          log: {
+            info: (msg: string) => evalLog(msg),
+            warn: (msg: string) => evalLog(`WARN: ${msg}`),
+            error: (msg: string) => evalLog(`ERROR: ${msg}`),
+            debug: (msg: string) => evalLog(`DEBUG: ${msg}`),
+          },
+          kici: buildKiciApi(
+            this._sendApiRequest
+              ? withBootstrapInterception((method, params) =>
+                  this._sendApiRequest!(method, params ?? {}),
+                )
+              : () => Promise.reject(new Error('Agent API not available')),
+          ),
+        }),
+      );
+
+      const running = roundResult.candidates.filter((c) => c.run).length;
+      const indeterminate = roundResult.candidates.filter((c) => c.indeterminate).length;
+      logger.info('Global eval round completed', {
+        jobId,
+        candidateCount: roundResult.candidates.length,
+        running,
+        indeterminate,
+      });
+      evalLog(
+        `Global eval round completed: ${running} of ${roundResult.candidates.length} workflow(s) apply` +
+          (indeterminate > 0 ? ` (${indeterminate} indeterminate)` : ''),
+      );
+      for (const candidate of roundResult.candidates) {
+        if (candidate.indeterminate) {
+          evalLog(`  ${candidate.workflowName}: indeterminate — ${candidate.reason ?? 'unknown'}`);
+        }
+      }
+
+      await closeStreamer();
+      this.sendStepStatus(
+        dispatch,
+        0,
+        'global-eval',
+        ExecutionStepStatus.enum.success,
+        undefined,
+        evalStreamer.getTotalBytes(),
+      );
+      this.sendJobStatus(dispatch, ExecutionJobStatus.enum.success, {
+        globalEvalResult: roundResult,
+        globalEvalComplete: true,
+      });
+    } catch (err) {
+      const errorMsg = toErrorMessage(err);
+      logger.error('Global eval round failed', { jobId, error: errorMsg });
+      evalLog(`Error: ${errorMsg}`);
+      await closeStreamer();
+      this.sendStepStatus(
+        dispatch,
+        0,
+        'global-eval',
+        ExecutionStepStatus.enum.failed,
+        { error: errorMsg },
+        evalStreamer.getTotalBytes(),
+      );
+      this.sendJobStatus(dispatch, ExecutionJobStatus.enum.failed, {
+        error: errorMsg,
+        globalEvalFailed: true,
+      });
+    } finally {
+      clearInterval(heartbeatTimer);
+    }
+  }
+
+  /**
    * Handle an init-only job.
    *
    * Init jobs evaluate dynamic functions (environment, env, concurrencyGroup)
@@ -1330,6 +1916,8 @@ export class JobRunner {
       dynamicEnv: boolean;
       dynamicConcurrencyGroup: boolean;
       dynamicMatrix?: boolean;
+      /** From `LockWorkflow.hasFilter` — evaluate the workflow's `filter` first. */
+      hasFilter?: boolean;
       event: Record<string, unknown>;
       timeoutMs?: number;
       contentHash?: string;
@@ -1347,8 +1935,26 @@ export class JobRunner {
     // Create a LogStreamer for the synthetic "init" step so user output during
     // dynamic-field evaluation appears in the dashboard.
     const initStreamer = this.createStepStreamer(dispatch, 0);
-    const initLog = (msg: string) => initStreamer.addLine(msg);
-    const initSink: CaptureSink = { addLine: (line) => initStreamer.addLine(line) };
+    // A filter may shell out, and `LogStreamer.destroy()` sets no closed flag —
+    // `addLine` buffers unconditionally — so a subprocess line arriving after
+    // the step was reported would emit a `log.chunk` for a terminal step. Drop
+    // those instead of buffering them.
+    let streamerClosed = false;
+    const initLog = (msg: string) => {
+      if (!streamerClosed) initStreamer.addLine(msg);
+    };
+    const initStreamLine = (line: string, stream: LogStream) => {
+      if (!streamerClosed) initStreamer.addLine(line, stream);
+    };
+    // Idempotent: the catch below also closes, so a throw from `sendStepStatus`
+    // on the success path would otherwise flush an already-destroyed streamer.
+    const closeStreamer = async () => {
+      if (streamerClosed) return;
+      streamerClosed = true;
+      await initStreamer.flush();
+      initStreamer.destroy();
+    };
+    const initSink: CaptureSink = { addLine: (line) => initLog(line) };
 
     this.sendStepStatus(dispatch, 0, 'init', ExecutionStepStatus.enum.running);
 
@@ -1364,8 +1970,7 @@ export class JobRunner {
 
     try {
       if (abortController.signal.aborted) {
-        await initStreamer.flush();
-        initStreamer.destroy();
+        await closeStreamer();
         this.sendStepStatus(
           dispatch,
           0,
@@ -1384,24 +1989,9 @@ export class JobRunner {
         await restoreDeps(workDir, dispatch.depsUrl, dispatch.depsHash);
       }
 
-      // 2. Materialize workflow source: extract from cached tarball if present,
-      //    otherwise clone from the source repo.
-      if (dispatch.sourceTarUrl) {
-        initLog('Restoring workflow source from cached tarball');
-        await restoreSource(workDir, dispatch.sourceTarUrl);
-      } else {
-        initLog(`Cloning ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
-        const cloneStart = Date.now();
-        await gitClone({
-          repoUrl: dispatch.repoUrl,
-          ref: dispatch.ref,
-          sha: dispatch.sha,
-          workDir,
-          gitAuth: dispatch.sourceAuth,
-          token: dispatch.sourceAuth ? undefined : dispatch.token,
-        });
-        cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
-      }
+      // 2. Materialize the workflow source into workDir (overlay for a test run,
+      //    cached tarball, or git clone — plus any attached overlay).
+      await this.materializeInitJobSource(dispatch, workDir, initLog);
 
       // 3. Install deps locally if the cached tarball wasn't provided —
       //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
@@ -1421,9 +2011,17 @@ export class JobRunner {
         });
       }
 
+      // 4. Materialize the source tree + diff a workflow-level `filter` reads.
+      //    Built before the capture scope because it clones and shells out; the
+      //    filter call itself runs inside the scope with everything else.
+      const filterInput = config.hasFilter
+        ? await buildInitFilterInput(dispatch, config.event, workDir, initStreamLine)
+        : undefined;
+
       // Wrap module load + dynamic-field evaluation in a console-capture scope.
-      // Any console.log in the workflow module top-level or inside a dynamic
-      // environment / env / concurrencyGroup function lands on this init log.
+      // Any console.log in the workflow module top-level or inside the
+      // workflow's filter or a dynamic environment / env / concurrencyGroup
+      // function lands on this init log.
       const initResult = await runCaptured(initSink, async () => {
         const { module } = await loadWorkflowSource(
           workDir,
@@ -1433,7 +2031,7 @@ export class JobRunner {
         );
         const workflow = extractWorkflow(module, config.workflowName);
         initLog(
-          `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} context=${config.dynamicContext} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false})`,
+          `Evaluating dynamic fields for job '${config.targetJobName}' (env=${config.dynamicEnv} context=${config.dynamicContext} concurrencyGroup=${config.dynamicConcurrencyGroup} matrix=${config.dynamicMatrix ?? false} filter=${config.hasFilter ?? false})`,
         );
         return evaluateDynamicFields(
           workflow,
@@ -1444,8 +2042,10 @@ export class JobRunner {
             dynamicEnv: config.dynamicEnv,
             dynamicConcurrencyGroup: config.dynamicConcurrencyGroup,
             dynamicMatrix: config.dynamicMatrix ?? false,
+            hasFilter: config.hasFilter ?? false,
           },
           config.timeoutMs,
+          filterInput,
         );
       });
 
@@ -1454,11 +2054,16 @@ export class JobRunner {
         hasContext: initResult.contextNames !== undefined,
         hasEnv: initResult.env !== undefined,
         hasConcurrencyGroup: initResult.concurrencyGroup !== undefined,
+        filterPassed: initResult.filterPassed,
       });
 
+      if (initResult.filterPassed === false) {
+        initLog(
+          `Workflow filter returned false — '${config.workflowName}' does not apply to this event, so no job is dispatched`,
+        );
+      }
       initLog('Init completed successfully');
-      await initStreamer.flush();
-      initStreamer.destroy();
+      await closeStreamer();
       this.sendStepStatus(
         dispatch,
         0,
@@ -1478,8 +2083,7 @@ export class JobRunner {
       const errorMsg = toErrorMessage(err);
       logger.error('Init job failed', { jobId, error: errorMsg });
       initLog(`Error: ${errorMsg}`);
-      await initStreamer.flush();
-      initStreamer.destroy();
+      await closeStreamer();
       this.sendStepStatus(
         dispatch,
         0,
@@ -1520,6 +2124,11 @@ export class JobRunner {
       timeoutMs?: number;
       contentHash?: string;
       resolvedHashFiles?: string[];
+      /**
+       * From `LockWorkflow.hasFilter` — evaluate the workflow's `filter` before
+       * the generator. A `false` verdict generates no jobs at all.
+       */
+      hasFilter?: boolean;
       /** Result-aware generator: declared needs + the frozen upstream snapshot. */
       resultAware?: boolean;
       declaredNeeds?: readonly unknown[];
@@ -1566,43 +2175,7 @@ export class JobRunner {
         return;
       }
 
-      // 1. Restore deps (needed for workflow imports like @kici-dev/sdk)
-      if (dispatch.depsUrl) {
-        evalLog('Restoring dependencies from cache');
-        await restoreDeps(workDir, dispatch.depsUrl, dispatch.depsHash);
-        evalLog('Dependencies restored');
-      }
-
-      // 2. Materialize workflow source: extract from cached tarball if present,
-      //    otherwise clone from the source repo.
-      if (dispatch.sourceTarUrl) {
-        evalLog('Restoring workflow source from cached tarball');
-        await restoreSource(workDir, dispatch.sourceTarUrl);
-      } else {
-        evalLog(`Cloning ${dispatch.repoUrl} ref=${dispatch.ref}`);
-        const cloneStart = Date.now();
-        await gitClone({
-          repoUrl: dispatch.repoUrl,
-          ref: dispatch.ref,
-          sha: dispatch.sha,
-          workDir,
-          gitAuth: dispatch.sourceAuth,
-          token: dispatch.sourceAuth ? undefined : dispatch.token,
-        });
-        cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
-      }
-
-      // 3. Install deps locally if the cached tarball wasn't provided —
-      //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
-      const kiciDir = join(workDir, '.kici');
-      if (!dispatch.depsUrl && (await fileExists(join(kiciDir, 'package.json')))) {
-        evalLog('Installing dependencies locally');
-        await installDeps(kiciDir, {
-          npmRegistries: dispatch.npmRegistries,
-          installEnvSecrets: dispatch.installEnvSecrets,
-          jobIdShort: dispatch.jobId.slice(0, 8),
-        });
-      }
+      await materializeEvalWorkspace(dispatch, workDir, evalLog);
 
       // 3. Build a per-invocation zx `$` whose subprocess stdout / stderr flows
       //    into the eval streamer. Mirrors the sandbox's $.log callback wiring in
@@ -1626,6 +2199,17 @@ export class JobRunner {
       }) as unknown as typeof zx$;
 
       const evalSink: CaptureSink = { addLine: (line) => evalStreamer.addLine(line) };
+
+      // The workflow's `filter` gates the generator too, not just the static
+      // jobs' init round. Without this a same-repo workflow whose jobs are all
+      // generated would keep the filter entirely inert, and a mixed workflow
+      // would deterministically half-dispatch: static jobs suppressed, generated
+      // jobs running. Built before the capture scope because it clones.
+      const filterInput = config.hasFilter
+        ? await buildInitFilterInput(dispatch, config.event, workDir, (line, stream) =>
+            evalStreamer.addLine(line, stream),
+          )
+        : undefined;
 
       // Route DynamicJobFn log calls through evalLog so they appear in the dashboard.
       // This is redundant with console.* capture below (both land in the same
@@ -1660,6 +2244,17 @@ export class JobRunner {
 
         const { extractDynamicJobFn } = await import('./workflow-loader.js');
         const workflow = extractWorkflow(module, config.workflowName);
+
+        if (config.hasFilter) {
+          if (!(await evaluateWorkflowFilter(workflow, config.event, filterInput, timeoutMs))) {
+            evalLog(
+              `Workflow filter returned false — '${config.workflowName}' does not apply to this ` +
+                `event, so its generator is not run and no jobs are generated`,
+            );
+            return [];
+          }
+        }
+
         const dynamicFn = extractDynamicJobFn(workflow, config.source.index);
 
         evalLog(`Evaluating DynamicJobFn (index ${config.source.index}, timeout ${timeoutMs}ms)`);
@@ -1669,20 +2264,17 @@ export class JobRunner {
         // dispatch (never a live read — see the determinism contract).
         const needs = buildEvalNeedsContext(config);
 
-        const context = {
-          $: scopedDollar,
-          ctx: {
-            workflow: { name: config.workflowName },
-            // Boundary cast: the wire `config.event` is untyped JSON that, per
-            // the unified event protocol, always carries the normalized event
-            // envelope. This is where it enters the DynamicJobFn's user context.
-            event: config.event as EventPayload,
-            ...(needs && { needs }),
-          },
-          log: dynamicJobLogger,
+        // Built through the shared builder so this first evaluation and the
+        // sandbox re-evaluation (workflow-loader.ts) cannot drift apart.
+        const context = buildGeneratorContext({
+          workflowName: config.workflowName,
+          event: config.event,
           env: process.env as Record<string, string | undefined>,
+          ...(needs && { needs }),
+          $: scopedDollar,
+          log: dynamicJobLogger,
           kici,
-        };
+        });
 
         const generatedJobs = await withTimeout(
           () => dynamicFn(context),

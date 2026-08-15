@@ -28,29 +28,50 @@ function createMockDb() {
   const mockExecuteTakeFirstOrThrow = vi.fn().mockResolvedValue({ total: 0 });
 
   const whereCalls: Array<unknown[]> = [];
+  /**
+   * The same predicates, tagged with the table the query read.
+   *
+   * `whereCalls` alone cannot say WHICH query carried a predicate, so a route
+   * that issues two queries against the same id proves nothing by its presence
+   * — dropping the predicate from one of them leaves the other's entry behind.
+   */
+  const whereCallsByTable: Array<{ table: string; args: unknown[] }> = [];
+  /** Every table name passed to `selectFrom`, in call order. */
+  const selectFromCalls: string[] = [];
 
-  const chainMethods: Record<string, any> = {};
-  const chain = new Proxy(chainMethods, {
-    get(_target, prop) {
-      if (prop === 'execute') return mockExecute;
-      if (prop === 'executeTakeFirst') return mockExecuteTakeFirst;
-      if (prop === 'executeTakeFirstOrThrow') return mockExecuteTakeFirstOrThrow;
-      if (prop === 'where')
-        return (...args: unknown[]) => {
-          whereCalls.push(args);
-          return chain;
-        };
-      return () => chain;
-    },
-  });
+  const makeChain = (table: string) => {
+    const chain: any = new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (prop === 'execute') return mockExecute;
+          if (prop === 'executeTakeFirst') return mockExecuteTakeFirst;
+          if (prop === 'executeTakeFirstOrThrow') return mockExecuteTakeFirstOrThrow;
+          if (prop === 'where')
+            return (...args: unknown[]) => {
+              whereCalls.push(args);
+              whereCallsByTable.push({ table, args });
+              return chain;
+            };
+          return () => chain;
+        },
+      },
+    );
+    return chain;
+  };
 
   return {
-    selectFrom: () => chain,
+    selectFrom: (table: string) => {
+      selectFromCalls.push(table);
+      return makeChain(table);
+    },
     fn: { countAll: () => ({ as: () => 'count' }) },
     mockExecute,
     mockExecuteTakeFirst,
     mockExecuteTakeFirstOrThrow,
     whereCalls,
+    whereCallsByTable,
+    selectFromCalls,
   };
 }
 
@@ -690,6 +711,133 @@ describe('admin run routes', () => {
       const appNoLog = createAdminRunRoutes(depsNoLog);
       const res = await request(appNoLog, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
       expect(res.status).toBe(503);
+    });
+  });
+
+  // ── step logs: the dispatch-queue fallback for eval rounds ──────
+  //
+  // A global eval round writes NO `execution_runs` row when it admits its
+  // candidates (the round is what decides whether a run exists at all), yet
+  // its `global-eval` step log is durably stored. `dispatch_queue` carries
+  // the same `run_id` plus the `routing_key` the scope guard needs, so the
+  // route resolves such ids there. The mock db ignores the table name, so
+  // each staged `executeTakeFirst` value is consumed in query order:
+  // execution_runs, then dispatch_queue, then the `execution_steps` lookup
+  // inside `readStepLogLines`. `selectFromCalls` records which tables were
+  // actually read.
+
+  describe('GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs — eval-round fallback', () => {
+    /** Point `tokenManager.validate` at a routing-key-scoped token. */
+    function useScopedToken(routingKey: string) {
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'user-1',
+        role: 'owner' as Role,
+        routingKey,
+        label: 'test',
+      });
+    }
+
+    it('serves logs for a runId known only to dispatch_queue', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row for an eval round
+        .mockResolvedValueOnce({ run_id: 'run-eval-1', routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: 'executions/run-eval-1/job-eval-1/step-0.log' });
+      (deps.logStorage!.read as any).mockResolvedValueOnce({
+        data: '[global-filter] verdict=true\n',
+        cursor: 0,
+        complete: true,
+      });
+
+      const res = await request(app, '/run-eval-1/jobs/job-eval-1/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.lines).toEqual([{ untrusted: true, value: '[global-filter] verdict=true' }]);
+      expect(deps.mockDb.selectFromCalls).toContain('dispatch_queue');
+      // The fallback must be keyed on THIS run. Without the predicate the
+      // query returns an ARBITRARY queued row, whose routing key would then
+      // authorize the request — and every other assertion in this describe
+      // still passes, because the mock returns the staged row either way.
+      //
+      // Asserted against `whereCallsByTable`, not `whereCalls`: the
+      // `execution_runs` lookup and the `execution_steps` lookup inside
+      // `readStepLogLines` both carry the same `run_id` predicate, so a
+      // table-blind assertion would be satisfied by either of them and prove
+      // nothing about the fallback.
+      expect(
+        deps.mockDb.whereCallsByTable
+          .filter((w) => w.table === 'dispatch_queue')
+          .map((w) => w.args),
+      ).toContainEqual(['run_id', '=', 'run-eval-1']);
+    });
+
+    it('still 404s a runId in neither table', async () => {
+      // Both lookups miss (the mock's default resolves to undefined).
+      const res = await request(app, '/run-nope/jobs/job-nope/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(404);
+      const body = await res.json();
+      expect(body.error).toBe('Run run-nope not found');
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'dispatch_queue']);
+    });
+
+    it('enforces routing-key scope using the dispatch_queue routing key', async () => {
+      useScopedToken('github:99');
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row
+        .mockResolvedValueOnce({ run_id: 'run-eval-2', routing_key: 'github:42' }); // dispatch_queue
+
+      const res = await request(app, '/run-eval-2/jobs/job-eval-2/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(403);
+      // The step lookup must never run for a denied request.
+      expect(deps.mockDb.selectFromCalls).not.toContain('execution_steps');
+    });
+
+    it('admits a matching scope resolved through dispatch_queue', async () => {
+      useScopedToken('github:42');
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce(undefined) // execution_runs: no row
+        .mockResolvedValueOnce({ run_id: 'run-eval-3', routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: 'executions/run-eval-3/job-eval-3/step-0.log' });
+
+      const res = await request(app, '/run-eval-3/jobs/job-eval-3/steps/0/logs', {
+        token: validToken,
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it('does not query dispatch_queue when execution_runs already has the row', async () => {
+      deps.mockDb.mockExecuteTakeFirst
+        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // execution_runs hit
+        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' });
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+
+      expect(res.status).toBe(200);
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'execution_steps']);
+    });
+
+    it('403s a scoped token on an ordinary run whose routing_key is null', async () => {
+      // A found run with a null routing key must stay a scope denial, never a
+      // 404 and never a fallthrough to dispatch_queue.
+      useScopedToken('github:42');
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
+        run_id: 'run-1',
+        routing_key: null,
+      });
+
+      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+
+      expect(res.status).toBe(403);
+      expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs']);
     });
   });
 });
