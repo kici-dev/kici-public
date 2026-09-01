@@ -70,6 +70,30 @@ export function detectLabelSetOverlaps(
 }
 
 /**
+ * The taint gate for one of a scaler's label sets.
+ *
+ * Prefers the index-aligned `labelSetMandatoryLabels`, falling back to the
+ * scaler-wide `mandatoryLabels` when it is absent (a caller that predates the
+ * per-label-set gate) or when its length does not match `labelSets` — a
+ * mismatched array carries no trustworthy alignment, so indexing into it would
+ * apply one label set's gate to another. Falling back to the union is the safe
+ * direction: it over-gates, where a wrong index could under-gate and admit a
+ * job onto a platform it cannot run on.
+ */
+function gateForLabelSet(
+  scaler: {
+    labelSets: Array<{ labels: string[] }>;
+    mandatoryLabels?: string[];
+    labelSetMandatoryLabels?: string[][];
+  },
+  index: number,
+): string[] {
+  const perSet = scaler.labelSetMandatoryLabels;
+  if (perSet && perSet.length === scaler.labelSets.length) return perSet[index] ?? [];
+  return scaler.mandatoryLabels ?? [];
+}
+
+/**
  * Find which scaler backend handles a given set of labels.
  * Returns the scaler name and label-set index, or null if no match.
  *
@@ -77,10 +101,10 @@ export function detectLabelSetOverlaps(
  * ['macos'] matches ['macos', 'darwin', 'bare-metal']. This is consistent
  * with peer routing (findPeersWithCapacity) which uses the same semantics.
  *
- * In addition, every label declared in a scaler's `mandatoryLabels` must be
+ * In addition, every label in the gate for the matched label set must be
  * present in the job's `runsOn`. This is the Kubernetes-taint-style opt-in
- * gate: a scaler with `mandatoryLabels: ['gpu']` only accepts jobs that
- * explicitly include `gpu` in `runsOn`.
+ * gate: a label set gated on `['gpu']` only accepts jobs that explicitly
+ * include `gpu` in `runsOn`.
  *
  * When multiple backends match, the one with the smallest label set wins
  * (most specific match).
@@ -91,19 +115,20 @@ export function findBackendForLabels(
     name: string;
     labelSets: Array<{ labels: string[] }>;
     mandatoryLabels?: string[];
+    labelSetMandatoryLabels?: string[][];
   }>,
   excludeLabels: string[] = [],
 ): { scalerName: string; labelSetIndex: number } | null {
   const targetLabels = new Set(labels.map((l) => l.toLowerCase()));
 
-  // Empty target matches the first scaler whose mandatoryLabels are empty.
-  // A scaler with any mandatoryLabel cannot accept an empty runsOn because
-  // the gate label cannot be present.
+  // Empty target matches the first label set with no gate. A gated label set
+  // cannot accept an empty runsOn because the gate label cannot be present.
   if (targetLabels.size === 0) {
     for (const scaler of scalers) {
-      if ((scaler.mandatoryLabels?.length ?? 0) > 0) continue;
-      if (scaler.labelSets.length > 0) {
-        return { scalerName: scaler.name, labelSetIndex: 0 };
+      for (let i = 0; i < scaler.labelSets.length; i++) {
+        if (gateForLabelSet(scaler, i).length === 0) {
+          return { scalerName: scaler.name, labelSetIndex: i };
+        }
       }
     }
     return null;
@@ -112,16 +137,17 @@ export function findBackendForLabels(
   let bestMatch: { scalerName: string; labelSetIndex: number; size: number } | null = null;
 
   for (const scaler of scalers) {
-    // Mandatory-labels gate: every label in scaler.mandatoryLabels must be
-    // present in the job's targetLabels. Mandatory labels are scaler-level,
-    // so we check once per scaler before scanning its labelSets.
-    const mandatory = scaler.mandatoryLabels ?? [];
-    if (mandatory.length > 0) {
-      const allMandatoryPresent = mandatory.every((m) => targetLabels.has(m.toLowerCase()));
-      if (!allMandatoryPresent) continue;
-    }
-
     for (let i = 0; i < scaler.labelSets.length; i++) {
+      // Per-label-set gate: every label in this set's gate must be present in
+      // the job's targetLabels. Checked inside the loop, because a scaler
+      // mixing platforms gates each of its label sets differently — hoisting
+      // this to the scaler level tests the union and rejects every set.
+      const mandatory = gateForLabelSet(scaler, i);
+      if (mandatory.length > 0) {
+        const allMandatoryPresent = mandatory.every((m) => targetLabels.has(m.toLowerCase()));
+        if (!allMandatoryPresent) continue;
+      }
+
       const scalerLabels = new Set(scaler.labelSets[i].labels.map((l) => l.toLowerCase()));
 
       // Check: every required label exists in the scaler's label set

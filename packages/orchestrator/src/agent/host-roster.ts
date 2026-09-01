@@ -96,6 +96,13 @@ export interface UpsertHostInput {
   agentId: string;
   tokenId: string | null;
   lifecycleClass: LifecycleClass;
+  /**
+   * True when an auto-scaler backend spawned this agent, so `runsOnAll`
+   * fan-out skips it. Derived from the scaler manager's registration lookup,
+   * never from `lifecycleClass` (which is `ephemeral` for every agent when the
+   * auth mode is `none`). Omitted ⇒ false.
+   */
+  scalerManaged?: boolean;
   labels: string[];
   hostname: string | null;
   platform: string;
@@ -184,6 +191,7 @@ export class HostRosterStore {
         agent_id: input.agentId,
         token_id: input.tokenId,
         lifecycle_class: input.lifecycleClass,
+        scaler_managed: input.scalerManaged ?? false,
         labels: labelsJson,
         hostname: input.hostname,
         platform: input.platform,
@@ -197,6 +205,10 @@ export class HostRosterStore {
         oc.column('agent_id').doUpdateSet({
           token_id: input.tokenId,
           lifecycle_class: input.lifecycleClass,
+          // Re-registration converges this like every other identity column: a
+          // host that stops (or starts) being scaler-spawned under the same
+          // agent id must not keep a stale fan-out eligibility.
+          scaler_managed: input.scalerManaged ?? false,
           labels: labelsJson,
           hostname: input.hostname,
           platform: input.platform,
@@ -365,21 +377,62 @@ export class HostRosterStore {
   }
 
   /**
-   * Resolve every roster host matching a `runsOnAll` predicate (OR-of-AND
-   * include groups, minus exclude labels), tagged with its derived status. This
-   * is the host-fanout resolver: it returns declared-but-absent static hosts
-   * (status `unreachable`) so the caller can apply `onUnreachable` — the live
-   * registry alone cannot name an expected-but-absent host.
+   * Resolve EVERY roster host matching a label predicate (OR-of-AND include
+   * groups, minus exclude labels), tagged with its derived status. Returns
+   * declared-but-absent static hosts (status `unreachable`) so a caller can
+   * apply `onUnreachable` — the live registry alone cannot name an
+   * expected-but-absent host.
+   *
+   * This is the INVENTORY query: it includes auto-scaler-spawned hosts, whose
+   * `lifecycleClass` is what the SDK's `ctx.kici.inventory` exposes to tell
+   * them apart. `runsOnAll` fan-out uses {@link findFanoutTargets} instead.
    */
   async findMatching(
     include: readonly (readonly LabelMatcher[])[],
     exclude: readonly LabelMatcher[],
     graceMs: number,
   ): Promise<MatchedHost[]> {
+    return this.matchRows(include, exclude, graceMs, false);
+  }
+
+  /**
+   * Resolve the `runsOnAll` fan-out target set: {@link findMatching}, minus
+   * every auto-scaler-spawned host.
+   *
+   * Fan-out targets DECLARED fleet members. An auto-scaler agent is spawned to
+   * a pool's fixed shape, so a child pinned to one runs at that shape rather
+   * than its own — the same defect the dispatcher's warm-pool suitability gate
+   * removes, on the path a pin deliberately leaves ungated.
+   *
+   * Separate from `findMatching` on purpose: `findMatching` also backs the
+   * SDK's `inventory.query`, where a host the caller asked for must never go
+   * missing (a selector returning FEWER hosts than no selector at all).
+   */
+  async findFanoutTargets(
+    include: readonly (readonly LabelMatcher[])[],
+    exclude: readonly LabelMatcher[],
+    graceMs: number,
+  ): Promise<MatchedHost[]> {
+    return this.matchRows(include, exclude, graceMs, true);
+  }
+
+  /**
+   * Shared row loop behind {@link findMatching} and {@link findFanoutTargets}.
+   * `excludeScalerManaged` stays private to the store — each public method
+   * names its own semantics, so a call site cannot silently pick the wrong
+   * population by passing a bare boolean.
+   */
+  private async matchRows(
+    include: readonly (readonly LabelMatcher[])[],
+    exclude: readonly LabelMatcher[],
+    graceMs: number,
+    excludeScalerManaged: boolean,
+  ): Promise<MatchedHost[]> {
     const rows = await this.db.selectFrom('host_roster').selectAll().execute();
     const now = Date.now();
     const out: MatchedHost[] = [];
     for (const row of rows) {
+      if (excludeScalerManaged && row.scaler_managed) continue;
       const labels: string[] = JSON.parse(row.labels);
       const set = new Set(labels);
       if (exclude.some((e) => matcherSatisfiedBy(e, set))) continue;

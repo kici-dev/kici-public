@@ -37,6 +37,7 @@ interface GlobalWorkflowSettings {
   deniedRepos: RepoPatternEntry[] | null;
   elevatedRepos: RepoPatternEntry[] | null;
   allowHttpNpmRegistries: boolean;
+  allowUntrustedDockerfileBuilds: boolean;
   userCacheQuotaBytes: number | null;
   userCacheTtlMs: number | null;
   artifactQuotaBytes: number | null;
@@ -71,6 +72,7 @@ interface PatchBody {
   deniedRepos?: RepoPatternEntry[] | null;
   elevatedRepos?: RepoPatternEntry[] | null;
   allowHttpNpmRegistries?: boolean;
+  allowUntrustedDockerfileBuilds?: boolean;
   userCacheQuotaBytes?: number | null;
   userCacheTtlMs?: number | null;
   artifactQuotaBytes?: number | null;
@@ -109,6 +111,7 @@ function formatSettings(s: GlobalWorkflowSettings, format: string): string {
     `Elevated authors:      ${s.elevatedRepos === null ? '(none)' : formatList(s.elevatedRepos)}`,
   );
   lines.push(`Allow http registries: ${s.allowHttpNpmRegistries}`);
+  lines.push(`Allow untrusted dockerfile builds: ${s.allowUntrustedDockerfileBuilds}`);
   lines.push(
     `User-cache quota:      ${s.userCacheQuotaBytes === null ? '(cluster default)' : `${s.userCacheQuotaBytes} bytes`}`,
   );
@@ -261,6 +264,39 @@ export function registerOrgSettingsCommands(
         const settings = await patchSettings(getClient(), {
           customerId,
           allowHttpNpmRegistries: allow,
+        });
+        console.log(formatSettings(settings, opts.format));
+      } catch (err) {
+        console.error(`Error: ${toErrorMessage(err)}`);
+        process.exit(1);
+      }
+    });
+
+  // ── allow-untrusted-dockerfile-builds ────────────────────────────
+  // A job may build its container image from a Dockerfile in the repo. That
+  // build runs on the agent host OUTSIDE the job's hardened sandbox, so an
+  // untrusted ref (a fork PR) is refused unless the operator opts in here.
+  orgSettings
+    .command('allow-untrusted-dockerfile-builds <value>')
+    .description(
+      "Permit an untrusted ref (fork PR) to build a job's container image from a " +
+        'Dockerfile. Default false. The build is NOT sandboxed — it runs arbitrary ' +
+        "RUN commands on the agent host's container daemon.",
+    )
+    .option('--customer-id <id>', 'Customer / org id (alias: --org)')
+    .option('--org <id>', 'Alias for --customer-id')
+    .option('--format <format>', 'Output format: json|table', 'table')
+    .action(async (value: string, opts: { customerId?: string; org?: string; format: string }) => {
+      const allow = value === 'true' ? true : value === 'false' ? false : undefined;
+      if (allow === undefined) {
+        console.error('Error: value must be "true" or "false"');
+        process.exit(1);
+      }
+      const customerId = resolveCustomerId(opts);
+      try {
+        const settings = await patchSettings(getClient(), {
+          customerId,
+          allowUntrustedDockerfileBuilds: allow,
         });
         console.log(formatSettings(settings, opts.format));
       } catch (err) {

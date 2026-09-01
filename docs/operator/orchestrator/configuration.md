@@ -18,16 +18,16 @@ The orchestrator resolves its configuration from four sources, in order of prece
 
 This means an environment variable always overrides the same setting from YAML or DB. The YAML file overrides the shared DB config. And the shared DB config overrides built-in defaults.
 
-The configuration source of truth is `packages/orchestrator/src/config/schema.ts`.
+Two source files define the configuration surface, and which one answers your question depends on the shape of the setting. `packages/orchestrator/src/config/schema.ts` holds the YAML / shared-DB layers and the merged schema the two-phase bootstrap validates — go there for anything with a nested config path (`queue.maxDepth`, `cluster.role`, `storage.bucket`). `packages/orchestrator/src/config.ts` holds the flat runtime schema behind `loadConfig()`, which is where the env-var-only knobs live (the `KICI_INGEST_*` admission controls, `KICI_DB_POOL_*`, the reroute and global-eval timings). The [env var reference](#environment-variable-reference-orchestrator-specific) below is generated from the latter, so it is the authoritative list of names and defaults.
 
-## Two-Phase Bootstrap
+## Two-phase bootstrap
 
 The orchestrator loads configuration in two phases to avoid a circular dependency (you need the database URL to connect to the DB, but the DB stores shared config):
 
 1. **Phase 1 (local-only):** Load `orchestrator.yaml` + KICI\_ env vars to get `database.url`, `instance.id`, `server.port`, and `instance.mode`. This is enough to start the process and connect to PostgreSQL.
 2. **Phase 2 (full merge):** Query the shared config from the `config_versions` table, merge all four layers (env > YAML > DB > defaults), and validate with the full `appConfigSchema`.
 
-## Local Config File
+## Local config file
 
 The local config file contains per-orchestrator-instance settings that are never shared across orchestrators. By default, the orchestrator looks for the file at `/etc/kici/orchestrator.yaml`. Override this with:
 
@@ -36,7 +36,7 @@ The local config file contains per-orchestrator-instance settings that are never
 
 If no file is found and no explicit path was given, the orchestrator runs in env-only mode (YAML is optional).
 
-### Full Annotated Example
+### Full annotated example
 
 ```yaml
 # /etc/kici/orchestrator.yaml
@@ -95,7 +95,7 @@ scaler:
   configDir: '/etc/kici/scalers.d/'
 ```
 
-### Local Config Fields
+### Local config fields
 
 | Field                | Type   | Default         | Description                                                     |
 | -------------------- | ------ | --------------- | --------------------------------------------------------------- |
@@ -109,7 +109,7 @@ scaler:
 | `scaler.configPath`  | string | --              | Path to `scalers.yaml`                                          |
 | `scaler.configDir`   | string | --              | Path to `scalers.d/` directory                                  |
 
-## Environment Variable Overrides
+## Environment variable overrides
 
 Every config field can be overridden by a `KICI_`-prefixed environment variable. The mapping uses underscore-separated uppercase paths:
 
@@ -255,16 +255,22 @@ variables, with type/default/required metadata generated from the config schema:
 | `KICI_REROUTE_SPAWN_WINDOW_MS`                         | no       | 90000                     | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_ROSTER_GRACE_MS`                                 | no       | 300000                    | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_ROSTER_TTL_MS`                                   | no       | 1800000                   | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_CLAIM_RETENTION_MS`                       | no       | 3600000                   | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SCALER_CONFIG_DIR`                               | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SCALER_CONFIG_PATH`                              | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SCALER_PENDING_SWEEP_INTERVAL_MS`                | no       | 10000                     | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_PROVISION_BACKOFF_BASE_MS`                | no       | 30000                     | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_PROVISION_BACKOFF_MAX_MS`                 | no       | 900000                    | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_PROVISION_MAX_CONSECUTIVE_FAILURES`       | no       | 5                         | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_REAP_INTERVAL_MS`                         | no       | 60000                     | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_REAP_REATTEMPT_INTERVAL_MS`               | no       | 600000                    | number                                       |         |                                                                                                                                                                                                                                             |
+| `KICI_SCALER_REAP_STRANDED_TIMEOUT_MS`                 | no       | 1800000                   | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SCALER_SPAWN_TIMEOUT_MS`                         | no       | 300000                    | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SECRET_KEY`                                      | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SECRET_KEY_FILE`                                 | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SECRET_KEY_FILE_OLD`                             | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SECRET_KEY_OLD`                                  | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_SERVER_TLS_CERT_PATH`                            | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_SKIP_S3_SENTINEL_VALIDATION`                     | no       | "false"                   | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_STALE_DETECTOR_SCAN_INTERVAL_MS`                 | no       | 60000                     | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_STALE_DETECTOR_THRESHOLD_MULTIPLIER`             | no       | 2                         | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_STEP_LOG_TTL_DAYS`                               | no       | 90                        | number                                       |         |                                                                                                                                                                                                                                             |
@@ -280,12 +286,6 @@ variables, with type/default/required metadata generated from the config schema:
 | `KICI_STORAGE_REGION`                                  | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_STORAGE_TYPE`                                    | no       |                           | enum:s3\|filesystem                          |         |                                                                                                                                                                                                                                             |
 | `KICI_STORAGE_UPLOAD_ENDPOINT`                         | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_EVENT_FAIL_FIRST_N`                         | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_MINT_DEFER_AUDIENCE`                        | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_MINT_REJECT_AUDIENCE`                       | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_MODE`                                       | no       | "0"                       | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES`               | no       |                           | string                                       |         |                                                                                                                                                                                                                                             |
-| `KICI_TEST_RERUN_DELAY_MS`                             | no       |                           | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_UNROUTABLE_GRACE_MS`                             | no       | 120000                    | number                                       |         |                                                                                                                                                                                                                                             |
 | `KICI_USER_CACHE_QUOTA_BYTES`                          | no       | 5368709120                | number                                       |         | Cluster-wide default per-org byte quota for the user-facing cache (ctx.cache). A per-org override in org_settings.user_cache_quota_bytes (set via `kici-admin org-settings user-cache set-quota`) takes precedence when present.            |
 | `KICI_USER_CACHE_TTL_MS`                               | no       | 604800000                 | number                                       |         | Cluster-wide default per-entry TTL (ms) for the user-facing cache. A per-org override in org_settings.user_cache_ttl_ms (set via `kici-admin org-settings user-cache set-ttl`) takes precedence when present.                               |
@@ -299,7 +299,7 @@ variables, with type/default/required metadata generated from the config schema:
 
 <!-- END GENERATED: orchestrator-env -->
 
-### Direct Mappings
+### Direct mappings
 
 | Env Var                                                | Config Path                                 | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------------------------------------------------ | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -368,27 +368,15 @@ variables, with type/default/required metadata generated from the config schema:
 | `KICI_LOG_LEVEL`                                       | `logLevel`                                  | Default: `info`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `KICI_NODE_ENV`                                        | `nodeEnv`                                   | Default: `development`                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-### Multi-App GitHub Provider Env Vars
+### GitHub App credentials are not env vars
 
-For multi-provider setups, env vars use the app name from the config (hyphen to underscore, uppercased):
+GitHub App credentials — app id, private key, webhook secret — are **not** orchestrator config fields. They live in the `sources` table, encrypted at rest, and you manage them with `kici-admin source add github` (see [multi-provider setup](#multi-provider-setup) below). Neither the local YAML schema nor the shared DB schema declares a `providers` section, so there is no config path for a `KICI_PROVIDERS_GITHUB_*` env var to reach.
 
-```
-KICI_PROVIDERS_GITHUB_<APP_NAME>_<FIELD>
-```
-
-| Env Var Pattern                               | Config Path                            | Example                                                   |
-| --------------------------------------------- | -------------------------------------- | --------------------------------------------------------- |
-| `KICI_PROVIDERS_GITHUB_<NAME>_APP_ID`         | `providers.github[name].appId`         | `KICI_PROVIDERS_GITHUB_MAIN_ORG_APP_ID=12345`             |
-| `KICI_PROVIDERS_GITHUB_<NAME>_PRIVATE_KEY`    | `providers.github[name].privateKey`    | `KICI_PROVIDERS_GITHUB_MAIN_ORG_PRIVATE_KEY=...`          |
-| `KICI_PROVIDERS_GITHUB_<NAME>_WEBHOOK_SECRET` | `providers.github[name].webhookSecret` | `KICI_PROVIDERS_GITHUB_MAIN_ORG_WEBHOOK_SECRET=whsec_...` |
-
-App name conversion: YAML `main-org` becomes env var segment `MAIN_ORG` (hyphen to underscore, uppercased).
-
-If an env var references an app name that does not exist in the config, a stub app entry is created automatically.
+Such a var left in an env file is not silently ignored. `KICI_PROVIDERS_GITHUB_<NAME>_APP_ID` (or `_PRIVATE_KEY` / `_WEBHOOK_SECRET`) is an unknown `KICI_*` var, so the typo catcher **refuses to start the orchestrator** and names it in the error. Set `KICI_DEV=true` to downgrade that to a warning. Move the credentials into a source with `kici-admin source add github`, then delete the env vars.
 
 **Important:** Legacy provider-specific env vars without the `KICI_` prefix (e.g., `PROVIDERS_GITHUB_APP_ID`, `PROVIDERS_GITHUB_PRIVATE_KEY`, `GITHUB_APP_ID`) are **not recognized**. Only `NODE_ENV` is still honored as a low-priority unprefixed fallback; every other config field requires its `KICI_`-prefixed env var name.
 
-## Config Resolution Precedence
+## Config resolution precedence
 
 The full resolution chain is: **env var > local YAML > shared DB > defaults**.
 
@@ -487,7 +475,7 @@ The orchestrator exposes admission-control state on its Prometheus `/metrics` en
 
 The durable overflow buffer adds four series: `kici_orch_ingest_overflow_buffered` (gauge — current buffered-row depth awaiting replay), `kici_orch_ingest_overflow_captured_total` (deliveries captured into the buffer), `kici_orch_ingest_overflow_replayed_total` (deliveries successfully replayed), and `kici_orch_ingest_overflow_dropped_total{reason}` (deliveries permanently dropped, `reason` being `cap_full` when the buffer was at its cap or `max_attempts` when replay exhausted its retries).
 
-## Multi-Provider Setup
+## Multi-provider setup
 
 The orchestrator supports multiple webhook sources simultaneously — GitHub App sources and generic webhook sources alike. Each is managed as a **webhook source** via the `kici-admin source` commands (not through config YAML or `config seed`).
 
@@ -522,9 +510,9 @@ Every webhook source — GitHub Apps, generic webhooks, internal sources — is 
 
 The `generic_webhook_sources` table has no `port` column, and `kici-admin source add ...` exposes no `--port` flag — there is intentionally no way to give one source its own listener while another stays on `KICI_PORT`. If you want different upstream URLs per source (different hostnames, different TLS certs, different ingress paths), terminate that distinction at your reverse proxy / load balancer and forward all of them to the orchestrator's single port. The same `KICI_BASE_PATH` reverse-proxy pattern documented in [getting-started](getting-started.md#reverse-proxy-setup) is the supported way to host the orchestrator behind a custom URL prefix.
 
-### Runtime env var overrides
+### Source credentials are not env-configurable
 
-The `KICI_PROVIDERS_GITHUB_<NAME>_<FIELD>` env vars (documented in the env var table above) can still inject provider fields into the runtime config object, but the primary mechanism for managing sources is `kici-admin source add`.
+`kici-admin source add` is the only mechanism for managing source credentials. There is no env-var override for a source's app id, private key, or webhook secret — see [GitHub App credentials are not env vars](#github-app-credentials-are-not-env-vars) above.
 
 ## Storage configuration
 
@@ -544,11 +532,11 @@ The orchestrator reports how it was deployed so the dashboard's infrastructure p
 | `KICI_DEPLOY_CONTAINER`         | the container name                               | container (compose) deployments only  |
 | `KICI_DEPLOY_CONTAINER_RUNTIME` | `podman` \| `docker`                             | container (compose) deployments only  |
 
-**You normally don't set these by hand.** `kici-admin orchestrator install` writes them into the orchestrator's env file automatically based on the deployment shape it just created — a systemd / launchd / Windows-service install writes `KICI_DEPLOY_MODE` alone; a container (compose) install also writes the container name and runtime so the dashboard can render the `<runtime> exec <container> kici-admin …` form. A hand-run orchestrator (no installer) reports an `unknown` shape, and the dashboard falls back to a bare `kici-admin` command plus a note to set `KICI_ADMIN_URL` / `KICI_ADMIN_TOKEN`. The values follow the project-wide `KICI_`-prefix convention; the orchestrator reads them directly at startup and they are exempt from the unknown-env-var typo catcher. Surrounding whitespace is ignored on all three, so a hand-edited env file that leaves a stray space or a trailing newline on a value still reports the right shape. Any other unrecognized `KICI_DEPLOY_MODE` value reports an `unknown` shape; an unrecognized container runtime is simply omitted, leaving the mode intact.
+**You normally don't set these by hand.** `kici-admin orchestrator install` writes them into the orchestrator's env file automatically based on the deployment shape it just created. A systemd / launchd / Windows-service install writes `KICI_DEPLOY_MODE` alone; a container (compose) install also writes the container name and runtime so the dashboard can render the `<runtime> exec <container> kici-admin …` form. A hand-run orchestrator (no installer) reports an `unknown` shape, and the dashboard falls back to a bare `kici-admin` command plus a note to set `KICI_ADMIN_URL` / `KICI_ADMIN_TOKEN`. The values follow the project-wide `KICI_`-prefix convention; the orchestrator reads them directly at startup and they are exempt from the unknown-env-var typo catcher. Surrounding whitespace is ignored on all three, so a hand-edited env file that leaves a stray space or a trailing newline on a value still reports the right shape. Any other unrecognized `KICI_DEPLOY_MODE` value reports an `unknown` shape; an unrecognized container runtime is omitted, leaving the mode intact.
 
-## Sensitive Values
+## Sensitive values
 
-### Master Key
+### Master key
 
 Secrets stored in the shared DB config (private keys, tokens, webhook secrets) are encrypted at rest using AES-256-GCM. The encryption key is derived from a master key that must be available on every orchestrator instance.
 
@@ -559,7 +547,7 @@ Set the master key via:
 
 The master key is the minimum bootstrap secret -- the only secret that must be distributed out-of-band to each orchestrator. All other secrets can then be stored encrypted in the database.
 
-### How Encryption Works
+### How encryption works
 
 When you seed config to the database (`kici-admin config seed`), the following fields are automatically encrypted before storage:
 
@@ -574,7 +562,7 @@ Each encrypted field uses a path-specific AAD (Additional Authenticated Data) in
 
 When you query config via the admin API or CLI (`kici-admin config get`), sensitive values in the response are redacted as `***REDACTED***`.
 
-## Scaler Config
+## Scaler config
 
 The auto-scaler configuration (`scalers.yaml`) remains a separate file, not part of the YAML/DB config system. It is referenced from the local config via `scaler.configPath` and `scaler.configDir`.
 
@@ -582,7 +570,7 @@ When SIGHUP is sent to the orchestrator, both the orchestrator config and the sc
 
 ## Validation
 
-### Startup Validation
+### Startup validation
 
 On startup, the orchestrator validates the merged config against `appConfigSchema` (Zod). If validation fails, the service prints all errors and exits:
 
@@ -592,7 +580,7 @@ Configuration validation failed:
   - platformToken: platformToken is required when mode is platform/hybrid/observed
 ```
 
-### Cross-Field Validation Rules
+### Cross-field validation rules
 
 - **Worker mode requires a coordinator URL:** If `cluster.role` is `worker`, either `cluster.coordinatorUrl` or the env-only multi-coordinator list `KICI_CLUSTER_COORDINATOR_URLS` (comma-separated; takes precedence over the singular form when both are set) must be present
 - **Coordinator mode requires database:** `databaseUrl` is required when `cluster.role` is `coordinator` (the default). Workers do not need a database connection.
@@ -601,8 +589,13 @@ Configuration validation failed:
 - **Cluster peers require address:** If `cluster.peers` is set, `cluster.address` is required
 - **S3 storage requires bucket:** If `storage.type` is `s3`, `storage.bucket` is required
 - **Filesystem storage requires an absolute path:** If `KICI_STORAGE_TYPE` is `filesystem`, `KICI_STORAGE_FS_PATH` must be set to an absolute path (see [storage layout](storage-layout.md) for the filesystem backend)
+- **Provision backoff ceiling must not sit below the base:** `KICI_SCALER_PROVISION_BACKOFF_MAX_MS` must be at least `KICI_SCALER_PROVISION_BACKOFF_BASE_MS`. The external-provision backoff is `min(base * 2^(n-1), ceiling)`, so a ceiling below the base collapses it to a constant from the first failure. The cluster-settings admin route rejects the same pair with a `400`, so the env path and the cluster-settings path cannot disagree about what is valid
 
-### Offline Validation
+### Packaging scope skips the runtime rules
+
+`kici-admin agent package` builds an agent payload from the object-storage config alone, so it validates in **packaging scope**: only the S3-bucket rule, the filesystem-path rule, and the cluster address-when-peers rule apply. The coordinator database URL, the worker coordinator URL, the Platform connection, and the observed-mode public URL are not required. This is deliberate — the operator shell that produces a build artifact does not carry the running orchestrator's runtime env, and demanding it would block packaging for no benefit. The boot-time unknown-`KICI_*` typo check is skipped in this scope for the same reason: an arbitrary operator shell may carry unrelated `KICI_*` vars.
+
+### Offline validation
 
 Validate a YAML file without contacting the orchestrator:
 
@@ -611,13 +604,13 @@ kici-admin config validate --file orchestrator.yaml --type local --offline
 kici-admin config validate --file shared-config.yaml --type shared --offline
 ```
 
-## Instance Identity
+## Instance identity
 
 Each orchestrator instance generates a unique `instanceId` at startup using a random UUID (e.g., `f47ac10b-58cc-4372-a567-0e02b2c3d479`). Override with `instance.id` in YAML or `KICI_INSTANCE_ID` env var.
 
-## Example Configurations
+## Example configurations
 
-### Platform Mode (Single App)
+### Platform mode (single app)
 
 **orchestrator.yaml:**
 
@@ -643,7 +636,7 @@ KICI_SECRET_KEY=<64-char-hex-master-key>
 KICI_BOOTSTRAP_ADMIN_TOKEN=<admin-token>
 ```
 
-### Independent Mode (No Platform)
+### Independent mode (no Platform)
 
 **orchestrator.yaml:**
 
@@ -656,7 +649,7 @@ server:
   port: 4000
 ```
 
-### Observed Mode (own ingress, hosted observability)
+### Observed mode (own ingress, hosted observability)
 
 Webhooks are posted straight to the orchestrator's own public URL and never
 transit KiCI, but the orchestrator keeps its Platform connection so runs, jobs,
@@ -688,7 +681,7 @@ sources are refused (both at startup and by `kici-admin source add`) because the
 are ingested through the Platform relay; use a generic or local source, or switch
 to `hybrid` if you want the relay.
 
-### Multi-App Hybrid Mode
+### Multi-app hybrid mode
 
 **orchestrator.yaml:**
 
@@ -711,9 +704,9 @@ storage:
   bucket: 'kici-cache'
 ```
 
-Provider credentials (GitHub App private keys, webhook secrets) are not part of the shared config schema. Manage them with `kici-admin source add` instead — see [Multi-Provider Setup](#multi-provider-setup).
+Provider credentials (GitHub App private keys, webhook secrets) are not part of the shared config schema. Manage them with `kici-admin source add` instead — see [Multi-provider setup](#multi-provider-setup).
 
-## Entry Points
+## Entry points
 
 | Mode / Role             | Entry Point           | CMD Override Needed                                  |
 | ----------------------- | --------------------- | ---------------------------------------------------- |
@@ -723,10 +716,10 @@ Provider credentials (GitHub App private keys, webhook secrets) are not part of 
 | `independent`           | `standalone.js`       | Yes: `node packages/orchestrator/dist/standalone.js` |
 | `cluster.role = worker` | `server.js` (default) | No (workers bypass mode check, work from any entry)  |
 
-## See Also
+## See also
 
-- [Config Management Guide](config-management.md) -- shared config lifecycle: seed, CLI, reload, rollback
-- [Orchestrator Getting Started](getting-started.md) -- deployment guide
+- [Config management guide](config-management.md) -- shared config lifecycle: seed, CLI, reload, rollback
+- [Orchestrator getting started](getting-started.md) -- deployment guide
 - [Auto-scaler configuration](auto-scaler.md) -- scaler YAML schema
-- [Agent Configuration](../agent/configuration.md) -- agent env vars
-- [Configuration Architecture](../../architecture/configuration.md) -- design deep-dive
+- [Agent configuration](../agent/configuration.md) -- agent env vars
+- [Configuration architecture](../../architecture/configuration.md) -- design deep-dive

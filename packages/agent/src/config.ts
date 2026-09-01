@@ -7,10 +7,15 @@ import {
   parseHostPropertyAssignments,
   validateNoReservedLabels,
 } from '@kici-dev/engine';
+import { ContainerBuildCli } from './execution/image-build/build-engine.js';
 
 /** Execution mode for the agent's sandbox backend. Mirrors the runtime enum. */
 export const ExecutionMode = z.enum(['container', 'bare-metal', 'firecracker']);
 export type ExecutionMode = z.infer<typeof ExecutionMode>;
+
+/** When the operator between-jobs reset command runs. */
+export const BetweenJobsRunOn = z.enum(['always', 'on-failure']);
+export type BetweenJobsRunOn = z.infer<typeof BetweenJobsRunOn>;
 
 const configSchema = z.object({
   orchestratorUrl: z.string().url().min(1, 'KICI_ORCHESTRATOR_URL is required'),
@@ -153,6 +158,47 @@ const configSchema = z.object({
     .string()
     .optional()
     .transform((s) => s === '1'),
+  // Set by the scaler when it spawned this agent FROM the job's own container
+  // image. Such an agent is already inside the image the job asked for, so it
+  // must run steps directly rather than nesting a second container from the
+  // same image — which would need a runtime inside a runtime and fail.
+  jobImageAgent: z
+    .string()
+    .optional()
+    .transform((s) => s === '1'),
+  // Where the KiCI runtime comes from when this agent NESTS a job container.
+  //
+  // A job may name any image, and that image is no more likely to ship Node
+  // than one a scaler spawns — so the agent injects the same pinned,
+  // glibc-2.17 Node the published agent image carries. It needs an image to
+  // copy that tree out of: a bind mount needs a host path, and the agent may
+  // itself be containerized, so it materializes the tree into a named volume
+  // exactly as the scaler does.
+  //
+  // Set automatically on every agent a scaler spawns (to the pool's own agent
+  // image, which is by construction present on that host). An operator running
+  // an agent by hand sets it to the kici-agent image matching their agent.
+  // Unset means no injection: the job container falls back to the image's own
+  // `node`, which is the historical contract and still correct for an image
+  // that ships one.
+  runtimeImage: z.string().optional(),
+  // Pre-provisioned Node tree to inject instead of materializing one — a host
+  // directory whose `bin/node` is the runtime, or the name of a volume holding
+  // it. Wins over runtimeImage. For a host that provisions the tree out of band
+  // (an air-gapped fleet with no agent image to pull).
+  runtimeNodeSource: z.string().optional(),
+  // Which build CLI runs a job's `container.dockerfile`. Unset auto-detects,
+  // preferring docker. Set it explicitly on a host that has both CLIs and whose
+  // container runtime is the other one — the build and the job container have to
+  // land on the same daemon, or the sandbox starts on a daemon that has never
+  // seen the image.
+  containerBuildCli: ContainerBuildCli.optional(),
+  // Self-bootstrap: a single-use claim code the agent exchanges for its own
+  // ephemeral credentials (scaler.claim-credentials) before registering. Set by
+  // an event-scaler provisioning path (e.g. a GitHub Actions runner) so the real
+  // token never transits the provisioning channel. Ignored when a static
+  // KICI_AGENT_TOKEN is present.
+  scalerClaimCode: z.string().optional(),
   scalerIdleTimeoutMs: z.coerce.number().default(5_000),
   scalerPendingDispatchTimeoutMs: z.coerce.number().default(60_000),
   // Explicit execution-mode override. Optional — when unset, the runner picks
@@ -172,6 +218,31 @@ const configSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === 'true'),
+  // Operator-supplied host-reset command run between jobs on a reused agent
+  // (unset = disabled). Runs in the supervisor after the job's process tree is
+  // reaped and its workdir removed. Meaningful on host-sharing backends
+  // (bare-metal / in-place); a no-op elsewhere. Fail-open: a failure never
+  // crashes the agent and never changes the finished job's result.
+  betweenJobsResetCommand: z.string().optional(),
+  // Timeout for the between-jobs reset command. Default 60s.
+  betweenJobsResetTimeoutMs: z.coerce.number().int().positive().default(60_000),
+  // When the reset command runs: 'always' (default) or only 'on-failure'.
+  betweenJobsResetRunOn: BetweenJobsRunOn.default('always'),
+  // Master switch for bare-metal process-group reaping of a finished job's
+  // descendant tree. Default on. 'false' restores the single-child-signal
+  // behavior — an escape hatch for a workload that legitimately backgrounds a
+  // daemon meant to outlive the job.
+  orphanCleanup: z
+    .string()
+    .default('true')
+    .transform((s) => s !== 'false'),
+  // Opt-in: drain the agent (stop accepting new jobs) after repeated
+  // consecutive between-jobs reset failures, so a persistently dirty host stops
+  // taking work. Default off.
+  drainOnResetFailure: z
+    .string()
+    .default('false')
+    .transform((s) => s === 'true'),
 });
 
 /**
@@ -219,11 +290,21 @@ export const envDef = defineEnv({
     sandboxMemoryBytes: 'KICI_SANDBOX_MEMORY_BYTES',
     sandboxNanoCpus: 'KICI_SANDBOX_NANO_CPUS',
     scalerManaged: 'KICI_SCALER_MANAGED',
+    jobImageAgent: 'KICI_JOB_IMAGE_AGENT',
+    runtimeImage: 'KICI_RUNTIME_IMAGE',
+    runtimeNodeSource: 'KICI_RUNTIME_NODE_SOURCE',
+    containerBuildCli: 'KICI_CONTAINER_BUILD_CLI',
+    scalerClaimCode: 'KICI_SCALER_CLAIM_CODE',
     scalerIdleTimeoutMs: 'KICI_SCALER_IDLE_TIMEOUT',
     scalerPendingDispatchTimeoutMs: 'KICI_SCALER_PENDING_DISPATCH_TIMEOUT',
     executionMode: 'KICI_EXECUTION_MODE',
     otelExporterOtlpEndpoint: 'OTEL_EXPORTER_OTLP_ENDPOINT',
     concurrencyWaitTimeoutMs: 'KICI_CONCURRENCY_WAIT_TIMEOUT_MS',
+    betweenJobsResetCommand: 'KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND',
+    betweenJobsResetTimeoutMs: 'KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS',
+    betweenJobsResetRunOn: 'KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON',
+    orphanCleanup: 'KICI_AGENT_ORPHAN_CLEANUP',
+    drainOnResetFailure: 'KICI_AGENT_DRAIN_ON_RESET_FAILURE',
   },
 });
 
@@ -256,10 +337,16 @@ export const envDef = defineEnv({
  * - KICI_SANDBOX_MEMORY_BYTES (default: 2 GiB) — memory cap in bytes for the job container cgroup
  * - KICI_SANDBOX_NANO_CPUS (default: 2 CPUs) — CPU cap in nano-CPUs for the job container cgroup
  * - KICI_SCALER_MANAGED (set to "1" by the orchestrator's auto-scaler — agent self-shuts down on idle)
+ * - KICI_SCALER_CLAIM_CODE (optional single-use claim code the agent exchanges for its own ephemeral credentials before registering; ignored when KICI_AGENT_TOKEN is set)
  * - KICI_SCALER_IDLE_TIMEOUT (ms, default 5000) — how long a scaler-managed agent waits before shutdown after going idle
  * - KICI_SCALER_PENDING_DISPATCH_TIMEOUT (ms, default 60000) — extended idle window when register.ack signals a queued bound job
  * - KICI_EXECUTION_MODE (optional, options: container | bare-metal | firecracker) — override the runner's mode-pick logic
  * - KICI_CONCURRENCY_WAIT_TIMEOUT_MS (default: 3_600_000) — workflow-runner timeout when long-polling for a slot-release follow-up `concurrency.ack`
+ * - KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND (optional) — host-reset command run between jobs on a reused agent (fail-open)
+ * - KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS (default: 60000) — reset command timeout
+ * - KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON (default: always, options: always | on-failure) — when the reset command runs
+ * - KICI_AGENT_ORPHAN_CLEANUP (default: true) — reap a finished job's leaked process tree (bare-metal); false = only signal the runner child
+ * - KICI_AGENT_DRAIN_ON_RESET_FAILURE (default: false) — drain the agent after repeated consecutive reset failures
  */
 export function loadConfig(): AppConfig {
   const data = envDef.parse();

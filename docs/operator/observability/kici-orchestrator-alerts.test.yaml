@@ -95,3 +95,170 @@ tests:
       - eval_time: 30m
         alertname: StateReplayBreakerOpen
         exp_alerts: []
+
+  # ScalerReapBlocked fires when the backstop stays off for 15m.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_reap_blocked'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: ScalerReapBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Event-scaler teardown backstop standing down (15m+)'
+              description: 'The provision reaper is connected to none of its known coordinator peers, so it has stopped sweeping. Provisions whose agent never registered will not be torn down until a peer returns. Their spawn rows keep counting against the cluster-wide maxAgents for that scaler, so the cap fills up while this fires and event autoscaling degrades toward a cluster-wide halt. If this is firing on two coordinators at once — or on one whose peer is also unreachable to your monitoring — treat it as a partition, not a dead node. Restore the link, and do NOT restart either coordinator or add a third: both resume sweeping on the reachable side and can tear down instances the other side is still running. See the event-scaler operator doc before acting.'
+
+  # ScalerReapBlocked does NOT fire while the backstop is sweeping (negative test).
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_reap_blocked'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: ScalerReapBlocked
+        exp_alerts: []
+
+  # ScalerProvisionsStuckUnseen fires once an absence outlives the stranded window.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_reap_unseen_provisions'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 46m
+        alertname: ScalerProvisionsStuckUnseen
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'Event-scaler provisions unseen past the stranded window (45m+)'
+              description: "One or more event-scaler provisions have had no registered agent for longer than the stranded window, without being torn down. Raise the `for` here if you tuned --scaler-reap-stranded-timeout-ms above 30m. Check for leader churn or a flapping peer link, which restart the absence clock. Search the orchestrator log for 'starting absence clock' to identify the agents."
+
+  # An absence that resolves inside the stranded window must NOT fire — that is
+  # the ordinary path where the reaper tears the provision down itself.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_reap_unseen_provisions'
+        values: '1x30 0x30'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: ScalerProvisionsStuckUnseen
+        exp_alerts: []
+
+  # ScalerCapCheckUnreachable fires when the cap check keeps failing for 15m.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_cap_lock_failures_total{reason="unreachable"}'
+        values: '0+1x25'
+    alert_rule_test:
+      - eval_time: 17m
+        alertname: ScalerCapCheckUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: unreachable
+            exp_annotations:
+              summary: 'Event-scaler cluster-wide cap check failing (15m+)'
+              description: 'The cluster-wide maxAgents check cannot reach the orchestrator database, so every event-scaler spawn is being refused and no new instances are being provisioned anywhere in the cluster. Jobs stay queued and are re-offered once the check recovers, so nothing is lost — but nothing scales up either. Check the orchestrator database and connection pool. A companion reason="contended" series is normal under load and is not alerted. See the event-scaler operator doc.'
+
+  # A short burst — a blip, or a rolling database restart — must NOT fire. It
+  # keeps the 10m window non-zero for about 11m, well short of the 15m `for`.
+  #
+  # 12m is the load-bearing eval: the expression is still TRUE there (the burst
+  # has not yet aged out of the 10m window), so a rule with a shorter `for`
+  # would be firing and only the 15m `for` keeps it quiet. Asserting solely at
+  # 25m, where the expression has gone false on its own, would pass against any
+  # `for` at all.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_cap_lock_failures_total{reason="unreachable"}'
+        values: '0+1x3 4x40'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: ScalerCapCheckUnreachable
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: ScalerCapCheckUnreachable
+        exp_alerts: []
+
+  # Contention on a healthy database must NOT page, however long it lasts —
+  # that is a capacity signal, and paging on it teaches operators to ignore the
+  # pack. Identical shape to the firing case, only the label differs.
+  - interval: 1m
+    input_series:
+      - series: 'kici_orch_scaler_cap_lock_failures_total{reason="contended"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ScalerCapCheckUnreachable
+        exp_alerts: []
+
+  # ExternalProvisioningFailing must fire on the cadence a real outage produces.
+  # A scaler that keeps failing is deferred by its own backoff between attempts,
+  # so the counter steps at that cadence rather than continuously: timeouts at
+  # 5, 10.5, 16.5, 23.5, 32.5, 45.5 and 65.5 minutes under the shipped defaults.
+  # `NxM` repeats the value M more times, so a run of K samples is written
+  # `Nx(K-1)`.
+  - interval: 30s
+    input_series:
+      - series: 'kici_orch_scaler_external_provision_timeout_total{scaler="github-actions"}'
+        values: '0x9 1x10 2x11 3x13 4x17 5x25 6x39 7x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: ExternalProvisioningFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scaler: github-actions
+            exp_annotations:
+              summary: 'External provisioning for scaler github-actions is failing (15m+)'
+              description: "At least two provisions this event scaler requested in the last hour were torn down because no agent registered, and the condition has held for at least 15 minutes. The scale-up events were delivered, so the provisioning workflow or the provider it drives is not returning a running agent. Jobs waiting on this scaler settle with the provisioning cause, and the scaler is backing off between attempts. Check your provider status and the provisioning workflow's own runs. See the event-scaler operator doc."
+
+  # A single transient timeout must NOT fire, anywhere in the hour the window
+  # spans. This series starts at zero inside the window, so `increase` does not
+  # extrapolate backwards and reports exactly 1.
+  - interval: 30s
+    input_series:
+      - series: 'kici_orch_scaler_external_provision_timeout_total{scaler="github-actions"}'
+        values: '0x4 1x160'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []
+
+  # The SAME single transient timeout on a scaler that has timed out before,
+  # which is the ordinary production shape and the one the case above cannot
+  # reach. The counter is already non-zero when the window opens, so `increase`
+  # extrapolates out to both window edges and reports ~1.01 for that one step.
+  # Under a `> 1` threshold this fires — one unlucky spawn pages the operator
+  # for an hour. `>= 2` is what holds it down, so this case fails on any
+  # threshold that accepts a single step.
+  - interval: 30s
+    input_series:
+      - series: 'kici_orch_scaler_external_provision_timeout_total{scaler="github-actions"}'
+        values: '5x9 6x200'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []
+
+  # A scaler that never times out must NOT fire.
+  - interval: 30s
+    input_series:
+      - series: 'kici_orch_scaler_external_provision_timeout_total{scaler="github-actions"}'
+        values: '0x160'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: ExternalProvisioningFailing
+        exp_alerts: []

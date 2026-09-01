@@ -101,33 +101,13 @@ function sanitizeConfig(raw: unknown): GlobalConfig {
  *
  * Resolution order:
  *   1. `KICI_CONFIG_DIR`, when set to a non-empty value.
- *   2. A hard refusal when `KICI_TEST_ISOLATION` is present. A developer
- *      machine's `~/.kici/config` names a real endpoint and carries a live
- *      PAT, so a test process that reads it authenticates against whatever
- *      that config points at — in practice, production. Every test that needs
- *      a config must name its own isolated directory.
- *   3. `~/.kici`.
+ *   2. `~/.kici`.
  *
- * `KICI_TEST_ISOLATION` is set by this repository's own vitest configs, via
- * `hack/lib/vitest-isolation.ts`. It is deliberately a KiCI-owned name rather
- * than the runner's `VITEST`: `kici` is a compat-protected CLI, and `VITEST`
- * is a third-party marker that propagates into spawned children, so keying off
- * it would break a customer whose vitest test shells out to `kici`.
- *
- * `env` is injectable so this module's own tests can exercise every branch.
- * It is NOT an opt-out: production call sites pass no argument and inherit the
- * guard.
+ * `env` is injectable so this module's own tests can exercise both branches.
  */
 export function getConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   if (env.KICI_CONFIG_DIR) {
     return env.KICI_CONFIG_DIR;
-  }
-  if (env.KICI_TEST_ISOLATION) {
-    throw new Error(
-      'Refusing to read the ambient ~/.kici config from a test process. ' +
-        'Set KICI_CONFIG_DIR to an isolated directory for this run — ' +
-        'the developer machine config may point at production.',
-    );
   }
   return path.join(os.homedir(), '.kici');
 }

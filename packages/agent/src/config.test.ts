@@ -407,6 +407,19 @@ describe('loadConfig', () => {
       expect(config.scalerPendingDispatchTimeoutMs).toBe(60000);
     });
 
+    it('parses KICI_SCALER_CLAIM_CODE into scalerClaimCode', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      process.env.KICI_SCALER_CLAIM_CODE = 'claim-abc';
+      const config = loadConfig();
+      expect(config.scalerClaimCode).toBe('claim-abc');
+    });
+
+    it('leaves scalerClaimCode undefined when KICI_SCALER_CLAIM_CODE unset', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      const config = loadConfig();
+      expect(config.scalerClaimCode).toBeUndefined();
+    });
+
     it('parses KICI_EXECUTION_MODE=container', () => {
       process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
       process.env.KICI_EXECUTION_MODE = 'container';
@@ -486,5 +499,49 @@ describe('agentClientConnectionOptions', () => {
     expect(opts.agentId).toBe('agent-1');
     expect(opts.labels).toEqual(['linux', 'container']);
     expect(opts.scalerManaged).toBe(true);
+  });
+});
+
+describe('between-jobs config', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('KICI_')) delete process.env[key];
+    }
+    process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+  });
+
+  it('defaults orphanCleanup on, drainOnResetFailure off, reset disabled', () => {
+    const c = loadConfig();
+    expect(c.orphanCleanup).toBe(true);
+    expect(c.drainOnResetFailure).toBe(false);
+    expect(c.betweenJobsResetCommand).toBeUndefined();
+    expect(c.betweenJobsResetTimeoutMs).toBe(60_000);
+    expect(c.betweenJobsResetRunOn).toBe('always');
+  });
+
+  it('parses configured reset command, timeout, run-on, and switches', () => {
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND = 'docker system prune -f';
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS = '90000';
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON = 'on-failure';
+    process.env.KICI_AGENT_ORPHAN_CLEANUP = 'false';
+    process.env.KICI_AGENT_DRAIN_ON_RESET_FAILURE = 'true';
+    const c = loadConfig();
+    expect(c.betweenJobsResetCommand).toBe('docker system prune -f');
+    expect(c.betweenJobsResetTimeoutMs).toBe(90_000);
+    expect(c.betweenJobsResetRunOn).toBe('on-failure');
+    expect(c.orphanCleanup).toBe(false);
+    expect(c.drainOnResetFailure).toBe(true);
+  });
+
+  it('does not trip validateUnknownKiciVars for the new vars', () => {
+    process.env.KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND = 'true';
+    expect(() => loadConfig()).not.toThrow();
   });
 });

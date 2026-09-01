@@ -37,10 +37,8 @@ export interface EventRouterConfig {
    * succeeds, and lands the row in the DLQ when N exceeds
    * `maxDispatchAttempts`.
    *
-   * Only honoured when `KICI_TEST_MODE=1` is set at config-load time —
-   * production deployments never see this knob even if the env var is
-   * planted by accident. Source the value from
-   * `KICI_TEST_EVENT_FAIL_FIRST_N` (a JSON object literal).
+   * Undefined in the shipped orchestrator: only the build-time test double
+   * supplies this map, via the injected fault-injection policy.
    */
   debugFailFirstNAttemptsByEvent?: Record<string, number>;
 }
@@ -75,50 +73,6 @@ export interface StoredEvent {
   nextRetryAt: Date | null;
   dlqAt: Date | null;
   dlqReason: DlqReason | null;
-}
-
-/**
- * Parse the `KICI_TEST_EVENT_FAIL_FIRST_N` JSON payload, gated by
- * `KICI_TEST_MODE`. Returns the parsed map or `undefined` when:
- *
- * - `testMode` is false (the master switch). The JSON value is ignored
- *   entirely; production deployments never see fault-injection even if
- *   the per-event env var is accidentally planted.
- * - the JSON value is absent / empty.
- * - the JSON value is malformed or carries a wrong-shape entry. We
- *   refuse to fall back to a partial map: a typo on one line silently
- *   skipping that test would be confusing in CI logs.
- *
- * The accepted shape is `{ "<eventName>": <number> }`; non-string keys
- * and non-number values are rejected. The numeric value is the inclusive
- * upper bound of attempts to fail (so `1` fails the first attempt and
- * succeeds on retry; `99` exceeds `maxDispatchAttempts` and lands the
- * row in the DLQ).
- */
-export function parseFaultInjectionMap(
-  testMode: boolean,
-  raw: string | undefined,
-): Record<string, number> | undefined {
-  if (!testMode) return undefined;
-  if (!raw || raw.trim() === '') return undefined;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return undefined;
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    return undefined;
-  }
-  const out: Record<string, number> = {};
-  for (const [key, value] of Object.entries(parsed)) {
-    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-      return undefined;
-    }
-    out[key] = value;
-  }
-  if (Object.keys(out).length === 0) return undefined;
-  return out;
 }
 
 /**

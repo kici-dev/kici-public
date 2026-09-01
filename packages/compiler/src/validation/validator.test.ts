@@ -253,3 +253,55 @@ describe('E124 approval on an organization-wide workflow', () => {
     expect(validateConfig([wrap(w, '/repo/.kici/workflows/ci.ts')]).valid).toBe(true);
   });
 });
+
+describe('invoke-gate validation', () => {
+  // Raw Job objects bypass the SDK factory guard so the validator's own
+  // defense-in-depth checks (a generated job could carry these shapes) are
+  // exercised directly.
+  function rawJob(overrides: Partial<Job> & { name: string }): Job {
+    return {
+      _tag: 'Job',
+      steps: [],
+      result: {} as never,
+      ...overrides,
+    } as unknown as Job;
+  }
+
+  it('accepts a valid invoke gate with no steps and no runsOn', () => {
+    const gate = rawJob({
+      name: 'repo-tests',
+      invoke: { _tag: 'InvokeSource', event: 'myorg.repo-tests', scope: 'source' } as any,
+    });
+    const w = workflow('ci', { jobs: [gate as any] });
+    expect(validateConfig([wrap(w)]).valid).toBe(true);
+  });
+
+  it('rejects invoke combined with steps', () => {
+    const bad = rawJob({
+      name: 'bad',
+      invoke: { _tag: 'InvokeSource', event: 'e', scope: 'source' } as any,
+      steps: [dummyStep],
+    });
+    const w = workflow('ci', { jobs: [bad as any] });
+    const result = validateConfig([wrap(w)]);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(
+        result.errors.some((e) => /mutually exclusive|cannot be combined/i.test(e.message)),
+      ).toBe(true);
+    }
+  });
+
+  it('rejects an empty invoke.event', () => {
+    const bad = rawJob({
+      name: 'bad',
+      invoke: { _tag: 'InvokeSource', event: '', scope: 'source' } as any,
+    });
+    const w = workflow('ci', { jobs: [bad as any] });
+    const result = validateConfig([wrap(w)]);
+    expect(result.valid).toBe(false);
+    if (!result.valid) {
+      expect(result.errors.some((e) => /event/i.test(e.message))).toBe(true);
+    }
+  });
+});

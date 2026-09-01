@@ -5,8 +5,10 @@
  * and the configuration layer depend on.
  */
 
+import { ImagePullPolicy } from '@kici-dev/shared/container-runtime';
 import { z } from 'zod';
 import { ScalerEventType } from '@kici-dev/engine';
+import type { ScaleDownReason } from './scaler-events.js';
 import type {
   ResourceRequest,
   ResourceSpec,
@@ -70,11 +72,40 @@ export interface EffectiveLimits {
  * select the exact container a trigger produced instead of guessing among
  * concurrent kici-managed containers. Absent for unbound spawns (warm pool).
  */
+/**
+ * A job's container spec with its registry credentials already resolved.
+ *
+ * The lock carries credential REFERENCES; this is what a runtime can actually
+ * pull with. Produced by `resolveContainerSpawn`, consumed by the container
+ * sandbox and by both spawning backends.
+ */
+export interface ResolvedContainerSpawn {
+  image: string;
+  authconfig?: { username: string; password: string; serveraddress: string };
+  env?: Record<string, string>;
+}
+
 export interface SpawnContext {
   /** Execution job id the spawn is bound to. */
   boundJobId?: string;
   /** Execution run id the bound job belongs to. */
   runId?: string;
+  /**
+   * The job's own container image plus resolved registry credentials, when the
+   * job declared one. Present means "spawn THIS image with the KiCI runtime
+   * injected" rather than the pool's fixed agent image.
+   */
+  container?: ResolvedContainerSpawn;
+  /**
+   * Plain platform-taint tokens (`windows`, `macos`, `arm64`) for the pool this
+   * spawn belongs to, derived by `ScalerManager` from the same resolved
+   * platform its taint gate uses. A backend forwards them to
+   * `scalerAgentLabels()` so the agent registers carrying the very tokens the
+   * gate demands — without them a tainted pool spawns agents no job can be
+   * dispatched to. A backend must never derive them itself: the manager is the
+   * single source, and computing them twice is the defect this field closes.
+   */
+  platformTaints?: readonly string[];
 }
 
 /**
@@ -96,9 +127,12 @@ export interface NetworkPolicy {
  * - `Always`: re-pull on every spawn. Set this on a label set that tracks a
  *   moving tag (e.g. `:latest`) or otherwise needs a fresh image each spawn.
  * - `Never`: never pull; fail if the image is absent.
+ *
+ * Defined alongside `pullImageIfMissing` in `@kici-dev/shared` — the agent
+ * pulls job images through the same helper — and re-exported here so the scaler
+ * config schema and every operator-facing value stay exactly where they were.
  */
-export const ImagePullPolicy = z.enum(['Always', 'IfNotPresent', 'Never']);
-export type ImagePullPolicy = z.infer<typeof ImagePullPolicy>;
+export { ImagePullPolicy };
 
 /**
  * Configuration for a single label-set mapping within a scaler backend.
@@ -198,6 +232,23 @@ export type ScalerRedispatchTrigger = z.infer<typeof ScalerRedispatchTrigger>;
 export type ValidationResult = { valid: true } | { valid: false; errors: string[] };
 
 /**
+ * Optional context passed to `ScalerBackend.destroy`. The event backend surfaces
+ * `reason` on its scale-down event; local backends ignore it.
+ */
+export interface ScalerDestroyContext {
+  /** Why the teardown was requested (idle, job-complete, drain, …). */
+  reason?: ScaleDownReason;
+  /**
+   * Where an event backend must deliver the teardown, overriding its live
+   * config. Set from the spawn record when the agent was adopted from another
+   * coordinator, so a teardown addresses the targets the provision was spawned
+   * with even if `provisioningTargets` has been edited since. Ignored by the
+   * local backends, which deliver nothing.
+   */
+  targets?: string[];
+}
+
+/**
  * Common interface for all scaler backends.
  * Each backend manages a specific pool of agents for specific label sets.
  * Designed to be pluggable -- Docker, bare-metal, and future K8s/VM backends
@@ -213,8 +264,11 @@ export interface ScalerBackend {
   /** Label sets this backend can provision */
   readonly labelSets: LabelSetConfig[];
 
-  /** Per-backend maximum agents */
-  readonly maxAgents: number;
+  /**
+   * Per-backend maximum agents. Updated by `reload` so a config change to
+   * `maxAgents` applies without an orchestrator restart.
+   */
+  maxAgents: number;
 
   /**
    * Whether this backend spawns its agents on the orchestrator's own host.
@@ -263,9 +317,47 @@ export interface ScalerBackend {
 
   /**
    * Destroy a specific managed agent.
-   * Docker: docker rm -f; Bare-metal: SIGTERM -> SIGKILL
+   * Docker: docker rm -f; Bare-metal: SIGTERM -> SIGKILL.
+   *
+   * @param context - Optional teardown context. The event backend carries
+   *   `reason` onto its `kici.scaler.scale-down` event so a teardown workflow
+   *   (and the timeline) can distinguish an idle reap from a job-complete
+   *   teardown or a spawn timeout. Local backends accept and ignore it.
    */
-  destroy(managedId: string): Promise<void>;
+  destroy(managedId: string, context?: ScalerDestroyContext): Promise<void>;
+
+  /**
+   * Reclaim the HOST-LOCAL compute of a managed agent this backend no longer
+   * tracks in memory, from whatever durable host state survived the loss.
+   *
+   * `destroy` is keyed off the in-memory agent map, so an orchestrator restart
+   * makes it a silent no-op while the VM or host process keeps running. This
+   * hook is the restart-surviving half: it reads the backend's own on-host
+   * artifacts for `managedId` and reclaims them.
+   *
+   * Two properties every implementation MUST hold:
+   *
+   * - **Host-local evidence only.** Reclaim nothing unless an artifact for
+   *   exactly this `managedId` exists on THIS host — that artifact is the proof
+   *   this backend spawned it. A coordinator must never be able to reach across
+   *   and reap a peer's compute.
+   * - **Caller supplies the orphan verdict.** The hook force-reclaims a *live*
+   *   instance, which is precisely what the liveness-driven orphan sweeps
+   *   refuse to do on their own. Only call it where the agent is known to be
+   *   unowned.
+   *
+   * Optional: a backend whose compute is not host-local — the event backend's
+   * customer cloud instance — cannot implement it at all. An implementation may
+   * also cover only part of its own backend, when the rest keeps nothing durable
+   * to read. Bare metal is that case: a container-mode agent carries
+   * `kici-agent-id` / `kici-scaler-name` labels on the host and is reclaimed,
+   * while a plain-process agent records its PID in the in-memory entry alone, so
+   * a restart loses it and the hook reports nothing to reclaim.
+   *
+   * @returns `true` when host-local state for `managedId` was found and
+   *   reclaimed, `false` when there was nothing here to reclaim.
+   */
+  reapUnowned?(managedId: string): Promise<boolean>;
 
   /**
    * Get the LogCapture for a managed agent (optional -- container and bare-metal backends
@@ -293,10 +385,24 @@ export interface ScalerBackend {
   ensureHostReady?(): Promise<void>;
 
   /**
-   * Reload configuration (called on SIGHUP).
-   * Returns validation errors if new config is invalid.
+   * Reload configuration (called on config reload / SIGHUP).
+   *
+   * `opts.maxAgents`, when present, replaces the population cap. `opts.entry`
+   * is the whole new config entry, for a backend that reads more than its
+   * label sets off it. On an invalid result NOTHING is applied.
    */
-  reload(labelSets: LabelSetConfig[]): ValidationResult;
+  reload(
+    labelSets: LabelSetConfig[],
+    opts?: { maxAgents?: number; entry?: ScalerEntry },
+  ): ValidationResult;
+
+  /**
+   * The config entry this backend is currently serving, for backends that hold
+   * one. Read by the reload rollback so a rejected reload can restore it
+   * alongside `labelSets` and `maxAgents`. Undefined for backends that keep no
+   * entry (container, bare-metal, Firecracker all read only their label sets).
+   */
+  readonly currentEntry?: ScalerEntry;
 }
 
 /**
@@ -468,6 +574,25 @@ export interface ScalerEntry {
    * binaries. Default false.
    */
   requireSudo?: boolean;
+
+  // ── Event-backend fields (meaningful only when `type: 'event'`) ──
+
+  /**
+   * Workflow refs (e.g. `org/infra`) the reserved scale-up / scale-down events
+   * are delivered to. The customer's provisioning / teardown workflows
+   * subscribe with `kiciEvent()`. Required for a `type: event` scaler.
+   */
+  provisioningTargets?: string[];
+  /**
+   * Seconds a pending provisioning claim code stays valid before it expires.
+   * @default 300
+   */
+  claimTtlSeconds?: number;
+  /**
+   * Seconds the ephemeral agent token minted for a claimed provision stays
+   * valid. @default 600
+   */
+  agentTokenTtlSeconds?: number;
 }
 
 /**

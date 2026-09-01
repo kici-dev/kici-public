@@ -44,6 +44,13 @@ function colorizeStatus(status: string): string {
 }
 
 /**
+ * Width of the table's Message column. A check message is cut at this many
+ * characters, so anything a check wants an operator to see in the default
+ * (non-`--json`) output has to fit inside it.
+ */
+export const DIAGNOSE_TABLE_MESSAGE_WIDTH = 42;
+
+/**
  * Format diagnostic results as a table.
  */
 function formatDiagnoseTable(response: DiagnoseResponse): string {
@@ -64,7 +71,9 @@ function formatDiagnoseTable(response: DiagnoseResponse): string {
   for (const check of response.checks) {
     const status = colorizeStatus(check.status.padEnd(5));
     const name = check.name.padEnd(24);
-    const message = check.message.substring(0, 42).padEnd(42);
+    const message = check.message
+      .substring(0, DIAGNOSE_TABLE_MESSAGE_WIDTH)
+      .padEnd(DIAGNOSE_TABLE_MESSAGE_WIDTH);
     const duration = `${check.durationMs}ms`;
     lines.push(`${status}  | ${name} | ${message} | ${duration}`);
   }

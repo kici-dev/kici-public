@@ -4,6 +4,7 @@ import {
   buildClusterPatch,
   buildClusterReset,
   checkVerifiedIssuerPublishes,
+  deprecatedKnobWarnings,
   registerClusterSettingsCommands,
   unpairedEvalTimeoutWarnings,
 } from './cluster-settings.js';
@@ -138,6 +139,44 @@ describe('unpairedEvalTimeoutWarnings', () => {
   });
 });
 
+describe('deprecatedKnobWarnings', () => {
+  it('warns that the contributor-cache TTL is inert', () => {
+    const lines = deprecatedKnobWarnings({ contributorCacheTtlMs: 900_000 });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('--contributor-cache-ttl-ms');
+    expect(lines[0]).toContain('inert');
+    expect(lines[0]).toContain('removed at v1.0.0');
+  });
+
+  it('says nothing for a live knob or for an empty patch', () => {
+    expect(deprecatedKnobWarnings({ queueMaxDepth: 500 })).toEqual([]);
+    expect(deprecatedKnobWarnings({})).toEqual([]);
+  });
+
+  it('says nothing when the knob is being cleared', () => {
+    // `reset` sends null. Clearing an inert override is exactly what the
+    // operator should do with it, so warning there would be backwards.
+    expect(deprecatedKnobWarnings({ contributorCacheTtlMs: null })).toEqual([]);
+  });
+});
+
+describe('the inert contributor-cache knob stays settable', () => {
+  // Deprecate-then-remove: the column, the route field, and this flag are a
+  // released operator surface, so a `set` must still build a patch rather than
+  // failing. It is the WARNING that tells the operator the value is inert.
+  it('still builds a patch', () => {
+    expect(buildClusterPatch({ contributorCacheTtlMs: '900000' })).toEqual({
+      contributorCacheTtlMs: 900_000,
+    });
+  });
+
+  it('still clears with reset', () => {
+    expect(buildClusterReset({ contributorCacheTtlMs: true })).toEqual({
+      contributorCacheTtlMs: null,
+    });
+  });
+});
+
 describe('buildClusterReset', () => {
   it('clears every knob to null when no flag is given', () => {
     const patch = buildClusterReset({});
@@ -155,10 +194,17 @@ describe('buildClusterReset', () => {
     expect(patch.globalEvalRoundTimeoutMs).toBeNull();
     expect(patch.globalEvalCacheMax).toBeNull();
     expect(patch.globalWorkflowsEnabled).toBeNull();
+    expect(patch.scalerReapIntervalMs).toBeNull();
+    expect(patch.scalerReapStrandedTimeoutMs).toBeNull();
+    expect(patch.scalerReapReattemptIntervalMs).toBeNull();
+    expect(patch.scalerClaimRetentionMs).toBeNull();
+    expect(patch.scalerProvisionBackoffBaseMs).toBeNull();
+    expect(patch.scalerProvisionBackoffMaxMs).toBeNull();
+    expect(patch.scalerProvisionMaxConsecutiveFailures).toBeNull();
     // Count guard: a knob added to KNOBS/STRING_KNOBS/BOOLEAN_KNOBS without a
     // reset path (or vice versa) shows up here rather than as a knob an operator
     // cannot clear.
-    expect(Object.keys(patch)).toHaveLength(31);
+    expect(Object.keys(patch)).toHaveLength(38);
   });
 
   it('clears only the check-run tracking TTL when that flag is given', () => {

@@ -1,8 +1,9 @@
 /**
  * ContributorResolver interface for determining contributor permissions.
  *
- * Used by the CI security system to check a contributor's permission level
- * on a repository, enabling trust-tier decisions for PR execution gating.
+ * Deprecated in favour of ref-based trust: the whole interface, including the
+ * `ContributorPermission` / `ContributorInfo` shapes it carries, is retained
+ * for compatibility and has no caller in this repo.
  */
 import type { ProviderType } from './types.js';
 
@@ -17,7 +18,14 @@ export interface ContributorInfo {
   isForkPR: boolean;
 }
 
-/** Resolves contributor information from a git hosting provider. */
+/**
+ * Resolves contributor information from a git hosting provider.
+ *
+ * @deprecated Trust is derived from the git ref, not from the contributor's
+ * permission level, so nothing in the webhook pipeline calls a resolver. The
+ * type stays exported for wire compatibility with external implementations and
+ * is removed at v1.0.0.
+ */
 export interface ContributorResolver {
   readonly provider: ProviderType;
   resolveContributor(

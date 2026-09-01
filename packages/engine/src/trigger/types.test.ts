@@ -16,8 +16,32 @@ describe('lock schema version window', () => {
   });
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
-    expect(SCHEMA_VERSION).toBe(35);
+    expect(SCHEMA_VERSION).toBe(39);
     expect(BREAKING_FLOOR).toBe(30);
+  });
+
+  it('LockJob.invoke is additive — the floor stays below the version', () => {
+    const gate: LockJob = {
+      _type: 'static',
+      name: 'repo-tests',
+      steps: [],
+      needs: [],
+      invoke: { event: 'myorg.repo-tests', scope: 'source', optional: true },
+    };
+    expect(gate.invoke?.event).toBe('myorg.repo-tests');
+    expect(gate.invoke?.scope).toBe('source');
+    expect(gate.invoke?.optional).toBe(true);
+    expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
+
+    // A bare invoke gate carries no `optional` (require-by-default).
+    const required: LockJob = {
+      _type: 'static',
+      name: 'repo-tests',
+      steps: [],
+      needs: [],
+      invoke: { event: 'myorg.repo-tests', scope: 'source' },
+    };
+    expect(required.invoke?.optional).toBeUndefined();
   });
 
   it('LockJob.sandbox is additive — the floor stays below the version', () => {
@@ -36,8 +60,8 @@ describe('lock schema version window', () => {
 });
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 35 (adds commitMessage + content-requirement text keys)', () => {
-    expect(SCHEMA_VERSION).toBe(35);
+  it('SCHEMA_VERSION is 39 (adds the container dockerfile build)', () => {
+    expect(SCHEMA_VERSION).toBe(39);
   });
 
   it('LockJob accepts includeUninitialized alongside runsOnAll', () => {

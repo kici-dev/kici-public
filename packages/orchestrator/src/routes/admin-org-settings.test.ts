@@ -799,3 +799,60 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
     expect(res.status).toBe(200);
   });
 });
+
+describe('org-settings/global-workflows — repo-pattern negation forms', () => {
+  function buildWithDb(db: unknown) {
+    const inner = createOrgSettingsRoutes({
+      db: db as never,
+      rbac: new RbacEnforcer(),
+      globalWorkflowsEnabledDefault: false,
+    });
+    const root = new Hono();
+    root.use('*', async (c, next) => {
+      c.set('role' as never, 'admin' as never);
+      c.set('userId' as never, 'tester' as never);
+      c.set('routingKey' as never, null as never);
+      await next();
+    });
+    root.route('/', inner);
+    return root;
+  }
+
+  async function patch(app: Hono, body: Record<string, unknown>) {
+    return app.request('/org-settings/global-workflows', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'kiciStg00001', ...body }),
+    });
+  }
+
+  for (const [list, bad] of [
+    ['allowedRepos', '!myorg/x'],
+    ['deniedRepos', '!(a|b)/x'],
+    ['elevatedRepos', 'myorg/[^a]*'],
+  ] as const) {
+    it(`rejects a negated ${list} entry with a 400 naming the pattern`, async () => {
+      const { db, rows } = makeOrgSettingsDbStub();
+      const res = await patch(buildWithDb(db), { [list]: [{ pattern: bad }] });
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain(bad);
+      expect(rows.get('kiciStg00001')).toBeUndefined();
+    });
+  }
+
+  it('rejects a whitespace-only pattern', async () => {
+    const { db } = makeOrgSettingsDbStub();
+    const res = await patch(buildWithDb(db), { allowedRepos: [{ pattern: '   ' }] });
+    expect(res.status).toBe(400);
+  });
+
+  it('still accepts ordinary globs, including a dot-prefixed repo name', async () => {
+    const { db, rows } = makeOrgSettingsDbStub();
+    const res = await patch(buildWithDb(db), {
+      allowedRepos: [{ pattern: 'myorg/*' }, { pattern: 'myorg/.github' }],
+      deniedRepos: [{ pattern: '**' }],
+    });
+    expect(res.status).toBe(200);
+    expect(rows.get('kiciStg00001')).toBeDefined();
+  });
+});

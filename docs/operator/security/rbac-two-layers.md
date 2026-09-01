@@ -51,7 +51,7 @@ Three fixed roles:
 | `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                     | Day-to-day operations, CI scripts     |
 | `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read` (metadata, no payload bodies, no secret values) | Compliance review, log inspection     |
 
-The full permission list (21 fine-grained permissions in total) lives in the orchestrator's `secrets/rbac.ts`, and the per-role matrix is in the [`kici-admin` CLI reference](../orchestrator/kici-admin-cli.md#rbac-roles).
+The full permission list (23 fine-grained permissions in total) lives in the orchestrator's `secrets/rbac.ts`, and the per-role matrix is in the [`kici-admin` CLI reference](../orchestrator/kici-admin-cli.md#rbac-roles).
 
 - **Identity** is the opaque bearer token. The orchestrator looks up the token's role from its `admin_tokens` table; nothing about the token's identity exists outside the orchestrator.
 - **Per-resource scoping** is intentionally absent at this layer. An `admin` token can write every secret in every scope. The granularity is "operator-equivalent or read-only".

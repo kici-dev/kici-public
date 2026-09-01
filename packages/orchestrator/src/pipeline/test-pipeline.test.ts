@@ -327,7 +327,7 @@ describe('processTestTrigger', () => {
         properties: {},
       },
     ];
-    deps.hostRosterStore = { findMatching: vi.fn().mockResolvedValue(matchedHosts) } as any;
+    deps.hostRosterStore = { findFanoutTargets: vi.fn().mockResolvedValue(matchedHosts) } as any;
     deps.maxFanoutHosts = 1024;
     (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([fanWorkflow]));
 
@@ -376,7 +376,7 @@ describe('processTestTrigger', () => {
         properties: {},
       },
     ];
-    deps.hostRosterStore = { findMatching: vi.fn().mockResolvedValue(matchedHosts) } as any;
+    deps.hostRosterStore = { findFanoutTargets: vi.fn().mockResolvedValue(matchedHosts) } as any;
     deps.maxFanoutHosts = 1024;
     (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([fanWorkflow]));
 
@@ -544,7 +544,7 @@ describe('processTestTrigger', () => {
     // coordinator). This proves the type migration: a ProcessingDeps carrying
     // hostRosterStore/maxFanoutHosts is a valid input to processTestTrigger.
     const procDeps = createMockDeps({
-      hostRosterStore: { findMatching: vi.fn().mockResolvedValue([]) } as any,
+      hostRosterStore: { findFanoutTargets: vi.fn().mockResolvedValue([]) } as any,
       maxFanoutHosts: 1024,
       pendingInits: {} as any,
       pendingDynamics: {} as any,

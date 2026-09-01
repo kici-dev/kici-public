@@ -60,7 +60,7 @@ Every lifecycle command — `uninstall`, `upgrade`, `start`, `stop`, `restart`, 
 
 If none of those resolve, the command exits non-zero with a candidate list of installed instances on the host. `--name` no longer has a default — a bare `kici-admin orchestrator uninstall` outside any deploy folder will refuse and list the candidates.
 
-`stop` and `uninstall` are **idempotent on a not-found `--name`**: if you pass `--name <n>` and no instance by that name is installed on the host, the command prints `… is not installed — nothing to stop/uninstall.` and exits 0 (there is nothing to remove). This is distinct from the ambiguous-targeting refusal above: supplying an explicit `--name` that simply isn't present is a successful no-op, so cleanup loops that stop/uninstall a set of candidate names across a fleet don't fail on the hosts where a given name was never installed.
+`stop` and `uninstall` are **idempotent on a not-found `--name`**: if you pass `--name <n>` and no instance by that name is installed on the host, the command prints `… is not installed — nothing to stop/uninstall.` and exits 0 (there is nothing to remove). This is distinct from the ambiguous-targeting refusal above: supplying an explicit `--name` that isn't present is a successful no-op. Cleanup loops that stop/uninstall a set of candidate names across a fleet therefore don't fail on the hosts where a given name was never installed.
 
 ## Prerequisites
 
@@ -158,6 +158,22 @@ of the pin.
 If you generate the compose file from a development build that never ran a release,
 the installer falls back to the `:latest` tag (with a warning) since no recorded
 digest ships with that build.
+
+#### Shutdown grace period
+
+The generated compose file sets `stop_grace_period` so the runtime waits for the
+service to shut down cleanly:
+
+```yaml
+stop_grace_period: 45s
+```
+
+Compose waits only 10 seconds by default. The orchestrator needs longer, because
+it stops each agent it manages before it exits. If the runtime stops waiting
+first, it kills the orchestrator part-way through shutdown. The orchestrator then
+never tells its peers that it is leaving, and never closes its agent connections.
+The generated value gives each component more time than its own shutdown budget,
+so the service always finishes on its own terms.
 
 ## Installation modes
 
@@ -507,18 +523,20 @@ kici-admin orchestrator upgrade --instance-dir ~/kici-deploy --cleanup
 
 The orchestrator auto-migrates its PostgreSQL database on startup (enabled by default). When the new version includes schema changes, migrations run automatically after the service restarts.
 
-If you've disabled auto-migration (`KICI_AUTO_MIGRATE=false`), run migrations manually before the upgrade:
+If you've disabled auto-migration (`KICI_AUTO_MIGRATE=false`), run migrations manually **before** you start the new binary:
 
 ```bash
 kici-admin db migrate --status   # Check pending migrations
 kici-admin db migrate            # Apply them
 ```
 
+The order matters. A new orchestrator writes the columns its own release added, so starting it against an un-migrated database fails those writes at runtime rather than at boot. This release is a concrete case. Every security-hold insert names `held_runs.posted_pending_check`, which migration 126 adds. On an un-migrated database each insert fails, so a fork pull request the policy should hold gets no hold row and the delivery errors. Nothing warns you at startup — the failure appears per delivery.
+
 See [Orchestrator setup — database](../orchestrator/orchestrator-setup.md#database) for details on migration management.
 
 ### Cluster upgrade order
 
-In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as both sides support the same minimum protocol version. When a protocol version bump occurs (documented in release notes), upgrade all nodes. See [Coordinator-worker — upgrade procedure](../../architecture/clustering/coordinator-worker.md#upgrade-procedure) for the full sequence.
+In clustered deployments (coordinator + workers), nodes can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. A release that raises the protocol version alone changes nothing: the minimum stays where it is, so a node on the older version keeps connecting. Upgrade every node when a release raises the **minimum accepted** version — the release notes name both numbers. See [Coordinator-worker — upgrade procedure](../../architecture/clustering/coordinator-worker.md#upgrade-procedure) for the full sequence.
 
 ### Job recovery during upgrade
 

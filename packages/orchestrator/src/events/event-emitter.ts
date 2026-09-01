@@ -1,4 +1,11 @@
 import type { EventRouter } from './event-router.js';
+import {
+  SCALER_EVENT_NAMES,
+  ScalerScaleUpPayload,
+  ScalerScaleDownPayload,
+  type ScalerScaleUpPayload as ScalerScaleUpPayloadType,
+  type ScalerScaleDownPayload as ScalerScaleDownPayloadType,
+} from '../scaler/scaler-events.js';
 
 /**
  * Input data for emitting a workflow_complete system event.
@@ -11,7 +18,12 @@ export interface WorkflowCompleteData {
   status: string;
   conclusion: string;
   duration: number;
-  jobResults: Array<{ name: string; status: string }>;
+  /**
+   * Per-job results. `outputs` carries a job's non-secret declared outputs
+   * (additive/optional — an invoke gate reads them to surface an invoked run's
+   * outputs to downstream global jobs; older readers ignore the field).
+   */
+  jobResults: Array<{ name: string; status: string; outputs?: Record<string, unknown> }>;
   /** Why the run failed (`RunFailureClass`); carried on the event so Plane B can route on it. */
   failureClass?: string;
 }
@@ -133,6 +145,42 @@ export class EventEmitter {
       sourceRoutingKey: data.routingKey,
       sourceRunId: data.runId,
       sourceJobId: data.jobId,
+      chainDepth: 0,
+    });
+  }
+
+  /**
+   * Emit a `kici.scaler.scale-up` system event. Delivered to the scaler's
+   * `provisioningTargets` (the workflow refs that provision cloud instances),
+   * carrying everything a provisioning workflow needs — including a single-use
+   * claim code. Root-level (chainDepth 0), rate-exempt via the reserved `kici.`
+   * prefix. Returns the event id as a delivery receipt.
+   */
+  async emitScalerScaleUp(payload: ScalerScaleUpPayloadType, targets: string[]): Promise<string> {
+    const validated = ScalerScaleUpPayload.parse(payload);
+    return this.router.emit({
+      eventName: SCALER_EVENT_NAMES.scaleUp,
+      payload: validated,
+      target: { repos: targets },
+      chainDepth: 0,
+    });
+  }
+
+  /**
+   * Emit a `kici.scaler.scale-down` system event. Delivered to the scaler's
+   * `provisioningTargets` so a teardown workflow deletes the instance
+   * registered under `payload.agentId`. Root-level (chainDepth 0), rate-exempt.
+   * Returns the event id as a delivery receipt.
+   */
+  async emitScalerScaleDown(
+    payload: ScalerScaleDownPayloadType,
+    targets: string[],
+  ): Promise<string> {
+    const validated = ScalerScaleDownPayload.parse(payload);
+    return this.router.emit({
+      eventName: SCALER_EVENT_NAMES.scaleDown,
+      payload: validated,
+      target: { repos: targets },
       chainDepth: 0,
     });
   }

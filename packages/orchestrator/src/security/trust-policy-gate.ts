@@ -1,215 +1,230 @@
 /**
- * Org trust-policy gate — turns the Platform-owned policy plus three per-PR
- * signals into exactly one outcome.
+ * Org trust-policy gate — turns the org's fork switch plus the per-PR signals
+ * into exactly one outcome.
  *
  * Pure: no I/O, no DB, no clock. The caller supplies the effective policy (see
- * `resolveEffectivePolicy`) and the signals; enforcement lives in the dispatch
- * gate.
+ * `resolveEffectivePolicy`) and the signals; enforcement lives elsewhere — the
+ * webhook pipeline drops an `ignore`d event before it can create a run, and the
+ * dispatch gate acts on the remaining verdicts.
  *
- * Scope: the caller only invokes this for sources whose provider bundle carries
- * a `ContributorResolver` (GitHub today). Every other source is trusted by
- * construction and never reaches here.
+ * Scope: the pipeline reaches this through `evaluateSecurityPolicy`, which
+ * short-circuits to `pass` for a source whose provider bundle leaves
+ * `hasForkModel` unset — so a source with no fork model never reaches the
+ * switch below by that route. That short-circuit is not a trust claim: a
+ * PR from a fork-less provider resolves NO tier, because the fork signal such a
+ * provider computes reads `false` whenever the payload keys it compares are
+ * absent. Those sources skip the switch because its one condition — "the PR
+ * came from a fork" — cannot be established for them, not because they are
+ * trusted.
  */
 import { z } from 'zod';
-import { DEFAULT_APPROVAL_EXPIRY_HOURS, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
+import {
+  DEFAULT_APPROVAL_EXPIRY_HOURS,
+  DEFAULT_APPROVAL_EXPIRY_SECONDS,
+  ForkPolicy,
+  approvalExpirySecondsOf,
+} from '@kici-dev/engine';
 import type { OrchestratorMode, TrustPolicy, TrustTier } from '@kici-dev/engine';
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import type { StoredTrustPolicy } from './trust-policy-store.js';
 
 /**
- * Which arm of the gate is actually in force for an org — the vocabulary the
- * admin API reports and `kici-admin trust-policy show` renders.
+ * The enforcement vocabulary the admin API reports and `kici-admin
+ * trust-policy show` renders.
  *
- * `policy` means `resolveEffectivePolicy` produced a policy and all three arms
- * apply; `legacy` means it produced `null`, so only the legacy
- * workflow-modification rule runs and there are no policy values to report.
- * Named here, next to the resolver that decides between them, so the route and
- * the CLI cannot drift apart on a bare string literal.
+ * @deprecated The route reports `policy` unconditionally: `resolveEffectivePolicy`
+ * returns a policy for every input, so there is no state left in which the
+ * values are absent. The field and this enum stay so an older `kici-admin`
+ * binary keeps parsing the response. Removed at v1.0.0.
  */
 export const TrustPolicyEnforcement = z.enum(['policy', 'legacy']);
 export type TrustPolicyEnforcement = z.infer<typeof TrustPolicyEnforcement>;
 
-/** The per-PR facts the policy is evaluated against. */
+/** The per-PR facts the fork switch is evaluated against. */
 export interface TrustPolicySignals {
-  /** Resolved contributor tier; undefined when trust resolution failed. */
+  /** Resolved contributor tier; undefined when no tier was resolved. */
   tier: TrustTier | undefined;
   /** The PR's head repo differs from its base repo. */
   isForkPR: boolean;
-  /** The PR changes `.kici/` workflow definitions. */
-  hasWorkflowModifications: boolean;
 }
 
 /**
- * The reasons the ORG TRUST POLICY itself can raise — its three arms.
+ * The reason the ORG TRUST POLICY itself raises.
  *
- * `context_trust` is excluded at the type level rather than merely by
- * convention: that reason belongs to the per-context minimum-trust gate, which
- * holds an individual job under its real name. Narrowing here is what lets
- * `SECURITY_HOLD_JOB_IDS` drop its phantom `context_trust` sentinel — a value
- * that existed only to satisfy a `Record<SecurityHoldReason, ...>` and was never
- * written to a single row.
+ * The fork switch is the policy's only arm, so `fork_pr` is the only reason it
+ * can produce. The `SecurityHoldReason` Zod enum deliberately keeps its other
+ * members: `held_runs` rows written by earlier builds still carry them, and the
+ * per-context minimum-trust gate still writes `context_trust` under its own
+ * name. Narrowing here is a statement about what this gate emits, not about
+ * what the column may hold.
  */
-export type TrustPolicyHoldReason = Exclude<SecurityHoldReason, 'context_trust'>;
+export type TrustPolicyHoldReason = Extract<SecurityHoldReason, 'fork_pr'>;
 
 export type TrustPolicyOutcome =
   | { action: 'pass' }
+  /**
+   * Drop the event entirely: no run row, no check status, nothing dispatched.
+   * The pipeline enforces this before it fetches a lock file, so an ignored
+   * event leaves no trace a contributor can see.
+   */
+  | { action: 'ignore' }
   | {
       action: 'hold';
       reason: TrustPolicyHoldReason;
       message: string;
       /**
-       * Hours the resulting hold stays approvable, taken from the SAME policy
-       * that produced this verdict. `null` in independent mode, where there is
-       * no upstream policy and therefore no operator-set window.
+       * Seconds the resulting hold stays approvable, taken from the SAME policy
+       * that produced this verdict.
        *
        * Carried on the outcome rather than re-read at the hold site: a second,
        * independent read bypassed `resolveEffectivePolicy`, so it was both a
        * TOCTOU (the policy could change between deciding and sizing) and a
-       * divergence — independent mode got the 72h default where the decision
-       * path deliberately has no policy at all.
+       * divergence between deciding and sizing. `null` means "no window came
+       * with this verdict", and the hold site falls back to
+       * `DEFAULT_APPROVAL_EXPIRY_SECONDS`.
+       *
+       * Seconds, not hours, because this is what the hold site actually needs:
+       * an hours-only window cannot express the sub-hour hold the policy may now
+       * carry, and rounding it here would silently lengthen it.
        */
-      approvalExpiryHours: number | null;
+      approvalExpirySeconds: number | null;
     }
   | { action: 'reject'; reason: TrustPolicyHoldReason; message: string };
 
 /**
- * The policy a Platform-attached orchestrator applies when it has no stored
- * row. Every arm holds — a hold is recoverable by approval, and these are the
- * documented org defaults, so an org that never changed its policy gets the
- * behavior its dashboard shows.
+ * The reason a verdict carries, or `undefined` for one that carries none.
+ *
+ * Logging and check-status call sites take any outcome, so they need the reason
+ * without narrowing the union themselves — and a call site that reached for
+ * `.reason` on a reasonless verdict would print `undefined` rather than fail.
+ */
+export function trustPolicyOutcomeReason(
+  outcome: TrustPolicyOutcome,
+): TrustPolicyHoldReason | undefined {
+  return outcome.action === 'hold' || outcome.action === 'reject' ? outcome.reason : undefined;
+}
+
+/** The fork switch applied when no policy row is stored. */
+export const DEFAULT_FORK_POLICY: ForkPolicy = ForkPolicy.enum.ignore;
+
+/**
+ * The policy applied when no row is stored — in every mode. Ignoring fork
+ * events is the fail-closed posture: nothing foreign dispatches, and the event
+ * is dropped rather than parked in a queue nobody is watching.
  *
  * This is NOT necessarily a brief transient. The Platform sends
  * `trust_policy.update` only when the org has a `trust_policies` row, and that
  * row is created lazily on a dashboard read — so an org that has never opened
  * Settings > CI trust receives no push at all and stays on these values
- * indefinitely. The expiry is therefore the generous documented default rather
- * than a short one: a short window would auto-fail legitimate runs.
+ * indefinitely.
  */
 export const FAIL_CLOSED_POLICY: TrustPolicy = Object.freeze({
-  forkPolicy: 'hold',
+  forkPolicy: DEFAULT_FORK_POLICY,
+  // Inert: the gate reads neither field. They are carried because the wire
+  // schema still declares them.
   unknownContributorPolicy: 'hold',
   workflowChangePolicy: 'hold',
   approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+  approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
 });
 
 /**
- * Pick the policy to evaluate. A stored row always wins. Without one, a
- * Platform-attached orchestrator fails closed (a push is imminent); an
- * independent orchestrator has no upstream authority at all, so it gets `null`
- * and the evaluator applies only the legacy rule — which is what keeps this
- * change from silently gating existing independent deployments on upgrade.
+ * The policy applied when the stored row could not be READ — a thrown query, a
+ * dropped connection.
  *
- * `PLATFORM_CONNECTED_MODES` is the shared definition of "expects a Platform
- * push", so a mode added there is fail-closed here without a second edit.
+ * Distinct from `FAIL_CLOSED_POLICY`, which answers a different question: that
+ * one is what an org with no stored row has chosen by not choosing. A read
+ * failure says nothing about what the org chose, and an org that chose `hold`
+ * or `allow` would have its fork PRs dropped with no trace if the two cases
+ * shared an answer — a transient database blip turning a recoverable,
+ * contributor-visible hold into a silent disappearance.
+ *
+ * Holding is fail-closed on the same terms: nothing untrusted dispatches. It is
+ * also recoverable — the contributor sees the security check, and an operator
+ * can approve it — which an ignored event is not.
+ */
+export const READ_FAILURE_POLICY: TrustPolicy = Object.freeze({
+  forkPolicy: ForkPolicy.enum.hold,
+  // Inert, exactly as in `FAIL_CLOSED_POLICY`: the gate reads neither field.
+  unknownContributorPolicy: 'hold',
+  workflowChangePolicy: 'hold',
+  approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+  approvalExpirySeconds: DEFAULT_APPROVAL_EXPIRY_SECONDS,
+});
+
+/**
+ * Pick the policy to evaluate. A stored row always wins; without one every
+ * orchestrator gets the fail-closed policy above.
+ *
+ * `mode` no longer selects between two postures — an independent orchestrator
+ * has no upstream authority, which is a reason to be stricter rather than more
+ * permissive — but it stays on the signature so callers that legitimately hold
+ * a mode do not have to change, and so a future per-mode difference has a place
+ * to land.
  */
 export function resolveEffectivePolicy(
   stored: StoredTrustPolicy | null,
-  mode: OrchestratorMode,
-): TrustPolicy | null {
+  _mode: OrchestratorMode,
+): TrustPolicy {
   if (stored) {
     return {
       forkPolicy: stored.forkPolicy,
       unknownContributorPolicy: stored.unknownContributorPolicy,
       workflowChangePolicy: stored.workflowChangePolicy,
       approvalExpiryHours: stored.approvalExpiryHours,
+      approvalExpirySeconds: stored.approvalExpirySeconds,
     };
   }
-  return PLATFORM_CONNECTED_MODES.includes(mode) ? FAIL_CLOSED_POLICY : null;
+  return FAIL_CLOSED_POLICY;
 }
 
-/** A contributor the policy arms apply to: anyone below `trusted`. */
-function isNonTrusted(tier: TrustTier | undefined): boolean {
-  return tier !== 'trusted';
-}
+/** The message carried by every verdict the fork switch raises. */
+const FORK_PR_MESSAGE = 'Pull request originates from a fork';
 
-const MESSAGES: Record<TrustPolicyHoldReason, string> = {
-  workflow_modification: 'Workflow files were modified by a non-trusted contributor',
-  fork_pr: 'Pull request originates from a fork',
-  unknown_contributor: 'Contributor could not be resolved to a known identity',
-};
+function holdForFork(policy: TrustPolicy): TrustPolicyOutcome {
+  return {
+    action: 'hold',
+    reason: SecurityHoldReason.enum.fork_pr,
+    message: FORK_PR_MESSAGE,
+    // Resolved through the shared rule rather than read off one field, so a
+    // policy that carries only the coarse hours spelling still sizes the hold.
+    approvalExpirySeconds: approvalExpirySecondsOf(policy),
+  };
+}
 
 /**
- * Evaluate the policy.
+ * Evaluate the fork switch.
  *
- * Arms are evaluated in a fixed order — workflow_modification, fork_pr,
- * unknown_contributor — and then any `reject` beats any `hold`, with the first
- * arm in that order supplying the reason among equals. That makes a PR tripping
- * several arms produce one outcome with a stable reason rather than a verdict
- * that depends on evaluation accident.
- *
- * An unresolved tier (`undefined`) counts as `unknown`, never as a pass: a
- * trust resolution that could not be answered is not evidence of trust.
- *
- * A `null` policy applies only the legacy rule (workflow modifications by a
- * non-trusted contributor hold), reproducing behavior from before the policy was
- * enforced.
+ * Two guards precede it. A `trusted` tier passes: the ref lives in the base
+ * repo, so only a write-or-higher contributor could have put it there. A
+ * non-fork event passes too — the switch names one condition, and an event that
+ * does not meet it has no verdict to receive here. Reduced privilege for a
+ * non-trusted contributor is derived from the tier further down the pipeline,
+ * not from this outcome.
  */
 export function evaluateTrustPolicy(
-  policy: TrustPolicy | null,
+  policy: TrustPolicy,
   signals: TrustPolicySignals,
 ): TrustPolicyOutcome {
-  if (!isNonTrusted(signals.tier)) return { action: 'pass' };
+  if (signals.tier === 'trusted') return { action: 'pass' };
+  if (!signals.isForkPR) return { action: 'pass' };
 
-  if (policy === null) {
-    return signals.hasWorkflowModifications
-      ? {
-          action: 'hold',
-          reason: SecurityHoldReason.enum.workflow_modification,
-          message: MESSAGES.workflow_modification,
-          // Independent mode: no upstream policy, so no operator-set window.
-          approvalExpiryHours: null,
-        }
-      : { action: 'pass' };
+  switch (policy.forkPolicy) {
+    case ForkPolicy.enum.allow:
+      return { action: 'pass' };
+    case ForkPolicy.enum.hold:
+      return holdForFork(policy);
+    // `reject` is deprecated in favour of `ignore` and behaves as it, so an
+    // orchestrator on this build honours a stored `reject` row without
+    // requiring the operator to rewrite it first.
+    case ForkPolicy.enum.ignore:
+    case ForkPolicy.enum.reject:
+      return { action: 'ignore' };
+    default:
+      // The policy columns are plain TEXT so a value written by a newer
+      // Platform stays readable — which means an unrecognised verdict is
+      // reachable, and for a security control the safe reading of "I do not
+      // understand this" is `hold`, not `pass`.
+      return holdForFork(policy);
   }
-
-  // A fork PR ALWAYS resolves to tier `unknown` (trust-resolver.ts returns it
-  // unconditionally for a fork), so the unknown-contributor arm would otherwise
-  // fire for every fork — and since `unknownContributorPolicy` has no `allow`
-  // member, no configuration could ever let a fork PR run. That made
-  // `forkPolicy: 'allow'` unreachable while the docs told open-source operators
-  // to use it: a second inert setting inside the fix for the first one.
-  //
-  // When the fork is what caused the unknown tier and the operator has
-  // explicitly allowed forks, the fork arm wins. Deliberately narrow: a
-  // NON-fork unknown contributor is unaffected, because widening
-  // `unknownContributorPolicy` would let any unresolvable contributor run.
-  const forkAllowsThisEvent = signals.isForkPR && policy.forkPolicy === 'allow';
-
-  const arms: Array<{ reason: TrustPolicyHoldReason; applies: boolean; verdict: string }> = [
-    {
-      reason: SecurityHoldReason.enum.workflow_modification,
-      applies: signals.hasWorkflowModifications,
-      verdict: policy.workflowChangePolicy,
-    },
-    {
-      reason: SecurityHoldReason.enum.fork_pr,
-      applies: signals.isForkPR,
-      verdict: policy.forkPolicy,
-    },
-    {
-      reason: SecurityHoldReason.enum.unknown_contributor,
-      applies: (signals.tier === 'unknown' || signals.tier === undefined) && !forkAllowsThisEvent,
-      verdict: policy.unknownContributorPolicy,
-    },
-  ];
-
-  const applicable = arms.filter((arm) => arm.applies);
-  const rejecting = applicable.find((arm) => arm.verdict === 'reject');
-  if (rejecting) {
-    return { action: 'reject', reason: rejecting.reason, message: MESSAGES[rejecting.reason] };
-  }
-  // Anything that is not an explicit `allow` holds. The policy columns are
-  // plain TEXT so a value written by a newer Platform stays readable — which
-  // means an unrecognised verdict is reachable, and for a security control the
-  // safe reading of "I do not understand this" is `hold`, not `pass`.
-  const holding = applicable.find((arm) => arm.verdict !== 'allow');
-  if (holding) {
-    return {
-      action: 'hold',
-      reason: holding.reason,
-      message: MESSAGES[holding.reason],
-      approvalExpiryHours: policy.approvalExpiryHours,
-    };
-  }
-  return { action: 'pass' };
 }

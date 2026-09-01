@@ -148,29 +148,79 @@ describe('kici types', () => {
     });
   });
 
-  describe('handles auth errors', () => {
-    it('returns false when not authenticated', async () => {
-      // No config file at all
-      const result = await typesCommand({});
+  /** Read the generated declaration file for a given .kici dir. */
+  async function readStub(kiciDir: string): Promise<string> {
+    return fs.readFile(path.join(kiciDir, 'types', 'secrets.d.ts'), 'utf-8');
+  }
 
-      expect(result).toBe(false);
+  describe('offline stub when the Platform is unreachable', () => {
+    it('writes an empty stub and succeeds when not authenticated', async () => {
+      // No config file at all — DashboardClient.fromConfig throws not_logged_in.
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      // Does NOT fail: the file must exist so an unauthenticated fresh clone
+      // typechecks against "no known keys" rather than "no exported member".
+      expect(result).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain("declare module '@kici-dev/sdk'");
+      expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
       const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
-      expect(errors).toContain('Not logged in');
-      expect(errors).toContain('kici login');
+      expect(errors).toContain('offline type stub');
     });
 
-    it('returns false when no active organization is set', async () => {
+    it('writes an empty stub and succeeds when no active organization is set', async () => {
       await writeConfig({ pat: 'kici_pat_abc', platformEndpoint: 'https://platform.example.com' });
 
-      const result = await typesCommand({});
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
 
-      expect(result).toBe(false);
-      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
-      expect(errors).toContain('No active organization');
+      expect(result).toBe(true);
+      // No org means no fetch is attempted (the client refuses before the wire).
       expect(mockFetch).not.toHaveBeenCalled();
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
     });
 
-    it('returns false on 403 response', async () => {
+    it('does NOT overwrite an existing populated file on a transient offline error', async () => {
+      await writeConfig(platformConfig);
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+      // A developer's real, populated declaration file generated on a prior
+      // authenticated run.
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      await fs.mkdir(path.join(kiciDir, 'types'), { recursive: true });
+      const populated =
+        "declare module '@kici-dev/sdk' { interface KnownSecretKeys { DB_PASS: string } }\nexport {};\n";
+      await fs.writeFile(path.join(kiciDir, 'types', 'secrets.d.ts'), populated, 'utf-8');
+
+      const result = await typesCommand({ kiciDir });
+
+      // The command still succeeds, but the good file is preserved verbatim —
+      // a Platform blip must not downgrade type-checking to "any key accepted".
+      expect(result).toBe(true);
+      expect(await readStub(kiciDir)).toBe(populated);
+      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
+      expect(errors).toContain('Keeping the existing');
+    });
+
+    it('writes an empty stub and succeeds on a network failure', async () => {
+      await writeConfig(platformConfig);
+      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
+
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
+
+      expect(result).toBe(true);
+      const content = await readStub(kiciDir);
+      expect(content).toContain('// Source: offline stub -- Platform unreachable');
+      expect(content).toMatch(/interface KnownSecretKeys \{\n\s*\}/);
+    });
+  });
+
+  describe('surfaces genuine auth/permission errors (no stub)', () => {
+    it('returns false on 403 response without writing a stub', async () => {
       await writeConfig(platformConfig);
 
       mockFetch.mockResolvedValue({
@@ -179,25 +229,15 @@ describe('kici types', () => {
         json: async () => ({ error: 'Insufficient permission: contexts.read needed' }),
       });
 
-      const result = await typesCommand({});
+      const kiciDir = path.join(tempDir, 'project', '.kici');
+      const result = await typesCommand({ kiciDir });
 
+      // A forbidden response is a real permission problem the user must see —
+      // masking it behind a stub would hide the misconfiguration.
       expect(result).toBe(false);
       const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
       expect(errors).toContain('contexts.read');
-    });
-  });
-
-  describe('handles network errors', () => {
-    it('returns false with error message on network failure', async () => {
-      await writeConfig(platformConfig);
-
-      mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
-
-      const result = await typesCommand({});
-
-      expect(result).toBe(false);
-      const errors = consoleErrorSpy.mock.calls.map((c) => c[0]).join('\n');
-      expect(errors).toContain('ECONNREFUSED');
+      await expect(readStub(kiciDir)).rejects.toThrow();
     });
   });
 });

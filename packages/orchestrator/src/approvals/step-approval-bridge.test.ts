@@ -13,6 +13,26 @@ function fakeStore(createId = 'hold-1'): {
   return { store, createHold };
 }
 
+/**
+ * Let `request()`'s in-flight chain run to the point where it parks on the
+ * pending-approval promise.
+ *
+ * `request()` is deliberately not awaited here — it only settles once someone
+ * calls `resolve()` — so its hold creation and audit write have to be waited for
+ * some other way. Counting microtask ticks (`await Promise.resolve()` twice) is
+ * not that way: it pins the assertions to the exact number of `await`s the
+ * implementation happens to traverse today. Adding one behaviour-neutral `await`
+ * to `request()` breaks five of these tests, which means they were measuring the
+ * implementation's shape rather than its effect.
+ *
+ * Every mock in this file settles on the microtask queue with no timer or I/O in
+ * it, so yielding one macrotask turn drains the whole chain however long it is —
+ * deterministically, not by racing it.
+ */
+async function settleRequest(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
 describe('StepApprovalBridge', () => {
   it('creates a step-scoped hold and resolves on approve', async () => {
     const { store, createHold } = fakeStore();
@@ -32,9 +52,7 @@ describe('StepApprovalBridge', () => {
       reason: 'gate',
     });
 
-    // Let the createHold promise settle so the resolver is registered.
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
 
     expect(createHold).toHaveBeenCalledWith(
       'org-1',
@@ -72,8 +90,7 @@ describe('StepApprovalBridge', () => {
       reason: 'prod patch',
       payload,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
 
     expect(createHold).toHaveBeenCalledWith('org-1', expect.objectContaining({ payload }));
     bridge.resolve('hold-payload', 'approved');
@@ -96,8 +113,7 @@ describe('StepApprovalBridge', () => {
       clauses: [],
       reason: 'gate',
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
     expect('payload' in createHold.mock.calls[0][1]).toBe(false);
   });
 
@@ -117,8 +133,7 @@ describe('StepApprovalBridge', () => {
       clauses: [],
       reason: 'gate',
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
     bridge.resolve('hold-2', 'rejected', 'nope');
     await expect(pending).resolves.toEqual({ outcome: 'rejected', reason: 'nope' });
   });
@@ -141,8 +156,7 @@ describe('StepApprovalBridge', () => {
       reason: 'gate',
       timeoutSeconds: 120,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
     expect(resolveExpirySeconds).not.toHaveBeenCalled();
     const requirement = createHold.mock.calls[0][1].requirement;
     const ttlMs = new Date(requirement.expiresAt).getTime() - Date.now();
@@ -169,8 +183,7 @@ describe('StepApprovalBridge', () => {
       clauses: [{ team: 'leads' }],
       reason: 'gate',
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({
         orgId: 'org-1',
@@ -199,8 +212,7 @@ describe('StepApprovalBridge', () => {
       clauses: [],
       reason: 'gate',
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
     bridge.failAgent('gone');
     await expect(pending).rejects.toThrow('agent disconnected');
     expect(bridge.size()).toBe(0);
@@ -252,8 +264,7 @@ describe('StepApprovalBridge.request timeout guard', () => {
       reason: 'gate',
       timeoutSeconds: 120,
     });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settleRequest();
 
     expect(createHold).toHaveBeenCalledTimes(1);
   });

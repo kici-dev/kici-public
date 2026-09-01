@@ -56,6 +56,10 @@ import { PendingAttestationsRepo } from './provenance/pending-attestations-repo.
 import { registerBlobRoutes, CACHE_BLOB_PATH_PREFIX } from './storage/blob-routes.js';
 import { AgentApiRegistry } from './ws/agent-api-registry.js';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
+import { GitCredentialBroker } from './git/credential-broker.js';
+import { buildGitCredentialHandler } from './ws/git-credential-relay.js';
+import { createJobCredentialContextReader } from './git/job-context.js';
 import { selectOidcMintRegistration } from './oidc/oidc-mint-registration.js';
 import type { LocalSigner } from './oidc/local-dev-signer.js';
 import { createInventoryGetHandler, createInventoryQueryHandler } from './ws/inventory-api.js';
@@ -114,6 +118,8 @@ import { createMetricsRoutes } from '@kici-dev/shared';
 import { createDiagnosticsRoutes } from './routes/diagnostics.js';
 import { createFleetRoutes } from './routes/fleet.js';
 import { processWebhook } from './pipeline/processor.js';
+import type { ProcessingDeps } from './pipeline/processor.js';
+import type { InvokeGateDeps } from './pipeline/invoke-gate.js';
 import { WebhookIngestOutcome } from './pipeline/process-webhook.js';
 import type { WebhookInfo } from './webhook/handler.js';
 import type { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
@@ -141,6 +147,7 @@ import { resolveBearerAuth } from './routes/admin-auth.js';
 import { createOnErrorHandler } from './app-on-error.js';
 import type { EventEmitter } from './events/event-emitter.js';
 import type { GlobalWorkflowPolicy } from './security/global-workflow-policy.js';
+import { createDirectIngressProcessingDeps } from './pipeline/direct-ingress-deps.js';
 import type { EventLogWriter } from './webhook/event-log.js';
 import type { AccessLogWriter } from './audit/access-log.js';
 import { payloadFromObject } from './webhook/event-log.js';
@@ -148,9 +155,9 @@ import type { GenericSourceManager } from './webhook/generic-sources.js';
 import type { TrustStore } from './events/trust-store.js';
 import type { ContextStore } from './contexts/context-store.js';
 import type { VariableStore } from './contexts/variable-store.js';
-import type { HeldRunStore } from './contexts/held-runs.js';
+import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
-import type { ContributorCache } from './security/contributor-cache.js';
+import { buildHeldRunRelease } from './approvals/held-run-release-wiring.js';
 import { stepsTotal, registerOrchestratorMetrics } from './metrics/prometheus.js';
 import { createLogChunkSink } from './reporting/log-chunk-sink.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
@@ -251,6 +258,14 @@ export interface AppDependencies {
    */
   localOidcSigner?: LocalSigner;
   /**
+   * Test-only fault-injection policy, threaded from a test-only entrypoint via
+   * `bootstrapOrchestrator`. Undefined in production. Consumed here only for the
+   * initial-mint provenance seam (`initialMintFault`); the other seams live in
+   * the composition root / server hooks. Type-only reference — the runtime
+   * module never enters the shipped bundle.
+   */
+  faultInjection?: import('./testing/fault-injection.js').OrchestratorFaultInjection;
+  /**
    * Orchestrator-owned provenance signing (Phase 1 root of trust). Present when
    * `KICI_ORCHESTRATOR_PROVENANCE_ISSUER` is configured: the orchestrator mints +
    * signs identity tokens locally with its own ES256 key, and serves its own
@@ -331,6 +346,16 @@ export interface AppDependencies {
   configRouteDeps?: ConfigRouteDeps;
   /** Event router for internal event delivery. Optional -- if not set, event routing is inactive. */
   eventRouter?: EventRouter;
+  /** Invoke-gate dependencies (summon callback + chain-depth bound). Optional -- if not set, invoke gates fail loudly. */
+  invokeGateDeps?: InvokeGateDeps;
+  /**
+   * Late-binding handle the internal-event dispatch adapter reads to obtain the
+   * live `ProcessingDeps` bag. `createApp` populates it, because the bag can
+   * only be assembled here while the event router that dispatches internal
+   * events is constructed earlier in the bootstrap. Left unset by callers that
+   * never route internal events (tests constructing a bare app).
+   */
+  processingDepsRef?: { current: (() => ProcessingDeps) | null };
   /** Event store. Optional -- mounted when admin DLQ admin route should be available. */
   eventStore?: EventStore;
   /** Event emitter for system events (workflow/job complete). Optional -- if not set, system events are skipped. */
@@ -371,6 +396,16 @@ export interface AppDependencies {
   heldRunStore?: HeldRunStore;
   /** Step-approval bridge — opens step-scoped holds and relays their resolution back to the waiting agent. Optional. */
   stepApprovalBridge?: StepApprovalBridge;
+  /**
+   * Re-dispatch a job whose hold was released. Supplied by both mode hooks
+   * through `appDepsExtras`; declared here so the admin held-run routes can
+   * read it type-safely rather than off an untyped spread. Optional — an app
+   * assembled without it mounts no local held-run decision surface, because a
+   * release that cannot dispatch is a row flip pretending to be a release.
+   */
+  onJobRelease?: (signal: ReleaseSignal) => Promise<void>;
+  /** Replay the stored dispatch context of a released workflow-scoped hold. Same provenance as `onJobRelease`. */
+  onWorkflowRelease?: (signal: ReleaseSignal) => Promise<void>;
   /** Global workflow policy for org-level permission enforcement. Optional -- if not set, global workflows are dispatched without permission checks. */
   globalWorkflowPolicy?: GlobalWorkflowPolicy;
   /** Inbound webhook delivery log writer. Optional -- if not set, deliveries are not persisted to event_log. */
@@ -407,10 +442,6 @@ export interface AppDependencies {
   coordinator?: RunCoordinator;
   /** Peer registry for aggregating infrastructure across cluster. Optional. */
   peerRegistry?: PeerRegistry;
-  /** Contributor permission cache. Optional -- threaded through from server.ts
-   *  so membership-related webhooks invalidate matching entries immediately
-   *  (instead of waiting for the 15-minute TTL). */
-  contributorCache?: ContributorCache;
   /**
    * Shared aggregator for agent-pushed metrics. When omitted, app.ts
    * constructs its own — kept optional so existing tests still work
@@ -698,12 +729,44 @@ export function createApp(deps: AppDependencies) {
     dispatcher: deps.dispatcher,
     db: deps.db,
     orchestratorId: deps.config.instanceId,
-    testMode: deps.config.testMode,
-    testMintDeferAudience: deps.config.testMintDeferAudience,
-    testMintRejectAudience: deps.config.testMintRejectAudience,
+    // Only the build-time test double injects a fault predicate; undefined in
+    // the shipped orchestrator means no fault injection.
+    initialMintFault: deps.faultInjection?.initialMintFault,
   });
   if (oidcMintReg) {
     agentApiRegistry.register(OIDC_TOKEN_REQUEST_METHOD, 'read', oidcMintReg.handler);
+  }
+
+  // Git credential broker: mints scoped, short-lived credentials on every git
+  // network operation, which is what lets a long job push after the one-hour
+  // installation-token lifetime would have expired a captured token.
+  //
+  // Two deliberate omissions, both of which fail with an actionable error
+  // rather than silently doing something weaker:
+  //
+  // - `sourceAuth` returns null. Reusing the SOURCE credential through the
+  //   helper needs the per-run provider credentials, which are not in scope
+  //   here — and it would buy little, because KiCI's own App is
+  //   `contents: read`, so a push always needs a customer-supplied credential
+  //   regardless. A workflow names one explicitly.
+  // - `secretOutputs` is unset, so the reserved `needs:` context is not
+  //   resolvable yet. Deriving a job's upstreams needs its `needs` list from
+  //   the lock file, which this site does not have; scanning every job in the
+  //   run instead would let a job read a secret output it never depended on.
+  if (deps.secretResolver) {
+    const gitCredentialBroker = new GitCredentialBroker({
+      secretResolver: deps.secretResolver,
+      sourceAuth: async () => null,
+    });
+    agentApiRegistry.register(
+      GIT_CREDENTIAL_REQUEST_METHOD,
+      'read',
+      buildGitCredentialHandler({
+        broker: gitCredentialBroker,
+        dispatcher: deps.dispatcher,
+        jobContext: createJobCredentialContextReader(deps.db),
+      }),
+    );
   }
 
   // Source location store for check run annotations
@@ -1012,8 +1075,8 @@ export function createApp(deps: AppDependencies) {
               deps.executionTracker!.updateJobHeartbeat(msg.runId, msg.jobId);
             }
           : undefined,
-        onScalerAgentRegistered: (agentId, labels) => {
-          const result = deps.scalerManager?.onAgentRegistered(agentId, labels) ?? null;
+        onScalerAgentRegistered: async (agentId, labels) => {
+          const result = (await deps.scalerManager?.onAgentRegistered(agentId, labels)) ?? null;
           deps.onAgentInventoryChanged?.(); // broadcast heartbeat to peers
           return result;
         },
@@ -1074,6 +1137,9 @@ export function createApp(deps: AppDependencies) {
                 }
               }
             : undefined,
+        onClaimCredentials: deps.scalerManager
+          ? (_agentId, claimCode) => deps.scalerManager!.claimScalerCredentials(claimCode)
+          : undefined,
         pendingBuilds: deps.pendingBuilds,
         pendingInits: deps.pendingInits,
         pendingDynamics: deps.pendingDynamics,
@@ -1502,58 +1568,37 @@ export function createApp(deps: AppDependencies) {
   };
 
   /**
+   * The live `ProcessingDeps` bag for this process, assembled once per call so
+   * every field reads the current subsystem instance (the provider registry is
+   * swapped on a source reload).
+   *
+   * Two consumers: the direct-ingress webhook pipeline below, and the
+   * internal-event dispatch adapter — which reaches it through
+   * `deps.processingDepsRef`, because the event router is constructed long
+   * before this bag can be assembled.
+   *
+   * Assembled by `createDirectIngressProcessingDeps` rather than inline, so the
+   * wiring is a unit under test instead of a field list buried in a composition
+   * root no test constructs.
+   */
+  const { build: buildProcessingDeps } = createDirectIngressProcessingDeps(deps, {
+    onSourceLocationsExtracted,
+  });
+
+  // Late-bind the factory for the internal-event dispatch adapter. The event
+  // router (and so `onEventMatched` / the invoke-gate summon callback) is
+  // constructed before this bag exists, so it reads the factory through the ref
+  // at dispatch time rather than capturing a bag that is not assembled yet.
+  if (deps.processingDepsRef) deps.processingDepsRef.current = buildProcessingDeps;
+
+  /**
    * Run the match-and-dispatch pipeline for one delivery. Records a `failed`
    * event-log row before rethrowing, so a throw is visible per delivery in the
    * dashboard whether or not any caller is still around to see the error.
    */
   const runWebhookPipeline = async (info: WebhookInfo): Promise<WebhookIngestOutcome> => {
     try {
-      return await processWebhook(info, {
-        dedup: deps.dedup,
-        providerRegistry: deps.providerRegistry,
-        ensureProviderBundle: deps.ensureProviderBundle,
-        lockFileCache: deps.lockFileCache,
-        contentRequirementsCache: deps.contentRequirementsCache,
-        dispatcher: deps.dispatcher,
-        platformClient: deps.platformClient,
-        sourceCache: deps.sourceCache,
-        buildCoordinator: deps.buildCoordinator,
-        depCache: deps.depCache,
-        pendingBuilds: deps.pendingBuilds,
-        pendingInits: deps.pendingInits,
-        pendingDynamics: deps.pendingDynamics,
-        pendingGlobalEvals: deps.pendingGlobalEvals,
-        globalEvalCache: deps.globalEvalCache,
-        checkRunReporter: deps.checkRunReporter,
-        executionTracker: deps.executionTracker,
-        onSourceLocationsExtracted,
-        eventRouter: deps.eventRouter,
-        registrationStore: deps.registrationStore,
-        registrationIndex: deps.registrationIndex,
-        db: deps.db,
-        secretKey: deps.config.secretKey,
-        secretResolver: deps.secretResolver,
-        sandboxAllowListReader: deps.sandboxAllowListReader,
-        logStorage: deps.logStorage,
-        contextStore: deps.contextStore,
-        variableStore: deps.variableStore,
-        heldRunStore: deps.heldRunStore,
-        coordinator: deps.coordinator,
-        cronScheduler: deps.cronScheduler,
-        globalWorkflowPolicy: deps.globalWorkflowPolicy,
-        eventLog: deps.eventLogWriter,
-        eventLogSource: 'direct',
-        contributorCache: deps.contributorCache,
-        accessLogWriter: deps.accessLogWriter,
-        hostRosterStore: deps.hostRosterStore,
-        instanceId: deps.config.instanceId,
-        rosterGraceMs: deps.config.rosterGraceMs,
-        maxFanoutHosts: deps.config.maxFanoutHosts,
-        globalEvalRoundTimeoutMs: deps.config.globalEvalRoundTimeoutMs,
-        globalEvalCandidateTimeoutMs: deps.config.globalEvalCandidateTimeoutMs,
-        globalEvalWaitTimeoutMs: deps.config.globalEvalWaitTimeoutMs,
-        clusterSettings: deps.clusterSettings,
-      });
+      return await processWebhook(info, buildProcessingDeps());
     } catch (err) {
       if (deps.eventLogWriter) {
         try {
@@ -1690,6 +1735,14 @@ export function createApp(deps: AppDependencies) {
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
         retryAttestations: deps.retryAttestations,
         globalWorkflowsEnabledDefault: deps.config.globalWorkflowsEnabled,
+        // Backs `kici-admin held-run approve|reject`. Absent when no mode hook
+        // supplied a job-release callback, which leaves the decision route
+        // unmounted rather than mounted-and-inert.
+        heldRunRelease: buildHeldRunRelease({
+          onJobRelease: deps.onJobRelease,
+          onWorkflowRelease: deps.onWorkflowRelease,
+          buildProcessingDeps,
+        }),
       }),
     );
   }

@@ -293,6 +293,75 @@ describe('fetchAdminApi — unreachable-host diagnostics', () => {
   });
 });
 
+/**
+ * `fetch` rejects with a TypeError for two unrelated situations: the transport
+ * failed, and the request could never be built at all. Reporting the second as
+ * the first sends an operator to check firewalls and ports when their token
+ * actually contains a stray newline — the orchestrator was never dialled.
+ *
+ * The real shapes, measured against Node 24's undici:
+ *   closed port    → TypeError('fetch failed')                       cause: Error(ECONNREFUSED)
+ *   invalid header → TypeError('Headers.append: … invalid header …') cause: undefined
+ *   invalid URL    → TypeError('Failed to parse URL from …')         cause: Error(ERR_INVALID_URL)
+ *
+ * So the discriminator is the message, NOT the presence of a cause — the
+ * invalid-URL case carries one.
+ */
+describe('fetchAdminApi — malformed request vs unreachable host', () => {
+  const BASE = 'http://127.0.0.1:4000';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('does not blame connectivity when the header value is invalid', async () => {
+    // The exact shape a token containing a newline produces.
+    const inner = new TypeError('Headers.append: "Bearer a\nb" is an invalid header value.');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).not.toContain('cannot reach');
+    expect(err.message).toContain('invalid header value');
+    expect(err.cause).toBe(inner);
+  });
+
+  it('points at the credential and the address as the usual cause', async () => {
+    const inner = new TypeError('Headers.append: "Bearer a\nb" is an invalid header value.');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain('KICI_ADMIN_TOKEN');
+    expect(err.message).toContain('KICI_ADMIN_URL');
+  });
+
+  it('does not blame connectivity when the URL cannot be parsed', async () => {
+    // Carries a cause, so a cause-presence check would misclassify this one.
+    const inner = new TypeError('Failed to parse URL from not-a-url');
+    (inner as { cause?: unknown }).cause = Object.assign(new Error('Invalid URL'), {
+      code: 'ERR_INVALID_URL',
+    });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).not.toContain('cannot reach');
+    expect(err.message).toContain('Failed to parse URL');
+  });
+
+  it('still reports a genuine transport failure as unreachable', async () => {
+    // Regression guard: the discriminator must not swallow the real case.
+    const inner = new TypeError('fetch failed');
+    (inner as { cause?: unknown }).cause = new Error('connect ECONNREFUSED 127.0.0.1:4000');
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    const err = await fetchAdminApi(`${BASE}/admin/x`, { method: 'GET' }, BASE).catch(
+      (e: unknown) => e as Error,
+    );
+    expect(err.message).toContain('cannot reach the orchestrator admin API');
+  });
+});
+
 describe('firstCauseMessage', () => {
   it('returns the cause message when present', () => {
     const e = new TypeError('fetch failed');

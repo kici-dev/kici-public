@@ -175,6 +175,8 @@ export interface RosterReconciler {
     agentId: string;
     tokenId: string | null;
     lifecycleClass: 'static' | 'ephemeral';
+    /** True when a scaler backend spawned this agent (kept out of `runsOnAll`). */
+    scalerManaged?: boolean;
     labels: string[];
     hostname: string | null;
     platform: string;
@@ -352,6 +354,11 @@ export class AgentRegistry {
           agentId,
           tokenId,
           lifecycleClass: metadata?.tokenAgentType ?? 'ephemeral',
+          // Recorded beside the lifecycle class, not derived from it: the class
+          // snapshots the auth TOKEN's type and is `ephemeral` for every agent
+          // when the auth mode is `none`, so only this flag separates a scaler
+          // agent from a fleet host in that mode.
+          scalerManaged: metadata?.scalerManaged ?? false,
           labels,
           hostname: metadata?.hostname ?? null,
           platform,

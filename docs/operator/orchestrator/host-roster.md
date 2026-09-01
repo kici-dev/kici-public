@@ -3,7 +3,7 @@ title: Host roster (declared inventory)
 description: The durable host roster that turns the orchestrator's observed agents into declared + observed inventory, with derived status and the kici-admin host commands
 ---
 
-The host roster is the orchestrator's **declared inventory**: a durable, cluster-shared record of every agent the cluster has ever enrolled. Without it, inventory is purely _observed_ — an agent that is offline simply does not exist, so a host mid-reboot is silently absent. The roster adds the _declared_ dimension: a host can be **expected** (and read as unreachable when absent) instead of vanishing.
+The host roster is the orchestrator's **declared inventory**: a durable, cluster-shared record of every agent the cluster has ever enrolled. Without it, inventory is purely _observed_ — an agent that is offline does not exist, so a host mid-reboot is silently absent. The roster adds the _declared_ dimension: a host can be **expected** (and read as unreachable when absent) instead of vanishing.
 
 The roster never replaces the live agent registry. The in-memory registry stays the hot path for dispatch; the roster is a best-effort durable shadow that the registry reconciles into on every agent register and disconnect.
 
@@ -98,6 +98,10 @@ kici-admin host declare --agent-id web-09 --labels role:web --hostname web-09
 # Pre-declare with typed properties (repeatable --prop key=value).
 kici-admin host declare --agent-id db-01 --labels role:db \
   --prop region=eu --prop cores=8 --prop gpu=true
+
+# Remove a host from the roster. Runs already pinned to it keep their
+# history; the host simply leaves the roster.
+kici-admin host remove --agent-id web-09
 ```
 
 A pre-declared static host is the bootstrap path: you record that a box _should_ exist (with its labels) before it has ever connected, so its absence is visible from the moment it is declared rather than only after it has connected once.
@@ -114,7 +118,7 @@ A declared host that has **never run an agent** — a freshly-provisioned box re
 
 ### Declared-host reach metadata
 
-To bootstrap a host, the roster needs to know how to reach it before it has an agent. `host declare` accepts four optional reach fields:
+To bootstrap a host, the roster needs to know how to reach it before it has an agent. `host declare` accepts five optional reach fields:
 
 ```bash
 kici-admin host declare --agent-id box-00007 \
@@ -133,7 +137,7 @@ kici-admin host declare --agent-id box-00007 \
 | `--ssh-key-secret` | A [scoped-secret](../../operator/security/secrets.md) reference (`scope/key`) holding the bring-up private key.                                                                                         |
 | `--s3-reachable`   | Marks the box as able to reach the orchestrator's object storage, so it pulls the agent payload directly (see [Payload delivery](#payload-delivery)). Omit for a box that can only be reached over SSH. |
 
-All four are nullable: a host declared without reach metadata simply cannot be bootstrapped and behaves exactly as before. The private key is **never** stored in the roster — only the reference is. The orchestrator resolves it server-side at bring-up time and hands it to the ops agent that performs the SSH, mirroring how every other [scoped secret](../../operator/security/secrets.md) reaches an agent.
+All five are nullable: a host declared without reach metadata cannot be bootstrapped, and behaves like any other declared host. The private key is **never** stored in the roster — only the reference is. The orchestrator resolves it server-side at bring-up time and hands it to the ops agent that performs the SSH, mirroring how every other [scoped secret](../../operator/security/secrets.md) reaches an agent.
 
 ### Bringing up an init-runner
 

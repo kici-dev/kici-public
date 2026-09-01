@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
-import { Command, Argument, Option, CommanderError } from 'commander';
+import { Command, Argument, CommanderError } from 'commander';
 import pc from 'picocolors';
 import { shouldSuppressBanner } from './cli-banner.js';
 
@@ -348,7 +348,6 @@ export function buildProgram(): Command {
       'Qualified secret reference (env:NAME) the private registry token comes from',
       'production:NPM_TOKEN',
     )
-    .addOption(new Option('--use-verdaccio-local').default(false).hideHelp())
     .action(async (options) => {
       const { initCommand } = await import('./commands/index.js');
       // commander turns `--no-agents-md` into options.agentsMd=false when the flag
@@ -741,7 +740,9 @@ Environment variables:
   runsCommand
     .command('show')
     .argument('<run-id>', 'Run ID to inspect')
-    .description('Show a run summary with its jobs and steps')
+    .description(
+      'Show a run summary with its jobs and steps, why a job did not run, and any approval hold',
+    )
     .option('--json', 'Output raw JSON', false)
     .action(async (runId, options) => {
       const { runsShowCommand } = await import('./commands/index.js');
@@ -829,11 +830,18 @@ Environment variables:
     .description('Approve a held approval gate for a run')
     .option('--job <name>', 'Approve the hold for a specific job')
     .option('--step <index>', 'Approve a step-scoped hold (requires --job)')
+    .option(
+      '--hold-type <type>',
+      'Approve the hold of this type (reviewer, timer, concurrency, security) — a job can carry two',
+    )
+    .option('--hold <id>', 'Approve one hold by its id, as listed when nothing else separates them')
     .action(async (runId, options) => {
       const { approveCommand } = await import('./commands/index.js');
       const success = await approveCommand(runId, {
         job: options.job,
         step: options.step,
+        hold: options.hold,
+        holdType: options.holdType,
       });
       process.exit(success ? 0 : 1);
     });
@@ -844,12 +852,19 @@ Environment variables:
     .description('Reject a held approval gate for a run')
     .option('--job <name>', 'Reject the hold for a specific job')
     .option('--step <index>', 'Reject a step-scoped hold (requires --job)')
+    .option(
+      '--hold-type <type>',
+      'Reject the hold of this type (reviewer, timer, concurrency, security) — a job can carry two',
+    )
+    .option('--hold <id>', 'Reject one hold by its id, as listed when nothing else separates them')
     .requiredOption('--reason <text>', 'Reason for the rejection')
     .action(async (runId, options) => {
       const { rejectCommand } = await import('./commands/index.js');
       const success = await rejectCommand(runId, {
         job: options.job,
         step: options.step,
+        hold: options.hold,
+        holdType: options.holdType,
         reason: options.reason,
       });
       process.exit(success ? 0 : 1);
@@ -906,6 +921,63 @@ Environment variables:
         orchestrator: options.orchestrator,
       });
       process.exit(success ? 0 : 1);
+    });
+
+  // `kici report` is action-bearing with two subcommands, the same shape as
+  // `kici run [event]` + `kici run remote`: the bare form produces a bundle,
+  // and list/withdraw manage what has already been sent.
+  const reportCmd = program
+    .command('report')
+    .description('Gather a redacted diagnostic bundle to share when reporting an issue');
+  reportCmd.enablePositionalOptions();
+
+  reportCmd
+    .option('--run <id>', 'Scope the bundle to a failing run')
+    .option('-o, --output <path>', 'Where to write the bundle ZIP')
+    .option(
+      '--metadata <key=value>',
+      'Attach metadata (repeatable)',
+      (v: string, p: string[]) => [...p, v],
+      [] as string[],
+    )
+    .option('--no-redact', 'Do NOT redact secrets (prints a loud warning)')
+    .option('--upload', 'Upload the bundle privately to KiCI and print a reference id')
+    .option('--message <text>', 'Describe the problem (sent with --upload)')
+    .option('--email <address>', 'Contact address for follow-up (sent with --upload)')
+    .option('--kici-dir <path>', 'Path to the .kici directory', '.kici')
+    .action(async (options) => {
+      const { reportCommand } = await import('./commands/index.js');
+      const ok = await reportCommand({
+        output: options.output,
+        run: options.run,
+        metadata: options.metadata,
+        redact: options.redact !== false,
+        upload: options.upload,
+        message: options.message,
+        email: options.email,
+        kiciDir: options.kiciDir,
+      });
+      process.exit(ok ? 0 : 1);
+    });
+
+  reportCmd
+    .command('list')
+    .description('List the issue reports you have uploaded')
+    .option('--json', 'Output raw JSON', false)
+    .action(async (options) => {
+      const { reportListCommand } = await import('./commands/index.js');
+      const ok = await reportListCommand({ json: options.json });
+      process.exit(ok ? 0 : 1);
+    });
+
+  reportCmd
+    .command('withdraw')
+    .argument('<ref>', 'Reference id of the report to withdraw')
+    .description('Withdraw an uploaded report and delete its bundle')
+    .action(async (ref: string) => {
+      const { reportWithdrawCommand } = await import('./commands/index.js');
+      const ok = await reportWithdrawCommand({ ref });
+      process.exit(ok ? 0 : 1);
     });
 
   const workflowsCommand = program

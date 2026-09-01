@@ -104,7 +104,7 @@ export const setup = job('setup', {
 
 ## `checkStep(name, options)`
 
-The check-mode-aware sibling of `idempotentStep()`. It takes the **same option shape**, but behaves differently when a run is started in check mode (`kici run --check`):
+The check-mode-aware sibling of `idempotentStep()`. It takes a closely related option shape, but behaves differently when a run is started in check mode (`kici run --check`):
 
 | Factory          | Behavior under `kici run --check`         |
 | ---------------- | ----------------------------------------- |
@@ -122,10 +122,16 @@ Use `checkStep()` for deploy-style steps where you want a dry-run preview of pen
 | `apply`           | `(ctx, drift: TDrift) => Promise<TApplied>` | Yes      | Brings the system to the desired state. Runs only in apply mode (skipped under `kici run --check`). |
 | `summarize`       | `(drift: TDrift) => string`                 | Yes      | Human-readable summary of what `apply()` would do; shown in check-mode drift output.                |
 | `whenInSync`      | `(ctx) => Promise<TInSync>`                 | No       | Runs when `check()` returned `null` (already in sync).                                              |
+| `outputs`         | `OutputSchema`                              | No       | Zod schema validating the step's outputs at runtime.                                                |
 | `continueOnError` | `boolean`                                   | No       | When true, the job proceeds even if this step fails.                                                |
 | `timeout`         | `number`                                    | No       | Step-level timeout in milliseconds.                                                                 |
+| `retry`           | `number \| RetryConfig`                     | No       | Retry policy for the step; `retry: N` is shorthand for `{ maxAttempts: N }`.                        |
+| `cache`           | `CacheInput`                                | No       | Declarative cache restored before the step and saved after it succeeds.                             |
+| `rules`           | `Rule[]`                                    | No       | Step-level conditional rules, evaluated agent-side.                                                 |
 
-The one signature difference from `idempotentStep`: `apply` and `whenInSync` receive `ctx` as their first argument, so the apply logic has access to `ctx.$`, `ctx.log`, and `ctx.secrets`.
+Everything from `outputs` down is a plain [`step()` option](./core.md) forwarded to the underlying step. The three step options `checkStep` does **not** accept are `onCancel`, `cleanup`, and `approval`.
+
+There are two signature differences from `idempotentStep`. First, `apply` and `whenInSync` receive `ctx` as their first argument, so the apply logic has access to `ctx.$`, `ctx.log`, and `ctx.secrets`. Second, `summarize` is **required** here, because it is what check mode prints; `idempotentStep` defaults it to a JSON dump of the drift. `idempotentStep` also takes none of the step-option passthroughs above.
 
 ### Result
 

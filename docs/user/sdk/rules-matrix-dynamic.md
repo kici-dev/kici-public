@@ -7,7 +7,7 @@ description: rule(), skip(), matrix builds (static + dynamic), and dynamicJob / 
 
 Rules control conditional execution of workflows and jobs. A rule that returns `false` (or whose check function returns `false`) prevents execution.
 
-A rule's check function that **returns `false`** cleanly skips the job or step. A check function that **throws** is treated as an evaluation failure, not a skip: the job or step **fails** with the error surfaced (both on a remote run and when running locally with `kici run --local`), so a broken rule can never silently pass as a green run. For example, `rule('main only', (ctx) => ctx.event.ref.endsWith('main'))` throws on an event whose `ref` is undefined — that run fails with the error instead of quietly skipping every step. Fix the thrown error (guard the access) rather than relying on the skip.
+A rule's check function that **returns `false`** cleanly skips the job or step. A check function that **throws** counts as an evaluation failure, not a skip. The job or step **fails** with the error surfaced (both on a remote run and when running locally with `kici run --local`), so a broken rule can never silently pass as a green run. For example, `rule('main only', (ctx) => ctx.event.ref.endsWith('main'))` throws on an event whose `ref` is undefined — that run fails with the error instead of quietly skipping every step. Fix the thrown error (guard the access) rather than relying on the skip.
 
 ### rule(label) / rule(label, check)
 

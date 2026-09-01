@@ -1,6 +1,7 @@
 // Git operations use execFileSync directly (not zx) to avoid
 // PowerShell quoting issues with Windows paths containing backslashes.
 
+import { execFileSync } from 'node:child_process';
 import { setupSshAuth, type SshAuthSetup } from './ssh-auth.js';
 
 /**
@@ -48,6 +49,43 @@ interface CloneOptions {
   gitAuth?: GitAuth;
   /** Clone depth (default: 1 for shallow clone) */
   depth?: number;
+  /**
+   * When set, the clone is configured to use this credential helper, so every
+   * later git network operation asks the agent for a freshly minted credential
+   * instead of relying on one captured at clone time.
+   */
+  credentialHelperPath?: string;
+  /**
+   * When set, the temp SSH key is handed to the job rather than deleted when
+   * the clone returns — which is what lets a later step push. Omit and the
+   * existing cleanup applies unchanged.
+   */
+  sshCleanupRegistry?: SshCleanupRegistry;
+}
+
+/** Hands SSH key cleanup to the job, so the key outlives the clone. */
+export interface SshCleanupRegistry {
+  defer(cleanup: () => Promise<void>): void;
+}
+
+/**
+ * Point a clone at the agent's credential helper.
+ *
+ * Only the helper PATH is written — never a secret — which is what makes it
+ * safe to persist in `.git/config`. `useHttpPath` makes git include
+ * `path=owner/repo.git` in every credential query, without which the helper
+ * could not tell one repository from another and a write grant could not be
+ * confined to its own repo.
+ */
+export function configureCredentialHelper(workDir: string, helperPath: string): void {
+  execFileSync('git', ['-C', workDir, 'config', 'credential.helper', helperPath], {
+    stdio: 'pipe',
+    timeout: 10_000,
+  });
+  execFileSync('git', ['-C', workDir, 'config', 'credential.useHttpPath', 'true'], {
+    stdio: 'pipe',
+    timeout: 10_000,
+  });
 }
 
 /**
@@ -85,7 +123,17 @@ function redactSensitive(input: string): string {
  * @throws Error if clone fails or SHA does not match
  */
 export async function gitClone(options: CloneOptions): Promise<void> {
-  const { repoUrl, ref, sha, workDir, token, gitAuth, depth = 1 } = options;
+  const {
+    repoUrl,
+    ref,
+    sha,
+    workDir,
+    token,
+    gitAuth,
+    depth = 1,
+    credentialHelperPath,
+    sshCleanupRegistry,
+  } = options;
 
   // Normalise the auth inputs:
   //   - When both `gitAuth` and `token` are set, `gitAuth` wins (Phase 4 is
@@ -164,6 +212,14 @@ export async function gitClone(options: CloneOptions): Promise<void> {
       throw sanitizeGitError(err);
     }
 
+    // Configure the credential helper as soon as the clone exists, so every
+    // later git network operation on this tree (fetch, push) asks the agent for
+    // a freshly minted credential. Done here rather than at the end of the
+    // function because the SHA check below can return early.
+    if (credentialHelperPath) {
+      configureCredentialHelper(workDir, credentialHelperPath);
+    }
+
     // Verify HEAD matches expected SHA (skip when sha is empty or 'HEAD' — no specific commit to verify)
     if (!sha || sha === 'HEAD') return;
 
@@ -215,9 +271,16 @@ export async function gitClone(options: CloneOptions): Promise<void> {
     }
   } finally {
     if (sshSetup) {
-      await sshSetup.cleanup().catch(() => {
-        /* best effort — tempdir is in $TMPDIR and will be reaped eventually */
-      });
+      if (sshCleanupRegistry) {
+        // Hand over: the key must outlive this clone so a later `git push` can
+        // use it. SSH keys do not expire, so holding it for the job is safe.
+        const setup = sshSetup;
+        sshCleanupRegistry.defer(() => setup.cleanup().catch(() => {}));
+      } else {
+        await sshSetup.cleanup().catch(() => {
+          /* best effort — tempdir is in $TMPDIR and will be reaped eventually */
+        });
+      }
     }
     if (safeDirCleanup) {
       await safeDirCleanup();

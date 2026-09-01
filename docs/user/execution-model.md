@@ -49,6 +49,8 @@ Trigger matching can query the **contents** of individual source files, not just
 
 The orchestrator also does **not** run `dynamicJob` generator bodies itself: for the event-only (function) form it dispatches a dedicated dynamic-evaluation job to an agent at event time; the generator function then runs agent-side (see below).
 
+A workflow-level `filter` predicate is the same shape: the orchestrator sees only the lock's `hasFilter` flag, never the predicate, so it dispatches an evaluation job and lets an agent decide whether the workflow applies. Prefer the declarative filters where they answer the question — `commitMessage` on the trigger and `requires` over source files cost no evaluation job at all.
+
 See [dynamic values](./dynamic-values.md) for how dynamic `context`, `env`, and `concurrencyGroup` functions resolve.
 
 ## Agent time
@@ -59,20 +61,33 @@ After dispatch, each job runs in its own ephemeral agent sandbox: a shallow clon
 2. **Step-level rules**, then each step's `run()` body and its hooks.
 3. **Dynamic values** (`context`, `env`, `concurrencyGroup` functions) are resolved here, via a short `__init__` job that runs the function before the real job runs; this shows in the run timeline as an `Init:` entry.
 4. **`dynamicJob` generators run here — both forms.** The event-only (function) form runs in a dedicated evaluation job dispatched at event time; the result-aware (options) form is deferred until its declared `needs` complete, then run with the upstream outputs frozen as `ctx.needs`.
+5. **A workflow-level `filter` predicate runs here too**, before the jobs it gates. A global workflow evaluates it once per (event × workflow repo), before any run row exists, so a `false` verdict leaves no run at all. A same-repo workflow evaluates it once per job that reaches dispatch and once per job generator, after the run row exists, so a `false` verdict leaves a run whose only entries are the evaluation jobs. Keep the predicate cheap, pure, and side-effect free — a ten-job workflow calls it ten times for one event. See [narrowing with a filter](./global-workflows.md#narrowing-with-a-filter).
 
 See [job execution](../architecture/execution/job-execution.md) and [hooks and rules](./hooks.md) for the details.
 
+## How a reused agent stays clean between jobs
+
+An ephemeral agent is discarded after one job, so residue never matters. A **reused agent** — a long-lived process on a shared host (the bare-metal profile) — serves many jobs in turn. Between them, the agent runs a supervisor-owned cleanup phase so one job's leftovers never reach the next:
+
+1. **It reaps the finished job's process tree.** A step may background a daemon that outlives the job. The agent runs each job's process in its own process group and signals the whole group when the job ends, so a stray daemon does not survive into the next job. Set `KICI_AGENT_ORPHAN_CLEANUP=false` to keep only the runner and leave a backgrounded process alive on purpose.
+2. **It re-runs declared cleanup after a hard kill.** A job's `cleanup` / `onFailure` hooks normally run in the job process. If that process is killed hard (out of memory, forced stop), the agent re-runs the declared cleanup against the preserved work directory.
+3. **It deletes the work directory.**
+4. **It runs an optional operator reset command.** Set `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND` to a host-reset command (for example, pruning a container cache). It runs after the reap and work-directory deletion. A failure never fails the finished job.
+
+This phase is the primary cross-job cleanup. The agent's startup temp-directory sweep stays as a backstop for anything a between-jobs phase missed. See [agent configuration](../operator/agent/configuration.md) for the full env-var reference.
+
 ## What re-evaluates where
 
-| Construct                    | Runs on          | When                            |
-| ---------------------------- | ---------------- | ------------------------------- |
-| Static value                 | Compile → lock   | Never re-evaluated              |
-| Dynamic value                | Agent init step  | Per event                       |
-| Job-level rules              | Agent            | After clone                     |
-| Step-level rules             | Agent            | Per step                        |
-| `dynamicJob` (function form) | Agent (eval job) | Dispatched at event time        |
-| `dynamicJob` (options form)  | Agent            | Deferred until `needs` complete |
-| Step / job body + hooks      | Agent            | Per job                         |
+| Construct                    | Runs on          | When                                                 |
+| ---------------------------- | ---------------- | ---------------------------------------------------- |
+| Static value                 | Compile → lock   | Never re-evaluated                                   |
+| Dynamic value                | Agent init step  | Per event                                            |
+| Job-level rules              | Agent            | After clone                                          |
+| Step-level rules             | Agent            | Per step                                             |
+| `dynamicJob` (function form) | Agent (eval job) | Dispatched at event time                             |
+| `dynamicJob` (options form)  | Agent            | Deferred until `needs` complete                      |
+| Workflow `filter` predicate  | Agent (eval job) | Per event (global) / per job + generator (same-repo) |
+| Step / job body + hooks      | Agent            | Per job                                              |
 
 **Determinism note.** `ctx.event` and `ctx.needs` are frozen snapshots — captured once and replayed unchanged on any re-evaluation. A generator that derives its output from them is stable across re-evaluations; one that reads the wall clock (`Date.now()`) or a random source (`Math.random()`) is not.
 

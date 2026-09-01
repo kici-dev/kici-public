@@ -12,7 +12,7 @@ import { planePaths, planePorts } from './paths.js';
  * `TS_CONST_PINS` in hack/containers-lock.ts (identity
  * docker.io/library/postgres+alpine), so a lock bump rewrites it in place.
  */
-export const PLANE_PG_IMAGE = 'docker.io/library/postgres:18.4-alpine';
+export const PLANE_PG_IMAGE = 'docker.io/library/postgres:18.6-alpine';
 
 /** Name of the fallback podman Postgres container. */
 export const PLANE_PG_CONTAINER = 'kici-local-postgres';
@@ -22,20 +22,6 @@ export type PlanePgHandle = {
   kind: 'embedded' | 'podman';
   stop(): Promise<void>;
 };
-
-let readyPoller = defaultReadyPoller;
-
-/** Test seam: override the podman readiness poller. */
-export function __setReadyPollerForTest(fn: typeof readyPoller): void {
-  readyPoller = fn;
-}
-
-let embeddedDaemon = defaultEmbeddedDaemon;
-
-/** Test seam: override the embedded postmaster daemonizer. */
-export function __setEmbeddedDaemonForTest(fn: typeof embeddedDaemon): void {
-  embeddedDaemon = fn;
-}
 
 async function defaultReadyPoller(_port: number): Promise<boolean> {
   // Probe readiness from inside the container so the host does not need a
@@ -176,8 +162,14 @@ export async function stopPlanePostgres(kind: 'embedded' | 'podman'): Promise<vo
  * (or when forced via `forcePodman` / `KICI_LOCAL_PG_MODE=podman`).
  */
 export async function startPlanePostgres(
-  opts: { forcePodman?: boolean } = {},
+  opts: {
+    forcePodman?: boolean;
+    readyPoller?: (port: number) => Promise<boolean>;
+    embeddedDaemon?: (port: number) => Promise<void>;
+  } = {},
 ): Promise<PlanePgHandle> {
+  const readyPoller = opts.readyPoller ?? defaultReadyPoller;
+  const embeddedDaemon = opts.embeddedDaemon ?? defaultEmbeddedDaemon;
   const { postgres: port } = planePorts();
   const url = `postgres://kici:kici@127.0.0.1:${port}/kici_local`;
   const forcePodman = opts.forcePodman || process.env.KICI_LOCAL_PG_MODE === 'podman';

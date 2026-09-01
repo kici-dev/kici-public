@@ -17,7 +17,9 @@
  * right destination (repo entries under `workDir`, home entries under the
  * homedir). Extraction lands in a scratch dir first, then moves each group
  * into place so a partial restore never leaves half-written paths in the live
- * tree (mirrors dep-restore).
+ * tree (mirrors dep-restore). The scratch dir honors `KICI_TMPDIR`, which may
+ * sit on a different filesystem from the workspace, so the move falls back to
+ * copy-then-remove on `EXDEV` rather than assuming a same-filesystem rename.
  */
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
@@ -123,6 +125,26 @@ export async function packCachePaths(
   }
 }
 
+/**
+ * Move a tree from `src` to `dest`. Attempts a rename (same-filesystem, cheap)
+ * and falls back to copy-then-remove only on `EXDEV` — the errno `rename(2)`
+ * reports when the scratch dir (which honors `KICI_TMPDIR`) is on a different
+ * filesystem from the destination workspace. `verbatimSymlinks` keeps a cached
+ * symlink graph intact (mirroring packCachePaths), and `preserveTimestamps`
+ * keeps mtimes stable so the fallback is byte-for-byte equivalent to the
+ * rename. Any non-`EXDEV` error propagates so a real permission or corruption
+ * failure is never silently turned into a copy.
+ */
+async function moveOrCopy(src: string, dest: string): Promise<void> {
+  try {
+    await rename(src, dest);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+    await cp(src, dest, { recursive: true, verbatimSymlinks: true, preserveTimestamps: true });
+    await rm(src, { recursive: true, force: true });
+  }
+}
+
 /** Move the extracted `__repo__` / `__home__` groups from a scratch dir into place. */
 async function moveAnchoredGroups(
   scratchDir: string,
@@ -137,7 +159,7 @@ async function moveAnchoredGroups(
       const dest = join(destRoot, child);
       await mkdir(dirname(dest), { recursive: true });
       await rm(dest, { recursive: true, force: true });
-      await rename(join(anchorDir, child), dest);
+      await moveOrCopy(join(anchorDir, child), dest);
     }
   }
 }

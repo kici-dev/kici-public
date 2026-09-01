@@ -73,6 +73,24 @@ export const webhookActivitySchema = z.object({
   orchestratorUnavailable: z.boolean(),
 });
 export type WebhookActivity = z.infer<typeof webhookActivitySchema>;
+const issueReportCreateSchema = z.object({ ref: z.string(), uploadUrl: z.string() });
+const issueReportConfirmSchema = z.object({ ref: z.string(), status: z.string() });
+const issueReportDeleteSchema = z.object({ ref: z.string(), deleted: z.boolean() });
+const issueReportListSchema = z.object({
+  reports: z.array(
+    z.object({
+      ref: z.string(),
+      bundleId: z.string(),
+      byteSize: z.number(),
+      status: z.string(),
+      createdAt: z.string(),
+      userId: z.string(),
+      message: z.string().nullable(),
+    }),
+  ),
+});
+export type IssueReportListResponse = z.infer<typeof issueReportListSchema>;
+
 const rerunResponseSchema = z.object({ newRunId: z.string() });
 // `alreadyTerminal` is optional: an orchestrator predating the field reports
 // nothing, and absent means "not reported", not "false".
@@ -293,6 +311,40 @@ export class DashboardClient {
    */
   async listArtifacts(runId: string): Promise<ArtifactsListResult> {
     return artifactsListResultSchema.parse(await this.getJson(`/runs/${runId}/artifacts`));
+  }
+
+  /**
+   * Reserve an issue-report upload slot.
+   *
+   * Returns a presigned PUT the caller uploads the bundle bytes to directly —
+   * the Platform never proxies them — plus the reference id the customer
+   * quotes to support.
+   */
+  async createIssueReport(body: {
+    bundleId: string;
+    byteSize: number;
+    sha256: string;
+    message?: string;
+    email?: string;
+  }): Promise<{ ref: string; uploadUrl: string }> {
+    return issueReportCreateSchema.parse(await this.postJson('/issue-reports', body));
+  }
+
+  /** Tell the Platform the bytes landed, so it can verify and mark the report received. */
+  async confirmIssueReport(ref: string): Promise<{ ref: string; status: string }> {
+    return issueReportConfirmSchema.parse(
+      await this.postJson(`/issue-reports/${encodeURIComponent(ref)}/confirm`),
+    );
+  }
+
+  async listIssueReports(): Promise<IssueReportListResponse> {
+    return issueReportListSchema.parse(await this.getJson('/issue-reports'));
+  }
+
+  async withdrawIssueReport(ref: string): Promise<{ ref: string; deleted: boolean }> {
+    return issueReportDeleteSchema.parse(
+      await this.deleteJson(`/issue-reports/${encodeURIComponent(ref)}`),
+    );
   }
 
   async rerunRun(runId: string): Promise<{ newRunId: string }> {

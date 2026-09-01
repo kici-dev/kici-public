@@ -45,6 +45,7 @@ import { registerHostCommands } from './commands/host.js';
 import { registerOrgSettingsCommands } from './commands/org-settings.js';
 import { registerClusterSettingsCommands } from './commands/cluster-settings.js';
 import { registerTrustPolicyCommands } from './commands/trust-policy.js';
+import { registerHeldRunCommands } from './commands/held-run.js';
 import { registerClusterNameCommands } from './commands/cluster-name.js';
 import { registerClusterCommands } from './commands/cluster.js';
 import { registerMaintenanceCommands } from './commands/maintenance.js';
@@ -61,6 +62,19 @@ import { registerFirecrackerCommands } from './commands/firecracker/index.js';
 import { registerScalerCommands } from './commands/scaler.js';
 import { registerJoinCommand } from './join.js';
 
+declare const KICI_PKG_VERSION: string;
+
+/**
+ * The version `kici-admin --version` reports.
+ *
+ * `scripts/build-service.mjs` defines `KICI_PKG_VERSION` for every orchestrator
+ * build entry, `cli.js` included, so a shipped binary reports the package
+ * version it was built from. The fallback covers a source run (tests, `tsx`),
+ * where no bundler substituted the constant — the same shape `server.ts` and
+ * `standalone.ts` use for `ORCHESTRATOR_VERSION`.
+ */
+export const CLI_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
+
 /**
  * Build the kici-admin Commander program with every command group registered.
  * Exported so the surface registry can walk the real command tree without
@@ -74,7 +88,7 @@ export function buildProgram(): Command {
   program
     .name('kici-admin')
     .description('KiCI orchestrator admin CLI for managing config, secrets, and tokens')
-    .version('0.0.1', '-V, --cli-version')
+    .version(CLI_VERSION, '-V, --cli-version')
     .option(
       '-u, --url <url>',
       'Orchestrator URL',
@@ -136,6 +150,7 @@ export function buildProgram(): Command {
   registerOrgSettingsCommands(program, getClient);
   registerClusterSettingsCommands(program, getClient);
   registerTrustPolicyCommands(program, getClient);
+  registerHeldRunCommands(program, getClient);
   registerClusterNameCommands(program, getClient);
   // Cluster identity recovery (reconcile-identity) is DB + S3 direct — no admin
   // HTTP client — so it works while the orchestrator is crash-looping on a

@@ -134,6 +134,20 @@ async function main() {
     process.exit(1);
   }
 
+  // Dev-only entries (e.g. an orchestrator test-double server that wires
+  // fault injection) are built ONLY behind an explicit gate — `--dev` or
+  // KICI_BUILD_DEV_ENTRIES=1 — so a release/publish build (which passes
+  // neither) never emits them into dist/, and they therefore never reach a
+  // published npm tarball or a container image. Staging / E2E builds opt in
+  // via the gate (see scripts/build-pipeline.ts's deploy-stg scope).
+  const includeDevEntries =
+    process.argv.includes('--dev') || process.env.KICI_BUILD_DEV_ENTRIES === '1';
+  const devEntries = pkg.build?.devEntries;
+  const allEntries =
+    includeDevEntries && devEntries && typeof devEntries === 'object'
+      ? { ...entries, ...devEntries }
+      : entries;
+
   // Build-time constants (hardcoded into every service bundle).
   // KICI_BUILD_COMMIT env var is set by container builds (git unavailable in containers);
   // falls back to git rev-parse when building locally.
@@ -187,7 +201,7 @@ const __dirname = __cjs_dirname(__filename);
     },
   };
 
-  for (const [outputFile, srcFile] of Object.entries(entries)) {
+  for (const [outputFile, srcFile] of Object.entries(allEntries)) {
     const inputPath = path.join(cwd, srcFile);
     const outputPath = path.join(stage, outputFile);
 
@@ -244,7 +258,7 @@ const __dirname = __cjs_dirname(__filename);
   pruneStaleArtifacts(cwd, published);
   pruneOrphanDeclarations(cwd);
 
-  console.log(`Built ${Object.keys(entries).length} entry points to dist/`);
+  console.log(`Built ${Object.keys(allEntries).length} entry points to dist/`);
   // Emit baked workspace dep metadata so local builds make drift visible in one line.
   // `unknown` indicates the peer's dist/index.js didn't exist (self-build or out-of-order).
   const shortHash = (h) => (h === 'unknown' ? 'unknown' : h.slice(0, 12));

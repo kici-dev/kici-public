@@ -75,6 +75,15 @@ export const ExecutionJobStatus = z.enum([
 export type ExecutionJobStatus = z.infer<typeof ExecutionJobStatus>;
 
 /**
+ * Job kind on the wire. `standard` runs steps on an agent; `gate` is an invoke
+ * gate that summons source-repo runs instead of running steps; `proxy` mirrors
+ * one summoned run's lifecycle. The orchestrator's DB `JobKind` enum mirrors
+ * these members.
+ */
+export const JobKind = z.enum(['standard', 'gate', 'proxy']);
+export type JobKind = z.infer<typeof JobKind>;
+
+/**
  * The status values a notification subscription may target at the given level.
  *
  * A run-level subscription matches against an `ExecutionRunStatus`; a job-level
@@ -190,6 +199,30 @@ export type RunFailureClass = z.infer<typeof RunFailureClass>;
 export const CacheStepType = z.enum(['cache:restore', 'cache:save']);
 export type CacheStepType = z.infer<typeof CacheStepType>;
 
+/**
+ * `step_type` values for pseudo-steps that run BEFORE a job's real steps.
+ *
+ * A run's step timeline is ordered by `step_index`, and every pseudo-step index
+ * sits ABOVE the real steps (the wire schema requires a non-negative index, and
+ * the in-sandbox allocators claim a high block). That is fine for the cache
+ * pseudo-steps, which mostly bracket the work — but a job's image build runs
+ * strictly first, and rendering it last reads as though it happened last.
+ *
+ * A reader therefore sorts these types ahead of everything else, by TYPE rather
+ * than by index. Keeping the ordering rule here — rather than as a negative
+ * index — is deliberate: `step.status` rejects a negative index outright, so an
+ * agent that sent one to an older orchestrator would have its connection closed
+ * mid-job, and two consumers (the check-run reporter's array write, the
+ * dashboard's `stepIndex >= 0` log gate) treat a negative index as absent.
+ */
+export const SetupStepType = z.enum(['container:build']);
+export type SetupStepType = z.infer<typeof SetupStepType>;
+
+/** True when a `step_type` names a pseudo-step that ran before the real steps. */
+export function isSetupStepType(stepType: string | null | undefined): boolean {
+  return stepType != null && SetupStepType.safeParse(stepType).success;
+}
+
 /** `run.event` types emitted for user-facing cache operations. */
 export const CacheRunEventType = z.enum(['cache.restore', 'cache.save']);
 export type CacheRunEventType = z.infer<typeof CacheRunEventType>;
@@ -295,6 +328,17 @@ export const executionStatusSchema = z.object({
    * older orchestrator that never sends it.
    */
   workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
+  /**
+   * True when this run records a global evaluation round rather than a
+   * workflow.
+   *
+   * The Platform mirrors it so its own re-run refusal can admit a round: a
+   * round is definitionally cross-repository, and re-running one re-evaluates
+   * the original event instead of resolving a workflow out of the acted-on
+   * repository's lock file. Absent means an ordinary run — optional for
+   * backward compatibility with an orchestrator that never sends it.
+   */
+  isGlobalEvalRound: z.boolean().optional(),
   /**
    * Run-level repo provider (origin host: `github` / `gitlab` / `bitbucket` /
    * `local`). Distinct from the routing-key-derived source provider; drives the
@@ -402,6 +446,14 @@ export const jobStatusForwardSchema = z.object({
   timestamp: z.number(),
   /** Structured init-failure signal — set for synthetic rejected-* / init-failed-* jobs. */
   initFailure: initFailureSchema.optional(),
+  /**
+   * Job kind. Absent means an ordinary `standard` job. `gate`/`proxy` mark an
+   * invoke gate and its per-run proxy children. Additive/optional — an older
+   * peer ignores it.
+   */
+  jobKind: JobKind.optional(),
+  /** For a `proxy` job, the summoned run it mirrors. Additive/optional. */
+  summonedRunId: z.string().max(STATUS_ID_MAX).optional(),
 });
 
 /** State replay sent on orchestrator reconnection -- full snapshot of active runs and jobs. */

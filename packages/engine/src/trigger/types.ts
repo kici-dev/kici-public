@@ -33,6 +33,11 @@
  * Schema version 34 (additive): adds LockWorkflow.hasFilter (workflow-level pre-dispatch filter predicate).
  * Schema version 35 (additive): adds `commitMessage` (LockTextMatch) to the push/pr/tag
  *   git-event triggers, and contains/notContains/notMatches to LockContentRequirement.
+ * Schema version 36 (additive): adds LockJob.invoke (invokeSource gate, incl. optional).
+ * Schema version 37 (additive): adds LockJob.gitCredentials (named git credential refs).
+ * Schema version 38 (additive): adds container.auth (private-registry credentials for the job image).
+ * Schema version 39 (additive): adds container.dockerfile/context/target/args (build the
+ *   job's image from a Dockerfile in the repo) and container.auth.registry.
  */
 
 import { z } from 'zod';
@@ -48,7 +53,7 @@ import { isFailureStatus } from '../status/presentation.js';
  * schema change (additive or breaking); the bump-history comment above records
  * which. See `BREAKING_FLOOR` for the compatibility-window semantics.
  */
-export const SCHEMA_VERSION = 35 as const;
+export const SCHEMA_VERSION = 39 as const;
 
 /**
  * Oldest lock schema version this codebase can still read correctly — the lower
@@ -802,9 +807,35 @@ export interface ResolvedSandboxGrant {
   user?: string;
 }
 
+/**
+ * Invoke-gate action carried on a lock job (compiled from `invokeSource()`).
+ * A job carrying this never runs steps on an agent: the orchestrator emits the
+ * named kici event at the source repo and gates on the runs it triggers.
+ */
+export interface LockInvoke {
+  /** The kici event name to emit; source-repo workflows subscribe with `kiciEvent({ name })`. */
+  readonly event: string;
+  /** Target scope. `'source'` targets exactly the source repo (the only v1 scope). */
+  readonly scope: 'source';
+  /** Optional event payload delivered to subscribers. */
+  readonly payload?: Readonly<Record<string, unknown>>;
+  /**
+   * When true, a zero-subscriber emit succeeds immediately (the repo may opt
+   * out). Absent/false (the default) fails the gate on zero subscribers.
+   */
+  readonly optional?: boolean;
+}
+
 export interface LockJob {
   readonly _type: 'static';
   readonly name: string;
+  /**
+   * Invoke-gate action. When set, the job is a gate: it never dispatches steps
+   * to an agent; the orchestrator emits `invoke.event` at the source repo and
+   * tracks each triggered run as a proxy child. Additive — an older
+   * orchestrator that does not understand it ignores it (the gate stays inert).
+   */
+  readonly invoke?: LockInvoke;
   /** Single-agent targeting matchers. Absent when the job uses `runsOnAll` instead. */
   readonly runsOn?: readonly LabelMatcher[];
   readonly excludeLabels?: readonly LabelMatcher[];
@@ -814,6 +845,16 @@ export interface LockJob {
    * `any` picks any available agent. Absent on a `runsOnAll` fan-out job.
    */
   readonly runsOnPick?: RunsOnPick;
+  /**
+   * Named git credentials for this job, as SECRET NAMES in qualified
+   * `<context>:<secret-name>` form — never credential material.
+   *
+   * `default` is used when a call names no credential; any other key is
+   * referenced by name. Additive: an older orchestrator that does not
+   * understand it simply passes it through in `jobConfig`, and an older agent
+   * ignores it (git falls back to its own mechanisms, exactly as before).
+   */
+  readonly gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /**
    * Host fan-out predicate (mutually exclusive with `runsOn`). When set, the job
    * fans out to every roster host matching the predicate, one pinned child per host.
@@ -877,13 +918,58 @@ export interface LockJob {
   readonly resources?: import('../scaler/resource-types.js').ResourceRequest;
   /**
    * Container image selecting the container execution backend on the agent. A
-   * bare image string or an object with `image` + optional `env`. When set, the
-   * agent's `determineExecutionMode` routes the job to the container sandbox
-   * (top priority), so the orchestrator threads it through dispatch as
-   * `jobConfig.container`. (Shape mirrors the SDK `string | ContainerConfig`;
-   * the engine cannot import the SDK, so it is inlined here.)
+   * bare image string, or an object naming exactly one image source: a
+   * finalized `image`, or a `dockerfile` the agent builds from the cloned tree
+   * before the job starts. When set, the agent's `determineExecutionMode`
+   * routes the job to the container sandbox (top priority), so the orchestrator
+   * threads it through dispatch as `jobConfig.container`. (Shape mirrors the SDK
+   * `string | ContainerConfig`, including `ContainerRegistryAuth`; the engine
+   * cannot import the SDK, so it is inlined here.)
    */
-  readonly container?: string | { readonly image: string; readonly env?: Record<string, string> };
+  readonly container?:
+    | string
+    | {
+        /** Finalized image to pull. Exactly one of `image` / `dockerfile` is set. */
+        readonly image?: string;
+        /**
+         * Repo-relative Dockerfile the agent builds before the job runs.
+         *
+         * The agent re-validates this path against the resolved workdir: a lock
+         * file is repo content, so a path that escapes the tree must be refused
+         * on the agent too, not only by the SDK that wrote it.
+         */
+        readonly dockerfile?: string;
+        /** Repo-relative build context. Defaults to the repository root. */
+        readonly context?: string;
+        /** Build stage to stop at. */
+        readonly target?: string;
+        /**
+         * Build arguments. Plain strings — never secret references, because a
+         * build argument is recorded in the built image's history.
+         */
+        readonly args?: Record<string, string>;
+        readonly env?: Record<string, string>;
+        /**
+         * Private-registry credentials for pulling `image`.
+         *
+         * Flattened `Sourced<Name>` pairs: exactly one half of each pair is
+         * set — `*Secret` names a `<context>:<secret-name>` entry to resolve,
+         * `*Value` carries material supplied at run time.
+         */
+        readonly auth?: {
+          readonly username?: string;
+          readonly usernameSecret?: string;
+          readonly usernameValue?: string;
+          readonly tokenSecret?: string;
+          readonly tokenValue?: string;
+          /**
+           * Registry host the credentials belong to. Derived from `image` when
+           * one is set; REQUIRED with `dockerfile`, whose base image is named
+           * inside the Dockerfile and cannot be read back out reliably.
+           */
+          readonly registry?: string;
+        };
+      };
   /**
    * Workflow-declared per-job sandbox escape-hatch request (container jobs
    * only). The orchestrator resolves it at dispatch against the operator's

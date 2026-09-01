@@ -93,6 +93,25 @@ export const triggerRunToolSchema = {
   registrationId: z.string().min(1).describe('The workflow registration id to trigger.'),
 };
 
+/**
+ * The two filters that separate holds a job name cannot. One job can carry more
+ * than one pending hold — an SDK `requireApproval` paired with a security-typed
+ * context gate writes two job-scoped rows under one job name — so `job` alone is
+ * ambiguous for that shape, and the error listing names these instead.
+ */
+const holdTypeArg = z
+  .string()
+  .optional()
+  .describe(
+    'Hold type (reviewer, timer, concurrency, security), when one job carries more than one hold.',
+  );
+const holdIdArg = z
+  .string()
+  .optional()
+  .describe(
+    'A specific hold id, as printed in the candidate list when nothing else separates them.',
+  );
+
 export const approveRunToolSchema = {
   orgId: orgIdArg,
   runId: z.string().min(1).describe('The run whose held approval gate to approve.'),
@@ -101,6 +120,8 @@ export const approveRunToolSchema = {
     .string()
     .optional()
     .describe('Zero-based step index (requires job) for a step-scoped hold.'),
+  holdType: holdTypeArg,
+  holdId: holdIdArg,
 };
 
 export const rejectRunToolSchema = {
@@ -111,6 +132,8 @@ export const rejectRunToolSchema = {
     .string()
     .optional()
     .describe('Zero-based step index (requires job) for a step-scoped hold.'),
+  holdType: holdTypeArg,
+  holdId: holdIdArg,
   reason: z.string().min(1).describe('Why the gate is rejected (required).'),
 };
 

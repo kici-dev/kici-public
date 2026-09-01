@@ -50,6 +50,7 @@ const mockRm = vi.fn().mockResolvedValue(undefined);
 const mockWriteFile = vi.fn().mockResolvedValue(undefined);
 const mockReadFile = vi.fn().mockResolvedValue('12345');
 const mockReaddir = vi.fn().mockResolvedValue([]);
+const mockStat = vi.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 const mockFdTruncate = vi.fn().mockResolvedValue(undefined);
 const mockFdClose = vi.fn().mockResolvedValue(undefined);
 const mockOpen = vi.fn().mockResolvedValue({ truncate: mockFdTruncate, close: mockFdClose });
@@ -62,6 +63,7 @@ vi.mock('node:fs/promises', () => ({
   writeFile: (...args: unknown[]) => mockWriteFile(...args),
   readFile: (...args: unknown[]) => mockReadFile(...args),
   readdir: (...args: unknown[]) => mockReaddir(...args),
+  stat: (...args: unknown[]) => mockStat(...args),
 }));
 
 // Mock file-tail (prevent real fs.watchFile/unwatchFile calls from tailFile)
@@ -172,6 +174,7 @@ describe('FirecrackerScalerBackend', () => {
     mockWaitForSocket.mockResolvedValue(true);
     mockReadFile.mockResolvedValue('12345');
     mockReaddir.mockResolvedValue([]);
+    mockStat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
     mockLink.mockResolvedValue(undefined);
     mockMkdir.mockResolvedValue(undefined);
     mockRm.mockResolvedValue(undefined);
@@ -638,6 +641,62 @@ describe('FirecrackerScalerBackend', () => {
       }
     });
 
+    it('never signals PID 0 read from a truncated PID file', async () => {
+      // `process.kill(0, 'SIGKILL')` signals the orchestrator's OWN process
+      // group, so a zeroed or truncated `firecracker.pid` must not reach it.
+      const { backend, mockIpAllocator } = createBackend();
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      mockReadFile.mockResolvedValue('0');
+
+      const origKill = process.kill;
+      const mockKill = vi.fn();
+      process.kill = mockKill as never;
+
+      try {
+        await backend.destroy('agent-1');
+
+        expect(mockKill).not.toHaveBeenCalled();
+        // The rest of the teardown still runs.
+        expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
+      } finally {
+        process.kill = origKill;
+      }
+    });
+
+    it('reads a truncated PID file as a dead VM, not as a live process group', async () => {
+      // Signal 0 to PID 0 probes this process's own group, which always exists,
+      // so a `!isNaN` liveness check would call every truncated-PID VM alive —
+      // and every sweep would skip its chroot and its IP forever.
+      const { backend } = createBackend();
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      mockReadFile.mockResolvedValue('0');
+      mockReaddir.mockResolvedValue(['agent-2']);
+
+      const origKill = process.kill;
+      const mockKill = vi.fn();
+      process.kill = mockKill as never;
+
+      try {
+        // `agent-2` has a chroot, a truncated PID file, and no DB allocation:
+        // the Pass-2 filesystem orphan, reaped only when it reads as dead.
+        await backend.cleanupOrphans();
+
+        expect(mockKill).not.toHaveBeenCalled();
+        expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-2', {
+          recursive: true,
+          force: true,
+        });
+      } finally {
+        process.kill = origKill;
+      }
+    });
+
     it('reclaims chroot ownership via sudo chown before rm on rootless nodes (requireSudo)', async () => {
       const { backend } = createBackend({ requireSudo: true });
       await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
@@ -779,6 +838,168 @@ describe('FirecrackerScalerBackend', () => {
     });
   });
 
+  describe('reapUnowned()', () => {
+    /** A directory `stat` result — only `isDirectory()` is read. */
+    const dirStat = { isDirectory: () => true };
+
+    function withMockedKill<T>(kill: ReturnType<typeof vi.fn>, body: () => Promise<T>): Promise<T> {
+      const origKill = process.kill;
+      process.kill = kill as never;
+      return body().finally(() => {
+        process.kill = origKill;
+      });
+    }
+
+    it('reclaims a VM whose chroot is on this host but which the backend no longer tracks', async () => {
+      // The leak: an orchestrator restart empties the in-memory agent map, so
+      // `destroy()` returns at its first line while the VM keeps running, and
+      // `cleanupOrphans()` skips it too because its jailer process is alive.
+      const { backend, mockIpAllocator } = createBackend();
+      mockStat.mockResolvedValue(dirStat);
+      mockReadFile.mockResolvedValue('12345');
+      mockIpAllocator.getAllocationForVm.mockResolvedValue({
+        ip: '10.0.0.2',
+        vm_id: 'scaler-firecracker-deadbeef',
+        scaler_name: 'test-fc',
+        tap_device: 'kici-aaaaaaaa',
+        mac_address: '06:00:AC:00:00:02',
+      });
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-deadbeef'),
+      );
+
+      expect(reaped).toBe(true);
+      expect(kill).toHaveBeenCalledWith(12345, 'SIGKILL');
+      expect(mockRemoveIsolationRules).toHaveBeenCalledWith('10.0.0.2', expect.anything());
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'ip',
+        ['link', 'del', 'kici-aaaaaaaa'],
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(mockIpAllocator.release).toHaveBeenCalledWith('scaler-firecracker-deadbeef');
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/scaler-firecracker-deadbeef', {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    it('touches nothing when this host carries no artifact for the id', async () => {
+      // THE DANGEROUS DIRECTION. On an HA cluster a refused agent's VM lives on
+      // whichever host spawned it, and the coordinator it happens to reach may
+      // not be that host. Reclaiming on a bare id would let one coordinator's
+      // refusal destroy a peer's live VM — so the on-host artifact is the only
+      // thing that authorizes the reap.
+      const { backend, mockIpAllocator } = createBackend();
+      // mockStat rejects ENOENT and getAllocationForVm resolves null by default.
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-elsewhere'),
+      );
+
+      expect(reaped).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+      expect(mockRemoveIsolationRules).not.toHaveBeenCalled();
+    });
+
+    it('never acts on an allocation row alone, which a peer coordinator shares', async () => {
+      // THE SAME DANGEROUS DIRECTION, by the other route. An HA pair is "two
+      // identical orchestrators sharing the same PostgreSQL, scalers, and
+      // routing key", so a peer's LIVE VM has a row in this same table naming
+      // this same scaler. Releasing it hands its address to the next VM — two
+      // guests on one IP, sharing the saddr-keyed rules that separate them. The
+      // chroot is the only artifact that places a VM on this host.
+      const { backend, mockIpAllocator } = createBackend();
+      // No chroot here: mockStat rejects ENOENT by default.
+      mockIpAllocator.getAllocationForVm.mockResolvedValue({
+        ip: '10.0.0.9',
+        vm_id: 'scaler-firecracker-peer',
+        scaler_name: 'test-fc',
+        tap_device: 'kici-bbbbbbbb',
+        mac_address: '06:00:AC:00:00:09',
+      });
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-peer'),
+      );
+
+      expect(reaped).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      expect(mockRemoveIsolationRules).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+
+    it('leaves a second scaler on this host holding its own IP', async () => {
+      // The chroot authorizes the VM teardown, but the IP space belongs to
+      // whichever scaler allocated it, and that scaler runs its own teardown.
+      const { backend, mockIpAllocator } = createBackend();
+      mockStat.mockResolvedValue(dirStat);
+      mockIpAllocator.getAllocationForVm.mockResolvedValue({
+        ip: '10.0.0.9',
+        vm_id: 'scaler-firecracker-other',
+        scaler_name: 'some-other-fc',
+        tap_device: 'kici-bbbbbbbb',
+        mac_address: '06:00:AC:00:00:09',
+      });
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-other'),
+      );
+
+      expect(reaped).toBe(true);
+      expect(kill).toHaveBeenCalledWith(12345, 'SIGKILL');
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      expect(mockRemoveIsolationRules).not.toHaveBeenCalled();
+    });
+
+    it('never signals PID 0 read from a truncated PID file', async () => {
+      // Same guard as `destroy()`: killing 0 kills this orchestrator's own
+      // process group. The chroot teardown still runs.
+      const { backend } = createBackend();
+      mockStat.mockResolvedValue(dirStat);
+      mockReadFile.mockResolvedValue('0');
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () =>
+        backend.reapUnowned('scaler-firecracker-truncated'),
+      );
+
+      expect(reaped).toBe(true);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/scaler-firecracker-truncated', {
+        recursive: true,
+        force: true,
+      });
+    });
+
+    it('defers to destroy() while the backend still tracks the agent', async () => {
+      // A tracked agent has a live TAP and IP that `destroy()` holds; reaping
+      // underneath it would race that teardown.
+      const { backend, mockIpAllocator } = createBackend();
+      await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
+
+      vi.clearAllMocks();
+      mockExecFile.mockImplementation(defaultExecFileImpl);
+      mockStat.mockResolvedValue(dirStat);
+      const kill = vi.fn();
+
+      const reaped = await withMockedKill(kill, () => backend.reapUnowned('agent-1'));
+
+      expect(reaped).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      expect(mockIpAllocator.release).not.toHaveBeenCalled();
+      expect(mockRm).not.toHaveBeenCalled();
+    });
+  });
+
   describe('shutdownAll()', () => {
     it('destroys all managed agents', async () => {
       const { backend, mockIpAllocator } = createBackend();
@@ -873,6 +1094,33 @@ describe('FirecrackerScalerBackend', () => {
       ];
       backend.reload(newLabelSets);
       expect(backend.labelSets).toEqual(newLabelSets);
+    });
+
+    it('applies a new maxAgents on reload', () => {
+      const { backend } = createBackend();
+      expect(backend.maxAgents).toBe(5);
+
+      const result = backend.reload(
+        [{ labels: ['linux', 'new'], rootfsPath: '/opt/rootfs/n.ext4' }],
+        { maxAgents: 9 },
+      );
+
+      expect(result.valid).toBe(true);
+      expect(backend.maxAgents).toBe(9);
+    });
+
+    it('keeps the current maxAgents when the opts argument is omitted', () => {
+      const { backend } = createBackend();
+      backend.reload([{ labels: ['linux', 'new'], rootfsPath: '/opt/rootfs/n.ext4' }]);
+      expect(backend.maxAgents).toBe(5);
+    });
+
+    it('leaves maxAgents untouched when the new label sets are invalid', () => {
+      const { backend } = createBackend();
+      const result = backend.reload([{ labels: ['linux', 'node20'] }], { maxAgents: 9 });
+
+      expect(result.valid).toBe(false);
+      expect(backend.maxAgents).toBe(5);
     });
   });
 

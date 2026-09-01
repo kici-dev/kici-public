@@ -50,7 +50,11 @@ The tarball is **platform-agnostic** — raw `.kici/` source files are identical
 - **Platform**: detected from the target agent (e.g., `linux`, `darwin`, `win32`; defaults to `linux` when no agents are registered)
 - **Arch**: detected from the target agent (e.g., `x64`, `arm64`; defaults to `x64` when no agents are registered)
 
-Key format: `deps/{platform}-{arch}/{lockfileHash}.tar.gz`
+Key format: two objects per entry — the tarball at
+`deps/{platform}-{arch}/{depsHash}.tar.gz`, addressed by its own content
+hash, and a pointer at `deps/{platform}-{arch}/{lockfileHash}.hash` holding
+that hash. Content-addressing keeps the tarball immutable, so two builds sharing
+a lock file and platform cannot leave a tarball and a hash that disagree.
 
 When the lockfile changes (new dependency added, version bumped), the cache key changes and a fresh build is triggered. When the lockfile is unchanged and the platform/arch match, the cached tarball is reused. Different architectures produce separate cache entries (e.g., `deps/linux-x64/abc123.tar.gz` and `deps/linux-arm64/abc123.tar.gz`) because native `node_modules` builds are not portable.
 
@@ -58,10 +62,10 @@ When the lockfile changes (new dependency added, version bumped), the cache key 
 
 KiCI maintains two caches that share the same storage backend:
 
-| Cache        | Key Format                                     | Contents                                                                                              | Invalidation                                                                                  | Platform scope             |
-| ------------ | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | -------------------------- |
-| Source cache | `source/{contentHash}.tar.gz`                  | Raw `.kici/` directory minus `node_modules/` (deterministic gzip tar)                                 | Workflow `.ts` or any `hashFiles` asset changes; `COMPILE_SCHEMA_VERSION` bump                | Shared (platform-agnostic) |
-| Dep cache    | `deps/{platform}-{arch}/{lockfileHash}.tar.gz` | `.kici/node_modules/` packed by the detected manager's install — npm, pnpm, or yarn (deterministic gzip tar) | Lock file changes (`package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`); separate entry per platform/arch | Platform-specific          |
+| Cache        | Key Format                                                                   | Contents                                                                                                     | Invalidation                                                                                                | Platform scope             |
+| ------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | -------------------------- |
+| Source cache | `source/{contentHash}.tar.gz`                                                | Raw `.kici/` directory minus `node_modules/` (deterministic gzip tar)                                        | Workflow `.ts` or any `hashFiles` asset changes; `COMPILE_SCHEMA_VERSION` bump                              | Shared (platform-agnostic) |
+| Dep cache    | `deps/{platform}-{arch}/{depsHash}.tar.gz` (+ `{lockfileHash}.hash` pointer) | `.kici/node_modules/` packed by the detected manager's install — npm, pnpm, or yarn (deterministic gzip tar) | Lock file changes (`package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`); separate entry per platform/arch | Platform-specific          |
 
 Both use the same `KICI_STORAGE_*` configuration. A single build job handles both caches when both miss — the build agent clones, installs dependencies with the detected manager (npm, pnpm, or yarn), then packs `.kici/` source and `node_modules/` in parallel and uploads each via its own pre-signed `PUT` URL.
 
@@ -158,6 +162,9 @@ scalers:
       - labels: ['linux']
         image: kici-agent:latest
         # Build agents need npm available (ships with Node.js)
+        resources: # required for a warm pool — the size of each ready agent
+          cpus: 2
+          memory: '4g'
     warmPool:
       enabled: true
       size: 1
@@ -174,12 +181,19 @@ scalers:
     labelSets:
       - labels: ['default']
         image: kici-agent:latest
+        resources: # required for a warm pool — the size of each ready agent
+          cpus: 2
+          memory: '4g'
     warmPool:
       enabled: true
       size: 1
 ```
 
+Each label set declares `resources` because both scalers enable a warm pool. A warm pool needs declared resources: the orchestrator starts a ready agent before any job exists, so it must know how much cpu and memory to give it. A label set that declares none gets no warm pool. See [Common configuration → Warm pool](./orchestrator/auto-scaler/common-config.md#requirements).
+
 Build jobs are routed to agents with the `kici:role:builder` auto-label (injected from the `roles` config). Execution jobs go to agents matching the workflow's `runsOn` labels.
+
+Every trigger takes this path, not only a webhook. A cron fire, a `kiciEvent()` emit, a workflow or job completion, and a failure batch each dispatch a build job before their own jobs. Keep at least one builder-role agent available, or those runs queue at the build job.
 
 ### Roles configuration
 

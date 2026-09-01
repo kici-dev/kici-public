@@ -167,6 +167,8 @@ Valid `step_type` values:
 - `hook:beforeStep`
 - `hook:afterStep`
 
+Hooks are not the only pseudo-steps that ride this field. The same convention carries the declarative cache phase (`cache:restore`, `cache:save`), the per-job init phase (`init:<n>`, one per init spec), and the container image build (`container:build`, which a reader sorts ahead of the real steps because it runs strictly first).
+
 Hook steps appear in the dashboard with a distinct visual marker (hook icon) and lighter styling. Each hook gets its own execution_steps row with separate status, timing, and log stream.
 
 ## Concurrency group protocol

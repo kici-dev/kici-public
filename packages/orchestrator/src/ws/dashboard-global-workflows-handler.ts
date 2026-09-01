@@ -27,6 +27,7 @@ import type {
   GlobalWorkflowSettings,
   RepoPatternEntry,
 } from '@kici-dev/engine/protocol/dashboard-global-workflows';
+import { invalidRepoPatternReason } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import type { Database, OrgSettings } from '../db/types.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
@@ -195,6 +196,23 @@ export class DashboardGlobalWorkflowsHandler {
     ) {
       return;
     }
+    const patternError = firstInvalidPattern(msg);
+    if (patternError) {
+      this.recordAccess(
+        msg.actor,
+        'global_workflows.update',
+        { type: 'context', id: this.deps.customerId },
+        msg.requestId,
+        'error',
+        patternError,
+      );
+      this.sendClientError(
+        'dashboard.global-workflows.update.response',
+        msg.requestId,
+        patternError,
+      );
+      return;
+    }
     try {
       const existing = await this.readRow();
       const patch = buildPatch(existing, msg);
@@ -282,6 +300,16 @@ export class DashboardGlobalWorkflowsHandler {
       .execute();
   }
 
+  /**
+   * Same envelope as `sendError`, for a request the client got wrong. Logged at
+   * warn level: bad input is not a server fault, and error-level rows here would
+   * pollute the error dashboards an operator watches.
+   */
+  private sendClientError(type: string, requestId: string, message: string): void {
+    logger.warn(`Rejected ${type.replace('.response', '')}`, { requestId, error: message });
+    this.deps.send({ type, requestId, error: message });
+  }
+
   private sendError(type: string, requestId: string, err: unknown): void {
     const message = toErrorMessage(err);
     logger.error(`Error handling ${type}`, { requestId, error: message });
@@ -295,6 +323,31 @@ interface NormalizedPatch {
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
   elevatedRepos: RepoPatternEntry[] | null;
+}
+
+/**
+ * The first negation-form pattern carried by an update message, rendered as a
+ * message naming the list, the entry index, and the pattern — or null when
+ * every incoming entry is storable.
+ *
+ * The wire schema stays permissive so rows already in `org_settings` keep
+ * parsing on read paths; the refusal applies only where a dashboard write
+ * would store a new pattern.
+ */
+function firstInvalidPattern(msg: GlobalWorkflowsUpdateRequest): string | null {
+  const lists = [
+    ['allowedRepos', msg.allowedRepos],
+    ['deniedRepos', msg.deniedRepos],
+    ['elevatedRepos', msg.elevatedRepos],
+  ] as const;
+  for (const [name, entries] of lists) {
+    if (!entries) continue;
+    for (const [i, entry] of entries.entries()) {
+      const reason = invalidRepoPatternReason(entry.pattern);
+      if (reason) return `${name}[${i}] '${entry.pattern}': ${reason}`;
+    }
+  }
+  return null;
 }
 
 /**

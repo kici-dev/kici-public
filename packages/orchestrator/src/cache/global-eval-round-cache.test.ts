@@ -9,6 +9,7 @@ const BASE = {
   workflowRepoIdentifier: 'org/pipelines',
   workflowSha: 'wsha',
   workflowRoutingKey: 'github:1',
+  sourceRepoIdentifier: 'org/app',
   sourceSha: 'ssha',
   candidates: [{ workflowName: 'a', sourceFile: '.kici/workflows/org.ts', hasFilter: true }],
   event: { type: 'push', targetBranch: 'main' },
@@ -27,6 +28,7 @@ describe('globalEvalRoundCacheKey', () => {
     ['workflow repo', { workflowRepoIdentifier: 'org/other' }],
     ['workflow sha', { workflowSha: 'wsha2' }],
     ['workflow routing key', { workflowRoutingKey: 'gitlab:9' }],
+    ['source repo', { sourceRepoIdentifier: 'org/other-app' }],
     ['source sha', { sourceSha: 'ssha2' }],
   ])('separates two rounds differing only in %s', (_label, override) => {
     expect(globalEvalRoundCacheKey({ ...BASE, ...override })).not.toBe(

@@ -15,14 +15,15 @@
  * rows after streaming. This is correct because cold chunks are
  * partitioned by `(routing_key, day)`, not by the secondary filters.
  */
-import { sql, type Kysely, type Selectable } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
-import type { Database, SecretAuditLogTable } from '../db/types.js';
+import type { Database, SecretAuditLogRow } from '../db/types.js';
+
+/** Re-exported rather than re-declared — see the note in `load-event-log-range`. */
+export type { SecretAuditLogRow };
 import { SYNTHETIC_ORCH_TENANT } from './load-access-log-range.js';
 
 const logger = createLogger({ prefix: 'load-secret-audit-log-range' });
-
-export type SecretAuditLogRow = Selectable<SecretAuditLogTable>;
 
 export interface LoadSecretAuditLogRangeArgs {
   db: Kysely<Database>;

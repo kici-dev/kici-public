@@ -149,7 +149,9 @@ The registration model enables the orchestrator to know about event-triggered wo
 
 The registration store (`packages/orchestrator/src/registration/registration-store.ts`) manages workflow registrations in PostgreSQL.
 
-**Atomic replace-all:** When a push to the default branch is processed, all registrations for that customer+repo are replaced atomically (DELETE + INSERT in a single transaction). This prevents race conditions on concurrent pushes.
+**Atomic replace-all:** A push to the default branch replaces every registration for that customer+repo in one transaction. The store selects the existing rows, updates the ones the lock file still names, inserts the new ones, then deletes the rest. This prevents race conditions on concurrent pushes. Each surviving row also keeps its id, which is what the `cron_last_fired` foreign key points at.
+
+A surviving workflow is updated, not re-inserted, so a column the caller does not supply keeps its stored value. Two columns depend on this. `disabled` must not reset a manually disabled workflow. `default_branch` must survive a manual re-registration, because only a default-branch push knows the repository's default branch.
 
 **Registry version:** The `registry_versions` table tracks a monotonically increasing version number. Every registration change calls `bumpVersion()`, which increments the counter. Cluster peers detect version changes via heartbeat messages and reload their in-memory indexes.
 
@@ -168,7 +170,7 @@ The registration index (`packages/orchestrator/src/registration/registration-ind
 
 The extractor (`packages/orchestrator/src/registration/extractor.ts`) identifies which workflows in a lock file have registerable triggers. It checks each workflow's triggers against the `RegisterableTriggerType` enum (defined in `packages/engine/src/registration/registerable-trigger-type.ts`), which covers two families:
 
-- **Non-Git-provider triggers** -- `kici_event`, `workflow_complete`, `job_complete`, `generic_webhook`, `schedule`, `lifecycle`, `webhook`. These have no per-repo lock file pipeline to fall back to, so the registration index is the authoritative source for matching.
+- **Non-Git-provider triggers** -- `kici_event`, `workflow_complete`, `workflows_failed_batch`, `job_complete`, `generic_webhook`, `schedule`, `lifecycle`, `webhook`. These have no per-repo lock file pipeline to fall back to, so the registration index is the authoritative source for matching.
 - **Git-provider triggers** -- `push`, `pr`, `tag`, `comment`, `review`, `review_comment`, `release`, `dispatch`, `create`, `delete`, `status`, `workflow_run`, `fork`, `star`, `watch`. These continue to be matched via the per-event lock file pipeline on the same-source path (e.g. a real GitHub push webhook). Registering them is additive — it enables cross-source dispatch from generic webhooks that target externally-hosted repos.
 
 ### Registration extraction flow

@@ -2,7 +2,7 @@
   "extends": ["//"],
   "tasks": {
     "build": {
-      "env": ["KICI_BUILD_COMMIT"]
+      "env": ["KICI_BUILD_COMMIT", "KICI_BUILD_DEV_ENTRIES"]
     }
   }
 }

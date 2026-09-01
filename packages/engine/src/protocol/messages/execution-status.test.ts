@@ -98,6 +98,26 @@ describe('jobStatusForwardSchema', () => {
     expect(() => jobStatusForwardSchema.parse({ ...validJobStatus, status: 'unknown' })).toThrow();
   });
 
+  it('carries an invoke-gate proxy jobKind + summonedRunId, and parses without them', () => {
+    const proxy = jobStatusForwardSchema.parse({
+      ...validJobStatus,
+      jobKind: 'proxy',
+      summonedRunId: 'r1',
+    });
+    expect(proxy.jobKind).toBe('proxy');
+    expect(proxy.summonedRunId).toBe('r1');
+    // Absent on an ordinary job — the fields are additive/optional.
+    const parsed = jobStatusForwardSchema.parse(validJobStatus);
+    expect(parsed.jobKind).toBeUndefined();
+    expect(parsed.summonedRunId).toBeUndefined();
+  });
+
+  it('rejects an invalid jobKind value', () => {
+    expect(() =>
+      jobStatusForwardSchema.parse({ ...validJobStatus, jobKind: 'nonsense' }),
+    ).toThrow();
+  });
+
   it('accepts agentId and orchestratorId as optional nullable fields', () => {
     // With both fields
     const withBoth = jobStatusForwardSchema.parse(validJobStatus);

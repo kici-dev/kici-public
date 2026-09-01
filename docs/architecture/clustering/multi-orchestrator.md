@@ -152,6 +152,8 @@ The `job.reroute` message contains:
 | `providerContext`               | Provider-specific context (e.g., `{ installationId }`)                                                                                                                                                               |
 | `sourceTarUrl`, `sourceTarHash` | Pre-signed `.kici/` source tarball URL + workflow `contentHash` (cache hit)                                                                                                                                          |
 | `depsUrl`, `depsHash`           | Pre-signed dependency tarball download URL and SHA-256 tarball-bytes hash (cache hit)                                                                                                                                |
+| `runsOnPatterns`                | Glob/regex include matchers the receiving peer's agent labels must satisfy, applied on top of the exact `runsOnLabels` prefilter. A job selected purely by pattern carries its whole selector here.                  |
+| `excludePatterns`               | Glob/regex matchers that disqualify a candidate agent                                                                                                                                                                |
 | `excludeLabels`                 | Labels that the dispatched agent must NOT have (optional)                                                                                                                                                            |
 | `cloneToken`                    | Pre-resolved clone token for workers without provider credentials                                                                                                                                                    |
 | `encryptedSecrets`              | Encrypted secrets envelope (AES-256-GCM with session key)                                                                                                                                                            |
@@ -167,7 +169,9 @@ The `job.reroute` message contains:
 4. **Sequential fallback:** If a peer rejects or times out (15s), the coordinator tries the next peer
 5. **Parallel fan-out:** Jobs targeting different peers are rerouted concurrently via `Promise.all`
 
-Local matching and peer-side capacity matching share the same predicate: a scaler is considered when its label set is a superset of the job's `runsOn`, none of its labels appear in the job's `excludeLabels`, and (when configured) the job's `runsOn` includes every label declared in the scaler's `mandatoryLabels` opt-in gate. The gate is propagated over the heartbeat protocol so cross-peer reroute decisions enforce it identically.
+Local matching and peer-side capacity matching share the same predicate. A label set is considered when it is a superset of the job's `runsOn`, none of its labels appear in the job's `excludeLabels`, and the job's `runsOn` includes every label in that label set's own opt-in gate. All three tests apply to the same label set. So a scaler mixing platforms is not disqualified by a sibling set's taint, and a peer is never selected on labels one set supplies while another set's gate is what was satisfied. The gate is propagated per label set over the heartbeat protocol, so cross-peer reroute decisions enforce it identically.
+
+Exact labels are only the prefilter. A `runsOn` selector may also carry glob/regex matchers, which travel on the reroute as `runsOnPatterns` / `excludePatterns` and are applied as a post-filter on the receiving peer — the same two-stage matching the single-orchestrator dispatch path uses. Carrying them matters most for a job selected purely by pattern: with no exact labels to prefilter on, the patterns are the whole selector.
 
 ### Loop prevention
 
@@ -185,6 +189,7 @@ When a run is cancelled (via API or fail-fast), the coordinator sends `peer.job.
 A positive `job.reroute.ack` only means the peer **queued** the job — the agent spawn happens afterwards and can still fail (transient scaler error, image-pull failure, peer crash, OOM). Without a backstop, a spawn that fails after the ACK produces no progress, so the run would sit `pending` until the stale detector force-fails it minutes later. Two complementary layers make a reroute resilient to a post-accept failure:
 
 - **Bounded-window re-dispatch (correctness backstop).** When a peer ACKs a reroute, the coordinator arms a per-job **spawn window**. The first `job.progress` (job or step) disarms it. If the window elapses with no progress, the coordinator best-effort cancels the original peer's job (a double-execution guard against a slow-but-healthy spawn), then re-runs the routing decision under the same `jobId` — trying another peer, then a local dispatch, and finally marking the job failed if no backend can run it. This also covers a peer that dies right after the ACK.
+  - **Silence is not evidence of failure.** Only a **worker** relays `job.progress`; a peer **coordinator** shares the database and writes the job's status straight to `execution_jobs`, so it relays nothing at all. Before it treats an elapsed window as a spawn failure, the coordinator therefore reads that shared row. A job the peer has already started disarms the backstop instead of being cancelled, which is what keeps a coordinator-to-coordinator reroute alive past the window (a slow scaler spawn, a long checkout, a big dependency install). The coordinator keeps the job's tracking entry — cancel propagation still needs it — and polls the row until the job is terminal, which is the only report the peer coordinator ever makes. A read failure is treated as "not started", so a database fault cannot silently disable the backstop; once the row has shown the job running, the coordinator latches that and never re-dispatches it.
 - **Spawn-failure fast path.** A worker relays a scaler spawn failure for a rerouted-in job back to the owning coordinator over the existing scaler-event channel. On that signal the coordinator runs the same cancel-then-re-dispatch immediately, without waiting the window out. The two layers are idempotent: whichever fires first removes the tracking entry, so the other is a no-op. The re-dispatch appends the failed peer to `triedConnections` so routing never re-selects it.
 
 The spawn window, the reroute ACK timeout, and the max-hop limit are per-org tunables (`reroute_spawn_window_ms`, `reroute_ack_timeout_ms`, `reroute_max_hops`) with cluster-wide defaults; operators change them with `kici-admin org-settings reroute`.
@@ -197,6 +202,11 @@ KiCI uses a minimal Raft implementation for **leader election only** (no log rep
 
 - **Orphan recovery:** Detecting and finalizing runs from crashed coordinators
 - **Cron scheduling:** Evaluating cron-triggered workflows to prevent duplicate firings across cluster nodes
+- **Event retry scanning:** Re-dispatching events whose earlier delivery failed, under a lease so only one node retries a given event
+- **Recovery and ACK-deadline sweeps:** Every 10s, failing any run stuck past its recovery deadline and any dispatch past its ACK deadline — this closes the window where a crashed coordinator's in-memory timers were lost
+- **Pending-scale sweeping:** Reconciling scale requests left pending by a crashed node
+- **Attestation retry:** Re-attempting build attestations that failed to sign or publish
+- **Signing-key generation:** Only the leader mints a fresh provenance signing key when none exists yet, so concurrent nodes cannot race two keys into existence
 
 ### State machine
 

@@ -238,6 +238,61 @@ describe('createAgentWsHandler', () => {
       );
     });
 
+    // An agent cannot tell which auth mode the orchestrator runs, so one that
+    // carries a token — a static `KICI_AGENT_TOKEN`, or the ephemeral one a
+    // claim-code self-bootstrap just minted — opens with `auth.request` and
+    // waits for `auth.success` before it registers. Refusing that frame strands
+    // every such agent in a permanent reconnect loop it can never escape.
+    it('answers a pre-registration auth.request with auth.success, then registers', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      expect(ws.close).not.toHaveBeenCalled();
+      const authSuccess = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.success');
+      expect(authSuccess).toBeDefined();
+      expect(authSuccess.connectionId).toEqual(expect.any(String));
+
+      await handler.onMessage!(
+        makeMessageEvent(registerMsg({ agentId: 'agent-selfboot' })),
+        ws as any,
+      );
+      expect(registry.get('agent-selfboot')).toBeDefined();
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledWith('agent-selfboot');
+    });
+
+    // Auth is disabled, so the frame is tolerated and the token ignored. Reading
+    // it would refuse an agent whose token is expired in a mode that accepts a
+    // tokenless one — a regression dressed as a hardening.
+    it('ignores the token on a pre-registration auth.request', async () => {
+      const tokenStore = mockTokenStore();
+      const handler = createHandler({ tokenStore });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      expect(tokenStore.validate).not.toHaveBeenCalled();
+    });
+
+    // The registration timer is deliberately left running across the tolerated
+    // auth.request, so an agent that authenticates and then goes quiet is still
+    // bounded rather than holding the connection open forever.
+    it('keeps the registration timeout running across the tolerated auth.request', async () => {
+      const handler = createHandler();
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      vi.advanceTimersByTime(10_000);
+
+      expect(ws.close).toHaveBeenCalledWith(WS_CLOSE_AUTH_TIMEOUT, 'Registration timeout');
+    });
+
     it('sends register.ack after registration', async () => {
       const handler = createHandler();
       const ws = mockWs();
@@ -308,6 +363,46 @@ describe('createAgentWsHandler', () => {
         .find((m: Record<string, unknown>) => m.type === 'register.ack');
       expect(registerAck).toBeDefined();
       expect(registerAck!.agentId).toBe('agent-1');
+    });
+
+    it('self-bootstrap: token-mode connection claims BEFORE auth, then auth.request proceeds', async () => {
+      // A scaler-managed agent runs against a token-mode orchestrator, so a
+      // fresh connection is in pendingAuth (Phase 1). It redeems its claim code
+      // FIRST, then authenticates with the minted token. The claim must be
+      // admitted in pendingAuth without breaking the follow-up auth.request.
+      const credentials = {
+        agentToken: 'kat_' + 'b'.repeat(64),
+        agentId: 'fresh-1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['github-actions'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = createHandler({ onClaimCredentials });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+
+      // Claim before any auth.request.
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+      expect(onClaimCredentials).toHaveBeenCalledWith('', 'code-abc');
+      const claimResp = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'scaler.claim-credentials.response');
+      expect(claimResp).toMatchObject({ requestId: 'r1', credentials });
+
+      // The connection stayed in pendingAuth: auth.request now proceeds to auth.success.
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      const authSuccess = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'auth.success');
+      expect(authSuccess).toBeDefined();
     });
 
     // ── Privileged-root taint (token mandatory_labels) ──────────
@@ -558,6 +653,118 @@ describe('createAgentWsHandler', () => {
 
       // Should not call dispatcher
       expect(dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+    });
+
+    it('a concurrent second agent.register on one socket adopts at most once', async () => {
+      // Awaiting the adoption lookup opens a yield point between
+      // `pendingRegistration.delete(ws)` and `registry.register(...)`. WS
+      // message handlers are not serialized, so prove a second frame cannot
+      // slip through it.
+      //
+      // The gate is a manually-released deferred rather than a timer: this
+      // suite runs on fake timers, so a `setTimeout` inside the callback would
+      // never fire and both frames would hang.
+      let releaseAdoption!: () => void;
+      const adoptionGate = new Promise<void>((resolve) => {
+        releaseAdoption = resolve;
+      });
+      const onScalerAgentRegistered = vi.fn().mockImplementation(async () => {
+        await adoptionGate;
+        return { mandatoryLabels: [] };
+      });
+      const handler = createHandler({ onScalerAgentRegistered });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      const first = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      // The first frame is parked inside the adoption lookup; the second one
+      // runs against exactly that window.
+      await vi.waitFor(() => expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1));
+      const second = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      releaseAdoption();
+      await Promise.all([first, second]);
+
+      expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1);
+      expect(registry.get('agent-1')).toBeDefined();
+      // The second frame is dropped, not closed: the socket is mid-registration,
+      // and closing it would kill the connection frame 1 is about to register.
+      expect(ws.close).not.toHaveBeenCalled();
+    });
+
+    it('a close arriving mid-registration leaves no entry for the dead socket', async () => {
+      // The socket has left `pendingRegistration` and has not reached
+      // `wsToAgentId`, so `onClose` matches none of its usual branches.
+      // Registering anyway would put a dead WS in the registry with no close
+      // event left to remove it — its jobs would never fail over and, for a
+      // scaler agent, its provisioned instance would never be torn down.
+      let releaseAdoption!: () => void;
+      const adoptionGate = new Promise<void>((resolve) => {
+        releaseAdoption = resolve;
+      });
+      const onScalerAgentRegistered = vi.fn().mockImplementation(async () => {
+        await adoptionGate;
+        return { mandatoryLabels: [] };
+      });
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+
+      const register = handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await vi.waitFor(() => expect(onScalerAgentRegistered).toHaveBeenCalledTimes(1));
+
+      // Close lands while the registration is parked in the scaler lookup.
+      handler.onClose!(new CloseEvent('close'), ws as any);
+      releaseAdoption();
+      await register;
+
+      expect(registry.get('agent-1')).toBeUndefined();
+      // The lookup already correlated the agent to a scaler, so its teardown
+      // has to run from here — no later close event will ever arrive.
+      expect(onScalerAgentDisconnected).toHaveBeenCalledWith('agent-1');
+    });
+
+    it('refuses the registration when the scaler lookup throws', async () => {
+      // The scaler could not read this agent's spawn record. Registering it
+      // anyway makes it static for its whole life, with no `mandatoryLabels`
+      // gate, so a queued job whose `runsOn` omits the platform taint can land
+      // on it. Refusing costs the agent a reconnect.
+      const onScalerAgentRegistered = vi
+        .fn()
+        .mockRejectedValue(new Error('scaler adoption lookup failed for agent agent-1'));
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(registry.get('agent-1')).toBeUndefined();
+      expect(ws.close).toHaveBeenCalledWith(4006, 'Scaler state unavailable');
+      // Nothing was correlated, so there is no teardown to run.
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('keeps registering when the close lands after registration completed', async () => {
+      // The complement of the test above: without it, a fix that simply never
+      // registered would pass that one.
+      const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: [] });
+      const onScalerAgentDisconnected = vi.fn();
+      const handler = createHandler({ onScalerAgentRegistered, onScalerAgentDisconnected });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      expect(registry.get('agent-1')).toBeDefined();
+      expect(onScalerAgentDisconnected).not.toHaveBeenCalled();
     });
   });
 
@@ -1060,6 +1267,55 @@ describe('createAgentWsHandler', () => {
       handler.onClose!(new CloseEvent('close'), ws as any);
       expect(dispatcher.onJobComplete).toHaveBeenCalled();
       expect(dispatcher.onAgentDisconnect).toHaveBeenCalled();
+    });
+
+    /**
+     * Register one agent and return the register.ack the handler sent.
+     * `scalerInfo` is what `onScalerAgentRegistered` resolves with: `null` for a
+     * static agent, no `boundJobId` for a warm (pre-spawned) one.
+     */
+    async function registerAndCaptureAck(
+      scalerInfo: { boundJobId?: string; mandatoryLabels: string[] } | null,
+    ): Promise<Record<string, unknown>> {
+      const boundDispatcher = {
+        ...mockDispatcher(),
+        dispatchBoundJob: vi.fn().mockResolvedValue(true),
+      } as unknown as Dispatcher;
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher: boundDispatcher,
+        agentAuthMode: 'none',
+        onJobStatus,
+        onScalerAgentRegistered: vi.fn().mockResolvedValue(scalerInfo),
+      });
+      const ws = mockWs();
+
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+
+      const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call: unknown[]) => JSON.parse(call[0] as string))
+        .find((m: Record<string, unknown>) => m.type === 'register.ack');
+      expect(ack).toBeDefined();
+      return ack as Record<string, unknown>;
+    }
+
+    it('marks a scaler-managed agent with no bound job as warm', async () => {
+      const ack = await registerAndCaptureAck({ mandatoryLabels: [] });
+      expect(ack.warmPool).toBe(true);
+      expect(ack.pendingDispatch).toBeUndefined();
+    });
+
+    it('does not mark a job-bound spawn as warm', async () => {
+      const ack = await registerAndCaptureAck({ boundJobId: 'job-1', mandatoryLabels: [] });
+      expect(ack.warmPool).toBeUndefined();
+      expect(ack.pendingDispatch).toBe(true);
+    });
+
+    it('does not mark a static agent as warm', async () => {
+      const ack = await registerAndCaptureAck(null);
+      expect(ack.warmPool).toBeUndefined();
+      expect(ack.scalerManaged).toBe(false);
     });
   });
 
@@ -2831,6 +3087,207 @@ describe('createAgentWsHandler', () => {
       );
 
       expect(sent(ws, 'event.emit.response')).toMatchObject({ error: 'Unknown job context' });
+    });
+
+    it('rejects a reserved kici. event-name prefix without invoking onEventEmit', async () => {
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'kici.scaler.scale-up',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(onEventEmit).not.toHaveBeenCalled();
+      expect(sent(ws, 'event.emit.response')).toMatchObject({
+        requestId: 'r1',
+        error: expect.stringContaining('reserved'),
+      });
+    });
+
+    /**
+     * The authoritative half of the `__` reservation. The SDK refuses it first,
+     * but the SDK runs inside the job — an attacker controls that side entirely,
+     * so this handler is what actually holds the boundary.
+     *
+     * Why it is a boundary and not a namespace: every name under the prefix is
+     * exempt from the event-storm rate limiter, and `__schedule_fire` is
+     * additionally dispatched as a TRUSTED ref (shared user-cache writes, the
+     * Dockerfile build gate) because no run causes it. An untrusted fork-PR job
+     * that could emit `__schedule_fire` would hand itself both. The lifecycle
+     * names inherit the tier of the run behind them, so forging one buys the
+     * rate-limiter exemption rather than the trusted ref — still a boundary.
+     */
+    it.each([
+      ['__schedule_fire'],
+      ['__workflow_complete'],
+      ['__job_complete'],
+      ['__workflows_failed_batch'],
+      ['__anything_else'],
+    ])('rejects the reserved internal event name %s without invoking onEventEmit', async (name) => {
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: name,
+          payload: { cronExpression: '* * * * *', commitSha: 'a'.repeat(40) },
+        }),
+        ws as any,
+      );
+
+      // Not merely answered with an error: the emit never reaches the router,
+      // so no row is written and nothing is dispatched.
+      expect(onEventEmit).not.toHaveBeenCalled();
+      expect(sent(ws, 'event.emit.response')).toMatchObject({
+        requestId: 'r1',
+        error: 'event name prefix "__" is reserved for KiCI internal events',
+      });
+    });
+
+    it('still admits an ordinary custom event name', async () => {
+      // The control for the two rejection suites above: the same handler, the
+      // same message shape, an unreserved name — and the emit goes through. A
+      // guard that refused everything would pass both suites.
+      const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
+      const handler = setup({ onEventEmit });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'event.emit',
+          messageId: 'm1',
+          requestId: 'r1',
+          jobId: 'job-1',
+          eventName: 'deploy__done',
+          payload: {},
+        }),
+        ws as any,
+      );
+
+      expect(onEventEmit).toHaveBeenCalledTimes(1);
+      expect(sent(ws, 'event.emit.response')).toMatchObject({ deliveryId: 'd1' });
+    });
+
+    it('scaler.claim-credentials returns minted credentials from the callback', async () => {
+      const credentials = {
+        agentToken: 'kat_secret',
+        agentId: 'a1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      expect(onClaimCredentials).toHaveBeenCalledWith(expect.any(String), 'code-abc');
+      expect(sent(ws, 'scaler.claim-credentials.response')).toMatchObject({
+        requestId: 'r1',
+        credentials,
+      });
+    });
+
+    it('scaler.claim-credentials forwards an author-actionable error verbatim', async () => {
+      const onClaimCredentials = vi.fn().mockResolvedValue({ error: 'invalid claim code' });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'bad',
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'scaler.claim-credentials.response')!;
+      expect(frame).toMatchObject({ requestId: 'r1', error: 'invalid claim code' });
+      expect(frame.credentials).toBeUndefined();
+    });
+
+    it('scaler.claim-credentials replaces a thrown callback with a safe fixed error', async () => {
+      const onClaimCredentials = vi.fn().mockRejectedValue(new Error(SECRET_TEXT));
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+      await register(handler, ws);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      const frame = sent(ws, 'scaler.claim-credentials.response')!;
+      expect(frame).toMatchObject({ error: AgentWsInternalFailure.scalerClaimFailed });
+      expect(JSON.stringify(frame)).not.toContain(SECRET_TEXT);
+    });
+
+    it('scaler.claim-credentials succeeds BEFORE the connection registers (self-bootstrap)', async () => {
+      const credentials = {
+        agentToken: 'kat_bootstrap',
+        agentId: 'fresh-1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      const onClaimCredentials = vi.fn().mockResolvedValue({ credentials });
+      const handler = setup({ onClaimCredentials });
+      const ws = mockWs();
+
+      // Open the connection but do NOT register: a fresh, not-yet-registered
+      // agent redeems its single-use claim code to self-bootstrap. The claim
+      // code is the authorization, so minting ignores the caller's agent id
+      // (empty here).
+      handler.onOpen!(new Event('open'), ws as any);
+
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'scaler.claim-credentials',
+          messageId: 'm1',
+          requestId: 'r1',
+          claimCode: 'code-abc',
+        }),
+        ws as any,
+      );
+
+      expect(onClaimCredentials).toHaveBeenCalledWith('', 'code-abc');
+      expect(sent(ws, 'scaler.claim-credentials.response')).toMatchObject({
+        requestId: 'r1',
+        credentials,
+      });
     });
 
     /** Drive one `agent.api.request` and return the response the handler sent. */

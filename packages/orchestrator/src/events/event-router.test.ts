@@ -35,7 +35,16 @@ vi.mock('./batch-accumulator.js', () => ({
   sweepExpiredBatchWindows: vi.fn().mockResolvedValue([]),
 }));
 
+// Mock only the catch-up-failure counter, so a test can read it. Everything
+// else in the module (the other event counters the router increments) is the
+// real lazy instrument.
+vi.mock('../metrics/prometheus.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return { ...actual, eventCatchUpFailuresTotal: { add: vi.fn() } };
+});
+
 import { EventRouter, type EmitEventInput, type EventRouterOptions } from './event-router.js';
+import { eventCatchUpFailuresTotal } from '../metrics/prometheus.js';
 import { openOrGetBatchWindow, appendBatchItem } from './batch-accumulator.js';
 import { DEFAULT_EVENT_ROUTER_CONFIG, type EventRouterConfig, type StoredEvent } from './types.js';
 import { EVENT_CATCHUP_BATCH_SIZE, type EventStore } from './event-store.js';
@@ -477,6 +486,27 @@ describe('EventRouter', () => {
       expect(circuitBreaker.checkRateLimit).not.toHaveBeenCalled();
     });
 
+    it('exempts kici.-prefixed scaler events from the rate limit', async () => {
+      const circuitBreaker = createMockCircuitBreaker({ rateAllowed: false });
+      const opts = createRouterOptions({ circuitBreaker });
+      const router = new EventRouter(opts);
+
+      // A burst of scale-up events from one source must all route: real scaling
+      // demand cannot be dropped by the per-source 100/min event-storm bucket.
+      for (let i = 0; i < 200; i++) {
+        await expect(
+          router.emit({
+            eventName: 'kici.scaler.scale-up',
+            payload: { agentId: `a-${i}` },
+            sourceRoutingKey: 'rk1',
+            target: { repos: ['org/infra'] },
+            chainDepth: 0,
+          }),
+        ).resolves.toBeDefined();
+      }
+      expect(circuitBreaker.checkRateLimit).not.toHaveBeenCalled();
+    });
+
     it('does not globally cap system completions across distinct workflows', async () => {
       // The bug: >100 workflow completions/min sharing the constant event name
       // `__workflow_complete` used to exhaust one global 100/min bucket and
@@ -583,6 +613,47 @@ describe('EventRouter', () => {
   });
 
   describe('notification handler', () => {
+    /**
+     * The other half of the boot latch. A live NOTIFY arriving mid-bootstrap
+     * must not lease and burn a dispatch attempt either — unlike the catch-up
+     * scan this one IS awaited inline, because the handler runs off the pg
+     * client's event loop and blocks nothing upstream.
+     */
+    it('holds a live notification until the boot latch resolves', async () => {
+      const event = makeStoredEvent({ id: 'evt-live' });
+      const eventStore = createMockEventStore({ events: [] });
+      (eventStore.tryLeaseForProcessing as any).mockResolvedValue(event);
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      let releaseLatch!: () => void;
+      const latch = new Promise<void>((resolve) => {
+        releaseLatch = resolve;
+      });
+      const opts = createRouterOptions({
+        eventStore,
+        onEventMatched,
+        registrationIndex: createMockRegistrationIndex([
+          makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+        ]),
+        dispatchReady: () => latch,
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      await simulateNotification(opts.mockPool, 'kici_event_channel', 'evt-live');
+
+      // Nothing leased while the latch is closed — the event is held, not lost.
+      expect(eventStore.tryLeaseForProcessing).not.toHaveBeenCalled();
+      expect(onEventMatched).not.toHaveBeenCalled();
+
+      releaseLatch();
+      await router.catchUpSettled;
+      // Flush the held notification's own continuation.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-live', 'test-node-A');
+      expect(onEventMatched).toHaveBeenCalledTimes(1);
+    });
+
     it('should atomically claim event and match against registrations', async () => {
       const event = makeStoredEvent({ id: 'evt-notified' });
       const eventStore = createMockEventStore({ events: [] });
@@ -847,6 +918,242 @@ describe('EventRouter', () => {
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-missed-2', 'test-node-A');
       // onEventMatched called for each matched event
       expect(onEventMatched).toHaveBeenCalledTimes(2);
+    });
+
+    /**
+     * The catch-up scan is the loaded case for the boot latch: a restart with a
+     * backlog replays every missed event at once, and `start()` runs it long
+     * before the dispatch dependencies exist. Without the gate a backlogged
+     * event burns its dispatch attempts inside that window and reaches the DLQ,
+     * which is terminal loss.
+     */
+    it('holds the catch-up scan until the boot latch resolves', async () => {
+      const eventStore = createMockEventStore({ events: [makeStoredEvent({ id: 'evt-boot' })] });
+      const reg = makeRegisteredWorkflow('on-deploy', 'deploy-complete');
+      const onEventMatched = vi.fn().mockResolvedValue(undefined);
+      let releaseLatch!: () => void;
+      const latch = new Promise<void>((resolve) => {
+        releaseLatch = resolve;
+      });
+      const router = new EventRouter(
+        createRouterOptions({
+          eventStore,
+          onEventMatched,
+          registrationIndex: createMockRegistrationIndex([reg]),
+          dispatchReady: () => latch,
+        }),
+      );
+
+      await router.start();
+      // Yield generously: the scan would have leased by now if it were not held.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(eventStore.getUnprocessedSince).not.toHaveBeenCalled();
+      expect(eventStore.tryLeaseForProcessing).not.toHaveBeenCalled();
+
+      releaseLatch();
+      await router.catchUpSettled;
+
+      // ...and the held event is dispatched, not dropped.
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-boot', 'test-node-A');
+      expect(onEventMatched).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * The gate above must never be paid for with a startup deadlock. In
+     * production NOTHING resolves the latch until the composition root
+     * continues past `await eventRouter.start()` — so a `start()` that awaited
+     * the scan would wait on a resolve that is downstream of the wait, and the
+     * orchestrator would hang on every boot in every mode.
+     *
+     * Asserted with a bounded race rather than a plain await, so a future
+     * reordering FAILS here instead of hanging CI forever.
+     */
+    it('completes start() while the boot latch is still unresolved', async () => {
+      const eventStore = createMockEventStore({ events: [makeStoredEvent({ id: 'evt-boot' })] });
+      const router = new EventRouter(
+        createRouterOptions({
+          eventStore,
+          registrationIndex: createMockRegistrationIndex([
+            makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+          ]),
+          // Never resolves: reproduces the production ordering, where the
+          // resolver runs only after this call returns.
+          dispatchReady: () => new Promise<void>(() => {}),
+        }),
+      );
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadlock = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('start() did not settle: boot deadlock')), 2000);
+      });
+      try {
+        await expect(Promise.race([router.start(), deadlock])).resolves.toBeUndefined();
+      } finally {
+        clearTimeout(timer);
+      }
+
+      // LISTEN is registered before the scan is scheduled, so no live
+      // notification is missed while the scan waits behind the latch.
+      expect(eventStore.getUnprocessedSince).not.toHaveBeenCalled();
+    });
+
+    /**
+     * `stopped` is a latch of its own: `stop()` sets it so a boot latch that
+     * resolves after shutdown does not start a scan. Never clearing it made
+     * every start AFTER a stop skip its catch-up silently — and recovering the
+     * backlog a stop left behind is the scan's whole job.
+     *
+     * The first cycle is the positive control: same router, same harness, and
+     * the scan runs. So a second cycle that does not run one is the flag, not
+     * the fixture.
+     */
+    it('runs the catch-up again after a stop -> start cycle', async () => {
+      const eventStore = createMockEventStore({ events: [makeStoredEvent({ id: 'evt-cycle' })] });
+      const reg = makeRegisteredWorkflow('on-deploy', 'deploy-complete');
+      const opts = createRouterOptions({
+        eventStore,
+        registrationIndex: createMockRegistrationIndex([reg]),
+        dispatchReady: () => Promise.resolve(),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      await router.catchUpSettled;
+      expect(eventStore.getUnprocessedSince).toHaveBeenCalled();
+
+      await router.stop();
+      // The precondition the fix must clear is genuinely present: `stop()` set
+      // the flag, and a `start()` that left it set skips the scan below.
+      expect((router as unknown as { stopped: boolean }).stopped).toBe(true);
+      (eventStore.getUnprocessedSince as any).mockClear();
+      // The store still holds the event, so a scan that runs will find it.
+      (eventStore.getUnprocessedSince as any)
+        .mockResolvedValueOnce([makeStoredEvent({ id: 'evt-cycle-2' })])
+        .mockResolvedValue([]);
+
+      await router.start();
+      await router.catchUpSettled;
+
+      expect(eventStore.getUnprocessedSince).toHaveBeenCalled();
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-cycle-2', 'test-node-A');
+    });
+
+    /**
+     * `stop()` tears out the pg client the scan's dispatches ride on, so it
+     * must not run while a scan is mid-flight. It waits on the SCAN, never on
+     * the latch-then-scan chain: in production the latch resolves only past
+     * `start()`, so a bootstrap that fails in between leaves it pending forever
+     * and awaiting the chain would hang shutdown instead of bounding it.
+     */
+    it('waits for a running catch-up scan before releasing the client', async () => {
+      let releaseScan!: () => void;
+      const scanGate = new Promise<void>((resolve) => {
+        releaseScan = resolve;
+      });
+      const eventStore = createMockEventStore({ events: [] });
+      let scanStarted = false;
+      let scanFinished = false;
+      (eventStore.getUnprocessedSince as any).mockImplementation(async () => {
+        scanStarted = true;
+        await scanGate;
+        scanFinished = true;
+        return [];
+      });
+      const opts = createRouterOptions({
+        eventStore,
+        dispatchReady: () => Promise.resolve(),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+      // Let the latch resolve and the scan begin, then hold it there.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(scanStarted).toBe(true);
+      expect(scanFinished).toBe(false);
+
+      const stopping = router.stop();
+      // The positive control: while the scan is held, `stop()` has not
+      // released the client. A `stop()` that ignored the scan would be done by
+      // now.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(opts.mockPool.client.release).not.toHaveBeenCalled();
+
+      releaseScan();
+      await stopping;
+
+      expect(scanFinished).toBe(true);
+      expect(opts.mockPool.client.release).toHaveBeenCalled();
+    });
+
+    /**
+     * The mirror image: `stop()` must NOT wait on a latch that never resolves.
+     * A bootstrap that throws between `start()` and the composition root's
+     * resolve leaves the chain pending for the life of the process, and a
+     * `stop()` that awaited it would hang the shutdown it was called to perform.
+     */
+    it('does not hang when the boot latch never resolves', async () => {
+      const eventStore = createMockEventStore({ events: [] });
+      const opts = createRouterOptions({
+        eventStore,
+        dispatchReady: () => new Promise<void>(() => {}),
+      });
+      const router = new EventRouter(opts);
+
+      await router.start();
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadlock = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('stop() did not settle')), 2000);
+      });
+      try {
+        await expect(Promise.race([router.stop(), deadlock])).resolves.toBeUndefined();
+      } finally {
+        clearTimeout(timer);
+      }
+      expect(opts.mockPool.client.release).toHaveBeenCalled();
+      // The control: the chain really is still pending, so `stop()` returned
+      // without it rather than because it happened to have settled.
+      const pending = Symbol('pending');
+      await expect(Promise.race([router.catchUpSettled, Promise.resolve(pending)])).resolves.toBe(
+        pending,
+      );
+    });
+
+    it('counts a failed deferred catch-up scan', async () => {
+      const eventStore = createMockEventStore({ events: [] });
+      (eventStore.getUnprocessedSince as any).mockRejectedValue(new Error('db is gone'));
+      const opts = createRouterOptions({
+        eventStore,
+        dispatchReady: () => Promise.resolve(),
+      });
+      const router = new EventRouter(opts);
+      const before = vi.mocked(eventCatchUpFailuresTotal.add).mock.calls.length;
+
+      await router.start();
+      // The chain swallows the rejection, so this resolves rather than throws —
+      // which is exactly why the failure needs a counter of its own.
+      await expect(router.catchUpSettled).resolves.toBeUndefined();
+
+      expect(vi.mocked(eventCatchUpFailuresTotal.add).mock.calls.length).toBe(before + 1);
+    });
+
+    it('runs the catch-up inline when no boot latch is configured', async () => {
+      // The unlatched shape every other caller (and every other test) uses:
+      // `start()` still completes the scan before it returns.
+      const eventStore = createMockEventStore({ events: [makeStoredEvent({ id: 'evt-inline' })] });
+      const router = new EventRouter(
+        createRouterOptions({
+          eventStore,
+          registrationIndex: createMockRegistrationIndex([
+            makeRegisteredWorkflow('on-deploy', 'deploy-complete'),
+          ]),
+        }),
+      );
+
+      await router.start();
+
+      expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-inline', 'test-node-A');
+      expect(router.catchUpSettled).toBeNull();
     });
 
     it('should handle empty catch-up gracefully', async () => {
@@ -1635,6 +1942,50 @@ describe('EventRouter', () => {
 
       expect(appendBatchItem).not.toHaveBeenCalled();
       expect(onEventMatched).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('matchKiciEventSubscribers (invoke-gate summon)', () => {
+    it('matches the source repo own kiciEvent subscribers', () => {
+      const reg = makeRegisteredWorkflow('docker-test', 'myorg.docker-test');
+      const opts = createRouterOptions({
+        registrationIndex: createMockRegistrationIndex([reg]),
+      });
+      const router = new EventRouter(opts);
+
+      const matches = router.matchKiciEventSubscribers('myorg.docker-test', {}, 'owner/repo');
+
+      expect(matches).toHaveLength(1);
+      expect(matches[0].reg.workflowName).toBe('docker-test');
+      expect(matches[0].decisions.length).toBeGreaterThan(0);
+      expect(matches[0].decisions.every((d) => d.matched)).toBe(true);
+      expect(matches[0].lockFile.workflows).toHaveLength(1);
+    });
+
+    it('excludes a subscriber registered against a different repo', () => {
+      const otherRepo = makeRegisteredWorkflow('docker-test', 'myorg.docker-test', {
+        repoIdentifier: 'owner/other-repo',
+      });
+      const opts = createRouterOptions({
+        registrationIndex: createMockRegistrationIndex([otherRepo]),
+      });
+      const router = new EventRouter(opts);
+
+      const matches = router.matchKiciEventSubscribers('myorg.docker-test', {}, 'owner/repo');
+
+      expect(matches).toHaveLength(0);
+    });
+
+    it('returns nothing when no workflow subscribes to the event name', () => {
+      const reg = makeRegisteredWorkflow('docker-test', 'myorg.docker-test');
+      const opts = createRouterOptions({
+        registrationIndex: createMockRegistrationIndex([reg]),
+      });
+      const router = new EventRouter(opts);
+
+      const matches = router.matchKiciEventSubscribers('myorg.node-test', {}, 'owner/repo');
+
+      expect(matches).toHaveLength(0);
     });
   });
 });

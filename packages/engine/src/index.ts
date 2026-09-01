@@ -43,6 +43,9 @@ export {
   peerUpdateSchema,
   cacheStatsSchema,
   orchMetricsSchema,
+  clusterMembershipSchema,
+  CLUSTER_MEMBERSHIP_MAX_WORKERS,
+  planHeadroomSchema,
   platformToOrchestratorMessageSchema,
   orchestratorToPlatformMessageSchema,
   collectDiscriminatorTypes,
@@ -58,7 +61,18 @@ export {
   type PeerUpdate,
   type CacheStats,
   type OrchMetrics,
+  type ClusterMembership,
+  type PlanHeadroom,
   DEFAULT_APPROVAL_EXPIRY_HOURS,
+  DEFAULT_APPROVAL_EXPIRY_SECONDS,
+  SECONDS_PER_HOUR,
+  MIN_APPROVAL_EXPIRY_SECONDS,
+  MAX_APPROVAL_EXPIRY_HOURS,
+  MAX_APPROVAL_EXPIRY_SECONDS,
+  approvalExpirySecondsOf,
+  approvalExpiryHoursOf,
+  ForkPolicy,
+  CiTrustLevel,
   trustPolicySchema,
   type TrustPolicy,
   trustPolicyUpdateSchema,
@@ -168,6 +182,16 @@ export * from './trigger/matcher.js';
 // second, subtly different repo matcher is how a deny-list pattern came to
 // mean one thing in the policy and another in the trigger.
 export { getRepoGlobMatcher } from './trigger/compiled-matchers.js';
+// The one classifier for "picomatch would read this repo pattern as a
+// negation", shared by every surface that stores a repo pattern — the
+// Platform's role allow-list and the orchestrator's global-workflow policy
+// lists. A second, hand-maintained ban list would let the same pattern
+// language be read two ways.
+export {
+  REGEX_NEGATIVE_ASSERTION,
+  isNegatedPattern,
+  negatedPatternReason,
+} from './repo/pattern-negation.js';
 export * from './trigger/event-buckets.js';
 export { scheduleTriggerKey } from './trigger/schedule-key.js';
 
@@ -236,6 +260,10 @@ export {
   CAPABILITY_LABEL_PREFIX,
   capabilityLabel,
   SSH_TRANSPORT_CAPABILITY,
+  RUNTIME_LABEL_PREFIX,
+  runtimeLabel,
+  RuntimeFact,
+  CONTAINER_BUILD_RUNTIME_LABEL,
   INIT_LABEL,
   PRIVILEGED_ROOT_LABEL,
   INIT_RUNNER_ROLE_LABEL,
@@ -261,6 +289,7 @@ export * from './inventory.js';
 
 // --- Scaler types ---
 export * from './scaler/scaler-backend-type.js';
+export * from './scaler/scaler-events.js';
 export * from './scaler/resource-types.js';
 
 // --- Registration types ---

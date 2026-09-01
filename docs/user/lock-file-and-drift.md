@@ -52,6 +52,7 @@ Step entries carry their own capability flags, so the orchestrator can reason ab
 
 | Flag            | Meaning                                                                                                                                              |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `hasOutputs`    | The step declares an output schema, so the run has typed outputs to record for it. Present on every step entry.                                      |
 | `hasCheck`      | The step declares an idempotent `check` facet, so a run can be dispatched in check mode. See [idempotent steps and check mode](idempotent-steps.md). |
 | `hasWhenInSync` | The step declares a `whenInSync` facet that produces its outputs when `check` reports no drift.                                                      |
 | `hasRules`      | The step has conditional rules (evaluated agent-side).                                                                                               |

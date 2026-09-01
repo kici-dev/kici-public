@@ -120,7 +120,14 @@ export async function handleNewHolds(args: {
     printHold(action.hold, out);
     ctx = ctx ?? (await resolveCtx());
     if (!ctx) {
-      out(pc.dim(`Run held; approve via \`kici approve ${action.hold.runId}\`.`));
+      // Names the hold, not just the run: one job can carry two pending holds
+      // (an SDK `requireApproval` plus a security-typed context gate), and a
+      // run-only command cannot tell them apart.
+      out(
+        pc.dim(
+          `Run held; approve via \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
+        ),
+      );
       continue;
     }
     if (args.approveAll) {
@@ -131,7 +138,11 @@ export async function handleNewHolds(args: {
       continue;
     }
     if (action.kind === 'notify') {
-      out(pc.dim(`Run held; approve via the dashboard or \`kici approve ${action.hold.runId}\`.`));
+      out(
+        pc.dim(
+          `Run held; approve via the dashboard or \`kici approve ${action.hold.runId} --hold ${action.hold.id}\`.`,
+        ),
+      );
       continue;
     }
     const approved = await args.confirm('Approve this gate?');

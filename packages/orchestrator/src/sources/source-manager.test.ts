@@ -85,9 +85,6 @@ vi.mock('../providers/github/index.js', () => ({
   GitHubCheckStatusPoster: class {
     constructor(_factory: any) {}
   },
-  GitHubContributorResolver: class {
-    constructor(_config: any) {}
-  },
 }));
 
 vi.mock('../providers/github/auth.js', () => ({

@@ -45,9 +45,24 @@ interface CacheEntry {
 const cache = new Map<string, CacheEntry>();
 
 /**
+ * Postgres `LISTEN/NOTIFY` channel carrying policy changes across the
+ * cluster. The payload is the `customer_id` alone — every coordinator
+ * shares one orchestrator database, so each listener re-reads the
+ * authoritative map for itself rather than trusting a wire copy.
+ *
+ * `DashboardWritePolicyChangeListener` (`./dashboard-write-policy-listener.ts`)
+ * is the consumer.
+ */
+export const DASHBOARD_WRITE_POLICY_CHANNEL = 'dashboard_write_policy_change';
+
+/**
  * Event bus for policy-change notifications. The WS publisher subscribes
  * to `'changed'` so it can broadcast a fresh `orch.capabilities` to
  * Platform whenever the operator flips a switch.
+ *
+ * The emitter is per-process, so it carries a change only to the peer that
+ * served the admin write. The NOTIFY channel above is what reaches the other
+ * coordinators, whose listeners then emit this same event locally.
  */
 export const dashboardWritePolicyEvents = new EventEmitter();
 
@@ -280,6 +295,13 @@ export async function setDashboardWritePolicy(
         }),
       )
       .execute();
+
+    // Cross-coordinator propagation. Issued INSIDE the transaction, so
+    // Postgres queues it until commit — a rolled-back policy write notifies
+    // nobody. Every coordinator's listener picks this up, drops its cached
+    // map, and re-broadcasts its own `orch.capabilities` to the control
+    // plane; without it only the peer that served this request would.
+    await sql`SELECT pg_notify(${DASHBOARD_WRITE_POLICY_CHANNEL}, ${customerId})`.execute(tx);
 
     if (options.onChange) {
       for (const change of changed) {

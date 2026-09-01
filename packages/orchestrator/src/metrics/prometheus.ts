@@ -265,7 +265,7 @@ export function setScalerUsageBreakdown(rows: ScalerUsageRow[]): void {
  * Current CPU reservations per scaler / machine pool.
  * Labels:
  * - scaler: operator-chosen scaler name; "__global__" is the orchestrator-wide rollup.
- * - scalerType: backend type (__global__ | stateful | container | firecracker | bare-metal).
+ * - scalerType: backend type — "__global__" for the rollup row, else a ScalerBackendType (container | bare-metal | firecracker | kubernetes | event).
  * - machinePool: optional pool name (operator-defined; capped at the Platform filter)
  */
 defineObservableGauge(
@@ -288,7 +288,7 @@ defineObservableGauge(
  * Current memory reservations per scaler / machine pool.
  * Labels:
  * - scaler: operator-chosen scaler name; "__global__" is the orchestrator-wide rollup.
- * - scalerType: backend type (__global__ | stateful | container | firecracker | bare-metal).
+ * - scalerType: backend type — "__global__" for the rollup row, else a ScalerBackendType (container | bare-metal | firecracker | kubernetes | event).
  * - machinePool: optional pool name (operator-defined; capped at the Platform filter)
  */
 defineObservableGauge(
@@ -307,6 +307,124 @@ defineObservableGauge(
   },
 );
 
+// ── Scaler warm pools ────────────────────────────────────────────
+//
+// A warm pool is the one part of the scaler with no job waiting on it: nothing
+// queues and nothing errors when the fill fails, so without these gauges an
+// empty pool is indistinguishable from a working one. `target` vs `ready`
+// answers "is the pool full?", and `in_flight` separates "still filling" from
+// "cannot fill".
+
+interface WarmPoolGaugeRow {
+  /** Operator-chosen scaler name that owns the pool. */
+  scaler: string;
+  /** Normalized label set the pool keeps agents ready for. */
+  labelSet: string;
+  target: number;
+  ready: number;
+  inFlight: number;
+}
+
+let _warmPoolRows: WarmPoolGaugeRow[] = [];
+
+/**
+ * Replace the current warm-pool fill state.
+ *
+ * Called by ScalerManager after each warm-pool tick and after a config reload,
+ * so the gauges follow the pool rather than the scrape.
+ */
+export function setWarmPoolGauges(rows: WarmPoolGaugeRow[]): void {
+  _warmPoolRows = rows;
+}
+
+/**
+ * Configured warm-pool target (`warmPool.size`) per scaler label set.
+ * Labels:
+ * - scaler: operator-chosen scaler name that owns the pool.
+ * - labelSet: normalized label set the pool keeps agents ready for.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_warm_pool_target',
+  {
+    description: 'Configured number of agents a warm pool keeps ready for a label set.',
+  },
+  (result) => {
+    for (const row of _warmPoolRows) {
+      result.observe(row.target, { scaler: row.scaler, labelSet: row.labelSet });
+    }
+  },
+);
+
+/**
+ * Agents that could serve a job for this label set right now.
+ * Labels:
+ * - scaler: operator-chosen scaler name that owns the pool.
+ * - labelSet: normalized label set the pool keeps agents ready for.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_warm_pool_ready',
+  {
+    description:
+      'Agents able to serve a job for a warm pool label set — the same query the dispatcher makes.',
+  },
+  (result) => {
+    for (const row of _warmPoolRows) {
+      result.observe(row.ready, { scaler: row.scaler, labelSet: row.labelSet });
+    }
+  },
+);
+
+/**
+ * Warm spawns started but not yet registered.
+ * Labels:
+ * - scaler: operator-chosen scaler name that owns the pool.
+ * - labelSet: normalized label set the pool keeps agents ready for.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_warm_pool_in_flight',
+  {
+    description:
+      'Warm-pool spawns started but not yet registered. A deficit covered by these is filling, not failing.',
+  },
+  (result) => {
+    for (const row of _warmPoolRows) {
+      result.observe(row.inFlight, { scaler: row.scaler, labelSet: row.labelSet });
+    }
+  },
+);
+
+/**
+ * Total warm-pool spawns started.
+ * Labels:
+ * - scaler: operator-chosen scaler name that owns the pool.
+ */
+export const scalerWarmPoolSpawnsTotal = lazyCounter('kici_orch_scaler_warm_pool_spawns_total', {
+  description: 'Total warm-pool spawns started, per scaler.',
+});
+
+/** Record a warm-pool spawn starting. */
+export function incWarmPoolSpawns(scaler: string): void {
+  scalerWarmPoolSpawnsTotal.add(1, { scaler });
+}
+
+/**
+ * Total warm-pool agents destroyed as surplus to the pool's target — either
+ * past `idleTimeoutSeconds`, or immediately when a config reload lowers the
+ * target. Both paths run through the same destroy callback, so the counter
+ * covers both.
+ * Labels:
+ * - scaler: operator-chosen scaler name that owns the pool.
+ */
+export const scalerWarmPoolReapedTotal = lazyCounter('kici_orch_scaler_warm_pool_reaped_total', {
+  description:
+    'Total warm-pool agents destroyed as surplus — past their idle timeout, or above a lowered target, per scaler.',
+});
+
+/** Record a warm-pool agent being destroyed. */
+export function incWarmPoolReaped(scaler: string): void {
+  scalerWarmPoolReapedTotal.add(1, { scaler });
+}
+
 let _scalerSpawnRefusalsValue = 0;
 
 /** Increment the spawn-refusal counter (called by ScalerManager when a request fails the cap check). */
@@ -322,6 +440,42 @@ defineObservableGauge(
   },
   (result) => result.observe(_scalerSpawnRefusalsValue),
 );
+
+/**
+ * Why an event scaler's cluster-wide cap check failed.
+ *
+ * `reason` label for `kici_orch_scaler_cap_lock_failures_total`. The two are a
+ * different fault with a different operator response, so they must not share a
+ * series any more than either may share one with a plain capacity refusal.
+ * - `contended` — the advisory lock was still held when the wait budget
+ *   expired. The database is healthy; several coordinators are scaling one hot
+ *   scaler at once. Raise the scaler's cap, or the wait budget.
+ * - `unreachable` — the cap could not be evaluated at all (connection lost,
+ *   statement timeout, schema error). Event autoscaling is stalled on the
+ *   database and no cap arithmetic is happening anywhere.
+ */
+export const ScalerCapLockFailureReason = {
+  Contended: 'contended',
+  Unreachable: 'unreachable',
+} as const;
+export type ScalerCapLockFailureReason =
+  (typeof ScalerCapLockFailureReason)[keyof typeof ScalerCapLockFailureReason];
+
+/**
+ * Total event-scaler cluster-wide cap checks that failed, so their spawn was
+ * refused without the cap ever being evaluated.
+ *
+ * Deliberately NOT folded into `kici_orch_scaler_spawn_refusals_total`: that
+ * series means "the cluster is full", and the operator response is to add
+ * capacity or raise a cap. This one means the cap could not be evaluated, so
+ * event spawns fail closed for a reason that has nothing to do with capacity.
+ * Labels:
+ * - reason: contended (the lock wait budget expired) | unreachable (the cap could not be evaluated at all)
+ */
+export const scalerCapLockFailuresTotal = lazyCounter('kici_orch_scaler_cap_lock_failures_total', {
+  description:
+    'Total event-scaler cluster-wide cap checks that failed, refusing their spawn without evaluating the cap. A rising rate means event autoscaling is not running; read reason to tell a stalled database from a contended lock.',
+});
 
 /**
  * Cumulative count of pending jobs re-offered to the scaler when capacity
@@ -344,6 +498,171 @@ const scalerRedispatchTotal = lazyCounter('kici_orch_scaler_redispatch_total', {
 export function incScalerRedispatch(trigger: ScalerRedispatchTrigger, count: number): void {
   if (count > 0) scalerRedispatchTotal.add(count, { trigger });
 }
+
+// ── Event-scaler (workflow-driven autoscaling) metrics ──────────────
+//
+// The event backend emits scale-up / scale-down events instead of doing local
+// compute. These counters/gauge give operators visibility into that path and
+// back the reaper-deletion alert (a non-zero reaper rate means the workflow
+// teardown layers L1–L3 leaked and L4/L5 had to clean up).
+
+/**
+ * Cumulative kici.scaler.scale-up events emitted by event scalers.
+ * Labels:
+ * - scaler: operator-chosen event-scaler name.
+ */
+const scalerScaleUpEmittedTotal = lazyCounter('kici_orch_scaler_scale_up_emitted_total', {
+  description:
+    'Cumulative kici.scaler.scale-up events emitted by event scalers, labeled by scaler.',
+});
+/** Record a scale-up event emitted for `scaler`. */
+export function incScalerScaleUpEmitted(scaler: string): void {
+  scalerScaleUpEmittedTotal.add(1, { scaler });
+}
+
+/**
+ * Cumulative kici.scaler.scale-down events emitted by event scalers.
+ * Labels:
+ * - scaler: operator-chosen event-scaler name.
+ * - reason: teardown reason (idle | job-complete | heartbeat-timeout | spawn-timeout | drain | shutdown).
+ */
+const scalerScaleDownEmittedTotal = lazyCounter('kici_orch_scaler_scale_down_emitted_total', {
+  description:
+    'Cumulative kici.scaler.scale-down events emitted by event scalers, labeled by scaler + reason.',
+});
+/** Record a scale-down event emitted for `scaler` with the teardown `reason`. */
+export function incScalerScaleDownEmitted(scaler: string, reason: string): void {
+  scalerScaleDownEmittedTotal.add(1, { scaler, reason });
+}
+
+/**
+ * Cumulative event-scaler provisions torn down for spawn-timeout.
+ * Labels:
+ * - scaler: operator-chosen event-scaler name.
+ */
+const scalerExternalProvisionTimeoutTotal = lazyCounter(
+  'kici_orch_scaler_external_provision_timeout_total',
+  {
+    description:
+      'Cumulative event-scaler provisions torn down for spawn-timeout (agent never registered), labeled by scaler.',
+  },
+);
+/** Record an event-scaler provision that timed out before its agent registered. */
+export function incScalerExternalProvisionTimeout(scaler: string): void {
+  scalerExternalProvisionTimeoutTotal.add(1, { scaler });
+}
+
+/**
+ * Cumulative spawn-record adoption lookups that failed with a store error, so
+ * the registering agent could not be classified as scaler-managed or static.
+ */
+const scalerAdoptionLookupFailuresTotal = lazyCounter(
+  'kici_orch_scaler_adoption_lookup_failures_total',
+  {
+    description:
+      'Cumulative event-scaler spawn-record adoption lookups that failed with a store error.',
+  },
+);
+/** Record an adoption lookup that could not reach its spawn record. */
+export function incScalerAdoptionLookupFailure(): void {
+  scalerAdoptionLookupFailuresTotal.add(1);
+}
+
+const _externalProvisioningActive = new Map<string, number>();
+
+/** Set the current count of in-flight (provisioning + active) external agents for `scaler`. */
+export function setScalerExternalProvisioningActive(scaler: string, count: number): void {
+  _externalProvisioningActive.set(scaler, count);
+}
+
+/**
+ * Current in-flight external (event-scaler) provisions per scaler. A persistently
+ * non-zero value with no matching agent registrations signals a stuck provisioning
+ * workflow.
+ * Labels:
+ * - scaler: operator-chosen event-scaler name.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_external_provisioning_active',
+  {
+    description:
+      'Current in-flight external (event-scaler) provisions, labeled by scaler (provisioning + active).',
+  },
+  (result) => {
+    for (const [scaler, count] of _externalProvisioningActive) {
+      result.observe(count, { scaler });
+    }
+  },
+);
+
+let _scalerReapUnseenProvisions = 0;
+
+/**
+ * Set how many event-scaler provisions the leader has been unable to see an
+ * agent for, for at least the flap grace. Zero on every non-leader, and on a
+ * leader whose sweep is blocked.
+ */
+export function setScalerReapUnseenProvisions(count: number): void {
+  _scalerReapUnseenProvisions = count;
+}
+
+/**
+ * Event-scaler provisions currently inside the reaper's stranded-absence
+ * window — their agent has been registered on no coordinator for at least the
+ * flap grace, and the leader is timing how long that has held before tearing
+ * them down.
+ *
+ * The flap-grace floor is what makes the gauge usable as an alert. An agent
+ * reads as unseen during its own reconnect, and every peer-adopted agent does
+ * on any peer flap, so counting every current absence would put a healthy
+ * cluster permanently above zero — while the reaper itself refuses to act below
+ * that same grace.
+ *
+ * Alert on it staying non-zero for longer than
+ * `--scaler-reap-stranded-timeout-ms`: the absence clock is leader-local, so a
+ * cluster with enough leader churn (or a peer link flapping faster than the
+ * window) restarts it before it ever expires and the provision bills forever.
+ * That failure is otherwise entirely silent.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_reap_unseen_provisions',
+  {
+    description:
+      'Event-scaler provisions whose agent has been registered on no coordinator for at least the flap grace, being timed by the leader-gated reaper.',
+  },
+  (result) => result.observe(_scalerReapUnseenProvisions),
+);
+
+let _scalerReapBlocked = 0;
+
+/** Set whether this coordinator's provision reaper is standing down (1) or sweeping (0). */
+export function setScalerReapBlocked(blocked: boolean): void {
+  _scalerReapBlocked = blocked ? 1 : 0;
+}
+
+/**
+ * Whether the leader-gated event-scaler reaper is standing down because this
+ * coordinator *knows* coordinator peers but is connected to none of them.
+ *
+ * Knows, not "is configured with": the count spans static config and every peer
+ * handshaken with since start. Keying it on config alone is what left the guard
+ * inert on a Platform-mode HA pair, which configures none.
+ *
+ * A partition and a dead peer are indistinguishable without a quorum, so the
+ * reaper refuses to act rather than risk deleting instances the majority side
+ * is still running. The cost is that the whole backstop — including the
+ * spawn-timeout arm, the primary orphan defence — is off while this reads 1.
+ * On a two-coordinator HA pair a permanently dead peer leaves it off
+ * indefinitely, so alert on it.
+ */
+defineObservableGauge(
+  'kici_orch_scaler_reap_blocked',
+  {
+    description:
+      'Whether the event-scaler provision reaper is standing down for lack of any connected coordinator peer (1) or sweeping (0).',
+  },
+  (result) => result.observe(_scalerReapBlocked),
+);
 
 // ── Dispatch queue depth (observable gauges with labels) ──────────
 //
@@ -705,14 +1024,31 @@ export const webhooksProcessedTotal = lazyCounter('kici_orch_webhooks_processed_
 /**
  * Org trust-policy gate decisions.
  * Labels:
- * - arm: which policy arm decided — workflow_modification | fork_pr | unknown_contributor | none (the PR passed)
- * - action: pass | hold | reject
+ * - arm: which policy arm decided — fork_pr | none (the verdict carried no reason)
+ * - action: pass | ignore | hold | reject
  *
  * Incremented once per evaluated PR event, including passes, so the ratio of
  * gated to ungated PRs is visible rather than only the gated ones.
  */
 export const trustPolicyDecisionsTotal = lazyCounter('kici_orch_trust_policy_decisions_total', {
   description: 'Total org trust-policy gate decisions by arm and action',
+});
+
+/**
+ * Fork pull-request events dropped by the org fork policy before any run row,
+ * check status, or job dispatch existed.
+ * Labels:
+ * - provider: the inbound delivery's provider (github, …)
+ *
+ * @conditionallyEmitted An org that does not ignore fork PRs emits no series.
+ *
+ * Distinct from `kici_orch_trust_policy_decisions_total{action="ignore"}`,
+ * which counts the verdict wherever it is reached: this counts the drop the
+ * ingest path actually performed, so a verdict that stopped being enforced
+ * shows as a divergence between the two rather than as silence.
+ */
+export const forkEventsIgnoredTotal = lazyCounter('kici_orch_fork_events_ignored_total', {
+  description: 'Total fork pull-request events dropped by the org fork policy',
 });
 
 // ── Trigger matching ──────────────────────────────────────────────
@@ -875,7 +1211,7 @@ export type ScalerSpawnFailureBound =
 /**
  * Total scaler agent spawn failures.
  * Labels:
- * - backend: scaler backend type (bare-metal | container | firecracker | unknown)
+ * - backend: scaler backend type (bare-metal | container | event | firecracker | unknown)
  * - bound: true (job-bound spawn) | false (warm-pool/unbound)
  */
 export const scalerSpawnFailuresTotal = lazyCounter('kici_orch_scaler_spawn_failures_total', {
@@ -1102,6 +1438,20 @@ export const eventRetryTotal = lazyCounter('kici_orch_event_retry_total', {
  */
 export const eventDlqTotal = lazyCounter('kici_orch_event_dlq_total', {
   description: 'Internal events moved to the DLQ after exhausting retries',
+});
+
+/**
+ * Startup catch-up scans that threw. Emits no labels.
+ *
+ * The scan recovers the internal-event backlog a restart left behind, and it
+ * runs behind a boot latch that the composition root resolves after startup
+ * continues — so a failure cannot fail the bootstrap and is otherwise invisible
+ * until the backlog quietly ages into the DLQ. This counter is what an alert
+ * fires on; the accompanying `Deferred catch-up scan failed` log line carries
+ * the reason.
+ */
+export const eventCatchUpFailuresTotal = lazyCounter('kici_orch_event_catch_up_failures_total', {
+  description: 'Startup internal-event catch-up scans that threw',
 });
 
 /**

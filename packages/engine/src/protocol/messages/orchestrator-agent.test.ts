@@ -18,6 +18,8 @@ import {
   eventEmitSchema,
   provenanceUploadDeferSchema,
   eventEmitResponseSchema,
+  scalerClaimCredentialsSchema,
+  scalerClaimCredentialsResponseSchema,
   agentAuthRequestSchema,
   agentAuthSuccessSchema,
   agentAuthFailureSchema,
@@ -82,6 +84,31 @@ describe('upstreamSnapshotSchema', () => {
     expect(() =>
       upstreamSnapshotSchema.parse({ jobs: {}, groups: {}, statuses: { build: 'nope' } }),
     ).toThrow();
+  });
+
+  it('round-trips an optional invokeResults map keyed by gate name', () => {
+    const parsed = upstreamSnapshotSchema.parse({
+      jobs: {},
+      groups: {},
+      invokeResults: {
+        'repo-tests': [
+          {
+            repo: 'myorg/backend',
+            workflow: 'unit',
+            runId: 'r1',
+            status: 'success',
+            outputs: { coverage: '92' },
+          },
+        ],
+      },
+    });
+    expect(parsed.invokeResults?.['repo-tests'][0]).toEqual({
+      repo: 'myorg/backend',
+      workflow: 'unit',
+      runId: 'r1',
+      status: 'success',
+      outputs: { coverage: '92' },
+    });
   });
 });
 
@@ -285,6 +312,38 @@ describe('jobDispatchSchema', () => {
     expect(parsed.orgId).toBeUndefined();
     expect(parsed.repoId).toBeUndefined();
     expect(parsed.cacheRefScope).toBeUndefined();
+  });
+
+  it('parses job.dispatch with containerRegistryAuth', () => {
+    const parsed = jobDispatchSchema.parse({
+      ...validDispatch,
+      containerRegistryAuth: {
+        username: 'bot',
+        password: 's3cr3t',
+        serveraddress: 'reg.internal:5000',
+      },
+    });
+    expect(parsed.containerRegistryAuth).toEqual({
+      username: 'bot',
+      password: 's3cr3t',
+      serveraddress: 'reg.internal:5000',
+    });
+  });
+
+  it('parses job.dispatch without containerRegistryAuth (older orchestrator)', () => {
+    // An orchestrator that predates per-job registry auth sends no field, and
+    // the agent must still pull anonymously rather than reject the dispatch.
+    const parsed = jobDispatchSchema.parse(validDispatch);
+    expect(parsed.containerRegistryAuth).toBeUndefined();
+  });
+
+  it('rejects a containerRegistryAuth missing its registry host', () => {
+    expect(() =>
+      jobDispatchSchema.parse({
+        ...validDispatch,
+        containerRegistryAuth: { username: 'bot', password: 's3cr3t' },
+      }),
+    ).toThrow();
   });
 
   it('rejects an invalid cacheRefScope value', () => {
@@ -1077,6 +1136,12 @@ describe('registerAckSchema', () => {
     const roundTripped = JSON.parse(JSON.stringify(validAck));
     expect(registerAckSchema.parse(roundTripped)).toEqual(validAck);
   });
+
+  it('accepts an optional warmPool flag on register.ack', () => {
+    expect(registerAckSchema.parse({ ...validAck, warmPool: true }).warmPool).toBe(true);
+    // Absent is the pre-warm-pool orchestrator: parses, and reads as undefined.
+    expect(registerAckSchema.parse(validAck).warmPool).toBeUndefined();
+  });
 });
 
 describe('configAckSchema', () => {
@@ -1546,6 +1611,62 @@ describe('eventEmitResponseSchema', () => {
   it('round-trips through JSON serialization', () => {
     const roundTripped = JSON.parse(JSON.stringify(validResponse));
     expect(eventEmitResponseSchema.parse(roundTripped)).toEqual(validResponse);
+  });
+});
+
+describe('scalerClaimCredentialsSchema', () => {
+  const validClaim = {
+    type: 'scaler.claim-credentials',
+    requestId: 'req-1',
+    claimCode: 'code-abc',
+  };
+
+  it('validates a well-formed claim and round-trips it', () => {
+    expect(scalerClaimCredentialsSchema.parse(validClaim)).toEqual(validClaim);
+    expect(scalerClaimCredentialsSchema.parse(JSON.parse(JSON.stringify(validClaim)))).toEqual(
+      validClaim,
+    );
+  });
+
+  it('rejects a missing claimCode', () => {
+    const { claimCode, ...rest } = validClaim;
+    expect(() => scalerClaimCredentialsSchema.parse(rest)).toThrow();
+  });
+
+  it('is a member of the agent -> orchestrator union', () => {
+    expect(agentToOrchestratorMessageSchema.parse(validClaim)).toEqual(validClaim);
+  });
+});
+
+describe('scalerClaimCredentialsResponseSchema', () => {
+  const validResponse = {
+    type: 'scaler.claim-credentials.response',
+    requestId: 'req-1',
+    credentials: {
+      agentToken: 'kat_secret',
+      agentId: 'a1',
+      orchestratorUrl: 'wss://h/ws',
+      labels: ['cloud=hetzner'],
+    },
+  };
+
+  it('validates a success response with credentials', () => {
+    expect(scalerClaimCredentialsResponseSchema.parse(validResponse)).toEqual(validResponse);
+  });
+
+  it('validates an error response with no credentials', () => {
+    const errorResponse = {
+      type: 'scaler.claim-credentials.response',
+      requestId: 'req-1',
+      error: 'invalid claim code',
+    };
+    const parsed = scalerClaimCredentialsResponseSchema.parse(errorResponse);
+    expect(parsed.error).toBe('invalid claim code');
+    expect(parsed.credentials).toBeUndefined();
+  });
+
+  it('is a member of the orchestrator -> agent union', () => {
+    expect(orchestratorToAgentMessageSchema.parse(validResponse)).toEqual(validResponse);
   });
 });
 

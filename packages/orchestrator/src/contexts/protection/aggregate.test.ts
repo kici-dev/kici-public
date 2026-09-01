@@ -144,6 +144,79 @@ describe('buildEffectiveContext', () => {
   });
 });
 
+describe('evaluateMultiContextGates — internally-triggered runs', () => {
+  it('accepts a run whose inherited branch matches the restriction', () => {
+    // The setup the docs present as canonical: a nightly deploy bound to a
+    // context restricted to the default branch.
+    const env = makeEnv({ name: 'production', branchRestrictions: ['main'] });
+    expect(
+      evaluateMultiContextGates([{ name: 'production', env }], {
+        ...ctx,
+        branch: 'main',
+        internallyTriggered: true,
+      }),
+    ).toEqual([]);
+  });
+
+  it('names the real branch when an internally-triggered run does not match', () => {
+    const env = makeEnv({ name: 'production', branchRestrictions: ['release/*'] });
+    const rej = evaluateMultiContextGates([{ name: 'production', env }], {
+      ...ctx,
+      branch: 'main',
+      internallyTriggered: true,
+    });
+    expect(rej).toHaveLength(1);
+    expect(rej[0].reason).toBe('branch_restricted');
+    expect(rej[0].detail).toContain("branch 'main' not allowed");
+  });
+
+  it('names the missing branch when the run carries none', () => {
+    const env = makeEnv({ name: 'production', branchRestrictions: ['main'] });
+    const rej = evaluateMultiContextGates([{ name: 'production', env }], {
+      ...ctx,
+      branch: '',
+      internallyTriggered: true,
+    });
+    expect(rej).toHaveLength(1);
+    expect(rej[0].reason).toBe('branch_restricted');
+    expect(rej[0].detail).toContain('carries no branch');
+    // The context name is added by the formatter, so the detail must not
+    // duplicate it.
+    expect(rej[0].detail).not.toContain('production');
+  });
+
+  it('still rejects a branchless run against a catch-all pattern', () => {
+    // `*` matches any branch NAME; a run with no branch has nothing to match,
+    // so the named-cause verdict stands rather than letting it through.
+    const env = makeEnv({ name: 'anything', branchRestrictions: ['*'] });
+    expect(
+      evaluateMultiContextGates([{ name: 'anything', env }], { ...ctx, branch: 'main' }),
+    ).toEqual([]);
+    const rej = evaluateMultiContextGates([{ name: 'anything', env }], {
+      ...ctx,
+      branch: '',
+      internallyTriggered: true,
+    });
+    expect(rej).toHaveLength(1);
+    expect(rej[0].reason).toBe('branch_restricted');
+    expect(rej[0].detail).toContain('carries no branch');
+  });
+
+  it('leaves a context with no branch restriction passing', () => {
+    // The documented remedy: the same internally-triggered run against a
+    // context that restricts by trigger type instead.
+    const env = makeEnv({ name: 'nightly', triggerTypeFilters: ['schedule'] });
+    expect(
+      evaluateMultiContextGates([{ name: 'nightly', env }], {
+        ...ctx,
+        branch: '',
+        triggerType: 'schedule',
+        internallyTriggered: true,
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe('formatMultiContextRejection', () => {
   it('names the env and rule', () => {
     const msg = formatMultiContextRejection([

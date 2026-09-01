@@ -54,6 +54,7 @@ export const SCOPE_GROUPS = [
       'getting-started.md',
       'migrating-from-github-actions.md',
       'why-kici.md',
+      'getting-help.md',
       'execution-model.md',
       'README.md',
       'README-public.md',
@@ -123,27 +124,48 @@ export const SCOPE_GROUPS = [
     // needs, and so the docs/user coverage check stays satisfied.
     extras: [{ dir: 'docs/user/cli' }],
   },
+  // The feature guides are split across two bundles because together they pass
+  // MAX_BUNDLE_BYTES. The line between them is what the reader is doing: `features`
+  // covers what a job is allowed to reach (contexts, secrets, approvals, the
+  // artifacts it proves), `features-execution` covers how work is scheduled and run.
   {
     id: 'features',
-    label: 'Workflow features',
-    purpose: 'Workflow features: concurrency, contexts, secrets, approvals, provenance, events',
+    label: 'Workflow features: access and approval',
+    purpose:
+      'Deployment contexts, scoped secrets, private registries, approvals, provenance, dashboard and account access',
+    dir: 'docs/user',
+    recurse: false,
+    only: [
+      'contexts.md',
+      'secrets.md',
+      'private-registries.md',
+      'approvals.md',
+      'provenance.md',
+      'dashboard.md',
+      'account-and-login.md',
+    ],
+  },
+  {
+    id: 'features-execution',
+    label: 'Workflow features: execution',
+    purpose:
+      'Concurrency, dynamic values, events, container jobs, environment variables, global workflows, idempotent steps',
     dir: 'docs/user',
     recurse: false,
     only: [
       'concurrency.md',
-      'contexts.md',
       'dynamic-values.md',
       'events.md',
-      'secrets.md',
-      'private-registries.md',
+      'container-jobs.md',
       'env-vars.md',
       'global-workflows.md',
-      'dashboard.md',
-      'account-and-login.md',
-      'approvals.md',
-      'provenance.md',
       'idempotent-steps.md',
     ],
+    // Workflow-authoring guides that live in co-located child pages under
+    // docs/user/workflows/ (e.g. autoscaling provisioning/teardown workflows).
+    // Bundle them so an authoring agent gets the feature guides and the
+    // docs/user coverage check stays satisfied.
+    extras: [{ dir: 'docs/user/workflows' }],
   },
   {
     id: 'providers',

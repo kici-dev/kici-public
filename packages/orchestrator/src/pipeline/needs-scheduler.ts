@@ -69,7 +69,7 @@ function parseRunOn(json: string): Set<string> {
  * its status is not in the edge's run_on set. Returns { satisfied: false } when
  * any upstream is not yet terminal.
  */
-async function checkAllUpstreamsSatisfied(
+export async function checkAllUpstreamsSatisfied(
   db: Kysely<Database>,
   runId: string,
   jobName: string,
@@ -151,7 +151,9 @@ export async function insertEdgesForRun(
   for (const job of jobs) {
     const concreteNeeds: Array<{ upstreamName: string; runOn: string }> = [];
 
-    for (const need of job.lockJob.needs) {
+    // A directly-registered global lock job can arrive without a `needs` array
+    // (the compiler emits `needs: []`); treat a missing one as no upstreams.
+    for (const need of job.lockJob.needs ?? []) {
       let baseName: string;
       let runOn: string;
       if (typeof need === 'string') {

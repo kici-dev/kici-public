@@ -72,3 +72,18 @@ describe('prometheus metrics', () => {
     expect(() => logBackpressureActive.add(-1, { mode: 'pause' })).not.toThrow();
   });
 });
+
+describe('between-jobs metrics', () => {
+  it('exposes the four new instruments with add/record', async () => {
+    const {
+      betweenJobsResetTotal,
+      betweenJobsResetDurationSeconds,
+      orphansReapedTotal,
+      orphanCleanupTotal,
+    } = await import('./prometheus.js');
+    expect(() => betweenJobsResetTotal.add(1, { status: 'success' })).not.toThrow();
+    expect(() => betweenJobsResetDurationSeconds.record(0.2)).not.toThrow();
+    expect(() => orphansReapedTotal.add(3)).not.toThrow();
+    expect(() => orphanCleanupTotal.add(1, { status: 'success' })).not.toThrow();
+  });
+});

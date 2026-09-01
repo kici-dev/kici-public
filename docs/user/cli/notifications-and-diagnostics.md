@@ -180,9 +180,9 @@ kici diagnostics --json
 Walk your KiCI setup end to end and print the exact next command for each
 problem found. Where `kici diagnostics` shows the org's infrastructure, `kici
 doctor` checks **your own setup**: it runs six checks in onboarding order —
-login (stored, unexpired credentials), active organization, a live token probe
-against the platform, a connected orchestrator for the org, a present, fresh,
-and committed lock file, and whether every workflow's `runsOn` labels are
+login (stored, unexpired credentials), active organization, a present, fresh,
+and committed lock file, a live token probe against the platform, a connected
+orchestrator for the org, and whether every workflow's `runsOn` labels are
 satisfiable by a connected agent or scaler. Each check reports pass/warn/fail
 with the fix command (e.g. `kici login`, `kici org use <name>`,
 `kici compile`), so the first failing row tells you exactly what to run next.
@@ -203,6 +203,60 @@ kici doctor --json
 
 The command exits `0` when every check passes, `1` when any check warns, and
 `2` when any check fails, so it also works as a CI preflight.
+
+### kici report
+
+Gather a diagnostic bundle to share when you report a problem. `kici doctor`
+tells you what is wrong; `kici report` packages the context somebody else needs
+to see it. The bundle holds your CLI, Node and orchestrator versions, your
+redacted configuration, and your project's workflow and lock-file state. With
+`--run` it also holds the failing run's detail and logs.
+
+```bash
+kici report [options]
+```
+
+The command writes a ZIP and prints its path and `sha256`. It does not send
+anything. Open the file and read it before you share it.
+
+```bash
+# Bundle your setup
+kici report
+
+# Scope it to the run that failed, and say what went wrong
+kici report --run 8f3c1d2e --message "matrix job hangs on macOS"
+
+# Choose the output path and attach your own metadata
+kici report -o /tmp/bug.zip --metadata ticket=1234 --metadata severity=high
+```
+
+**Redaction.** KiCI removes known secret shapes — API keys, tokens, `Authorization`
+headers, private keys, passwords in connection URLs — from configuration and
+from log text. This is best effort. A secret in a format KiCI does not
+recognize can survive, so review the bundle before you share it. `--no-redact`
+turns redaction off and prints a warning; use it only on a bundle you keep.
+
+**Sending it privately.** Add `--upload` to send the bundle to KiCI over a
+one-time upload link. The bundle goes straight to KiCI storage, and the command
+prints a reference id to quote:
+
+```bash
+kici report --run 8f3c1d2e --upload --message "matrix job hangs on macOS"
+```
+
+Uploads are private, are kept for 90 days, and are yours to withdraw:
+
+```bash
+# See what you have sent
+kici report list
+
+# Delete an uploaded bundle
+kici report withdraw <ref>
+```
+
+Anyone in your organization can upload a report. By default you see and
+withdraw your own; a member with the `support:admin` permission can manage
+every report in the organization.
 
 ## Reference
 
@@ -410,6 +464,49 @@ Synopsis: `kici notifications subscriptions remove <id> [options]`
 | Option       | Default | Description                                    |
 | ------------ | ------- | ---------------------------------------------- |
 | `--org <id>` |         | Target organization (overrides the active org) |
+
+### `kici report`
+
+Gather a redacted diagnostic bundle to share when reporting an issue
+
+Synopsis: `kici report [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                  |
+| ------------------------ | ------- | ------------------------------------------------------------ |
+| `--run <id>`             |         | Scope the bundle to a failing run                            |
+| `-o, --output <path>`    |         | Where to write the bundle ZIP                                |
+| `--metadata <key=value>` |         | Attach metadata (repeatable)                                 |
+| `--no-redact`            |         | Do NOT redact secrets (prints a loud warning)                |
+| `--upload`               |         | Upload the bundle privately to KiCI and print a reference id |
+| `--message <text>`       |         | Describe the problem (sent with --upload)                    |
+| `--email <address>`      |         | Contact address for follow-up (sent with --upload)           |
+| `--kici-dir <path>`      | `.kici` | Path to the .kici directory                                  |
+
+### `kici report list`
+
+List the issue reports you have uploaded
+
+Synopsis: `kici report list [options]`
+
+**Options**
+
+| Option   | Default | Description     |
+| -------- | ------- | --------------- |
+| `--json` | `false` | Output raw JSON |
+
+### `kici report withdraw`
+
+Withdraw an uploaded report and delete its bundle
+
+Synopsis: `kici report withdraw <ref>`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description                            |
+| -------- | -------- | -------- | -------------------------------------- |
+| `ref`    | yes      | no       | Reference id of the report to withdraw |
 
 ### `kici verify-attestation`
 

@@ -300,6 +300,40 @@ export function capabilityLabel(name: string): string {
 export const SSH_TRANSPORT_CAPABILITY = 'kici:capability:ssh-transport';
 
 /**
+ * Runtime-fact label prefix — `kici:runtime:<name>` states something the AGENT
+ * discovered about its own host.
+ *
+ * Deliberately NOT `kici:capability:`. That prefix grants a privilege
+ * (`ssh-transport` custodies the bootstrap SSH key), so it must stay
+ * token-bound and an agent must never be able to self-assert it. A runtime fact
+ * grants nothing: it reports what the host can do, the way `kici:os:` reports
+ * what the host is, and it is self-reported for the same reason — the scaler
+ * cannot predict it at token-mint time.
+ */
+export const RUNTIME_LABEL_PREFIX = 'kici:runtime:';
+
+/** Build a `kici:runtime:<name>` label. */
+export function runtimeLabel(name: string): string {
+  return `${RUNTIME_LABEL_PREFIX}${name}`;
+}
+
+/**
+ * Runtime facts an agent reports about its own host at registration.
+ *
+ * - `docker` / `podman` — that container runtime's socket answered, so the
+ *   agent can nest a job container.
+ * - `container-build` — a `docker` / `podman` CLI is on PATH, so the agent can
+ *   build a job's image from a Dockerfile. Distinct from the two above: a host
+ *   reachable only through a mounted socket can RUN containers but not BUILD
+ *   one, because the build shells out to the CLI.
+ */
+export const RuntimeFact = z.enum(['docker', 'podman', 'container-build']);
+export type RuntimeFact = z.infer<typeof RuntimeFact>;
+
+/** The label a job's `runsOn` names to require a host that can build an image. */
+export const CONTAINER_BUILD_RUNTIME_LABEL = runtimeLabel(RuntimeFact.enum['container-build']);
+
+/**
  * The `kici:init` lifecycle label carried by a temporary init-runner agent
  * brought up on a fresh box for bootstrap. Marks it as ephemeral + privileged;
  * it dies on reboot and is reaped. Distinct from `kici:role:init-runner`
@@ -350,35 +384,71 @@ export function resolveRoleLabels(roles: readonly string[] | undefined): string[
 
 /**
  * The full label set a scaler injects into an agent it spawns: the base label
- * set plus the scaler-assigned `kici:agent:`, `kici:scaler:`, and `kici:role:`
- * labels. This is exactly what the scaler writes into `KICI_LABELS`, and it is
- * the set an ephemeral agent token must be bound to — the agent then adds only
- * the self-reported platform facts (`kici:os:`, `kici:arch:`, `kici:host:`) at
- * registration, which the orchestrator's register-time scope gate exempts (see
- * `isSelfReportedLabel`). Keep this aligned with the agent's wire-label
- * construction in `orchestrator-client.ts#sendAgentRegister`.
+ * set plus the scaler-assigned `kici:agent:`, `kici:scaler:`, `kici:role:`, and
+ * platform-taint labels. This is exactly what the scaler writes into
+ * `KICI_LABELS`, and it is the set an ephemeral agent token must be bound to —
+ * the agent then adds only the self-reported platform facts (`kici:os:`,
+ * `kici:arch:`, `kici:host:`) at registration, which the orchestrator's
+ * register-time scope gate exempts (see `isSelfReportedLabel`). Keep this
+ * aligned with the agent's wire-label construction in
+ * `orchestrator-client.ts#sendAgentRegister`.
+ *
+ * `platformTaints` are the plain tokens (`windows`, `macos`, `arm64`) derived
+ * from the pool's resolved platform. A taint is a routing GRANT, not a host
+ * fact: it is what a job's `runsOn` names to reach this pool, and the matcher
+ * gates on it. So the orchestrator asserts it here — bound into the agent's
+ * ephemeral token — rather than letting the agent self-report it. Adding these
+ * prefixes to `SELF_REPORTED_LABEL_PREFIXES` instead would let any agent claim
+ * any platform unchallenged, which is the opposite of a gate. The caller must
+ * derive them from the same source the gate uses
+ * (`ScalerManager.resolveScalerPlatform`) — deriving them twice is exactly the
+ * defect this parameter closes.
+ *
+ * The result is de-duplicated in first-seen order: a warm pool measures its
+ * readiness with a label set that already carries the taints, so it passes them
+ * as `labelSet` AND as `platformTaints`, and a label repeated in the set an
+ * ephemeral token is bound to is never meaningful.
  */
 export function scalerAgentLabels(
   labelSet: string[],
   backendType: string,
   backendName: string,
   roles: readonly string[] | undefined,
+  platformTaints: readonly string[] = [],
 ): string[] {
   return [
-    ...labelSet,
-    agentTypeLabel(backendType),
-    scalerLabel(backendName),
-    ...resolveRoleLabels(roles),
+    ...new Set([
+      ...labelSet,
+      agentTypeLabel(backendType),
+      scalerLabel(backendName),
+      ...resolveRoleLabels(roles),
+      ...platformTaints,
+    ]),
   ];
 }
 
 /**
  * Label-category prefixes the agent self-reports at registration from its own
- * host (operating system, CPU architecture, hostname). They are immutable
- * platform facts, not authorization grants, so the orchestrator's register-time
- * label-scope gate does not require an ephemeral token to be bound to them.
+ * host: operating system, CPU architecture, hostname, and runtime facts. They
+ * are platform facts, not authorization grants, so the orchestrator's
+ * register-time label-scope gate does not require an ephemeral token to be
+ * bound to them.
+ *
+ * Adding a prefix here lets any agent assert it unchallenged. That is correct
+ * for a fact about the host and WRONG for anything that grants a privilege —
+ * `kici:capability:` is absent from this list for exactly that reason.
  */
-export const SELF_REPORTED_LABEL_PREFIXES = ['kici:os:', 'kici:arch:', 'kici:host:'] as const;
+export const SELF_REPORTED_LABEL_PREFIXES = [
+  'kici:os:',
+  'kici:arch:',
+  'kici:host:',
+  // Runtime FACTS (what the host can do), never `kici:capability:` (which
+  // grants a privilege and stays token-bound). The scaler cannot know at
+  // token-mint time whether a host has a container runtime or a build CLI —
+  // that is the agent's own discovery, which is exactly why gating on an
+  // orchestrator-side probe stranded container jobs before.
+  RUNTIME_LABEL_PREFIX,
+] as const;
 
 /**
  * True if a label is a self-reported platform fact (os/arch/host) rather than a

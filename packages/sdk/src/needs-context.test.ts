@@ -40,6 +40,47 @@ describe('buildNeedsContext', () => {
     expect((needs.a as { status: string }).status).toBe('success');
   });
 
+  it('resolves an invoke-gate need as { result } — an ordered array of InvokeResult', () => {
+    const gateSnapshot = {
+      jobs: {},
+      groups: {},
+      invokeResults: {
+        'repo-tests': [
+          {
+            repo: 'myorg/backend',
+            workflow: 'repo-tests',
+            runId: 'r1',
+            status: 'success',
+            outputs: { coverage: '92' },
+          },
+          {
+            repo: 'myorg/backend',
+            workflow: 'repo-lint',
+            runId: 'r2',
+            status: 'failed',
+            outputs: {},
+          },
+        ],
+      },
+    };
+    const needs = buildNeedsContext(gateSnapshot, ['repo-tests']);
+    const entry = needs['repo-tests'] as {
+      result: Array<{
+        repo: string;
+        workflow: string;
+        runId: string;
+        status: string;
+        outputs: Record<string, unknown>;
+      }>;
+    };
+    const arr = entry.result;
+    expect(arr.map((e) => e.runId)).toEqual(['r1', 'r2']);
+    expect(arr.map((e) => e.repo)).toEqual(['myorg/backend', 'myorg/backend']);
+    expect(arr.map((e) => e.workflow)).toEqual(['repo-tests', 'repo-lint']);
+    expect(arr.map((e) => e.status)).toEqual(['success', 'failed']);
+    expect(arr[0].outputs.coverage).toBe('92');
+  });
+
   it('throws a clear error when a single-job need has no snapshot entry', () => {
     expect(() => {
       const n = buildNeedsContext({ jobs: {}, groups: {} }, ['missing']);

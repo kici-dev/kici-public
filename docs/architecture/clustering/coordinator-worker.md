@@ -36,6 +36,17 @@ When an orchestrator starts in worker mode, the following subsystems are skipped
 | Worker status endpoint                     | No          | Yes         | `/status` with recent job history                                                        |
 | Worker drain endpoint                      | No          | Yes         | `POST /drain` for graceful drain                                                         |
 
+## Plan limit
+
+Every orchestrator instance counts toward the organization's plan orchestrator
+limit — coordinators and workers alike. A worker does not open its own upstream
+connection, so the coordinator reports its connected workers to the hosted
+Platform. The Platform aggregates the org's total (one coordinator plus its
+workers, summed across every coordinator) and pushes each coordinator a ceiling
+on how many workers it may hold. The coordinator refuses a worker join past that
+ceiling. An organization that stays over its limit is notified, and after a
+grace window its newest workers are drained and disconnected down to the limit.
+
 ## Job flow
 
 ```
@@ -76,7 +87,7 @@ Workers do not have a local job queue. When a worker receives `job.reroute`:
 
 The coordinator tracks NAK count per peer with backoff. After repeated NAKs from the same peer, the coordinator deprioritizes that peer temporarily.
 
-If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the coordinator re-dispatches the job (to another peer or locally) rather than stranding the run. A bounded post-ACK spawn window backstops this: the first progress from the accepting peer disarms it, and a worker-relayed provisioning failure re-dispatches immediately. The re-dispatch, the disarm, and a job's terminal cleanup are all keyed to the peer the job is tracked against, so a stale signal relayed for the same job by a superseded peer (after an earlier re-dispatch moved it) is ignored — it cannot bounce the healthy replacement, wrongly mark the run finished, or strip the replacement's spawn-window backstop.
+If a worker ACKs a job but the scaler then fails to provision an agent (Docker down, Firecracker exhausted), the coordinator re-dispatches the job (to another peer or locally) rather than stranding the run. A bounded post-ACK spawn window backstops this: the first progress from the accepting peer disarms it, and a worker-relayed provisioning failure re-dispatches immediately. A worker relays progress because it holds no database. A peer coordinator instead writes the job's status to the shared database and relays nothing. So when the window elapses, the coordinator reads that row and disarms the backstop for a job the peer already started. The re-dispatch, the disarm, and a job's terminal cleanup are all keyed to the peer the job is tracked against. So the coordinator ignores a stale signal relayed for the same job by a superseded peer, after an earlier re-dispatch moved it. Such a signal cannot bounce the healthy replacement, wrongly mark the run finished, or strip the replacement's spawn-window backstop.
 
 ## Reliable terminal-status relay
 
@@ -144,7 +155,9 @@ Defined in `packages/engine/src/protocol/version.ts` as `PROTOCOL_VERSION` and `
 - **Coordinator-worker:** Peer handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 - **Agent-orchestrator:** Agent handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 
-Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented on breaking changes to message schemas.
+Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` is currently `2` and `MIN_PROTOCOL_VERSION` is `1`, so every peer still connects.
+
+Raising `PROTOCOL_VERSION` on its own is additive. A sender that needs to know whether a peer can parse a new value gates on the version that peer negotiated, against a named floor, and down-converts for anything older. `FORK_POLICY_IGNORE_MIN_PROTOCOL_VERSION` is the first such floor: it names the version whose `trust_policy.update` reader accepts `forkPolicy: 'ignore'`. Raising `MIN_PROTOCOL_VERSION` is the breaking half, and it is what forces every node to be upgraded.
 
 ### Capability flags (per-feature negotiation)
 
@@ -159,7 +172,7 @@ Schemas use `.passthrough()` so newer peers sending unknown flags don't get stri
 
 ### Software version (diagnostic only)
 
-Both sides send `softwareVersion` in the peer auth handshake for logging and debugging. It is not used for compatibility gating. Coordinators and workers can be upgraded in any order as long as both support the same minimum protocol version.
+Both sides send `softwareVersion` in the peer auth handshake for logging and debugging. It is not used for compatibility gating. Coordinators and workers can be upgraded in any order as long as every node's protocol version is at or above the minimum the others accept.
 
 ### CLI capability probe (REST)
 

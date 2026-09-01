@@ -13,6 +13,8 @@ import {
   OIDC_TOKEN_REQUEST_METHOD,
   type OidcTokenResult,
 } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
+import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
+import type { GitApi, GitGrant } from './git-types.js';
 import type { HostInventoryEntry, InventorySelector } from '@kici-dev/engine';
 
 export type { OidcTokenResult };
@@ -153,6 +155,31 @@ export interface BootstrapApi {
   restageAgent(targetAgentId: string): Promise<{ restaged: boolean }>;
 }
 
+// --- Event-scaler credential claim ---
+
+/** Credentials a provisioning workflow uses to boot a scaler-provisioned agent. */
+export interface ClaimedAgentCredentials {
+  /** Single-use ephemeral agent token the provisioned instance registers with. */
+  agentToken: string;
+  /** Agent id the instance must register with (chosen by the scaler). */
+  agentId: string;
+  /** Orchestrator WS URL the instance connects back to. */
+  orchestratorUrl: string;
+  /** Labels the token authorizes. */
+  labels: string[];
+}
+
+export interface ScalerApi {
+  /**
+   * Exchange a single-use claim code — delivered on a `kici.scaler.scale-up`
+   * event to a provisioning workflow — for freshly minted ephemeral agent
+   * credentials. Boot a cloud instance whose agent registers with the returned
+   * `agentId` and `agentToken`, and the pending bound job runs on it. The token
+   * is minted lazily on this call and never appears in the persisted event log.
+   */
+  claimAgentCredentials(claimCode: string): Promise<ClaimedAgentCredentials>;
+}
+
 // --- Top-level KiCI API ---
 
 export interface KiciApi {
@@ -162,10 +189,14 @@ export interface KiciApi {
   inventory: InventoryApi;
   /** Request short-lived OIDC ID tokens for the current job (build provenance). */
   oidc: OidcApi;
+  /** Forge-typed git credentials for the current job. */
+  git: GitApi;
   /** Host-lifecycle operations on the agent's own host (e.g. reboot). */
   host: HostApi;
   /** Fresh-box bootstrap bring-up (init-runner over SSH, pre-boot unlock). */
   bootstrap: BootstrapApi;
+  /** Event-scaler provisioning: claim ephemeral agent credentials. */
+  scaler: ScalerApi;
 }
 
 // --- Transport layer (internal) ---
@@ -218,6 +249,35 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
         }) as Promise<OidcTokenResult>;
       },
     },
+    git: {
+      github: {
+        getToken: (opts) => {
+          if (!jobCtx) {
+            return Promise.reject(
+              new Error(
+                'ctx.kici.git.github.getToken() is only available inside a running job step',
+              ),
+            );
+          }
+          if (opts.repositories.length === 0) {
+            // An empty list would mint across the whole installation. Refuse:
+            // a write grant must always name a specific repository.
+            return Promise.reject(
+              new Error('git.github.getToken requires at least one repository'),
+            );
+          }
+          return transport(GIT_CREDENTIAL_REQUEST_METHOD, {
+            jobId: jobCtx.jobId,
+            repositories: opts.repositories,
+            permissions: opts.permissions,
+            ...(opts.credential ? { credential: opts.credential } : {}),
+          }).then((raw) => {
+            const r = raw as { secret: string; expiresAt: string | null; grant: GitGrant };
+            return { token: r.secret, expiresAt: r.expiresAt, granted: r.grant };
+          });
+        },
+      },
+    },
     host: {
       requestReboot: (opts) =>
         transport('host.requestReboot', {
@@ -240,6 +300,13 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
       // orchestrator's privileged resolve is availability-gated + audited.
       restageAgent: (targetAgentId) =>
         transport('kici.restageAgent', { targetAgentId }) as Promise<{ restaged: boolean }>,
+    },
+    scaler: {
+      // The agent process intercepts this method: it relays it to the
+      // orchestrator over the dedicated `scaler.claim-credentials` WS message
+      // (the token rides that response only, never the persisted event log).
+      claimAgentCredentials: (claimCode) =>
+        transport('scaler.claim-credentials', { claimCode }) as Promise<ClaimedAgentCredentials>,
     },
   };
 }

@@ -158,3 +158,47 @@ export const logBackpressureActive = meter.createUpDownCounter(
 export const connectionStatus = meter.createUpDownCounter('kici_agent_connection_status', {
   description: 'Orchestrator WebSocket connection status (0=disconnected, 1=connected)',
 });
+
+// -- Between-jobs lifecycle ---------------------------------------------------
+
+/**
+ * Total operator between-jobs reset command invocations.
+ * Labels:
+ * - status: success | failed | timeout
+ * - scaler: injected orch-side; `stateful` for static agents
+ */
+export const betweenJobsResetTotal = meter.createCounter('kici_agent_between_jobs_reset_total', {
+  description: 'Total operator between-jobs reset command invocations',
+});
+
+/**
+ * Between-jobs reset command duration in seconds.
+ * Labels:
+ * - scaler: injected orch-side
+ */
+export const betweenJobsResetDurationSeconds = meter.createHistogram(
+  'kici_agent_between_jobs_reset_duration_seconds',
+  {
+    description: 'Between-jobs reset command duration in seconds',
+    advice: { explicitBucketBoundaries: [0.1, 1, 5, 30, 60, 300] },
+  },
+);
+
+/**
+ * Processes killed by the between-jobs process-group reap.
+ * Labels:
+ * - scaler: injected orch-side
+ */
+export const orphansReapedTotal = meter.createCounter('kici_agent_orphans_reaped_total', {
+  description: 'Total processes killed by the between-jobs process-group reap',
+});
+
+/**
+ * Out-of-band declared-cleanup re-runs after a hard-killed runner.
+ * Labels:
+ * - status: success | failed | timeout | skipped
+ * - scaler: injected orch-side
+ */
+export const orphanCleanupTotal = meter.createCounter('kici_agent_orphan_cleanup_total', {
+  description: 'Total out-of-band declared-cleanup re-runs',
+});

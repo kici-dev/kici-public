@@ -19,7 +19,7 @@ The settings page (`/orgs/:customerId/settings`) uses a tabbed layout:
 10. **Global workflows** -- org-level security knobs for cross-repo workflows (visible with `org_settings:read` permission)
 11. **Webhooks** -- outbound webhook endpoint management with delivery logs and test ping
 12. **Event log** -- inbound webhook delivery log (visible with `event_log:read` permission)
-13. **Security** -- dashboard-level session and account security controls for this org (today, the session max age; viewing needs `org_settings:read`, changing needs `org_settings:write`)
+13. **Security** -- dashboard-level session and account security controls for this org (today, the session max age). Every member sees the tab; only an organization owner can change the value
 14. **Orchestrator security** -- read-only view of the orchestrator's dashboard-write policy matrix (visible with `org_settings:read` permission)
 15. **Support access** -- opt-in switch that controls whether KiCI support staff may open read-only support sessions against your org (visible with `support:read`; toggled with `support:admin`)
 
@@ -115,7 +115,17 @@ The list view supports filters for routing key, event type, status, and free-tex
 **Permissions:**
 
 - `event_log:read` -- list rows and view metadata in the detail panel.
-- `event_log:read_payload` -- additionally view the raw webhook payload body. (Owners and admins inherit this. Lower-tier roles see "Payload not available" with a hint to ask for an elevated role.)
+- `event_log:read_payload` -- additionally view the raw webhook payload body, and the parts of the decision trace that quote it. (Owners and admins inherit this. Lower-tier roles see "Payload not available" with a hint to ask for an elevated role.)
+
+**Workflow decisions:**
+
+The detail panel shows the per-workflow decision trace the orchestrator recorded for the delivery. Each entry names a workflow, says whether it matched, and expands to the individual checks the trigger evaluation performed: the check, the pattern, the value tested against it, whether it passed, and the reason.
+
+An organization-wide workflow lives in a different repository from the one the event came from, so its entry also names the repository that defines it. Use this to see why an organization-wide workflow did or did not fire — see [Organization-wide workflows](../global-workflows.md#reading-the-decision-trace-for-a-delivery).
+
+Parts of the trace quote the webhook body: the value a check tested, and the reason it gives. Those two fields need `event_log:read_payload`, the same permission as the payload viewer. Without it the row still names the check, the pattern, and whether it passed, and the value and reason read `[redacted — requires event_log:read_payload]`.
+
+A trace is bounded in two places, and each bound says what it did. A workflow with very many checks keeps the first of them, and the entry says how many checks it kept out of the total. A delivery with very many workflows keeps the decisions that fit, and a note under the list says how many further decisions were dropped. A delivery the Platform rejected before trigger matching has no trace at all.
 
 **Edge cases the UI surfaces:**
 

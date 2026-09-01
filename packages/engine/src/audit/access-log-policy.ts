@@ -119,6 +119,7 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'global_workflows.update': { kind: 'always' },
   'org_settings.dashboard_write_policy.update': { kind: 'always' },
   'trust_policy.updated': { kind: 'always' },
+  'trust_directory.updated': { kind: 'always' },
   'cluster_name.update': { kind: 'always' },
   'attestation.retry': { kind: 'always' },
   // Direct-DB kici-admin mutations (source 'admin_cli') — always recorded.

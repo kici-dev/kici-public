@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/orchestrator",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
   "keywords": [
     "ci",
@@ -30,6 +30,8 @@
   "files": [
     "dist",
     "!dist/**/*.map",
+    "!dist/server-test.d.ts",
+    "!dist/testing",
     "sbom.spdx.json",
     "installer-image-digests.json"
   ],
@@ -54,6 +56,9 @@
       "standalone.js": "src/standalone.ts",
       "cli.js": "src/cli/kici-admin.ts",
       "index.js": "src/index.ts"
+    },
+    "devEntries": {
+      "server-test.js": "src/server-test.ts"
     }
   },
   "scripts": {
@@ -64,33 +69,33 @@
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/orchestrator --name @kici-dev/orchestrator"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1089.0",
-    "@aws-sdk/client-s3": "^3.1089.0",
-    "@aws-sdk/lib-storage": "^3.1089.0",
-    "@aws-sdk/s3-request-presigner": "^3.1089.0",
-    "@hono/node-server": "^2.0.10",
-    "@inquirer/prompts": "^8.5.2",
+    "@aws-sdk/client-kms": "^3.1121.0",
+    "@aws-sdk/client-s3": "^3.1121.0",
+    "@aws-sdk/lib-storage": "^3.1121.0",
+    "@aws-sdk/s3-request-presigner": "^3.1121.0",
+    "@hono/node-server": "^2.1.1",
+    "@inquirer/prompts": "^8.7.0",
     "@kici-dev/engine": "workspace:*",
     "@kici-dev/shared": "workspace:*",
-    "@octokit/auth-app": "^8.2.0",
+    "@octokit/auth-app": "^8.3.0",
     "@octokit/rest": "^22.0.1",
     "archiver": "^8.0.0",
     "commander": "^15.0.0",
     "croner": "^10.0.1",
     "dockerode": "^5.0.1",
-    "hashi-vault-js": "^0.5.2",
-    "hono": "^4.12.32",
-    "jose": "^6.1.0",
+    "hashi-vault-js": "^0.5.3",
+    "hono": "^4.13.2",
+    "jose": "^6.2.10",
     "jsonpath-plus": "^10.4.0",
     "jszip": "^3.10.1",
     "kysely": "^0.29.4",
     "lru-cache": "^11.5.2",
-    "nanoid": "^6.0.0",
-    "pg": "^8.22.0",
-    "picomatch": "^4.0.5",
+    "nanoid": "^6.0.1",
+    "pg": "^8.23.0",
+    "picomatch": "^4.0.7",
     "strip-ansi": "^7.2.0",
-    "tar": "^7.5.20",
-    "ws": "^8.21.1",
+    "tar": "^7.5.22",
+    "ws": "^8.21.3",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
   },

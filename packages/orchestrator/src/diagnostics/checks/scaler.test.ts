@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { checkScalerProvisioning, SCALER_FAILURE_WINDOW_MS } from './scaler.js';
+import { DIAGNOSE_TABLE_MESSAGE_WIDTH } from '../../cli/commands/diagnose.js';
 import type { DiagnosticDeps } from '../types.js';
 import type { ScalerManager } from '../../scaler/manager.js';
 import type { BackendFailureSummary } from '../../scaler/failure-tracker.js';
 
 function makeDeps(
-  backends: Array<{ name: string; type: string }>,
+  backends: Array<{ name: string; type: string; retiring?: boolean; activeCount?: number }>,
   failures: Record<string, BackendFailureSummary>,
 ): DiagnosticDeps {
   const fake = {
@@ -85,5 +86,48 @@ describe('checkScalerProvisioning', () => {
       unboundCount: 1,
       lastError: 'spawn ENOENT',
     });
+  });
+});
+
+describe('checkScalerProvisioning retirement', () => {
+  it('reports a retiring backend and its remaining agent count', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps([{ name: 'gone', type: 'container', retiring: true, activeCount: 2 }], {}),
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0].message).toContain('retiring');
+    expect(results[0].message).toContain('2 agent(s) left');
+    expect(results[0].details).toMatchObject({ retiring: true, activeCount: 2 });
+  });
+
+  it('keeps the retirement marker inside the diagnose table width', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps([{ name: 'gone', type: 'container', retiring: true, activeCount: 2 }], {
+        gone: {
+          backendType: 'container',
+          boundCount: 3,
+          unboundCount: 9,
+          lastError: 'x'.repeat(200),
+          lastAtMs: Date.now(),
+        },
+      }),
+    );
+
+    // `formatDiagnoseTable` (cli/commands/diagnose.ts) cuts each message at 42
+    // characters, so a marker appended after the failure text would never be
+    // rendered. Assert on the visible slice, not the whole string.
+    const visible = results[0].message.substring(0, DIAGNOSE_TABLE_MESSAGE_WIDTH);
+    expect(visible).toContain('retiring');
+    expect(visible).toContain('2 agent(s) left');
+  });
+
+  it('says nothing about retirement for a configured backend', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps([{ name: 'live', type: 'container', retiring: false, activeCount: 1 }], {}),
+    );
+
+    expect(results[0].message).not.toContain('retiring');
+    expect(results[0].details).toMatchObject({ retiring: false });
   });
 });

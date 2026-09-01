@@ -13,7 +13,7 @@
  * synthetic prefix `__orchestrator__`. Mirrors the same pattern already
  * used for `event_log` payload keys when the routing key is missing.
  */
-import { sql, type Kysely, type Selectable } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import {
   type ChunkCommitMetadata,
   type ColdRetention,
@@ -26,10 +26,11 @@ import {
   minSecretAuditLogWarmDays,
   secretAuditLogWarmSqlCase,
 } from '@kici-dev/engine';
-import type { Database, SecretAuditLogTable } from '../../db/types.js';
-import { SYNTHETIC_ORCH_TENANT } from '../load-access-log-range.js';
+import type { Database, SecretAuditLogRow } from '../../db/types.js';
 
-export type SecretAuditLogRow = Selectable<SecretAuditLogTable>;
+/** Re-exported rather than re-declared — see the note in `load-event-log-range`. */
+export type { SecretAuditLogRow };
+import { SYNTHETIC_ORCH_TENANT } from '../load-access-log-range.js';
 
 const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|secret_audit_log';
 const APPROX_ROW_BYTES = 400;

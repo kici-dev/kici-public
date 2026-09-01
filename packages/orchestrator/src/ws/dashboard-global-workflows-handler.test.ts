@@ -13,6 +13,7 @@ import type {
 } from '../cluster/cluster-settings-reader.js';
 
 const ORG = 'kiciStg00001';
+const ACTOR = { type: 'user', sub: 'u1' } as const;
 
 /** A ClusterSettingsReader stand-in that returns a fixed read outcome. */
 function fakeClusterSettings(read: ClusterSettingRead<boolean>) {
@@ -156,6 +157,61 @@ describe('DashboardGlobalWorkflowsHandler', () => {
       expect(response.settings.deniedRepos).toEqual([{ pattern: 'myorg/blocked-*' }]);
       // The master switch is fleet-wide and read-only, projected from the cluster.
       expect(response.settings.enabled).toBe(true);
+    });
+
+    it('refuses an update carrying a negated pattern, naming it, and writes nothing', async () => {
+      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
+      await handler.handleMessage({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'req-neg',
+        actor: ACTOR,
+        deniedRepos: [{ pattern: '!myorg/blocked' }],
+      });
+      const response = sent.at(-1) as any;
+      expect(response.type).toBe('dashboard.global-workflows.update.response');
+      expect(response.requestId).toBe('req-neg');
+      expect(response.settings).toBeUndefined();
+      expect(response.error).toContain('!myorg/blocked');
+      expect(mocks.insertInto).not.toHaveBeenCalled();
+    });
+
+    it('refuses a negative-lookahead entry on the allow list', async () => {
+      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
+      await handler.handleMessage({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'req-allow',
+        actor: ACTOR,
+        // picomatch compiles this into a real inversion, so storing it would
+        // allow every repository in every organization but the one it names.
+        allowedRepos: [{ pattern: '(?!myorg/legacy)**' }],
+      });
+      expect((sent.at(-1) as any).error).toContain('(?!myorg/legacy)**');
+      expect(mocks.insertInto).not.toHaveBeenCalled();
+    });
+
+    it('refuses a negated entry on the elevated list', async () => {
+      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
+      await handler.handleMessage({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'req-elev',
+        actor: ACTOR,
+        elevatedRepos: [{ pattern: 'myorg/[^a]*' }],
+      });
+      expect((sent.at(-1) as any).error).toContain('myorg/[^a]*');
+      expect(mocks.insertInto).not.toHaveBeenCalled();
+    });
+
+    it('accepts ordinary globs, including a dot-prefixed repo name', async () => {
+      const { handler, sent, mocks } = makeHandler({ clusterEnabled: true, row: undefined });
+      await handler.handleMessage({
+        type: 'dashboard.global-workflows.update',
+        requestId: 'req-ok',
+        actor: ACTOR,
+        allowedRepos: [{ pattern: 'myorg/*' }, { pattern: 'myorg/.github' }],
+        deniedRepos: [{ pattern: '**' }],
+      });
+      expect((sent.at(-1) as any).error).toBeUndefined();
+      expect(mocks.insertInto).toHaveBeenCalledWith('org_settings');
     });
 
     it('an update carrying enabled fails schema validation', () => {

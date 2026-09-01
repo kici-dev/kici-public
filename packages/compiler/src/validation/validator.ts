@@ -127,8 +127,41 @@ function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerErr
     errors.push(...matrixErrors);
   }
 
+  // Validate invoke-gate jobs (mutually exclusive with steps; non-empty event).
+  for (const job of staticJobs) {
+    errors.push(...validateInvokeJob(job, jobLoc(job.name)));
+  }
+
   errors.push(...validateGlobalApproval(workflow, staticJobs, workflowFile));
 
+  return errors;
+}
+
+/**
+ * Validate an invoke-gate job. A gate is mutually exclusive with step code and
+ * must name a non-empty event. Defense-in-depth: the SDK `job()` factory already
+ * enforces these, but a generated job could reach the compiler carrying them.
+ */
+function validateInvokeJob(job: Job, location: SourceLocation): CompilerError[] {
+  if (!job.invoke) return [];
+  const errors: CompilerError[] = [];
+  if ((job.steps?.length ?? 0) > 0) {
+    errors.push(
+      compilerError('E125', `job '${job.name}': 'invoke' cannot be combined with 'steps'`, {
+        location,
+        suggestion: 'An invoke gate never runs steps — remove `steps`/`run`, or drop `invoke`.',
+      }),
+    );
+  }
+  if (typeof job.invoke.event !== 'string' || job.invoke.event.trim().length === 0) {
+    errors.push(
+      compilerError('E126', `job '${job.name}': invoke.event must be a non-empty event name`, {
+        location,
+        suggestion:
+          'Pass a kici event name to invokeSource(), e.g. invokeSource("myorg.repo-tests").',
+      }),
+    );
+  }
   return errors;
 }
 

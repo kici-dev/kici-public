@@ -48,9 +48,14 @@ Each item lists the local substitute where one exists.
 - **Dynamic peer matchmaking.** Platform-connected clusters discover peers through
   the Platform. Independent clusters configure their peers statically.
 - **Platform-side developer CLI commands.** `kici login`, `kici org`, `kici runs`,
-  `kici secrets-list`, `kici pat`, and connected/routed runs talk to the Platform.
+  `kici secrets list`, `kici pat`, and connected/routed runs talk to the Platform.
   Compiling workflows, running locally (`kici run --local`), and verifying
   attestations offline do not.
+- **Private issue-report upload.** `kici report` writes its diagnostic bundle
+  locally with no Platform involvement. Sending it — `kici report --upload`, and
+  the `kici report list` / `kici report withdraw` commands that manage what you
+  sent — uploads to KiCI-operated storage and is Platform-side. Self-hosted, you
+  still get the bundle; you share it however you prefer.
 - **Platform-side scheduled jobs and dashboard notifications.**
 
 ## Source registration is always `kici-admin`

@@ -19,6 +19,7 @@ import {
   ExecutionJobStatus,
 } from '@kici-dev/engine';
 import type { LockJob, MaterializedJob } from '@kici-dev/engine';
+import type { JobKind } from '../db/types.js';
 import type {
   JobToRoute,
   RouteResult,
@@ -42,6 +43,14 @@ export interface DispatchedJobEntry {
    * groups a wave's children by — a NULL there makes the wave gate bail.
    */
   baseJobName?: string;
+  /**
+   * `gate` marks an invoke-gate row (runs the gate executor, never an agent).
+   * The global-workflow dispatch path registers a gate as a synthetic pending
+   * row and carries its kind through to `execution_jobs.job_kind`.
+   */
+  jobKind?: JobKind;
+  /** For a gate job, its wall-clock timeout in ms (orchestrator-swept). */
+  timeoutMs?: number;
 }
 
 export interface RejectedJobEntry {

@@ -13,6 +13,7 @@
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { HeldRunStatus } from '../contexts/held-runs.js';
 import { sql, type Kysely } from 'kysely';
 import { githubDisplayMessage } from '../providers/github/commit-message.js';
 import type { Database } from '../db/types.js';
@@ -39,11 +40,9 @@ import type { AgentRegistry } from '../agent/registry.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
 import type { RunCoordinator } from '../cluster/coordinator.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
-import type { TeamMembershipLookup } from '../approvals/team-membership-lookup.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { LogWriter } from '../reporting/log-writer.js';
 import type { SecretResolverApi } from '../secrets/secret-resolver.js';
-import type { ContributorCache } from '../security/contributor-cache.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type {
   LockFile as FullLockFile,
@@ -54,6 +53,9 @@ import type {
 } from '@kici-dev/engine';
 import { LockFileParseError } from '@kici-dev/engine';
 import type { EventRouter } from '../events/event-router.js';
+import type { InvokeGateDeps, InvokeGateParams } from './invoke-gate.js';
+import { releaseInvokeGate } from './invoke-gate.js';
+import { checkAllUpstreamsSatisfied } from './needs-scheduler.js';
 import type { RegistrationStore } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { CronScheduler } from '../cron/cron-scheduler.js';
@@ -64,10 +66,20 @@ import { ExecutionJobStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import type { LockJob } from '@kici-dev/engine';
 import type { ContextStore } from '../contexts/context-store.js';
 import type { VariableStore } from '../contexts/variable-store.js';
-import type { TrustResolver, IdentityLink, PermissionLevel } from '../security/trust-resolver.js';
+import type { IdentityLink, PermissionLevel } from '../security/identity-link.js';
 import { SecurityHoldReason, type HeldRunStore } from '../contexts/held-runs.js';
+import { countOccupyingJobs } from '../contexts/release-queued-holds.js';
+import { evaluateConcurrencyGate } from '../contexts/protection/concurrency-gate.js';
+import {
+  DEFAULT_CONCURRENCY_STRATEGY,
+  DEFAULT_HOLD_EXPIRY_SECONDS,
+  HoldType,
+  type Context as EngineContext,
+} from '@kici-dev/engine';
 import type { OrchestratorMode, WorkflowDecision } from '@kici-dev/engine';
+import { truncateDecisionsToByteBudget } from '@kici-dev/engine';
 import type { TrustPolicyStore } from '../security/trust-policy-store.js';
+import type { TrustDirectoryStore } from '../security/trust-directory-store.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -82,6 +94,12 @@ const logger = createLogger({ prefix: 'pipeline' });
 interface PendingJobContext {
   jobInput: QueuedJobInput;
   runsOnLabels: string[];
+  /**
+   * When set, this pending job is an invoke gate: on release it summons the
+   * source repo's subscribers (`runInvokeGate`) instead of dispatching `jobInput`
+   * to an agent.
+   */
+  invoke?: InvokeGateParams;
 }
 
 const pendingJobContexts = new Map<string, PendingJobContext>();
@@ -155,6 +173,7 @@ export async function storePendingJobContext(
 ): Promise<void> {
   pendingJobContexts.set(`${runId}:${jobName}`, ctx);
   if (db) {
+    const invokeConfig = ctx.invoke ? JSON.stringify(ctx.invoke) : null;
     await db
       .insertInto('pending_job_contexts')
       .values({
@@ -162,11 +181,13 @@ export async function storePendingJobContext(
         job_name: jobName,
         job_input: JSON.stringify(ctx.jobInput),
         runs_on_labels: JSON.stringify(ctx.runsOnLabels),
+        invoke_config: invokeConfig,
       })
       .onConflict((oc) =>
         oc.columns(['run_id', 'job_name']).doUpdateSet({
           job_input: JSON.stringify(ctx.jobInput),
           runs_on_labels: JSON.stringify(ctx.runsOnLabels),
+          invoke_config: invokeConfig,
         }),
       )
       .execute();
@@ -211,7 +232,7 @@ export async function consumePendingJobContext(
     .deleteFrom('pending_job_contexts')
     .where('run_id', '=', runId)
     .where('job_name', '=', jobName)
-    .returning(['job_input', 'runs_on_labels'])
+    .returning(['job_input', 'runs_on_labels', 'invoke_config'])
     .execute();
 
   if (claimed.length === 0) return undefined;
@@ -220,7 +241,37 @@ export async function consumePendingJobContext(
   return {
     jobInput: row.job_input as unknown as QueuedJobInput,
     runsOnLabels: row.runs_on_labels as unknown as string[],
+    ...(row.invoke_config != null && {
+      invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
+    }),
   };
+}
+
+/**
+ * Is the pending context for this (run, job) an invoke gate?
+ *
+ * Reads WITHOUT consuming, which is why it exists as its own function: the
+ * ready-dispatch concurrency re-gate runs before `consumePendingJobContext`, and
+ * consuming there would delete the resume path of a job it goes on to re-hold.
+ *
+ * `undefined` means "no pending context" — the caller already handles that a few
+ * lines later, when the consume returns nothing.
+ */
+async function pendingJobContextIsInvokeGate(
+  db: Kysely<Database> | undefined,
+  runId: string,
+  jobName: string,
+): Promise<boolean> {
+  const memCtx = pendingJobContexts.get(`${runId}:${jobName}`);
+  if (memCtx) return !!memCtx.invoke;
+  if (!db) return false;
+  const row = await db
+    .selectFrom('pending_job_contexts')
+    .select('invoke_config')
+    .where('run_id', '=', runId)
+    .where('job_name', '=', jobName)
+    .executeTakeFirst();
+  return row?.invoke_config != null;
 }
 
 /**
@@ -269,6 +320,9 @@ export async function restorePendingJobContexts(db: Kysely<Database>): Promise<n
     pendingJobContexts.set(key, {
       jobInput: row.job_input as unknown as QueuedJobInput,
       runsOnLabels: row.runs_on_labels as unknown as string[],
+      ...(row.invoke_config != null && {
+        invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
+      }),
     });
   }
   return rows.length;
@@ -287,8 +341,11 @@ export function clearPendingJobContextsMap(): void {
  * Root jobs can be dispatched immediately; non-root jobs wait for the scheduler.
  */
 export function isRootJob(lockJob: LockJob): boolean {
-  // Check for concrete needs (string or NeedsEntry with 'name')
-  const hasConcreteNeeds = lockJob.needs.some(
+  // Check for concrete needs (string or NeedsEntry with 'name'). A lock job
+  // read from the registration store can arrive without a `needs` array (the
+  // compiler always emits `needs: []`, but a directly-registered global entry
+  // may omit it); a missing `needs` means no upstreams — a root job.
+  const hasConcreteNeeds = (lockJob.needs ?? []).some(
     (n) => typeof n === 'string' || (typeof n === 'object' && 'name' in n),
   );
   const hasDependsOnGroups =
@@ -659,10 +716,23 @@ export function extractCommitMessage(event: string, payload: unknown): string | 
 
 /**
  * Build a human-readable summary for a security hold check.
+ *
+ * `tier` is the resolved trust tier, or undefined when trust never resolved;
+ * the summary displays `unknown` for the latter. The caller passes the resolved
+ * value rather than forging `unknown` for an absent one, so this summary and
+ * `buildReducedPrivilegeNote` (`../security/reduced-privilege-note.ts`) cannot
+ * disagree about which case a run is in.
+ *
+ * Carries no reduced-privilege note of its own: the note is appended by the
+ * call site, because the two summaries this builds are read on checks with
+ * different fates. The trust-policy HOLD stores a resume context, so
+ * `/kici approve` replays its dispatch and its call site
+ * (`holdRunForSecurityPolicy`) appends the note; the trust-policy REJECTION
+ * never runs, so `buildSecurityRejectionSummary`'s call site appends nothing.
  */
 export function buildSecurityHoldSummary(
   reason: string,
-  tier: string,
+  tier: string | undefined,
   contributorUsername?: string,
 ): string {
   const parts: string[] = [];
@@ -686,7 +756,7 @@ export function buildSecurityHoldSummary(
   }
 
   if (contributorUsername) {
-    parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier})`);
+    parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier ?? 'unknown'})`);
   }
 
   return parts.join('\n');
@@ -700,11 +770,16 @@ export function buildSecurityHoldSummary(
  * `held_runs` row, so telling the contributor to seek "approval from a user
  * with ci_trust:write or higher" points at a queue the run will never appear
  * in. Only an org policy change can unblock it.
+ *
+ * Carries no reduced-privilege note for the same reason: the summary's own next
+ * line says the run cannot be approved, so a posture note beside it would read
+ * as "it ran with reduced privileges and that is why it failed" for a run that
+ * never dispatched at all.
  */
 export function buildSecurityRejectionSummary(
   reason: string,
   message: string,
-  tier: string,
+  tier: string | undefined,
   contributorUsername?: string,
 ): string {
   const parts: string[] = [
@@ -715,7 +790,7 @@ export function buildSecurityRejectionSummary(
       'or a re-opened pull request will be evaluated again.',
   ];
   if (contributorUsername) {
-    parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier})`);
+    parts.push(`\n**Contributor:** ${contributorUsername} (tier: ${tier ?? 'unknown'})`);
   }
   return parts.join('\n');
 }
@@ -737,6 +812,22 @@ export function summarizeApprovalClauses(
   );
   return `Awaiting approval: ${named.join(', ')}`;
 }
+
+/**
+ * The line appended to an approval hold's check description when a security
+ * trust hold gates the SAME job.
+ *
+ * Both holds must be answered before the job runs, and the check run carries one
+ * description. Without this line the check names only the approval clauses — so
+ * the named approver approves, nothing runs, and the text does not change: a
+ * contributor is left with a satisfied requirement, no statement of what is
+ * still outstanding, and no idea that a different permission clears it. Naming
+ * the second gate and how it is released is the minimum that makes the check
+ * honest.
+ */
+export const SECURITY_HOLD_ALSO_GATES_NOTE =
+  'A security trust hold also gates this job, and both must be released before it runs. ' +
+  'That one is cleared by a `ci_trust:write` approver, or by commenting `/kici approve` on this pull request.';
 
 /**
  * Dependencies for the processing pipeline.
@@ -829,6 +920,12 @@ export interface ProcessingDeps {
   ) => void;
   /** Event router for registering lock file event subscriptions. Optional -- if not set, event routing is inactive. */
   eventRouter?: EventRouter;
+  /**
+   * Invoke-gate dependencies (summon callback + chain-depth bound). Optional --
+   * when absent an invoke gate cannot summon (it fails loudly rather than
+   * silently reaching an agent). Built at the composition root.
+   */
+  invokeGateDeps?: InvokeGateDeps;
   /** Registration store for persisting workflow registrations. Optional -- if not set, registration is skipped. */
   registrationStore?: RegistrationStore;
   /** Registration index for in-memory lookup. Optional -- if not set, registration is skipped. */
@@ -854,8 +951,6 @@ export interface ProcessingDeps {
   variableStore?: VariableStore;
   /** Held run store for persisting protection rule holds. Optional -- if not set, holds are not persisted. */
   heldRunStore?: HeldRunStore;
-  /** Trust resolver for determining contributor trust tiers. Optional -- if not set, trust resolution is skipped. */
-  trustResolver?: TrustResolver;
   /**
    * Cache of the Platform-owned org trust policy. Read per PR event by the
    * trust-policy gate. Optional so existing tests and independent deployments
@@ -870,16 +965,26 @@ export interface ProcessingDeps {
    * so a hand-built deps object never accidentally opens the gate.
    */
   orchestratorMode?: OrchestratorMode;
-  /** Identity links pushed from Platform for trust resolution. Optional -- defaults to empty. */
+  /** Identity links pushed from Platform, read by the comment-approval path. Optional -- defaults to empty. */
   identityLinks?: IdentityLink[];
   /** ci_trust permission levels per user ID from Platform push. Optional -- defaults to empty. */
   orgMemberPermissions?: Map<string, PermissionLevel>;
   /**
-   * Team-membership lookup pushed from the Platform (team name → member set).
-   * Consumed by the approval resolver to satisfy `{team}` approval clauses.
-   * Optional -- defaults to "no teams".
+   * Persisted approval directory, read at `/kici approve` time when neither
+   * `identityLinks` nor `orgMemberPermissions` was supplied.
+   *
+   * The two fields above are the Platform-push path: `server.ts` keeps them in
+   * memory and refreshes them on every `trust_policy.update`, so it always
+   * supplies both and this store is never consulted there. Every other
+   * assembly of these deps — the direct-ingress pipeline in `app.ts`, which is
+   * the ONLY one an independent orchestrator has — supplies neither, and
+   * without this store its approval path would resolve an empty directory and
+   * refuse every commenter forever.
+   *
+   * Optional so a hand-built deps object keeps working; the read is skipped
+   * when it is absent.
    */
-  teamMembershipLookup?: TeamMembershipLookup;
+  trustDirectoryStore?: TrustDirectoryStore;
   /** Global workflow policy for org-level permission enforcement. Optional -- if not set, global workflows are unrestricted. */
   globalWorkflowPolicy?: GlobalWorkflowPolicy;
   /** Inbound webhook delivery log writer. Optional -- if not set, deliveries are not persisted to event_log. */
@@ -888,11 +993,6 @@ export interface ProcessingDeps {
    *  Used by the eventLog writer to populate the source column. Defaults to
    *  'direct' when omitted (independent / direct paths). */
   eventLogSource?: EventLogSource;
-  /** Contributor permission cache. Optional -- if not set, membership-webhook
-   *  invalidations silently no-op. In platform/hybrid mode the singleton is
-   *  created in server.ts and threaded through both the Platform-relay WS
-   *  path and the generic webhook HTTP path. */
-  contributorCache?: ContributorCache;
   /** Access-log writer for the orchestrator audit stream. Optional -- if not
    *  set, hold-creation audit rows (`held_run.request`) are skipped. */
   accessLogWriter?: AccessLogWriter;
@@ -943,6 +1043,416 @@ function triggerHasPathFilters(trigger: LockTrigger): boolean {
 // (server.ts, app.ts) and tests.
 export { processWebhook } from './process-webhook.js';
 
+/** How many times {@link hasPendingHold} reads before it gives up and refuses. */
+export const PENDING_HOLD_READ_ATTEMPTS = 3;
+/** Backoff between {@link hasPendingHold} attempts, multiplied by the attempt number. */
+export const PENDING_HOLD_RETRY_BASE_MS = 25;
+
+/**
+ * Is there a still-pending hold for this (run, job)?
+ *
+ * `held_runs.job_id` carries the expanded job NAME for job-scoped holds, which
+ * is the same key the pending dispatch context uses. A missing row, or any
+ * non-pending status, means nothing is gating the job.
+ *
+ * **Fails CLOSED** once the read has genuinely failed: a job whose hold state
+ * cannot be read is treated as held and left for the release path. This gate is
+ * the enforcement point for "every requirement answered" on a job carrying two
+ * holds — the reviewer row and the security row are written together and BOTH
+ * must leave `pending` before dispatch — so answering `false` on a read error
+ * dispatched a job with neither hold released and the approval boundary
+ * bypassed entirely. That is unrecoverable; the failure in the other direction
+ * is not.
+ *
+ * A refusal leaves the job pending rather than losing it: the context is not
+ * consumed (the check runs before the consume), every release path re-drives
+ * `dispatchReadyJob`, and the needs-scheduler recovery loop on the next start
+ * recomputes `needs_satisfied` for every non-terminal run and re-fires the
+ * ready jobs. So the worst case of a closed failure is a delay, against a
+ * silently bypassed approval for an open one.
+ *
+ * The retries are what keep that trade cheap. The realistic error here is a
+ * transient one — a deadlock, a statement timeout, a lost connection — and a
+ * single blip must not park a job until the next restart, so the read is
+ * attempted {@link PENDING_HOLD_READ_ATTEMPTS} times with a short linear
+ * backoff before the refusal stands.
+ */
+export async function hasPendingHold(
+  db: Kysely<Database>,
+  runId: string,
+  jobName: string,
+  opts: { attempts?: number; retryBaseMs?: number } = {},
+): Promise<boolean> {
+  const attempts = opts.attempts ?? PENDING_HOLD_READ_ATTEMPTS;
+  const retryBaseMs = opts.retryBaseMs ?? PENDING_HOLD_RETRY_BASE_MS;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const row = await db
+        .selectFrom('held_runs')
+        .select('status')
+        .where('run_id', '=', runId)
+        .where('job_id', '=', jobName)
+        .where('status', '=', HeldRunStatus.Pending)
+        .executeTakeFirst();
+      return !!row;
+    } catch (err) {
+      const lastAttempt = attempt === attempts;
+      logger.error('Failed to check for a pending hold before dispatching a ready job', {
+        runId,
+        jobName,
+        attempt,
+        attempts,
+        // Names the consequence, so an operator reading the line knows whether
+        // the job was parked or the read is about to be retried.
+        outcome: lastAttempt ? 'refusing dispatch (fail closed)' : 'retrying',
+        error: toErrorMessage(err),
+      });
+      if (lastAttempt) return true;
+      await new Promise((resolve) => setTimeout(resolve, retryBaseMs * attempt));
+    }
+  }
+  // Unreachable: the loop either returns a row verdict or returns true on the
+  // last attempt. Kept so the fail-closed direction is the function's only exit.
+  return true;
+}
+
+/** Read attempts for the needs verdict, mirroring {@link PENDING_HOLD_READ_ATTEMPTS}. */
+export const NEEDS_READ_ATTEMPTS = 3;
+/** Linear backoff base between needs-verdict read attempts. */
+export const NEEDS_RETRY_BASE_MS = 25;
+
+/**
+ * Read whether a job's `needs` upstreams are satisfied, for the dispatch guard.
+ *
+ * Fails CLOSED, exactly as {@link hasPendingHold} does and for the same reason:
+ * an unreadable verdict must never be read as permission to dispatch. A closed
+ * failure returns `{ satisfied: false }`, which the guard treats as "upstream
+ * still pending" — the recoverable branch, since the start-up recovery loop
+ * recomputes `needs_satisfied` for every non-terminal run and re-fires its ready
+ * jobs, and the stale-run expiry sweep is the backstop.
+ *
+ * Reads only. It never writes `needs_satisfied` — the scheduler owns that claim.
+ */
+export async function readNeedsVerdict(
+  db: Kysely<Database>,
+  runId: string,
+  jobName: string,
+  opts: { attempts?: number; retryBaseMs?: number } = {},
+): Promise<{ satisfied: boolean; action?: 'dispatch' | 'skip'; reason?: string }> {
+  const attempts = opts.attempts ?? NEEDS_READ_ATTEMPTS;
+  const retryBaseMs = opts.retryBaseMs ?? NEEDS_RETRY_BASE_MS;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await checkAllUpstreamsSatisfied(db, runId, jobName);
+    } catch (err) {
+      const lastAttempt = attempt === attempts;
+      logger.error('Failed to read the needs verdict before dispatching a ready job', {
+        runId,
+        jobName,
+        attempt,
+        attempts,
+        outcome: lastAttempt ? 'refusing dispatch (fail closed)' : 'retrying',
+        error: toErrorMessage(err),
+      });
+      if (lastAttempt) return { satisfied: false };
+      await new Promise((resolve) => setTimeout(resolve, retryBaseMs * attempt));
+    }
+  }
+  // Unreachable: the loop either returns a verdict or fails closed on the last
+  // attempt. Kept so the fail-closed direction is the function's only exit.
+  return { satisfied: false };
+}
+
+/**
+ * Resolve the `execution_jobs.job_id` a ready job is currently tracked under.
+ *
+ * `onJobStatus` keys on the job ID, not the job name: the tracker's in-memory
+ * job map, its scheduler hook, its run-completion check and the
+ * `(run_id, job_id)` upsert conflict target all use it. Passing a name matches
+ * nothing, so the upsert INSERTs a second row under `job_id = <name>` while the
+ * real placeholder stays `pending` and the scheduler hook never runs.
+ *
+ * A job still waiting on a gate sits on a `NEEDS_PENDING_JOB_ID_PREFIX`
+ * placeholder — the one synthetic shape this codebase builds, for the needs
+ * gate, the approval hold and the rolling-wave hold alike — which
+ * {@link ExecutionTracker.findSyntheticJobId} resolves from memory and from the
+ * DB. `undefined` therefore means the job is NOT waiting on a gate: it already
+ * dispatched and had its placeholder swapped for a real id, or nothing tracks
+ * it at all. Neither is this gate's to terminalize.
+ *
+ * A by-name `execution_jobs` fallback would resolve exactly those already-
+ * dispatched rows, and the caller would then mark a running or completed job
+ * `skipped` — the upsert carries no terminal-status guard, so a `success` row
+ * would be overwritten. Answering `undefined` is the safe direction: the caller
+ * leaves the context in place and a later recompute can still act.
+ */
+async function resolveTrackedJobId(
+  executionTracker: ExecutionTracker,
+  runId: string,
+  jobName: string,
+): Promise<string | undefined> {
+  return executionTracker.findSyntheticJobId(runId, jobName);
+}
+
+/**
+ * Pre-dispatch `needs` gate for {@link dispatchReadyJob}.
+ *
+ * A needs-gated job must not dispatch merely because a hold was released. The
+ * needs scheduler claims a downstream on `needs_satisfied` alone, so every
+ * release path (approval, the stale detector's concurrency sweep, wait holds,
+ * admin release) funnels through `dispatchReadyJob` and would otherwise run the
+ * job beside a pending upstream — or after a failed one.
+ *
+ * Four outcomes:
+ * - upstreams satisfied and admitted -> `'proceed'`, the ordinary path (a job
+ *   with no needs edges reads as dispatchable, so this is a no-op for it);
+ * - upstream not terminal yet -> `'stop'` without consuming the context, so the
+ *   scheduler's next `onJobReady` still has one to dispatch with;
+ * - upstream terminal but its status not admitted by the edge's `run_on`, and
+ *   {@link resolveTrackedJobId} finds the placeholder the job waits on ->
+ *   consume the context and terminalize that row as `skipped`;
+ * - same, but no tracker or no placeholder -> `'stop'` without consuming, so
+ *   the context outlives the miss and a later recompute can still resume the
+ *   job. Consuming with nothing to terminalize would delete the only resume
+ *   path and leave the job pending until the context expiry sweep.
+ *
+ * Reads only. The scheduler owns the `needs_satisfied` claim; see the warning on
+ * `recomputeNeedsSatisfied` about handing claims back.
+ *
+ * Called BEFORE the context is consumed, for the same reason
+ * {@link hasPendingHold} is: refusing after the consume would delete the resume
+ * path and strand the job.
+ */
+async function applyNeedsGate(
+  db: Kysely<Database>,
+  runId: string,
+  jobName: string,
+  executionTracker: ExecutionTracker | undefined,
+): Promise<'proceed' | 'stop'> {
+  const verdict = await readNeedsVerdict(db, runId, jobName);
+  if (!verdict.satisfied) {
+    // Upstream is not terminal yet. The scheduler re-fires `onJobReady` when it
+    // completes, and the context is still here for that call.
+    logger.info('Ready job has unsatisfied needs — leaving it for the scheduler', {
+      runId,
+      jobName,
+    });
+    return 'stop';
+  }
+  if (verdict.action === 'skip') {
+    // Upstream IS terminal but its status is not admitted by the edge's
+    // `run_on`. The scheduler will never fire ready again, so returning early
+    // would strand the job until the expiry sweep. Terminalize it instead —
+    // `onJobStatus` drives `runSchedulerHook` -> `evaluateDownstreams`, which
+    // propagates the skip to this job's own downstreams.
+    logger.info('Ready job upstream is terminal and unmet — skipping', {
+      runId,
+      jobName,
+      reason: verdict.reason,
+    });
+    // Resolve the tracked job id BEFORE consuming the context. Without a row to
+    // terminalize, consuming would delete the only resume path and leave the
+    // placeholder pending forever; leaving the context in place keeps the job
+    // recoverable by a later recompute.
+    const jobId = executionTracker
+      ? await resolveTrackedJobId(executionTracker, runId, jobName)
+      : undefined;
+    if (!executionTracker || !jobId) {
+      logger.warn('Ready job to skip has no tracked execution_jobs row — leaving it queued', {
+        runId,
+        jobName,
+        hasTracker: !!executionTracker,
+      });
+      return 'stop';
+    }
+    await consumePendingJobContext(db, runId, jobName);
+    // `error` (not `reason`) is the field the tracker persists to
+    // `error_message`, so the skip carries its cause to the dashboard.
+    await executionTracker.onJobStatus(
+      runId,
+      jobId,
+      ExecutionJobStatus.enum.skipped,
+      Date.now(),
+      undefined,
+      { error: verdict.reason },
+    );
+    return 'stop';
+  }
+  return 'proceed';
+}
+
+/**
+ * The subset of a context row the ready-dispatch re-gate reads.
+ *
+ * `ContextStore.matchContext` returns the raw `contexts` row, so the field names
+ * are snake_case. `concurrency_strategy` and `hold_expiry_seconds` are optional
+ * because the release-path callers already in the tree narrow their closure to
+ * `concurrency_limit` alone; an absent strategy resolves to
+ * {@link DEFAULT_CONCURRENCY_STRATEGY} and an absent hold window to
+ * {@link DEFAULT_HOLD_EXPIRY_SECONDS}, which are also the columns' own defaults.
+ */
+export interface ReadyDispatchContextRow {
+  id: string;
+  concurrency_limit: number | null;
+  concurrency_strategy?: string | null;
+  hold_expiry_seconds?: number | null;
+}
+
+/** Inputs the ready-dispatch concurrency re-gate needs. Absent = no re-gate. */
+export interface ReadyDispatchGateDeps {
+  matchContext: (orgId: string, name: string) => Promise<ReadyDispatchContextRow | null>;
+  heldRunStore: Pick<HeldRunStore, 'create'>;
+  /**
+   * Audits each re-hold, mirroring the `held_run.request` row the dispatch-pass
+   * path writes for every hold it mints. Optional: a call site with no writer
+   * still gates, exactly as the dispatch path's own `accessLogWriter?.record`
+   * degrades.
+   */
+  accessLogWriter?: Pick<AccessLogWriter, 'record'>;
+  /** The routing key the audit row is attributed to, when the call site knows it. */
+  routingKey?: string | null;
+}
+
+/** What {@link resolveRunConcurrency} needs to evaluate the concurrency gate. */
+export interface RunConcurrency {
+  orgId: string;
+  group: string;
+  contextId: string;
+  limit: number | null;
+  strategy: EngineContext['concurrencyStrategy'];
+  /**
+   * The context's own hold window, seconds. A queued hold this gate mints must
+   * expire on the same schedule as one the dispatch pass mints for the same
+   * context, or an operator's configured queue timeout applies to one path and
+   * not the other.
+   */
+  holdExpirySeconds: number;
+}
+
+/**
+ * Resolve a run's bound context to the inputs the concurrency gate needs.
+ *
+ * `null` means no concurrency constraint applies — the run has no bound context,
+ * or the context it names no longer exists. That is the common case, so the cost
+ * on the ready-dispatch path is one indexed lookup by `run_id`.
+ */
+export async function resolveRunConcurrency(
+  db: Kysely<Database>,
+  matchContext: ReadyDispatchGateDeps['matchContext'],
+  runId: string,
+): Promise<RunConcurrency | null> {
+  const run = await db
+    .selectFrom('execution_runs')
+    .select(['context', 'customer_id'])
+    .where('run_id', '=', runId)
+    .executeTakeFirst();
+  if (!run?.context || !run.customer_id) return null;
+
+  const cfg = await matchContext(run.customer_id, run.context);
+  if (!cfg) return null;
+
+  return {
+    orgId: run.customer_id,
+    group: run.context,
+    contextId: cfg.id,
+    limit: cfg.concurrency_limit,
+    strategy: (cfg.concurrency_strategy ??
+      DEFAULT_CONCURRENCY_STRATEGY) as EngineContext['concurrencyStrategy'],
+    holdExpirySeconds: cfg.hold_expiry_seconds ?? DEFAULT_HOLD_EXPIRY_SECONDS,
+  };
+}
+
+/**
+ * Pre-dispatch concurrency re-gate for {@link dispatchReadyJob}.
+ *
+ * The context protection pipeline runs once, at dispatch-pass time. Only the
+ * CONCURRENCY gate is time-varying — branch, trust, reviewer and wait-timer
+ * verdicts cannot change between then and now, and approval state is already
+ * covered by {@link hasPendingHold}. So a job that reaches this chokepoint after
+ * its `needs` were satisfied, or after an approval / wait / admin hold released,
+ * would otherwise dispatch with no limit check at all and run over its group's
+ * limit.
+ *
+ * Only {@link evaluateConcurrencyGate} is consulted. Re-running the whole
+ * pipeline would re-litigate branch/trust/reviewer decisions already made — and
+ * could re-derive the very approval hold `hasPendingHold` exists to respect.
+ *
+ * Re-holding a just-released job is CORRECT, not a ping-pong: the slot that
+ * freed can be retaken by another job before this one dispatches, and the queued
+ * hold is what the stale detector's sweep releases when a slot frees again.
+ *
+ * Called BEFORE the context is consumed, for the same reason every other guard
+ * here is: a re-held job must keep its pending context so the release path can
+ * resume it.
+ */
+async function applyContextProtectionGate(
+  db: Kysely<Database>,
+  runId: string,
+  jobName: string,
+  gateDeps: ReadyDispatchGateDeps,
+): Promise<'proceed' | 'stop'> {
+  // An invoke gate never reaches an agent — `releaseInvokeGate` summons the
+  // source repo's subscribers — so it never becomes a `running` row and holds no
+  // slot in the group `countOccupyingJobs` counts. Gating it would queue a cross-repo
+  // summon behind jobs it does not compete with, and expire it outright if no
+  // slot freed inside the hold window. The three call sites that dispatch ROOT
+  // invoke gates pass no gate deps at all for the same reason; this is the
+  // needs-gated case, which reaches the shared ready callback.
+  if (await pendingJobContextIsInvokeGate(db, runId, jobName)) return 'proceed';
+
+  const conc = await resolveRunConcurrency(db, gateDeps.matchContext, runId);
+  // A degenerate non-positive limit is unlimited, exactly as the gate reads it.
+  if (!conc || conc.limit === null || conc.limit <= 0) return 'proceed';
+
+  const running = await countOccupyingJobs(db, conc.orgId, conc.group);
+  const verdict = evaluateConcurrencyGate(
+    { concurrencyLimit: conc.limit, concurrencyStrategy: conc.strategy },
+    running,
+    conc.group,
+  );
+  if (verdict.action !== 'queue') return 'proceed';
+
+  logger.info('Ready job is over its context concurrency limit — re-holding', {
+    runId,
+    jobName,
+    concurrencyGroup: conc.group,
+    running,
+    limit: conc.limit,
+  });
+  const held = await gateDeps.heldRunStore.create(conc.orgId, {
+    runId,
+    jobId: jobName,
+    contextId: conc.contextId,
+    holdType: HoldType.enum.concurrency,
+    queueType: 'context',
+    reason: verdict.reason ?? `Concurrency limit reached (${running}/${conc.limit})`,
+    expiresAt: new Date(Date.now() + conc.holdExpirySeconds * 1000),
+  });
+  // One audit row per hold, matching what the dispatch-pass path writes for
+  // every row it mints: a hold that appears in the approval queue with no trail
+  // saying it was raised is a gap, whichever gate raised it. The actor is the
+  // dispatcher system component — no operator is present on this path.
+  void gateDeps.accessLogWriter?.record({
+    orgId: conc.orgId,
+    routingKey: gateDeps.routingKey ?? null,
+    actor: { type: 'system', component: 'dispatcher' },
+    action: 'held_run.request',
+    target: { type: 'held_run', id: held.id },
+    requestId: null,
+    source: 'platform_proxy',
+    outcome: 'allowed',
+    meta: {
+      runId,
+      jobId: jobName,
+      holdType: HoldType.enum.concurrency,
+      concurrencyGroup: conc.group,
+      running,
+      limit: conc.limit,
+    },
+  });
+  return 'stop';
+}
+
 /**
  * Dispatch a job that has become ready via the needs scheduler.
  *
@@ -958,13 +1468,75 @@ export async function dispatchReadyJob(
   executionTracker?: ExecutionTracker,
   coordinator?: RunCoordinator,
   db?: Kysely<Database>,
+  invokeGateDeps?: InvokeGateDeps,
+  gateDeps?: ReadyDispatchGateDeps,
 ): Promise<void> {
+  // A job can be BOTH needs-gated and held for approval, and the two use the
+  // SAME `needs-pending-` synthetic id and the same pending context. The needs
+  // scheduler claims a downstream on `needs_satisfied` alone, so without this
+  // gate an upstream completing dispatched a held job straight to an agent while
+  // its `held_runs` row still said `pending` — approval bypassed entirely.
+  //
+  // Checked BEFORE consuming the context: refusing after the consume would
+  // delete the resume path and strand the job forever. Every release path flips
+  // the row out of `pending` before it dispatches, so a legitimate resume passes
+  // straight through.
+  if (db && (await hasPendingHold(db, runId, jobName))) {
+    logger.info('Ready job is held for approval — leaving it for the release path', {
+      runId,
+      jobName,
+    });
+    return;
+  }
+
+  if (db && (await applyNeedsGate(db, runId, jobName, executionTracker)) === 'stop') return;
+
+  // Ordering is load-bearing: the needs gate runs first, so a job whose upstream
+  // failed is skipped rather than queued for a slot it would never use.
+  if (db && gateDeps && (await applyContextProtectionGate(db, runId, jobName, gateDeps)) === 'stop')
+    return;
+
   const pendingCtx = await consumePendingJobContext(db, runId, jobName);
   if (!pendingCtx) {
     logger.warn('No pending dispatch context for ready job (may have been dispatched already)', {
       runId,
       jobName,
     });
+    return;
+  }
+
+  // An invoke gate never reaches an agent: on release it summons the source
+  // repo's subscribers instead of dispatching its (stepless) job input. Fail
+  // loudly rather than silently hanging if the gate deps are missing.
+  if (pendingCtx.invoke) {
+    if (!db || !executionTracker || !invokeGateDeps) {
+      logger.error('Invoke gate ready but gate dependencies are unavailable; failing the gate', {
+        runId,
+        jobName,
+        hasDb: !!db,
+        hasTracker: !!executionTracker,
+        hasInvokeGateDeps: !!invokeGateDeps,
+      });
+      if (executionTracker) {
+        // The gate is tracked under its `needs-pending-` placeholder id, and
+        // `onJobStatus` keys on the job id — see {@link resolveTrackedJobId}.
+        await executionTracker.onJobStatus(
+          runId,
+          (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
+          ExecutionJobStatus.enum.failed,
+          Date.now(),
+          undefined,
+          { error: 'invoke gate could not run: gate dependencies unavailable' },
+        );
+      }
+      return;
+    }
+    await releaseInvokeGate(
+      { db, executionTracker, invokeGateDeps },
+      runId,
+      jobName,
+      pendingCtx.invoke,
+    );
     return;
   }
 
@@ -977,9 +1549,12 @@ export async function dispatchReadyJob(
         reason: (result as any).reason,
       });
       if (executionTracker) {
+        // Terminalize the `needs-pending-` placeholder the job is still tracked
+        // under, not its name — see {@link resolveTrackedJobId}. A rejected
+        // dispatch never got a real job id to swap it for.
         await executionTracker.onJobStatus(
           runId,
-          jobName,
+          (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
           ExecutionJobStatus.enum.failed,
           Date.now(),
           undefined,
@@ -1045,14 +1620,30 @@ export async function dispatchReadyJob(
 }
 
 /**
- * Check whether a webhook event is a push to the repository's default branch.
- * Used to trigger registration extraction for workflow event subscriptions.
+ * Read the repository's default branch out of a webhook payload.
  *
- * Resolution order for the default branch:
+ * Resolution order:
  *   1. `normalizer.extractDefaultBranch?(payload)` — provider-specific hook
  *      (universal-git reads a JSONPath from the source's `payloadPaths.defaultBranch`).
  *   2. Fallback to `payload.repository.default_branch` — the GitHub-shaped
  *      default that most forges mirror.
+ *
+ * `null` when neither source names one. Shared by `isDefaultBranchPush` (which
+ * compares it against the pushed branch) and the registration write path (which
+ * persists it, so a scheduled run can present it as its own branch).
+ */
+export function extractDefaultBranch(
+  payload: Record<string, unknown>,
+  normalizer: WebhookNormalizer,
+): string | null {
+  const viaHook = normalizer.extractDefaultBranch?.(payload) ?? null;
+  const repository = payload.repository as { default_branch?: string } | undefined;
+  return viaHook ?? repository?.default_branch ?? null;
+}
+
+/**
+ * Check whether a webhook event is a push to the repository's default branch.
+ * Used to trigger registration extraction for workflow event subscriptions.
  */
 export function isDefaultBranchPush(
   info: WebhookInfo,
@@ -1061,15 +1652,27 @@ export function isDefaultBranchPush(
   normalizer: WebhookNormalizer,
 ): boolean {
   if (info.event !== 'push') return false;
-  const viaHook = normalizer.extractDefaultBranch?.(payload) ?? null;
-  const repository = payload.repository as { default_branch?: string } | undefined;
-  const defaultBranch = viaHook ?? repository?.default_branch ?? null;
+  const defaultBranch = extractDefaultBranch(payload, normalizer);
   if (!defaultBranch) return false;
   return event.targetBranch === defaultBranch;
 }
 
 /**
+ * Cap on the per-decision trace forwarded to the Platform.
+ *
+ * A fixed bound on a debug payload, not a behavior an operator tunes: the
+ * summary rides an `execution.event` and lands in a stored row, so an
+ * essay-length trace from a workflow with hundreds of triggers must not be able
+ * to grow either without limit.
+ */
+export const DECISION_TRACE_MAX_CHECKS = 50;
+
+/**
  * Create a serializable summary of a workflow decision for Platform forwarding.
+ *
+ * Carries the individual checks, capped, so the dashboard can answer "why did
+ * this workflow not fire" from the delivery alone. `checksCount` stays the
+ * untruncated total, and `checksTruncated` marks a trace the cap shortened.
  */
 export function summarizeDecision(decision: WorkflowDecision): Record<string, unknown> {
   return {
@@ -1078,5 +1681,37 @@ export function summarizeDecision(decision: WorkflowDecision): Record<string, un
     matchedTrigger: decision.matchedTrigger,
     summary: decision.summary,
     checksCount: decision.checks.length,
+    checks: decision.checks.slice(0, DECISION_TRACE_MAX_CHECKS),
+    ...(decision.checks.length > DECISION_TRACE_MAX_CHECKS && { checksTruncated: true }),
   };
+}
+
+/**
+ * Byte budget for the whole forwarded trace, across every workflow on the
+ * delivery.
+ *
+ * The per-decision check cap and the per-field text clamp bound one entry; this
+ * bounds the frame. One event is evaluated against every workflow in the lock
+ * file plus every organization-wide registration, so a repository with a
+ * hundred comment-triggered workflows multiplies a bounded entry into an
+ * unbounded message. A frame past the Platform's WebSocket payload ceiling
+ * closes the orchestrator's connection, stalling every delivery for that
+ * organization until it reconnects — so the budget sits well under the
+ * Platform's own storage guard, which is then a backstop rather than the only
+ * limit.
+ */
+export const DECISION_TRACE_MAX_BYTES = 131_072;
+
+/**
+ * Bound the serialized trace, replacing whatever did not fit with a marker.
+ *
+ * Truncating rather than dropping keeps the delivery's answer to "why did my
+ * workflow not fire" partially readable, and says out loud that the rest was
+ * dropped.
+ */
+export function capDecisionSummaries(
+  summaries: readonly Record<string, unknown>[],
+  maxBytes: number = DECISION_TRACE_MAX_BYTES,
+): Record<string, unknown>[] {
+  return truncateDecisionsToByteBudget(summaries, maxBytes).decisions;
 }

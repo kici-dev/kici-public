@@ -24,6 +24,7 @@ import type { RegistrationIndex } from '../registration/registration-index.js';
 import { definingRepoOfRun, runsDefinedByRepos } from '../registration/registration-run-match.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { genericProviderTypeToSubtype } from '../entry-helpers.js';
+import { cleanupPendingJobContexts } from '../pipeline/processor.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   assertDashboardWriteAllowed,
@@ -323,6 +324,12 @@ export class DashboardRegistrationsHandler {
                 .set({ status: 'cancelled', completed_at: new Date() })
                 .where('run_id', '=', run.run_id)
                 .execute();
+              // This arm terminalizes the run with a direct UPDATE — it never
+              // reaches the execution tracker, so neither `onExecutionComplete`
+              // nor `onRunTerminalCleanup` fires and the run's un-dispatched
+              // pending job contexts would outlive it. A cancelled run's
+              // needs-gated jobs are exactly the ones holding them.
+              await cleanupPendingJobContexts(this.deps.db, run.run_id);
             }
 
             if (activeRuns.length > 0) {

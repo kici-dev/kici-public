@@ -9,7 +9,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile in the usual pnpm flow). DHI ships ca-certificates
 # in both variants by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin matches the root package.json `packageManager` field and
@@ -75,8 +75,15 @@ COPY packages/orchestrator/ packages/orchestrator/
 # Build-time git commit (passed via --build-arg since git is unavailable in builder stage)
 ARG KICI_BUILD_COMMIT=unknown
 
+# Dev-entry gate. Defaults to empty, so a published / shipped image never emits
+# the test-double entry (dist/server-test.js) — the orchestrator build only adds
+# it when KICI_BUILD_DEV_ENTRIES=1. The cluster fault-injection E2E passes
+# `--build-arg KICI_BUILD_DEV_ENTRIES=1` so its container coordinator can run the
+# test double; every other build (including the customer image) leaves it empty.
+ARG KICI_BUILD_DEV_ENTRIES=
+
 # Build packages
-RUN pnpm -C packages/core build && pnpm -C packages/shared build && pnpm -C packages/engine build && KICI_BUILD_COMMIT=${KICI_BUILD_COMMIT} pnpm -C packages/orchestrator build
+RUN pnpm -C packages/core build && pnpm -C packages/shared build && pnpm -C packages/engine build && KICI_BUILD_COMMIT=${KICI_BUILD_COMMIT} KICI_BUILD_DEV_ENTRIES=${KICI_BUILD_DEV_ENTRIES} pnpm -C packages/orchestrator build
 
 # Re-install production-only deps so the runtime stage's copy carries no
 # devDependencies. `pnpm prune --prod` does NOT recurse across workspace
@@ -92,7 +99,7 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts \
 # binary + its shared-library closure into the distroless runtime. The runtime
 # stays distroless (no apt/shell/perl); nft is the only host tool it needs
 # (agent network isolation, requires --cap-add=NET_ADMIN at runtime).
-FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev AS nft
+FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev AS nft
 RUN apt-get update \
   && apt-get install -y --no-install-recommends nftables \
   && rm -rf /var/lib/apt/lists/*
@@ -130,7 +137,7 @@ RUN set -eux; \
 # Stage 3: Runtime (distroless -debian13 — no apt, no shell, no perl). The nft
 # binary + its shared-library closure are COPYed from the nft extractor stage;
 # libc + the dynamic loader already ship with the Node base.
-FROM ${DHI_PREFIX}/node:24.18.0-0-debian13
+FROM ${DHI_PREFIX}/node:24.20.0-0-debian13
 WORKDIR /app
 
 # nft binary + its shared-library closure, staged at arch-correct absolute

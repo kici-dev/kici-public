@@ -10,6 +10,7 @@ export type ClusterNumberColumn =
   | 'event_log_max_payload_bytes'
   | 'lock_file_max_bytes'
   | 'webhook_dedup_ttl_ms'
+  /** @deprecated Readable, but no call site reads it. Removed at v1.0.0. */
   | 'contributor_cache_ttl_ms'
   | 'event_router_event_ttl_seconds'
   | 'event_router_max_dispatch_attempts'
@@ -34,7 +35,14 @@ export type ClusterNumberColumn =
   | 'agent_token_ttl_ms'
   | 'ownership_db_check_timeout_ms'
   | 'unroutable_grace_ms'
-  | 'ingest_overflow_claim_timeout_ms';
+  | 'ingest_overflow_claim_timeout_ms'
+  | 'scaler_reap_interval_ms'
+  | 'scaler_reap_stranded_timeout_ms'
+  | 'scaler_reap_reattempt_interval_ms'
+  | 'scaler_claim_retention_ms'
+  | 'scaler_provision_backoff_base_ms'
+  | 'scaler_provision_backoff_max_ms'
+  | 'scaler_provision_max_consecutive_failures';
 
 /** Text columns on cluster_settings readable via {@link ClusterSettingsReader}. */
 export type ClusterStringColumn = 'dashboard_verified_issuer';
@@ -76,10 +84,14 @@ export const CACHE_MAX_ENTRIES_CEILING = 100_000;
  * A value that is not a usable positive count (NaN, non-finite, below 1) falls
  * back to the configured default rather than clamping to 1: a 1-entry cache
  * thrashes silently, which is harder to diagnose than simply ignoring garbage.
+ * The fallback is floored and bounded by the ceiling on the same path as the
+ * stored value, so neither a fractional nor an above-ceiling configured default
+ * can reach the LRU constructor as a non-integer or unclamped max — the
+ * constructor rejects both, and either would prevent boot.
  */
 export function clampCacheMaxEntries(value: number, fallback: number): number {
-  if (!Number.isFinite(value) || value < 1) return fallback;
-  return Math.min(Math.floor(value), CACHE_MAX_ENTRIES_CEILING);
+  const usable = !Number.isFinite(value) || value < 1 ? fallback : value;
+  return Math.min(Math.floor(usable), CACHE_MAX_ENTRIES_CEILING);
 }
 
 /**

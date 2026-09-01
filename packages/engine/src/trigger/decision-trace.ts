@@ -37,7 +37,31 @@ export interface WorkflowDecision {
 }
 
 /**
+ * Max characters of any free-text field a trace entry carries, so an
+ * essay-length input stays bounded.
+ *
+ * The entry count is capped separately, downstream, but a count bound alone
+ * bounds nothing: a single `paths` entry names every changed file in the push
+ * and a single `bodyMatch` entry quotes a comment body an outsider authored, so
+ * fifty entries can still be megabytes. The forwarded trace rides one WebSocket
+ * frame to the Platform, and a frame past the server's payload ceiling closes
+ * the connection — stalling every delivery for that organization until it
+ * reconnects. Bounding at the point each field is minted is what makes the
+ * downstream size guards a backstop rather than the only limit.
+ */
+export const TRACE_TEXT_MAX = 200;
+
+/** Clamp one free-text trace field, marking a clamped value with an ellipsis. */
+export function truncateTraceText(text: string): string {
+  return text.length > TRACE_TEXT_MAX ? `${text.slice(0, TRACE_TEXT_MAX)}…` : text;
+}
+
+/**
  * Create a new trace entry.
+ *
+ * Every free-text field is clamped here rather than at each call site: the
+ * fields are fed from event content of unbounded size, and one unclamped call
+ * site is enough to reintroduce an unbounded frame.
  */
 export function createTraceEntry(
   check: string,
@@ -46,7 +70,13 @@ export function createTraceEntry(
   passed: boolean,
   reason?: string,
 ): TraceEntry {
-  return { check, pattern, value, passed, reason };
+  return {
+    check,
+    pattern: truncateTraceText(pattern),
+    value: truncateTraceText(value),
+    passed,
+    reason: reason === undefined ? undefined : truncateTraceText(reason),
+  };
 }
 
 /**
@@ -68,6 +98,8 @@ export const TraceCheck = {
   GlobalFilter: 'filter',
   /** Tier-0 declarative `commitMessage` filter, read from the normalized event. */
   CommitMessage: 'commitMessage',
+  /** Materialization of a matched workflow's jobs, on the way to dispatch. */
+  Dispatch: 'dispatch',
 } as const;
 export type TraceCheck = (typeof TraceCheck)[keyof typeof TraceCheck];
 
@@ -137,6 +169,25 @@ export function createGlobalFilterTraceEntry(args: {
 }
 
 /**
+ * Record that a matched workflow could not be materialized into jobs.
+ *
+ * A workflow whose triggers matched and whose build then threw is absent from
+ * every other record: no run row is created and no job is queued. Omitting it
+ * from the trace as well leaves its author unable to tell it apart from a
+ * workflow that was never registered — the exact indistinguishability the trace
+ * exists to remove.
+ */
+export function createDispatchFailureTraceEntry(reason: string): TraceEntry {
+  return createTraceEntry(
+    TraceCheck.Dispatch,
+    'jobs materialize',
+    TraceVerdict.Excluded,
+    false,
+    reason,
+  );
+}
+
+/**
  * Return a copy of `decision` with `entries` appended to its checks.
  *
  * A decision is treated as a value, never mutated in place: the same object is
@@ -160,9 +211,6 @@ export function appendChecks(
     summary: failed ? (failed.reason ?? `Excluded by the ${failed.check} check`) : decision.summary,
   };
 }
-
-/** Max characters of the message recorded in a trace, so an essay-length body stays bounded. */
-const TRACE_TEXT_MAX = 200;
 
 /**
  * Record the Tier-0 `commitMessage` filter's verdict for one trigger.
@@ -191,6 +239,96 @@ export function createCommitMessageTraceEntry(args: {
     args.passed,
     args.reason ?? `message: ${JSON.stringify(shown)}`,
   );
+}
+
+/**
+ * What a withheld trace field is replaced with when the reader does not hold
+ * `event_log:read_payload`.
+ *
+ * Lives here rather than beside the Platform's redactor because three packages
+ * read it: the Platform writes it, the dashboard renders it, and the E2E suite
+ * asserts the permission boundary against it. A literal repeated at each site
+ * would drift into a marker one of them no longer recognizes.
+ */
+export const REDACTED_TRACE_FIELD = '[redacted — requires event_log:read_payload]';
+
+/**
+ * Workflow name the truncation marker carries.
+ *
+ * A reserved sentinel rather than a real workflow: it is written by one package
+ * and read back by two others, so a literal repeated at each site would drift
+ * into a marker nobody recognizes.
+ */
+export const TRACE_TRUNCATION_WORKFLOW_NAME = '(trace truncated)';
+
+/**
+ * Build the marker that stands in for the decisions a size budget dropped.
+ *
+ * The trace is truncated rather than discarded: a reader who is told nothing
+ * cannot tell "matching never ran" from "the trace was too large to keep", and
+ * those two have opposite answers to "why did my workflow not fire".
+ */
+export function createTraceTruncationMarker(omitted: number): Record<string, unknown> {
+  return {
+    workflowName: TRACE_TRUNCATION_WORKFLOW_NAME,
+    matched: false,
+    traceTruncated: true,
+    decisionsOmitted: omitted,
+    checks: [],
+    checksCount: 0,
+    summary:
+      (omitted === 1
+        ? '1 further workflow decision was dropped: '
+        : `${omitted} further workflow decisions were dropped: `) +
+      'the trace exceeded the size budget for this delivery.',
+  };
+}
+
+/**
+ * UTF-8 byte length of `text`.
+ *
+ * Byte length, never `String.length`: the latter counts UTF-16 code units, so a
+ * CJK-heavy comment body measures at roughly a third of the bytes it actually
+ * costs on the wire and in the stored row.
+ */
+export function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
+ * Drop trailing decisions until the serialized array fits `maxBytes`, appending
+ * a marker naming how many were dropped.
+ *
+ * Shared by the orchestrator, which bounds what it puts on the wire, and the
+ * Platform, which bounds what it stores. Two independent budgets over one
+ * shape: keeping one implementation is what stops them from disagreeing about
+ * what a truncated trace looks like.
+ */
+export function truncateDecisionsToByteBudget<T>(
+  decisions: readonly T[],
+  maxBytes: number,
+): { decisions: Array<T | Record<string, unknown>>; omitted: number } {
+  if (utf8ByteLength(JSON.stringify(decisions)) <= maxBytes) {
+    return { decisions: [...decisions], omitted: 0 };
+  }
+
+  // The marker's own size depends on the count it reports, so reserve the
+  // worst case (every decision dropped) rather than discovering a one-entry
+  // overrun after the fact.
+  const reserved = utf8ByteLength(JSON.stringify(createTraceTruncationMarker(decisions.length)));
+  // `[` + `]`, plus the comma joining the marker to whatever precedes it.
+  let used = 3 + reserved;
+
+  const kept: T[] = [];
+  for (const decision of decisions) {
+    const cost = utf8ByteLength(JSON.stringify(decision)) + 1;
+    if (used + cost > maxBytes) break;
+    used += cost;
+    kept.push(decision);
+  }
+
+  const omitted = decisions.length - kept.length;
+  return { decisions: [...kept, createTraceTruncationMarker(omitted)], omitted };
 }
 
 /**

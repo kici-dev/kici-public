@@ -207,7 +207,9 @@ describe('buildRunDetailJobs', () => {
           matrix_values: null,
           base_job_name: null,
           variant_kind: null,
-          variant_label: null,
+          variant_label: 'octocat/repo:deploy',
+          job_kind: 'proxy',
+          summoned_run_id: 'summoned-run-42',
           started_at: started,
           completed_at: null,
           duration_ms: 100,
@@ -251,6 +253,9 @@ describe('buildRunDetailJobs', () => {
     expect(jobs[0].secretOutputKeys).toEqual(['TOKEN']);
     expect(jobs[0].needs).toEqual([{ upstreamName: 'lint', runOn: ['success'] }]);
     expect(jobs[0].steps[0].stepName).toBe('compile');
+    expect(jobs[0].jobKind).toBe('proxy');
+    expect(jobs[0].summonedRunId).toBe('summoned-run-42');
+    expect(jobs[0].variantLabel).toBe('octocat/repo:deploy');
   });
 });
 

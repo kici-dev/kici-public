@@ -157,6 +157,22 @@ export const AccessLogAction = z.enum([
    */
   'trust_policy.updated',
   /**
+   * Approval-directory member registration or removal via the orch admin
+   * `PATCH` / `DELETE /admin/trust-policy/directory` routes (driven by
+   * `kici-admin trust-policy directory-set` / `directory-remove`). Reachable
+   * only on an independent orchestrator — a Platform-attached one refuses both,
+   * because the Platform owns the directory there. `actor_meta` carries the
+   * `userId` acted on, plus the registration for a write, so an operator
+   * granting themselves `write` CI trust is attributable. Written inside the
+   * same transaction as the directory row.
+   *
+   * Past tense for the same reason as `trust_policy.updated` above:
+   * `trust_policy.update` is the Platform→orchestrator wire frame that delivers
+   * the directory, and reusing that name for an audited local mutation would
+   * conflate two different things.
+   */
+  'trust_directory.updated',
+  /**
    * Cluster-name rename via the orch admin `PUT /admin/cluster-name`
    * route (driven by `kici-admin cluster-name set`). The `actor_meta`
    * columns carry `prior_value` and `new_value`. Cluster-name is

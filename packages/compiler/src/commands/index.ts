@@ -60,6 +60,8 @@ export { diagnosticsCommand } from './diagnostics.js';
 export type { DiagnosticsOptions } from './diagnostics.js';
 export { doctorCommand } from './doctor.js';
 export type { DoctorOptions } from './doctor.js';
+export { reportCommand, reportListCommand, reportWithdrawCommand } from './report/index.js';
+export type { ReportOptions } from './report/index.js';
 
 export { orgListCommand, orgUseCommand, orgCurrentCommand } from './org.js';
 

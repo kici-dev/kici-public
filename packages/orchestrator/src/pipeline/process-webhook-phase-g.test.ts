@@ -2,14 +2,15 @@
  * Phase G (workflow-modification detection) unit tests for
  * `applyWorkflowModificationsAndSecurityHold`.
  *
- * Guards the two behavioral contracts of the phase-G rework: the neutral
- * "workflow changes" check is posted on its OWN dedicated poster method, and
- * phase G no longer posts the pending "Held for approval" check (that moved to
- * the dispatch gate, which creates a real resolvable hold). It also surfaces the
- * PR-wide `hasWorkflowModifications` signal the trust-policy gate consumes.
+ * Guards the two behavioral contracts of the phase: the neutral "workflow
+ * changes" check is posted on its OWN dedicated poster method, and the phase
+ * posts no pending "Held for approval" check (that belongs to the dispatch
+ * gate, which creates a real resolvable hold).
  *
- * Phase G is detection-only: it reports whether workflow files changed and
- * leaves every decision to the evaluator (`trust-policy-gate.test.ts`).
+ * Detection and legibility only: it reports whether workflow files changed, and
+ * that report feeds no dispatch decision — the org trust policy is the fork
+ * switch, evaluated from the fork signal and the tier alone
+ * (`trust-policy-gate.test.ts`).
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { LockFile, LockWorkflow } from '@kici-dev/engine';

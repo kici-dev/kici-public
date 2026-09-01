@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { canonicalize } from './kici-admin.js';
+import { canonicalize, buildProgram, CLI_VERSION } from './kici-admin.js';
 
 /**
  * The entry-point guard in kici-admin.ts compares the invoked script path
@@ -56,5 +56,24 @@ describe('canonicalize (kici-admin entry guard)', () => {
 
   it('resolves a relative path to an absolute one', () => {
     expect(path.isAbsolute(canonicalize('some/relative/path'))).toBe(true);
+  });
+});
+
+/**
+ * `--version` used to report a hardcoded `0.0.1` placeholder, so a support
+ * bundle or an issue report carried no usable version context for the admin
+ * CLI. The version now comes from the build-injected package version.
+ */
+describe('kici-admin --version', () => {
+  it('reports CLI_VERSION rather than a literal placeholder', () => {
+    expect(buildProgram().version()).toBe(CLI_VERSION);
+  });
+
+  it('does not pass a bare version literal to Commander', () => {
+    const src = fs.readFileSync(path.join(import.meta.dirname, 'kici-admin.ts'), 'utf-8');
+    // Positive control: the registration this assertion is about is present,
+    // so an empty match below means "no literal", not "file not read".
+    expect(src).toMatch(/\.version\(/);
+    expect(src).not.toMatch(/\.version\(\s*['"]/);
   });
 });

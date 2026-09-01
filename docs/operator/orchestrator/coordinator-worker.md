@@ -180,7 +180,7 @@ Workers are stateless, so upgrading is straightforward:
 2. **Replace the binary** -- deploy the new version
 3. **Restart** -- the worker reconnects using its persisted credential (no new join token needed)
 
-Coordinators and workers can be upgraded in any order as long as both support the same minimum protocol version. When a protocol version bump occurs (documented in release notes), upgrade all nodes to the new version.
+Coordinators and workers can be upgraded in any order as long as every node's protocol version is at or above the **minimum** the others accept. A release that raises the protocol version alone changes nothing here: the minimum stays where it is, so a node on the older version keeps connecting. Upgrade every node when a release raises the **minimum accepted** version — the release notes name both numbers.
 
 ## Troubleshooting
 

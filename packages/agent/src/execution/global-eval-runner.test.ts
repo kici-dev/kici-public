@@ -164,6 +164,38 @@ describe('runGlobalEvalRound', () => {
     expect(result.candidates[1]).toEqual({ workflowName: 'fine', run: true });
   });
 
+  it('marks a workflow indeterminate when two generators emit the same job name', async () => {
+    const wf = makeWorkflow({
+      name: 'dupe',
+      jobs: [async () => [makeJob('build')], async () => [makeJob('build')]],
+    });
+
+    const result = await runGlobalEvalRound(
+      argsFor({ 'dupe.ts': [wf] }, [
+        { workflowName: 'dupe', sourceFile: 'dupe.ts', hasFilter: false },
+      ]),
+    );
+
+    expect(result.candidates[0]).toMatchObject({ run: false, indeterminate: true });
+    expect(result.candidates[0].reason).toContain("Duplicate job name 'build'");
+  });
+
+  it('allows two generators emitting distinct job names', async () => {
+    const wf = makeWorkflow({
+      name: 'distinct',
+      jobs: [async () => [makeJob('build')], async () => [makeJob('test')]],
+    });
+
+    const result = await runGlobalEvalRound(
+      argsFor({ 'd.ts': [wf] }, [
+        { workflowName: 'distinct', sourceFile: 'd.ts', hasFilter: false },
+      ]),
+    );
+
+    expect(result.candidates[0].run).toBe(true);
+    expect(result.candidates[0].jobs?.map((j) => j.name)).toEqual(['build', 'test']);
+  });
+
   it('marks a candidate whose module fails to load indeterminate', async () => {
     const ok = makeWorkflow({ name: 'fine', jobs: [makeJob('static')] });
     const result = await runGlobalEvalRound(
@@ -177,7 +209,7 @@ describe('runGlobalEvalRound', () => {
     expect(result.candidates[1].run).toBe(true);
   });
 
-  it('marks a candidate indeterminate when it exceeds the per-candidate budget', async () => {
+  it('marks a candidate that exceeds the per-candidate budget indeterminate without affecting its siblings', async () => {
     const slow = makeWorkflow({
       name: 'slow',
       filter: async () => {
@@ -185,15 +217,29 @@ describe('runGlobalEvalRound', () => {
         return true;
       },
     });
+    // A sibling that decides normally AFTER the slow one breaches its budget.
+    // Its verdict must survive the timeout — that isolation is the property.
+    const ok = makeWorkflow({
+      name: 'ok',
+      filter: () => true,
+      jobs: [async () => [makeJob('ci-test')]],
+    });
 
     const result = await runGlobalEvalRound(
-      argsFor({ 's.ts': [slow] }, [{ workflowName: 'slow', sourceFile: 's.ts', hasFilter: true }], {
-        candidateTimeoutMs: 10,
-      }),
+      argsFor(
+        { 's.ts': [slow], 'o.ts': [ok] },
+        [
+          { workflowName: 'slow', sourceFile: 's.ts', hasFilter: true },
+          { workflowName: 'ok', sourceFile: 'o.ts', hasFilter: true },
+        ],
+        { candidateTimeoutMs: 10 },
+      ),
     );
 
     expect(result.candidates[0]).toMatchObject({ run: false, indeterminate: true });
     expect(result.candidates[0].reason).toMatch(/timeout/i);
+    expect(result.candidates[1].run).toBe(true);
+    expect(result.candidates[1].jobs?.map((j) => j.name)).toEqual(['ci-test']);
   });
 
   it('reports the verdicts it established when the round budget is exhausted', async () => {
@@ -365,6 +411,30 @@ describe('runGlobalEvalRound', () => {
 
     expect(result.candidates[0].indeterminate).toBe(true);
     expect(process.env.KICI_IS_GLOBAL_WORKFLOW).toBeUndefined();
+  });
+
+  it('restores process.env even when round-state construction throws', async () => {
+    // `applyGlobalWorkflowEnv` reads only `args.repos`, so it sets the seven
+    // KICI_* keys before `buildRoundState` ever touches `args.$`. A throwing
+    // `$` getter therefore fails inside round-state construction, after the
+    // env is dirtied — the exact window the restore must still cover.
+    const wf = makeWorkflow({ name: 'ok' });
+    const args = argsFor({ 'o.ts': [wf] }, [
+      { workflowName: 'ok', sourceFile: 'o.ts', hasFilter: false },
+    ]);
+    Object.defineProperty(args, '$', {
+      get() {
+        throw new Error('shell wiring exploded during round-state build');
+      },
+    });
+
+    const result = await runGlobalEvalRound(args);
+
+    // The round never throws: every candidate is reported indeterminate.
+    expect(result.candidates[0].indeterminate).toBe(true);
+    // And the env keys were restored despite the construction throw.
+    expect(process.env.KICI_IS_GLOBAL_WORKFLOW).toBeUndefined();
+    expect(process.env.KICI_SOURCE_REPO_PATH).toBeUndefined();
   });
 
   it('restores process.env even when the round budget is exhausted', async () => {

@@ -221,6 +221,12 @@ The orchestrator secrets admin API uses a fixed three-role model (defined in `pa
 | event_log.read_payload | Y     | Y     | -       |
 | access_log.read        | Y     | Y     | Y       |
 | scheduled_job.trigger  | Y     | Y     | -       |
+| attestation.retry      | Y     | Y     | -       |
+| event_dlq.read         | Y     | Y     | Y       |
+| event_dlq.manage       | Y     | Y     | -       |
+| orchestrator.drain     | Y     | Y     | -       |
+| ci_trust.read          | Y     | Y     | -       |
+| ci_trust.admin         | Y     | Y     | -       |
 
 ### Token authentication
 
@@ -296,6 +302,9 @@ interface StepSecrets {
   expose(key: string): Promise<void>;
   has(key: string): boolean;
   getMeta(key: string): SecretMeta | undefined;
+  list(): string[];
+  mountFile(opts: SecretFileOptions): Promise<MountedFile>;
+  exposeFile(envVar: string, opts: SecretFileOptions): Promise<MountedFile>;
 }
 ```
 
@@ -303,6 +312,11 @@ interface StepSecrets {
 - **`expose(key)`** -- injects a secret into the step's environment variables. Throws `SecretNotFoundError` if the key does not exist.
 - **`has(key)`** -- synchronous existence check. Returns `boolean`, never throws. Use this for conditional patterns where a secret may or may not be present.
 - **`getMeta(key)`** -- retrieves metadata about a resolved secret (backend name and scope). Returns `SecretMeta | undefined` -- `undefined` if the key does not exist. Use this to inspect which backend and scope provided a specific secret.
+- **`list()`** -- returns every secret key available to the step, sorted alphabetically. Synchronous, never throws, and returns names only -- pair it with `getMeta(key)` to inspect a specific key.
+- **`mountFile(opts)`** -- concatenates one or more existing secrets (in `opts.sources` order, optionally separated by `opts.divider`) into a tmpfile inside a per-step tmpdir, chmodded to `opts.mode` (default `0o600`), and returns its absolute path. The tmpdir is allocated lazily on the first call and removed when the step completes -- success, failure, or timeout. Throws `SecretNotFoundError` naming every missing source key.
+- **`exposeFile(envVar, opts)`** -- `mountFile(opts)` plus setting `process.env[envVar]` to the resulting path. The env var is unset and the file removed on step completion.
+
+The SDK itself imports no `node:fs`, so the two file methods are backed by a host adapter the agent wires in (local preview/run mode plugs the same adapter shape against `os.tmpdir()`); without a host they throw. Mounted file contents are registered with the log masker, which covers the case where a concatenation produces bytes neither source value would mask on its own. See [Secrets > mountFile](../../user/secrets.md#mountfileopts).
 
 ### Flat merge logic
 

@@ -25,20 +25,25 @@ import {
 
 describe('global config management', () => {
   let tempDir: string;
+  let harnessConfigDir: string | undefined;
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-config-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // This suite's vitest config sets the KiCI test-isolation marker, so the
-    // ambient-config guard in getConfigDir() throws for every case that
-    // resolves a path from the process env. Point KICI_CONFIG_DIR at exactly
-    // the directory the mocked homedir produces, so the file-writing cases
-    // below read and write inside this test's temp dir.
+    // The vitest harness sets KICI_CONFIG_DIR to an isolated tempdir so the CLI
+    // never reads the developer's ambient ~/.kici. Save it, and repoint it at
+    // exactly the directory the mocked homedir produces, so the file-writing
+    // cases below read and write inside this test's temp dir.
+    harnessConfigDir = process.env.KICI_CONFIG_DIR;
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
   });
 
   afterEach(async () => {
-    delete process.env.KICI_CONFIG_DIR;
+    // Restore the harness's isolated dir rather than deleting it, so a later
+    // test file reusing this worker keeps its isolation from the ambient
+    // ~/.kici config.
+    if (harnessConfigDir === undefined) delete process.env.KICI_CONFIG_DIR;
+    else process.env.KICI_CONFIG_DIR = harnessConfigDir;
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
@@ -61,27 +66,17 @@ describe('global config management', () => {
       expect(dir).toBe(path.join(tempDir, '.kici'));
     });
 
-    it('refuses the ambient config when the KiCI test-isolation marker is set', () => {
-      expect(() => getConfigDir({ KICI_TEST_ISOLATION: '1' })).toThrow(
-        /Refusing to read the ambient/,
-      );
-      expect(() => getConfigDir({ KICI_TEST_ISOLATION: '1' })).toThrow(/KICI_CONFIG_DIR/);
+    it('returns KICI_CONFIG_DIR when set, else ~/.kici (no test-isolation branch)', () => {
+      expect(getConfigDir({ KICI_CONFIG_DIR: '/tmp/iso' })).toBe('/tmp/iso');
+      expect(getConfigDir({})).toBe(path.join(tempDir, '.kici'));
     });
 
-    it('accepts an explicit KICI_CONFIG_DIR even under the marker', () => {
-      const dir = getConfigDir({ KICI_TEST_ISOLATION: '1', KICI_CONFIG_DIR: '/tmp/iso' });
-      expect(dir).toBe('/tmp/iso');
-    });
-
-    it('does not refuse under a third-party VITEST marker', () => {
-      // `kici` is a compat-protected CLI and VITEST is a marker we do not own
-      // that propagates into spawned children. A customer whose vitest test
-      // shells out to `kici` must keep working, so VITEST alone resolves the
-      // homedir default exactly as it did before the guard existed.
+    it('ignores unrelated env vars and resolves the homedir default', () => {
+      // Only KICI_CONFIG_DIR affects resolution; any other key (including the
+      // runner's own VITEST marker) falls through to ~/.kici. `kici` is a
+      // compat-protected CLI, so a customer whose vitest test shells out to it
+      // must resolve the ordinary default.
       expect(getConfigDir({ VITEST: 'true' })).toBe(path.join(tempDir, '.kici'));
-    });
-
-    it('is inert outside a test process', () => {
       expect(getConfigDir({ NODE_ENV: 'production' })).toBe(path.join(tempDir, '.kici'));
     });
   });

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -89,6 +89,10 @@
     "./package-manager-types": {
       "import": "./dist/package-manager-types.js",
       "types": "./dist/package-manager-types.d.ts"
+    },
+    "./container-runtime": {
+      "import": "./dist/container-runtime.js",
+      "types": "./dist/container-runtime.d.ts"
     }
   },
   "scripts": {
@@ -98,7 +102,7 @@
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/shared --name @kici-dev/shared"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1089.0",
+    "@aws-sdk/client-s3": "^3.1121.0",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
     "@opentelemetry/api": "^1.9.1",
@@ -111,10 +115,10 @@
     "@opentelemetry/semantic-conventions": "^1.43.0",
     "archiver": "^8.0.0",
     "diff": "^9.0.0",
-    "hono": "^4.12.32",
+    "hono": "^4.13.2",
     "kysely": "^0.29.4",
     "oxc-transform": "0.140.0",
-    "pg": "^8.22.0",
+    "pg": "^8.23.0",
     "picocolors": "^1.1.1",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",
@@ -124,6 +128,8 @@
   },
   "devDependencies": {
     "@opentelemetry/sdk-trace-base": "^2.10.0",
-    "@types/archiver": "^8.0.0"
+    "@types/archiver": "^8.0.0",
+    "@types/dockerode": "^4.0.1",
+    "dockerode": "^5.0.1"
   }
 }

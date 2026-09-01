@@ -98,6 +98,6 @@ An orchestrator enforces a few limits, each surfaced as a clear step error when 
 - A **per-org storage quota** (20 GiB by default) across all non-expired artifacts.
 - An **expiry** (30 days by default) after which an artifact is no longer downloadable or listed.
 
-Operators can raise or lower the quota and expiry per organization; see the [orchestrator storage layout](../../operator/orchestrator/storage-layout.md#artifacts) for the operator-facing knobs.
+Each of the four is a cluster-wide default an operator can raise or lower per organization; see the [orchestrator storage layout](../../operator/orchestrator/storage-layout.md#artifacts) for the operator-facing knobs.
 
 When an upload or download fails for a reason that is **not** one of these limits — the orchestrator has no artifact storage configured, or it could not service the request — the step error says exactly that, instead of reporting a quota rejection or a missing artifact. So an error that names a limit really is a limit you can act on, and an error that names an orchestrator problem is one to take to whoever runs it.

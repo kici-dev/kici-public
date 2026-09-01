@@ -17,6 +17,8 @@
  */
 
 import { sql, type Kysely } from 'kysely';
+import { routeRelease } from '../approvals/resume-router.js';
+import { releaseQueuedHolds } from '../contexts/release-queued-holds.js';
 import type { Database } from '../db/types.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
@@ -24,7 +26,15 @@ import type { ScalerManager } from '../scaler/manager.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentRegistry } from '../agent/registry.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { ExecutionJobStatus } from '@kici-dev/engine';
+import { CheckRunConclusion, ExecutionJobStatus, HoldScope } from '@kici-dev/engine';
+import { deletePendingWorkflowContext } from '../pipeline/pending-workflow-context.js';
+import { completeUndispatchedHoldChecks } from '../pipeline/undispatched-hold-checks.js';
+import {
+  buildHoldEndedSummary,
+  settleSecurityCheckForOutcome,
+  HoldOutcome,
+  type ResolveCheckStatusPoster,
+} from '../pipeline/security-hold-check.js';
 import {
   staleRunsDetectedTotal,
   staleDetectionDurationSeconds,
@@ -73,8 +83,33 @@ export interface StaleRunDetectorDeps {
    * set, wait-timer workflow holds are not auto-released.
    */
   onWorkflowRelease?: (signal: ReleaseSignal) => Promise<void>;
+  /**
+   * Resume a released JOB-scoped hold by re-dispatching the job. A job-scoped
+   * wait-timer hold has a pending job context, not a pending workflow context,
+   * so it cannot go through `onWorkflowRelease`.
+   */
+  onJobRelease?: (signal: ReleaseSignal) => Promise<void>;
+  /**
+   * Resolve a context by name, for the queued-concurrency sweep — it needs each
+   * group's configured `concurrency_limit` to know how many holds a freed slot
+   * lets through. `ContextStore.matchContext`.
+   */
+  matchContext?: (
+    orgId: string,
+    name: string,
+  ) => Promise<{ concurrency_limit: number | null } | null>;
   /** Access-log writer for the orchestrator audit stream. Optional -- if not set, expiry audit rows (`held_run.expire`) are skipped. */
   accessLogWriter?: AccessLogWriter;
+  /**
+   * Resolve the check poster of the provider bundle serving a routing key, so an
+   * expiring security hold's `KiCI Security` check can be completed. A function
+   * rather than the registry itself because the registry instance is replaced
+   * when sources are (re)loaded, and this detector outlives that.
+   *
+   * Optional -- if not set, an expiring security hold's check is left alone,
+   * which is the pre-existing behaviour rather than a wrong one.
+   */
+  resolveCheckStatusPoster?: ResolveCheckStatusPoster;
 }
 
 export class StaleRunDetector {
@@ -93,7 +128,10 @@ export class StaleRunDetector {
   private readonly stepApprovalBridge?: StepApprovalBridge;
   private readonly failRun?: (runId: string, reason: string) => Promise<void>;
   private readonly onWorkflowRelease?: (signal: ReleaseSignal) => Promise<void>;
+  private readonly onJobRelease?: (signal: ReleaseSignal) => Promise<void>;
+  private readonly matchContext?: StaleRunDetectorDeps['matchContext'];
   private readonly accessLogWriter?: AccessLogWriter;
+  private readonly resolveCheckStatusPoster?: ResolveCheckStatusPoster;
   private interval: ReturnType<typeof setInterval> | null = null;
 
   constructor(deps: StaleRunDetectorDeps) {
@@ -112,21 +150,93 @@ export class StaleRunDetector {
     this.stepApprovalBridge = deps.stepApprovalBridge;
     this.failRun = deps.failRun;
     this.onWorkflowRelease = deps.onWorkflowRelease;
+    this.onJobRelease = deps.onJobRelease;
+    this.matchContext = deps.matchContext;
     this.accessLogWriter = deps.accessLogWriter;
+    this.resolveCheckStatusPoster = deps.resolveCheckStatusPoster;
   }
 
   /**
-   * Release workflow install-gate wait-timer holds whose timer has elapsed.
-   * Runs BEFORE `expireOverdueHolds` so a wait hold resumes the workflow rather
-   * than being failed by the expire-and-fail sweep.
+   * Release queued concurrency holds whose group now has a free slot.
+   *
+   * A context's concurrency gate returns `queue` when its limit is met, holding
+   * the job. Nothing released those holds: they sat pending until the expiry
+   * sweep marked them expired and their jobs never ran. This is the release
+   * half.
+   *
+   * Driven from the periodic scan rather than from job completion: the
+   * completion callback is constructed before the dispatcher, coordinator and
+   * context store exist, so wiring it there would mean threading four refs
+   * through a hot path. The cost is up to one scan interval of latency before a
+   * freed slot is reused, which for a throughput control is an acceptable
+   * trade — and every release still re-checks the limit, so the bound is never
+   * exceeded regardless of when the sweep runs.
+   */
+  private async releaseFreedConcurrencyHolds(): Promise<void> {
+    if (!this.heldRunStore || !this.onJobRelease || !this.matchContext) return;
+    const onJobRelease = this.onJobRelease;
+    const matchContext = this.matchContext;
+    try {
+      const queued = await this.heldRunStore.listAllQueuedHolds();
+      // One release pass per distinct (org, group): the limit is per group, so
+      // sweeping per hold would re-check the same group N times.
+      const groups = new Map<string, { orgId: string; group: string }>();
+      for (const hold of queued) {
+        if (!hold.orgId || !hold.concurrencyGroup) continue;
+        groups.set(`${hold.orgId}\u0000${hold.concurrencyGroup}`, {
+          orgId: hold.orgId,
+          group: hold.concurrencyGroup,
+        });
+      }
+      for (const { orgId, group } of groups.values()) {
+        const cfg = await matchContext(orgId, group);
+        if (!cfg) continue;
+        await releaseQueuedHolds({
+          db: this.db,
+          heldRunStore: this.heldRunStore,
+          orgId,
+          concurrencyGroup: group,
+          concurrencyLimit: cfg.concurrency_limit,
+          onJobRelease,
+        });
+      }
+    } catch (err) {
+      logger.error('Error releasing freed concurrency holds', { error: toErrorMessage(err) });
+    }
+  }
+
+  /**
+   * Release wait-timer holds whose timer has elapsed, at ANY scope, and route
+   * each to the resume path its shape requires: a workflow install-gate hold
+   * rebuilds its workflow dispatch context, a job-scoped hold re-dispatches the
+   * one job it held.
+   *
+   * Runs BEFORE `expireOverdueHolds` so a wait hold resumes rather than being
+   * failed by the expire-and-fail sweep — that sweep is not scope-filtered, so
+   * the ordering is load-bearing.
    */
   private async releaseDueWaitHolds(): Promise<void> {
-    if (!this.heldRunStore || !this.onWorkflowRelease) return;
+    if (!this.heldRunStore) return;
     try {
       const released = await this.heldRunStore.releaseDueWaitHolds();
       for (const signal of released) {
         try {
-          await this.onWorkflowRelease(signal);
+          await routeRelease(signal, {
+            onWorkflowRelease: this.onWorkflowRelease,
+            onJobRelease: async (s: ReleaseSignal) => {
+              if (!this.onJobRelease) {
+                // Loud: the hold row is already flipped to `released`, so a
+                // missing handler means the job is stranded rather than retried.
+                logger.error('Job-scoped wait hold released with no job-release handler', {
+                  runId: s.runId,
+                  jobId: s.jobId,
+                  holdId: s.holdId,
+                });
+                return;
+              }
+              await this.onJobRelease(s);
+            },
+          });
         } catch (err) {
           logger.error('Error resuming workflow after wait-timer release', {
             runId: signal.runId,
@@ -147,11 +257,21 @@ export class StaleRunDetector {
    * bulk status flip: step-scoped holds notify the waiting agent (which fails
    * the step), job/workflow-scoped holds fail the whole run. Then the bulk
    * `expireOverdue()` flips every overdue row to `expired`.
+   *
+   * Every overdue row's id is excluded from the security check's contention
+   * query for the whole loop, because `expireOverdue()` has not run yet: each
+   * of them is still `pending` in the database while its siblings are being
+   * routed, and without the exclusion a commit whose two holds both expired
+   * would see each hold refuse on account of the other and leave the check
+   * pending forever. The commits already settled are tracked so one sweep
+   * writes each shared check once.
    */
   private async expireOverdueHolds(): Promise<void> {
     if (!this.heldRunStore) return;
     try {
       const overdue = await this.heldRunStore.listOverdue();
+      const expiringHoldIds = overdue.map((h) => h.id);
+      const settledCommits = new Set<string>();
       for (const hold of overdue) {
         try {
           if (hold.hold_scope === 'step') {
@@ -159,6 +279,48 @@ export class StaleRunDetector {
           } else if (this.failRun) {
             await this.failRun(hold.run_id, `Approval expired for ${hold.hold_scope} hold`);
           }
+          // A workflow-scoped hold owns a stored dispatch context that only a
+          // release or a rejection consumes. Expiry reaches neither, so drop it
+          // here — otherwise every unapproved fork PR (the common outcome for a
+          // hold nobody answers) leaves one behind until an orchestrator
+          // restart sweeps it as terminal.
+          //
+          // Its dispatch already posted the queued `kici/<workflow>` and
+          // per-job check runs, and `failRun` above completes none of them: it
+          // writes DB rows and never fires `onExecutionComplete`, which is the
+          // one callback wired to `updateWorkflowStatus`. Close them as
+          // `timed_out` — the approval window elapsed — before the context they
+          // are derived from is deleted.
+          if (hold.hold_scope === HoldScope.enum.workflow) {
+            await completeUndispatchedHoldChecks({
+              db: this.db,
+              checkRunReporter: this.checkRunReporter,
+              runId: hold.run_id,
+              conclusion: CheckRunConclusion.enum.timed_out,
+              // Same summary the security check below carries, so the two
+              // families agree on why the run never started.
+              summary: buildHoldEndedSummary({
+                outcome: HoldOutcome.Expired,
+                scope: HoldScope.enum.workflow,
+              }),
+            });
+            await deletePendingWorkflowContext(this.db, hold.run_id);
+          }
+          // A hold that posted a pending `KiCI Security` check when it was
+          // raised leaves it `in_progress` here, and nothing above completes
+          // it: `failRun` writes rows, not check runs, and a job-scoped hold
+          // never reaches the workflow branch above at all. At EVERY scope —
+          // an install-gate hold posted no such check and the settler declines
+          // for it rather than fabricating one.
+          const settled = await settleSecurityCheckForOutcome({
+            db: this.db,
+            resolvePoster: this.resolveCheckStatusPoster,
+            hold,
+            outcome: HoldOutcome.Expired,
+            excludeHoldIds: expiringHoldIds,
+            skipCommits: settledCommits,
+          });
+          if (settled.commit && settled.posted) settledCommits.add(settled.commit);
           // Audit the expiry. The stale detector expires the hold automatically
           // (no human / Keycloak user context), so the actor is the stale-detector
           // system component.
@@ -319,6 +481,9 @@ export class StaleRunDetector {
       // so a wait-timer workflow hold resumes instead of being failed).
       if (this.heldRunStore) {
         await this.releaseDueWaitHolds();
+        // After wait releases, before the expire pass: a slot freed by this
+        // scan's own terminalizations should be reused now rather than next tick.
+        await this.releaseFreedConcurrencyHolds();
         await this.expireOverdueHolds();
       }
 
@@ -372,6 +537,10 @@ export class StaleRunDetector {
         'er.workflow_name',
         'er.repo_identifier',
         'er.workflow_repo_identifier',
+        // The run's trust posture, forwarded onto the check-run completion so a
+        // job reaped on a fork run still explains its reduced privileges.
+        'er.trust_tier',
+        'er.lock_file_source',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -427,6 +596,10 @@ export class StaleRunDetector {
         'er.workflow_name',
         'er.repo_identifier',
         'er.workflow_repo_identifier',
+        // The run's trust posture, forwarded onto the check-run completion so a
+        // job reaped on a fork run still explains its reduced privileges.
+        'er.trust_tier',
+        'er.lock_file_source',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -496,6 +669,10 @@ export class StaleRunDetector {
         'er.workflow_name',
         'er.repo_identifier',
         'er.workflow_repo_identifier',
+        // The run's trust posture, forwarded onto the check-run completion so a
+        // job reaped on a fork run still explains its reduced privileges.
+        'er.trust_tier',
+        'er.lock_file_source',
         'er.sha',
         'er.provider',
         'er.provider_context',
@@ -620,6 +797,11 @@ export class StaleRunDetector {
             description: errorMessage,
             installationId,
             routingKey: entry.routing_key ?? undefined,
+            // A stale reap is a completion like any other: without the posture
+            // it posts the one check a degraded fork run gets, with nothing on
+            // it to explain the run's reduced privileges.
+            ...(entry.trust_tier && { trustTier: entry.trust_tier }),
+            ...(entry.lock_file_source && { lockFileSource: entry.lock_file_source }),
             // Explicit runId — the stale-detector tick fires from a
             // setInterval outside any request-context ALS frame, so the
             // reporter's fallback can't find the runId. Without this,
@@ -649,6 +831,8 @@ export class StaleRunDetector {
       workflow_name: string;
       repo_identifier: string;
       workflow_repo_identifier: string | null;
+      trust_tier: string | null;
+      lock_file_source: string | null;
       sha: string;
       provider: string;
       provider_context: string;
@@ -776,6 +960,9 @@ export class StaleRunDetector {
         description: errorMessage,
         installationId,
         routingKey: job.routing_key ?? undefined,
+        // See the queue-scan site: a reaped job's check is a completion too.
+        ...(job.trust_tier && { trustTier: job.trust_tier }),
+        ...(job.lock_file_source && { lockFileSource: job.lock_file_source }),
         runId: job.run_id,
       });
     }

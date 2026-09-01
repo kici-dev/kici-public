@@ -55,11 +55,15 @@ import {
   collectDiscriminatorTypes,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
   hasPlatformCapability,
+  CLUSTER_MEMBERSHIP_MAX_WORKERS,
   type OrchCapabilities,
   type OrchRole,
   type PlatformCapabilities,
   type OrchestratorMode,
+  type PlanHeadroom,
+  type ClusterMembership,
 } from '@kici-dev/engine';
+import type { PlanHeadroomStore } from '../cluster/plan-headroom-store.js';
 import { EventBuffer } from './event-buffer.js';
 import { RelayBufferRegistry, type RelayStartMeta } from '../webhook/relay-buffer.js';
 import type { AdmitResult } from '../webhook/ingest-admission.js';
@@ -173,34 +177,6 @@ function toSourceRegistrationEntry(source: ProviderSource): SourceRegistrationEn
   };
 }
 
-/**
- * Test-only: remove the comma-separated `dashboard.*` request types in `omit`
- * from the advertised manifest, so an integration test can reproduce an
- * orchestrator that predates a given capability. Double-gated on `testMode`
- * (config `KICI_TEST_MODE=1`, matching the other orchestrator test seams), so a
- * stray env var can never strip advertised capabilities in production — which
- * leaves `KICI_TEST_MODE` unset. No-op unless both are set; production
- * advertises the full set. The values flow from config (registered in the
- * orchestrator env schema), never read from `process.env` here.
- */
-function applyTestCapabilityOmissions(
-  caps: OrchCapabilities,
-  opts: { testMode?: boolean; omit?: string },
-): OrchCapabilities {
-  if (!opts.testMode || !opts.omit) return caps;
-  const omit = new Set(
-    opts.omit
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-  if (omit.size === 0 || !Array.isArray(caps.supportedDashboardRequests)) return caps;
-  return {
-    ...caps,
-    supportedDashboardRequests: caps.supportedDashboardRequests.filter((t) => !omit.has(t)),
-  };
-}
-
 export interface PlatformClientOptions {
   /** WebSocket URL of the Platform relay. */
   url: string;
@@ -266,6 +242,25 @@ export interface PlatformClientOptions {
   }) => void;
   /** Optional callback invoked after successful authentication and source registration. */
   onAuthenticated?: () => void;
+  /**
+   * Returns this coordinator's currently-connected worker peers for the
+   * `cluster.membership` snapshot. Undefined on a non-coordinator (or when
+   * clustering is off) → no membership is reported.
+   */
+  getWorkerPeers?: () => Array<{ instanceId: string }>;
+  /**
+   * Persisted cache of the Platform-pushed worker ceiling. Written on every
+   * `plan.headroom`, read by `getWorkerCeiling`. Undefined → the coordinator
+   * receives no ceiling and admits worker joins freely.
+   */
+  planHeadroomStore?: PlanHeadroomStore;
+  /**
+   * Reconcile this coordinator's workers against a pushed ceiling. Invoked on
+   * EVERY `plan.headroom` frame with the frame's `evictExcess` flag, so a raised
+   * ceiling (or a cleared `evictExcess`) can cancel an in-flight drain, not only
+   * start one. Undefined → no eviction reconciliation.
+   */
+  onPlanCeiling?: (ceiling: number, evictExcess: boolean) => void;
   /**
    * Optional callback invoked when the Platform surfaces the orchestrator's
    * canonical org id on `auth.success`. Used to auto-provision the
@@ -344,16 +339,12 @@ export interface PlatformClientOptions {
   /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
-   * Test-only. Whether the orchestrator runs in test mode (config
-   * `KICI_TEST_MODE=1`). Gates `testOmitDashboardRequestTypes`.
+   * Test-only fault-injection transform over the advertised capability manifest,
+   * supplied only by the build-time test double to reproduce an older /
+   * sourceless orchestrator that predates a given dashboard capability. Undefined
+   * (the shipped default) means identity — the full capability set is advertised.
    */
-  testMode?: boolean;
-  /**
-   * Test-only. Comma-separated `dashboard.*` request types to drop from the
-   * advertised capability manifest (config `KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES`).
-   * Only honored when `testMode` is true; production leaves both unset.
-   */
-  testOmitDashboardRequestTypes?: string;
+  capabilitiesTransform?: (c: OrchCapabilities) => OrchCapabilities;
   /**
    * Verify a reassembled inbound webhook from the chunked relay path.
    *
@@ -441,6 +432,7 @@ export class PlatformClient {
   private _state: ConnectionState = 'disconnected';
   private readonly eventBuffer: EventBuffer;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private membershipTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   /** Armed on auth; resets the backoff only if the connection survives it. */
@@ -501,6 +493,9 @@ export class PlatformClient {
 
   private readonly onPeerDiscover?: PlatformClientOptions['onPeerDiscover'];
   private readonly onAuthenticated?: PlatformClientOptions['onAuthenticated'];
+  private readonly getWorkerPeers?: PlatformClientOptions['getWorkerPeers'];
+  private readonly planHeadroomStore?: PlanHeadroomStore;
+  private readonly onPlanCeiling?: PlatformClientOptions['onPlanCeiling'];
   private readonly onOrgIdentified?: PlatformClientOptions['onOrgIdentified'];
   private readonly onProvenanceIssuer?: PlatformClientOptions['onProvenanceIssuer'];
   private readonly onDashboardRunDetail?: PlatformClientOptions['onDashboardRunDetail'];
@@ -582,6 +577,9 @@ export class PlatformClient {
 
     this.onPeerDiscover = options.onPeerDiscover;
     this.onAuthenticated = options.onAuthenticated;
+    this.getWorkerPeers = options.getWorkerPeers;
+    this.planHeadroomStore = options.planHeadroomStore;
+    this.onPlanCeiling = options.onPlanCeiling;
     this.onOrgIdentified = options.onOrgIdentified;
     this.onProvenanceIssuer = options.onProvenanceIssuer;
     this.onDashboardRunDetail = options.onDashboardRunDetail;
@@ -613,10 +611,13 @@ export class PlatformClient {
     this.onTrustPolicyUpdate = options.onTrustPolicyUpdate;
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
-    this.orchCapabilities = applyTestCapabilityOmissions(
-      { ...ORCH_CAPABILITIES, ...options.orchCapabilities },
-      { testMode: options.testMode, omit: options.testOmitDashboardRequestTypes },
-    );
+    // Only the build-time test double injects a capability transform; the
+    // shipped orchestrator advertises the full set (identity transform).
+    const capabilitiesTransform = options.capabilitiesTransform ?? ((c: OrchCapabilities) => c);
+    this.orchCapabilities = capabilitiesTransform({
+      ...ORCH_CAPABILITIES,
+      ...options.orchCapabilities,
+    });
     this.onVerifyInbound = options.onVerifyInbound;
     this.onAdmit = options.onAdmit;
     this.onShedCapture = options.onShedCapture;
@@ -850,6 +851,7 @@ export class PlatformClient {
   disconnect(): void {
     this.intentionalDisconnect = true;
     this.stopHeartbeat();
+    this.stopClusterMembership();
     this.clearStabilityTimer();
     this.cancelReconnect();
 
@@ -1238,6 +1240,7 @@ export class PlatformClient {
       // so never let a stale advertisement leak across reconnects.
       this.platformCapabilities = undefined;
       this.stopHeartbeat();
+      this.stopClusterMembership();
       this.clearStabilityTimer();
 
       if (this.replaySentOnConnection && !this.connectionProvenStable) {
@@ -1392,6 +1395,10 @@ export class PlatformClient {
 
       case 'auth.failure':
         this.handleAuthFailure(msg);
+        break;
+
+      case 'plan.headroom':
+        void this.onPlanHeadroom(msg);
         break;
 
       case 'webhook.relay.start':
@@ -1788,6 +1795,7 @@ export class PlatformClient {
     // the Platform has no provenance issuer configured.
     this.onProvenanceIssuer?.(msg.provenanceIssuer ?? null);
     this.startHeartbeat();
+    this.startClusterMembership();
 
     // Announce presence to the Platform. Always send source.register —
     // even with zero sources — so the Platform records this orchestrator
@@ -2038,6 +2046,69 @@ export class PlatformClient {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
+  }
+
+  /** How often a coordinator re-sends its membership snapshot. */
+  private static readonly CLUSTER_MEMBERSHIP_INTERVAL_MS = 60_000;
+
+  /**
+   * Send the current worker-peer snapshot to the Platform.
+   *
+   * A snapshot, not a delta: a dropped frame self-heals on the next send. A
+   * no-op when the client is not authenticated or has no worker-peer source.
+   */
+  sendClusterMembership(): void {
+    if (this._state !== 'authenticated' || !this.getWorkerPeers) return;
+    const workers = this.getWorkerPeers();
+    const message: ClusterMembership = {
+      type: 'cluster.membership',
+      workers: workers
+        .slice(0, CLUSTER_MEMBERSHIP_MAX_WORKERS)
+        .map((peer) => ({ instanceId: peer.instanceId })),
+      timestamp: Date.now(),
+    };
+    this.sendDirect(message);
+  }
+
+  private startClusterMembership(): void {
+    this.stopClusterMembership();
+    if (!this.getWorkerPeers) return;
+    // Report once immediately so the Platform has a count before the first
+    // interval elapses, then every 60 s as the self-healing backstop.
+    this.sendClusterMembership();
+    this.membershipTimer = setInterval(
+      () => this.sendClusterMembership(),
+      PlatformClient.CLUSTER_MEMBERSHIP_INTERVAL_MS,
+    );
+  }
+
+  private stopClusterMembership(): void {
+    if (this.membershipTimer) {
+      clearInterval(this.membershipTimer);
+      this.membershipTimer = null;
+    }
+  }
+
+  /**
+   * Store the Platform's worker ceiling and act on an eviction directive.
+   *
+   * The stored value survives a Platform disconnect and a coordinator restart,
+   * which is what makes the fail-open stance bounded rather than unlimited.
+   */
+  private async onPlanHeadroom(msg: PlanHeadroom): Promise<void> {
+    await this.planHeadroomStore?.write(msg);
+    // Reconcile on EVERY frame (not only evictExcess), so a raised ceiling can
+    // cancel an in-flight drain rather than letting it disconnect the worker.
+    this.onPlanCeiling?.(msg.maxWorkerPeers, msg.evictExcess);
+  }
+
+  /**
+   * The ceiling this coordinator enforces, or `null` when none was ever
+   * received — in which case worker joins are admitted freely.
+   */
+  async getWorkerCeiling(): Promise<number | null> {
+    const stored = await this.planHeadroomStore?.read();
+    return stored ? stored.maxWorkerPeers : null;
   }
 
   private scheduleReconnect(): void {

@@ -37,6 +37,24 @@ Manages per-org global-workflow policy (workflow-author allow-list, source-repo 
 - `deny-add` / `deny-remove` mutate the source-repo deny-list.
 - `elevate-add` / `elevate-remove` mutate the elevated-access list. **Deprecated and not enforced:** an organization-wide workflow's job is dispatched with no secret material, so the list grants nothing. Removed at v1.0.0.
 
+##### Accepted pattern shape
+
+A `<pattern>` is a plain glob over a repository identifier (`owner/name`). An identifier is not a file path, so a leading dot carries no special meaning: `myorg/*` and `**` both cover `myorg/.github`.
+
+Negation forms are refused. Each of these is rejected at write time, on all three lists:
+
+- a leading `!` — `!myorg/x`
+- extglob negation — `!(a|b)/x` and `myorg/!(secret)`
+- character-class negation — `myorg/[^a]*`
+- a negative lookahead or lookbehind — `(?!myorg/legacy)**`, `myorg/(?!secret)*`, `**(?<!secret)`
+- an empty or whitespace-only pattern
+
+The list you add to already decides the direction: `allow-add` grants, `deny-add` blocks. A negated pattern inverts that direction inside one entry. On the allow-list it grants almost every repository; on the deny-list it blocks almost every repository. Either way the entry does the opposite of what it reads as. The assertions are the widest of the four forms. One can spell a whole repository identifier rather than a single character, so `(?!myorg/legacy)**` on the allow-list reads as "all but legacy" and allows **every repository in every organization** except that one.
+
+`myorg/[!a]*` is **not** a negation and is accepted. The matcher reads `[!a]` as a literal class holding the two characters `!` and `a`, so the pattern matches only the repositories whose name begins with one of them — a genuine restriction, and the exact inverse of `myorg/[^a]*`.
+
+A pattern of one of these shapes that is already stored is not applied as a negation. The allow-list and elevated-access list grant nothing for it, the deny-list blocks, and the orchestrator logs a warning naming the org and the pattern. Remove such an entry with `allow-remove` / `deny-remove` / `elevate-remove` and write the repositories you mean.
+
 #### `allow-http-npm` — permit non-https private npm registries
 
 ```bash
@@ -231,29 +249,148 @@ Manages the per-orch dashboard write policy — the matrix of `dashboard.*` writ
 - `reset` returns every operation to the permissive default.
 - `--customer-id <id>` (alias `--org`) selects the org row.
 
-### trust-policy -- CI trust policy for untrusted pull requests
+### trust-policy -- CI trust policy for fork pull requests
 
 ```bash
 kici-admin trust-policy show --customer-id <id> [--format json|table]
-kici-admin trust-policy set --customer-id <id> [--fork-policy hold|reject|allow] [--unknown-contributor-policy hold|reject] [--workflow-change-policy hold|reject|allow] [--approval-expiry-hours <n>] [--format json|table]
+kici-admin trust-policy directory --customer-id <id> [--format json|table]
+kici-admin trust-policy set --customer-id <id> [--fork-policy ignore|hold|allow] [--approval-expiry-hours <n>] [--approval-expiry-seconds <n>] [--format json|table]
+kici-admin trust-policy directory-set --customer-id <id> --user-id <id> --provider-username <name> --provider-user-id <id> --ci-trust none|read|write|admin [--provider <name>] [--format json|table]
+kici-admin trust-policy directory-remove --customer-id <id> --user-id <id> [--format json|table]
 ```
 
-The org-wide policy deciding what happens when a pull request is not trusted on its face. Three independent knobs, each resolving to `hold` (park the run behind a security approval), `reject` (refuse it outright), or — where offered — `allow`:
+The org-wide switch deciding what happens to a pull request from a fork. `--fork-policy` takes one of three values:
 
-- `--fork-policy` — a PR from a fork of the repository.
-- `--unknown-contributor-policy` — a PR from an author with no established relationship to the repo. There is deliberately **no `allow`** here; the wire enum has no such member.
-- `--workflow-change-policy` — a PR that modifies the workflow definitions themselves.
-- `--approval-expiry-hours` — how long a security hold waits for an approval before it expires (integer, at least 1).
+- `ignore` — the orchestrator drops the event. It creates no run and posts no check status. This is what an org with no stored policy applies.
+- `hold` — the run parks behind a security approval.
+- `allow` — the pull request runs, with reduced privilege.
 
-`show` also reports an **enforcement** mode. Under `enforcement: legacy` the four fields above are omitted entirely rather than printed, because only the legacy rule is running and rendering a value nothing enforces would be false assurance.
+`--approval-expiry-hours` and `--approval-expiry-seconds` set how long a security hold waits for an approval before it expires. They are two spellings of one window. Hours is the ergonomic form (integer, at least 1). Seconds is the only form that can express a window shorter than an hour (integer, at least 1, up to one year). Setting either recomputes the other, so they cannot disagree. Pass both and the seconds value wins, because it is the more specific. The CLI then prints a warning naming the value it ignored.
 
-`set` works on an **independent** orchestrator only. Wherever a Platform is attached, the Platform owns the trust policy and the admin route refuses with `409`; the CLI surfaces that message verbatim, so manage the policy from the dashboard instead. Both verbs talk to the orchestrator admin API directly rather than the Platform dashboard proxy, so `show` keeps working when Platform is unavailable. They require the `ci_trust.read` / `ci_trust.admin` permissions — owner and admin only, never auditor, which sees trust-policy changes through `access_log.read` instead.
+`show` prints a whole-hour window as hours (`72 h`) and anything finer as seconds (`30 s`).
+
+Three inputs are deprecated and are removed at v1.0.0. `--fork-policy reject` behaves as `ignore`; the CLI stores the value as given and prints a warning. `--unknown-contributor-policy` and `--workflow-change-policy` are still accepted, stored, and echoed back, but no dispatch decision reads them, so setting one changes no outcome. The `show` table omits those two values for that reason; `--format json` still prints them.
+
+`directory` prints the stored approval directory — the identity links, member CI trust levels, and teams that `/kici approve` is resolved against. Use it to tell a stale directory from an absent one when an approval comment is refused.
+
+#### Registering approvers on an independent orchestrator
+
+Where a Platform is attached it owns the directory: it pushes the whole thing on every membership change, so link provider accounts and set CI trust levels in the dashboard. An **independent** orchestrator has no Platform and therefore no upstream authority, so the operator registers approvers directly:
+
+```bash
+kici-admin trust-policy directory-set \
+  --customer-id acme \
+  --user-id alice \
+  --provider-username alice \
+  --provider-user-id 4242 \
+  --ci-trust write
+```
+
+- `--user-id` is the KiCI user id the approval is attributed to. It is yours to choose on an independent orchestrator — it appears in the access log and on the security check, and it is the id `--ci-trust` is recorded against.
+- `--provider-user-id` is the immutable provider-side numeric id (GitHub's `sender.id`). It is **required**, because an approval comment is matched on this alone and never on the username — so renaming a provider account cannot be used to impersonate a registered member. A link with no numeric id could authorize nobody, so the CLI refuses to create one.
+- `--provider-username` is display only.
+- `--provider` defaults to `github`.
+- `--ci-trust` grants the level: `write` or `admin` may release a security hold, `read` and `none` may not.
+
+Re-running `directory-set` for the same `--user-id` replaces that member's link rather than adding a second one, so moving someone to a new provider account also retires their old numeric id. `directory-remove --user-id <id>` revokes a member: every identity link they hold plus their CI trust level. Both verbs leave team memberships untouched.
+
+`set`, `directory-set`, and `directory-remove` work on an **independent** orchestrator only. Wherever a Platform is attached, the Platform owns the trust policy and the approval directory, and the admin route refuses with `409`; the CLI surfaces that message verbatim, so manage both from the dashboard instead. Every verb talks to the orchestrator admin API directly rather than the Platform dashboard proxy, so `show` and `directory` keep working when Platform is unavailable. They require the `ci_trust.read` / `ci_trust.admin` permissions — owner and admin only, never auditor, which sees trust-policy changes through `access_log.read` instead.
 
 See [CI security](../../../architecture/security/ci-security.md) for the threat model behind these knobs.
+
+### held-run -- answer a hold locally
+
+`kici-admin held-run` lists and answers the runs this orchestrator is holding. It is the release surface for an **independent** orchestrator, which has no dashboard approval queue to click and cannot be reached by `kici approve` or the MCP tools — all three go through the Platform.
+
+```bash
+# What is this run waiting for, and who may answer it?
+kici-admin held-run list --customer-id org-1 --run-id run-abc
+
+# Let it run.
+kici-admin held-run approve --customer-id org-1 --run-id run-abc
+
+# Or cancel it.
+kici-admin held-run reject --customer-id org-1 --run-id run-abc --reason "wrong branch"
+```
+
+`list` prints one entry per pending hold: its id, the element it holds, its type and queue, when it expires, and the approvers its requirement names. Read the approver line first — a hold naming a specific user or team is only answerable by a token that requirement accepts.
+
+A run can carry more than one hold, and each takes its own decision: a job gated by both a reviewer requirement and a security policy writes two rows. `approve` and `reject` take the same four disambiguators `kici approve` takes, and refuse to guess between two candidates:
+
+| Flag                 | Picks                                               |
+| -------------------- | --------------------------------------------------- |
+| `--job <name>`       | the hold on that job                                |
+| `--step <index>`     | a step-scoped hold within `--job`                   |
+| `--hold-type <type>` | `reviewer`, `timer`, `concurrency`, or `security`   |
+| `--hold <id>`        | one hold by its own id, ignoring every other filter |
+
+Four properties worth knowing:
+
+- **Both verbs refuse with a `409` on a Platform-attached orchestrator.** There the Platform authorizes each decision against the acting member's org RBAC, and an orchestrator admin token carries none of it. The CLI surfaces that refusal verbatim.
+- **Approving lets the held work run; it does not make its contributor trusted.** A released fork pull request resumes with the base branch's lock file, no install or registry secrets, and an isolated cache write scope.
+- **The decision is attributed to the admin token, not to a person.** There is no flag to claim someone else's identity, because `held_run_approvals` is the record of who approved and a name the operator merely typed would make it false. A `{team}` clause is satisfiable only if that team, in the stored approval directory, contains the token's own subject.
+- **Step-scoped holds are refused.** Answering one means notifying the waiting agent, and an independent orchestrator wires no such bridge; flipping the row without it would leave the agent waiting with nothing left to release or expire it.
+
+`list` needs `ci_trust.read`; `approve` and `reject` need `ci_trust.admin` — the same permissions `trust-policy` takes, held by owner and admin only, and by no routing-key-scoped token. Every decision writes a `held_run.approve` or `held_run.reject` row to the access log; read them back with `kici-admin access-log list --action held_run.approve`.
 
 ## Reference
 
 <!-- BEGIN GENERATED: kici-admin-org-settings (do not edit; run the doc generator) -->
+
+### `kici-admin held-run`
+
+List and answer the runs this orchestrator is holding (independent orchestrators only — a Platform-attached orchestrator is answered from the dashboard)
+
+Synopsis: `kici-admin held-run`
+
+### `kici-admin held-run approve`
+
+Approve a held run, letting the held work RUN. It does not make the contributor trusted: an untrusted fork PR still resumes with the base-branch lock file, no install or registry secrets, and an isolated cache write scope
+
+Synopsis: `kici-admin held-run approve [options]`
+
+**Options**
+
+| Option               | Default | Description                                                                |
+| -------------------- | ------- | -------------------------------------------------------------------------- |
+| `--customer-id <id>` |         | Org / customer id                                                          |
+| `--run-id <id>`      |         | Run whose hold to approve                                                  |
+| `--job <name>`       |         | Match a hold by its job name                                               |
+| `--step <index>`     |         | Match a step-scoped hold by its step index                                 |
+| `--hold <id>`        |         | Match one hold by its own id (ignores every other filter)                  |
+| `--hold-type <type>` |         | Narrow to holds of one type (reviewer \| timer \| concurrency \| security) |
+
+### `kici-admin held-run list`
+
+Print the pending holds for a run, with the approvers each one requires
+
+Synopsis: `kici-admin held-run list [options]`
+
+**Options**
+
+| Option               | Default | Description                |
+| -------------------- | ------- | -------------------------- |
+| `--customer-id <id>` |         | Org / customer id          |
+| `--run-id <id>`      |         | Run whose holds to list    |
+| `--format <format>`  | `table` | Output format: json\|table |
+
+### `kici-admin held-run reject`
+
+Reject a held run, cancelling the element it was holding
+
+Synopsis: `kici-admin held-run reject [options]`
+
+**Options**
+
+| Option               | Default | Description                                                                |
+| -------------------- | ------- | -------------------------------------------------------------------------- |
+| `--customer-id <id>` |         | Org / customer id                                                          |
+| `--run-id <id>`      |         | Run whose hold to reject                                                   |
+| `--reason <text>`    |         | Why the hold is being rejected                                             |
+| `--job <name>`       |         | Match a hold by its job name                                               |
+| `--step <index>`     |         | Match a step-scoped hold by its step index                                 |
+| `--hold <id>`        |         | Match one hold by its own id (ignores every other filter)                  |
+| `--hold-type <type>` |         | Narrow to holds of one type (reviewer \| timer \| concurrency \| security) |
 
 ### `kici-admin org-settings`
 
@@ -266,6 +403,26 @@ Synopsis: `kici-admin org-settings`
 Permit plain http:// npm registry URLs in workflow registries:. Default false; loopback / *.local are always allowed regardless.
 
 Synopsis: `kici-admin org-settings allow-http-npm <value> [options]`
+
+**Arguments**
+
+| Argument | Required | Variadic | Description |
+| -------- | -------- | -------- | ----------- |
+| `value`  | yes      | no       |             |
+
+**Options**
+
+| Option               | Default | Description                      |
+| -------------------- | ------- | -------------------------------- |
+| `--customer-id <id>` |         | Customer / org id (alias: --org) |
+| `--org <id>`         |         | Alias for --customer-id          |
+| `--format <format>`  | `table` | Output format: json\|table       |
+
+### `kici-admin org-settings allow-untrusted-dockerfile-builds`
+
+Permit an untrusted ref (fork PR) to build a job's container image from a Dockerfile. Default false. The build is NOT sandboxed — it runs arbitrary RUN commands on the agent host's container daemon.
+
+Synopsis: `kici-admin org-settings allow-untrusted-dockerfile-builds <value> [options]`
 
 **Arguments**
 
@@ -1177,9 +1334,54 @@ Synopsis: `kici-admin org-settings user-cache show [options]`
 
 ### `kici-admin trust-policy`
 
-Show or set the org trust policy the orchestrator enforces
+Show or set the org trust policy the orchestrator enforces, and read the cached approval directory it arrives with
 
 Synopsis: `kici-admin trust-policy`
+
+### `kici-admin trust-policy directory`
+
+Print the stored approval directory — identity links, member CI trust levels, and teams
+
+Synopsis: `kici-admin trust-policy directory [options]`
+
+**Options**
+
+| Option               | Default | Description                |
+| -------------------- | ------- | -------------------------- |
+| `--customer-id <id>` |         | Org / customer id          |
+| `--format <format>`  | `table` | Output format: json\|table |
+
+### `kici-admin trust-policy directory-remove`
+
+Revoke a member: remove every identity link they hold and their CI trust level (independent orchestrators only)
+
+Synopsis: `kici-admin trust-policy directory-remove [options]`
+
+**Options**
+
+| Option               | Default | Description                |
+| -------------------- | ------- | -------------------------- |
+| `--customer-id <id>` |         | Org / customer id          |
+| `--user-id <id>`     |         | KiCI user id to revoke     |
+| `--format <format>`  | `table` | Output format: json\|table |
+
+### `kici-admin trust-policy directory-set`
+
+Register a member as an approver: link their provider account to a KiCI user id and set their CI trust level (independent orchestrators only — a Platform-attached orchestrator is managed from the dashboard)
+
+Synopsis: `kici-admin trust-policy directory-set [options]`
+
+**Options**
+
+| Option                       | Default  | Description                                                                                                                              |
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `--customer-id <id>`         |          | Org / customer id                                                                                                                        |
+| `--user-id <id>`             |          | KiCI user id the approval is attributed to                                                                                               |
+| `--provider-username <name>` |          | Provider-side username (display only)                                                                                                    |
+| `--provider-user-id <id>`    |          | Immutable provider-side numeric id (GitHub's `sender.id`). Required: an approval comment is matched on this alone, never on the username |
+| `--ci-trust <level>`         |          | CI trust level to grant (none \| read \| write \| admin); write or admin may approve                                                     |
+| `--provider <name>`          | `github` | Provider the link is for                                                                                                                 |
+| `--format <format>`          | `table`  | Output format: json\|table                                                                                                               |
 
 ### `kici-admin trust-policy set`
 
@@ -1189,14 +1391,15 @@ Synopsis: `kici-admin trust-policy set [options]`
 
 **Options**
 
-| Option                                 | Default | Description                                      |
-| -------------------------------------- | ------- | ------------------------------------------------ |
-| `--customer-id <id>`                   |         | Org / customer id                                |
-| `--format <format>`                    | `table` | Output format: json\|table                       |
-| `--fork-policy <value>`                |         | Fork PR policy (hold \| reject \| allow)         |
-| `--unknown-contributor-policy <value>` |         | Unknown contributor policy (hold \| reject)      |
-| `--workflow-change-policy <value>`     |         | Workflow change policy (hold \| reject \| allow) |
-| `--approval-expiry-hours <value>`      |         | Security-hold approval expiry (integer >= 1)     |
+| Option                                 | Default | Description                                                                                                      |
+| -------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| `--customer-id <id>`                   |         | Org / customer id                                                                                                |
+| `--format <format>`                    | `table` | Output format: json\|table                                                                                       |
+| `--fork-policy <value>`                |         | Fork PR policy (ignore \| hold \| reject \| allow)                                                               |
+| `--unknown-contributor-policy <value>` |         | Unknown contributor policy (hold \| reject) [deprecated: no longer enforced; removed at v1.0.0]                  |
+| `--workflow-change-policy <value>`     |         | Workflow change policy (hold \| reject \| allow) [deprecated: no longer enforced; removed at v1.0.0]             |
+| `--approval-expiry-hours <value>`      |         | Security-hold approval expiry, in hours (integer >= 1)                                                           |
+| `--approval-expiry-seconds <value>`    |         | Security-hold approval expiry, in seconds (integer >= 1). Wins over --approval-expiry-hours when both are given. |
 
 ### `kici-admin trust-policy show`
 

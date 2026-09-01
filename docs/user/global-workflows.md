@@ -174,6 +174,106 @@ export default workflow('org-ci', {
 
 The same `sourceRepo.path` caution applies: read the tree through it, and derive job names from the repo's _contents_, never from the path.
 
+## Invoking a source repo's own workflows
+
+A global workflow can run the source repo's **own** workflows and gate on them. Use the `invoke:` job option, built with `invokeSource()`:
+
+```ts
+import { job, workflow, push, kiciEvent, invokeSource } from '@kici-dev/sdk';
+
+// Source repo (myorg/backend/.kici/workflows/tests.ts) — opts in by subscribing.
+export const repoTests = workflow('repo-tests', {
+  on: [kiciEvent({ name: 'myorg.repo-tests' })],
+  jobs: [
+    job('unit', {
+      runsOn: ['kici:os:linux'],
+      run: async ({ $ }) => {
+        await $`npm test`;
+      },
+    }),
+  ],
+});
+
+// Global workflow (myorg/ci-pipelines/.kici/workflows/org-pipeline.ts).
+export default workflow('org-pipeline', {
+  on: [push({ repos: ['myorg/*'], branches: ['main'] })],
+  jobs: [
+    // The invoke gate: emits `myorg.repo-tests` at the source repo and waits for
+    // every run it triggers. It runs no steps of its own.
+    job('repo-tests', { invoke: invokeSource('myorg.repo-tests') }),
+
+    // Gated on the invoked runs through the standard needs vocabulary.
+    job('deploy', {
+      needs: ['repo-tests'],
+      runsOn: ['kici:os:linux'],
+      run: async (ctx) => {
+        for (const r of ctx.needs['repo-tests'].result) {
+          // r = { repo, workflow, runId, status, outputs }
+          if (r.status === 'success') ctx.log.info(`coverage=${r.outputs.coverage}`);
+        }
+      },
+    }),
+  ],
+});
+```
+
+An invoke gate never runs steps, so it is mutually exclusive with `steps` / `run`. A repo opts in by subscribing to the event with `kiciEvent({ name })` — a global cannot invoke a repo that did not subscribe.
+
+The gate's event name follows the same rule as `ctx.emit`: the prefixes `__` and `kici.` are reserved for KiCI, and `invokeSource()` rejects them when you compile. A lock file that still carries a reserved gate fails that gate job at dispatch with `invoke gate cannot summon '…': the event-name prefix "…" is reserved for KiCI internal events. Choose a name a workflow may emit.` The job's status is `failed`, not skipped, so `optional` does not turn the refusal green. Nothing is summoned and no proxy job is created. See [reserved event names](events.md#reserved-event-names).
+
+A summoned run inherits the [trust tier](events.md#trust-tiers-on-internal-triggers) of the run that holds the gate.
+
+### Required by default
+
+An emit that matches **zero** subscribers **fails** the gate. A repo that forgot to wire up its tests must not silently pass the org gate. To let a repo opt out, pass `optional`:
+
+```ts
+job('repo-tests', { invoke: invokeSource('myorg.repo-tests', { optional: true }) });
+```
+
+A zero-subscriber gate with `optional: true` succeeds immediately with no proxies. `optional` is separate from `continueOnError`: `optional` governs whether there was anything to invoke, `continueOnError` governs whether an invoked run passed.
+
+### Reading invoked-run results
+
+Each invoked run appears as a **proxy node** under the gate in the run graph, and its result is available to downstream jobs on `ctx.needs['<gate>'].result` — an array of `{ repo, workflow, runId, status, outputs }`, one entry per invoked run. `outputs` carries the run's non-secret declared outputs; a repo's secret outputs never cross into the global run.
+
+### Standard job options apply
+
+The gate is a standard job. Tolerate a failed invoked run with `continueOnError`, react to a failed gate with a downstream `needs` `when: 'on-failure'`, bound the wait with the job `timeout`, and bound the fan-out with `maxParallel` / `failFast`:
+
+```ts
+job('repo-tests', {
+  invoke: invokeSource('myorg.repo-tests'),
+  continueOnError: true,
+  timeout: '1h',
+  maxParallel: 10,
+  failFast: true,
+});
+```
+
+### Generating invoke gates
+
+Because `invoke:` is a job shape, a generator can inspect the source repo and return only the gates that apply:
+
+```ts
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+const perRepoGates: DynamicJobFn = async ({ sourceRepo }) => {
+  if (!sourceRepo) return [];
+  const jobs = [];
+  if (existsSync(join(sourceRepo.path, 'Dockerfile')))
+    jobs.push(job('docker', { invoke: invokeSource('myorg.docker-test', { optional: true }) }));
+  if (existsSync(join(sourceRepo.path, 'package.json')))
+    jobs.push(job('node', { invoke: invokeSource('myorg.node-test') }));
+  return jobs;
+};
+```
+
+The generator decides whether to create a gate at all; `optional` decides what a created gate does when nothing subscribes.
+
+**Set a `timeout` when a summoned run can be held.** A gate waits for every run it summoned. An invoked run binds its own [contexts](contexts.md), so a [protection rule](contexts.md#protection-rules) can hold it for reviewer approval or a wait timer. A gate with no `timeout` then waits for as long as the hold lasts, which is until a human acts on it. Give such a gate a `timeout` so the wait is bounded.
+
 ## Enabling global workflows
 
 Global workflows are gated by a **fleet-wide master switch** held by the orchestrator operator, off by default. Until it is on, `repos:`-bearing workflows are registered but never dispatched.
@@ -232,7 +332,8 @@ When that evaluation cannot reach a verdict — it fails, breaches its budget, o
 
 - The check is posted whether the evaluation failed **outright** or only **partly**. A per-workflow budget breach, or a `filter` that throws, leaves that one workflow undecided while its neighbours from the same repo are decided and run normally; the check then names only the undecided ones. So a broken `filter` is reported the same way whether or not other global workflows happen to share its repo.
 - Branch protection that lists required checks by name is unaffected, because the check is not on that list. Merge automation that requires _every_ check to be green will block on it.
-- **The check clears only on a new commit.** A provider redelivery of the same event is dropped as a duplicate, so re-delivering the webhook will not re-run the evaluation.
+- **Re-run the failed evaluation to clear the check.** A failed evaluation is recorded as one errored run named `__globaleval__<owner>/<workflow-repo>`. Fix the cause, then re-run that run — `kici runs rerun <run-id>`, or the **Re-run** button on the run in the dashboard. The re-run re-evaluates the original event against the workflow repo's current state, dispatches whatever it now admits, and posts a `success` check under the same name on the same commit. The request is **accepted immediately**; the evaluation itself is a job on an agent and runs after the answer, exactly as it does for the push that first triggered it. So watch the run and the check for the outcome, not the response. The check clears only when the re-evaluation reaches a verdict: if it fails again, or the orchestrator cannot run it, the `failure` check stands. A provider redelivery of the same webhook will not do this: it is dropped as a duplicate. Pushing a new commit also works, and is what you need when the payload of the original delivery is no longer stored.
+- **Two failed evaluations on one commit share the check.** The check name carries no repo, so if two workflow repos both fail on the same push, re-running one of them posts `success` over the other's `failure`. The success summary names the workflow repo it re-evaluated; re-run the other round too.
 
 ## Approval gates are not supported
 
@@ -240,11 +341,25 @@ A global workflow cannot carry an `approval` gate, at the workflow level or on a
 
 To gate a deployment behind a human, put the gated jobs in a workflow whose triggers carry no `repos:`.
 
-## Re-running is not supported
+## Re-running an organization-wide run
 
-A global workflow's run cannot be re-run. The rerun path resolves a workflow out of the repo the run acted on, and for a global workflow that is the **source** repo — not the workflow repo that declares it. Re-running is refused with an error naming both repos rather than resolving the wrong one, which for a source repo carrying a same-named workflow would silently run that workflow instead, with the source repo's credentials and none of the global job configuration.
+An organization-wide run that executed against another repository cannot be re-run from that repository. This is a permanent authorization boundary, not a limitation.
 
-To run it again, push a new commit to the source repo (a provider redelivery of the same event is dropped as a duplicate), or trigger it from the workflow repo.
+The re-run path resolves a workflow out of the repo the run acted on. For an organization-wide run that is the **source** repo, not the workflow repo that declares it. So a re-run from the source repo would re-execute the defining repo's code without the defining repo's policy pass. If the source repo carries a workflow of the same name, the re-run would run that workflow instead — with the source repo's credentials and none of the organization-wide job configuration.
+
+Two tiers refuse it: your orchestrator, and the hosted Platform on every path that exposes re-run. Each refusal names both repos.
+
+That refusal is what makes the run visible to both teams. A member scoped to **either** repo reads and cancels the run. Neither team can re-execute the other's code.
+
+To run it again, trigger it from the repo that defines the workflow. You can also push a new commit to the source repo; a provider redelivery of the same event is dropped as a duplicate.
+
+A failed organization-workflow **evaluation** is the exception. Re-running one re-evaluates the original event instead of resolving a workflow, so the substitution above cannot happen. See [When does it fire?](#when-does-it-fire).
+
+## Notifications
+
+An organization-wide run belongs to two repositories: the one it executed against, and the one that defines the workflow. A notification subscription's repository filter matches on either. So a subscription scoped to the defining repo hears about every organization-wide run of its own workflows, even though those runs execute against other repositories.
+
+This is the same either-repo rule the run history uses, so the runs a team sees in the dashboard are the runs it is notified about.
 
 ## Requirements a filter places on the run
 
@@ -261,10 +376,34 @@ A `filter` reads the source tree, so the evaluation must be able to obtain one. 
 | Dashboard shows workflow twice after registering                                                | Both a generic webhook source and a provider source (github, generic) re-registered the same repo.                                                                                                                     | Check `workflow_registrations` via `kici-admin workflow list` and confirm the right routing key owns the workflow.                                                                                                                                                                                                                                   |
 | Global workflow registered, enabled, allowed — and still no run appears                         | Its `filter` returned `false`. A global filter runs before the run is created, so a suppressed workflow leaves nothing behind at all.                                                                                  | [Reading a global workflow's filter output](#reading-a-global-workflows-filter-output) — the evaluation round's own log. The orchestrator also logs `Global workflow skipped by eval round`, naming the workflow and the reason.                                                                                                                     |
 | Global workflow never fires for one particular source repo                                      | Its `repos:` patterns do not match that repo's identifier.                                                                                                                                                             | Orchestrator log: `Global workflows dropped by their repos filter` — one line per delivery, naming each dropped workflow, its repo and its patterns.                                                                                                                                                                                                 |
-| A `failure` check named `KiCI: Organization workflow evaluation` on a commit                    | The pre-run evaluation failed or timed out, so the global workflows from that repo were not run.                                                                                                                       | Orchestrator log for the evaluation job; push a new commit to re-evaluate (a redelivery is dropped as a duplicate).                                                                                                                                                                                                                                  |
+| A `failure` check named `KiCI: Organization workflow evaluation` on a commit                    | The pre-run evaluation failed or timed out, so the global workflows from that repo were not run.                                                                                                                       | Orchestrator log for the evaluation job. Fix the cause, then re-run the errored `__globaleval__…` run (`kici runs rerun <run-id>`) to re-evaluate and clear the check; a redelivery is dropped as a duplicate.                                                                                                                                       |
 | Same-repo workflow shows a `success` run with no jobs in it                                     | Its `filter` returned `false`. A same-repo filter runs after the run exists, so the run remains, carrying only the evaluation jobs.                                                                                    | The run detail page — the evaluation job's log records the filter verdict.                                                                                                                                                                                                                                                                           |
-| Re-run is refused with "Cannot re-run an organization-wide workflow"                            | Expected — the run executed against a source repo that does not declare the workflow.                                                                                                                                  | [Re-running is not supported](#re-running-is-not-supported) — push a new commit to the source repo instead.                                                                                                                                                                                                                                          |
+| Re-run is refused with "Cannot re-run an organization-wide workflow"                            | Expected — the run executed against a source repo that does not declare the workflow.                                                                                                                                  | [Re-running an organization-wide run](#re-running-an-organization-wide-run) — trigger it from the repo that defines the workflow instead.                                                                                                                                                                                                            |
 | Every global workflow stopped running right after an orchestrator upgrade                       | The agents were not upgraded first. An agent older than v0.5.0 cannot evaluate a global workflow, and one containing a `dynamicJob` now needs an evaluation even without a `filter` — so its **static** jobs stop too. | The `KiCI: Organization workflow evaluation` check names the agent versions it found. Upgrade every `kici:role:init-runner` agent to v0.5.0 or newer.                                                                                                                                                                                                |
+
+### Reading the decision trace for a delivery
+
+The dashboard records why each workflow did or did not fire. Open
+**Settings → Event log**, select the delivery, and read the **Workflow
+decisions** section. It lists every workflow the delivery was evaluated
+against — per-repository and organization-wide alike.
+
+Each entry expands to the individual checks the trigger evaluation performed:
+the check, the pattern, the value tested against it, and whether it passed. An
+organization-wide workflow is named with the repository that defines it, so you
+can find your own workflow even though it is absent from the source
+repository's lock file.
+
+This is the first place to look when a workflow does not fire. A failed `repo`
+check means the `repos:` patterns do not match the source repository. A failed
+`filter` check means the evaluation round excluded the workflow.
+
+The value a check tested and the reason it gives quote the webhook body, so
+those two fields need the `event_log:read_payload` permission. Without it the
+row still names the check, the pattern, and whether it passed.
+
+The orchestrator records the trace when trigger matching runs. A delivery the
+Platform rejected at the relay therefore has none.
 
 ### Reading a global run in the dashboard
 

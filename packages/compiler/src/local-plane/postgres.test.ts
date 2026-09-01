@@ -33,10 +33,9 @@ describe('startPlanePostgres', () => {
     embeddedInit.mockResolvedValue(undefined);
     embeddedStart.mockResolvedValue(undefined);
     embeddedCreateDb.mockResolvedValue(undefined);
-    const { startPlanePostgres, __setEmbeddedDaemonForTest } = await import('./postgres.js');
+    const { startPlanePostgres } = await import('./postgres.js');
     // Stub the pg_ctl daemonizer so the unit test never spawns a real process.
-    __setEmbeddedDaemonForTest(async () => {});
-    const h = await startPlanePostgres();
+    const h = await startPlanePostgres({ embeddedDaemon: async () => {} });
     expect(h.kind).toBe('embedded');
     expect(h.url).toContain('kici_local');
     expect(embeddedStart).toHaveBeenCalled();
@@ -44,10 +43,9 @@ describe('startPlanePostgres', () => {
 
   it('falls back to podman when embedded init throws', async () => {
     embeddedInit.mockRejectedValue(new Error('no native binary'));
-    const { startPlanePostgres, __setReadyPollerForTest } = await import('./postgres.js');
-    __setReadyPollerForTest(async () => true);
+    const { startPlanePostgres } = await import('./postgres.js');
     spawnMock.mockReturnValue({ on: vi.fn(), unref: vi.fn() });
-    const h = await startPlanePostgres();
+    const h = await startPlanePostgres({ readyPoller: async () => true });
     expect(h.kind).toBe('podman');
     expect(spawnMock).toHaveBeenCalledWith(
       'podman',

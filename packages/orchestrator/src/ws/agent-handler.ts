@@ -13,7 +13,11 @@
  * 2. pendingRegistration (10s): After auth.success, agent must send agent.register.
  * 3. registered: Agent is fully connected and can exchange messages.
  *
- * When agentAuthMode === 'none', the auth phase is skipped (legacy behavior).
+ * When agentAuthMode === 'none', the auth phase is skipped and the connection
+ * starts in pendingRegistration. An agent that happens to carry a token still
+ * opens with auth.request — nothing on the wire tells it the mode — so that
+ * frame is accepted there and answered with auth.success without reading the
+ * token, and the agent then registers as normal.
  */
 
 import type { WSContext, WSEvents, WSMessageReceive } from 'hono/ws';
@@ -25,6 +29,7 @@ import {
   MIN_PROTOCOL_VERSION,
   WS_CLOSE_AUTH_TIMEOUT,
   WS_CLOSE_INVALID_MESSAGE,
+  WS_CLOSE_INTERNAL_ERROR,
   WS_CLOSE_AGENT_AUTH_FAILED,
   WS_CLOSE_PROTOCOL_ERROR,
   WsRateLimiter,
@@ -36,6 +41,7 @@ import {
   ArtifactDownloadOutcome,
   ArtifactUploadOutcome,
   LogStream,
+  reservedEventNamePrefix,
 } from '@kici-dev/engine';
 import type { RateLimiterConfig, AttestationVerifyStatus } from '@kici-dev/engine';
 import { provenanceStorageKey } from '@kici-dev/engine/provenance/bundle';
@@ -52,6 +58,7 @@ import type { OwnershipTracker } from '../agent/ownership-tracker.js';
 import { OWNERSHIP_REFUSED } from '../agent/ownership-refusal.js';
 import { gateOwnership } from './ownership-gate.js';
 import type { SourceCache } from '../cache/source-cache.js';
+import { depTarballKey } from '../cache/dep-cache.js';
 import type { DepCache } from '../cache/dep-cache.js';
 import type { UserCache, UserCacheRef } from '../cache/user-cache.js';
 import {
@@ -365,12 +372,16 @@ export interface AgentWsHandlerDeps {
    *   AgentRegistry so subsequent label matches (queue drain + eager
    *   dispatch) apply the same gate the scaler-side selector applied.
    *
-   * Returns `null` for static agents not managed by any scaler.
+   * Resolves to `null` for static agents not managed by any scaler.
+   *
+   * Asynchronous because the agent may reach an instance that did not spawn
+   * it: that instance adopts the agent from the shared spawn record, which is
+   * a database round trip.
    */
   onScalerAgentRegistered?: (
     agentId: string,
     labels: string[],
-  ) => { boundJobId?: string; mandatoryLabels: string[] } | null;
+  ) => Promise<{ boundJobId?: string; mandatoryLabels: string[] } | null>;
   /** Optional callback when an agent disconnects (for scaler lifecycle). */
   onScalerAgentDisconnected?: (agentId: string) => void;
   /** Optional callback when an agent completes a job (for scaler lifecycle). */
@@ -405,6 +416,25 @@ export interface AgentWsHandlerDeps {
       target?: { repos?: string[] };
     },
   ) => Promise<{ deliveryId?: string; error?: string }>;
+  /**
+   * Optional callback: a provisioning workflow's agent exchanges a single-use
+   * claim code (from a `kici.scaler.scale-up` event) for freshly minted
+   * ephemeral agent credentials. Delegates to the event scaler backend's claim
+   * store. Returns the credentials or an author-actionable error; the token is
+   * carried only in the response, never logged.
+   */
+  onClaimCredentials?: (
+    agentId: string,
+    claimCode: string,
+  ) => Promise<{
+    credentials?: {
+      agentToken: string;
+      agentId: string;
+      orchestratorUrl: string;
+      labels: string[];
+    };
+    error?: string;
+  }>;
   /** Optional callback when agent sends a run.event for infrastructure lifecycle tracking. */
   onRunEvent?: (
     agentId: string,
@@ -719,6 +749,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
     onAgentLog,
     onConfigAck,
     onEventEmit,
+    onClaimCredentials,
     onRunEvent,
     onJobContext,
     sourceCache,
@@ -809,6 +840,22 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
   >();
 
   /**
+   * Sockets parked inside the initial-registration await window — past
+   * `pendingRegistration.delete(ws)` but not yet in `wsToAgentId`.
+   *
+   * The scaler notification is awaited before the registry write (a database
+   * round trip when the agent registers on an instance that did not spawn it),
+   * so that interval is no longer synchronous and the WS belongs to none of the
+   * three maps `onClose` inspects. This map is the fourth state: `onClose`
+   * marks the entry `closed` instead of falling through having done nothing,
+   * and the in-flight registration reads that flag before writing to the
+   * registry — otherwise it registers a dead socket that can never emit another
+   * close, so the disconnect path (and, for a scaler agent, the teardown that
+   * frees the provisioned instance) never runs.
+   */
+  const registering = new Map<WSContext, { closed: boolean }>();
+
+  /**
    * Map from WSContext to agentId for registered connections.
    * Separate from the registry's WS map because we use WSContext here
    * (Hono type) vs WsLike in the registry.
@@ -845,6 +892,55 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
   function sendJson(ws: WSContext, data: unknown): void {
     if (ws.readyState === 1) {
       ws.send(JSON.stringify(data));
+    }
+  }
+
+  /**
+   * Redeem a single-use scaler claim code for freshly minted ephemeral
+   * credentials and reply on `ws`. Shared by the registered-agent message loop
+   * and the pre-register self-bootstrap admission, so a fresh agent can claim
+   * before it registers. Minting routes by the claim code and ignores the
+   * caller's agent id, so the pre-register caller passes an empty id. The claim
+   * code is a single-use secret and is never logged.
+   */
+  async function handleClaimCredentials(
+    ws: WSContext,
+    requestId: string,
+    claimCode: string,
+    agentId: string,
+    onClaimCredentials: AgentWsHandlerDeps['onClaimCredentials'],
+  ): Promise<void> {
+    if (!onClaimCredentials) {
+      logger.warn('scaler.claim-credentials received but event scaler not configured', {
+        agentId,
+      });
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        error: 'Scaler credential claim not available',
+      });
+      return;
+    }
+
+    try {
+      const result = await onClaimCredentials(agentId, claimCode);
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        ...(result.credentials && { credentials: result.credentials }),
+        ...(result.error && { error: result.error }),
+      });
+    } catch (err) {
+      logger.error('Failed to process scaler.claim-credentials', {
+        agentId,
+        // The claim code is a single-use secret — never log it.
+        error: toErrorMessage(err),
+      });
+      sendJson(ws, {
+        type: 'scaler.claim-credentials.response',
+        requestId,
+        error: AgentWsInternalFailure.scalerClaimFailed,
+      });
     }
   }
 
@@ -940,6 +1036,25 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
       // -- Phase 1: Pending auth (token mode) --
       const authEntry = pendingAuth.get(ws);
       if (authEntry !== undefined) {
+        // Self-bootstrap: a fresh agent may redeem a single-use claim code for
+        // its ephemeral credentials BEFORE it authenticates. The claim code is
+        // the authorization, so this one frame is admitted ahead of auth.request
+        // and routed through the same helper the registered case uses (empty
+        // agent id — minting routes by the code). The connection stays in
+        // pendingAuth with its timer running, so the agent then authenticates
+        // with the minted token via the normal auth.request path below.
+        const preAuth = agentToOrchestratorMessageSchema.safeParse(raw);
+        if (preAuth.success && preAuth.data.type === 'scaler.claim-credentials') {
+          await handleClaimCredentials(
+            ws,
+            preAuth.data.requestId,
+            preAuth.data.claimCode,
+            '',
+            onClaimCredentials,
+          );
+          return;
+        }
+
         clearTimeout(authEntry.timer);
         pendingAuth.delete(ws);
 
@@ -1052,10 +1167,48 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
       // -- Phase 2: Pending registration --
       const regEntry = pendingRegistration.get(ws);
       if (regEntry !== undefined) {
+        const parsed = agentToOrchestratorMessageSchema.safeParse(raw);
+
+        // Self-bootstrap: a fresh, not-yet-registered agent may redeem a
+        // single-use claim code for its ephemeral credentials before it
+        // registers. The claim code is the authorization, so this one frame is
+        // admitted here and routed through the same helper the registered case
+        // uses (with an empty agent id — minting routes by the code and ignores
+        // it). The registration timer keeps running, so the connection is still
+        // bounded: the agent registers, or times out, as normal afterwards.
+        if (parsed.success && parsed.data.type === 'scaler.claim-credentials') {
+          await handleClaimCredentials(
+            ws,
+            parsed.data.requestId,
+            parsed.data.claimCode,
+            '',
+            onClaimCredentials,
+          );
+          return;
+        }
+
+        // Auth disabled, but the agent HAS a token: either a static
+        // `KICI_AGENT_TOKEN`, or an ephemeral one this orchestrator just minted
+        // for the claim-code self-bootstrap immediately above. Nothing on the
+        // wire tells an agent which auth mode the orchestrator runs, so it
+        // opens with `auth.request` and waits for `auth.success` before it
+        // registers — and refusing the frame strands it in a permanent
+        // reconnect loop it can never escape.
+        //
+        // Answering `auth.success` grants nothing. No `AuthState` is built, no
+        // token is read, and the register gates below are skipped in this mode
+        // exactly as they already are for a tokenless agent — this mode accepts
+        // any agent by definition (see the startup warning in `onOpen`). It
+        // only lets the agent proceed to `agent.register`. The registration
+        // timer keeps running, so the connection stays bounded.
+        if (agentAuthMode === 'none' && parsed.success && parsed.data.type === 'auth.request') {
+          sendJson(ws, { type: 'auth.success', connectionId: randomUUID() });
+          return;
+        }
+
         clearTimeout(regEntry.timer);
         pendingRegistration.delete(ws);
 
-        const parsed = agentToOrchestratorMessageSchema.safeParse(raw);
         if (!parsed.success || parsed.data.type !== 'agent.register') {
           logger.warn('First message after auth must be agent.register', {
             errors: parsed.success ? undefined : parsed.error.issues,
@@ -1107,8 +1260,60 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         // queue-drain or label-match call observes it; registering the agent
         // with an empty gate and back-filling it later would leave a window
         // where `dequeueForLabels` could pull an off-gate queued job.
-        const scalerInfo = onScalerAgentRegistered?.(agentId, labels) ?? null;
+        //
+        // The await is a DB round trip on the adoption path (the agent reached
+        // an instance that did not spawn it). `pendingRegistration.delete(ws)`
+        // above is what keeps a concurrent second register on this socket from
+        // racing through the same window, and `registering` carries the socket
+        // through it so a close landing mid-lookup is still seen.
+        const registerState = { closed: false };
+        registering.set(ws, registerState);
+        let scalerInfo: { boundJobId?: string; mandatoryLabels: string[] } | null = null;
+        let scalerLookupFailed = false;
+        try {
+          scalerInfo = (await onScalerAgentRegistered?.(agentId, labels)) ?? null;
+        } catch (err) {
+          // The scaler could not read the spawn record for an agent id it
+          // recognises as its own. Registering anyway would drop that agent's
+          // `mandatoryLabels` gate for its whole life, so a queued job whose
+          // `runsOn` omits the platform taint could land on it. Refuse instead:
+          // the agent reconnects, and a transient store fault costs one retry.
+          scalerLookupFailed = true;
+          logger.error('Scaler lookup failed during agent registration', {
+            agentId,
+            error: toErrorMessage(err),
+          });
+        } finally {
+          registering.delete(ws);
+        }
+
+        if (scalerLookupFailed) {
+          wsToAuthState.delete(ws);
+          agentIdToTokenId.delete(agentId);
+          ws.close(WS_CLOSE_INTERNAL_ERROR, 'Scaler state unavailable');
+          return;
+        }
+
+        if (registerState.closed) {
+          // The socket died while the scaler lookup was in flight. Registering
+          // it now would put a dead WS in the registry with no close event left
+          // to remove it. Unwind the pre-await bindings instead, and hand the
+          // agent straight to the scaler's disconnect path: the lookup may have
+          // already adopted (or locally correlated) it, and that bookkeeping is
+          // what tears the provisioned instance down.
+          logger.info('Agent connection closed during registration', { agentId });
+          wsToAuthState.delete(ws);
+          agentIdToTokenId.delete(agentId);
+          if (scalerInfo !== null) {
+            onScalerAgentDisconnected?.(agentId);
+          }
+          return;
+        }
+
         const pendingDispatch = scalerInfo?.boundJobId != null;
+        // A scaler-managed agent with no bound job was pre-spawned to wait for
+        // work. It must not arm the short idle timer — see registerAckSchema.
+        const warmPool = scalerInfo !== null && scalerInfo.boundJobId == null;
 
         // Register in the registry (platform/arch default to linux/x64 if not provided)
         registry.register(
@@ -1180,6 +1385,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
           scalerManaged: scalerInfo !== null,
           capabilities: ORCH_AGENT_CAPABILITIES,
           ...(pendingDispatch ? { pendingDispatch: true } : {}),
+          ...(warmPool ? { warmPool: true } : {}),
         });
 
         // Update metrics
@@ -1238,6 +1444,14 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
       // -- Registered: validate and route --
       const agentId = wsToAgentId.get(ws);
       if (!agentId) {
+        if (registering.has(ws)) {
+          // A second frame arrived while this socket's registration is parked
+          // in the scaler lookup. Drop it rather than close: the connection is
+          // mid-registration, not unregistered, and closing it here would kill
+          // the socket the in-flight registration is about to complete.
+          logger.warn('Message arrived while registration is in flight, dropping');
+          return;
+        }
         logger.warn('Message from unregistered connection, closing');
         ws.close(WS_CLOSE_INVALID_MESSAGE, 'Not registered');
         return;
@@ -1823,7 +2037,17 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
                 });
                 break;
               }
-              uploadUrl = await depCache.getUploadUrl(msg.lockfileHash!, msg.platform, msg.arch);
+              // Content-addressed: the tarball is stored under its own hash, so
+              // sign for that. An older agent omits `depsHash` — fall back to
+              // the lockfile-derived name so a mixed-version rollout still
+              // uploads somewhere rather than failing the build. Such an entry
+              // gets no pointer, so nothing will ever resolve to it and it ages
+              // out on TTL; the next build with a current agent repopulates.
+              uploadUrl = await depCache.getUploadUrl(
+                msg.depsHash ?? msg.lockfileHash!,
+                msg.platform,
+                msg.arch,
+              );
             }
             sendJson(ws, {
               type: 'cache.upload.response',
@@ -1861,21 +2085,31 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             break;
           }
 
-          // Compute the storage key from the message fields
+          // Compute the storage key from the message fields. A dep tarball is
+          // addressed by its own content hash; only fall back to the lockfile
+          // name for an older agent that sent no `depsHash` (see the upload-URL
+          // branch above — the two must agree on the key or initMeta stamps TTL
+          // bookkeeping onto an object that does not exist).
           let storageKey: string;
           if (msg.cacheType === 'source') {
             storageKey = `source/${msg.contentHash}.tar.gz`;
           } else {
-            storageKey = `deps/${msg.platform}-${msg.arch}/${msg.lockfileHash}.tar.gz`;
+            storageKey = depTarballKey(msg.depsHash ?? msg.lockfileHash!, msg.platform, msg.arch);
           }
 
           if (cacheStorage) {
             try {
               await cacheStorage.initMeta(storageKey);
-              // Store companion hash file for dep tarballs (agent-side integrity verification)
-              if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash) {
-                const hashKey = `deps/${msg.platform}-${msg.arch}/${msg.lockfileHash}.hash`;
-                await cacheStorage.put(hashKey, msg.depsHash);
+              // Publish the pointer only now, after the agent confirmed the
+              // upload landed. Publishing earlier would let a reader resolve a
+              // lockfile to bytes that are not there yet.
+              if (msg.cacheType === 'deps' && msg.depsHash && msg.lockfileHash && depCache) {
+                await depCache.publishPointer(
+                  msg.lockfileHash,
+                  msg.platform,
+                  msg.arch,
+                  msg.depsHash,
+                );
               }
               logger.info('Cache upload metadata initialized', {
                 agentId,
@@ -2548,6 +2782,34 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
             break;
           }
 
+          // Authoritative forgery guard: `kici.` is reserved for KiCI-internal
+          // system events (the event scaler's scale-up / scale-down) and `__`
+          // for the events the orchestrator mints for itself. A user step must
+          // never emit either — the SDK rejects it client-side, and this is the
+          // server-side backstop.
+          //
+          // The `__` half is a privilege boundary, not just a namespace: every
+          // name under it is exempt from the event-storm rate limiter, and
+          // `__schedule_fire` is additionally dispatched as a TRUSTED ref
+          // (no run causes it). So a job that could emit `__schedule_fire`
+          // would hand itself both. The lifecycle names inherit the tier of
+          // the run behind them, so emitting one forges the exemption alone —
+          // still a boundary worth holding.
+          const reservedPrefix = reservedEventNamePrefix(msg.eventName);
+          if (reservedPrefix) {
+            logger.warn('event.emit rejected: reserved event-name prefix', {
+              agentId,
+              eventName: msg.eventName,
+              reservedPrefix,
+            });
+            sendJson(ws, {
+              type: 'event.emit.response',
+              requestId: msg.requestId,
+              error: `event name prefix "${reservedPrefix}" is reserved for KiCI internal events`,
+            });
+            break;
+          }
+
           if (!onEventEmit) {
             logger.warn('event.emit received but event routing not configured', { agentId });
             sendJson(ws, {
@@ -2589,6 +2851,22 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
               error: AgentWsInternalFailure.eventEmitFailed,
             });
           }
+          break;
+        }
+
+        case 'scaler.claim-credentials': {
+          // A provisioning workflow's already-registered agent exchanges its
+          // single-use claim code for freshly minted ephemeral credentials. A
+          // fresh, not-yet-registered agent takes the same path pre-register via
+          // handleClaimCredentials; the token rides the response only and is
+          // never logged.
+          await handleClaimCredentials(
+            ws,
+            msg.requestId,
+            msg.claimCode,
+            agentId,
+            onClaimCredentials,
+          );
           break;
         }
 
@@ -2679,6 +2957,19 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): WSEvents {
         clearTimeout(regEntry.timer);
         pendingRegistration.delete(ws);
         logger.info('Agent connection closed before registration');
+        return;
+      }
+
+      // Closed inside the initial-registration await window: the WS has left
+      // `pendingRegistration` and has not reached `wsToAgentId`, so neither
+      // branch above matches it. Flag the in-flight registration instead of
+      // returning having done nothing — it reads this before writing to the
+      // registry and unwinds itself, which is the only cleanup available while
+      // the agent has no registry entry to tear down.
+      const registeringState = registering.get(ws);
+      if (registeringState !== undefined) {
+        registeringState.closed = true;
+        logger.info('Agent connection closed during registration');
         return;
       }
 

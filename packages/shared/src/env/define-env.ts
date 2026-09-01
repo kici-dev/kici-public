@@ -408,12 +408,13 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
  *   `hack/lib/commit-build-counter.mjs` (skip the per-build `.build-counter`
  *   commit on a force-synced checkout, e.g. a remote E2E executor). Set in the
  *   ambient shell for `pnpm build`; the native orchestrator spawn inherits it.
- * - `KICI_TEST_ISOLATION`: the test-isolation marker set at config-eval time
- *   by every vitest config in this repository (`hack/lib/vitest-isolation.ts`,
- *   enforced by `hack/check-vitest-isolation.ts`). It makes the CLI's
- *   `getConfigDir` refuse the developer machine's ambient `~/.kici` config, and
- *   it is inherited by every service a test spawns — same leak-by-inheritance
- *   shape as the `KICI_E2E_` prefix below.
+ * - `KICI_CONFIG_DIR`: the isolated, empty config directory the vitest harness
+ *   sets at config-eval time (`hack/lib/vitest-isolation.ts`, enforced by
+ *   `hack/check-vitest-isolation.ts`) so the CLI's `getConfigDir` reads a
+ *   throwaway dir instead of the developer machine's ambient `~/.kici`. It is a
+ *   real CLI var (not a config typo) inherited by every service a test spawns —
+ *   which do not read it — same leak-by-inheritance shape as the `KICI_E2E_`
+ *   prefix below.
  *
  * Keep this list small and well-justified. Every addition is a typo we can
  * no longer catch, so only list things that are (a) actually set in the
@@ -423,7 +424,7 @@ export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
   'KICI_CACHE',
   'KICI_DEV',
   'KICI_BUILD_COUNTER_NO_COMMIT',
-  'KICI_TEST_ISOLATION',
+  'KICI_CONFIG_DIR',
 ];
 
 /**

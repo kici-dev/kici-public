@@ -113,6 +113,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'global_workflows.update': 180,
   'org_settings.dashboard_write_policy.update': 180,
   'trust_policy.updated': 180,
+  'trust_directory.updated': 180,
   'cluster_name.update': 180,
   'attestation.retry': 180,
 
@@ -457,6 +458,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'global_workflows.update': 730,
   'org_settings.dashboard_write_policy.update': 730,
   'trust_policy.updated': 730,
+  'trust_directory.updated': 730,
   'cluster_name.update': 730,
   'attestation.retry': 730,
 

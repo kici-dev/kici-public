@@ -31,7 +31,7 @@ Each field is either **trusted** or **untrusted**:
   ```
 
 The envelope self-describes, so the tag survives reshaping. A consumer that fences
-untrusted content simply refuses to render any `{ "untrusted": true }` value into an
+untrusted content refuses to render any `{ "untrusted": true }` value into an
 instruction channel, while still showing it as data.
 
 ## Endpoints

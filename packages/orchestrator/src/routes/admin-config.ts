@@ -16,6 +16,7 @@
  * All routes protected by Bearer token auth (reuses admin middleware pattern).
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { createLogger } from '@kici-dev/shared';
 import { AUTH_ERROR } from './admin-auth.js';
@@ -69,7 +70,10 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
 
   // ── Bearer token auth middleware ──────────────────────────────
   app.use('*', async (c, next) => {
-    if (!deps.adminToken) {
+    // Capture into a local so TS narrows it to `string` for constantTimeEqual;
+    // a bare `deps.adminToken` property access does not narrow across the guard.
+    const expectedToken = deps.adminToken;
+    if (!expectedToken) {
       return c.json({ error: 'Admin config API not configured (no admin token)' }, 503);
     }
     const authHeader = c.req.header('Authorization');
@@ -77,12 +81,16 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
       return c.json({ error: AUTH_ERROR.missing }, 401);
     }
     const token = authHeader.slice(7);
-    if (token !== deps.adminToken) {
-      // The static-token comparator performs no I/O and cannot throw, so this
-      // router does not use the DB-backed auth boundary in routes/admin-auth.ts
-      // and has no 503 outcome. Its 'Invalid token' body is deliberately
-      // distinct from the DB-backed routers' 'Invalid or expired token': the
-      // wording is how an operator tells which credential store rejected them.
+    if (!constantTimeEqual(token, expectedToken)) {
+      // The token is compared in constant time (constantTimeEqual: a byte-length
+      // guard plus timingSafeEqual), so this compare is not a prefix-timing
+      // oracle and cannot throw. This static-token check does no DB lookup, so —
+      // unlike the DB-backed boundary in routes/admin-auth.ts — its auth outcome
+      // has no lookup-failure 503; that scoping is about this auth path only, not
+      // a review verdict on the router's other outcomes. The 'Invalid token' body
+      // is deliberately distinct from the DB-backed routers' 'Invalid or expired
+      // token': the wording is how an operator tells which credential store
+      // rejected them.
       return c.json({ error: 'Invalid token' }, 401);
     }
     await next();
@@ -381,6 +389,24 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Compare a presented token against the configured admin token in constant
+ * time. timingSafeEqual throws when the two buffers differ in length, so the
+ * byte lengths are checked first and a mismatch is rejected without calling it.
+ * The length check itself leaks length; that is accepted, matching the raw-token
+ * comparison in providers/generic/verification.ts. Guard on Buffer byte length,
+ * not String length: a multi-byte string can share a character count with the
+ * expected token yet differ in bytes, which would make timingSafeEqual throw.
+ */
+function constantTimeEqual(provided: string, expected: string): boolean {
+  const providedBuffer = Buffer.from(provided, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(providedBuffer, expectedBuffer);
+}
 
 /**
  * Deep-delete a path from an object.

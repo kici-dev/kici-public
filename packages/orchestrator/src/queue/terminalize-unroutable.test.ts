@@ -42,6 +42,26 @@ describe('classifyUnroutable', () => {
     expect(r.errorMessage).toBe('image pull failed');
   });
 
+  it('settles an external provisioning failure on the provisioning cause, not the labels', () => {
+    // The shape the event scaler records once its stranded provision is reaped.
+    // The probe deliberately says "nothing routes": a `runsOn` naming only the
+    // scaler's own label matches no CONNECTED agent while the provision is
+    // failing, which is exactly the state that produced the misleading
+    // "No connected agent or scaler backend currently matches …" verdict — a
+    // backend did match, and was actively spawning.
+    const detail =
+      'External provisioning for scaler `github-actions` produced no agent: the scale-up ' +
+      'was delivered, but agent agent-77 never registered before the spawn timeout.';
+    const r = classifyUnroutable(
+      { ...base, runsOnLabels: ['github-actions'], lastProvisioningError: detail },
+      () => false,
+    );
+    expect(r.unroutable).toBe(false);
+    expect(r.status).toBe(ExecutionJobStatus.enum.timed_out_stale);
+    expect(r.errorMessage).toBe(detail);
+    expect(r.errorMessage).not.toContain('No connected agent or scaler backend');
+  });
+
   it('falls back to timed_out_stale when no probe is wired', () => {
     const r = classifyUnroutable(base, undefined);
     expect(r.unroutable).toBe(false);

@@ -53,8 +53,11 @@ kici logout
 This:
 
 1. Revokes the PAT on the server (preventing further use)
-2. Clears auth fields from the local config file
-3. Preserves non-auth settings (active org, default clusters, Platform endpoint)
+2. Detaches the local dev plane if it is attached, so a logged-out user is not left with a hybrid plane holding an orphaned orchestrator key
+3. Clears the auth fields from the local config file — the PAT, its id and expiry, your email, and the active organization
+4. Preserves the connection settings (per-org default clusters, Platform endpoint, orchestrator endpoint, OIDC issuer, routing key)
+
+Server revocation is best-effort: if the network call fails, the local config is still cleared.
 
 ## Organization management
 
@@ -215,11 +218,13 @@ Every `/api/v1/*` mutation that touches tenant-plane data is recorded in the ups
 
 The CLI stores authentication data in `~/.kici/config` with `0600` permissions (owner read/write only). The config file contains:
 
-- PAT token
-- PAT expiry date
+- PAT token, its server-side id, and its expiry date
+- The email address from your OIDC token
 - Active organization ID
 - Per-org default orchestrator clusters
-- Platform endpoint URL
+- Platform endpoint URL, orchestrator endpoint URL, and the OIDC issuer the PAT was minted against
+- Routing key for webhook source identification
+- API key, when you logged in with `--token`
 
 ## Troubleshooting
 
@@ -253,11 +258,11 @@ Two ways forward:
 
 A port below 1024 fails the same way, with a permissions message rather than an "in use" one: those ports need elevated privileges. Pick a port above 1024. A value that is not a port number at all — non-numeric, negative, or above 65535 — is rejected before the login starts, naming the value you set.
 
-### Device flow timeout
+### Device code expired
 
 This is the device flow's own expiry, not the browser flow's callback timeout above.
 
-The device flow has a 5-minute timeout. If it expires:
+The device code is issued by the identity provider, which also sets how long it lives. The CLI prints the lifetime with the code (`Code expires in N minutes`) and polls until you approve or the code expires. On expiry it stops with `Device code expired`. If that happens:
 
 - Run `kici login --device` again to get a new code
 - Ensure you're using the correct URL displayed by the CLI

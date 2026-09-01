@@ -283,7 +283,8 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
         // Reachable for a failure BEFORE the delivery is queued (source lookup,
         // verification, the durable write). A pipeline failure cannot land here
         // any more — by then the response is sent — so it surfaces as a `failed`
-        // event-log row plus an `orch:ingest-accept` error line instead.
+        // event-log row (written by `processWebhook`, under the delivery's
+        // resolved org) plus an `orch:ingest-accept` error line instead.
         logger.error('Generic webhook processing error', {
           orgId,
           sourceId,

@@ -3,7 +3,7 @@ title: 'Auto-scaler: common configuration'
 description: Shared scaler.yaml fields that apply across all auto-scaler backend types
 ---
 
-The fields on this page apply to every scaler backend. Backend-specific fields are documented on each backend's own page: [Container](./container.md), [Bare-metal](./bare-metal.md), [Firecracker](./firecracker.md).
+The fields on this page apply to every scaler backend. Backend-specific fields are documented on each backend's own page: [Container](./container.md), [Bare-metal](./bare-metal.md), [Firecracker](./firecracker.md), [Event](../event-scaler.md).
 
 ## Top-level schema
 
@@ -44,7 +44,7 @@ Each entry in the `scalers` array configures one backend:
 ```yaml
 scalers:
   - name: container-linux # Required. Unique human-readable name.
-    type: container # Required. Backend type: "container", "bare-metal", or "firecracker".
+    type: container # Required. Backend type: "container", "bare-metal", "firecracker", or "event".
     maxAgents: 20 # Required. Per-backend population cap: max concurrent agents.
     maxConcurrentSpawns: 8 # Optional. Provisioning-rate throttle. Default: 8.
     labelSets: # Required. At least one label-set mapping.
@@ -53,7 +53,7 @@ scalers:
     warmPool: # Optional. Warm pool configuration.
       enabled: false # Enable warm pool for this scaler. Default: false.
       size: 0 # Number of idle agents to maintain. Default: 0.
-      idleTimeoutSeconds: 300 # Seconds before idle agent is destroyed. Default: 300 (5 min).
+      idleTimeoutSeconds: 300 # Seconds before an idle agent ABOVE size is destroyed. Default: 300 (5 min).
     mandatoryLabels: # Optional. Labels a job MUST declare in runsOn to land on this scaler. Default: [].
       - gpu
     roles: # Optional. Agent roles this scaler handles. See "Agent roles" below.
@@ -64,7 +64,7 @@ scalers:
     machinePool: shared-host # Optional. Reference to a top-level machinePools entry. See "Resource caps & machine pools".
 ```
 
-Container-, bare-metal-, and Firecracker-only scaler fields are documented on their respective backend pages. The `type` field selects the backend: `container`, `bare-metal`, or `firecracker`.
+Backend-only scaler fields are documented on their respective backend pages. The `type` field selects the backend: `container`, `bare-metal`, `firecracker`, or [`event`](../event-scaler.md).
 
 ## Label sets
 
@@ -85,7 +85,7 @@ labelSets:
     backpressureMode: pause # Optional. Controls agent log streaming backpressure ('pause' or 'drop').
 ```
 
-The provisioning field that tells the backend _what_ to spawn is type-specific: `image` for [container](./container.md#container-specific-fields), `binaryPath` for [bare-metal](./bare-metal.md#bare-metal-specific-fields), `rootfsPath` for [Firecracker](./firecracker.md#firecracker-specific-fields). Each backend page documents its own label-set fields.
+The provisioning field that tells the backend _what_ to spawn is type-specific: `image` for [container](./container.md#container-specific-fields), `binaryPath` for [bare-metal](./bare-metal.md#bare-metal-specific-fields), `rootfsPath` for [Firecracker](./firecracker.md#firecracker-specific-fields). An [event](../event-scaler.md) label set needs none of them — the provisioning workflow chooses how to boot the instance. Each backend page documents its own label-set fields.
 
 ## Resource limits
 
@@ -190,7 +190,7 @@ Two mechanisms drive this, and both route through the same spawn path (so the `m
 - **Capacity-freed hook** — near-zero latency. The moment a slot opens, the oldest pending jobs are re-offered (oldest-first, so the longest-waiting job in a burst gets the freed slot first). A short debounce coalesces a burst of simultaneous releases into one re-dispatch pass.
 - **Leader-gated sweep** — a periodic backstop that re-runs the same re-offer on a timer, catching any edge case the hook could miss (a silently failed spawn, a reservation freed on a non-leader coordinator). The interval is `KICI_SCALER_PENDING_SWEEP_INTERVAL_MS` (default `10000`). The sweep runs only on the cluster leader, so multiple coordinators don't each drive the queue.
 
-A job re-offered while the scaler is still at capacity simply stays queued for the next release or sweep tick — there is no per-job retry state to tune. The `kici_orch_scaler_redispatch_total` counter (labeled `trigger="hook"` / `"sweep"`) reports how many jobs each mechanism has re-dispatched.
+A job re-offered while the scaler is still at capacity stays queued for the next release or sweep tick — there is no per-job retry state to tune. The `kici_orch_scaler_redispatch_total` counter (labeled `trigger="hook"` / `"sweep"`) reports how many jobs each mechanism has re-dispatched.
 
 ### Machine-pool ledger
 
@@ -218,14 +218,25 @@ Cross-orchestrator coordination is mandatory for staging+test setups that run tw
 
 ## Warm pool
 
-Warm pools maintain a configurable number of pre-spawned idle agents, reducing cold-start latency for on-demand jobs.
+A warm pool keeps a number of agents ready for a label set, so a job does not wait for an agent to start. Warm pools help most when starting an agent is slow — a cloud instance that must boot and install the agent. They help least when it is fast, such as a container from a cached image.
+
+:::caution[Warm pools need a recent agent]
+Warm pools need an agent new enough to understand the ready signal the orchestrator sends when it starts an agent for the pool. An older agent shuts itself down shortly after it starts, so the pool never reaches its target and reports fewer ready agents than you configured.
+:::
 
 ### How it works
 
-1. When a warm pool is enabled for a label set, the pool is configured with the target `size` but agents are not pre-spawned at startup. The pool fills on demand as agents are consumed and replenished.
-2. When a job arrives with matching labels, the scaler consumes an idle agent from the warm pool instead of spawning a new one.
-3. After consuming an agent, the warm pool triggers replenishment asynchronously (on the next microtask), spawning new agents to restore the pool to its configured `size`.
-4. Idle agents that exceed `idleTimeoutSeconds` are destroyed to free resources.
+1. Every 30 seconds the orchestrator compares the pool's target (`size`) against the agents that can already serve a job with those labels, plus the spawns it has started but not yet seen register. It starts the difference.
+2. When a job arrives, the orchestrator gives it a ready agent — the same way it gives a job any available agent. There is no separate pool to take from.
+3. The orchestrator keeps `size` agents ready for as long as the pool is enabled. `idleTimeoutSeconds` removes only agents above that number. An agent that makes up the pool is not destroyed while it is the pool.
+
+A pool with `size: 0` — the default — starts nothing, and releases any agent it still holds.
+
+### Requirements
+
+A warm pool needs declared resources — on the label set, or on the scaler defaults. The orchestrator starts a ready agent before any job exists, so it must know what size to make it. A label set with no declared resources gets no warm pool, and the orchestrator logs which scaler and label set it skipped.
+
+A ready agent has the size the pool declares and runs the pool's agent image. Both are set when the agent starts and cannot change afterwards. So a job that asks for different resources, or brings its own container image, gets its own new agent instead of a ready one. The ready agent stays ready for the next job that fits it.
 
 ### Configuration
 
@@ -236,23 +247,48 @@ scalers:
     maxAgents: 20
     warmPool:
       enabled: true
-      size: 5 # Keep 5 idle agents ready
-      idleTimeoutSeconds: 300 # Destroy idle agents after 5 minutes
+      size: 5 # agents kept ready
+      idleTimeoutSeconds: 300 # destroy an agent above that number after 5 minutes
     labelSets:
       - labels: ['linux', 'container']
         image: 'ghcr.io/myorg/kici-agent:latest'
+        resources: # required for a warm pool — the size of each ready agent
+          cpus: 2
+          memory: '4g'
 ```
 
 ### Capacity interaction
 
-Warm pool agents count toward both the per-scaler `maxAgents` and the `globalMaxAgents` cap. Ensure warm pool sizes leave room for on-demand spawns:
+Ready agents count toward the scaler's `maxAgents` and the orchestrator's `globalMaxAgents`, so leave room for on-demand spawns:
 
 ```
 maxAgents = 20, warmPool.size = 5
 => 15 slots available for on-demand spawns
 ```
 
-If the global cap is reached due to warm pool agents, on-demand jobs are queued and re-dispatched as soon as capacity frees (see [At-capacity queueing and re-dispatch](#at-capacity-queueing-and-re-dispatch)).
+A ready agent also reserves its declared resources, so it counts toward `resourceCap`, `globalResourceCap`, and the machine pool the scaler references — the same way an on-demand agent does.
+
+If a cap is reached, the pool stops filling and jobs queue as usual (see [At-capacity queueing and re-dispatch](#at-capacity-queueing-and-re-dispatch)).
+
+A ready agent holds its slot until a job takes it. Some jobs cannot use a ready agent: a job that asks for different resources, or one that brings its own container image. Such a job needs a slot of its own. If you set `size` to the same value as a cap, there is no slot left, and the job queues until it expires. The orchestrator does not destroy a ready agent to make room. So leave room below every cap for these jobs, the same way you leave room for on-demand spawns.
+
+`size` counts agents **per orchestrator**, the same way `maxAgents` does. Each orchestrator keeps its own `size` agents ready, so a fleet of three orchestrators with `size: 5` keeps 15 agents ready in total. Set `size` against what one orchestrator should hold, not the fleet.
+
+A warm pool holds `size` agents for as long as it is enabled. On a cloud backend those agents cost money continuously, whether or not a job uses them. Set `size: 0` to release them.
+
+A ready agent has no lifetime of its own. It waits until the orchestrator gives it a job or destroys it. So any hard lifetime cap you set outside the orchestrator applies to it too — a max-lifetime self-poweroff in the instance's cloud-init, or a reaper that deletes instances older than a TTL. Set those caps above the lifetime you want a ready agent to have. Below it, the pool loses agents it still counts as ready and starts replacements.
+
+### Monitoring
+
+| Metric                                    | Meaning                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------- |
+| `kici_orch_scaler_warm_pool_target`       | Configured `size`                                                |
+| `kici_orch_scaler_warm_pool_ready`        | Agents ready now                                                 |
+| `kici_orch_scaler_warm_pool_in_flight`    | Spawns started, not yet registered                               |
+| `kici_orch_scaler_warm_pool_spawns_total` | Spawns started                                                   |
+| `kici_orch_scaler_warm_pool_reaped_total` | Agents destroyed as surplus — an idle timeout, or a lower `size` |
+
+A pool that stays below its target has a fill problem — usually an exhausted cap or a failing provisioning workflow.
 
 ## Agent roles
 
@@ -316,7 +352,7 @@ A workflow with `runsOn: ['linux']` cannot land on `gpu-pool` — the gate requi
 
 **Validation invariants:**
 
-- Every label in `mandatoryLabels` MUST appear (case-insensitive) in the `labels` array of every entry in `labelSets`. Otherwise jobs could route through a labelSet missing the gate label and bypass the gate. Config validation rejects this at load time.
+- Every label in `mandatoryLabels` MUST be requestable (case-insensitive) on every entry in `labelSets` — either declared in that entry's `labels` array, or supplied by the scaler's structured `platform` taint, which the orchestrator injects into every label set as a matchable label. A gate label a job cannot request on a label set makes that label set unroutable. Config validation rejects this at load time.
 - Labels with the `kici:` prefix are reserved for auto-injected system labels (`kici:role:*`, `kici:os:*`, `kici:arch:*`, `kici:agent:*`, `kici:scaler:*`) and cannot be used in `mandatoryLabels` — same rule as `labelSets[].labels`.
 - The default is `[]` (no gate).
 
@@ -334,13 +370,17 @@ A workflow with `runsOn: ['linux']` cannot land on `gpu-pool` — the gate requi
 
 When `platform` is set, BOTH the auto-injected `kici:os:*` / `kici:arch:*` labels AND the mandatory taint derive from this one field. A non-default `os` (`macos`, `windows`) or `arch` (`arm64`) taints the pool, and the plain taint token (`macos` / `windows` / `arm64`) is injected as a matchable label — so a job whose `runsOn` requests that platform is routed to the pool without you also declaring the platform in `labels`, even when the pool's plain labels use a non-canonical name (`windows-builders`, `osx`) that the label-based detection below would miss. When `platform` is omitted, a bare-metal pool derives its platform from the host OS/arch, and container / firecracker pools default to Linux.
 
+The orchestrator also gives the taint token to each agent it starts for the pool. So the agent carries the label the job asks for, and a warm pool on such a scaler counts its own agents as ready.
+
 Declaring the structured field is preferred; the orchestrator logs a warning when a plain platform label is used without it.
 
-**Automatic platform taint (fallback):** a bare-metal (or any) scaler pool whose declared `labels` include a non-default OS or architecture — `windows`, `win32`, `macos`, `darwin`, `arm64`, `aarch64`, or `arm` — is **also** automatically treated as if that platform label were in its `mandatoryLabels`, with no extra configuration. This label-based detection is the fallback for pools that have not yet declared the structured `platform` field. Only jobs whose `runsOn` requests that platform are routed to such a pool, locally or via cross-peer reroute. Linux and x64/amd64 are the defaults and carry no taint, so an unqualified `runsOn: 'bare-metal'` (Linux-x64) job still routes to a Linux-x64 pool and is never dispatched to a Windows, macOS, or ARM pool it cannot run. The derived taint stacks with any explicit `mandatoryLabels` you configure.
+**Automatic platform taint (fallback):** a label set whose declared `labels` include a non-default OS or architecture — `windows`, `win32`, `macos`, `darwin`, `arm64`, `aarch64`, or `arm` — is **also** automatically gated on that platform label, with no extra configuration. This label-based detection is the fallback for pools that have not yet declared the structured `platform` field. Only jobs whose `runsOn` requests that platform are routed to such a label set, locally or via cross-peer reroute. Linux and x64/amd64 are the defaults and carry no taint. So an unqualified `runsOn: 'bare-metal'` (Linux-x64) job still routes to a Linux-x64 pool, and is never dispatched to a Windows, macOS, or ARM pool it cannot run. The derived taint stacks with any explicit `mandatoryLabels` you configure.
+
+The derived taint is scoped to **the label set that declares it**. A scaler can therefore mix platforms across its label sets: a pool declaring `[linux, gpu]` alongside `[macos, xcode]` gates only the second set on `macos`, and a `runsOn: ['linux', 'gpu']` job still routes to the first. Your configured `mandatoryLabels` apply to the whole scaler entry and stack on top of each label set's own derived taint.
 
 For example, a Windows pool declared with `labels: [windows, bare-metal]` only accepts a job whose `runsOn` includes `windows` (e.g. `runsOn: ['windows', 'bare-metal']`); a plain `runsOn: 'bare-metal'` job is rejected there and lands on a Linux pool instead.
 
-**Cross-peer routing:** `mandatoryLabels` (including the automatic platform taint above) is advertised over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same gate. A coordinator will not reroute a job to a peer whose only matching scaler is gated by a label the job does not declare.
+**Cross-peer routing:** the gate (including the automatic platform taint above) is advertised per label set over the peer heartbeat protocol, so cluster-mode reroute decisions apply the same rule. A coordinator will not reroute a job to a peer unless one label set both supplies every label the job requires and has its own gate satisfied by them.
 
 `mandatoryLabels` and `excludeLabels` are two orthogonal mechanisms that control which scaler a job lands on. Both filter at the scaler-matcher level; the dispatcher applies them together.
 

@@ -627,7 +627,7 @@ function buildRoundJobInput(args: {
  * verdict we cannot act on, and half-dispatching its jobs would be worse than
  * reporting that we could not decide.
  */
-function narrowVerdict(raw: unknown, workflowName: string): GlobalEvalCandidateResult {
+export function narrowVerdict(raw: unknown, workflowName: string): GlobalEvalCandidateResult {
   const v = (raw ?? {}) as Partial<GlobalEvalCandidateResult> & { jobs?: unknown };
   const base: GlobalEvalCandidateResult = {
     workflowName,
@@ -921,6 +921,7 @@ async function runOneRound(
         workflowRepoIdentifier: reg.repoIdentifier,
         workflowSha: reg.commitSha ?? '',
         workflowRoutingKey: reg.routingKey,
+        sourceRepoIdentifier: args.repoIdentifier,
         sourceSha: ref,
         candidates: input.jobConfig.candidates,
         event: input.jobConfig.event,

@@ -16,8 +16,9 @@
  * driven end-to-end through `processWebhook`.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { processWebhook } from './process-webhook.js';
+import { dispatchGlobalWorkflowsForOtherRepos, processWebhook } from './process-webhook.js';
 import { ROUND_JOB_PREFIX } from './global-eval-round.js';
+import { webhookPayloadPath } from './webhook-payload-store.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import { TraceCheck } from '@kici-dev/engine';
 import type { GlobalEvalRoundResult, LockJob } from '@kici-dev/engine';
@@ -78,11 +79,13 @@ function makeGlobalRegistration(over: {
   /** The registration's own routing key. Differs from the inbound one when the
    * workflow repo lives behind another provider. */
   routingKey?: string;
+  /** The repository that defines the workflow. */
+  repoIdentifier?: string;
 }) {
   return {
     id: over.id ?? 'reg-global-1',
     routingKey: over.routingKey ?? 'github:1',
-    repoIdentifier: GLOBAL_REPO,
+    repoIdentifier: over.repoIdentifier ?? GLOBAL_REPO,
     commitSha: 'globalsha',
     sourceFile: '.kici/workflows/org.ts',
     lockEntry: {
@@ -161,10 +164,14 @@ function captureLogLines() {
 
 interface Harness {
   deps: Parameters<typeof processWebhook>[1];
+  /** The inbound event's provider bundle — the one the scoped pass posts through. */
+  bundle: Record<string, any>;
   dispatch: ReturnType<typeof vi.fn>;
   track: ReturnType<typeof vi.fn>;
   /** The errored-run writer for a round that produced no verdicts. */
   recordRoundFailure: ReturnType<typeof vi.fn>;
+  /** Object-storage writes — how a failed round's webhook payload is persisted. */
+  append: ReturnType<typeof vi.fn>;
   /** The `execution_runs` writer for a dispatched candidate. */
   onExecutionStarted: ReturnType<typeof vi.fn>;
   /** The post-dispatch job registration. */
@@ -189,6 +196,8 @@ interface Harness {
   dispatched: () => Array<Record<string, any>>;
   /** Dispatched jobs excluding the eval-round job itself. */
   workJobs: () => Array<Record<string, any>>;
+  /** The decision summaries carried by the started `execution.event`. */
+  forwardedDecisions: () => Array<Record<string, any>>;
 }
 
 /**
@@ -226,8 +235,15 @@ function makeDeps(over: {
   bundleByRoutingKey?: Record<string, unknown>;
   /** The repo the event came from. Defaults to `acme/app`. */
   sourceRepo?: string;
+  /**
+   * The normalized event's two branches. They are equal by default, which is
+   * the push case; a caller sets them apart to tell which of the two a code
+   * path actually reads.
+   */
+  branches?: { targetBranch: string; sourceBranch: string };
 }): Harness {
   const sourceRepo = over.sourceRepo ?? SOURCE_REPO;
+  const branches = over.branches ?? { targetBranch: 'main', sourceBranch: 'main' };
   const callOrder: string[] = [];
   const dispatch = vi.fn(async (input: Record<string, any>) => {
     callOrder.push(`dispatch:${input.jobName}`);
@@ -244,6 +260,7 @@ function makeDeps(over: {
     return over.roundResult ?? { candidates: [] };
   });
   const recordRoundFailure = vi.fn(async () => undefined);
+  const append = vi.fn(async () => undefined);
   const onExecutionStarted = vi.fn(async () => {
     callOrder.push('run-start');
   });
@@ -271,8 +288,8 @@ function makeDeps(over: {
       normalizeEvent: () => ({
         type: 'push',
         payload: {},
-        targetBranch: 'main',
-        sourceBranch: 'main',
+        targetBranch: branches.targetBranch,
+        sourceBranch: branches.sourceBranch,
         senderUsername: 'octocat',
         provider: 'github',
       }),
@@ -291,8 +308,11 @@ function makeDeps(over: {
     repoUrlBuilder: { buildCloneUrl: (repo: string) => `https://example.invalid/${repo}.git` },
   };
 
+  const platformSend = vi.fn();
   const deps = {
     dedup: { claim: vi.fn(async () => true), exists: vi.fn(), mark: vi.fn(), cleanup: vi.fn() },
+    logStorage: { append },
+    platformClient: { send: platformSend },
     providerRegistry: {
       getByRoutingKey: (key: string) => over.bundleByRoutingKey?.[key] ?? bundle,
       getAll: () => [],
@@ -352,9 +372,11 @@ function makeDeps(over: {
   const dispatched = () => dispatch.mock.calls.map((c) => c[0] as Record<string, any>);
   return {
     deps,
+    bundle,
     dispatch,
     track,
     recordRoundFailure,
+    append,
     onExecutionStarted,
     addJobsToRun,
     onJobStatus,
@@ -365,6 +387,13 @@ function makeDeps(over: {
     callOrder,
     dispatched,
     workJobs: () => dispatched().filter((d) => !String(d.jobName).startsWith(ROUND_JOB_PREFIX)),
+    /** The decision summaries carried by the started `execution.event`. */
+    forwardedDecisions: (): Array<Record<string, any>> => {
+      const started = platformSend.mock.calls
+        .map((call) => call[0] as Record<string, any>)
+        .find((msg) => msg.type === 'execution.event' && msg.event === 'started');
+      return (started?.data?.decisions ?? []) as Array<Record<string, any>>;
+    },
   };
 }
 
@@ -649,6 +678,37 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
   });
 
+  it('records the build failure in the trace rather than omitting the workflow', async () => {
+    // A workflow that matched, failed to materialize, and then went missing
+    // from the delivery's trace reproduces exactly the indistinguishability the
+    // trace exists to remove: its author cannot tell it apart from one that was
+    // never registered.
+    const broken = { _type: 'static', name: 'broken', runsOn: ['default'] } as unknown as LockJob;
+    const h = makeDeps({
+      registrations: [
+        makeGlobalRegistration({ id: 'reg-a', name: 'org-dyn', jobs: [dynamicEntry()] }),
+        makeGlobalRegistration({ id: 'reg-b', name: 'org-static', jobs: [staticJob('scan')] }),
+      ],
+      roundResult: {
+        candidates: [{ workflowName: 'org-dyn', run: true, jobs: [broken] }],
+      } as GlobalEvalRoundResult,
+    });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    const decisions = h.forwardedDecisions();
+    // Positive control: the sibling that DID dispatch is in the trace, so the
+    // entry asserted below is being read out of a populated array.
+    expect(decisions.map((d) => d.workflowName)).toContain('org-static');
+
+    const failed = decisions.find((d) => d.workflowName === 'org-dyn');
+    expect(failed).toBeDefined();
+    expect(failed?.matched).toBe(false);
+    expect(failed?.checks).toEqual(
+      expect.arrayContaining([expect.objectContaining({ check: 'dispatch', passed: false })]),
+    );
+  });
+
   it('propagates a dispatcher failure on a round-cleared workflow', async () => {
     // The catch is bounded to the BUILD. A dispatcher throw — a wedged queue, a
     // database error — is an infrastructure fault, and swallowing it here would
@@ -760,6 +820,36 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
     // And nothing ran: a round that produced no verdict clears no workflow.
     expect(h.workJobs()).toEqual([]);
+  });
+
+  it("stores the failed round's webhook payload under the round run id", async () => {
+    // Re-running the errored round re-evaluates the original event, so the
+    // payload the round was deciding on has to survive with its run row.
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundFails: true,
+      withExecutionTracker: true,
+    });
+    const info = makeInfo();
+
+    await processWebhook(info, h.deps);
+
+    const runId = h.recordRoundFailure.mock.calls[0][0].runId as string;
+    expect(h.append).toHaveBeenCalledWith(webhookPayloadPath(runId), JSON.stringify(info.payload));
+  });
+
+  it('completes the delivery when the payload write for a failed round throws', async () => {
+    // Best-effort like the row and the check: the round already failed, and
+    // losing the delivery on top of that would take the event-log row with it.
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundFails: true,
+      withExecutionTracker: true,
+    });
+    h.append.mockRejectedValue(new Error('storage down'));
+
+    await expect(processWebhook(makeInfo(), h.deps)).resolves.toBeDefined();
+    expect(h.append).toHaveBeenCalled();
   });
 
   it('records the errored run and the check for a round that reported success but decided nothing', async () => {
@@ -911,6 +1001,31 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
       // wave scheduler's grouping key and must be present either way.
       [{ jobId: 'job-scan', jobName: 'scan', baseJobName: 'scan', runsOnLabels: ['default'] }],
     ]);
+  });
+
+  it('records the presented branch on the run row, never the job checkout ref', async () => {
+    // `execution_runs.ref` is the branch the run PRESENTS, which is what every
+    // other `onExecutionStarted` caller writes and what the context branch gate
+    // evaluates. The dispatched jobs carry a different value — the checkout ref,
+    // which for a pull request is the head branch a fork contributor names
+    // freely — and this row is read back as a branch claim by the internal-event
+    // branch inheritance, so the two must not be confused.
+    //
+    // The two branches differ here, so the assertion can only hold if the
+    // presented branch is what reaches the row.
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
+      withExecutionTracker: true,
+      branches: { targetBranch: 'main', sourceBranch: 'attacker-names-this' },
+    });
+
+    await processWebhook(makeInfo(), h.deps);
+
+    // Control: the job really was dispatched, and it really does carry the
+    // other branch — so this is about which of two live values the row takes.
+    expect(h.workJobs().map((d) => d.ref)).toEqual(['attacker-names-this']);
+    expect(h.onExecutionStarted).toHaveBeenCalledTimes(1);
+    expect(h.onExecutionStarted.mock.calls[0][ARG.ref]).toBe('main');
   });
 
   it('records the run for a candidate the eval round cleared', async () => {
@@ -1412,5 +1527,237 @@ describe('a global run is held open across its dispatch window', () => {
 
     await expect(processWebhook(makeInfo(), h.deps)).rejects.toThrow(/dispatch exploded/);
     expect(h.releasePendingJobsHold).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The organization-wide pass can be scoped to one workflow repository.
+ *
+ * The re-run of a failed evaluation round re-drives this pass for exactly the
+ * repository whose round failed. Every other repository's globals already
+ * reached their verdict on the original delivery, so re-evaluating them would
+ * dispatch a second run for work that already ran.
+ */
+describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
+  const OTHER_GLOBAL_REPO = 'acme/other-workflows';
+
+  function passArgs(h: Harness, onlyWorkflowRepo?: string) {
+    return {
+      info: makeInfo(),
+      deps: h.deps,
+      eventWithFiles: {
+        type: 'push',
+        payload: {},
+        targetBranch: 'main',
+        sourceBranch: 'main',
+        senderUsername: 'octocat',
+        provider: 'github',
+        sourceRepo: SOURCE_REPO,
+      },
+      resolvedOrgId: 'org-1',
+      repoIdentifier: SOURCE_REPO,
+      ref: 'headsha',
+      dispatchBundle: h.bundle,
+      dispatchCredentials: { token: 'src-token' },
+      bundle: h.bundle,
+      credentials: { token: 'src-token' },
+      securityDecision: { action: 'pass' },
+      ...(onlyWorkflowRepo === undefined ? {} : { onlyWorkflowRepo }),
+    } as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0];
+  }
+
+  function twoRepoHarness() {
+    return makeDeps({
+      registrations: [
+        makeGlobalRegistration({ jobs: [staticJob('scoped')], name: 'org-ci', id: 'reg-1' }),
+        makeGlobalRegistration({
+          jobs: [staticJob('other')],
+          name: 'other-ci',
+          id: 'reg-2',
+          repoIdentifier: OTHER_GLOBAL_REPO,
+        }),
+      ],
+    });
+  }
+
+  it('evaluates every workflow repo when no scope is set', async () => {
+    // The non-vacuity control: both registrations really do reach dispatch, so
+    // the single job below is about the scope and not about a harness that only
+    // ever dispatches one.
+    const h = twoRepoHarness();
+
+    await dispatchGlobalWorkflowsForOtherRepos(passArgs(h));
+
+    expect(
+      h
+        .workJobs()
+        .map((d) => d.jobName)
+        .sort(),
+    ).toEqual(['other', 'scoped']);
+  });
+
+  it('drops registrations authored outside the scoped workflow repo', async () => {
+    const h = twoRepoHarness();
+
+    await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+    expect(h.workJobs().map((d) => d.jobName)).toEqual(['scoped']);
+  });
+
+  it("records the dispatch source the round's stored credentials belong to", async () => {
+    // A cross-provider global resolves its lock file through ANOTHER source's
+    // bundle, so `provider_context` and `routing_key` name different sources. The
+    // re-run rebuilds the dispatch pair from this column; without it, it pairs
+    // one source's credentials with the other source's API client.
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundFails: true,
+      withExecutionTracker: true,
+    });
+    const args = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+    args.dispatchRoutingKey = 'github:99';
+
+    await dispatchGlobalWorkflowsForOtherRepos(
+      args as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+    );
+
+    expect(h.recordRoundFailure).toHaveBeenCalledTimes(1);
+    expect(h.recordRoundFailure.mock.calls[0][0].dispatchRoutingKey).toBe('github:99');
+  });
+
+  it('records no dispatch source when the round dispatched through the inbound one', async () => {
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundFails: true,
+      withExecutionTracker: true,
+    });
+
+    await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+    expect(h.recordRoundFailure).toHaveBeenCalledTimes(1);
+    expect(h.recordRoundFailure.mock.calls[0][0].dispatchRoutingKey).toBeUndefined();
+  });
+
+  it('reports the workflow repo of a round it could not decide', async () => {
+    // What a re-run reads to tell a clean re-evaluation from one that failed
+    // again, without reading the run rows back.
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundFails: true,
+      withExecutionTracker: true,
+    });
+
+    const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+    expect(outcome.roundFailureWorkflowRepos).toEqual([GLOBAL_REPO]);
+  });
+
+  it('reports no round failure when the scoped round decides cleanly', async () => {
+    const h = makeDeps({
+      registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+      roundResult: {
+        candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [staticJob('gen-a')] }],
+      } as GlobalEvalRoundResult,
+      withExecutionTracker: true,
+    });
+
+    const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+    expect(outcome.roundFailureWorkflowRepos).toEqual([]);
+    expect(outcome.decidedWorkflowRepos).toEqual([GLOBAL_REPO]);
+    expect(h.workJobs().map((d) => d.jobName)).toEqual(['gen-a']);
+  });
+
+  /**
+   * The positive signal a re-run gates its success check on.
+   *
+   * "No round failure" is not the same claim: several paths evaluate nothing at
+   * all and report no failure either, so reading their silence as a clean
+   * verdict posts success for work that never ran.
+   */
+  describe('decidedWorkflowRepos', () => {
+    it('names a repository whose candidates dispatched straight from the lock file', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
+      });
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+      expect(outcome.decidedWorkflowRepos).toEqual([GLOBAL_REPO]);
+      expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
+    });
+
+    it('names a repository the pass considered and excluded on a real verdict', async () => {
+      // A `run: false` verdict IS a verdict: the round decided the workflow does
+      // not apply. The repository was evaluated, so it counts as decided even
+      // though nothing dispatched.
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+        roundResult: {
+          candidates: [{ workflowName: GLOBAL_WORKFLOW, run: false }],
+        } as GlobalEvalRoundResult,
+      });
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+      expect(outcome.decidedWorkflowRepos).toEqual([GLOBAL_REPO]);
+      expect(h.workJobs()).toEqual([]);
+    });
+
+    it('names no repository when no pending-eval tracker is wired', async () => {
+      // The fail-closed branch suppresses every candidate and deliberately
+      // surfaces no round failure, so the absence of one says nothing here.
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')], hasFilter: true })],
+        withoutTracker: true,
+      });
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+      expect(outcome.roundFailureWorkflowRepos).toEqual([]);
+      expect(outcome.decidedWorkflowRepos).toEqual([]);
+      expect(h.workJobs()).toEqual([]);
+    });
+
+    it('names no repository when the round could not be decided', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
+        roundFails: true,
+        withExecutionTracker: true,
+      });
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(passArgs(h, GLOBAL_REPO));
+
+      expect(outcome.decidedWorkflowRepos).toEqual([]);
+    });
+
+    it('names no repository when the orchestrator carries no registration index', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
+      });
+      const args = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+      args.deps = { ...(args.deps as Record<string, unknown>), registrationIndex: undefined };
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(
+        args as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+      );
+
+      expect(outcome.roundFailureWorkflowRepos).toEqual([]);
+      expect(outcome.decidedWorkflowRepos).toEqual([]);
+    });
+
+    it('names no repository when the trust policy did not admit the event', async () => {
+      const h = makeDeps({
+        registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
+      });
+      const args = passArgs(h, GLOBAL_REPO) as unknown as Record<string, unknown>;
+      args.securityDecision = { action: 'hold', reason: 'untrusted contributor' };
+
+      const outcome = await dispatchGlobalWorkflowsForOtherRepos(
+        args as unknown as Parameters<typeof dispatchGlobalWorkflowsForOtherRepos>[0],
+      );
+
+      expect(outcome.decidedWorkflowRepos).toEqual([]);
+    });
   });
 });

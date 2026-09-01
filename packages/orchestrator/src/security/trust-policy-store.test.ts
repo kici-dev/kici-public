@@ -124,6 +124,74 @@ describeDb('TrustPolicyStore', () => {
     });
   });
 
+  it('derives the coarse hours column from a seconds-only push', async () => {
+    // The hours column is what an older build reads. Writing the seconds window
+    // without recomputing it would leave that build enforcing a stale number.
+    await store.upsertFromPlatform('org-1', { ...POLICY, approvalExpirySeconds: 30 });
+    const row = await db
+      .selectFrom('org_trust_policy')
+      .selectAll()
+      .where('customer_id', '=', 'org-1')
+      .executeTakeFirstOrThrow();
+    expect(row.approval_expiry_seconds).toBe(30);
+    // Rounded UP, never to zero: a zero-hour window would mint an
+    // already-expired hold on the build that reads it.
+    expect(Number(row.approval_expiry_hours)).toBe(1);
+    expect((await store.get('org-1'))!.approvalExpirySeconds).toBe(30);
+  });
+
+  it('prefers the seconds field over the hours field on the same push', async () => {
+    await store.upsertFromPlatform('org-1', {
+      ...POLICY,
+      approvalExpiryHours: 48,
+      approvalExpirySeconds: 90,
+    });
+    expect((await store.get('org-1'))!.approvalExpirySeconds).toBe(90);
+  });
+
+  it('resolves a row whose seconds column is NULL from its hours column', async () => {
+    // Exactly what migration 127 leaves behind for every pre-existing row, and
+    // what an older build writing this table produces. Falling back to the
+    // documented default here would silently replace the operator's 5 hours
+    // with 72.
+    await sql`
+      INSERT INTO org_trust_policy
+        (customer_id, fork_policy, unknown_contributor_policy,
+         workflow_change_policy, approval_expiry_hours, source)
+      VALUES ('org-legacy', 'hold', 'hold', 'hold', 5, 'platform')
+    `.execute(db);
+    const stored = await store.get('org-legacy');
+    expect(stored!.approvalExpirySeconds).toBe(5 * 3600);
+    expect(stored!.approvalExpiryHours).toBe(5);
+  });
+
+  it('rewrites the hours column when a local patch names only seconds', async () => {
+    // A field-by-field merge would keep the old 48 beside the new window; the
+    // two columns would then disagree about the same setting.
+    await store.upsertFromPlatform('org-1', POLICY);
+    const merged = await store.upsertLocal('org-1', { approvalExpirySeconds: 30 });
+    expect(merged.approvalExpirySeconds).toBe(30);
+    expect(merged.approvalExpiryHours).toBe(1);
+    expect((await store.get('org-1'))!.approvalExpirySeconds).toBe(30);
+  });
+
+  it('rewrites the seconds column when a local patch names only hours', async () => {
+    // The inverse, and the one that actually loses an operator's write: a stale
+    // 30-second value left in place would out-rank the explicit 6 hours on the
+    // very next read.
+    await store.upsertLocal('org-1', { approvalExpirySeconds: 30 });
+    const merged = await store.upsertLocal('org-1', { approvalExpiryHours: 6 });
+    expect(merged.approvalExpirySeconds).toBe(6 * 3600);
+    expect((await store.get('org-1'))!.approvalExpirySeconds).toBe(6 * 3600);
+  });
+
+  it('leaves the stored window untouched by a patch that names neither field', async () => {
+    await store.upsertLocal('org-1', { approvalExpirySeconds: 30 });
+    const merged = await store.upsertLocal('org-1', { forkPolicy: 'allow' });
+    expect(merged.approvalExpirySeconds).toBe(30);
+    expect(merged.forkPolicy).toBe('allow');
+  });
+
   it('keeps orgs isolated from one another', async () => {
     await store.upsertFromPlatform('org-1', POLICY);
     await store.upsertFromPlatform('org-2', { ...POLICY, forkPolicy: 'reject' });

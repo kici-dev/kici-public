@@ -550,8 +550,43 @@ export interface LockJob {
   readonly checkout?: boolean;
   /** Declarative cache specs (normalized to an array). Restored before steps / saved after the job. */
   readonly cache?: readonly import('@kici-dev/sdk').CacheSpec[];
-  /** Docker image for job execution. All steps run inside the container. */
-  readonly container?: string | { image: string; env?: Record<string, string> };
+  /**
+   * Container for job execution. All steps run inside it.
+   *
+   * A bare image string, or an object naming exactly one image source: a
+   * finalized `image`, or a `dockerfile` the agent builds from the cloned tree
+   * before the job starts.
+   *
+   * Kept in step with `LockJob.container` in `@kici-dev/engine` and
+   * `ContainerConfig` in `@kici-dev/sdk` — three mirrors of one shape, and a
+   * field added to one has to be added to all three or the generator stops
+   * typechecking.
+   */
+  readonly container?:
+    | string
+    | {
+        /** Finalized image to pull. Exactly one of `image` / `dockerfile` is set. */
+        image?: string;
+        /** Repo-relative Dockerfile the agent builds before the job runs. */
+        dockerfile?: string;
+        /** Repo-relative build context. Defaults to the repository root. */
+        context?: string;
+        /** Build stage to stop at. */
+        target?: string;
+        /** Build arguments. Plain strings — never secret references. */
+        args?: Record<string, string>;
+        env?: Record<string, string>;
+        /** Private-registry credentials for pulling the image (flattened Sourced pairs). */
+        auth?: {
+          username?: string;
+          usernameSecret?: string;
+          usernameValue?: string;
+          tokenSecret?: string;
+          tokenValue?: string;
+          /** Registry host. Required when `dockerfile` is set. */
+          registry?: string;
+        };
+      };
   /**
    * Bound contexts in merge order. Each entry is a static name or inline
    * expression (pure function); `dynamic` is set when it is a function resolved at

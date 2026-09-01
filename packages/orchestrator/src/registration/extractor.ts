@@ -39,9 +39,9 @@ export function extractGlobalWorkflows(lockFile: LockFile): LockWorkflow[] {
  * Extract workflows that have at least one registerable trigger, OR that
  * have repo patterns (global workflows).
  *
- * Since phase 28.5, Git-provider triggers (push, pr, tag, …) are ALSO
- * registerable so cross-source dispatch can resolve them via the registration
- * index when a generic webhook targets an externally-hosted repo. The
+ * Git-provider triggers (push, pr, tag, …) are ALSO registerable, so
+ * cross-source dispatch can resolve them via the registration index when a
+ * generic webhook targets an externally-hosted repo. The
  * per-event lock file pipeline remains the primary matching path for
  * same-source git events; registration is an additive index.
  *

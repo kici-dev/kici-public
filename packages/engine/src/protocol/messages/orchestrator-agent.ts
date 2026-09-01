@@ -34,11 +34,23 @@ export type CacheRefScope = z.infer<typeof CacheRefScope>;
  * - `groups` maps a dynamic group name to its ordered member job names.
  * - `statuses` maps an upstream job name to its terminal status, so the
  *   generator's `ctx.needs.<job>.status` reflects the frozen upstream outcome.
+ * - `invokeResults` maps an invoke-gate job name to its ordered per-run results,
+ *   so the generator's `ctx.needs.<gate>.result` reflects each summoned run.
  */
+export const invokeResultSchema = z.object({
+  repo: z.string(),
+  workflow: z.string(),
+  runId: z.string(),
+  status: z.string(),
+  outputs: z.record(z.string(), z.unknown()),
+});
+export type InvokeResult = z.infer<typeof invokeResultSchema>;
+
 export const upstreamSnapshotSchema = z.object({
   jobs: z.record(z.string(), z.record(z.string(), z.unknown())),
   groups: z.record(z.string(), z.array(z.string())),
   statuses: z.record(z.string(), ExecutionJobStatus).optional(),
+  invokeResults: z.record(z.string(), z.array(invokeResultSchema)).optional(),
 });
 export type UpstreamSnapshot = z.infer<typeof upstreamSnapshotSchema>;
 
@@ -132,6 +144,15 @@ export const jobDispatchSchema = z
     /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). Powers `ctx.needs.<job>.status`. */
     upstreamJobStatuses: z.record(z.string(), ExecutionJobStatus).optional(),
     /**
+     * Per-invoke-gate results for any upstream gate this job `needs`, keyed by
+     * gate job name. One {@link invokeResultSchema} entry per run the gate
+     * triggered, carrying the invoked run's non-secret declared outputs. Powers
+     * a standard downstream job's `ctx.needs['<gate>'].result`. Additive and
+     * optional — older orchestrators omit it and the agent resolves the gate
+     * need through the fan-out group shape instead.
+     */
+    upstreamInvokeResults: z.record(z.string(), z.array(invokeResultSchema)).optional(),
+    /**
      * Structured clone auth for the source repo. Preferred over `token` (which
      * remains as a backward-compat field for same-provider GitHub App flows
      * during the transition to universal-git / cross-provider global workflows).
@@ -169,6 +190,22 @@ export const jobDispatchSchema = z
           token: z.string().min(1),
         }),
       )
+      .optional(),
+    /**
+     * Registry credentials for pulling this job's container image, already
+     * resolved by the orchestrator (the lock carries secret NAMES; the agent
+     * never resolves them itself).
+     *
+     * Optional for backward compatibility with older orchestrators, which do
+     * not send it — an agent that receives no auth pulls anonymously, exactly
+     * as it did before.
+     */
+    containerRegistryAuth: z
+      .object({
+        username: z.string().min(1),
+        password: z.string().min(1),
+        serveraddress: z.string().min(1),
+      })
       .optional(),
     /**
      * Extra resolved secrets to project as env vars on the install
@@ -237,6 +274,23 @@ export const registerAckSchema = z.object({
    * KICI_SCALER_PENDING_DISPATCH_TIMEOUT (default 60s) acts as a safety net.
    */
   pendingDispatch: z.boolean().optional(),
+  /**
+   * Set when this agent was pre-spawned to wait for work (a warm pool) rather
+   * than for a specific queued job. Such an agent MUST NOT arm any
+   * idle-shutdown timer on register: it is meant to sit ready until the
+   * orchestrator either dispatches a job to it or destroys it.
+   *
+   * The orchestrator's warm-pool reaper is the sole authority on its lifetime.
+   * An agent that also ran its own idle timer would self-terminate behind the
+   * reaper's back, re-creating the spawn/reap churn that reaping only surplus
+   * agents exists to prevent.
+   *
+   * Absent on orchestrators that predate warm pools. An agent that does not
+   * understand this field arms the short KICI_SCALER_IDLE_TIMEOUT timer exactly
+   * as before — so warm pools do not work against it, which is today's
+   * behaviour rather than a regression.
+   */
+  warmPool: z.boolean().optional(),
   /**
    * Optional agent-facing capabilities this orchestrator supports (absent on
    * pre-capability orchestrators). The agent reads it to decide whether to
@@ -572,6 +626,15 @@ const cacheUploadRequestSchema = z.object({
   lockfileHash: z.string().optional(),
   platform: z.string(),
   arch: z.string(),
+  /**
+   * SHA-256 of the dependency tarball about to be uploaded. Deps uploads only.
+   *
+   * The dep tarball is stored under its own content hash, so the orchestrator
+   * needs it to sign the upload URL — the agent has already built the tarball
+   * and hashed it by the time it asks. Optional so an older agent that omits it
+   * still gets a usable (lockfile-keyed) URL during a mixed-version rollout.
+   */
+  depsHash: z.string().optional(),
 });
 
 /** Orchestrator -> Agent: return the pre-signed upload URL. */
@@ -895,6 +958,46 @@ export const eventEmitResponseSchema = z.object({
   error: z.string().optional(),
 });
 
+// --- Event-scaler credential-claim protocol ---
+
+/**
+ * Agent -> Orchestrator: exchanges a single-use claim code (delivered on a
+ * `kici.scaler.scale-up` event) for freshly minted ephemeral agent credentials.
+ * A provisioned agent normally sends this itself to self-bootstrap — the claim
+ * code is the authorization, so it may send it before it authenticates or
+ * registers. A provisioning workflow can also send it to obtain the token
+ * directly. Additive/negotiated by presence — older peers that never emit it
+ * are unaffected, so it needs no `PROTOCOL_VERSION` bump of its own.
+ */
+export const scalerClaimCredentialsSchema = z.object({
+  type: z.literal('scaler.claim-credentials'),
+  /** Correlates to the response for this claim. */
+  requestId: z.string(),
+  /** Single-use code from the scale-up event's payload. */
+  claimCode: z.string(),
+});
+
+/**
+ * Orchestrator -> Agent: minted ephemeral credentials for a claimed provision,
+ * or an error. The token appears only here — never in the persisted event log.
+ */
+export const scalerClaimCredentialsResponseSchema = z.object({
+  type: z.literal('scaler.claim-credentials.response'),
+  /** Correlates to the original scaler.claim-credentials requestId. */
+  requestId: z.string(),
+  /** Minted credentials (present on success). */
+  credentials: z
+    .object({
+      agentToken: z.string(),
+      agentId: z.string(),
+      orchestratorUrl: z.string(),
+      labels: z.array(z.string()),
+    })
+    .optional(),
+  /** Error description (present on failure). */
+  error: z.string().optional(),
+});
+
 // --- Agent metrics push protocol ---
 
 /** Periodic metrics push from agent to orchestrator. */
@@ -1089,6 +1192,7 @@ export const orchestratorToAgentMessageSchema = z.discriminatedUnion('type', [
   artifactsUploadCompleteAckSchema,
   artifactsDownloadResponseSchema,
   eventEmitResponseSchema,
+  scalerClaimCredentialsResponseSchema,
   agentApiResponseSchema,
   agentAuthSuccessSchema,
   agentAuthFailureSchema,
@@ -1121,6 +1225,7 @@ export const agentToOrchestratorMessageSchema = z.discriminatedUnion('type', [
   artifactsUploadCompleteSchema,
   artifactsDownloadRequestSchema,
   eventEmitSchema,
+  scalerClaimCredentialsSchema,
   agentApiRequestSchema,
   agentMetricsSchema,
   agentAuthRequestSchema,
@@ -1157,5 +1262,7 @@ export type ArtifactsDownloadResponse = z.infer<typeof artifactsDownloadResponse
 export type FleetLogsRequest = z.infer<typeof fleetLogsRequestSchema>;
 export type FleetBundleChunk = z.infer<typeof fleetBundleChunkSchema>;
 export type FleetBundleError = z.infer<typeof fleetBundleErrorSchema>;
+export type ScalerClaimCredentials = z.infer<typeof scalerClaimCredentialsSchema>;
+export type ScalerClaimCredentialsResponse = z.infer<typeof scalerClaimCredentialsResponseSchema>;
 export type OrchestratorToAgentMessage = z.infer<typeof orchestratorToAgentMessageSchema>;
 export type AgentToOrchestratorMessage = z.infer<typeof agentToOrchestratorMessageSchema>;

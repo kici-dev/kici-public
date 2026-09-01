@@ -226,17 +226,6 @@ describe('orchestrator loadConfig', () => {
       expect(config.independentSecrets).toBe(true);
     });
 
-    it('parses KICI_SKIP_S3_SENTINEL_VALIDATION=true to true', () => {
-      process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
-      const config = loadConfig();
-      expect(config.skipS3SentinelValidation).toBe(true);
-    });
-
-    it('defaults skipS3SentinelValidation to false', () => {
-      const config = loadConfig();
-      expect(config.skipS3SentinelValidation).toBe(false);
-    });
-
     it('defaults user-cache quota and TTL when unset', () => {
       const config = loadConfig();
       expect(config.userCacheQuotaBytes).toBe(5 * 1024 * 1024 * 1024);
@@ -253,58 +242,6 @@ describe('orchestrator loadConfig', () => {
       expect(config.userCacheTtlMs).toBe(67890);
       expect(config.storage?.userCacheQuotaBytes).toBe(12345);
       expect(config.storage?.userCacheTtlMs).toBe(67890);
-    });
-
-    it('maps KICI_TEST_MINT_DEFER_AUDIENCE to testMintDeferAudience', () => {
-      process.env.KICI_TEST_MODE = '1';
-      process.env.KICI_TEST_MINT_DEFER_AUDIENCE = 'kici-provenance';
-      const config = loadConfig();
-      expect(config.testMode).toBe(true);
-      expect(config.testMintDeferAudience).toBe('kici-provenance');
-    });
-
-    it('leaves testMintDeferAudience undefined when unset', () => {
-      const config = loadConfig();
-      expect(config.testMintDeferAudience).toBeUndefined();
-    });
-
-    it('maps KICI_TEST_MINT_REJECT_AUDIENCE to testMintRejectAudience', () => {
-      process.env.KICI_TEST_MODE = '1';
-      process.env.KICI_TEST_MINT_REJECT_AUDIENCE = 'kici-provenance-reject';
-      const config = loadConfig();
-      expect(config.testMode).toBe(true);
-      expect(config.testMintRejectAudience).toBe('kici-provenance-reject');
-    });
-
-    it('leaves testMintRejectAudience undefined when unset', () => {
-      const config = loadConfig();
-      expect(config.testMintRejectAudience).toBeUndefined();
-    });
-
-    it('maps KICI_TEST_RERUN_DELAY_MS to testRerunDelayMs', () => {
-      process.env.KICI_TEST_MODE = '1';
-      process.env.KICI_TEST_RERUN_DELAY_MS = '4000';
-      const config = loadConfig();
-      expect(config.testMode).toBe(true);
-      expect(config.testRerunDelayMs).toBe(4000);
-    });
-
-    it('leaves testRerunDelayMs undefined when unset', () => {
-      const config = loadConfig();
-      expect(config.testRerunDelayMs).toBeUndefined();
-    });
-
-    it('maps KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES to testOmitDashboardRequestTypes', () => {
-      process.env.KICI_TEST_MODE = '1';
-      process.env.KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES = 'dashboard.contexts.list';
-      const config = loadConfig();
-      expect(config.testMode).toBe(true);
-      expect(config.testOmitDashboardRequestTypes).toBe('dashboard.contexts.list');
-    });
-
-    it('leaves testOmitDashboardRequestTypes undefined when unset', () => {
-      const config = loadConfig();
-      expect(config.testOmitDashboardRequestTypes).toBeUndefined();
     });
   });
 
@@ -330,6 +267,23 @@ describe('orchestrator loadConfig', () => {
       expect(() => loadConfig()).toThrow(
         /KICI_CLUSTER_COORDINATOR_URL or KICI_CLUSTER_COORDINATOR_URLS is required/,
       );
+    });
+
+    it('rejects a provision-backoff ceiling below its base', () => {
+      // The admin route 400s the same pair. Refusing it here too means the env
+      // path and the cluster-settings path cannot disagree about what is a
+      // valid pair — and a ceiling under the base silently collapses
+      // `min(base * 2^(n-1), ceiling)` to a constant from the first failure.
+      process.env.KICI_SCALER_PROVISION_BACKOFF_BASE_MS = '60000';
+      process.env.KICI_SCALER_PROVISION_BACKOFF_MAX_MS = '30000';
+      expect(() => loadConfig()).toThrow(/KICI_SCALER_PROVISION_BACKOFF_MAX_MS/);
+    });
+
+    it('accepts a provision-backoff ceiling equal to its base, a constant delay on purpose', () => {
+      process.env.KICI_SCALER_PROVISION_BACKOFF_BASE_MS = '60000';
+      process.env.KICI_SCALER_PROVISION_BACKOFF_MAX_MS = '60000';
+      const config = loadConfig();
+      expect(config.scalerProvisionBackoffMaxMs).toBe(60_000);
     });
 
     it('accepts worker mode with KICI_CLUSTER_COORDINATOR_URLS (plural, comma-separated)', () => {
@@ -382,6 +336,31 @@ describe('orchestrator loadConfig', () => {
       process.env.KICI_SECERT_KEY = 'oops';
       process.env.KICI_DEV = 'true';
       expect(() => loadConfig()).not.toThrow();
+    });
+
+    it('tolerates the test-only fault / harness vars under NODE_ENV=test', () => {
+      // The test double (dist/server-test.js) boots with NODE_ENV=test and the
+      // fault-injection env set; the boot validator must not reject those.
+      process.env.NODE_ENV = 'test';
+      process.env.KICI_TEST_MODE = '1';
+      process.env.KICI_TEST_EVENT_FAIL_FIRST_N = '{"evt":1}';
+      process.env.KICI_TEST_MINT_DEFER_AUDIENCE = 'kici-provenance';
+      process.env.KICI_TEST_RERUN_DELAY_MS = '1';
+      process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
+      process.env.KICI_SKIP_DB_TESTS = '1';
+      expect(() => loadConfig()).not.toThrow();
+    });
+
+    it('rejects a stray KICI_TEST_* var under any other NODE_ENV (defense in depth)', () => {
+      process.env.NODE_ENV = 'production';
+      process.env.KICI_TEST_MODE = '1';
+      expect(() => loadConfig()).toThrow(/Unknown KICI_\* env var/);
+    });
+
+    it('rejects a stray KICI_SKIP_S3_SENTINEL_VALIDATION under any other NODE_ENV', () => {
+      process.env.NODE_ENV = 'production';
+      process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
+      expect(() => loadConfig()).toThrow(/Unknown KICI_\* env var/);
     });
   });
 

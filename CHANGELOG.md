@@ -2,6 +2,156 @@
 
 Release notes for the public KiCI packages.
 
+## v0.6.0 — 2026-09-01
+
+### Features
+
+- The orchestrator plan limit now counts worker orchestrators alongside coordinators.
+- Workflow-driven autoscaling: a new event scaler backend emits reserved scale-up/scale-down events that customer provisioning and teardown workflows consume to spin up and tear down ephemeral cloud instances
+- SDK: buildAgentCloudInit — customizable cloud-init for scaler-provisioned agents
+- Reused (bare-metal) agents now reap a finished job's leaked process tree, re-run declared cleanup out-of-band after a hard kill, and can run an operator between-jobs reset command
+- invokeSource: global workflows can invoke and gate on a source repo's opt-in workflows
+- GitHub Actions autoscaling: run KiCI agents as one-shot GitHub Actions workflow runs via the event scaler, with unified claim-code self-bootstrap
+- Event-scaler autoscaling works behind a single shared endpoint on a multi-coordinator cluster, with maxAgents counted cluster-wide
+- Authenticated git in workflows: declare named credentials from the secrets backend with gitCredentials, and push with ctx.repo.withWrite. Credentials are minted per git operation, so a push at the end of a long job works.
+- Container jobs can use any glibc image, including a private one, without that image shipping Node. An agent that starts your image as a second container also clones for you, so that image needs no git either; a pool that runs your image as the agent itself still needs git in the image.
+- Container jobs can build their image from a Dockerfile in your repository, instead of naming a finalized image. KiCI clones, builds on the agent that runs the job, and runs the job in the result; the build's output appears in the run log as its own step.
+- kici runs show prints why a run never started: the run-level failure, each job's rejection reason, and any approval hold with its context and reason
+- A repeatedly failing external (event) scaler now backs off exponentially instead of re-dispatching every spawn timeout, with three cluster settings to tune it
+- Ref-based CI trust: same-repo refs run fully trusted; fork pull requests are governed by one org-level switch (ignore, hold, or allow) and always run with reduced privilege
+- Independent orchestrators can register their own `/kici approve` approvers with `kici-admin trust-policy directory-set` and revoke them with `directory-remove`; both refuse on a Platform-attached orchestrator, where the dashboard owns the directory
+- The org CI trust policy accepts a seconds-granularity approval expiry, so a security hold can be shorter than an hour
+- Independent orchestrators raise, persist, surface and expire approval holds. A fork pull request the org policy holds is now parked with a `KiCI Security` check and released with `/kici approve`; a workflow's own `approval` gate is enforced instead of running the job ungated
+- `kici-admin held-run list|approve|reject` answers a held run on an independent orchestrator, covering the approval queue as well as the security queue. Approving re-dispatches the held job or workflow rather than only marking it approved, and the resumed run keeps the reduced privilege its ref earned. Both verbs refuse with a 409 wherever a Platform is attached, because the Platform authorizes each decision there
+- The Members tab now names a per-member CI trust override on the badge and lets a `ci_trust:admin` member clear it. The override outranks the level a member's roles grant, so an organization that had lowered someone by override previously had no way to see that, or undo it, from the dashboard
+- Notification subscriptions scoped to a workflow's defining repository now receive that workflow's organization-wide runs. A repository filter matches either the repository a run executed against or the repository that defines the workflow.
+- A failed organization-workflow evaluation round can be re-run. Re-running the errored evaluation run re-evaluates the original event; a clean result posts success on the 'KiCI: Organization workflow evaluation' check and dispatches the admitted workflows.
+- The SDK exports the reserved scaler event names and their payload schemas (SCALER_EVENT_NAMES, ScaleDownReason, ScalerScaleUpPayload, ScalerScaleDownPayload), so an autoscaling workflow imports the contract instead of re-declaring it
+- Copy-pasteable GitHub Actions provisioning and teardown workflows now ship under examples/, pointed at your runner repo by the GITHUB_RUNNER_REPO context variable
+- kici report gathers a redacted diagnostic bundle for an issue report, with an opt-in private upload to KiCI and self-service list/withdraw
+
+### Fixes
+
+- Cache restore now works when KICI_TMPDIR points at a different filesystem from the workspace
+- kici types now writes an empty offline stub when the Platform is unreachable instead of failing, so an unauthenticated compile still typechecks
+- kici init now scaffolds .kici/.gitignore so the generated types/ declarations stay untracked (kici.lock.json remains tracked source)
+- kici types preserves an existing populated secrets.d.ts when the Platform is unreachable, writing the empty offline stub only when the file is absent
+- Agent: dynamic job generators now see env vars set by a workflow module at import time, matching the global eval round
+- Reject duplicate generated job names across a whole eval round, not just within one dynamic generator
+- Update dependencies to clear high/moderate advisories (undici, tar, react-router, postcss, nanoid, hono, @hono/node-server, brace-expansion, fast-uri, ip-address)
+- Bump the DHI Node base image to 24.19.0 (picks up the 24.18.1 security release) across the orchestrator, agent, and platform images
+- The orchestrator now starts correctly on macOS, Windows, and ARM (the cross-platform bundle no longer exits immediately without running)
+- A failed job's GitHub check run no longer gets stuck showing in-progress with a failure conclusion (a late progress update could reopen the completed check)
+- A workflow host-restart's post-restart job is no longer dispatched into the rebooting host by the pending-job safety-net re-drive (it stays held until the host reboots back)
+- kici-admin now distinguishes a malformed request (e.g. a token containing a newline) from an unreachable orchestrator, instead of reporting both as a connectivity failure
+- Dependency-cache tarballs are addressed by their own content hash, so two builds sharing a lock file can no longer leave a tarball and integrity hash that disagree (which failed jobs with a durable hash mismatch)
+- Event-scaler provisions are no longer stranded without teardown, and an agent that reaches a different coordinator in a cluster is no longer treated as unmanaged
+- A kiciEvent() workflow now receives the emitted payload on ctx.rawPayload, so an autoscaling provisioning workflow can read its claim code
+- An event-scaler teardown addresses the provisioning targets recorded at spawn time on every coordinator, and removing an event scaler from the config no longer strands its in-flight provisions
+- An internally triggered workflow no longer reads a fabricated targetBranch of "main" on ctx.event — an internal event has no branch, so the field is absent
+- Container installs now wait for the orchestrator and agent to shut down cleanly instead of killing them after 10 seconds
+- kici.git.github.getToken now mints a token covering every repository you name, instead of silently using only the first
+- A job that pairs requireApproval with a dynamic env, context, concurrency group or matrix is now held for approval instead of dispatching ungated, and a context bound dynamically is now checked against its protection rules
+- A job that pairs requireApproval with a dynamic matrix now holds every matrix child for approval, instead of holding one placeholder that would resume as a single job
+- A job held by a context's wait-timer, concurrency or trust gate is now registered on its run and keeps a resume path, instead of being dropped while the run reported success
+- A job that both waits on another job and requires approval is no longer dispatched when its upstream finishes, and a job held for approval is no longer lost when the orchestrator has connected peers
+- A job with a dynamic concurrency group is now limited by that group rather than by its context name, and a held matrix or host child keeps its variant identity
+- A context bound statically to a job that also uses a dynamic field now has its protection rules and secrets applied, and approving a security hold now runs the gated job instead of only marking it approved
+- Config reload now adds and removes scaler backends: a new scaler starts routing immediately, a removed scaler is retired (routing stops, warm agents are destroyed, job-bound agents finish), and maxAgents, maxConcurrentSpawns, machine pools and warm-pool removal all apply without a restart.
+- A Firecracker scaler entry that sets `requireSudo: true` now escalates privileged commands through `sudo -n` on a leader orchestrator, not only on a worker — a rootless leader no longer fails to run `ip`, `chown`, `chmod` and `nft`.
+- A scaler removed from the config no longer advertises capacity to cluster peers, so a peer stops routing jobs to a retiring scaler that cannot serve them
+- The kici-admin diagnose table now shows a retiring scaler and its remaining agent count instead of cutting the marker off the end of the row
+- A scaler config reload that cannot construct a newly added scaler now leaves every existing scaler exactly as it was, instead of keeping the new label sets and maxAgents while reporting that the previous config was kept.
+- Removing a scaler from the config while one of its agent spawns is still in flight no longer tears the backend down early, so the agent that lands is still tracked and destroyed instead of outliving the scaler it belonged to.
+- A scaler added by a config reload is now built from the reloaded config. It previously used the boot-time config, so a Firecracker scaler added alongside a network change allocated IPs from the old CIDR and attached to the old bridge.
+- Config reload now applies an event scaler's roles, mandatoryLabels, provisioningTargets, agentTokenTtlSeconds and claimTtlSeconds. They were read from the entry captured at startup, so a reload that retargeted the provisioning workflow kept emitting scale-up events to the old one.
+- Warm pools now keep agents ready. A scaler configured with warmPool.enabled pre-spawned nothing, because the pool was never populated; it now fills from the orchestrator's own agent registry. idleTimeoutSeconds removes only agents above the configured size, so an agent that makes up the pool stays ready until a job uses it.
+- Re-adding a scaler while it is still draining now keeps it routable, instead of dropping the backend once the drain finishes
+- The scaler panel in dashboard diagnostics now reflects the config a `SIGHUP` reload applied, instead of the one the orchestrator started with
+- Warm pools keep their agents. An agent started for a warm pool used to shut itself down a few seconds later, so the pool never held any agents; it now waits for work until the orchestrator gives it a job or removes it.
+- Jobs now run on a scaler that declares a platform. A scaler with a platform such as arm64 or macOS started agents that no job could use, so its jobs went back to the queue and started more agents.
+- Warm pools now reserve the resources their agents use, and a job that asks for different resources or its own container image gets its own agent instead of a ready one. Warm pools now require declared resources.
+- A job that declares its own cpu and memory now gets an agent of that size on a worker node. Such a job used to lose its declared size when it was queued on a worker, so it ran on a ready agent of the pool's size, or started a new agent of the default size.
+- Agents spawning at the same time no longer mount a partially copied KiCI runtime
+- A failed runtime copy no longer removes the runtime volume another agent is still writing
+- A failed runtime copy now reaps its dead volume instead of leaking it
+- Runtime materialization containers now carry the kici-managed label, so the orphan reaper removes them
+- runsOnAll fan-out targets declared fleet hosts only; auto-scaler agents are no longer pinned fan-out targets
+- Reference autoscaling provisioning workflows now bind the context that holds their cloud credential, and the GitHub Actions scaler example names a repo in provisioningTargets instead of a workflow name
+- A workflow triggered by a schedule or an event resolves its bound contexts in full: context variables, scoped secrets, and the context's protection rules
+- A gated context now gates an internally-triggered run: reject rules, approval holds, wait timers and concurrency groups apply to schedule and event triggers
+- An internally-triggered run carries a trust tier: the orchestrator's own schedule and lifecycle events are trusted, and a kiciEvent() subscriber inherits the tier of the run that emitted the event
+- A run summoned by an invoke gate inherits the trust tier of the summoning run
+- A kiciEvent() subscriber that inherits a tier below trusted receives no install secrets, and a minimumTrust context holds it for security review when the inherited tier falls short
+- A Dockerfile build in a cron-fired workflow runs, because a schedule fire is a trusted trigger
+- The event-name prefix __ is reserved for KiCI internal events: ctx.emit() refuses it, alongside the existing kici. reservation
+- invokeSource() refuses a reserved event name at compile time, and a lock file that still carries one fails that gate job at dispatch
+- A scheduled or event-triggered workflow dispatches its dynamic-matrix, dynamic-env and dynamic-concurrency jobs, and honors workflow-level filters
+- A cron-fired run records the commit sha it ran against, so the run links to the commit that registered the workflow
+- A job a deployment context rejects now appears on the run as a failed job naming the context and the rule, instead of vanishing from the run — so a run whose gated job was silently absent, and reported green, now reports failed
+- A branch-restricted context now names the real reason it rejects an internally-triggered run
+- A workflow triggered by `kici.scaler.scale-up` or `kici.scaler.scale-down` now runs trusted, so it can build a Dockerfile job and pass a `minimumTrust` context
+- The orchestrator now recovers its internal-event backlog after a restart that follows a stop, and shutdown waits for a running catch-up scan
+- A refused invoke-gate summon now fails the gate instead of reading as a green skip under `optional: true`
+- A workflow triggered by a run completing, or by a failure batch, now runs at the trust tier of the run or runs that caused the event instead of always trusted. Where that cause was untrusted, the workflow loses shared cache scope, is denied a Dockerfile build, receives no install secrets so a private-registry install fails at install time, and is held for approval by any context that sets minimumTrust
+- A scheduled or event-triggered run now presents a real branch, so a branch-restricted context can accept it
+- Agents that carry a token can now connect to an orchestrator running with agent authentication disabled, instead of being refused and reconnecting forever
+- In a multi-orchestrator cluster, a job routed to a peer orchestrator is no longer cancelled mid-execution when it takes longer than the spawn window to finish
+- The dependency-cache key is now computed for a repository whose package manager could not be detected from its root, so those repositories get dependency caching instead of a fresh install on every job
+- A dependency change now rebuilds the dependency cache: previously a cache miss on dependencies was ignored whenever the workflow source was unchanged, so every job reinstalled from the registry
+- Job routing labels and matrix values are no longer dropped by the runs API
+- An external (event-scaler) provisioning failure now reports the provisioning cause on the affected job instead of a label-mismatch message
+- An orchestrator no longer retains a scaler failure event for an agent that never registered, so a long-running orchestrator does not accumulate them
+- On a multi-orchestrator cluster, a provision another coordinator adopted is no longer reported as a failed external provisioning
+- A pull request whose run ends before any job starts now completes its KiCI check runs, so the pull request reports a failure instead of staying pending forever
+- A job gated by both a reviewer approval and a security trust hold now requires both to be released, and kici approve and kici reject take --hold-type or --hold to name which one
+- The org fork policy now governs pull requests that arrive on the orchestrator's own GitHub webhook route, not only those relayed from the Platform; before this, such a pull request was dropped whatever the org had chosen
+- The self-approval gate now fires for every actor type. When `allow_self_approval` is off, an approve from the principal that triggered the run is refused whether that principal is a user acting through an agent, a service account, or a system component — previously only a plain user was recognised, so the other renderings were admitted
+- A held job is no longer dispatched when the orchestrator cannot read its hold rows. The pre-dispatch hold check now retries a failed read and then refuses, leaving the job pending for the next release or the scheduler recovery pass, instead of treating an unreadable gate as an open one
+- A dispatch that fails part-way now completes the queued `kici/…` checks it had already posted. An infrastructure error — a rolled-back hold transaction, a lost connection — used to leave those checks queued forever, which blocks branch protection with no explanation
+- A pending security check is no longer stranded by a transient database error. The orchestrator records an accepted check post on the hold rows with a bounded retry, so a lost connection between the post and the record no longer leaves a check on the commit that nothing can close
+- A webhook delivery whose pipeline throws now records a `failed` event-log row on every ingress, under the delivery's resolved organization. Direct-ingress failures previously appeared only in the orchestrator's own log, so the dashboard's failed-delivery count could never be non-zero for them
+- The CI trust approval expiry editor no longer widens a sub-hour window. It now takes an amount plus a unit (seconds, minutes, or hours) and saves the exact value, instead of reading and writing back the rounded-up hours view — which turned a stored 90-second window into an hour on the next save
+- Global-workflow policy repository lists now reject negation patterns ('!…') at write time; a stored negation entry fails closed (grants nothing on the allow list, blocks on the deny list) instead of silently inverting.
+- Global-workflow policy repository lists now reject the regular-expression negative assertions '(?!…)' and '(?<!…)', which the matcher compiled into a real inversion — an allow-list entry of '(?!myorg/legacy)**' allowed every repository in every organization but the one it named. The character class '[!a]' is no longer refused: it is a literal class, not a negation.
+- Re-running a failed global workflow evaluation round now looks up the original delivery within the run's own organization, so a delivery id another organization supplied can no longer be read.
+- The webhook delivery decision trace no longer shows commit messages, comment bodies, or changed-file lists to members without event_log:read_payload
+- A re-run of a failed organization-workflow evaluation posts success on the gating check only when the re-evaluation actually reached a verdict. A pass that could evaluate nothing leaves the check as it stands, so a merge gate is never cleared by work that did not run.
+- Re-running a failed organization-workflow evaluation no longer times out: the request is accepted immediately and the re-evaluation runs in the background, like the push that first triggered it
+- A workflow-level approval gate now also applies when the job's context raises its own reviewer hold
+- A context concurrency limit now counts the jobs one dispatch admits against each other, so a matrix job bound to that context admits at most that many children
+- A scaler-started agent that re-registers with no spawn record is now refused instead of being treated as a static agent, so it can never lose its mandatory-labels gate.
+- Approving or rejecting a held run answers when the decision is recorded, instead of timing out behind the resume it starts
+- Scaler taint gates are now per label set, so a scaler mixing platforms no longer makes its own label sets unroutable
+- A job gated on `needs` no longer dispatches when a concurrency or approval hold is released while its upstream is still pending, and is skipped when its upstream failed
+- A job the needs gate skips, and a scheduler-ready job whose dispatch is rejected, now terminalize their own tracked job instead of leaving it pending
+- A job released from a hold no longer runs over its context concurrency limit
+- A scaler agent refused for a missing spawn record now has its compute reclaimed on the host that spawned it, instead of looping on reconnect while its resources leak. This covers a Firecracker VM and a container-mode bare-metal agent. A bare-metal agent running as a plain process is still reclaimed only while the orchestrator that spawned it is running.
+- An event-scaler provision that a peer adopted is no longer reported as a failed provision after its spawn record is torn down
+- The published GitHub Actions teardown workflow now cancels only genuinely stranded runner runs (spawn-timeout, heartbeat-timeout) instead of cancelling healthy ones on shutdown
+- `kici-admin variable set --value` no longer warns that it put "the secret" in your shell history — a context variable is plaintext by design, and the warning now names the value
+- diagnostic bundles now redact KiCI API keys, personal access tokens, cluster join tokens and fine-grained GitHub tokens, and kici report --no-redact leaves the bundle unredacted as documented
+- Bump the DHI Node base image to 24.20.0 across the orchestrator, agent, and platform images — including the portable Node runtime mounted into every job container — refresh runtime dependencies to their current in-range releases (aws-sdk, jose, picomatch, pg-boss, react-router, mantine, tanstack, eslint, vite, vitest, and others), and move the quickstart compose example to seaweedfs 4.44
+- Scaler resource gauges from an event-backed scaler now reach the hosted Platform: the metrics catalog admits every scaler backend type on the `scalerType` and agent `scaler` labels, so an `event` scaler's CPU and memory series are no longer dropped as `bad_label_value`.
+- A dashboard-write policy change now takes effect on every coordinator in a high-availability cluster, not just the one that served the kici-admin write.
+- Context concurrency limits are no longer exceeded while a dispatched job is still starting up
+- The quickstart object-store image now carries the patched openssl (SeaweedFS 4.45)
+
+### Documentation
+
+- Event scaler docs now lead with the claim-code self-bootstrap flow, and the agent protocol reference states correctly when an agent may redeem a claim code
+- Operator docs for what happens when external (event-scaler) provisioning fails, the retry backoff, and its three cluster settings
+- A copy-pasteable GitHub Actions agent workflow now ships in examples/github-actions-autoscale/, and the autoscaling docs link to it
+
+### Other
+
+- Refresh runtime and build dependencies to current in-range releases (aws-sdk, playwright, mantine, eslint, stripe, pg, recharts, react, and others)
+- Removed the orchestrator's test-only fault-injection env knobs (KICI_TEST_MODE and the KICI_TEST_* and KICI_SKIP_S3_SENTINEL_VALIDATION family) from the shipped customer artifact; fault injection now lives only in a build-time test double that never ships
+- buildAgentCloudInit token-baking (CloudInitCredentials) deprecated in favor of claim-code delivery (ClaimCodeCredentials); removed at v1.0.0
+- An internally-triggered run packs its source through a build job before its own jobs, so it needs an agent with the kici:role:builder label
+- Deprecated: the unknown-contributor and workflow-change trust policy arms, the fork policy value reject, the per-member CI trust override, and the known trust tier — see the deprecations ledger
+- Protocol version 2: the orchestrator and Platform negotiate version 2 so a fork policy of ignore reaches the orchestrator; version 1 peers stay accepted and receive the equivalent deny value
+
 ## v0.5.0 — 2026-08-15
 
 ### Features

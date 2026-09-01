@@ -60,6 +60,12 @@ import { AccessLogWriter } from './audit/access-log.js';
 import { SamplingRateLimiter } from './audit/sampling-rate-limiter.js';
 import { Dispatcher, DEFAULT_REDRIVE_BATCH } from './agent/dispatcher.js';
 import { PendingScaleSweeper } from './scaler/pending-scale-sweeper.js';
+import {
+  EventProvisionReaper,
+  adopterIsLive,
+  canReapForCluster,
+  reaperFlapGraceMs,
+} from './scaler/event-provision-reaper.js';
 import { LockFileCache } from './lockfile-cache.js';
 import { ContentRequirementsCache } from './content-requirements-cache.js';
 import { DedupCache } from './webhook/dedup.js';
@@ -85,9 +91,7 @@ import {
 import {
   createSandboxAllowListReader,
   type SandboxAllowListReader,
-  type SandboxAllowList,
 } from './pipeline/sandbox-allowlist-reader.js';
-import { resolveSandboxGrant } from './pipeline/resolve-sandbox-grant.js';
 import { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
 import { IngestOverflowReplayer } from './webhook/ingest-overflow-replayer.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
@@ -105,29 +109,34 @@ import { resolveSelection } from './diagnostics/fleet-selection.js';
 import {
   WS_CLOSE_GOING_AWAY,
   WS_CLOSE_DISPATCH_ACK_TIMEOUT,
-  isLockStaticJob,
-  partitionMatchers,
-  resolveScheduleInputs,
   VariantKind,
   ExecutionJobStatus,
-  InitFailureCategory,
-  type LabelMatcher,
+  reservedEventNamePrefix,
   type PeerHeartbeat,
   type CacheRefScope,
   type PeerLogsCollectRequest,
   type PeerToPeerMessage,
-  type ResolvedSandboxGrant,
+  type InvokeResult,
 } from '@kici-dev/engine';
 import {
   ScalerManager,
+  type ScalerManagerDeps,
   ContainerScalerBackend,
-  BareMetalScalerBackend,
   FirecrackerScalerBackend,
   DbIpAllocator,
+  ClaimStore,
+  DEFAULT_CLAIM_TTL_SECONDS,
+  createScalerBackend,
+  requiredToolsFor,
   loadScalerConfig,
   detectLabelSetOverlaps,
 } from './scaler/index.js';
-import type { ScalerBackend, ScalerConfig, ScalerEvent } from './scaler/index.js';
+import type {
+  BackendFactoryContext,
+  ScalerBackend,
+  ScalerConfig,
+  ScalerEvent,
+} from './scaler/index.js';
 import { createCacheStorage, generateSigningSecret } from './storage/index.js';
 import type { CacheStorage } from './storage/index.js';
 import { assertAgentReachableStorage } from './storage/loopback-guard.js';
@@ -176,7 +185,14 @@ import {
   clearEvalGatesForRun,
   resolveOrgId,
 } from './pipeline/processor.js';
+import type { ProcessingDeps, ReadyDispatchGateDeps } from './pipeline/processor.js';
+import {
+  dispatchInternalEventViaPipeline,
+  type InternalEventDispatchContext,
+} from './pipeline/internal-event-pipeline.js';
 import { restorePendingWorkflowContexts } from './pipeline/pending-workflow-context.js';
+import { SummonRefusedError } from './pipeline/invoke-gate.js';
+import type { InvokeGateDeps, SummonArgs, SummonedRun } from './pipeline/invoke-gate.js';
 import { recomputeNeedsSatisfied } from './pipeline/needs-scheduler.js';
 import { StepLogBuffer } from './reporting/step-log-buffer.js';
 import { createLogStorage, type LogStorage } from './reporting/log-storage.js';
@@ -186,6 +202,7 @@ import { createLogChunkSink, type NormalizedLogChunk } from './reporting/log-chu
 import { normalizePeerLogChunk } from './reporting/peer-log-normalize.js';
 import { StaleRunDetector } from './stale-detector/stale-run-detector.js';
 import { WorkflowDeadlineDetector } from './stale-detector/workflow-deadline-detector.js';
+import { GateDeadlineDetector } from './stale-detector/gate-deadline-detector.js';
 import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
 import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import { cancelRunWithReason } from './cancel/cancel-run.js';
@@ -197,9 +214,8 @@ import {
   RaftStateStore,
   OrphanRecovery,
   RunCoordinator,
+  PlanHeadroomStore,
   createClusterHealthRoutes,
-  type RunContext,
-  type JobToRoute,
 } from './cluster/index.js';
 import { extractRepoIdentifier } from './entry-helpers.js';
 import { runMigrations } from './db/migrator.js';
@@ -230,11 +246,15 @@ import { EventRouter, type EventMatchContext } from './events/event-router.js';
 import { EventRetryScanner } from './events/event-retry-scanner.js';
 import { EventEmitter } from './events/event-emitter.js';
 import { TrustStore } from './events/trust-store.js';
-import { parseFaultInjectionMap, type EventRouterConfig } from './events/types.js';
+import { type EventRouterConfig } from './events/types.js';
+// Type-only: the fault-injection policy interface. `import type` keeps the
+// test-only runtime module (`src/testing/*`) out of the shipped bundle.
+import type { OrchestratorFaultInjection } from './testing/fault-injection.js';
 import { GenericSourceManager } from './webhook/generic-sources.js';
 import { createGenericProviderBundle } from './providers/generic/index.js';
 import { registerProviderBundleForSource } from './webhook/register-source-bundle.js';
 import { GenericSourcesChangeListener } from './webhook/generic-sources-listener.js';
+import { DashboardWritePolicyChangeListener } from './policy/dashboard-write-policy-listener.js';
 import {
   universalGitRegistrationErrorsTotal,
   setDeclaredHostsUnreachable,
@@ -266,6 +286,7 @@ import { createS3Client } from '@kici-dev/shared';
 import { GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import type { Kysely } from 'kysely';
 import type { Database } from './db/types.js';
+import { JobKind } from './db/types.js';
 import type pg from 'pg';
 
 const logger = createLogger({ prefix: 'core' });
@@ -334,6 +355,8 @@ export interface OrchestratorSubsystems {
   globalEvalCache: GlobalEvalRoundCache;
   dedup: DedupCache;
   eventRouter: EventRouter;
+  /** Invoke-gate dependencies (summon callback + chain-depth bound). */
+  invokeGateDeps: InvokeGateDeps;
   /**
    * Event store for custom internal events (system + custom). Exposed
    * here so the dashboard handler can serve the per-org DLQ surface
@@ -362,6 +385,10 @@ export interface OrchestratorSubsystems {
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   broadcastHeartbeatToAllPeers: () => void;
   broadcastAgentTokenRevoke: (tokenId: string) => void;
+  /** Platform-owned worker-ceiling cache, read by the peer-handler admission gate. */
+  planHeadroomStore: PlanHeadroomStore;
+  /** Late-bind the coordinator's cluster.membership reporter (see ClusterInfra). */
+  setMembershipReporter: (report: () => void) => void;
   joinHandler: JoinHandler;
   configReloader: ConfigReloader;
   localConfigVersion: number;
@@ -373,6 +400,12 @@ export interface OrchestratorSubsystems {
    * Platform when a generic source is added/removed at runtime.
    */
   genericSourcesChangeListener: GenericSourcesChangeListener;
+  /**
+   * Dashboard-write policy hot-reload listener. Keeps every coordinator's
+   * cached policy map — and the capability snapshot it advertises to the
+   * control plane — in step with a `kici-admin` write served by any peer.
+   */
+  dashboardWritePolicyChangeListener: DashboardWritePolicyChangeListener;
   /** Inbound webhook delivery log writer (event_log table + object-storage payloads). */
   eventLogWriter: EventLogWriter;
   /** Access log writer (read + mutation attribution for dashboard + admin). */
@@ -416,6 +449,17 @@ export interface OrchestratorSubsystems {
   ingestOverflowBuffer: IngestOverflowBuffer;
   /** Background replayer draining the overflow buffer once capacity recovers. */
   ingestOverflowReplayer: IngestOverflowReplayer;
+  /**
+   * The live direct-ingress `ProcessingDeps` bag, assembled inside `createApp`.
+   *
+   * A mode hook that has to resume a held run needs the same bag the pipeline
+   * that created the hold used — otherwise the resume runs against a second,
+   * hand-assembled bag that can silently diverge from it. `createApp` runs
+   * AFTER `onSubsystemsReady`, so this throws until it has, which is why every
+   * caller must invoke it lazily (inside a release callback, never at wiring
+   * time).
+   */
+  buildProcessingDeps: () => ProcessingDeps;
 }
 
 /**
@@ -522,6 +566,18 @@ async function initializeScaler(
   onScalerEvent: (runId: string, jobId: string, event: ScalerEvent) => void,
   isDraining: () => boolean,
   clusterSettings: ClusterSettingsReader,
+  /**
+   * Late-bound accessor for the event emitter (built after the scaler). The
+   * event scaler backend calls it only at runtime scale-up / scale-down, by
+   * which point the emitter is assigned.
+   */
+  eventEmitterProvider: () => EventEmitter,
+  /**
+   * Read-only view of the agent registry, used by the warm pool to count the
+   * agents that could already serve a job for a label set. Built before the
+   * scaler, so it is passed directly rather than late-bound.
+   */
+  agentRegistry: ScalerManagerDeps['agentRegistry'],
 ): Promise<{ manager: ScalerManager; config: ScalerConfig } | null> {
   if (!config.scalerConfigPath) return null;
 
@@ -545,19 +601,7 @@ async function initializeScaler(
   }
 
   // Validate required external tools for all configured scalers
-  const toolRequirements = scalerConfig.scalers.flatMap((s) => {
-    switch (s.type) {
-      case 'container':
-        return ContainerScalerBackend.getRequiredTools(s);
-      case 'bare-metal':
-        return BareMetalScalerBackend.getRequiredTools(s);
-      case 'firecracker':
-        return FirecrackerScalerBackend.getRequiredTools(s);
-      default:
-        return [];
-    }
-  });
-  const toolErrors = validateRequiredTools(toolRequirements);
+  const toolErrors = validateRequiredTools(requiredToolsFor(scalerConfig.scalers));
   if (toolErrors.length > 0) {
     const detail =
       'Required tools validation failed:\n' + toolErrors.map((e) => `  - ${e}`).join('\n');
@@ -565,103 +609,56 @@ async function initializeScaler(
     await exitWithStartupBackoff(detail);
   }
 
-  // Create backends from config
+  // Constructed ahead of the backends because the event backend's claim store
+  // persists through it — a claim minted here must be redeemable on any
+  // coordinator behind the same shared endpoint.
+  // The pool-acquire timeout doubles as the cluster-cap lock wait: the manager
+  // holds its process-wide reservation lock across that call, so a coordinator
+  // queuing indefinitely behind a peer's advisory lock would stall every other
+  // backend's scale request with it.
+  const scalerStateStore = new ScalerStateStore(db, config.dbPoolAcquireTimeoutMs);
+
+  // Create backends from config. One shared factory, so a reload can only
+  // construct what startup already exercises.
+  const factoryCtx: BackendFactoryContext = {
+    scalerConfig,
+    tokenStore,
+    injectAgentToken: config.agentAuth === 'token',
+    tokenTtlMs: config.agentTokenTtlMs,
+    // Live per-spawn resolve of the fleet-wide agent-token TTL override
+    // (cluster_settings.agent_token_ttl_ms); leader has DB access.
+    tokenTtlProvider: () => clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
+    ipAllocator: ({ cidr, gateway, netmask }) => new DbIpAllocator({ db, cidr, gateway, netmask }),
+    stateStore: scalerStateStore,
+    eventEmitterProvider: () => eventEmitterProvider(),
+    logger,
+  };
+
   const backendResults = await Promise.all(
     scalerConfig.scalers.map(async (s) => {
-      if (s.type === 'container') {
-        return {
-          name: s.name,
-          backend: await ContainerScalerBackend.create({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            host: s.host,
-            socketPath: s.socketPath,
-            runtime: s.runtime,
-            defaultResources: scalerConfig.defaults?.resources,
-            extraHosts: s.extraHosts,
-            networkIsolation: s.networkIsolation,
-            tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // Live per-spawn resolve of the fleet-wide agent-token TTL override
-            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
-            tokenTtlProvider: () =>
-              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
-            roles: s.roles,
-          }),
-        };
-      } else if (s.type === 'bare-metal') {
-        return {
-          name: s.name,
-          backend: new BareMetalScalerBackend({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            defaultResources: scalerConfig.defaults?.resources,
-            tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // Live per-spawn resolve of the fleet-wide agent-token TTL override
-            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
-            tokenTtlProvider: () =>
-              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
-            roles: s.roles,
-            enforceCgroups: s.enforceCgroups,
-          }),
-        };
-      } else if (s.type === 'firecracker') {
-        const fcNet = scalerConfig.firecracker;
-        const cidr = fcNet?.cidr ?? '10.0.0.0/24';
-        const bridgeName = fcNet?.bridgeName ?? 'kici-br0';
-        const gateway = fcNet?.gateway ?? '10.0.0.1';
-        const netmask = fcNet?.netmask ?? '255.255.255.0';
-        const table = fcNet?.table ?? 'kici';
-        const autoProvisionHost = fcNet?.autoProvisionHost ?? true;
-        const ipAllocator = new DbIpAllocator({ db, cidr, gateway, netmask });
-        return {
-          name: s.name,
-          backend: new FirecrackerScalerBackend({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            ipAllocator,
-            firecrackerPath: s.firecrackerPath!,
-            jailerPath: s.jailerPath!,
-            kernelPath: s.kernelPath!,
-            chrootBaseDir: s.chrootBaseDir,
-            uid: s.uid!,
-            gid: s.gid!,
-            vcpuCount: s.vcpuCount,
-            memSizeMib: s.memSizeMib,
-            bridgeName,
-            cidr,
-            gateway,
-            netmask,
-            table,
-            autoProvisionHost,
-            tokenStore: config.agentAuth === 'token' ? tokenStore : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // Live per-spawn resolve of the fleet-wide agent-token TTL override
-            // (cluster_settings.agent_token_ttl_ms); leader has DB access.
-            tokenTtlProvider: () =>
-              clusterSettings.getNumber('agent_token_ttl_ms', config.agentTokenTtlMs),
-            roles: s.roles,
-          }),
-        };
-      } else {
-        logger.warn(`Unsupported scaler type "${s.type}" for scaler "${s.name}", skipping`);
-        return null;
-      }
+      const backend = await createScalerBackend(s, factoryCtx);
+      return backend ? { name: s.name, backend } : null;
     }),
   );
   const backends: Array<{ name: string; backend: ScalerBackend }> = backendResults.filter(
     (b) => b !== null,
   );
 
-  const scalerStateStore = new ScalerStateStore(db);
   const scalerManager = new ScalerManager({
     config: scalerConfig,
     backends,
+    agentRegistry,
+    instanceId: config.instanceId,
     stateStore: scalerStateStore,
+    eventEmitter: eventEmitterProvider,
+    // Redemption-only: it never writes a claim row, so it carries no scaler
+    // name. The emitting backend's own store stamps that per row.
+    claimStore: new ClaimStore({
+      createEphemeral: (agentId, labels, ttlMs) =>
+        tokenStore.createEphemeral(agentId, labels, ttlMs),
+      stateStore: scalerStateStore,
+      ttlDefaultSec: DEFAULT_CLAIM_TTL_SECONDS,
+    }),
     machineLedger: {
       dir: config.machineLedgerDir,
       instanceId: config.instanceId,
@@ -674,6 +671,28 @@ async function initializeScaler(
       'scaler_spawn_timeout_ms',
       config.scalerSpawnTimeoutMs,
     ),
+    // Read per spawn request, so an operator retuning the backoff mid-outage
+    // takes effect on the next request rather than at the next restart. A NULL
+    // column falls back to the cluster-wide config default.
+    resolveProvisionBackoff: async () => ({
+      baseMs: await clusterSettings.getNumber(
+        'scaler_provision_backoff_base_ms',
+        config.scalerProvisionBackoffBaseMs,
+      ),
+      maxMs: await clusterSettings.getNumber(
+        'scaler_provision_backoff_max_ms',
+        config.scalerProvisionBackoffMaxMs,
+      ),
+      maxConsecutiveFailures: await clusterSettings.getNumber(
+        'scaler_provision_max_consecutive_failures',
+        config.scalerProvisionMaxConsecutiveFailures,
+      ),
+    }),
+    // A scaler added by a config reload is built through the same factory
+    // startup uses, so a reload can only construct what startup exercises.
+    // The reloaded config, not the boot-time one: the factory reads
+    // `defaults.resources` and the firecracker network block off it.
+    createBackend: (entry, cfg) => createScalerBackend(entry, { ...factoryCtx, scalerConfig: cfg }),
   });
 
   // Hydrate scaler state from DB so a Raft leader switch / coord
@@ -1139,32 +1158,6 @@ export function upstreamBaseNamesFromNeeds(needs: unknown): string[] {
   return names;
 }
 
-/**
- * Partition a lock job's `runsOn` / `excludeLabels` matchers into exact label
- * strings and regex patterns for internal-event (cron / `ctx.emit`) dispatch.
- * Lock jobs carry `runsOn` as `LabelMatcher[]`; the coordinator routing and the
- * direct dispatcher both need exact labels for the indexed/SQL fast path and
- * regex patterns as a separate JS post-filter — never the raw matcher objects.
- */
-export function internalJobRunsOnSelectors(job: {
-  runsOn?: readonly LabelMatcher[];
-  excludeLabels?: readonly LabelMatcher[];
-}): {
-  runsOnLabels: string[];
-  runsOnPatterns: LabelMatcher[];
-  excludeLabels: string[];
-  excludePatterns: LabelMatcher[];
-} {
-  const include = partitionMatchers(job.runsOn ?? []);
-  const exclude = partitionMatchers(job.excludeLabels ?? []);
-  return {
-    runsOnLabels: include.exact,
-    runsOnPatterns: include.regex,
-    excludeLabels: exclude.exact,
-    excludePatterns: exclude.regex,
-  };
-}
-
 /** Escape SQL LIKE wildcards (`%`, `_`) so a literal base name matches exactly. */
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, (c) => `\\${c}`);
@@ -1260,6 +1253,87 @@ export function buildUpstreamStatusesByBase(
 }
 
 /**
+ * For each declared need that names an invoke gate, gather its per-run results
+ * from the gate's proxy children — `{ repo, workflow, runId, status, outputs }`,
+ * one entry per proxy. `outputs` is the proxy's non-secret mirrored outputs (the
+ * same `execution_jobs.outputs` cell `mirrorSummonedRunOntoProxy` writes); a
+ * repo's secret outputs live in `run_secret_outputs` and are never read here.
+ * Keyed by gate name; a gate that summoned zero subscribers yields an empty
+ * array (so `.result` stays an `InvokeResult[]`), while a declared need that is
+ * a regular job (no gate row) yields no key.
+ *
+ * Shared by both `ctx.needs['<gate>'].result` construction paths: the
+ * DynamicJobFn generator (via `gatherUpstreamSnapshot`) and a standard
+ * `run:`/step job (via `mergeUpstreamOutputs` → the `upstreamInvokeResults`
+ * dispatch field).
+ */
+export async function gatherInvokeResults(
+  db: Kysely<Database>,
+  runId: string,
+  gateNames: readonly string[],
+): Promise<Record<string, InvokeResult[]>> {
+  const invokeResults: Record<string, InvokeResult[]> = {};
+  if (gateNames.length === 0) return invokeResults;
+
+  // Seed an empty array for every declared upstream that IS an invoke gate —
+  // identified authoritatively by its own `job_kind = Gate` row. A gate that
+  // summoned zero subscribers (an `optional` gate whose source repos all opted
+  // out) has no proxy children, but its `ctx.needs['<gate>'].result` must still
+  // be an (empty) `InvokeResult[]`, not fall through to the plain single-job
+  // shape. A declared upstream that is a regular job has no Gate row, so it is
+  // not seeded and keeps resolving through the normal outputs path.
+  const gateRows = await db
+    .selectFrom('execution_jobs')
+    .select('job_name')
+    .where('run_id', '=', runId)
+    .where('job_kind', '=', JobKind.Gate)
+    .where('job_name', 'in', [...gateNames])
+    .execute();
+  for (const g of gateRows) {
+    if (g.job_name) invokeResults[g.job_name] = [];
+  }
+
+  const proxyRows = await db
+    .selectFrom('execution_jobs')
+    .select(['base_job_name', 'summoned_run_id', 'status', 'outputs'])
+    .where('run_id', '=', runId)
+    .where('job_kind', '=', JobKind.Proxy)
+    .where('base_job_name', 'in', [...gateNames])
+    .orderBy('created_at', 'asc')
+    .orderBy('job_name', 'asc')
+    .execute();
+  if (proxyRows.length === 0) return invokeResults;
+
+  // Resolve each summoned run's repo + workflow (authoritative source-of-truth
+  // for the label, independent of how the proxy's job_name is composed).
+  const summonedRunIds = proxyRows
+    .map((r) => r.summoned_run_id)
+    .filter((id): id is string => id !== null);
+  const runRows =
+    summonedRunIds.length > 0
+      ? await db
+          .selectFrom('execution_runs')
+          .select(['run_id', 'repo_identifier', 'workflow_name'])
+          .where('run_id', 'in', summonedRunIds)
+          .execute()
+      : [];
+  const runMap = new Map(runRows.map((r) => [r.run_id, r]));
+
+  for (const row of proxyRows) {
+    if (!row.base_job_name || !row.summoned_run_id) continue;
+    const rr = runMap.get(row.summoned_run_id);
+    (invokeResults[row.base_job_name] ??= []).push({
+      repo: rr?.repo_identifier ?? '',
+      workflow: rr?.workflow_name ?? '',
+      runId: row.summoned_run_id,
+      status: row.status ?? '',
+      outputs: parseOutputsCell(row.outputs) ?? {},
+    });
+  }
+  return invokeResults;
+}
+
+/**
  * Fold a `runsOnAll` upstream's host children into the `byHost` envelope
  * `{ byHost: { '<host>': outputs }, summary: { succeededHosts, failedHosts, outputs } }`.
  * Unlike the matrix envelope, `summary.outputs[key]` is an array view across hosts
@@ -1342,15 +1416,25 @@ export async function mergeUpstreamOutputs(
   mergedSecrets: Record<string, string> | undefined;
   upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined;
   upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined;
+  upstreamInvokeResults: Record<string, InvokeResult[]> | undefined;
 }> {
   let mergedSecrets = dispatchSecrets ? { ...dispatchSecrets } : undefined;
   let upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined;
   let upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined;
+  let upstreamInvokeResults: Record<string, InvokeResult[]> | undefined;
 
   const baseNames = upstreamBaseNamesFromNeeds(needs);
-  if (baseNames.length === 0) return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
+  if (baseNames.length === 0)
+    return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses, upstreamInvokeResults };
 
   try {
+    // An upstream need naming an invoke gate resolves to its per-run results
+    // (one entry per proxy child), exposed downstream as
+    // `ctx.needs['<gate>'].result`. Mirrors the generator path's
+    // `gatherUpstreamSnapshot` so both `ctx.needs` builders agree.
+    const invoke = await gatherInvokeResults(db, runId, baseNames);
+    if (Object.keys(invoke).length > 0) upstreamInvokeResults = invoke;
+
     const secretOutputStore = new SecretOutputStore(db);
     // Match both exact base-name rows (non-fanned) and expanded matrix children
     // (`${base} (...)`). The LIKE patterns escape the SQL wildcards in the base
@@ -1378,7 +1462,7 @@ export async function mergeUpstreamOutputs(
     const upstreamJobs = await query.execute();
 
     if (upstreamJobs.length === 0)
-      return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
+      return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses, upstreamInvokeResults };
 
     upstreamJobOutputs = buildUpstreamOutputsByBase(baseNames, upstreamJobs);
     upstreamJobStatuses = buildUpstreamStatusesByBase(upstreamJobs);
@@ -1414,7 +1498,7 @@ export async function mergeUpstreamOutputs(
     });
   }
 
-  return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses };
+  return { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses, upstreamInvokeResults };
 }
 
 /**
@@ -1560,6 +1644,8 @@ function buildOnDispatch(
       Array<Record<string, unknown>> | undefined;
     const dispatchInstallEnvSecrets = job.jobConfig.installEnvSecrets as
       Record<string, string> | undefined;
+    const dispatchContainerRegistryAuth = job.jobConfig.containerRegistryAuth as
+      { username: string; password: string; serveraddress: string } | undefined;
     // Strip secrets/runPublicKey/internal-auth-context — agent never sees these.
     const cleanJobConfig = Object.fromEntries(
       Object.entries(job.jobConfig).filter(
@@ -1569,19 +1655,21 @@ function buildOnDispatch(
           k !== 'runPublicKey' &&
           k !== 'npmRegistries' &&
           k !== 'installEnvSecrets' &&
+          k !== 'containerRegistryAuth' &&
           k !== 'workflowRoutingKey' &&
           k !== 'workflowProviderContext',
       ),
     );
 
-    const { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses } = await mergeUpstreamOutputs(
-      db,
-      job.runId,
-      job.jobName,
-      cleanJobConfig.needs,
-      dispatchSecrets,
-      config.secretKey!,
-    );
+    const { mergedSecrets, upstreamJobOutputs, upstreamJobStatuses, upstreamInvokeResults } =
+      await mergeUpstreamOutputs(
+        db,
+        job.runId,
+        job.jobName,
+        cleanJobConfig.needs,
+        dispatchSecrets,
+        config.secretKey!,
+      );
 
     const dispatchMsg: Record<string, unknown> = {
       type: 'job.dispatch',
@@ -1621,8 +1709,12 @@ function buildOnDispatch(
         Object.keys(dispatchInstallEnvSecrets).length > 0 && {
           installEnvSecrets: dispatchInstallEnvSecrets,
         }),
+      ...(dispatchContainerRegistryAuth && {
+        containerRegistryAuth: dispatchContainerRegistryAuth,
+      }),
       ...(upstreamJobOutputs && { upstreamJobOutputs }),
       ...(upstreamJobStatuses && { upstreamJobStatuses }),
+      ...(upstreamInvokeResults && { upstreamInvokeResults }),
     };
 
     if (bundle) {
@@ -1731,402 +1823,29 @@ function buildOnSecretOutputs(config: AppConfig, db: Kysely<Database>) {
 
 // ── onEventMatched handler builder ──────────────────────────────────────────
 
-interface InternalEventDispatchContext {
-  event: any;
-  routingKey: string;
-  repoIdentifier: string;
-  providerContext: Record<string, unknown>;
-  providerType: 'github' | undefined;
-  repoUrl: string;
-  cronCommitSha: string;
-}
-
-interface InternalEventDispatchDeps {
-  dispatcher: Dispatcher;
-  coordinator: RunCoordinator | null;
-  executionTracker: ExecutionTracker;
-  db: Kysely<Database>;
-  sandboxAllowListReader: SandboxAllowListReader;
-}
-
 /**
- * Route a workflow's static jobs through the cluster coordinator (cluster mode)
- * or fall back to direct local dispatch on timeout. Returns the locally
- * dispatched job IDs for tracking. The "rerouted" and "failed" cases are
- * logged but do not contribute to the local-tracked set.
+ * Read the late-bound `ProcessingDeps` factory, or throw.
+ *
+ * Throwing is deliberate: the two callers wrap each decision's dispatch in a
+ * try/catch, so returning early instead would swallow every internally
+ * triggered run behind a debug line — a cron schedule that silently never fires
+ * is far worse than a loud error per matched workflow.
  */
-async function routeInternalJobsViaCoordinator(
-  coordinator: RunCoordinator,
-  dispatcher: Dispatcher,
-  runId: string,
-  workflow: any,
-  staticJobs: any[],
-  ctx: InternalEventDispatchContext,
-  buildInternalJobConfig: (job: any) => Record<string, unknown>,
-): Promise<Array<{ jobId: string; jobName: string }>> {
-  const dispatchedJobs: Array<{ jobId: string; jobName: string }> = [];
-
-  const jobsToRoute: JobToRoute[] = staticJobs.map((job: any) => {
-    const sel = internalJobRunsOnSelectors(job);
-    return {
-      jobName: job.name,
-      runsOnLabels: [sel.runsOnLabels],
-      runsOnPatterns: sel.runsOnPatterns,
-      excludeLabels: sel.excludeLabels,
-      excludePatterns: sel.excludePatterns,
-      jobConfig: buildInternalJobConfig(job),
-      repoUrl: ctx.repoUrl,
-      ref: '',
-      sha: ctx.cronCommitSha,
-      ...(job.resources && { resources: job.resources }),
-    };
-  });
-
-  const runCtx: RunContext = {
-    runId,
-    deliveryId: ctx.event.id,
-    routingKey: ctx.routingKey,
-    event: ctx.event.eventName,
-    action: null,
-    provider: ctx.providerType ?? 'internal',
-    payload: ctx.event.payload ?? {},
-    repoIdentifier: ctx.repoIdentifier,
-    sha: ctx.cronCommitSha,
-    ref: '',
-    workflowName: workflow.name,
-    installationId:
-      typeof ctx.providerContext.installationId === 'number'
-        ? ctx.providerContext.installationId
-        : undefined,
-  };
-
-  // Add a 30s timeout to routeJobs to prevent blocking indefinitely
-  // when peer orchestrators are unreachable or slow to respond.
-  const routeResult = await Promise.race([
-    coordinator.routeJobs(runCtx, jobsToRoute),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('routeJobs timed out after 30s')), 30_000),
-    ),
-  ]).catch((err) => {
-    logger.warn(
-      'Coordinator routing timed out for internal event, falling back to direct dispatch',
-      { runId, workflow: workflow.name, error: toErrorMessage(err) },
+function requireProcessingDeps(ref: {
+  current: (() => ProcessingDeps) | null;
+}): () => ProcessingDeps {
+  if (!ref.current) {
+    throw new Error(
+      'Internal-event dispatch requires a ProcessingDeps factory; processingDepsRef is unpopulated',
     );
-    return null;
-  });
-
-  if (!routeResult) {
-    // Timeout fallback: direct dispatch
-    return dispatchInternalJobsDirect(dispatcher, runId, workflow, staticJobs, ctx, false);
   }
-
-  for (const local of routeResult.localJobs) {
-    dispatchedJobs.push({ jobId: local.jobId, jobName: local.jobName });
-  }
-  for (const rerouted of routeResult.reroutedJobs) {
-    logger.info('Internal event job rerouted to peer', {
-      eventId: ctx.event.id,
-      runId,
-      workflow: workflow.name,
-      job: rerouted.jobName,
-      peerId: rerouted.peerId,
-    });
-  }
-  for (const failed of routeResult.failedJobs) {
-    logger.warn('Internal event job routing failed', {
-      eventId: ctx.event.id,
-      runId,
-      workflow: workflow.name,
-      job: failed.jobName,
-      reason: failed.reason,
-    });
-  }
-  return dispatchedJobs;
+  return ref.current;
 }
 
-/**
- * Direct local dispatch of every static job in a workflow. Used when the
- * coordinator is absent (standalone mode) or after a coordinator timeout.
- */
-async function dispatchInternalJobsDirect(
-  dispatcher: Dispatcher,
-  runId: string,
-  workflow: any,
-  staticJobs: any[],
-  ctx: InternalEventDispatchContext,
-  logEachDispatch: boolean,
-): Promise<Array<{ jobId: string; jobName: string }>> {
-  const dispatchedJobs: Array<{ jobId: string; jobName: string }> = [];
-  const buildJobConfig = (job: any) =>
-    buildInternalJobConfigForWorkflow(workflow, job, undefined, ctx.event?.payload);
-
-  for (const job of staticJobs) {
-    const sel = internalJobRunsOnSelectors(job);
-    const result = await dispatcher.dispatch({
-      runId,
-      workflowName: workflow.name,
-      jobName: job.name,
-      runsOnLabels: sel.runsOnLabels,
-      runsOnPatterns: sel.runsOnPatterns,
-      excludeLabels: sel.excludeLabels,
-      excludePatterns: sel.excludePatterns,
-      jobConfig: buildJobConfig(job),
-      repoUrl: ctx.repoUrl,
-      ref: '',
-      sha: ctx.cronCommitSha,
-      deliveryId: ctx.event.id,
-      provider: ctx.providerType ?? 'internal',
-      providerContext: ctx.providerContext,
-      routingKey: ctx.routingKey,
-      ...(job.resources && { resources: job.resources }),
-    });
-
-    if (result.status !== 'rejected') {
-      dispatchedJobs.push({ jobId: result.jobId, jobName: job.name });
-    }
-    if (logEachDispatch) {
-      logger.info('Internal event job dispatched', {
-        eventId: ctx.event.id,
-        runId,
-        workflow: workflow.name,
-        job: job.name,
-        jobId: result.status !== 'rejected' ? result.jobId : undefined,
-        status: result.status,
-      });
-    }
-  }
-  return dispatchedJobs;
-}
-
-export function buildInternalJobConfigForWorkflow(
-  workflow: any,
-  job: any,
-  sandboxGrant?: ResolvedSandboxGrant,
-  firedSchedule?: { cronExpression?: string; timezone?: string },
-): Record<string, unknown> {
-  // Schedule fires carry no operator input — resolve the trigger's declared
-  // defaults. A workflow may declare several schedule() triggers, so for a
-  // __schedule_fire event resolve the trigger whose cron matches the schedule
-  // that actually fired; fall back to the first schedule for internal events
-  // that carry no cron (workflow_complete, job_complete). Non-schedule events
-  // have no schedule trigger, so dispatchInputs stays undefined and is omitted.
-  const scheduleTriggers = (
-    (workflow.triggers ?? []) as Array<{
-      _type?: string;
-      cronExpression?: string;
-      timezone?: string;
-      inputs?: Parameters<typeof resolveScheduleInputs>[0];
-    }>
-  ).filter((t) => t._type === 'schedule');
-  const firedCron = firedSchedule?.cronExpression;
-  const firedTz = firedSchedule?.timezone;
-  const scheduleTrigger = firedCron
-    ? (scheduleTriggers.find(
-        (t) => t.cronExpression === firedCron && (t.timezone ?? '') === (firedTz ?? ''),
-      ) ?? scheduleTriggers[0])
-    : scheduleTriggers[0];
-  const dispatchInputs = resolveScheduleInputs(scheduleTrigger?.inputs);
-  return {
-    source: workflow.source ?? undefined,
-    workflowName: workflow.name,
-    name: job.name,
-    steps: job.steps as unknown as Record<string, unknown>[],
-    needs: job.needs,
-    ...(job.matrix && { matrix: job.matrix }),
-    ...(job.include && { include: job.include }),
-    ...(job.exclude && { exclude: job.exclude }),
-    ...(job.rules && { rules: job.rules }),
-    ...(dispatchInputs && { dispatchInputs }),
-    ...(workflow.contentHash && { contentHash: workflow.contentHash }),
-    ...(job.resources && { resources: job.resources }),
-    // The job's container image selects the container execution backend on the
-    // agent (determineExecutionMode gives jobConfig.container top priority), so
-    // it must survive dispatch or a container:-field job silently runs bare-metal.
-    ...(job.container && { container: job.container }),
-    // The dispatch-resolved sandbox escape-hatch grant (allow-listed by the
-    // caller). Absent ⇒ no grant ⇒ default hardened posture.
-    ...(sandboxGrant && { sandboxGrant }),
-  };
-}
-
-/**
- * Dispatch one matched workflow for an internal event: register the
- * execution row, dispatch its static jobs (via coordinator or direct),
- * and fail the run immediately if no jobs landed (instead of waiting for
- * OrphanRecovery's 5-minute timeout). The whole body is wrapped in
- * try/catch by the caller so a single bad decision doesn't poison the
- * batch.
- */
-/**
- * Resolve the static jobs' `sandbox:` escape-hatch requests for an internally
- * triggered workflow against the org allow-list. Populates `out` with the
- * authorized grants and returns a denial reason (to fail the run) on the first
- * non-allow-listed request — deny is loud + total, never a silent strip. When no
- * job requests an escape hatch the allow-list is not even read. An org that
- * cannot be resolved from the routing key falls back to deny-all (safe).
- */
-async function resolveInternalSandboxGrants(
-  staticJobs: any[],
-  routingKey: string,
-  db: Kysely<Database>,
-  reader: SandboxAllowListReader,
-  out: Map<string, ResolvedSandboxGrant>,
-): Promise<string | null> {
-  if (!staticJobs.some((j) => j.sandbox)) return null;
-  let allowList: SandboxAllowList = { capabilities: [], allowHostNetwork: false };
-  try {
-    allowList = await reader.read(await resolveOrgId(db, routingKey));
-  } catch {
-    // Org unresolvable → keep the deny-all default (a request will be denied).
-  }
-  for (const job of staticJobs) {
-    if (!job.sandbox) continue;
-    const res = resolveSandboxGrant(job.sandbox, allowList);
-    if ('denied' in res) return `job '${job.name}': ${res.denied.reason}`;
-    if (res.grant) out.set(job.name, res.grant);
-  }
-  return null;
-}
-
-async function dispatchInternalEventDecision(
-  decision: any,
-  lockFile: any,
-  ctx: InternalEventDispatchContext,
-  deps: InternalEventDispatchDeps,
-): Promise<void> {
-  const workflow = lockFile.workflows.find((w: any) => w.name === decision.workflowName);
-  if (!workflow) return;
-
-  // Dispatch-resolved sandbox escape-hatch grants, keyed by lock-job name.
-  // Populated below (after the run is started) from the org allow-list; the
-  // closure reads it by reference at job-dispatch time.
-  const sandboxGrants = new Map<string, ResolvedSandboxGrant>();
-
-  // Patch source field for buildInternalJobConfig — needs lockFile fallback
-  const buildJobConfig = (job: any): Record<string, unknown> => ({
-    ...buildInternalJobConfigForWorkflow(
-      workflow,
-      job,
-      sandboxGrants.get(job.name),
-      ctx.event?.payload,
-    ),
-    source: workflow.source ?? lockFile.source,
-  });
-
-  const runId = crypto.randomUUID();
-
-  // Derive triggerEvent for dashboard display from internal event name:
-  // __schedule_fire -> 'schedule', __workflow_complete -> 'workflow_complete', etc.
-  const triggerEvent =
-    ctx.event.eventName === '__schedule_fire'
-      ? 'schedule'
-      : ctx.event.eventName.startsWith('__')
-        ? ctx.event.eventName.slice(2)
-        : ctx.event.eventName;
-
-  // Mark runs dispatched by a failure-lifecycle trigger so their own completion
-  // is excluded from batch accumulation (a broken notifier must not re-trigger
-  // itself). See EventRouter.isFailureLifecycleRun.
-  const matchedTrigger = workflow.triggers?.[decision.matchedTrigger ?? -1];
-  const dispatchedByFailureLifecycle =
-    matchedTrigger?._type === 'workflows_failed_batch' ||
-    (matchedTrigger?._type === 'workflow_complete' &&
-      Array.isArray(matchedTrigger.status) &&
-      matchedTrigger.status.includes('failed'));
-
-  await deps.executionTracker.onExecutionStarted(
-    runId,
-    workflow.name,
-    ctx.providerType ?? 'internal',
-    ctx.repoIdentifier,
-    '',
-    ctx.cronCommitSha,
-    ctx.event.id,
-    ctx.providerContext,
-    {
-      matched: true,
-      eventName: ctx.event.eventName,
-      ...(dispatchedByFailureLifecycle && { dispatchedByFailureLifecycle: true }),
-    },
-    [],
-    ctx.routingKey,
-    undefined,
-    triggerEvent,
-    undefined, // commitMessage
-    undefined, // parentRunId
-    undefined, // triggeredBy
-    undefined, // originalRunId
-    workflow.concurrency
-      ? {
-          cancelInProgress: workflow.concurrency.cancelInProgress,
-          max: workflow.concurrency.max,
-        }
-      : undefined,
-    workflow.timeout, // workflowTimeoutMs
-  );
-
-  const staticJobs = workflow.jobs.filter(isLockStaticJob);
-
-  // Resolve each static job's `sandbox:` escape-hatch request against the org
-  // allow-list (the single enforcement point — the agent never reads it). A
-  // denied request fails the run loudly before any job is dispatched; an org
-  // that cannot be resolved from the routing key defaults to deny-all (safe).
-  const sandboxDenial = await resolveInternalSandboxGrants(
-    staticJobs,
-    ctx.routingKey,
-    deps.db,
-    deps.sandboxAllowListReader,
-    sandboxGrants,
-  );
-  if (sandboxDenial) {
-    await deps.executionTracker.failRun(runId, sandboxDenial, {
-      scope: 'run',
-      category: InitFailureCategory.enum.sandbox_denied,
-      message: sandboxDenial,
-    });
-    logger.warn('Internal event run failed: sandbox escape-hatch denied', {
-      runId,
-      workflow: workflow.name,
-      reason: sandboxDenial,
-    });
-    return;
-  }
-
-  const dispatchedJobs =
-    deps.coordinator && staticJobs.length > 0
-      ? await routeInternalJobsViaCoordinator(
-          deps.coordinator,
-          deps.dispatcher,
-          runId,
-          workflow,
-          staticJobs,
-          ctx,
-          buildJobConfig,
-        )
-      : await dispatchInternalJobsDirect(deps.dispatcher, runId, workflow, staticJobs, ctx, true);
-
-  if (dispatchedJobs.length > 0) {
-    await deps.executionTracker.addJobsToRun(runId, dispatchedJobs);
-  }
-  // Fail immediately if no jobs landed (no agents available locally or on peers)
-  // instead of leaving the run in 'running' for OrphanRecovery to catch later.
-  if (dispatchedJobs.length === 0 && staticJobs.length > 0) {
-    await deps.executionTracker.failRun(runId, 'No agents available to dispatch jobs');
-    logger.warn('Internal event run failed: no agents dispatched', {
-      runId,
-      workflow: workflow.name,
-      eventId: ctx.event.id,
-    });
-  }
-}
-
-function buildOnEventMatched(
+export function buildOnEventMatched(
   dispatcherRef: { current: Dispatcher | null },
-  executionTracker: ExecutionTracker,
   providerRegistryRef: { current: ProviderRegistry },
-  coordinatorRef: { current: RunCoordinator | null },
-  db: Kysely<Database>,
-  sandboxAllowListReader: SandboxAllowListReader,
+  processingDepsRef: { current: (() => ProcessingDeps) | null },
 ) {
   return async (
     event: any,
@@ -2154,9 +1873,6 @@ function buildOnEventMatched(
     const providerContext = context?.providerContext ?? {};
     const providerType = routingKey ? (routingKey.split(':')[0] as 'github') : undefined;
     const bundle = routingKey ? providerRegistryRef.current.getByRoutingKey(routingKey) : undefined;
-    const repoUrl = bundle?.repoUrlBuilder
-      ? bundle.repoUrlBuilder.buildCloneUrl(repoIdentifier)
-      : '';
     // For cron-triggered runs (__schedule_fire), the event payload carries
     // the registration's commitSha so the run can be associated with the
     // commit that registered the workflow (enables clickable workflow links).
@@ -2169,20 +1885,18 @@ function buildOnEventMatched(
       repoIdentifier,
       providerContext,
       providerType,
-      repoUrl,
+      bundle,
       cronCommitSha,
+      // A `__schedule_fire` run executes this branch's lock file, so it is the
+      // branch the run presents to a context's branch restrictions. `null`
+      // until the repo's next default-branch push captures it.
+      registrationDefaultBranch: context?.defaultBranch ?? null,
     };
-    const deps: InternalEventDispatchDeps = {
-      dispatcher: dispatcherRef.current,
-      coordinator: coordinatorRef.current,
-      executionTracker,
-      db,
-      sandboxAllowListReader,
-    };
+    const buildDeps = requireProcessingDeps(processingDepsRef);
 
     for (const decision of matchedWorkflows) {
       try {
-        await dispatchInternalEventDecision(decision, lockFile, ctx, deps);
+        await dispatchInternalEventViaPipeline(decision, lockFile, ctx, buildDeps());
       } catch (err) {
         logger.error('Failed to dispatch internal event workflow', {
           eventId: event.id,
@@ -2191,6 +1905,124 @@ function buildOnEventMatched(
         });
       }
     }
+  };
+}
+
+/**
+ * Build the invoke-gate `summon` callback: match the source repo's own opt-in
+ * `kiciEvent({ name })` subscribers, dispatch each as a normal in-repo run, and
+ * return the spawned run ids so the gate can correlate a proxy job per run.
+ *
+ * This is the composition-root half of the invoke gate — it reuses the same
+ * in-process match + dispatch path the internal-event router uses
+ * (`matchKiciEventSubscribers` + `dispatchInternalEventViaPipeline`), scoped to
+ * the source repo. The gate executor (`runInvokeGate`) enforces the chain-depth
+ * bound and persists the summon↔spawn correlation.
+ */
+export function buildSummonCallback(
+  dispatcherRef: { current: Dispatcher | null },
+  providerRegistryRef: { current: ProviderRegistry },
+  eventRouter: EventRouter,
+  processingDepsRef: { current: (() => ProcessingDeps) | null },
+): (args: SummonArgs) => Promise<SummonedRun[]> {
+  return async (args: SummonArgs): Promise<SummonedRun[]> => {
+    if (!dispatcherRef.current) {
+      logger.warn('Invoke-gate summon before dispatcher initialized; nothing summoned', {
+        event: args.event,
+        sourceRepo: args.sourceRepo,
+      });
+      throw new SummonRefusedError(
+        `invoke gate cannot summon '${args.event}': the orchestrator's dispatcher is not initialized yet`,
+      );
+    }
+    // Second, independent stop on the reservation `runInvokeGate` already
+    // refuses (this callback is injected, so it does not inherit that check):
+    // the gate's event name is workflow-authored, and a reserved name must
+    // never reach the dispatcher from here either. It THROWS rather than
+    // returning `[]`, because a gate carrying `optional: true` reads zero
+    // summoned runs as a green skip — so a refusal returned as an empty array
+    // would report success if these two checks were ever reordered.
+    const reservedPrefix = reservedEventNamePrefix(args.event);
+    if (reservedPrefix) {
+      logger.warn('Invoke-gate summon refused: reserved event-name prefix', {
+        event: args.event,
+        sourceRepo: args.sourceRepo,
+        reservedPrefix,
+      });
+      throw new SummonRefusedError(
+        `invoke gate cannot summon '${args.event}': the event-name prefix "${reservedPrefix}" is reserved for KiCI internal events`,
+      );
+    }
+    const matches = eventRouter.matchKiciEventSubscribers(
+      args.event,
+      args.payload ?? {},
+      args.sourceRepo,
+    );
+    if (matches.length === 0) {
+      logger.info('Invoke-gate summon matched no source-repo subscribers', {
+        event: args.event,
+        sourceRepo: args.sourceRepo,
+      });
+      return [];
+    }
+    const buildDeps = requireProcessingDeps(processingDepsRef);
+    const out: SummonedRun[] = [];
+    for (const { reg, lockFile, decisions } of matches) {
+      const providerType = reg.routingKey ? (reg.routingKey.split(':')[0] as 'github') : undefined;
+      const bundle = reg.routingKey
+        ? providerRegistryRef.current.getByRoutingKey(reg.routingKey)
+        : undefined;
+      const ctx: InternalEventDispatchContext = {
+        event: {
+          id: `invoke-${crypto.randomUUID()}`,
+          eventName: args.event,
+          payload: args.payload,
+        },
+        routingKey: reg.routingKey,
+        repoIdentifier: reg.repoIdentifier,
+        providerContext: reg.providerContext,
+        providerType,
+        bundle,
+        cronCommitSha: '',
+        // A summon is never a `__schedule_fire`, so this is not the branch it
+        // presents — it inherits its summoner's branch instead. Threaded so the
+        // registration's own value is never silently absent.
+        registrationDefaultBranch: reg.defaultBranch ?? null,
+        // The summoner IS the emitting run, stated rather than looked up: the
+        // event id above is synthesized and matches no `kici_events` row, so a
+        // summoned run inherits its summoner's trust tier from here.
+        summonedByRunId: args.summonedByRunId,
+        chainDepth: args.chainDepth,
+      };
+      for (const decision of decisions) {
+        try {
+          const spawned = await dispatchInternalEventViaPipeline(
+            decision,
+            lockFile,
+            ctx,
+            buildDeps(),
+          );
+          if (spawned) {
+            out.push(spawned);
+            logger.info('Invoke-gate summoned a source-repo run', {
+              event: args.event,
+              sourceRepo: args.sourceRepo,
+              summonedRunId: spawned.runId,
+              workflow: spawned.workflow,
+              chainDepth: args.chainDepth,
+            });
+          }
+        } catch (err) {
+          logger.error('Invoke-gate summon dispatch failed', {
+            event: args.event,
+            sourceRepo: args.sourceRepo,
+            workflow: decision.workflowName,
+            error: toErrorMessage(err),
+          });
+        }
+      }
+    }
+    return out;
   };
 }
 
@@ -2206,6 +2038,14 @@ interface ClusterInfra {
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   broadcastHeartbeatToAllPeers: () => void;
   broadcastAgentTokenRevoke: (tokenId: string) => void;
+  /** The Platform-owned worker-ceiling cache, read by the peer-handler admission gate. */
+  planHeadroomStore: PlanHeadroomStore;
+  /**
+   * Late-bind the membership reporter (a coordinator's `cluster.membership`
+   * sender). The platform client is created after this substrate, so server.ts
+   * calls this once the client exists; peer-set changes then re-report.
+   */
+  setMembershipReporter: (report: () => void) => void;
   /**
    * Mutable handle to the leader-gated recovery-sweep timer. The
    * outer `bootstrapOrchestrator` clears it during graceful shutdown
@@ -2264,15 +2104,7 @@ function initializeCluster(
     draining: isDraining(),
     capabilities: { s3LogAccess: !!cacheStorage },
     ...(scalerManager && {
-      scalerCapacity: scalerManager.getStatus().backends.map((b) => ({
-        name: b.name,
-        type: b.type,
-        labelSets: b.labelSets,
-        maxAgents: b.maxAgents,
-        activeCount: b.activeCount,
-        spawnsOnLocalHost: b.spawnsOnLocalHost,
-        mandatoryLabels: b.mandatoryLabels,
-      })),
+      scalerCapacity: scalerManager.getRoutableCapacity(),
     }),
     configVersion: localConfigVersionRef.value,
     registryVersion: registrationIndex.getVersion(),
@@ -2281,7 +2113,14 @@ function initializeCluster(
     leaderId: raftRef?.getLeaderId() ?? null,
   });
 
+  // Platform-owned worker-ceiling cache + the late-bound membership reporter.
+  // The platform client is created after this substrate, so onMembershipChange
+  // routes through a ref that server.ts fills via setMembershipReporter.
+  const planHeadroomStore = new PlanHeadroomStore(db);
+  const membershipReporterRef: { current: (() => void) | null } = { current: null };
+
   const peerRegistry = new PeerRegistry({
+    onMembershipChange: () => membershipReporterRef.current?.(),
     onConfigVersionBehind: (peerVersion: number) => {
       logger.info('Peer has newer config version, triggering reload', {
         peerVersion,
@@ -2389,6 +2228,8 @@ function initializeCluster(
     sendAndWaitAckViaHandler: (targetId, msg, timeoutMs) =>
       peerHandlerObj?.sendAndWaitAck(targetId, msg, timeoutMs) ?? Promise.resolve(false),
     sendToPeerViaHandler: (targetId, msg) => peerHandlerObj?.sendToPeer(targetId, msg) ?? false,
+    closePeerViaHandler: (targetId, code, reason) =>
+      peerHandlerObj?.closePeer(targetId, code, reason),
     getRerouteSpawnWindowMs: makeOrgNumberReader(
       db,
       'reroute_spawn_window_ms',
@@ -2442,6 +2283,10 @@ function initializeCluster(
     instanceId: config.instanceId,
     peerRegistry,
     getLocalInventory,
+    // The worker-join admission gate reads the persisted Platform ceiling. It
+    // survives a Platform disconnect (fail-open on the last-known value), and
+    // is null until the first plan.headroom push (admit freely).
+    getWorkerCeiling: async () => (await planHeadroomStore.read())?.maxWorkerPeers ?? null,
     heartbeatIntervalMs: config.cluster.peerHeartbeatIntervalMs,
     onLogsCollectRequest: (msg, send) =>
       fleetResponderRef.current?.(msg, send) ?? Promise.resolve(),
@@ -2604,6 +2449,10 @@ function initializeCluster(
     getLocalInventory,
     broadcastHeartbeatToAllPeers,
     broadcastAgentTokenRevoke,
+    planHeadroomStore,
+    setMembershipReporter: (report: () => void) => {
+      membershipReporterRef.current = report;
+    },
     recoverySweepTimerRef,
     fleetResponderRef,
   };
@@ -2614,8 +2463,18 @@ function initializeCluster(
 export async function bootstrapOrchestrator(
   config: AppConfig,
   hooks: OrchestratorHooks,
-  options?: { otelSdk?: { shutdown(): Promise<void> } },
+  options?: {
+    otelSdk?: { shutdown(): Promise<void> };
+    /**
+     * Test-only fault-injection policy. Undefined in production (server.ts /
+     * standalone.ts pass nothing), so every seam sees an undefined policy and
+     * runs with no fault injection. A test-only entrypoint passes a policy to
+     * drive the seams directly.
+     */
+    faultInjection?: OrchestratorFaultInjection;
+  },
 ): Promise<void> {
+  const faultInjection = options?.faultInjection;
   // 1. Initialize database
   const pool = createPool(config.databaseUrl, {
     config: {
@@ -2680,7 +2539,10 @@ export async function bootstrapOrchestrator(
         : undefined,
     storageBucket: config.storage?.bucket,
     storagePrefix: config.storage?.prefix,
-    skipSentinelValidation: config.skipS3SentinelValidation,
+    // Split-brain sentinel validation is always on in the shipped orchestrator.
+    // Only the build-time test double injects `skipS3Sentinel` to exercise the
+    // fault path; production has no runtime escape hatch.
+    skipSentinelValidation: faultInjection?.skipS3Sentinel ?? false,
   });
   await clusterIdentity.validateAtStartup(config.cluster.instanceId);
 
@@ -2789,6 +2651,12 @@ export async function bootstrapOrchestrator(
   // job dispatch — long after the tracker is assigned to the ref — so the
   // ref is always populated by the time a scaler.failed event arrives.
   let executionTrackerRef: ExecutionTracker | null = null;
+  // Forward-declared here (assigned far below) so the event scaler backend can
+  // late-bind to it: the scaler is built now, but eventEmitter depends on the
+  // event router built later. Scale-up / scale-down only fire during runtime
+  // scaling — long after eventEmitter is assigned — so the provider is always
+  // populated by the time the event backend emits.
+  let eventEmitter: EventEmitter | null = null;
   const scalerResult = await initializeScaler(
     config,
     db,
@@ -2796,6 +2664,13 @@ export async function bootstrapOrchestrator(
     (runId, jobId, ev) => executionTrackerRef?.emitScalerEvent(runId, jobId, ev),
     () => drainController.isDraining(),
     clusterSettings,
+    () => {
+      if (!eventEmitter) {
+        throw new Error('event emitter not initialized before an event-scaler emit');
+      }
+      return eventEmitter;
+    },
+    agentRegistry,
   );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
@@ -2872,8 +2747,8 @@ export async function bootstrapOrchestrator(
     isTestRun: (runId) => executionTrackerRef?.isTestRun(runId) ?? false,
   });
 
-  // Forward-declare eventEmitter for the onWorkflowComplete/onJobComplete callbacks
-  let eventEmitter: EventEmitter | null = null;
+  // eventEmitter is forward-declared above (before initializeScaler) so the
+  // event scaler backend can late-bind to it via a provider.
   // Forward-declare concurrency refs for slot release on run completion
   let concurrencyTrackerRef: ConcurrencyGroupTracker | null = null;
   let concurrencyQueueManagerRef: ConcurrencyQueueManager | null = null;
@@ -2889,11 +2764,41 @@ export async function bootstrapOrchestrator(
   // For now, get the callback creators; actual binding happens via closures.
   const trackerExtras = hooks.executionTrackerExtras?.({} as any);
 
+  /**
+   * Drop the in-process state a terminal run leaves behind.
+   *
+   * One function rather than a body inlined in `onExecutionComplete`, because
+   * that callback covers only the runs whose jobs actually ran. The tracker
+   * calls this from its other two terminalization arms (`failRun`,
+   * `cancelHeldRun`) as `onRunTerminalCleanup`, which is where an
+   * expired-approval sweep and a rejected install gate land — the runs whose
+   * jobs were gated rather than dispatched, and so the ones actually holding a
+   * pending job context.
+   *
+   * Fire-and-forget on the DB half: the in-memory Map cleanup is synchronous
+   * inside `cleanupPendingJobContexts`, and only the DELETE is async. A missed
+   * DELETE is swept on the next start by `restorePendingJobContexts`, which
+   * drops every row whose run is already terminal.
+   */
+  const runTerminalCleanup = (runId: string): void => {
+    cleanupPendingJobContexts(db, runId).catch((err) => {
+      logger.warn('Failed to clean up pending job contexts from DB', {
+        runId,
+        error: toErrorMessage(err),
+      });
+    });
+    // Drop any still-open result-aware eval gates for this run so a run that
+    // ended (e.g. cancelled) before an upstream finished doesn't leak a
+    // never-resolved gate promise.
+    clearEvalGatesForRun(runId);
+  };
+
   const executionTracker = new ExecutionTracker({
     db,
     observerRegistry,
     jobQueue: queue,
     resolveOrgId: (rk: string) => resolveOrgId(db, rk),
+    onRunTerminalCleanup: runTerminalCleanup,
     onExecutionComplete: (runId, status, context, description) => {
       const doWork = () => {
         logger.info('Execution completed', { runId, status });
@@ -2912,19 +2817,10 @@ export async function bootstrapOrchestrator(
           });
         });
 
-        // Clean up any un-dispatched pending job contexts for this run
-        // Fire-and-forget: in-memory Map cleanup is synchronous inside the function;
-        // only the DB DELETE is async and can safely be best-effort here.
-        cleanupPendingJobContexts(db, runId).catch((err) => {
-          logger.warn('Failed to clean up pending job contexts from DB', {
-            runId,
-            error: toErrorMessage(err),
-          });
-        });
-        // Drop any still-open result-aware eval gates for this run so a run that
-        // completed (e.g. cancelled) before an upstream finished doesn't leak a
-        // never-resolved gate promise.
-        clearEvalGatesForRun(runId);
+        // Drop the un-dispatched pending job contexts and any still-open eval
+        // gates this run leaves behind. Shared with `onRunTerminalCleanup` below
+        // so every terminalization arm sheds the same state.
+        runTerminalCleanup(runId);
 
         const [owner, repo] = context.repoIdentifier.split('/');
         checkRunReporter.updateWorkflowStatus({
@@ -2943,6 +2839,12 @@ export async function bootstrapOrchestrator(
           installationId: context.installationId,
           routingKey: context.routingKey,
           description,
+          // The run's trust posture, so the roll-up check names the reduced
+          // privileges a fork run carried. Absent when trust never resolved.
+          ...(context.trustTier !== undefined && { trustTier: context.trustTier }),
+          ...(context.lockFileSource !== undefined && {
+            lockFileSource: context.lockFileSource,
+          }),
           // Explicit runId — the onExecutionComplete callback may fire from
           // an agent WS handler or stale-detector tick that's outside the
           // request-context ALS frame, so the reporter cannot rely on its
@@ -3085,6 +2987,14 @@ export async function bootstrapOrchestrator(
   // wire the needs-aware scheduler's onJobReady callback.
   // When the scheduler determines a job's upstreams are all satisfied,
   // it calls this callback to dispatch the newly-ready job.
+  // Late-bound: the invoke-gate deps are built after the event router (below),
+  // but the callback only reads the ref at job-ready time, well after assignment.
+  const invokeGateDepsRef: { current: InvokeGateDeps | null } = { current: null };
+  // Late-bound for the same reason: the context and held-run stores come from
+  // the mode hook's `appDepsExtras`, which is built further down. Without them
+  // a needs-gated job dispatches with no concurrency check — it was gated once,
+  // at dispatch-pass time, and its upstream completing is not a freed slot.
+  const readyGateDepsRef: { current: ReadyDispatchGateDeps | null } = { current: null };
   executionTracker.setOnJobReadyCallback(async (runId, jobName) => {
     // A result-aware dynamic eval job is gated by the same needs scheduler, but
     // its "ready" signal goes to the deferred dispatch task (which then gathers
@@ -3092,7 +3002,16 @@ export async function bootstrapOrchestrator(
     // normal pending-context dispatch path. openEvalGate returns true when it
     // handled the signal, so we must not also run dispatchReadyJob for it.
     if (openEvalGate(runId, jobName)) return;
-    await dispatchReadyJob(runId, jobName, dispatcher, executionTracker, cluster.coordinator, db);
+    await dispatchReadyJob(
+      runId,
+      jobName,
+      dispatcher,
+      executionTracker,
+      cluster.coordinator,
+      db,
+      invokeGateDepsRef.current ?? undefined,
+      readyGateDepsRef.current ?? undefined,
+    );
   });
 
   logger.info('Execution reporting initialized', {
@@ -3415,6 +3334,18 @@ export async function bootstrapOrchestrator(
   });
   await genericSourcesChangeListener.start();
 
+  // Same warm-path shape for the dashboard-write policy: `setDashboardWritePolicy`
+  // emits pg_notify('dashboard_write_policy_change', customer_id) from inside its
+  // own write transaction, and every coordinator's listener drops its cached map
+  // and re-broadcasts its capabilities. Without it only the peer that served the
+  // `kici-admin` write would, leaving its siblings advertising a stale policy to
+  // the control plane for as long as the cluster stays up.
+  const dashboardWritePolicyChangeListener = new DashboardWritePolicyChangeListener({
+    pool,
+    db,
+  });
+  await dashboardWritePolicyChangeListener.start();
+
   /**
    * Re-register one generic source's provider bundle from its database row.
    *
@@ -3463,33 +3394,43 @@ export async function bootstrapOrchestrator(
     retryBaseBackoffMs: config.eventRouterRetryBaseBackoffMs,
     retryMaxBackoffMs: config.eventRouterRetryMaxBackoffMs,
     retryScanIntervalMs: config.eventRouterRetryScanIntervalMs,
-    debugFailFirstNAttemptsByEvent: parseFaultInjectionMap(
-      config.testMode,
-      config.testEventFailFirstN,
-    ),
+    // The per-event fault map is only ever supplied by the build-time test
+    // double via the injected policy; undefined means no faults.
+    debugFailFirstNAttemptsByEvent: faultInjection?.eventFailFirstN,
   };
   if (eventRouterConfig.debugFailFirstNAttemptsByEvent) {
-    logger.warn(
-      'Event-dispatch fault-injection ACTIVE — KICI_TEST_MODE=1 + KICI_TEST_EVENT_FAIL_FIRST_N parsed. Production deployments must clear both env vars.',
-      { map: eventRouterConfig.debugFailFirstNAttemptsByEvent },
-    );
+    logger.warn('Event-dispatch fault-injection ACTIVE via injected policy.', {
+      map: eventRouterConfig.debugFailFirstNAttemptsByEvent,
+    });
   }
   const eventStore = new EventStore(db, eventRouterConfig);
   const circuitBreaker = new EventCircuitBreaker(eventRouterConfig, clusterSettings);
   const trustStore = new TrustStore(db);
 
-  // Forward-declare dispatcher and coordinator for event router callback
+  // Forward-declare the dispatcher for the event router callback.
   const dispatcherRef: { current: Dispatcher | null } = { current: null };
-  const coordinatorRef: { current: RunCoordinator | null } = { current: null };
+  // Forward-declare the ProcessingDeps factory the internal-event dispatch
+  // adapter runs on. The bag is assembled inside createApp (it needs the
+  // mode-specific app deps), which happens well after the event router is
+  // constructed — so the router's callbacks read it through this ref.
+  const processingDepsRef: { current: (() => ProcessingDeps) | null } = { current: null };
+  // ...and the latch that makes the gap between the two unreachable. The event
+  // router starts (and runs its catch-up scan) before createApp populates the
+  // ref, so without this an event arriving mid-bootstrap would burn dispatch
+  // attempts against an unpopulated ref and could reach the DLQ. Resolved
+  // immediately after createApp returns.
+  let markProcessingDepsReady!: () => void;
+  const processingDepsReady = new Promise<void>((resolve) => {
+    markProcessingDepsReady = resolve;
+  });
 
   // 15. Initialize registration store and index (before EventRouter so it can match events)
   const registrationStore = new RegistrationStore(db);
   const registrationIndex = new RegistrationIndex(registrationStore);
 
   // Cached per-org sandbox escape-hatch allow-list reader, consumed at dispatch
-  // (both the webhook and internal-event paths) to resolve `sandbox:` requests —
-  // the single enforcement point. Created here so the internal-event dispatcher
-  // (buildOnEventMatched, below) and the subsystems bundle share one instance.
+  // to resolve `sandbox:` requests — the single enforcement point. Created here
+  // so every consumer in the subsystems bundle shares one instance.
   const sandboxAllowListReader = createSandboxAllowListReader({ db });
 
   const eventRouter = new EventRouter({
@@ -3500,18 +3441,26 @@ export async function bootstrapOrchestrator(
     trustStore,
     config: eventRouterConfig,
     clusterSettings,
-    onEventMatched: buildOnEventMatched(
-      dispatcherRef,
-      executionTracker,
-      providerRegistryRef,
-      coordinatorRef,
-      db,
-      sandboxAllowListReader,
-    ),
+    onEventMatched: buildOnEventMatched(dispatcherRef, providerRegistryRef, processingDepsRef),
+    dispatchReady: () => processingDepsReady,
     registrationIndex,
     nodeId: config.instanceId,
   });
   eventEmitter = new EventEmitter(eventRouter);
+
+  // Invoke-gate dependencies: the summon callback matches + dispatches the source
+  // repo's opt-in subscribers in-process, and the chain-depth bound comes from the
+  // same config the event router uses. Threaded into the dispatch pipeline via
+  // ProcessingDeps so a gate job runs the executor instead of reaching an agent.
+  const invokeGateDeps: InvokeGateDeps = {
+    db,
+    executionTracker,
+    summon: buildSummonCallback(dispatcherRef, providerRegistryRef, eventRouter, processingDepsRef),
+    maxChainDepth: config.eventRouterMaxChainDepth,
+  };
+  // Bind the late ref so the onJobReady callback (registered above) can release
+  // a needs-gated invoke gate through the gate executor.
+  invokeGateDepsRef.current = invokeGateDeps;
 
   // Start event store cleanup and event router LISTEN/NOTIFY
   // EventRouter.start() loads registrations from DB via registrationIndex
@@ -3550,15 +3499,23 @@ export async function bootstrapOrchestrator(
   // leadership callback; the closures reference it lazily so a null (no scaler)
   // deployment no-ops.
   let pendingScaleSweeper: PendingScaleSweeper | null = null;
+  // Leader-gated teardown backstop for event-scaler provisions. Constructed
+  // once `cluster` exists (it needs the peer registry to tell a live adopter
+  // from a dead one), which is still well before `cluster.raft.start()` fires
+  // any leadership callback; the closures reference it lazily so a no-scaler
+  // deployment no-ops.
+  let eventProvisionReaper: EventProvisionReaper | null = null;
   eventRetryScannerRef.onBecomeLeader = () => {
     eventRetryScanner.onBecomeLeader();
     hostRosterReaper.onBecomeLeader();
     pendingScaleSweeper?.onBecomeLeader();
+    eventProvisionReaper?.onBecomeLeader();
   };
   eventRetryScannerRef.onLoseLeadership = () => {
     eventRetryScanner.onLoseLeadership();
     hostRosterReaper.onLoseLeadership();
     pendingScaleSweeper?.onLoseLeadership();
+    eventProvisionReaper?.onLoseLeadership();
   };
 
   // 17. Initialize cron scheduler
@@ -3594,8 +3551,22 @@ export async function bootstrapOrchestrator(
       clusterSettings,
     ),
     onNoMatchingAgent: scalerManager
-      ? (labels, jobId, runId, excludeLabels, resources, orgId) =>
-          scalerManager!.requestScale(labels, jobId, runId, excludeLabels ?? [], resources, orgId)
+      ? (labels, jobId, runId, excludeLabels, resources, orgId, containerSpawn) =>
+          scalerManager!.requestScale(
+            labels,
+            jobId,
+            runId,
+            excludeLabels ?? [],
+            resources,
+            orgId,
+            containerSpawn,
+          )
+      : undefined,
+    canPrespawnedAgentServe: scalerManager
+      ? (agentId, job) => scalerManager!.canPrespawnedAgentServe(agentId, job)
+      : undefined,
+    isPrespawnedAgent: scalerManager
+      ? (agentId) => scalerManager!.isPrespawnedAgent(agentId)
       : undefined,
     isDraining: () => drainController.isDraining(),
     maxReconnectDelayMs: config.agentMaxReconnectDelayMs,
@@ -3767,7 +3738,79 @@ export async function bootstrapOrchestrator(
     logWriter,
     hooks.forwardLogChunk,
   );
-  coordinatorRef.current = cluster.coordinator;
+  if (scalerManager) {
+    const manager = scalerManager;
+    // A fresh handle rather than a plumbed one: the store is a stateless
+    // wrapper over the same `db` pool, so a second instance reads exactly the
+    // rows the scaler's own instance writes.
+    const reaperStateStore = new ScalerStateStore(db);
+    eventProvisionReaper = new EventProvisionReaper({
+      listCandidates: (cutoff) => reaperStateStore.listReapCandidates(cutoff),
+      // Mirrors `shouldDeferReroutedJob`: `peer.connected` flips on WS close
+      // with no grace, so a link blip between two healthy coordinators would
+      // otherwise be indistinguishable from a dead one — while the agent is
+      // still connected to that peer running a customer job.
+      isPeerLive: (instanceId, flapGraceMs) =>
+        instanceId === config.instanceId ||
+        adopterIsLive(cluster.peerRegistry.getPeer(instanceId), Date.now(), flapGraceMs),
+      // A coordinator with zero connected coordinator peers self-elects after
+      // the dormant-mode window, so both halves of a partitioned pair become
+      // leader and each would read every agent the other holds as gone.
+      // Standing down is the only safe answer. The counting rule, and why it
+      // spans both config and the live registry, is in `canReapForCluster` —
+      // which is unit-tested against a real `PeerRegistry`, because an untested
+      // predicate here is what let the guard read permissive on a Platform-mode
+      // HA pair.
+      canReap: () => canReapForCluster(config.cluster.peers.length, cluster.peerRegistry),
+      // Cluster-wide on purpose: an event agent adopted by a peer is registered
+      // on that peer, never here, so a local-only lookup would read every
+      // healthy adopted provision as stranded. Peers publish their agent list on
+      // each heartbeat, which is why the stranded deadline is generous.
+      isAgentRegistered: (agentId) =>
+        agentRegistry.get(agentId) !== undefined ||
+        cluster.peerRegistry
+          .getConnectedPeers()
+          .some((peer) => peer.agents.some((agent) => agent.agentId === agentId)),
+      emitScaleDown: (candidate, reason) => manager.emitOrphanScaleDown(candidate, reason),
+      purgeExpiredClaims: (cutoff) => reaperStateStore.purgeExpiredClaims(cutoff),
+      purgeProvisionOutcomes: (cutoff) => reaperStateStore.purgeProvisionOutcomes(cutoff),
+      // Read per sweep, so `kici-admin cluster-settings --scaler-reap-*` retunes
+      // a running cluster without a restart. `spawnTimeoutMs` is the one value
+      // read from static config: its operator knob is per-tenant
+      // (`org_settings.scaler_spawn_timeout_ms`) and the reaper works off spawn
+      // rows that carry no org, so the cluster-wide default is the only
+      // defensible cutoff here.
+      resolveWindows: async () => ({
+        intervalMs: await clusterSettings.getNumber(
+          'scaler_reap_interval_ms',
+          config.scalerReapIntervalMs,
+        ),
+        spawnTimeoutMs: config.scalerSpawnTimeoutMs,
+        // Shared with the rerouted-job guard rather than given a knob of its
+        // own: both ask "has this peer really gone, or is it reconnecting?",
+        // and two knobs for one question drift into one sweeper deferring a
+        // flap the other reaps on. Floored, because the two consumers do not
+        // carry the same risk — see `reaperFlapGraceMs`.
+        flapGraceMs: reaperFlapGraceMs(
+          await clusterSettings.getNumber('reroute_flap_grace_ms', config.rerouteFlapGraceMs),
+          config.cluster.peerStaleTimeoutMs,
+        ),
+        strandedTimeoutMs: await clusterSettings.getNumber(
+          'scaler_reap_stranded_timeout_ms',
+          config.scalerReapStrandedTimeoutMs,
+        ),
+        reattemptIntervalMs: await clusterSettings.getNumber(
+          'scaler_reap_reattempt_interval_ms',
+          config.scalerReapReattemptIntervalMs,
+        ),
+        claimRetentionMs: await clusterSettings.getNumber(
+          'scaler_claim_retention_ms',
+          config.scalerClaimRetentionMs,
+        ),
+      }),
+      bootIntervalMs: config.scalerReapIntervalMs,
+    });
+  }
 
   // Late-bind the cross-peer agent-token-revoke broadcaster onto adminDeps
   // now that `cluster` exists. The DELETE /api/v1/agent-tokens/:id route
@@ -4052,6 +4095,7 @@ export async function bootstrapOrchestrator(
     eventRouter,
     eventStore,
     eventEmitter: eventEmitter!,
+    invokeGateDeps,
     genericSourceManager,
     ensureProviderBundle,
     trustStore,
@@ -4067,12 +4111,15 @@ export async function bootstrapOrchestrator(
     getLocalInventory: cluster.getLocalInventory,
     broadcastHeartbeatToAllPeers: cluster.broadcastHeartbeatToAllPeers,
     broadcastAgentTokenRevoke: cluster.broadcastAgentTokenRevoke,
+    planHeadroomStore: cluster.planHeadroomStore,
+    setMembershipReporter: cluster.setMembershipReporter,
     joinHandler,
     configReloader: null as any, // assigned after creation below
     localConfigVersion: localConfigVersionRef.value,
     sourceStore,
     sourceManager,
     genericSourcesChangeListener,
+    dashboardWritePolicyChangeListener,
     eventLogWriter,
     accessLogWriter,
     coldStore: coldStoreSingleton,
@@ -4093,10 +4140,32 @@ export async function bootstrapOrchestrator(
     }),
     fleetCollectResponder: (msg, send) =>
       cluster.fleetResponderRef.current?.(msg, send) ?? Promise.resolve(),
+    // Lazy by construction: `processingDepsRef` is populated by `createApp`,
+    // which has not run yet at `onSubsystemsReady` time. `requireProcessingDeps`
+    // throws rather than returning a half-built bag, so a caller that reads it
+    // too early fails loudly instead of resuming a run against nothing.
+    buildProcessingDeps: () => requireProcessingDeps(processingDepsRef)(),
   };
 
   // 24. Call mode-specific hook for wiring
   const modeResult = await hooks.onSubsystemsReady(subsystems);
+
+  // Arm the ready-dispatch concurrency re-gate now that the mode hook has
+  // supplied the stores it reads. A mode that supplies neither leaves the ref
+  // null, which is the correct degraded behaviour for a deployment with no
+  // context store rather than a silent misbehaviour.
+  {
+    const gateMatchContext = modeResult.appDepsExtras?.matchContext as
+      ReadyDispatchGateDeps['matchContext'] | undefined;
+    const gateHeldRunStore = modeResult.appDepsExtras?.heldRunStore as HeldRunStore | undefined;
+    if (gateMatchContext && gateHeldRunStore) {
+      readyGateDepsRef.current = {
+        matchContext: gateMatchContext,
+        heldRunStore: gateHeldRunStore,
+        accessLogWriter,
+      };
+    }
+  }
 
   // 25. Start Raft. Webhook secrets are read on-demand by
   //     verifyInboundWebhook directly from PgSecretStore, so there is no
@@ -4236,6 +4305,11 @@ export async function bootstrapOrchestrator(
               scalerConfigReloadsTotal.add(1, { result: 'failed' });
               return;
             }
+            // The dashboard diagnostics snapshot renders its scaler list from
+            // this stored config, not from the manager, so leaving it at the
+            // boot-time value makes the panel hide a scaler the reload just
+            // added and keep showing one it removed.
+            subsystems.scalerConfig = newScalerConfig;
             logger.info('Scaler configuration reloaded successfully');
             scalerConfigReloadsTotal.add(1, { result: 'success' });
           } catch (err) {
@@ -4375,6 +4449,9 @@ export async function bootstrapOrchestrator(
   let warm = false;
 
   const { app, wss, tryDispatchNextQueued, reinjectDirect } = createApp({
+    // Populated by createApp with the live ProcessingDeps factory, which the
+    // event router's already-registered callbacks then dispatch through.
+    processingDepsRef,
     config,
     db,
     clusterSettings,
@@ -4407,6 +4484,8 @@ export async function bootstrapOrchestrator(
     cacheStorage,
     provenanceTrustRoot,
     localOidcSigner,
+    // Test-only policy for the initial-mint provenance seam (undefined in prod).
+    faultInjection,
     ...(provenanceSigningEnabled && orchestratorSigningRepo
       ? {
           provenanceSigning: {
@@ -4431,6 +4510,10 @@ export async function bootstrapOrchestrator(
     pendingGlobalEvals,
     checkRunReporter,
     executionTracker,
+    // The invoke-gate summon deps must reach the app's webhook pipeline so a
+    // global-workflow (or per-repo) invoke gate dispatched through it can run the
+    // gate executor instead of failing with "gate dependencies unavailable".
+    invokeGateDeps,
     logWriter,
     stepLogBuffer,
     adminDeps,
@@ -4487,6 +4570,16 @@ export async function bootstrapOrchestrator(
     },
     ...modeResult.appDepsExtras,
   });
+  // Release the internal-event dispatch latch: createApp populated
+  // `processingDepsRef` synchronously, so every event the router held back
+  // during bootstrap can now dispatch.
+  if (!processingDepsRef.current) {
+    throw new Error(
+      'createApp did not populate processingDepsRef; internal-event dispatch would be dead',
+    );
+  }
+  markProcessingDepsReady();
+
   // Wire the long-poll concurrency dispatcher built inside createApp into the
   // forward-declared ref consumed by `onExecutionComplete` above.
   tryDispatchNextQueuedRef = tryDispatchNextQueued;
@@ -4549,8 +4642,26 @@ export async function bootstrapOrchestrator(
     // scope). Supplied by the platform/hybrid mode hook alongside heldRunStore.
     onWorkflowRelease: modeResult.appDepsExtras?.onWorkflowRelease as
       ((signal: ReleaseSignal) => Promise<void>) | undefined,
+    // Resume a JOB-scoped wait-timer hold by re-dispatching the one job it held.
+    // Threaded from the same extras object — without it a job-scoped release
+    // flips the hold row and then strands the job, which the detector logs
+    // loudly rather than swallowing.
+    onJobRelease: modeResult.appDepsExtras?.onJobRelease as
+      ((signal: ReleaseSignal) => Promise<void>) | undefined,
+    // Lets the queued-concurrency sweep read each group's configured limit.
+    // Without it the sweep is inert — which is the correct degraded behaviour
+    // for a deployment with no context store, not a silent misbehaviour.
+    matchContext: modeResult.appDepsExtras?.matchContext as
+      | ((orgId: string, name: string) => Promise<{ concurrency_limit: number | null } | null>)
+      | undefined,
     // Audit each approval-hold expiry to the orchestrator access-log stream.
     accessLogWriter,
+    // Lets an expiring security hold complete the `KiCI Security` check it
+    // posted when it was raised. Read through the ref, not the registry value:
+    // `sourceManager` replaces the registry whenever sources are (re)loaded, and
+    // the detector runs for the process lifetime.
+    resolveCheckStatusPoster: (routingKey) =>
+      providerRegistryRef.current.getByRoutingKey(routingKey)?.checkStatusPoster,
   });
   await staleRunDetector.cleanupOrphanedRecoveryJobs();
   await staleRunDetector.start();
@@ -4593,6 +4704,19 @@ export async function bootstrapOrchestrator(
   });
   await workflowDeadlineDetector.start();
   logger.info('Workflow deadline detector started', {
+    scanIntervalMs: config.staleDetectorScanIntervalMs,
+  });
+
+  // Invoke gates run no steps on an agent, so their job timeout is enforced
+  // orchestrator-side: fail a gate whose proxies have not all terminalized in
+  // time. Reuses the stale-detector scan interval.
+  const gateDeadlineDetector = new GateDeadlineDetector({
+    db,
+    executionTracker,
+    scanIntervalMs: config.staleDetectorScanIntervalMs,
+  });
+  await gateDeadlineDetector.start();
+  logger.info('Gate deadline detector started', {
     scanIntervalMs: config.staleDetectorScanIntervalMs,
   });
 
@@ -4731,6 +4855,7 @@ export async function bootstrapOrchestrator(
       {
         name: 'Shutting down scaler',
         fn: async () => {
+          eventProvisionReaper?.stop();
           if (scalerManager) await scalerManager.shutdownAll();
         },
       },
@@ -4790,6 +4915,10 @@ export async function bootstrapOrchestrator(
         fn: () => genericSourcesChangeListener.stop(),
       },
       {
+        name: 'Stopping dashboard-write policy change listener',
+        fn: () => dashboardWritePolicyChangeListener.stop(),
+      },
+      {
         name: 'Stopping event router',
         fn: async () => {
           await eventRouter.stop();
@@ -4811,6 +4940,10 @@ export async function bootstrapOrchestrator(
       {
         name: 'Stopping workflow deadline detector',
         fn: () => workflowDeadlineDetector.stop(),
+      },
+      {
+        name: 'Stopping gate deadline detector',
+        fn: () => gateDeadlineDetector.stop(),
       },
       {
         name: 'Stopping heartbeat monitor',

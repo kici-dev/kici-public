@@ -65,7 +65,18 @@ Orchestrator                         Agent                    Sandbox (child pro
 
 ### Agent pipeline
 
-The agent delegates job execution to an `ExecutionSandbox` (container, bare-metal, or firecracker). The sandbox runs customer code in an isolated child process -- never in the agent's V8 isolate. Four job types are handled: execution jobs (sandbox), build-only jobs (in-process, cache population), init-only jobs (in-process, dynamic field resolution), and DynamicJobFn evaluation jobs (in-process, runtime job generation). See [Job execution lifecycle](./execution/job-execution.md) for details.
+The agent delegates job execution to an `ExecutionSandbox` (container, bare-metal, or firecracker). The sandbox runs customer code in an isolated child process -- never in the agent's V8 isolate.
+
+Six job types are handled. Only the first uses a sandbox; the other five run in-process, because they never execute customer workflow steps:
+
+- **Execution jobs** -- the standard sandbox path.
+- **Init-only jobs** -- dynamic field resolution.
+- **Global-eval-round jobs** -- filters and generators for the candidate global workflows of one workflow repo.
+- **DynamicJobFn evaluation jobs** -- runtime job generation.
+- **Bring-up jobs** -- init-runner SSH bring-up. No clone, no sandbox.
+- **Build-only jobs** -- cache population.
+
+See [Job execution lifecycle](./execution/job-execution.md) for details.
 
 1. **Report running** -- Send `job.status: running` immediately upon accepting the dispatch
 2. **Sandbox selection** -- Determine execution mode (container, bare-metal, firecracker) from job config and environment
@@ -138,7 +149,7 @@ Build Job Dispatch --> Build Agent (kici:role:builder + matching kici:os:/kici:a
   |                      |-- Pack .kici/ source (portable tar.gz, excludes node_modules)
   |                      |-- Pack .kici/node_modules (portable tar.gz)
   |                      |-- Upload source tarball to cache (source/{contentHash}.tar.gz)
-  |                      |-- Upload deps tarball to cache (deps/{plat}-{arch}/{lockfileHash}.tar.gz)
+  |                      |-- Upload deps tarball to cache (deps/{plat}-{arch}/{depsHash}.tar.gz)
   |                      |-- Upload deps companion .hash file
   |                      |-- Report success (cache.upload.complete × 2)
   |                      |
@@ -212,7 +223,7 @@ Dep cache misses alone do **not** trigger a build job. Deps are platform-specifi
 
 ### Cross-source / no-contentHash workflows
 
-- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 34.
+- **Lock files without `contentHash`** (schema v1) skip the source cache entirely; agents compile from source. Regenerate lock files with `kici compile` to enable caching. The current lock file schema version is 39.
 - **Cross-source / global-workflow dispatch** (a workflow registered against source A fired by a webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 
 ### Build deduplication
@@ -252,7 +263,10 @@ Both source and dep caches use `S3CacheStorage` as the sole backend. The `CacheS
 Cache keys reflect that source tarballs and deps have different platform characteristics:
 
 - **Source:** `source/{contentHash}.tar.gz` — platform-agnostic. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(COMPILE_SCHEMA_VERSION + ":" + rawSource [+ "\0" + assetDigest])`, where `COMPILE_SCHEMA_VERSION = 5` and line endings are normalized to LF so the hash agrees across platforms).
-- **Deps:** `deps/{platform}-{arch}/{lockfileHash}.tar.gz` (e.g., `deps/linux-arm64/def456.tar.gz`) — platform-specific. Native dependencies in `node_modules` differ across architectures, so each platform/arch combination gets its own cache entry.
+- **Deps:** `deps/{platform}-{arch}/{depsHash}.tar.gz`, with a
+  `deps/{platform}-{arch}/{lockfileHash}.hash` pointer holding that hash — the
+  tarball is addressed by its own content, so two builds sharing a lock file
+  cannot leave a tarball and an integrity hash that disagree. Platform-specific. Native dependencies in `node_modules` differ across architectures, so each platform/arch combination gets its own cache entry.
 
 The orchestrator derives the target platform/arch for dep cache lookups by probing `AgentRegistry.findAvailable()` with the workflow's first job's `runsOn` labels to find a representative matching agent, then using that agent's platform and arch. Falls back to `linux/x64` if no matching agents are registered.
 

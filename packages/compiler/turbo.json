@@ -3,7 +3,7 @@
   "tasks": {
     "build": {
       "env": ["KICI_BUILD_COMMIT"],
-      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/docs/**/*.md"]
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/docs/**/*.md", "!$TURBO_ROOT$/docs/changelog.md"]
     }
   }
 }

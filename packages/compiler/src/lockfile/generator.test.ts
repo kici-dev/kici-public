@@ -313,6 +313,45 @@ describe('generator - agent execution fields', () => {
       }
     });
 
+    it('serializes container registry auth (secret key-names) to LockJob', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: {
+          image: 'reg:5000/acme/ci:1.2',
+          auth: { usernameSecret: 'prod:u', tokenSecret: 'prod:t' },
+        },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+      const lockJob = lockFile.workflows[0].jobs[0];
+      // Asserted unconditionally: an `if (_type === 'static')` guard would make
+      // this pass silently if the job ever stopped being static.
+      expect(lockJob._type).toBe('static');
+      expect((lockJob as { container?: unknown }).container).toEqual({
+        image: 'reg:5000/acme/ci:1.2',
+        auth: { usernameSecret: 'prod:u', tokenSecret: 'prod:t' },
+      });
+    });
+
+    it('serializes the *Value half of a container auth pair', () => {
+      const s = step('build', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        container: { image: 'ghcr.io/acme/ci:1', auth: { tokenValue: 'runtime-token' } },
+      });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockJob = generateLockFile([makeWorkflowWithSource(w)]).workflows[0].jobs[0];
+      expect(lockJob._type).toBe('static');
+      expect((lockJob as { container?: { auth?: unknown } }).container?.auth).toEqual({
+        tokenValue: 'runtime-token',
+      });
+    });
+
     it('serializes the sandbox escape-hatch request to LockJob', () => {
       const s = step('build', async () => {});
       const j = job('build', {
@@ -546,14 +585,38 @@ describe('generator - content hash fields', () => {
     expect(lockFile1.workflows[0].contentHash).not.toBe(lockFile2.workflows[0].contentHash);
   });
 
-  it('schemaVersion is 35', () => {
+  it('emits the current schemaVersion into the lock', () => {
     const s = step('build', async () => {});
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    expect(lockFile.schemaVersion).toBe(35);
-    expect(SCHEMA_VERSION).toBe(35);
+    // What matters here is that the generator stamps the engine's version, not
+    // what that number happens to be — the number itself is pinned once, in
+    // engine's own types.test.ts, so a bump does not churn every mirror.
+    expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
+  });
+
+  it('emits an invoke gate lock job (optional set, steps empty)', () => {
+    const gate = job('repo-tests', {
+      invoke: sdk.invokeSource('myorg.repo-tests', { optional: true }),
+    });
+    const w = workflow('ci', { jobs: [gate] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0] as any;
+    expect(lockJob.invoke.event).toBe('myorg.repo-tests');
+    expect(lockJob.invoke.scope).toBe('source');
+    expect(lockJob.invoke.optional).toBe(true);
+    expect(lockJob.steps).toEqual([]);
+  });
+
+  it('omits invoke.optional for a require-by-default gate', () => {
+    const gate = job('repo-tests', { invoke: sdk.invokeSource('myorg.repo-tests') });
+    const w = workflow('ci', { jobs: [gate] });
+    const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
+    const lockJob = lockFile.workflows[0].jobs[0] as any;
+    expect(lockJob.invoke.event).toBe('myorg.repo-tests');
+    expect('optional' in lockJob.invoke).toBe(false);
   });
 
   it('serializes runsOnPick: deterministic by default and any when set', () => {

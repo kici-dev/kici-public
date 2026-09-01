@@ -9,7 +9,7 @@ Every workflow run moves through a lifecycle: it is created, its jobs are dispat
 
 The status vocabularies are the wire contract. They are shared enums defined once in `packages/engine/src/protocol/messages/execution-status.ts` and carried on the `execution.status`, `job.status`, and `step.status` protocol messages, so the orchestrator and agent always agree on the set of legal values.
 
-Lifecycle _logic_ — deciding when a run is complete, rolling job outcomes up into a run outcome, and persisting the result — lives in the orchestrator's execution tracker (`packages/orchestrator/src/reporting/execution-tracker.ts`). The tracker is the single authority for run state; there is no separate transition engine.
+Lifecycle _logic_ — deciding when a run is complete, rolling job outcomes up into a run outcome, and persisting the result — lives in the orchestrator's execution tracker (`packages/orchestrator/src/reporting/execution-tracker.ts`). The tracker is the single authority for run state; there is no separate transition engine. What the tracker does not decide for itself is what each status _means_: the failure classification and the precedence order it reads are a shared engine table (`packages/engine/src/status/presentation.ts`), described under [shared status classification](#shared-status-classification) below.
 
 ## Status vocabularies
 
@@ -66,7 +66,7 @@ A step is one command within a job. Steps report independently so the run timeli
 | `pending`   | A parallel-group child queued behind the group's `maxParallel` limit, not yet launched. |
 | `cancelled` | A parallel-group sibling aborted by fail-fast. This is **not** a failure.               |
 
-A `TERMINAL_STEP_STATES` constant sits alongside the run and job terminal sets described below (`success`, `failed`, `skipped`, `cancelled`), but no lifecycle logic consults it — a step's outcome is read directly from its status.
+A `TERMINAL_STEP_STATES` constant sits alongside the run and job terminal sets described below (`success`, `failed`, `skipped`, `cancelled`). No lifecycle logic consults it — a step's outcome is read directly from its status. Its one consumer is the dashboard, which pairs it with the job status to decide when a job has stopped producing log lines.
 
 Each step also carries a concurrency role (`StepConcurrencyKind`) that explains which of those values it can take: `sequential` for an ordinary step in the flat step sequence, `parallel-child` for a member of a `parallel()` group running concurrently with its siblings, and `parallel-group` for the structural group wrapper the dashboard renders as an aggregate band. The `pending` and `cancelled` statuses only ever appear on parallel-group children.
 
@@ -76,15 +76,27 @@ A status is **terminal** when the entity has reached a final outcome and will no
 
 - **`TERMINAL_RUN_STATES`** = `success`, `failed`, `cancelled`.
 - **`TERMINAL_JOB_STATES`** = `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`.
-- **`TERMINAL_STEP_STATES`** = `success`, `failed`, `skipped`, `cancelled`. Exported for completeness; the lifecycle paths read a step's status directly instead.
+- **`TERMINAL_STEP_STATES`** = `success`, `failed`, `skipped`, `cancelled`. The lifecycle paths read a step's status directly instead. The dashboard's run-detail log viewer is the set's one consumer: a job whose agent went silent is finalised on the job row alone, so its steps stay at `running` forever, and the viewer checks the job status first and the step set second before it closes a job's live log subscriptions.
 
 The four extra job-terminal values — `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` — are **job-level verdicts**. They describe how an individual job settled, and they roll up into the run's aggregate outcome rather than appearing on the run directly. A run whose only unfinished job is skipped still settles on `success` or `failed` based on its other jobs; it never carries a `skipped` status of its own. Keeping the two sets separate is what makes a run-level terminal check use the 3-value set and a job-level check use the 7-value set.
+
+`TerminalJobStatus` is the type-level counterpart of `TERMINAL_JOB_STATES`, and its direction is deliberate. It is written as an `Exclude<>` of the five non-terminal statuses rather than an `Extract<>` of the seven terminal ones, because only `Exclude<>` widens when a value joins the enum. A switch that claims to be total over the terminal set then fails to compile until the new status is handled — which is the only reason to write such a switch. The check-run reporter is the consumer that relies on this: it maps each terminal job status onto a provider check conclusion, and a new status must not silently fall through to a default arm.
+
+## Shared status classification
+
+The enums say which values are legal; a second engine module says what they mean. `packages/engine/src/status/presentation.ts` holds the classification every consumer reads, keyed by `CanonicalStatus` — the union of the run and job vocabularies, of which the step vocabulary is a strict subset:
+
+- **`STATUS_FAILURE_CLASS`** classifies each status as `failure`, `cancelled`, `neutral`, `success`, or `in-flight`. Four statuses classify as `failure`: `failed`, `timed_out_stale`, `drift_dropped`, and `unroutable` — in each case a job the workflow declared did not do what it declared. `skipped` is `neutral` (terminal, but it never ran) and `cancelled` is its own class. `isFailureStatus()` is the one predicate over this table, and both the run outcome roll-up below and the `on-failure` needs edge read it, which is what stops them from disagreeing about what "failed" means.
+- **`STATUS_PRECEDENCE`** ranks every status worst-first for roll-up aggregates such as a matrix band or a parallel group header. Failures outrank in-flight states, so one failed shard reddens its group immediately instead of waiting for its siblings to settle; `success` outranks `skipped`, so a matrix where three shards were narrowed out and one passed reads green. `worstStatus()` returns the winning status for a set of children, or `undefined` when it recognises none — a roll-up never invents a status for a child it did not understand.
+- **`LEGACY_STATUS_ALIASES`** resolves older spellings (`passed`, `completed`, `in_progress`, `error`, `canceled`, `waiting`) onto their canonical status, so no consumer keeps a second copy of the mapping. `toCanonicalStatus()` resolves canonical values and aliases alike, and returns `undefined` for anything else.
+
+The module is pure Zod and rides the engine barrel, so the dashboard reads the same classification the orchestrator writes.
 
 ## Run outcome roll-up
 
 The tracker folds job outcomes into the run outcome with a fixed rule, applied in order:
 
-- The run is `failed` if **any** job ended `failed`, `timed_out_stale`, `drift_dropped`, or `unroutable` — the three infra-class job verdicts fail the run exactly like an ordinary job failure. `unroutable` in particular is what stops a run whose job could not be routed from reporting success on its siblings alone.
+- The run is `failed` if **any** job ended in a `failure` status — `failed`, `timed_out_stale`, `drift_dropped`, or `unroutable`. The three infra-class job verdicts fail the run exactly like an ordinary job failure, and `unroutable` in particular is what stops a run whose job could not be routed from reporting success on its siblings alone. The tracker does not hand-list those four: both its in-memory path and its database-fallback path ask `isFailureStatus()`, so the two cannot disagree, and neither can drift from the `on-failure` needs edge.
 - Otherwise the run is `cancelled` if **any** job was cancelled.
 - Otherwise the run is `success`. Jobs that were `skipped` do not hold a run back from succeeding.
 

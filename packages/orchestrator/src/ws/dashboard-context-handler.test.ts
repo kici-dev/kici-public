@@ -2,7 +2,13 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DashboardContextHandler } from './dashboard-context-handler.js';
 import type { DashboardContextHandlerDeps } from './dashboard-context-handler.js';
 import type { DashboardPlatformToOrchMessage } from '@kici-dev/engine';
-import { ContextDeleteErrorCode, AccessLogOutcome, HoldType } from '@kici-dev/engine';
+import {
+  ContextDeleteErrorCode,
+  AccessLogOutcome,
+  HoldType,
+  stringifyActor,
+  type ActorPrincipal,
+} from '@kici-dev/engine';
 import { ContextDeleteBlockedError } from '../contexts/context-store.js';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
 import { loadRoutableStores } from '../secrets/scope-routing.js';
@@ -1468,6 +1474,245 @@ describe('DashboardContextHandler held-runs list hold types', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(whereCalls().some((call) => call[0] === 'held_runs.id')).toBe(false);
+    });
+  });
+
+  // ── the self-approval gate, driven through the handler ────────────────────
+  //
+  // `applyDecision` refuses an approve when `actorSub === triggererSub`, so
+  // this handler's two renderings of one principal — the live actor's subject
+  // and the stored `execution_runs.triggered_by` — have to agree. They did not:
+  // the resolver split `triggered_by` on its first colon, which is wrong for
+  // an agent-mediated trigger (` via agent:<label>` rode along on the id) and
+  // for a service account (the live subject carries a `service:` prefix the
+  // split threw away). Both left the gate comparing strings that can never be
+  // equal, i.e. silently admitting every self-approval.
+  //
+  // The cases below drive the handler, not the mapper: the mapper's own unit
+  // tests cannot see a caller that stopped using it.
+  describe('held-runs approve — self-approval gate', () => {
+    /**
+     * A handler wired with the resolver-backed approval path, and a db mock
+     * that answers per selected column (both `org_settings` reads hit the same
+     * table, so the table alone cannot disambiguate them).
+     */
+    function selfApprovalHandler(triggeredBy: string) {
+      const sent: unknown[] = [];
+      let lastSelect = '';
+      const db: any = {
+        selectFrom: vi.fn().mockReturnThis(),
+        select: vi.fn((col: string) => {
+          lastSelect = col;
+          return db;
+        }),
+        where: vi.fn().mockReturnThis(),
+        executeTakeFirst: vi.fn(async () => {
+          if (lastSelect === 'dashboard_write_policy') return { dashboard_write_policy: null };
+          if (lastSelect === 'allow_self_approval') return { allow_self_approval: false };
+          if (lastSelect === 'triggered_by') return { triggered_by: triggeredBy };
+          return undefined;
+        }),
+      };
+      const store = {
+        getById: vi.fn().mockResolvedValue({
+          id: 'hr-self',
+          run_id: 'run-self',
+          org_id: 'org-1',
+          status: 'pending',
+          hold_scope: 'job',
+          // No clauses: any actor the self-approval gate does not block is
+          // eligible, so a refusal here can only come from that gate.
+          approval_requirement: { clauses: [], expiresAt: '', reason: '' },
+        }),
+        listDecisions: vi.fn().mockResolvedValue([]),
+        recordDecision: vi.fn().mockResolvedValue(undefined),
+        recordAndRelease: vi.fn().mockResolvedValue({ heldRunId: 'hr-self', runId: 'run-self' }),
+      };
+      const deps = {
+        orgId: 'org-1',
+        send: (msg: unknown) => sent.push(msg),
+        db,
+        contextStore: {} as any,
+        variableStore: {} as any,
+        bindingStore: {} as any,
+        secretStore: {} as any,
+        approvals: {
+          store: store as any,
+          teamMembershipLookup: () => new Set<string>(),
+          resumeJob: vi.fn().mockResolvedValue(undefined),
+        },
+      } as unknown as DashboardContextHandlerDeps;
+      invalidateDashboardWritePolicyCache();
+      return { handler: new DashboardContextHandler(deps), sent, store };
+    }
+
+    async function approveAs(triggeredBy: string, actor: ActorPrincipal) {
+      const { handler: h, sent, store } = selfApprovalHandler(triggeredBy);
+      await h.handleMessage({
+        type: 'dashboard.held-runs.approve',
+        requestId: 'req-self',
+        heldRunId: 'hr-self',
+        actor,
+      } as DashboardPlatformToOrchMessage);
+      return { resp: sent.at(-1) as any, store };
+    }
+
+    it('refuses a user who triggered the run through an agent', async () => {
+      const actor: ActorPrincipal = { type: 'user', sub: 'kc-1' };
+      const { resp, store } = await approveAs(
+        stringifyActor({ type: 'user', sub: 'kc-1', agent: { label: 'builder' } }),
+        actor,
+      );
+      expect(resp.error).toMatch(/not eligible/);
+      expect(store.recordAndRelease).not.toHaveBeenCalled();
+    });
+
+    it('refuses the service account that triggered the run', async () => {
+      const { resp, store } = await approveAs(
+        stringifyActor({ type: 'service_account', id: 'ops-token' }),
+        { type: 'service_account', id: 'ops-token' },
+      );
+      expect(resp.error).toMatch(/not eligible/);
+      expect(store.recordAndRelease).not.toHaveBeenCalled();
+    });
+
+    it('refuses the system component that triggered the run', async () => {
+      const { resp, store } = await approveAs(
+        stringifyActor({ type: 'system', component: 'dispatcher' }),
+        { type: 'system', component: 'dispatcher' },
+      );
+      expect(resp.error).toMatch(/not eligible/);
+      expect(store.recordAndRelease).not.toHaveBeenCalled();
+    });
+
+    it('still admits a different user', async () => {
+      // The negative control: the gate must refuse the triggerer, not everyone.
+      const { resp, store } = await approveAs(
+        stringifyActor({ type: 'user', sub: 'kc-1', agent: { label: 'builder' } }),
+        { type: 'user', sub: 'kc-2' },
+      );
+      expect(resp.error).toBeUndefined();
+      expect(store.recordAndRelease).toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * The relay answer goes out at the durable record, not at the resume.
+   *
+   * The defect: releasing a workflow-scoped fork-PR hold replays the whole
+   * stored dispatch context before acking, which measured 9.8 s inside the
+   * Platform's 10 s relay budget — so an approval that had already landed
+   * answered 504, and the operator's natural retry hit "already resolved".
+   */
+  describe('held-runs approve — answers before the resume', () => {
+    function applierHandler(resumeJob: (signal: unknown) => Promise<void>) {
+      const sent: unknown[] = [];
+      const accessLogRecord = vi.fn();
+      let lastSelect = '';
+      const db: any = {
+        selectFrom: vi.fn().mockReturnThis(),
+        select: vi.fn((col: string) => {
+          lastSelect = col;
+          return db;
+        }),
+        where: vi.fn().mockReturnThis(),
+        executeTakeFirst: vi.fn(async () => {
+          if (lastSelect === 'dashboard_write_policy') return { dashboard_write_policy: null };
+          if (lastSelect === 'allow_self_approval') return { allow_self_approval: true };
+          if (lastSelect === 'triggered_by') return { triggered_by: 'user:kc-other' };
+          return undefined;
+        }),
+      };
+      const store = {
+        getById: vi.fn().mockResolvedValue({
+          id: 'hr-async',
+          run_id: 'run-async',
+          job_id: 'deploy',
+          org_id: 'org-1',
+          status: 'pending',
+          hold_scope: 'job',
+          approval_requirement: { clauses: [], expiresAt: '', reason: '' },
+        }),
+        listDecisions: vi.fn().mockResolvedValue([]),
+        recordDecision: vi.fn().mockResolvedValue(undefined),
+        recordAndRelease: vi.fn().mockResolvedValue({
+          holdId: 'hr-async',
+          runId: 'run-async',
+          jobId: 'deploy',
+          scope: 'job',
+          stepIndex: null,
+          triggerSource: 'explicit',
+        }),
+      };
+      const deps = {
+        orgId: 'org-1',
+        send: (msg: unknown) => sent.push(msg),
+        db,
+        contextStore: {} as any,
+        variableStore: {} as any,
+        bindingStore: {} as any,
+        secretStore: {} as any,
+        accessLog: { record: accessLogRecord },
+        approvals: {
+          store: store as any,
+          teamMembershipLookup: () => new Set<string>(),
+          resumeJob,
+        },
+      } as unknown as DashboardContextHandlerDeps;
+      invalidateDashboardWritePolicyCache();
+      return { handler: new DashboardContextHandler(deps), sent, store, accessLogRecord };
+    }
+
+    const approveMsg = {
+      type: 'dashboard.held-runs.approve',
+      requestId: 'req-async',
+      heldRunId: 'hr-async',
+      actor: { type: 'user', sub: 'kc-approver' },
+    } as DashboardPlatformToOrchMessage;
+
+    it('sends the response while the resume is still running', async () => {
+      let releaseResume: (() => void) | undefined;
+      const h = applierHandler(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseResume = resolve;
+          }),
+      );
+
+      await h.handler.handleMessage(approveMsg);
+
+      const resp = h.sent.at(-1) as { type: string; error?: string };
+      expect(resp.type).toBe('dashboard.held-runs.approve.response');
+      expect(resp.error).toBeUndefined();
+      expect(h.store.recordAndRelease).toHaveBeenCalledTimes(1);
+      // Answered with the resume still in flight — the coupling being removed.
+      expect(releaseResume).toBeDefined();
+
+      releaseResume!();
+      await vi.waitFor(() => expect(h.accessLogRecord).toHaveBeenCalledTimes(1));
+      expect(h.accessLogRecord.mock.calls[0][0]).toMatchObject({
+        action: 'held_run.approve',
+        outcome: 'allowed',
+      });
+    });
+
+    it('still answers OK when the resume throws, and audits the failure as error', async () => {
+      // Where a failed resume surfaces: one `held_run.approve` access-log entry
+      // with outcome `error` and the failure message, readable in the dashboard
+      // activity view and with `kici-admin access-log`. The approval is durable
+      // regardless, which is why the answer stays a success.
+      const h = applierHandler(() => Promise.reject(new Error('dispatcher exploded')));
+
+      await h.handler.handleMessage(approveMsg);
+
+      const resp = h.sent.at(-1) as { type: string; error?: string };
+      expect(resp.error).toBeUndefined();
+      await vi.waitFor(() => expect(h.accessLogRecord).toHaveBeenCalledTimes(1));
+      expect(h.accessLogRecord.mock.calls[0][0]).toMatchObject({
+        action: 'held_run.approve',
+        outcome: 'error',
+      });
+      expect(h.accessLogRecord.mock.calls[0][0].errorMessage).toContain('dispatcher exploded');
     });
   });
 });

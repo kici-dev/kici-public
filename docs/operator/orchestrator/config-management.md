@@ -411,6 +411,8 @@ All endpoints are under `/admin/config/*` and require Bearer token authenticatio
 Authorization: Bearer <KICI_SECRET_KEY>
 ```
 
+Verification uses constant-time comparison.
+
 If no secret key is configured, all `/admin/config/*` endpoints return 503.
 
 ### Validate types

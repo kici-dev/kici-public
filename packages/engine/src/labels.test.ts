@@ -322,6 +322,19 @@ describe('scalerAgentLabels', () => {
     const labels = scalerAgentLabels(['linux'], 'container', 'c', []);
     expect(labels).toEqual(['linux', 'kici:agent:container', 'kici:scaler:c']);
   });
+
+  it('appends the platform taints, so a job asking for the platform can match', () => {
+    const labels = scalerAgentLabels(['linux'], 'bare-metal', 'gpu-pool', [], ['arm64']);
+    expect(labels).toEqual(['linux', 'kici:agent:bare-metal', 'kici:scaler:gpu-pool', 'arm64']);
+  });
+
+  it('de-duplicates a taint the label set already declares', () => {
+    // A warm pool measures readiness with the taints already in the label set,
+    // so it supplies them twice. The token is bound to this set; a repeated
+    // label in it is never meaningful.
+    const labels = scalerAgentLabels(['linux', 'arm64'], 'bare-metal', 'gpu-pool', [], ['arm64']);
+    expect(labels).toEqual(['linux', 'arm64', 'kici:agent:bare-metal', 'kici:scaler:gpu-pool']);
+  });
 });
 
 describe('isSelfReportedLabel', () => {

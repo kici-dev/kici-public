@@ -18,7 +18,17 @@
  */
 
 import { execFile, spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
-import { open, link, copyFile, mkdir, rm, writeFile, readFile, readdir } from 'node:fs/promises';
+import {
+  open,
+  link,
+  copyFile,
+  mkdir,
+  rm,
+  writeFile,
+  readFile,
+  readdir,
+  stat,
+} from 'node:fs/promises';
 import { openSync, closeSync, writeFileSync, readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
@@ -30,7 +40,7 @@ import { FirecrackerApi } from './firecracker-api.js';
 import { tailFile } from './file-tail.js';
 import { forwardLine } from './log-forwarder.js';
 import { ScalerEventType } from './types.js';
-import type { IpAllocator, IpAllocationResult } from './ip-allocator.js';
+import type { IpAllocator, IpAllocationResult, IpAllocationRecord } from './ip-allocator.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import {
   provisionBridge as defaultProvisionBridge,
@@ -54,6 +64,7 @@ async function linkOrCopy(src: string, dest: string): Promise<void> {
 }
 import type {
   ScalerBackend,
+  ScalerDestroyContext,
   ScalerEntry,
   ManagedAgent,
   LabelSetConfig,
@@ -188,7 +199,7 @@ export interface FirecrackerScalerBackendOptions {
 export class FirecrackerScalerBackend implements ScalerBackend {
   readonly type = ScalerBackendType.enum.firecracker;
   readonly spawnsOnLocalHost = true;
-  readonly maxAgents: number;
+  maxAgents: number;
 
   // Firecracker uses two logsSource values (firecracker-serial, firecracker-vmm),
   // but the getter returns a general identifier for the ScalerBackend interface.
@@ -335,7 +346,7 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     orchestratorUrl: string,
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
-    _spawnContext?: SpawnContext,
+    spawnContext?: SpawnContext,
     // The abort signal is accepted for interface parity but not threaded into
     // the VM-provisioning HTTP calls; the ScalerManager deadline race still
     // releases the semaphore slot if a boot hangs.
@@ -560,7 +571,13 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       // labels). Bind the ephemeral token to exactly this set so register-time
       // labels pass the scope gate; the agent adds only self-reported
       // os/arch/host facts on top, which the gate exempts.
-      const fullLabels = scalerAgentLabels(labelSet, this.type, this.name, this.roles);
+      const fullLabels = scalerAgentLabels(
+        labelSet,
+        this.type,
+        this.name,
+        this.roles,
+        spawnContext?.platformTaints,
+      );
 
       // 13. Create ephemeral agent token if token store is available
       let agentToken: string | undefined;
@@ -674,7 +691,8 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     await this.provisionBridgeFn(cfg, opts);
   }
 
-  async destroy(managedId: string): Promise<void> {
+  async destroy(managedId: string, _context?: ScalerDestroyContext): Promise<void> {
+    // _context (teardown reason) is only meaningful to the event backend.
     const managed = this.agents.get(managedId);
     if (!managed) return;
 
@@ -704,7 +722,10 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       const pidFile = join(this.getChrootDir(managedId), 'firecracker.pid');
       const pidStr = await readFile(pidFile, 'utf-8');
       const pid = parseInt(pidStr.trim(), 10);
-      if (!isNaN(pid)) {
+      // `> 0` and not merely `!isNaN`: a truncated or zeroed PID file parses to
+      // 0, and `process.kill(0, ...)` signals the orchestrator's OWN process
+      // group. No VM has PID 0, so the guard costs nothing.
+      if (pid > 0) {
         try {
           process.kill(pid, 'SIGKILL');
         } catch {
@@ -747,6 +768,129 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     this.agents.delete(managedId);
   }
 
+  /**
+   * Force-reclaim a VM this backend no longer tracks in memory.
+   *
+   * `destroy()` opens with `if (!managed) return`, so after an orchestrator
+   * restart it silently no-ops while the VM keeps running, holding its RAM and
+   * its IP. `cleanupOrphans()` cannot recover that VM either: every one of its
+   * three passes skips an id whose jailer process is alive, deliberately, since
+   * a live process is the only thing that distinguishes a healthy VM from a
+   * leaked one when you are sweeping blind.
+   *
+   * This is the same reclaim addressed to ONE id whose orphan status the caller
+   * already established, so the liveness check is exactly what must not apply.
+   * See `ScalerBackend.reapUnowned` for the two properties the caller relies on;
+   * the host-local half is enforced here by refusing to act unless the jailer
+   * chroot for `managedId` exists on THIS host. That directory is the only
+   * host-local artifact a VM leaves: an `ip_allocations` row is not one, because
+   * an HA pair is "two identical orchestrators sharing the same PostgreSQL,
+   * scalers, and routing key" (`docs/operator/orchestrator/clustering.md`), so a
+   * peer's live VM has a row naming this very scaler. The row is read only to
+   * finish a reclaim the chroot already authorized.
+   */
+  async reapUnowned(managedId: string): Promise<boolean> {
+    if (this.agents.has(managedId)) {
+      // Still tracked, so `destroy()` owns this id and holds the live TAP and
+      // IP for it. Reaping underneath it would race its teardown.
+      return false;
+    }
+
+    const vmDir = join(this.chrootBaseDir, 'firecracker', managedId);
+    let hasChroot = false;
+    try {
+      hasChroot = (await stat(vmDir)).isDirectory();
+    } catch {
+      // No chroot for this id on this host.
+    }
+    // THE ONE GATE. Without a chroot here, nothing places this VM on this host,
+    // and a shared `ip_allocations` row cannot stand in for one: on an HA pair
+    // both coordinators run the same named scalers against one database, so a
+    // peer's live VM carries a row that names this scaler. Releasing it would
+    // hand its address to the next VM — two guests on one IP, sharing the
+    // saddr-keyed isolation rules that are supposed to separate them. The
+    // row-without-chroot case needs no reclaim anyway: with no chroot there is
+    // no PID file to kill through, and `cleanupOrphans()` Pass 1 already
+    // releases such a row (no PID file means `isVmProcessAlive` reads false).
+    if (!hasChroot) return false;
+
+    let alloc: IpAllocationRecord | null = null;
+    try {
+      alloc = await this.ipAllocator.getAllocationForVm(managedId);
+    } catch (err) {
+      // Best effort: the chroot already authorized the reclaim, and a failed
+      // read only costs the IP release, which the next sweep redoes.
+      logger.warn('firecracker: allocation lookup failed during orphan reclaim', {
+        managedId,
+        error: toErrorMessage(err),
+      });
+    }
+    // A second firecracker scaler on this host has its own IP space and its own
+    // teardown, so only a row naming THIS scaler is ours to release.
+    const ownsAllocation = alloc !== null && alloc.scaler_name === this.name;
+
+    logger.warn('firecracker: reclaiming an unowned VM', {
+      managedId,
+      ownsAllocation,
+    });
+
+    // Forward whatever the serial console and VMM logs still hold before the
+    // chroot goes — this is the only record of why the VM was orphaned.
+    try {
+      await this.forwardRemainingLogs(managedId, this.getChrootDir(managedId));
+    } catch {
+      // Best effort — the log files may not exist.
+    }
+
+    // Kill the jailer process. Unlike `destroy()` there is no graceful
+    // SendCtrlAltDel first: the guest is a refused agent with no work in
+    // flight, and the API socket belongs to a VM this process never opened.
+    try {
+      const pidStr = await readFile(join(this.getChrootDir(managedId), 'firecracker.pid'), 'utf-8');
+      const pid = parseInt(pidStr.trim(), 10);
+      // `> 0`, for the same reason `destroy()` uses it: a truncated PID file
+      // parses to 0, and killing 0 kills this orchestrator's own process group.
+      if (pid > 0) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // ESRCH — already dead, which is the outcome we wanted.
+        }
+      }
+    } catch {
+      // No PID file: the VM never started, or the chroot is already partial.
+    }
+
+    if (alloc !== null && ownsAllocation) {
+      try {
+        await removeIsolationRules(alloc.ip, { requireSudo: this.requireSudo });
+      } catch {
+        // Best effort — a stale rule is inert once the TAP is gone.
+      }
+      try {
+        await this.execAsync('ip', ['link', 'del', alloc.tap_device]);
+      } catch {
+        // TAP may already be gone.
+      }
+      try {
+        await this.ipAllocator.release(managedId);
+      } catch (err) {
+        logger.warn('firecracker: IP release failed during orphan reclaim', {
+          managedId,
+          error: toErrorMessage(err),
+        });
+      }
+    }
+
+    try {
+      await this.removeChrootDir(managedId);
+    } catch {
+      // Best effort — the next sweep sees it now that the process is dead.
+    }
+
+    return true;
+  }
+
   async shutdownAll(): Promise<void> {
     this.stopPeriodicOrphanSweep();
     const ids = [...this.agents.keys()];
@@ -758,7 +902,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
    * Belt-and-suspenders: even though MMDS only contains orchestrator URL,
    * clearing it reduces the attack surface to zero post-startup.
    *
-   * Note: Wiring from agent-handler is done in Plan 04.
+   * Called by `ScalerManager.onConfigAck`, which reaches it structurally
+   * (`'clearAgentMmds' in backend`) rather than through `ScalerBackend` — no
+   * other backend has an MMDS to clear.
    *
    * @param agentId - The agent ID whose VM MMDS should be cleared
    */
@@ -775,7 +921,10 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     }
   }
 
-  reload(labelSets: LabelSetConfig[]): ValidationResult {
+  reload(
+    labelSets: LabelSetConfig[],
+    opts?: { maxAgents?: number; entry?: ScalerEntry },
+  ): ValidationResult {
     // Validate: all Firecracker label sets must have rootfsPath
     const errors: string[] = [];
     labelSets.forEach((ls, i) => {
@@ -789,6 +938,9 @@ export class FirecrackerScalerBackend implements ScalerBackend {
     }
 
     this._labelSets = labelSets;
+    if (opts?.maxAgents !== undefined) {
+      this.maxAgents = opts.maxAgents;
+    }
     return { valid: true };
   }
 
@@ -1226,7 +1378,11 @@ export class FirecrackerScalerBackend implements ScalerBackend {
       const pidFile = join(this.getChrootDir(vmId), 'firecracker.pid');
       const pidStr = await readFile(pidFile, 'utf-8');
       const pid = parseInt(pidStr.trim(), 10);
-      if (isNaN(pid)) return false;
+      // `> 0`, not `!isNaN`: a truncated PID file parses to 0, and signal 0 to
+      // PID 0 probes the orchestrator's own process group, which always exists.
+      // That reads back as "this VM is alive" forever, and every sweep skips a
+      // live-looking id — the chroot and the IP then leak permanently.
+      if (!(pid > 0)) return false;
 
       // signal 0 checks process existence without sending a signal
       process.kill(pid, 0);

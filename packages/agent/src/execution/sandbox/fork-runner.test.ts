@@ -564,6 +564,96 @@ describe('buildRequest - global workflow fields', () => {
   });
 });
 
+describe('fork-runner completion-hooks-done relay', () => {
+  let mockChild: ReturnType<typeof createMockChild>;
+
+  beforeEach(() => {
+    vi.resetModules();
+    mockChild = createMockChild();
+    vi.doMock('node:child_process', () => ({
+      fork: vi.fn().mockReturnValue(mockChild),
+      spawn: vi.fn().mockReturnValue(mockChild),
+    }));
+    vi.doMock('node:fs', () => ({ existsSync: vi.fn().mockReturnValue(false) }));
+    vi.doMock('./env-sanitizer.js', () => ({ buildSanitizedEnv: vi.fn().mockReturnValue({}) }));
+    vi.doMock('./secret-encryption.js', () => ({
+      encryptSecretOutputs: vi.fn().mockReturnValue(undefined),
+    }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+  });
+
+  it('flips completionHooksRan to true on the completion-hooks-done message', async () => {
+    const mod = await import('./fork-runner.js');
+    const handle = mod.createForkRunner(
+      { runnerPath: '/test/runner.js', env: {} },
+      createMockExecOptions(),
+    );
+    expect(handle.completionHooksRan).toBe(false);
+    mockChild.simulateIpc({ type: 'completion-hooks-done' });
+    expect(handle.completionHooksRan).toBe(true);
+  });
+
+  it('records declaresCleanup from the hooks-declared message', async () => {
+    const mod = await import('./fork-runner.js');
+    const handle = mod.createForkRunner(
+      { runnerPath: '/test/runner.js', env: {} },
+      createMockExecOptions(),
+    );
+    expect(handle.declaresCleanup).toBe(false);
+    mockChild.simulateIpc({ type: 'hooks-declared', declaresCleanup: true });
+    expect(handle.declaresCleanup).toBe(true);
+  });
+
+  it('surfaces detached + a reap() that SIGTERMs the child process group', async () => {
+    const mod = await import('./fork-runner.js');
+    // Spy at the syscall boundary — killProcessGroup calls process.kill(-pid).
+    // Throw ESRCH so killProcessGroup returns 0 and reapGroup early-returns
+    // WITHOUT scheduling the grace timer + SIGKILL — a real deferred timer
+    // firing process.kill after the spy is restored would be a cross-test flake.
+    const esrch = Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => {
+      throw esrch;
+    });
+    const handle = mod.createForkRunner(
+      { runnerPath: '/test/runner.js', env: {}, detachProcessGroup: true },
+      createMockExecOptions(),
+    );
+    expect(handle.detached).toBe(true);
+    expect(await handle.reap()).toBe(0);
+    expect(killSpy).toHaveBeenCalledWith(-mockChild.pid, 'SIGTERM');
+    killSpy.mockRestore();
+  });
+
+  it('force-cancel escalates to the process group when detached', async () => {
+    const mod = await import('./fork-runner.js');
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const handle = mod.createForkRunner(
+      { runnerPath: '/test/runner.js', env: {}, detachProcessGroup: true },
+      createMockExecOptions(),
+    );
+    handle.cancel(true);
+    expect(killSpy).toHaveBeenCalledWith(-mockChild.pid, 'SIGKILL');
+    killSpy.mockRestore();
+  });
+
+  it('force-cancel does NOT group-kill when not detached', async () => {
+    const mod = await import('./fork-runner.js');
+    const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const handle = mod.createForkRunner(
+      { runnerPath: '/test/runner.js', env: {} },
+      createMockExecOptions(),
+    );
+    handle.cancel(true);
+    // The child's own kill() is a mock (not process.kill); no group signal fires.
+    expect(killSpy).not.toHaveBeenCalled();
+    killSpy.mockRestore();
+  });
+});
+
 // --- buildRequest tests for job-level timeout ---
 
 describe('buildRequest - job timeout', () => {

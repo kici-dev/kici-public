@@ -12,6 +12,7 @@ import {
   OVERFLOW_LABEL_VALUE,
 } from './catalog-policy.js';
 import { ExecutionRunStatus } from '../protocol/messages/execution-status.js';
+import { ScalerBackendType } from '../scaler/scaler-backend-type.js';
 
 describe('catalog-policy', () => {
   // Services whose metrics the orchestrator is allowed to push: its own,
@@ -112,6 +113,25 @@ describe('catalog-policy', () => {
       expect(policy?.scalerType?.values).toEqual([...ORCH_SCALER_VALUES]);
       expect(policy?.machinePool?.maxUniqueValues).toBe(50);
     }
+  });
+
+  it('admits every scaler backend type on scalerType and on the agent scaler label', () => {
+    // The orchestrator stamps `scalerType` straight from its `backends` map,
+    // so any ScalerBackendType the policy omits is dropped as
+    // bad_label_value — which is how the `event` backend silently lost both
+    // resource gauges on the Platform. Same source feeds the agent-side
+    // `scaler` label via ScalerManager.getBackendType.
+    for (const backendType of ScalerBackendType.options) {
+      expect(ORCH_SCALER_VALUES, `scalerType must admit ${backendType}`).toContain(backendType);
+      expect(
+        METRIC_LABEL_POLICY.kici_agent_jobs_total?.scaler?.values,
+        `agent scaler label must admit ${backendType}`,
+      ).toContain(backendType);
+    }
+    // A static agent no scaler manages is stamped `stateful`, which is not a
+    // backend type — the agent label carries it, the orch rollup does not.
+    expect(METRIC_LABEL_POLICY.kici_agent_jobs_total?.scaler?.values).toContain('stateful');
+    expect(ORCH_SCALER_VALUES).toContain('__global__');
   });
 
   it('declares event_name as a capped label and result/reason as closed enums for the event family', () => {

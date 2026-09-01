@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { initTelemetry } from '@kici-dev/shared';
 import type { Context as DbContext } from '../db/types.js';
-import { HoldType } from '@kici-dev/engine';
+import { HoldType, installGateJobId } from '@kici-dev/engine';
 import type { Context as EngineContext, ProtectionGateResult } from '@kici-dev/engine';
 import type { TrustResolution } from '../security/trust-resolver.js';
 import type { SecretResolver } from '../secrets/secret-resolver.js';
@@ -28,7 +28,7 @@ const baseProtectionContext: JobDispatchContext = {
   triggerType: 'push',
   repository: 'acme/web',
   runId: 'run-1',
-  jobId: '__install__wf',
+  jobId: installGateJobId('wf'),
 };
 
 function makeEnvRow(overrides: Partial<DbContext> = {}): DbContext {
@@ -72,16 +72,12 @@ function makeSecretResolver(perEnv: Map<string, Record<string, string>>): Secret
 const trusted: TrustResolution = {
   tier: 'trusted',
   contributorUsername: 'alice',
-  identityLinked: true,
-  providerPermission: 'admin',
-  reason: 'org-owner',
+  reason: 'same-repo ref',
 };
 
 const untrusted: TrustResolution = {
   tier: 'unknown',
   contributorUsername: 'fork-user',
-  identityLinked: false,
-  providerPermission: 'read',
   reason: 'fork',
 };
 

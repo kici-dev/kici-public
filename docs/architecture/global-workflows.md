@@ -126,9 +126,8 @@ org's trust policy (`packages/orchestrator/src/security/trust-policy-gate.ts`).
 Both org-global dispatch paths — the fallback that runs globals when the source
 repo has no lock file, and the pass that dispatches globals authored in other
 repos — return without dispatching unless the verdict is `pass`. So a `hold` or
-`reject` verdict (a workflow modification, a fork pull request, or an unresolved
-contributor) stops the organization's global workflows too, not only the pull
-request's own workflows. This matters because globals run with **org**
+`reject` verdict from the policy's fork switch stops the organization's global
+workflows too, not only the pull request's own workflows. This matters because globals run with **org**
 credentials against the **event's** head SHA: dispatching them for an event the
 policy refused would hand an untrusted head SHA the org's credentials.
 
@@ -232,6 +231,14 @@ matches. This is the safe default — orphans silently stop applying rather
 than re-binding to some unrelated source. The dashboard surfaces orphans
 inline with an "Unknown source" badge so an operator can rebind them or
 delete them.
+
+### Re-running across repositories
+
+A run of an organization-wide **workflow** that executed against another repository is never re-run. Two tiers refuse it independently. The orchestrator's re-run pipeline (`packages/orchestrator/src/pipeline/rerun.ts`) refuses it at the tier that holds the credentials and the lock file. The hosted Platform enforces the same refusal on its own mirrored run row, ahead of every path that exposes re-run.
+
+**One exception: a failed evaluation round.** Both tiers admit a run that records a global evaluation round, ahead of the cross-repository comparison. Each tier reads a structural marker on the run row (`is_global_eval_round`), never the workflow name, so no repository enters the exception by naming a workflow a certain way. The exception is necessary, and it is narrow. A round is cross-repository by definition — it decides one repository's global workflows against another repository's event — so the comparison would refuse every round. The round path also resolves no workflow out of the acted-on repository's lock file, so the workflow substitution the refusal prevents cannot happen. A re-run of a round re-evaluates the original event against the workflow repository's current state, and dispatches what that evaluation admits.
+
+The refusal is an authorization boundary, not a correctness workaround: it is what keeps the either-repository grant narrow. [RBAC](./security/rbac.md) lets a member scoped to **either** of a global run's two repositories read and cancel that run. The basis is that no caller re-executes an organization-wide workflow from the repository the run acted on. A failed evaluation round is the one run such a caller re-executes. It runs the same evaluation the original event ran, through the same policy axes, and it does not let the caller select which workflow runs. Lifting one refusal alone does not widen the grant. Lifting both requires answering the authorization question first: which of the two repositories may re-execute the run, and with whose credentials.
 
 ### Credential scoping
 
@@ -370,10 +377,64 @@ was added.
 
 The CLI talks directly to the orchestrator admin API (`/api/v1/admin/org-settings/global-workflows`) so policy management remains available even when the Platform relay is unreachable.
 
+## Invoking source-repo workflows
+
+A global workflow can hand control back to the source repo it runs against and
+gate on the repo's own work. A job that carries an `invoke:` action — built with
+`invokeSource('event.name')` — is a **gate**: it runs no steps on an agent.
+Instead, when the gate becomes ready the orchestrator:
+
+1. **Emits** the named kici event at the source repo (`ctx.sourceRepo`).
+2. **Matches** the repo's opt-in subscribers — workflows that declare
+   `on: [ kiciEvent({ name }) ]` — and **dispatches** each as a normal in-repo
+   run, capturing the run ids it created.
+3. Creates one **proxy job** per spawned run, tracked in the global run's graph
+   as a fan-out child of the gate. A proxy runs no steps; its status **mirrors**
+   the spawned run.
+4. As each spawned run reaches a terminal state, the orchestrator maps it back to
+   its proxy and sets the proxy's status, carrying the run's non-secret outputs.
+5. Once every proxy is terminal, the gate aggregates a status and the downstream
+   `needs` release.
+
+```
+repo-tests ─┬─ repo-tests (myorg/backend:unit)   ← proxy, mirrors the spawned run
+            ├─ repo-tests (myorg/backend:lint)   ← proxy
+            └─ repo-tests (myorg/backend:e2e)    ← proxy
+                     │ (all terminal)
+                  deploy
+```
+
+**Required by default.** An emit that matches zero subscribers **fails** the
+gate, with a message naming the event and repo. A repo that never wired up its
+tests must not silently pass the org gate. Pass `invokeSource(event, { optional:
+true })` to let a repo opt out: a zero-subscriber gate then succeeds immediately
+with no proxies.
+
+**Dynamic invocation.** Because `invoke:` is a job shape, a generator job can
+inspect the source repo at runtime and return only the invoke gates that apply —
+e.g. a `docker-test` gate when the repo has a `Dockerfile`, a `node-test` gate
+when it has a `package.json`. The generator decides _whether to create a gate_;
+`optional` decides _what a created gate does when nothing subscribes_.
+
+**Failure, timeout, concurrency — the standard job vocabulary.** The gate is a
+standard job. `continueOnError` tolerates a failed invoked run. A downstream
+`needs` `when: on-failure` reacts to a failed gate. The job `timeout` bounds the
+wait — the orchestrator enforces it, since the gate has no agent. `maxParallel`
+and `failFast` bound the fan-out over the proxies.
+
+**Security.** The invoked workflow runs as the repo's own run, with the repo's
+own secrets and its own dashboard run — the global never gains the repo's
+secrets, only pass/fail plus plain declared outputs. The opt-in is the
+subscription: a global cannot invoke a repo that did not subscribe. The invoke
+path reuses the same trust-policy and global-workflow-policy gates as the rest of
+the global dispatch path, and a bounded chain depth stops an invoke chain from
+looping.
+
 ## Related files
 
 | Component              | Path                                                           |
 | ---------------------- | -------------------------------------------------------------- |
+| Invoke-gate executor   | `packages/orchestrator/src/pipeline/invoke-gate.ts`            |
 | GlobalWorkflowPolicy   | `packages/orchestrator/src/security/global-workflow-policy.ts` |
 | Registration extractor | `packages/orchestrator/src/registration/extractor.ts`          |
 | Registration index     | `packages/orchestrator/src/registration/registration-index.ts` |

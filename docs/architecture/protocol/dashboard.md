@@ -242,14 +242,16 @@ Sent every 30 seconds by each peer. Carries agent inventory, scaler capacity, an
 
 PeerAgentSummary:
 
-| Field          | Type     | Required | Description                         |
-| -------------- | -------- | -------- | ----------------------------------- |
-| agentId        | string   | Yes      | Agent identifier                    |
-| labels         | string[] | Yes      | Capability labels                   |
-| activeJobs     | number   | Yes      | Currently running jobs              |
-| maxConcurrency | number   | Yes      | Maximum concurrent jobs             |
-| platform       | string   | Yes      | OS platform (e.g., linux)           |
-| arch           | string   | Yes      | CPU architecture (e.g., x64, arm64) |
+| Field           | Type           | Required | Description                                                                                              |
+| --------------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------- |
+| agentId         | string         | Yes      | Agent identifier                                                                                         |
+| labels          | string[]       | Yes      | Capability labels                                                                                        |
+| activeJobs      | number         | Yes      | Currently running jobs                                                                                   |
+| maxConcurrency  | number         | Yes      | Maximum concurrent jobs                                                                                  |
+| platform        | string         | Yes      | OS platform (e.g., linux)                                                                                |
+| arch            | string         | Yes      | CPU architecture (e.g., x64, arm64)                                                                      |
+| mandatoryLabels | string[]       | No       | Taint gate inherited from the spawning scaler. Empty or absent for a static agent, and for a legacy peer |
+| scalerName      | string or null | No       | Backend that spawned this agent, or null for a static agent. Groups the peer's agents in diagnostics     |
 
 PeerCapabilities:
 
@@ -260,13 +262,16 @@ PeerCapabilities:
 
 ScalerCapacitySummary:
 
-| Field       | Type       | Required | Description                                           |
-| ----------- | ---------- | -------- | ----------------------------------------------------- |
-| name        | string     | No       | Scaler backend name (e.g., `stg-worker-bare-metal`)   |
-| type        | string     | No       | Scaler backend type (e.g., `bare-metal`, `container`) |
-| labelSets   | string[][] | Yes      | Label sets this backend provisions                    |
-| maxAgents   | number     | Yes      | Maximum agents for this backend                       |
-| activeCount | number     | Yes      | Current active agent count                            |
+| Field                   | Type       | Required | Description                                                                                    |
+| ----------------------- | ---------- | -------- | ---------------------------------------------------------------------------------------------- |
+| name                    | string     | No       | Scaler backend name (e.g., `stg-worker-bare-metal`)                                            |
+| type                    | string     | No       | Scaler backend type (e.g., `bare-metal`, `container`)                                          |
+| labelSets               | string[][] | Yes      | Label sets this backend provisions                                                             |
+| maxAgents               | number     | Yes      | Maximum agents for this backend                                                                |
+| activeCount             | number     | Yes      | Current active agent count                                                                     |
+| spawnsOnLocalHost       | boolean    | No       | Whether this backend spawns its agents on the peer's own host                                  |
+| mandatoryLabels         | string[]   | No       | Deprecated. The union of every entry in `labelSetMandatoryLabels`                              |
+| labelSetMandatoryLabels | string[][] | No       | Taint gate per label set, index-aligned with `labelSets`. Absent from a peer without the field |
 
 #### raft.vote.request
 
@@ -636,22 +641,25 @@ Request a presigned URL for uploading the working-tree overlay tarball.
 
 Trigger a remote test run using a fixture payload (mirrors the orchestrator's `TestTriggerInput`).
 
-| Field               | Type                   | Required | Description                                                         |
-| ------------------- | ---------------------- | -------- | ------------------------------------------------------------------- |
-| type                | `"test.relay.trigger"` | Yes      | Message discriminator                                               |
-| requestId           | string                 | Yes      | Correlation ID for the response                                     |
-| actor               | ActorPrincipal         | Yes      | Authenticated principal initiating the run                          |
-| routingKey          | string                 | Yes      | Provider routing key                                                |
-| fixtureId           | string                 | Yes      | Fixture identifier                                                  |
-| event               | TestEvent              | Yes      | Simulated event (type, action, branch, payload)                     |
-| workflowName        | string                 | No       | Specific workflow to test (all if omitted)                          |
-| uploadId            | string                 | No       | Upload ID returned by `test.relay.uploads.init.response`            |
-| cliPublicKey        | string                 | No       | CLI ephemeral X25519 public key used to encrypt the overlay tarball |
-| inlineLockFile      | string                 | No       | Lock file sent inline instead of via upload                         |
-| fullRepo            | boolean                | No       | Whether the upload is the full working tree (not an overlay)        |
-| secrets             | Record<string, string> | No       | Plaintext secrets for the run                                       |
-| encryptedSecrets    | string                 | No       | Encrypted secrets blob                                              |
-| encryptedSecretsKey | string                 | No       | Key wrapping the encrypted secrets blob                             |
+| Field               | Type                   | Required | Description                                                                                                                                                    |
+| ------------------- | ---------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type                | `"test.relay.trigger"` | Yes      | Message discriminator                                                                                                                                          |
+| requestId           | string                 | Yes      | Correlation ID for the response                                                                                                                                |
+| actor               | ActorPrincipal         | Yes      | Authenticated principal initiating the run                                                                                                                     |
+| routingKey          | string                 | Yes      | Provider routing key                                                                                                                                           |
+| fixtureId           | string                 | Yes      | Fixture identifier                                                                                                                                             |
+| event               | TestEvent              | Yes      | Simulated event (type, action, branch, payload)                                                                                                                |
+| workflowName        | string                 | No       | Specific workflow to test (all if omitted)                                                                                                                     |
+| uploadId            | string                 | No       | Upload ID returned by `test.relay.uploads.init.response`                                                                                                       |
+| cliPublicKey        | string                 | No       | CLI ephemeral X25519 public key used to encrypt the overlay tarball                                                                                            |
+| inlineLockFile      | string                 | No       | Lock file sent inline instead of via upload                                                                                                                    |
+| fullRepo            | boolean                | No       | Whether the upload is the full working tree (not an overlay)                                                                                                   |
+| checkMode           | enum                   | No       | Run mode for idempotent steps, relayed onto the dispatch event. Omitted means `apply`                                                                          |
+| target              | HostTargetSelector     | No       | Host narrowing from `kici run --target`, intersected with each `runsOnAll` job's matched roster. Omitted for webhook runs                                      |
+| dispatchInputs      | Record<string, string> | No       | Raw `kici run --input KEY=VALUE` pairs, relayed verbatim. The orchestrator validates, coerces and defaults them against the matched workflow's lock descriptor |
+| secrets             | Record<string, string> | No       | Plaintext secrets for the run                                                                                                                                  |
+| encryptedSecrets    | string                 | No       | Encrypted secrets blob                                                                                                                                         |
+| encryptedSecretsKey | string                 | No       | Key wrapping the encrypted secrets blob                                                                                                                        |
 
 TestEvent: `{ type: string, action?: string, targetBranch: string, sourceBranch?: string, payload: Record<string, unknown>, changedFiles?: string[] }`
 
@@ -710,15 +718,16 @@ Presigned upload URL plus the ephemeral encryption key the CLI uses to encrypt t
 
 Acknowledge a triggered run.
 
-| Field     | Type                            | Required | Description                          |
-| --------- | ------------------------------- | -------- | ------------------------------------ |
-| type      | `"test.relay.trigger.response"` | Yes      | Message discriminator                |
-| requestId | string                          | Yes      | ID of the request being responded to |
-| runId     | string                          | No       | Execution run ID                     |
-| status    | enum                            | No       | One of: `accepted`, `rejected`       |
-| reason    | string                          | No       | Rejection reason (if rejected)       |
-| jobIds    | string[]                        | No       | IDs of the jobs created for the run  |
-| error     | string                          | No       | Failure reason                       |
+| Field     | Type                            | Required | Description                                                                 |
+| --------- | ------------------------------- | -------- | --------------------------------------------------------------------------- |
+| type      | `"test.relay.trigger.response"` | Yes      | Message discriminator                                                       |
+| requestId | string                          | Yes      | ID of the request being responded to                                        |
+| runId     | string                          | No       | Execution run ID                                                            |
+| status    | enum                            | No       | One of: `accepted`, `rejected`                                              |
+| reason    | string                          | No       | Rejection reason (if rejected)                                              |
+| jobIds    | string[]                        | No       | IDs of the jobs created for the run                                         |
+| warnings  | string[]                        | No       | User-visible warnings on acceptance (e.g. a skipped non-test bound context) |
+| error     | string                          | No       | Failure reason                                                              |
 
 #### test.relay.run.status.response
 
@@ -764,7 +773,7 @@ KiCI defines custom close codes in the 4000-4999 range (reserved for application
 
 | Code | Constant                         | Meaning                                                                                                                                                                                                                              | Sent By |
 | ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------- |
-| 1000 | --                               | Normal closure. Sent by the connecting side when it disconnects on purpose -- an agent or orchestrator shutting down its uplink, or a peer client abandoning a handshake that failed                                                 | Client  |
+| 1000 | --                               | Normal closure. Sent by the connecting side when it disconnects on purpose -- an agent or orchestrator shutting down its uplink, or any client (agent, orchestrator uplink, or peer) abandoning a handshake that failed              | Client  |
 | 1001 | `WS_CLOSE_GOING_AWAY`            | Server shutdown or browser navigating away                                                                                                                                                                                           | Server  |
 | 4001 | `WS_CLOSE_UNAUTHORIZED`          | Client failed authentication. Also sent when the Platform times out an unauthenticated connection, when a client's API key is revoked mid-session, and on an operator force-disconnect                                               | Server  |
 | 4002 | `WS_CLOSE_AUTH_TIMEOUT`          | Auth timeout expired                                                                                                                                                                                                                 | Server  |
@@ -786,8 +795,8 @@ All protocol messages are validated at runtime using Zod discriminated unions. E
 
 **Orchestrator-Agent layer:**
 
-- Incoming (Orchestrator receives): `agentToOrchestratorMessageSchema` -- parses `agent.register`, `agent.status`, `job.status`, `job.reject`, `job.ack`, `log.chunk`, `step.status`, `job.heartbeat`, `agent.log`, `job.concurrency.report`, `config.ack`, `cache.upload.request`, `cache.upload.complete`, `cache.user.restore.request`, `cache.user.save.request`, `cache.user.save.complete`, `provenance.upload.request`, `provenance.upload.complete`, `provenance.upload.defer`, `artifacts.upload.request`, `artifacts.upload.complete`, `artifacts.download.request`, `event.emit`, `agent.api.request`, `agent.metrics`, `auth.request`, `fleet.bundle.chunk`, `fleet.bundle.error`, `step.approval-request`
-- Outgoing (Orchestrator sends): `orchestratorToAgentMessageSchema` -- validates `job.dispatch`, `job.cancel`, `register.ack`, `job.concurrency.ack`, `cache.upload.response`, `cache.user.restore.response`, `cache.user.save.response`, `provenance.upload.response`, `artifacts.upload.response`, `artifacts.upload.complete.ack`, `artifacts.download.response`, `event.emit.response`, `agent.api.response`, `auth.success`, `auth.failure`, `fleet.logs.request`, `step.approval-resolved`
+- Incoming (Orchestrator receives): `agentToOrchestratorMessageSchema` -- parses `agent.register`, `agent.status`, `job.status`, `job.reject`, `job.ack`, `log.chunk`, `step.status`, `job.heartbeat`, `agent.log`, `job.concurrency.report`, `config.ack`, `cache.upload.request`, `cache.upload.complete`, `cache.user.restore.request`, `cache.user.save.request`, `cache.user.save.complete`, `provenance.upload.request`, `provenance.upload.complete`, `provenance.upload.defer`, `artifacts.upload.request`, `artifacts.upload.complete`, `artifacts.download.request`, `event.emit`, `scaler.claim-credentials`, `agent.api.request`, `agent.metrics`, `auth.request`, `fleet.bundle.chunk`, `fleet.bundle.error`, `step.approval-request`
+- Outgoing (Orchestrator sends): `orchestratorToAgentMessageSchema` -- validates `job.dispatch`, `job.cancel`, `register.ack`, `job.concurrency.ack`, `cache.upload.response`, `cache.user.restore.response`, `cache.user.save.response`, `provenance.upload.response`, `artifacts.upload.response`, `artifacts.upload.complete.ack`, `artifacts.download.response`, `event.emit.response`, `scaler.claim-credentials.response`, `agent.api.response`, `auth.success`, `auth.failure`, `fleet.logs.request`, `step.approval-resolved`
 
 **Peer-to-peer layer:**
 

@@ -9,7 +9,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.3.0 to match the runtime stage (see below): the same
@@ -137,7 +137,7 @@ RUN cd packages/shared && node --input-type=module -e "import('oxc-transform').t
 # Runtime base is the -dev variant because the agent needs apt-installed
 # host tools (git/bash/iptables) at runtime. ca-certificates ships with
 # the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.18.0-0-debian13-dev
+FROM ${DHI_PREFIX}/node:24.20.0-0-debian13-dev
 WORKDIR /app
 
 # Install the CI userland, then strip perl ENTIRELY — including the Essential
@@ -164,8 +164,41 @@ WORKDIR /app
 # still attributes the perl-source CVEs to the image. Now that the perl files
 # are genuinely gone, delete the matching SBOM stubs so the image's SBOM
 # reflects reality and the CVE gate sees no perl.
+#
+# curl and libcurl4t64 are installed as an explicitly matched pair, and the
+# `--allow-downgrades` this needs is NOT a security downgrade.
+#
+# The DHI base ships its own rebuild of the library — `libcurl4t64` at
+# `8.14.1-2+deb13u4+dhi0` — while Debian's `curl` depends on
+# `libcurl4t64 (= <curl's own version>)` exactly. apt orders the `+dhi0` suffix
+# above the plain Debian version, so installing curl implies a downgrade of the
+# library and apt refuses the whole transaction with "held broken packages".
+# Without this the image does not build at all.
+#
+# It is the same source at the same patch level, not an older one: the DHI
+# package declares `Source: curl`, `Version: 8.14.1-2+deb13u4+dhi0` — a rebuild
+# of Debian's `8.14.1-2+deb13u4`, where `deb13u4` IS the security revision. So
+# this swaps who built the library, not which CVEs are fixed in it. Every other
+# package on this line already comes from Debian too.
+#
+# The version is derived rather than pinned: Debian's curl declares
+# `Depends: libcurl4t64 (= ${binary:Version})`, so the pair always moves
+# together and the next security update needs no edit here. A hardcoded version
+# would instead go stale and either break the build again or hold the library
+# back at a patch level Debian has moved past.
+#
+# The `rm` of the libcurl SBOM stub below is the same fix the perl purge needs,
+# for the same reason: apt records the replacement in the real dpkg database,
+# but the DHI base's distroless SBOM stub under /var/lib/dpkg/status.d/ is not
+# dpkg-managed and keeps claiming `+dhi0`. Left in place, the image advertises a
+# library it does not contain and OSV-Scanner reports every curl CVE twice —
+# once against the library that is installed, once against a phantom.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git bash curl gzip xz-utils iptables \
+  && CURL_VER="$(apt-cache policy curl | awk '/Candidate:/{print $2}')" \
+  && { [ -n "$CURL_VER" ] && [ "$CURL_VER" != '(none)' ]; } \
+  && apt-get install -y --no-install-recommends --allow-downgrades \
+       git bash "curl=$CURL_VER" "libcurl4t64=$CURL_VER" gzip xz-utils iptables \
+  && rm -f /var/lib/dpkg/status.d/libcurl4t64 \
   && dpkg --remove --force-depends perl perl-modules-5.40 libperl5.40 liberror-perl \
   && dpkg --purge --force-depends --force-remove-essential perl-base \
   && rm -f /var/lib/dpkg/status.d/perl /var/lib/dpkg/status.d/perl-base \
@@ -194,9 +227,53 @@ RUN corepack enable \
        done; } \
   && chmod a+x /usr/lib/nodejs/corepack/dist/*.js
 
+# KiCI-provisioned portable Node runtime, mounted read-only into a job's own
+# container at /opt/kici/node.
+#
+# It must be the OFFICIAL nodejs.org build rather than this image's own node.
+# The base image's node is dynamically linked against THIS image's glibc, while
+# the runtime gets injected into an ARBITRARY customer image whose glibc may be
+# older. The official Linux builds target glibc 2.17, which is what lets one
+# binary run across the range of images a customer might reasonably name — and
+# it avoids the `GLIBC_2.28 not found` failure that is the most-reported bug of
+# the equivalent GitHub Actions mechanism.
+#
+# Version matches the base image's node so the image carries one Node version.
+# Both digests are the upstream SHASUMS256.txt values, verified at build time —
+# an unverified tarball here would execute in every customer job container.
+ARG KICI_RUNTIME_NODE_VERSION=24.20.0
+ARG KICI_RUNTIME_NODE_SHA256_X64=2f2c0da162318f0de47665410c7c8c2ed3d36c8f3105de4bbc61176c70a7cbf2
+ARG KICI_RUNTIME_NODE_SHA256_ARM64=5f4ddab610c1ab2016b3c227cebdbf6d9495161487e4739c7b90090595f465f7
+RUN set -eu; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) nodearch=x64; sha="$KICI_RUNTIME_NODE_SHA256_X64" ;; \
+    arm64) nodearch=arm64; sha="$KICI_RUNTIME_NODE_SHA256_ARM64" ;; \
+    *) echo "unsupported architecture for the KiCI runtime: $arch" >&2; exit 1 ;; \
+  esac; \
+  tarball="node-v${KICI_RUNTIME_NODE_VERSION}-linux-${nodearch}.tar.xz"; \
+  curl -fsSLo "/tmp/$tarball" \
+    "https://nodejs.org/dist/v${KICI_RUNTIME_NODE_VERSION}/$tarball"; \
+  echo "$sha  /tmp/$tarball" | sha256sum -c -; \
+  mkdir -p /opt/kici/node; \
+  tar -xJf "/tmp/$tarball" -C /opt/kici/node --strip-components=1; \
+  rm -f "/tmp/$tarball"; \
+  /opt/kici/node/bin/node --version
+
 # Copy the pruned workspace (prod node_modules + pre-rebuilt oxc-transform
 # native binding + dist artifacts) from the builder.
 COPY --from=builder --chown=node:node /app /app
+
+# Second copy of the app under the runtime tree, so /opt/kici is SELF-CONTAINED.
+#
+# The scaler materializes /opt/kici into a named volume and mounts that volume —
+# and only that volume — into a job's own container. Anything the agent needs to
+# run therefore has to live under /opt/kici: with node alone in there, the agent
+# entrypoint resolves to a path that does not exist inside the job container.
+#
+# A symlink to /app would not do, because it points outside the copied tree and
+# would dangle once the volume is mounted somewhere else.
+RUN cp -a /app /opt/kici/app && chown -R node:node /opt/kici
 
 # Run as non-root user
 USER node

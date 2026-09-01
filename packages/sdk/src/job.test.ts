@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { job } from './job.js';
 import { step } from './step.js';
+import { invokeSource } from './invoke.js';
 import { rule } from './rules/index.js';
 import type { HookInput } from './hooks/types.js';
 import type { GenericInitConfig } from './types.js';
@@ -318,6 +319,94 @@ describe('job()', () => {
 
       expect(basicJob.checkout).toBeUndefined();
       expect(basicJob.container).toBeUndefined();
+    });
+
+    it('rejects a container that names neither an image nor a dockerfile', () => {
+      expect(() =>
+        job('build', { runsOn: 'linux', steps: [buildStep], container: {} as never }),
+      ).toThrow(/exactly one of container.image or container.dockerfile/);
+    });
+
+    it('rejects a container that names both an image and a dockerfile', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { image: 'python:3.12', dockerfile: 'Dockerfile' },
+        }),
+      ).toThrow(/exactly one of container.image or container.dockerfile/);
+    });
+
+    it('rejects a dockerfile path that escapes the repository', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: '../evil' },
+        }),
+      ).toThrow(/container.dockerfile must stay inside the repository/);
+    });
+
+    it('rejects an absolute dockerfile path', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: '/etc/shadow' },
+        }),
+      ).toThrow(/container.dockerfile must stay inside the repository/);
+    });
+
+    it('rejects a context path that escapes the repository', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: 'Dockerfile', context: '../..' },
+        }),
+      ).toThrow(/container.context must stay inside the repository/);
+    });
+
+    it('rejects a build-only field on a job that names a finalized image', () => {
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { image: 'python:3.12', target: 'ci' },
+        }),
+      ).toThrow(/container.target applies only to container.dockerfile/);
+    });
+
+    it('requires auth.registry when building from a dockerfile', () => {
+      // The base image lives inside the Dockerfile, so there is no image
+      // reference to derive the registry host from.
+      expect(() =>
+        job('build', {
+          runsOn: 'linux',
+          steps: [buildStep],
+          container: { dockerfile: 'Dockerfile', auth: { tokenSecret: 'prod:TOKEN' } },
+        }),
+      ).toThrow(/container.auth.registry is required/);
+    });
+
+    it('creates a job that builds its image from a dockerfile', () => {
+      const containerJob = job('build', {
+        runsOn: 'linux',
+        steps: [buildStep],
+        container: {
+          dockerfile: '.kici/ci.Dockerfile',
+          context: '.',
+          target: 'ci',
+          args: { NODE_VERSION: '24' },
+        },
+      });
+
+      expect(containerJob.container).toEqual({
+        dockerfile: '.kici/ci.Dockerfile',
+        context: '.',
+        target: 'ci',
+        args: { NODE_VERSION: '24' },
+      });
     });
   });
 
@@ -699,6 +788,76 @@ describe('job()', () => {
       });
       expect(j.concurrencyGroup).toBeUndefined();
     });
+
+    describe('gitCredentials', () => {
+      it('stores a named map on the job', () => {
+        const j = job('release', {
+          runsOn: 'linux',
+          gitCredentials: {
+            default: {
+              kind: 'app',
+              appIdSecret: 'ci:A_ID',
+              installationIdSecret: 'ci:I_ID',
+              privateKeySecret: 'ci:A_KEY',
+            },
+            forge: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
+          },
+          steps: [checkoutStep],
+        });
+        expect(Object.keys(j.gitCredentials ?? {})).toEqual(['default', 'forge']);
+      });
+
+      it('omits the field entirely when no credentials are declared', () => {
+        const j = job('build', { runsOn: 'linux', steps: [checkoutStep] });
+        expect(j.gitCredentials).toBeUndefined();
+      });
+
+      it('carries secret NAMES, never material', () => {
+        const j = job('release', {
+          runsOn: 'linux',
+          gitCredentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
+          steps: [checkoutStep],
+        });
+        // The lock file is generated from this object, so material here would be
+        // committed to a git repository.
+        expect(JSON.stringify(j.gitCredentials)).not.toMatch(/BEGIN |gh[pousr]_/);
+      });
+
+      it('rejects a pasted private key, naming the field', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: {
+              default: {
+                kind: 'ssh',
+                privateKeySecret: '-----BEGIN RSA PRIVATE KEY-----\nMII',
+              },
+            },
+            steps: [checkoutStep],
+          }),
+        ).toThrow(/default\.privateKeySecret/);
+      });
+
+      it('rejects an unqualified secret reference', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: { default: { kind: 'token', tokenSecret: 'FORGE_PAT' } },
+            steps: [checkoutStep],
+          }),
+        ).toThrow(/qualified <context>:<secret-name>/);
+      });
+
+      it('does not reject a *Value field, which is material by declaration', () => {
+        expect(() =>
+          job('release', {
+            runsOn: 'linux',
+            gitCredentials: { default: { kind: 'token', tokenValue: 'ghp_runtime_material_0001' } },
+            steps: [checkoutStep],
+          }),
+        ).not.toThrow();
+      });
+    });
   });
 });
 
@@ -744,5 +903,26 @@ describe('job() sandbox escape hatch', () => {
   it('omits the sandbox key entirely when not requested', () => {
     const j = job('build', { runsOn: 'linux', run: async () => {} });
     expect('sandbox' in j).toBe(false);
+  });
+});
+
+describe('job() invoke gate', () => {
+  it('accepts an invoke gate with no steps and no runsOn', () => {
+    const j = job('repo-tests', { invoke: invokeSource('myorg.repo-tests') });
+    expect(j.invoke?.event).toBe('myorg.repo-tests');
+    expect(j.steps ?? []).toEqual([]);
+    expect(j.runsOn).toBeUndefined();
+  });
+
+  it('rejects invoke together with steps', () => {
+    expect(() =>
+      job('bad', { invoke: invokeSource('e'), steps: [step('s', async () => {})] } as any),
+    ).toThrow(/mutually exclusive/i);
+  });
+
+  it('rejects invoke together with run', () => {
+    expect(() => job('bad', { invoke: invokeSource('e'), run: async () => {} } as any)).toThrow(
+      /mutually exclusive/i,
+    );
   });
 });

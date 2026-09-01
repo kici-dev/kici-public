@@ -13,13 +13,20 @@
  * dashboard's payload-detail view continues to resolve archived
  * deliveries identically to hot ones.
  */
-import { sql, type Kysely, type Selectable } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
-import type { Database, EventLogTable } from '../db/types.js';
+import type { Database } from '../db/types.js';
+import type { EventLogColdStoreRow } from './tables/event-log.js';
+
+/**
+ * Re-exported, not re-declared: the alias is defined beside the cold-store
+ * adapter that owns the table, and a second identical declaration here is what
+ * a homonym sweep flags. Kept as an export so this module's public surface is
+ * unchanged for its consumers.
+ */
+export type { EventLogColdStoreRow };
 
 const logger = createLogger({ prefix: 'load-event-log-range' });
-
-export type EventLogColdStoreRow = Selectable<EventLogTable>;
 
 export interface LoadOrchEventLogRangeArgs {
   db: Kysely<Database>;

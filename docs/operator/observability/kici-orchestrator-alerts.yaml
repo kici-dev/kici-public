@@ -151,3 +151,133 @@ groups:
             The Platform run mirror for this org is stale and usage counts may
             undercount until a replay succeeds. Check orchestrator logs for
             'state replay' validation errors.
+
+      # The event-scaler teardown backstop has switched itself off. It refuses
+      # to act when this coordinator is connected to none of the peers it knows,
+      # because a partition and a dead peer are indistinguishable without a
+      # quorum and guessing wrong deletes running instances. While it is off,
+      # nothing tears down a provision whose agent never registered — the
+      # runaway-billing case. Those spawn rows are also what the cluster-wide
+      # maxAgents counts, so they accumulate while this fires and the cap fills
+      # up: the second consequence is that event autoscaling degrades toward a
+      # cluster-wide halt. On a two-coordinator HA pair a permanently dead
+      # peer leaves it off indefinitely. Alert on the cluster leader: a minority
+      # node reads 1 while a healthy majority still reaps, so on a 3+ node
+      # cluster scope this to the leader or expect one firing series per
+      # minority instance.
+      - alert: ScalerReapBlocked
+        expr: kici_orch_scaler_reap_blocked > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Event-scaler teardown backstop standing down (15m+)'
+          description: >-
+            The provision reaper is connected to none of its known coordinator
+            peers, so it has stopped sweeping. Provisions whose agent never
+            registered will not be torn down until a peer returns. Their spawn
+            rows keep counting against the cluster-wide maxAgents for that
+            scaler, so the cap fills up while this fires and event autoscaling
+            degrades toward a cluster-wide halt. If this is
+            firing on two coordinators at once — or on one whose peer is also
+            unreachable to your monitoring — treat it as a partition, not a dead
+            node. Restore the link, and do NOT restart either coordinator or add
+            a third: both resume sweeping on the reachable side and can tear down
+            instances the other side is still running. See the event-scaler
+            operator doc before acting.
+
+      # Provisions whose agent has been registered on no coordinator for longer
+      # than the flap grace. The gauge counts only past-grace absences, so an
+      # agent transiting the set during an ordinary reconnect never reaches it.
+      # The clock is leader-local, so a cluster that changes leader more often
+      # than --scaler-reap-stranded-timeout-ms restarts it before it can expire
+      # and the provision bills forever. `for` is set well above the 30m default
+      # stranded window so a normally-expiring absence never fires; a value that
+      # outlives the window is the starvation signal.
+      - alert: ScalerProvisionsStuckUnseen
+        expr: kici_orch_scaler_reap_unseen_provisions > 0
+        for: 45m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Event-scaler provisions unseen past the stranded window (45m+)'
+          description: >-
+            One or more event-scaler provisions have had no registered agent for
+            longer than the stranded window, without being torn down. Raise the
+            `for` here if you tuned --scaler-reap-stranded-timeout-ms above 30m.
+            Check for leader churn or a flapping peer link, which restart the
+            absence clock. Search the orchestrator log for 'starting absence
+            clock' to identify the agents.
+
+      # An event scaler counts maxAgents across the whole cluster, so every
+      # spawn first takes a lock in the orchestrator database. When that check
+      # cannot run, the spawn is refused rather than admitted — safe, because
+      # admitting would bill for cloud instances no cap can see, but it means
+      # event-scaler provisioning stops cluster-wide while it lasts. Only
+      # reason="unreachable" is alerted: reason="contended" is a healthy
+      # database under load and belongs on the capacity dashboard, not a pager.
+      # The 10m window keeps the condition continuous on an orchestrator that
+      # scales only every few minutes, and `for: 15m` outlives the ~11m a single
+      # isolated burst stays true — so a blip or a rolling database restart
+      # cannot reach it, while a real stall fires 15m after it starts. The
+      # counter moves only when something tries to scale, so this reports "event
+      # autoscaling is failing", not "the database is down".
+      - alert: ScalerCapCheckUnreachable
+        expr: increase(kici_orch_scaler_cap_lock_failures_total{reason="unreachable"}[10m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Event-scaler cluster-wide cap check failing (15m+)'
+          description: >-
+            The cluster-wide maxAgents check cannot reach the orchestrator
+            database, so every event-scaler spawn is being refused and no new
+            instances are being provisioned anywhere in the cluster. Jobs stay
+            queued and are re-offered once the check recovers, so nothing is
+            lost — but nothing scales up either. Check the orchestrator database
+            and connection pool. A companion reason="contended" series is normal
+            under load and is not alerted. See the event-scaler operator doc.
+
+      # An event scaler hands provisioning to your workflow, which drives your
+      # provider, so the orchestrator never sees the provider's error. The one
+      # signal it does have is generic: the scale-up went out and no agent came
+      # back. That covers a provider incident, an exhausted quota, and a broken
+      # boot script the same way, with no provider-specific code.
+      #
+      # The window is coupled to the orchestrator's own backoff, not chosen for
+      # its own sake. A scaler that keeps failing is deferred between attempts
+      # by `scaler_provision_backoff_max_ms` (15 min by default), so at steady
+      # state it times out about once every 20 minutes — the deferral plus the
+      # spawn timeout. A short rate window is empty for most of that cadence and
+      # would leave this rule dark through the exact outage it is written for.
+      # An hour always spans at least two attempts. Raise the window with
+      # `scaler_provision_backoff_max_ms` if you push that past ~25 minutes.
+      #
+      # The threshold is `>= 2`, not `> 1`, because `increase()` extrapolates
+      # its result out to the edges of the window. A counter that is already
+      # non-zero when the window opens — every scaler that has timed out before
+      # — reports about 1.01 for a single step, so `> 1` pages on one unlucky
+      # spawn. At a 30s scrape interval a single step extrapolates to at most
+      # about 1.02, so reaching 2 takes a second real step. That bound comes
+      # from the sample spacing, not from the window, so a series carrying only
+      # two samples across the whole hour — an orchestrator scraped twice and
+      # then gone — still reports 2.0 for one step and fires.
+      #
+      # `for: 15m` then demands the condition hold continuously, so the alert
+      # reports a sustained failure rather than a coincidence.
+      - alert: ExternalProvisioningFailing
+        expr: sum by (scaler) (increase(kici_orch_scaler_external_provision_timeout_total[1h])) >= 2
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'External provisioning for scaler {{ $labels.scaler }} is failing (15m+)'
+          description: >-
+            At least two provisions this event scaler requested in the last
+            hour were torn down because no agent registered, and the condition
+            has held for at least 15 minutes. The scale-up events were delivered,
+            so the provisioning workflow or the provider it drives is not
+            returning a running agent. Jobs waiting on this scaler settle with
+            the provisioning cause, and the scaler is backing off between
+            attempts. Check your provider status and the provisioning workflow's
+            own runs. See the event-scaler operator doc.

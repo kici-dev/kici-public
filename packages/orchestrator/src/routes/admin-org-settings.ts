@@ -14,7 +14,10 @@ import { sql, type Kysely } from 'kysely';
 import { z } from 'zod';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { canonicalizeCapability, isKnownCapability } from '@kici-dev/engine';
-import { repoPatternEntrySchema } from '@kici-dev/engine/protocol/dashboard-global-workflows';
+import {
+  invalidRepoPatternReason,
+  repoPatternEntrySchema,
+} from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import type { RepoPatternEntry } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import {
   DashboardWriteOperation,
@@ -61,13 +64,32 @@ type AdminEnv = {
   };
 };
 
+/**
+ * A repo-pattern list that additionally refuses negation forms. The entry
+ * schema itself stays permissive so rows already stored in `org_settings` keep
+ * parsing on read paths; the refusal applies only where an operator writes.
+ */
+const validatedPatternList = z.array(repoPatternEntrySchema).superRefine((entries, ctx) => {
+  for (const [i, entry] of entries.entries()) {
+    const reason = invalidRepoPatternReason(entry.pattern);
+    if (reason) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [i, 'pattern'],
+        message: `'${entry.pattern}': ${reason}`,
+      });
+    }
+  }
+});
+
 const updateSchema = z
   .object({
     customerId: z.string().min(1),
-    allowedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-    deniedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
-    elevatedRepos: z.array(repoPatternEntrySchema).nullable().optional(),
+    allowedRepos: validatedPatternList.nullable().optional(),
+    deniedRepos: validatedPatternList.nullable().optional(),
+    elevatedRepos: validatedPatternList.nullable().optional(),
     allowHttpNpmRegistries: z.boolean().optional(),
+    allowUntrustedDockerfileBuilds: z.boolean().optional(),
     // null clears the per-org override and falls back to the cluster-wide
     // default; a positive integer sets a per-org value.
     userCacheQuotaBytes: z.number().int().positive().nullable().optional(),
@@ -116,6 +138,7 @@ interface ProjectedSettings {
   deniedRepos: RepoPatternEntry[] | null;
   elevatedRepos: RepoPatternEntry[] | null;
   allowHttpNpmRegistries: boolean;
+  allowUntrustedDockerfileBuilds: boolean;
   /** Per-org user-cache byte quota; null = cluster-wide default. */
   userCacheQuotaBytes: number | null;
   /** Per-org user-cache entry TTL (ms); null = cluster-wide default. */
@@ -193,6 +216,7 @@ function projectRow(
       deniedRepos: null,
       elevatedRepos: null,
       allowHttpNpmRegistries: false,
+      allowUntrustedDockerfileBuilds: false,
       userCacheQuotaBytes: null,
       userCacheTtlMs: null,
       artifactQuotaBytes: null,
@@ -224,6 +248,7 @@ function projectRow(
     deniedRepos: row.global_workflow_denied_repos,
     elevatedRepos: row.global_workflow_elevated_repos,
     allowHttpNpmRegistries: row.allow_http_npm_registries,
+    allowUntrustedDockerfileBuilds: row.allow_untrusted_dockerfile_builds,
     userCacheQuotaBytes: bigintToNumber(row.user_cache_quota_bytes),
     userCacheTtlMs: bigintToNumber(row.user_cache_ttl_ms),
     artifactQuotaBytes: bigintToNumber(row.artifact_quota_bytes),
@@ -300,6 +325,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       let elevatedRepos: RepoPatternEntry[] | null =
         existing?.global_workflow_elevated_repos ?? null;
       let allowHttpNpmRegistries = existing?.allow_http_npm_registries ?? false;
+      let allowUntrustedDockerfileBuilds = existing?.allow_untrusted_dockerfile_builds ?? false;
       // BIGINT columns: existing comes back as string | null from pg.
       let userCacheQuotaBytes: number | null = bigintToNumber(
         existing?.user_cache_quota_bytes ?? null,
@@ -341,6 +367,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       if (body.elevatedRepos !== undefined) elevatedRepos = body.elevatedRepos;
       if (body.allowHttpNpmRegistries !== undefined)
         allowHttpNpmRegistries = body.allowHttpNpmRegistries;
+      if (body.allowUntrustedDockerfileBuilds !== undefined)
+        allowUntrustedDockerfileBuilds = body.allowUntrustedDockerfileBuilds;
       // null is a meaningful value here (clear the override → fall back to the
       // cluster-wide default), so distinguish it from undefined (leave as-is).
       if (body.userCacheQuotaBytes !== undefined) userCacheQuotaBytes = body.userCacheQuotaBytes;
@@ -390,6 +418,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
           global_workflow_denied_repos: deniedJson,
           global_workflow_elevated_repos: elevatedJson,
           allow_http_npm_registries: allowHttpNpmRegistries,
+          allow_untrusted_dockerfile_builds: allowUntrustedDockerfileBuilds,
           user_cache_quota_bytes: userCacheQuotaBytes,
           user_cache_ttl_ms: userCacheTtlMs,
           artifact_quota_bytes: artifactQuotaBytes,
@@ -415,6 +444,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
             global_workflow_denied_repos: deniedJson,
             global_workflow_elevated_repos: elevatedJson,
             allow_http_npm_registries: allowHttpNpmRegistries,
+            allow_untrusted_dockerfile_builds: allowUntrustedDockerfileBuilds,
             user_cache_quota_bytes: userCacheQuotaBytes,
             user_cache_ttl_ms: userCacheTtlMs,
             artifact_quota_bytes: artifactQuotaBytes,

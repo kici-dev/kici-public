@@ -367,7 +367,7 @@ describe('kici-admin secret CLI', () => {
         );
         expect(exitCode).toBeNull();
         expect(client.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'K', 'v');
-        expect(stderrChunks.join('')).toMatch(/--value puts the secret in shell history/);
+        expect(stderrChunks.join('')).toMatch(/--value puts the value in shell history/);
       } finally {
         process.stderr.write = origStderrWrite;
       }

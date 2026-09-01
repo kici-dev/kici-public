@@ -18,6 +18,7 @@ import {
   WS_CLOSE_PROTOCOL_ERROR,
   WS_CLOSE_AUTH_TIMEOUT,
   WS_CLOSE_INVALID_MESSAGE,
+  WS_CLOSE_PLAN_LIMIT,
   type PeerHeartbeat,
   type PeerToPeerMessage,
   type JobReroute,
@@ -84,6 +85,14 @@ export interface PeerHandlerDeps {
   peerRegistry: PeerRegistry;
   /** Callback to get this orchestrator's local agent inventory for heartbeats. */
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
+  /**
+   * The Platform-pushed worker ceiling this coordinator enforces, or `null`
+   * when none was ever received (admit worker joins freely). Read at each
+   * worker-peer admission. Served from the persisted PlanHeadroomStore, so it
+   * survives a Platform disconnect — the coordinator keeps enforcing the last
+   * known ceiling rather than resetting to unlimited.
+   */
+  getWorkerCeiling?: () => Promise<number | null>;
   /** Heartbeat interval in ms. Default: 30000 (30s). */
   heartbeatIntervalMs?: number;
   /** Auth timeout in ms. Default: 15000 (15s). */
@@ -178,6 +187,25 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
  * Returns `handleConnection(ws, remoteIp?)` which should be called when a new
  * WebSocket connection is upgraded on the peer endpoint.
  */
+/**
+ * Whether a joining peer may be admitted against the plan ceiling.
+ *
+ * Only workers are gated: a coordinator peer holds its own Platform connection
+ * and is counted there, and a peer advertising no role registers as a
+ * coordinator (see PeerRegistry.addPeer), so neither is gated here. A `null`
+ * ceiling — none ever received — admits freely. The ceiling is ABSOLUTE, so the
+ * join is admitted only while the currently-connected worker count is below it.
+ */
+export function shouldAdmitWorker(
+  role: string | undefined,
+  ceiling: number | null,
+  connectedWorkerCount: number,
+): boolean {
+  if (role !== 'worker') return true;
+  if (ceiling === null) return true;
+  return connectedWorkerCount < ceiling;
+}
+
 export function createPeerHandler(deps: PeerHandlerDeps) {
   const {
     tokenManager,
@@ -186,6 +214,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     instanceId,
     peerRegistry,
     getLocalInventory,
+    getWorkerCeiling,
     heartbeatIntervalMs = 30_000,
     authTimeoutMs = 15_000,
     onJobReroute,
@@ -307,6 +336,39 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     msg: PeerToPeerMessage | Record<string, unknown>,
   ): void {
     ws.send(encryptMessage(JSON.stringify(msg), sessionKey));
+  }
+
+  /**
+   * Gate a worker join against the Platform-pushed ceiling, before the
+   * `accepted: true` response. Returns true when the join may proceed. A plan
+   * rejection is NOT an auth failure, so it does not call recordFailedAuth and
+   * must not consume the peer's rate-limit budget.
+   */
+  async function admitWorkerOrReject(
+    role: string | undefined,
+    ws: PeerWsLike,
+    sessionKey: Buffer,
+    peerInstanceId: string,
+  ): Promise<boolean> {
+    if (role !== 'worker') return true;
+    const ceiling = getWorkerCeiling ? await getWorkerCeiling() : null;
+    const connected = peerRegistry.getConnectedWorkerPeers().length;
+    if (shouldAdmitWorker(role, ceiling, connected)) return true;
+
+    const reason = `Plan limit: this organization allows ${(ceiling ?? 0) + 1} orchestrator(s), coordinators and workers combined`;
+    logger.warn('Worker join refused by plan ceiling', {
+      peerInstanceId,
+      connected,
+      ceiling,
+    });
+    sendEncryptedMessage(ws, sessionKey, {
+      type: 'peer.auth.response',
+      accepted: false,
+      instanceId,
+      reason,
+    });
+    ws.close(WS_CLOSE_PLAN_LIMIT, reason);
+    return false;
   }
 
   /**
@@ -884,6 +946,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
           revokedPriorCredentials: saveResult.revokedCount,
         });
 
+        // Gate a worker join against the plan ceiling before accepting.
+        if (!(await admitWorkerOrReject(result.routing.role, ws, sessionKey, authMsg.instanceId)))
+          return false;
+
         // Get local inventory for auth response
         const inventory = getLocalInventory();
 
@@ -954,6 +1020,16 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
                 trigger: 'idempotent-token-retry',
                 revokedPriorCredentials: retrySave.revokedCount,
               });
+
+              if (
+                !(await admitWorkerOrReject(
+                  parsed.routing.role,
+                  ws,
+                  sessionKey,
+                  authMsg.instanceId,
+                ))
+              )
+                return false;
 
               const inventory = getLocalInventory();
               sendEncryptedMessage(ws, sessionKey, {
@@ -1063,6 +1139,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       // Update last seen (track which coordinator validated)
       await credentialStore.updateLastSeen(stored.credentialHash, instanceId);
 
+      // Gate a worker join against the plan ceiling before accepting.
+      if (!(await admitWorkerOrReject(stored.role, ws, sessionKey, authMsg.instanceId)))
+        return false;
+
       // Get local inventory for auth response
       const inventory = getLocalInventory();
 
@@ -1111,6 +1191,16 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
    */
   function getConnectionCount(): number {
     return connections.size;
+  }
+
+  /**
+   * Close a connected peer's socket by instanceId. Used by worker eviction to
+   * disconnect a drained worker. No-op if the peer holds no connection here.
+   */
+  function closePeer(targetInstanceId: string, code: number, reason: string): void {
+    const conn = connections.get(targetInstanceId);
+    if (!conn) return;
+    conn.ws.close(code, reason);
   }
 
   /**
@@ -1261,6 +1351,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   return {
     handleConnection,
     sendToPeer,
+    closePeer,
     sendAndWaitAck,
     sendConfigReloadAndWait,
     sendLogsCollectAndWait,

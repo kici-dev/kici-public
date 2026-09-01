@@ -64,7 +64,7 @@ The orchestrator is the execution brain. It decides what to run and dispatches w
 - **Job queue** -- PostgreSQL-backed FIFO queue for reliable dispatch.
 - **Webhook pipeline** -- Dedup, event mapping, lock file fetch, trigger matching, and job dispatch in a single pipeline.
 - **Multi-orchestrator clustering** -- Optional peer-to-peer coordination via direct WebSocket connections. Enables cross-architecture job routing (e.g., x64 coordinator reroutes arm64 jobs to a peer), high availability, and dedicated coordinator topologies. Uses Raft consensus for leader election (orphan recovery). See [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md).
-- **Auto-scaler** -- Optional pluggable module for ephemeral agent provisioning. Supports containers (Docker/Podman), bare-metal processes, and Firecracker microVMs as backends. Spawns agents on demand when no matching agent is connected, with label-based routing, two-level capacity limits (global + per-backend), warm pools, YAML configuration (`scalers.d/` directory support), and SIGHUP reload. Disabled by default -- orchestrator works without it.
+- **Auto-scaler** -- Optional pluggable module for ephemeral agent provisioning. Four backends are configurable: containers (Docker/Podman), bare-metal processes, Firecracker microVMs, and the event backend, which performs no local compute -- it emits reserved scale-up / scale-down events that a customer-authored provisioning workflow consumes to boot and tear down a cloud instance. Spawns agents on demand when no matching agent is connected, with label-based routing, two-level capacity limits (global + per-backend), warm pools, YAML configuration (`scalers.d/` directory support), and SIGHUP reload. Disabled by default -- orchestrator works without it.
 - **Independent database** -- Has its own PostgreSQL database separate from the Platform. Stores execution runs/jobs/steps, dispatch queue, webhook secrets, dedup cache, and scaler state. The orchestrator's `execution_runs` and `execution_jobs` are the authoritative source of truth. The Platform receives execution status updates via WebSocket messages (`execution.status`, `job.status.forward`).
 
 > Source: `packages/orchestrator/src/pipeline/processor.ts` (webhook pipeline), `packages/orchestrator/src/cluster/` (P2P coordination), `packages/orchestrator/src/scaler/` (auto-scaler module), `packages/orchestrator/src/server.ts` (Platform/hybrid entry point)
@@ -74,6 +74,7 @@ The orchestrator is the execution brain. It decides what to run and dispatches w
 The agent is the execution worker. It runs on customer infrastructure and has full access to customer code.
 
 - **Repository cloning** -- Clones the target repo with token-based auth (token in HTTP headers, not URLs, to prevent leakage).
+- **Git credential helper** -- Registers a credential helper for the job's git operations. Every network operation asks the orchestrator's broker for a credential, so a token is minted seconds before use rather than held for the life of the job. Write access is opt-in and time-boxed: `ctx.repo.withWrite(...)` adds a repository-scoped grant for the duration of its callback and revokes it afterwards, with a TTL backstop.
 - **Step execution** -- Runs steps in declaration order with full `StepContext` (zx shell, logger, environment, workflow/job metadata). Steps wrapped in a `parallel()` group run concurrently behind a `maxParallel` window, and each child reports as its own observable step with its own logs, status, timing, and retry.
 - **Execution sandboxes** -- Runs the workflow runner as a separate child process with a sanitized environment, in one of three sandboxes: bare metal (process fork, with optional bubblewrap namespace isolation), a container runtime (the whole job lifecycle runs inside a disposable container), or inside a Firecracker microVM. Agent-internal credentials never reach customer workflow code.
 - **Log streaming** -- Chunked log streaming back to the orchestrator with configurable size limits.
@@ -89,11 +90,14 @@ The agent is the execution worker. It runs on customer infrastructure and has fu
 Shared business logic used by all three tiers. Single source of truth for cross-tier concerns. Has no internal `@kici-dev/*` dependencies -- only a handful of third-party libraries.
 
 - Protocol message schemas (Zod-based, direction-specific unions including dashboard REST-over-WS, browser live streaming, the test-relay control plane, log pull, run events, peer-to-peer, cluster join, and source registration)
-- Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, FileContentsFetcher, CloneTokenProvider, RepoUrlBuilder, ContributorResolver, CheckStatusPoster)
+- Provider interfaces (WebhookNormalizer, LockFileFetcher, ChangedFilesFetcher, FileContentsFetcher, CloneTokenProvider, RepoUrlBuilder, CheckStatusPoster), plus the deprecated `ContributorResolver` the pipeline no longer calls
+- Git credential vocabulary (forge names plus the credential reference, grant, request, and result shapes the SDK declares and the orchestrator's broker resolves) and the agent→orchestrator relay protocol its credential helper calls. See [Git credentials](../user/patterns/git-credentials.md)
 - Trigger matching engine (branch, path, event evaluation)
+- Content-requirement matcher (the declarative `requires` filter -- pure data describing a query over the bytes of one source file at the event's ref, interpreted by the orchestrator via the `FileContentsFetcher` so no author code runs there) and the shared text-match vocabulary (`contains` / `notContains` / `matches` / `notMatches`) it shares with the commit-message trigger filter
 - Dispatch inputs (input descriptors, extraction from the trigger event, and coercion to typed values)
 - Matrix expansion and fanout (combination expansion with include/exclude, job-name suffix formatting, and materialization of one matrix or multi-host job into N dispatchable children)
-- Execution status vocabulary (run/job/step status enums + terminal-state sets; lifecycle owned by the orchestrator's execution tracker)
+- Execution status vocabulary (run/job/step status enums + terminal-state sets; lifecycle owned by the orchestrator's execution tracker) and its presentation layer (the total precedence order that decides which status wins a roll-up, legacy-spelling resolution, and the per-status failure classification every consumer asks about)
+- Job-kind discriminator, alongside the status enums. It separates a `standard` job running steps from an invoke `gate` and from the `proxy` job that mirrors a summoned run
 - Check mode (the idempotent run modes `apply` / `check` / `check-fail-on-drift` and the per-step outcome vocabulary)
 - Webhook signature verification (HMAC-SHA256, timing-safe)
 - WebSocket close codes (unified across all tiers)
@@ -104,12 +108,13 @@ Shared business logic used by all three tiers. Single source of truth for cross-
 - Approval requirements (normalized approver clauses shared by the orchestrator gate, the resolver, the held-run store, and the agent step round-trip)
 - Build provenance (in-toto statement schema, DSSE envelope, attestation bundle, verification)
 - Artifact name contract (the shared filesystem/URL-safe name schema the orchestrator, agent, and SDK all validate against)
-- Developer MCP tool schemas (argument schemas for the AI-agent tool surface)
+- Developer MCP tool schemas (argument schemas for the AI-agent tool surface) and the untrusted-content fence that wraps every repository- or contributor-supplied value an agent reads in a per-response random nonce, so log lines and error text cannot be read as instructions
 - Developer-operations contract (one row per workflow-developer operation declaring which entrypoints expose it -- the shared REST API behind the web UI and the `kici` CLI, the AI-agent tool surface, and a curated UI flag -- asserted against each real surface by congruence tests)
 - Label utilities (platform label derivation, runsOn normalization, `kici:*` set-only reserved namespace, role labels)
 - Host inventory (the canonical queryable host-roster schema shared by the orchestrator's roster store, the agent-facing inventory API, and the SDK's `ctx.kici.inventory`)
 - Audit policy and retention (per-action access-log sampling, warm-retention windows for cold-store eligibility, federated activity row schema)
-- Scaler backend type enum (`container`, `bare-metal`, `firecracker`, `kubernetes`)
+- Scaler backend type enum (`container`, `bare-metal`, `firecracker`, `kubernetes`, `event`) and the reserved `kici.` event-name prefix that keeps a user step from forging a system event
+- Job resource vocabulary (the requests/limits shape the SDK accepts, the compiler validates and emits, the orchestrator uses for capacity math and kernel-side enforcement, and the dashboard displays)
 - Registration trigger type enum (registerable trigger discriminator)
 - Sandbox capability set (the Linux capability names a container sandbox may add or drop, shared by the SDK validator, the compiler, and the dispatch resolver)
 - Plan tier vocabulary (the hosted plan tiers and the purchasable subset, shared by the Platform and the browser dashboard)
@@ -135,7 +140,7 @@ It also runs the **local dev plane** -- an on-demand, fully local execution stac
 
 ### `@kici-dev/core`
 
-Light shared utilities with no server-side dependencies — JSON-structured logging, error helpers, human-readable formatting (`formatBytes`/`formatDuration`/`formatUptime`), cryptographic helpers (`sha256`/`sha256File`/`deriveSharedSecret`), zx initialization (`initZx()`), and the TypeScript loader hook that transforms TypeScript on import. It is the dependency-light core that the SDK, compiler, and `kici` CLI consume directly so they stay free of heavier server-only dependencies. `@kici-dev/shared` re-exports it, so existing `@kici-dev/shared` import paths keep working.
+Light shared utilities with no server-side dependencies. It provides JSON-structured logging, error helpers, async-local-storage request context, and human-readable formatting (`formatBytes`/`formatDuration`/`formatUptime`). It also provides cryptographic helpers (`sha256`/`sha256File`/`deriveSharedSecret` plus symmetric encrypt/decrypt), retry-backoff computation, and the shared diagnostics-result contract. The rest of its surface ships as subpath entry points: the temp-directory allocator and its garbage collector, package-manager detection, CI-environment detection, and the idempotent-step runner (the check / confirm / apply primitive behind idempotent steps). Finally it supplies zx initialization (`initZx()`) and the TypeScript loader hook that transforms TypeScript on import. It is the dependency-light core that the SDK, compiler, and `kici` CLI consume directly so they stay free of heavier server-only dependencies. `@kici-dev/shared` re-exports it, so existing `@kici-dev/shared` import paths keep working.
 
 > Source: `packages/core/src/`
 
@@ -223,7 +228,7 @@ The orchestrator connects outbound to the Platform WebSocket endpoint. After aut
 
 When multiple orchestrators are deployed, they establish direct WebSocket connections to each other on the `/ws/peer` endpoint. Peers are discovered via the Platform matchmaker (Platform/hybrid modes) or static configuration (`KICI_CLUSTER_PEERS` env var, independent mode). Connections are authenticated with a mutual pre-shared key (PSK). Traffic includes agent inventory heartbeats, job rerouting, progress reporting, cancel propagation, and Raft leader election. These messages never transit the Platform tier.
 
-> See [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md) for clustering details and [Protocol Messages](protocol/dashboard.md#orchestrator-orchestrator-messages-peer-to-peer) for message schemas.
+> See [Multi-Orchestrator Architecture](./clustering/multi-orchestrator.md) for clustering details and [Protocol Messages](protocol/dashboard.md#orchestrator---orchestrator-messages-peer-to-peer) for message schemas.
 
 ### Orchestrator ↔ Agent
 

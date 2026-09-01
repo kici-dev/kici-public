@@ -133,7 +133,9 @@ conforming name.
 Two gates are not scoped to a single job and store a run-wide sentinel instead:
 
 - `__install__<workflow>` -- the workflow install gate (registry / install-env resolution).
-- `__workflow_modification__` -- the PR-wide security hold for a non-trusted contributor who modified workflow files.
+- `__fork_pr__` -- the PR-wide security hold the org fork switch raises on a fork pull request.
+
+Two further sentinels, `__workflow_modification__` and `__unknown_contributor__`, appear on rows written by earlier builds. Nothing writes them now, and the dashboard still renders a label for each.
 
 ### States
 

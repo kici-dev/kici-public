@@ -37,17 +37,133 @@ import { oidcMintRequestSchema, oidcMintResponseSchema } from './oidc-mint.js';
  */
 export const DEFAULT_APPROVAL_EXPIRY_HOURS = 72;
 
+/** Seconds in an hour — the one conversion between the two expiry spellings. */
+export const SECONDS_PER_HOUR = 3600;
+
+/**
+ * The same documented default as {@link DEFAULT_APPROVAL_EXPIRY_HOURS}, in the
+ * granularity the policy actually stores.
+ */
+export const DEFAULT_APPROVAL_EXPIRY_SECONDS = DEFAULT_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR;
+
+/**
+ * The shortest expressible security-hold window.
+ *
+ * One second, not a rounder-looking number: the floor exists to stop a zero or
+ * negative value minting an already-expired hold, and any strictly positive
+ * integer discharges that. A larger floor would be an invented usability
+ * opinion that also puts the window back out of reach of a test.
+ */
+export const MIN_APPROVAL_EXPIRY_SECONDS = 1;
+
+/** The longest window the Platform accepts: one year, the bound already applied to hours. */
+export const MAX_APPROVAL_EXPIRY_HOURS = 8760;
+
+/** {@link MAX_APPROVAL_EXPIRY_HOURS} in seconds, so neither spelling outranges the other. */
+export const MAX_APPROVAL_EXPIRY_SECONDS = MAX_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR;
+
+/**
+ * The window a policy actually means, in seconds.
+ *
+ * `approvalExpirySeconds` is the authority and `approvalExpiryHours` its coarse
+ * spelling, so the more specific field wins whenever both are present — the
+ * only rule that never discards what an operator asked for. A policy carrying
+ * neither (an older peer that sent no window at all) falls back to the
+ * documented default.
+ */
+export function approvalExpirySecondsOf(policy: {
+  approvalExpiryHours?: number | null;
+  approvalExpirySeconds?: number | null;
+}): number {
+  if (policy.approvalExpirySeconds != null) return policy.approvalExpirySeconds;
+  if (policy.approvalExpiryHours != null) return policy.approvalExpiryHours * SECONDS_PER_HOUR;
+  return DEFAULT_APPROVAL_EXPIRY_SECONDS;
+}
+
+/**
+ * The coarse `approvalExpiryHours` view of a window stored in seconds.
+ *
+ * Rounds UP, and never below one hour. A sub-hour window has no exact hours
+ * spelling, and the peer reading this field is one that cannot express the real
+ * value anyway — so the choice is which way to be wrong. Rounding up yields a
+ * longer hold than asked for, which stays approvable; rounding down yields zero,
+ * which is the already-expired hold `MIN_APPROVAL_EXPIRY_SECONDS` exists to
+ * prevent.
+ */
+export function approvalExpiryHoursOf(seconds: number): number {
+  return Math.max(1, Math.ceil(seconds / SECONDS_PER_HOUR));
+}
+
+/**
+ * The org-level fork switch: the setting an org's trust policy carries for how
+ * fork pull requests are treated. Each value names what the operator is
+ * choosing; which values the orchestrator's trust-policy gate honours, and the
+ * mechanism it uses, are owned there rather than here.
+ *
+ * - `ignore` — the operator declines fork pull requests.
+ * - `hold` — the operator requires approval first; the policy's approval expiry
+ *   bounds how long that approval stays open.
+ * - `allow` — the operator permits fork pull requests to run with reduced
+ *   privilege.
+ * - `reject` — deprecated in favour of `ignore`; removed at v1.0.0.
+ */
+export const ForkPolicy = z.enum(['ignore', 'hold', 'reject', 'allow']);
+export type ForkPolicy = z.infer<typeof ForkPolicy>;
+
+/**
+ * How much CI authority one org member holds.
+ *
+ * The level the `/kici approve` comment path reads once it has resolved a
+ * commenter to a KiCI user id: `write` or `admin` may release a security hold,
+ * `read` and `none` may not. Named here rather than spelled inline so the wire
+ * schema, the orchestrator's admin route, and `kici-admin` all offer exactly
+ * the same four values.
+ */
+export const CiTrustLevel = z.enum(['none', 'read', 'write', 'admin']);
+export type CiTrustLevel = z.infer<typeof CiTrustLevel>;
+
 export const trustPolicySchema = z.object({
-  forkPolicy: z.enum(['hold', 'reject', 'allow']),
+  forkPolicy: ForkPolicy,
+  /**
+   * @deprecated Accepted for wire compatibility and still stored and echoed
+   * back, so an orchestrator or CLI on an older build keeps seeing the value it
+   * expects. The orchestrator's trust-policy gate does not read it, so it
+   * changes no dispatch outcome. Removed at v1.0.0.
+   */
   unknownContributorPolicy: z.enum(['hold', 'reject']),
+  /**
+   * @deprecated Accepted for wire compatibility and still stored and echoed
+   * back, so an orchestrator or CLI on an older build keeps seeing the value it
+   * expects. The orchestrator's trust-policy gate does not read it, so it
+   * changes no dispatch outcome. Removed at v1.0.0.
+   */
   workflowChangePolicy: z.enum(['hold', 'reject', 'allow']),
   /**
-   * Hours a security hold stays open. Integer and positive: the column is
-   * INTEGER NOT NULL, so a fractional value throws inside the fire-and-forget
-   * persist and the policy is then silently never stored, and a zero or
-   * negative value mints an already-expired hold.
+   * Hours a security hold stays open — the coarse spelling of
+   * `approvalExpirySeconds`, kept required so an orchestrator or CLI on an
+   * older build still receives a window it can read. Not deprecated: it is read,
+   * enforced whenever no seconds value accompanies it, and remains the
+   * ergonomic way to say "72 hours".
+   *
+   * Integer and positive: the column is INTEGER NOT NULL, so a fractional value
+   * throws inside the fire-and-forget persist and the policy is then silently
+   * never stored, and a zero or negative value mints an already-expired hold.
    */
   approvalExpiryHours: z.number().int().min(1),
+  /**
+   * Seconds a security hold stays open — the authoritative window, and the one
+   * granularity that can express a sub-hour hold.
+   *
+   * Optional because an older Platform sends only the hours field; a frame
+   * without it resolves through {@link approvalExpirySecondsOf}, which falls
+   * back to `approvalExpiryHours * SECONDS_PER_HOUR`. When both are present this
+   * one wins, at every layer.
+   *
+   * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS} for the same two
+   * reasons the hours field is: the column is INTEGER, and a non-positive window
+   * mints an already-expired hold.
+   */
+  approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS).optional(),
 });
 export type TrustPolicy = z.infer<typeof trustPolicySchema>;
 
@@ -71,7 +187,7 @@ export const trustPolicyUpdateSchema = z.object({
       providerUserId: z.string().nullish(),
     }),
   ),
-  memberCiTrustLevels: z.record(z.string(), z.enum(['none', 'read', 'write', 'admin'])),
+  memberCiTrustLevels: z.record(z.string(), CiTrustLevel),
   /**
    * Operator-defined teams and their member user ids. The orchestrator has no
    * identity store, so team membership is delivered here (next to
@@ -343,6 +459,53 @@ export const orchMetricsSchema = z.object({
 });
 export type OrchMetrics = z.infer<typeof orchMetricsSchema>;
 
+/** Largest worker-peer snapshot accepted on one frame. */
+export const CLUSTER_MEMBERSHIP_MAX_WORKERS = 512;
+
+/**
+ * Worker-peer membership snapshot, sent by a coordinator to the Platform.
+ *
+ * A snapshot rather than a delta: a dropped or reordered frame self-heals on
+ * the next send instead of corrupting a running tally. The Platform stores the
+ * reported size on `platform_connections` and aggregates it into the org's
+ * combined orchestrator count.
+ *
+ * The array bound is the first line of defence, for the same reason
+ * `orchMetricsSchema` bounds its own arrays: a malformed or hostile push must
+ * fail Zod parse at the WS edge and never reach the aggregate.
+ */
+export const clusterMembershipSchema = z.object({
+  type: z.literal('cluster.membership'),
+  workers: z
+    .array(z.object({ instanceId: z.string().min(1).max(128) }))
+    .max(CLUSTER_MEMBERSHIP_MAX_WORKERS),
+  timestamp: z.number(),
+});
+export type ClusterMembership = z.infer<typeof clusterMembershipSchema>;
+
+/**
+ * Per-coordinator orchestrator ceiling, pushed by the Platform.
+ *
+ * `maxWorkerPeers` is an ABSOLUTE ceiling on this coordinator's connected
+ * worker peers, not a remaining allowance. The Platform computes it by
+ * excluding this connection's own workers from the org total, so it does not
+ * move when a local worker joins or leaves — the coordinator can enforce
+ * against its live peer count with no round trip and no staleness window.
+ *
+ * `orgLimit` and `orgTotal` are informational: they let the coordinator's
+ * rejection reason say why, rather than closing opaquely. `evictExcess` is set
+ * once the org has been over its limit for longer than the grace window, and
+ * asks the coordinator to drain its newest workers down to the ceiling.
+ */
+export const planHeadroomSchema = z.object({
+  type: z.literal('plan.headroom'),
+  maxWorkerPeers: z.number().int().min(0),
+  orgLimit: z.number().int().min(0),
+  orgTotal: z.number().int().min(0),
+  evictExcess: z.boolean(),
+});
+export type PlanHeadroom = z.infer<typeof planHeadroomSchema>;
+
 /**
  * Acknowledgment that a webhook was received and processing started.
  *
@@ -475,6 +638,8 @@ export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', 
   oidcMintResponseSchema,
   // Platform capability advertisement (Platform → orchestrator direction).
   platformCapabilitiesMessageSchema,
+  // Per-coordinator orchestrator ceiling (Platform → coordinator direction).
+  planHeadroomSchema,
   // Negative acknowledgment: the Platform's diagnosable reply when it receives
   // an orchestrator frame whose type it does not understand (version skew).
   // A member of BOTH direction unions since either side can NACK the other.
@@ -513,6 +678,8 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   jobContextMessageSchema,
   orchMetricsSchema,
   oidcMintRequestSchema,
+  // Worker-peer membership snapshot (coordinator → Platform direction).
+  clusterMembershipSchema,
   // Negative acknowledgment: the orchestrator's diagnosable reply when it
   // receives a Platform frame whose type it does not understand (version skew).
   nackSchema,

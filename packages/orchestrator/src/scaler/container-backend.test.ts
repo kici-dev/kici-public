@@ -36,12 +36,18 @@ const mockContainerInspect = vi.fn().mockResolvedValue({
   },
 });
 
+// `ensureRuntimeVolume` probes the runtime volume's completion marker with a
+// short-lived container, so the fake has to be waitable. Exit 0 = the marker is
+// there = the volume is reused rather than repopulated.
+const mockWait = vi.fn().mockResolvedValue({ StatusCode: 0 });
+
 const mockContainer = {
   id: 'container-abc123',
   start: mockStart,
   stop: mockStop,
   remove: mockRemove,
   inspect: mockContainerInspect,
+  wait: mockWait,
 };
 
 const mockCreateContainer = vi.fn().mockResolvedValue(mockContainer);
@@ -68,6 +74,14 @@ const mockNetworkInspect = vi.fn().mockResolvedValue({
   Options: { 'com.docker.network.bridge.name': 'br-abc123456789' },
 });
 const mockGetNetwork = vi.fn().mockReturnValue({ inspect: mockNetworkInspect });
+// The runtime volume a per-job image mounts. Default to "already present" so
+// the existing fixed-image cases never touch the populator path.
+const mockVolumeInspect = vi.fn().mockResolvedValue({});
+const mockVolumeRemove = vi.fn().mockResolvedValue(undefined);
+const mockGetVolume = vi
+  .fn()
+  .mockReturnValue({ inspect: mockVolumeInspect, remove: mockVolumeRemove });
+const mockCreateVolume = vi.fn().mockResolvedValue({});
 
 vi.mock('dockerode', () => {
   return {
@@ -80,6 +94,8 @@ vi.mock('dockerode', () => {
         createNetwork: mockCreateNetwork,
         getNetwork: mockGetNetwork,
         getImage: mockGetImage,
+        getVolume: mockGetVolume,
+        createVolume: mockCreateVolume,
         pull: mockPull,
         modem: {
           followProgress: mockFollowProgress,
@@ -723,6 +739,32 @@ describe('ContainerScalerBackend', () => {
 
       expect(backend.labelSets).toEqual(newLabelSets);
     });
+
+    it('applies a new maxAgents on reload', async () => {
+      const backend = await createBackend();
+      expect(backend.maxAgents).toBe(5);
+
+      const result = backend.reload([{ labels: ['linux', 'docker'], image: 'a:latest' }], {
+        maxAgents: 9,
+      });
+
+      expect(result.valid).toBe(true);
+      expect(backend.maxAgents).toBe(9);
+    });
+
+    it('keeps the current maxAgents when the opts argument is omitted', async () => {
+      const backend = await createBackend();
+      backend.reload([{ labels: ['linux', 'docker'], image: 'a:latest' }]);
+      expect(backend.maxAgents).toBe(5);
+    });
+
+    it('leaves maxAgents untouched when the new label sets are invalid', async () => {
+      const backend = await createBackend();
+      const result = backend.reload([{ labels: ['linux', 'node20'] }], { maxAgents: 9 });
+
+      expect(result.valid).toBe(false);
+      expect(backend.maxAgents).toBe(5);
+    });
   });
 
   describe('type', () => {
@@ -1012,5 +1054,90 @@ describe('ContainerScalerBackend', () => {
       } as Entry;
       expect(ContainerScalerBackend.getRequiredTools(entry)).toEqual([]);
     });
+  });
+});
+
+describe('ContainerScalerBackend per-job image', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreateContainer.mockResolvedValue(mockContainer);
+    mockVolumeInspect.mockResolvedValue({});
+    mockGetVolume.mockReturnValue({ inspect: mockVolumeInspect, remove: mockVolumeRemove });
+  });
+
+  const jobContainer = {
+    image: 'reg.internal:5000/acme/ci:1.2',
+    authconfig: {
+      username: 'bot',
+      password: 's3cr3t',
+      serveraddress: 'reg.internal:5000',
+    },
+  };
+
+  it('spawns the job own image with the runtime injected, not the pool image', async () => {
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-perjob', 'ws://orch/ws', () => {}, undefined, {
+      boundJobId: 'job-1',
+      runId: 'run-1',
+      container: jobContainer,
+    });
+
+    const created = mockCreateContainer.mock.calls.at(-1)![0] as {
+      Image: string;
+      Cmd?: string[];
+      HostConfig: { Binds?: string[] };
+    };
+    expect(created.Image).toBe('reg.internal:5000/acme/ci:1.2');
+    // The injected runtime is what lets an arbitrary image run without Node.
+    expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBe(true);
+    // A per-job image declares its OWN default CMD, so without naming the agent
+    // the container runs the customer's entrypoint and never registers.
+    expect((created as { Cmd?: string[] }).Cmd).toEqual([
+      '/opt/kici/node/bin/node',
+      '/opt/kici/app/packages/agent/dist/server.js',
+    ]);
+  });
+
+  it('authenticates the pull for a private per-job image', async () => {
+    // Absent only for the JOB image, so the pull runs. The AGENT image must
+    // still inspect: the runtime volume is keyed by its content id.
+    mockGetImage.mockImplementation((image: string) => ({
+      inspect:
+        image === 'reg.internal:5000/acme/ci:1.2'
+          ? vi.fn().mockRejectedValue(new Error('absent'))
+          : vi.fn().mockResolvedValue({ Id: 'sha256:' + 'a'.repeat(64) }),
+    }));
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-priv', 'ws://orch/ws', () => {}, undefined, {
+      container: jobContainer,
+    });
+
+    const pullCall = mockPull.mock.calls.find((c) => c[0] === 'reg.internal:5000/acme/ci:1.2');
+    expect((pullCall?.[1] as { authconfig?: unknown })?.authconfig).toEqual(
+      jobContainer.authconfig,
+    );
+  });
+
+  it('spawns the fixed pool image and injects nothing when no job image is set', async () => {
+    const backend = await createBackend();
+
+    await backend.spawn(['linux', 'docker'], 'agent-fixed', 'ws://orch/ws', () => {}, undefined, {
+      boundJobId: 'job-1',
+    });
+
+    const created = mockCreateContainer.mock.calls.at(-1)![0] as {
+      Image: string;
+      Cmd?: string[];
+      HostConfig: { Binds?: string[] };
+    };
+    // The agent image already carries the runtime — injecting into it would
+    // shadow its own /opt/kici.
+    expect(created.Image).not.toBe('reg.internal:5000/acme/ci:1.2');
+    expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBeFalsy();
+    // The pool's agent image already starts the agent by default; overriding
+    // its CMD would be a second way to say the same thing.
+    expect((created as { Cmd?: string[] }).Cmd).toBeUndefined();
   });
 });

@@ -289,7 +289,11 @@ kici runs list --json | jq '.runs[].runId'
 #### kici runs show
 
 Show a run's summary header plus its jobs-and-steps tree (name, status,
-duration, exit code). If the run id is not on the Platform but exists in your
+duration, exit code). A run that never started a step also prints why: the
+run-level failure, and per job the reason it did not run — a job a
+[context](../contexts.md#protection-rules) rejected names the context and the
+rule. Any approval hold on the run is listed too, with its context, hold type,
+status and reason. If the run id is not on the Platform but exists in your
 local run history (from `kici run <event> --local`), the local record is shown instead.
 
 ```bash
@@ -470,10 +474,12 @@ Synopsis: `kici approve <run-id> [options]`
 
 **Options**
 
-| Option           | Default | Description                                 |
-| ---------------- | ------- | ------------------------------------------- |
-| `--job <name>`   |         | Approve the hold for a specific job         |
-| `--step <index>` |         | Approve a step-scoped hold (requires --job) |
+| Option               | Default | Description                                                                                  |
+| -------------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `--job <name>`       |         | Approve the hold for a specific job                                                          |
+| `--step <index>`     |         | Approve a step-scoped hold (requires --job)                                                  |
+| `--hold-type <type>` |         | Approve the hold of this type (reviewer, timer, concurrency, security) — a job can carry two |
+| `--hold <id>`        |         | Approve one hold by its id, as listed when nothing else separates them                       |
 
 ### `kici reject`
 
@@ -489,11 +495,13 @@ Synopsis: `kici reject <run-id> [options]`
 
 **Options**
 
-| Option            | Default | Description                                |
-| ----------------- | ------- | ------------------------------------------ |
-| `--job <name>`    |         | Reject the hold for a specific job         |
-| `--step <index>`  |         | Reject a step-scoped hold (requires --job) |
-| `--reason <text>` |         | Reason for the rejection                   |
+| Option               | Default | Description                                                                                 |
+| -------------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `--job <name>`       |         | Reject the hold for a specific job                                                          |
+| `--step <index>`     |         | Reject a step-scoped hold (requires --job)                                                  |
+| `--hold-type <type>` |         | Reject the hold of this type (reviewer, timer, concurrency, security) — a job can carry two |
+| `--hold <id>`        |         | Reject one hold by its id, as listed when nothing else separates them                       |
+| `--reason <text>`    |         | Reason for the rejection                                                                    |
 
 ### `kici run`
 
@@ -691,7 +699,7 @@ Synopsis: `kici runs rerun <run-id> [options]`
 
 ### `kici runs show`
 
-Show a run summary with its jobs and steps
+Show a run summary with its jobs and steps, why a job did not run, and any approval hold
 
 Synopsis: `kici runs show <run-id> [options]`
 

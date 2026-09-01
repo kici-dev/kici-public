@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { Dispatcher, type DispatchMetrics } from './dispatcher.js';
+import { Dispatcher, containerSpawnFor, type DispatchMetrics } from './dispatcher.js';
 import { AgentRegistry } from './registry.js';
 import type { JobQueue, QueuedJob, QueuedJobInput } from '../queue/job-queue.js';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
@@ -812,6 +812,48 @@ describe('Dispatcher', () => {
   });
 
   describe('redrivePendingToConnectedAgents (pending safety-net)', () => {
+    it('does NOT re-drive a held label-routed post-restart job onto a reboot-pending host', async () => {
+      // The safety-net re-drive must apply the same reboot-pending gate as
+      // dispatch() / drainForAgent: a job held because its only matching host is
+      // reboot-pending must stay pending, not be re-driven into the about-to-die
+      // box. Without the gate this path defeats the workflow host-restart hold.
+      const rosterStore = {
+        isRebootPending: vi.fn(async (agentId: string) => agentId === 'restart-box'),
+        clearRebootPending: vi.fn(),
+      };
+      registry.register('restart-box', mockWs(), ['kici:host:restart-box']);
+      const job = makeQueuedJob({ id: 'verify-1', runsOnLabels: ['kici:host:restart-box'] });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(queue.dequeueById).not.toHaveBeenCalled();
+      expect(onDispatch).not.toHaveBeenCalled();
+    });
+
+    it('does NOT re-drive a held pinned post-restart job onto its reboot-pending host', async () => {
+      const rosterStore = {
+        isRebootPending: vi.fn(async (agentId: string) => agentId === 'restart-box'),
+        clearRebootPending: vi.fn(),
+      };
+      registry.register('restart-box', mockWs(), ['kici:host:restart-box']);
+      const job = makeQueuedJob({
+        id: 'verify-1',
+        runsOnLabels: ['kici:host:restart-box'],
+        pinnedAgentId: 'restart-box',
+      });
+      const queue = mockQueue({ depth: 1, pendingJobs: [job], dequeueJobs: [job] });
+      const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
+
+      const placed = await dispatcher.redrivePendingToConnectedAgents();
+
+      expect(placed).toBe(0);
+      expect(queue.dequeueById).not.toHaveBeenCalled();
+      expect(onDispatch).not.toHaveBeenCalled();
+    });
+
     it('places a pending job onto a connected idle matching agent via the atomic claim', async () => {
       registry.register('healthy', mockWs(), ['linux']);
       const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'] });
@@ -1069,6 +1111,229 @@ describe('Dispatcher', () => {
     });
   });
 
+  describe('pre-spawned agent suitability', () => {
+    /**
+     * One label-matching agent plus a scaler that answers `verdict` for it. The
+     * question every case here asks is whether the job reaches that agent or
+     * falls through to the scaler.
+     */
+    function withOneAgent(verdict: boolean, queue = mockQueue(), agentLabels = ['linux']) {
+      registry.register('warm-1', mockWs(), agentLabels);
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const canPrespawnedAgentServe = vi.fn().mockReturnValue(verdict);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+        canPrespawnedAgentServe,
+      });
+      return { dispatcher, onNoMatchingAgent, canPrespawnedAgentServe };
+    }
+
+    it('skips a pre-spawned agent that cannot serve the job and scales instead', async () => {
+      const { dispatcher, onNoMatchingAgent } = withOneAgent(false);
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('queued');
+      expect(onDispatch).not.toHaveBeenCalled();
+      expect(onNoMatchingAgent).toHaveBeenCalled();
+    });
+
+    it('dispatches to a pre-spawned agent the scaler accepts', async () => {
+      const { dispatcher, onNoMatchingAgent } = withOneAgent(true);
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('dispatched');
+      expect(onDispatch).toHaveBeenCalled();
+      expect(onNoMatchingAgent).not.toHaveBeenCalled();
+    });
+
+    it("asks the scaler with the job's own resources and image", async () => {
+      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true);
+      const resources = { requests: { cpus: 4, memory: '8g' } };
+
+      await dispatcher.dispatch(
+        makeJobInput({ resources, jobConfig: { container: 'node:22-bookworm' } }),
+      );
+
+      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
+        resources,
+        hasOwnContainerImage: true,
+      });
+    });
+
+    // The typed `resources` field is a convenience mirror the caller may omit:
+    // the webhook dispatch path and the worker's reroute handler both build
+    // their input with the declaration in `jobConfig` alone. Reading only the
+    // mirror reported a job that declares nothing, so the gate admitted a warm
+    // agent of the pool's size to a job that asked for another.
+    it('reads the declared shape from jobConfig when the typed mirror is absent', async () => {
+      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true);
+      const resources = { requests: { cpus: 8, memory: '16g' } };
+
+      await dispatcher.dispatch(makeJobInput({ jobConfig: { resources } }));
+
+      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
+        resources,
+        hasOwnContainerImage: false,
+      });
+    });
+
+    it('scales for a jobConfig-only shape when no agent fits', async () => {
+      registry.register('warm-1', mockWs(), ['linux']);
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue(),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+        canPrespawnedAgentServe: vi.fn().mockReturnValue(false),
+      });
+
+      await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { resources: { requests: { cpus: 8 } } } }),
+      );
+
+      // The 5th argument is the shape the spawn is sized from. Read as absent,
+      // the scaler starts the job's own agent at the label-set default.
+      expect(onNoMatchingAgent.mock.calls[0][4]).toEqual({ requests: { cpus: 8 } });
+    });
+
+    it('carries a jobConfig-only shape into the queue drain too', async () => {
+      const queue = mockQueue();
+      registry.register('warm-1', mockWs(), ['linux']);
+      const canPrespawnedAgentServe = vi.fn().mockReturnValue(false);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        canPrespawnedAgentServe,
+        isPrespawnedAgent: (id) => id === 'warm-1',
+      });
+
+      await dispatcher.onAgentAvailable('warm-1');
+
+      const canServe = (queue.dequeueForLabels as ReturnType<typeof vi.fn>).mock.calls[0][3] as (
+        job: QueuedJob,
+      ) => boolean;
+      // A row whose mirror never got materialized still has to be gated on the
+      // shape its jobConfig declares — `makeQueuedJob` sets no `resources`.
+      expect(canServe(makeQueuedJob({ jobConfig: { resources: { requests: { cpus: 8 } } } }))).toBe(
+        false,
+      );
+      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
+        resources: { requests: { cpus: 8 } },
+        hasOwnContainerImage: false,
+      });
+    });
+
+    it('reports no own image for a job that only names a dockerfile', async () => {
+      // A dockerfile job additionally requires the build-capable runtime label,
+      // and it runs the pool's agent image nesting a container it builds — so
+      // it does NOT bring its own image.
+      const { dispatcher, canPrespawnedAgentServe } = withOneAgent(true, mockQueue(), [
+        'linux',
+        'kici:runtime:container-build',
+      ]);
+
+      await dispatcher.dispatch(
+        makeJobInput({ jobConfig: { container: { dockerfile: 'Dockerfile' } } }),
+      );
+
+      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
+        hasOwnContainerImage: false,
+      });
+    });
+
+    it('dispatches to every agent when no scaler is wired', async () => {
+      registry.register('warm-1', mockWs(), ['linux']);
+      const onNoMatchingAgent = vi
+        .fn()
+        .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue(),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      const result = await dispatcher.dispatch(makeJobInput());
+
+      expect(result.status).toBe('dispatched');
+      expect(onNoMatchingAgent).not.toHaveBeenCalled();
+    });
+
+    it('skips an unsuitable pre-spawned agent on the redispatch path too', async () => {
+      const job = makeQueuedJob({ id: 'requeued-1', status: 'pending' });
+      const queue = mockQueue({ dequeueJobs: [job] });
+      (queue.getFullJobById as ReturnType<typeof vi.fn>).mockResolvedValue(job);
+      const { dispatcher, onNoMatchingAgent } = withOneAgent(false, queue);
+
+      await (dispatcher as unknown as { redispatch(jobId: string): Promise<void> }).redispatch(
+        'requeued-1',
+      );
+
+      expect(queue.dequeueById).not.toHaveBeenCalled();
+      expect(onNoMatchingAgent).toHaveBeenCalled();
+    });
+
+    it('carries the suitability gate into the queue drain for a pre-spawned agent', async () => {
+      const queue = mockQueue();
+      registry.register('warm-1', mockWs(), ['linux']);
+      const canPrespawnedAgentServe = vi.fn().mockReturnValue(false);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        canPrespawnedAgentServe,
+        isPrespawnedAgent: (id) => id === 'warm-1',
+      });
+
+      await dispatcher.onAgentAvailable('warm-1');
+
+      // The predicate reaches the claim itself: a row rejected after being
+      // claimed would be stranded Dispatched and would burn a dispatch attempt.
+      const canServe = (queue.dequeueForLabels as ReturnType<typeof vi.fn>).mock.calls[0][3] as (
+        job: QueuedJob,
+      ) => boolean;
+      expect(canServe(makeQueuedJob({ resources: { requests: { cpus: 8 } } }))).toBe(false);
+      expect(canPrespawnedAgentServe).toHaveBeenCalledWith('warm-1', {
+        resources: { requests: { cpus: 8 } },
+        hasOwnContainerImage: false,
+      });
+    });
+
+    it('leaves the queue drain unfiltered for an ordinary agent', async () => {
+      const queue = mockQueue();
+      registry.register('static-1', mockWs(), ['linux']);
+      const dispatcher = new Dispatcher({
+        registry,
+        queue,
+        metrics,
+        onDispatch,
+        canPrespawnedAgentServe: vi.fn().mockReturnValue(true),
+        isPrespawnedAgent: () => false,
+      });
+
+      await dispatcher.onAgentAvailable('static-1');
+
+      // No predicate, so the drain keeps its single-statement fast path.
+      expect((queue.dequeueForLabels as ReturnType<typeof vi.fn>).mock.calls[0][3]).toBeUndefined();
+    });
+  });
+
   describe('onNoMatchingAgent hook', () => {
     it('enqueues job when onNoMatchingAgent returns spawning', async () => {
       const queue = mockQueue();
@@ -1097,6 +1362,7 @@ describe('Dispatcher', () => {
         queuedJobId,
         'run-1',
         [],
+        undefined,
         undefined,
         undefined,
       );
@@ -1131,6 +1397,7 @@ describe('Dispatcher', () => {
         [],
         resources,
         undefined,
+        undefined,
       );
     });
 
@@ -1159,6 +1426,7 @@ describe('Dispatcher', () => {
         queuedJobId,
         'run-attribution-1',
         [],
+        undefined,
         undefined,
         undefined,
       );
@@ -1308,6 +1576,7 @@ describe('Dispatcher', () => {
         ['windows'],
         undefined,
         undefined,
+        undefined,
       );
       expect(onNoMatchingAgent).toHaveBeenNthCalledWith(
         2,
@@ -1317,8 +1586,83 @@ describe('Dispatcher', () => {
         [],
         undefined,
         undefined,
+        undefined,
       );
       expect(metrics.incScalerRedispatch).toHaveBeenCalledWith('hook', 2);
+    });
+
+    it('hands the scaler the job image + resolved credentials', async () => {
+      const onNoMatchingAgent = vi.fn().mockResolvedValue({ action: 'spawning' });
+      const pendingJobs = [
+        makeQueuedJob({
+          id: 'ctr',
+          runId: 'run-ctr',
+          runsOnLabels: ['linux'],
+          jobConfig: {
+            container: { image: 'reg.internal:5000/acme/ci:1.2' },
+            containerRegistryAuth: {
+              username: 'bot',
+              password: 's3cr3t',
+              serveraddress: 'reg.internal:5000',
+            },
+          },
+        }),
+      ];
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue({ pendingJobs }),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      await dispatcher.retryPendingScaleRequests(10);
+
+      const [labels, , , , , , containerSpawn] = onNoMatchingAgent.mock.calls[0] as [
+        string[],
+        string,
+        string,
+        string[],
+        unknown,
+        unknown,
+        { image: string; authconfig?: unknown } | undefined,
+      ];
+      // Labels are passed through untouched: KiCI does not add a runtime
+      // requirement, because the orchestrator cannot know whether the host that
+      // ends up running the job has one (see container-routing.ts).
+      expect(labels).toEqual(['linux']);
+      // Assembled from what dispatch already resolved — never re-resolved here.
+      expect(containerSpawn?.image).toBe('reg.internal:5000/acme/ci:1.2');
+      expect(containerSpawn?.authconfig).toEqual({
+        username: 'bot',
+        password: 's3cr3t',
+        serveraddress: 'reg.internal:5000',
+      });
+    });
+
+    it('leaves a non-container job with no spawn context at all', async () => {
+      const onNoMatchingAgent = vi.fn().mockResolvedValue({ action: 'spawning' });
+      const dispatcher = new Dispatcher({
+        registry,
+        queue: mockQueue({ pendingJobs: [makeQueuedJob({ id: 'plain' })] }),
+        metrics,
+        onDispatch,
+        onNoMatchingAgent,
+      });
+
+      await dispatcher.retryPendingScaleRequests(10);
+
+      const [labels, , , , , , containerSpawn] = onNoMatchingAgent.mock.calls[0] as [
+        string[],
+        string,
+        string,
+        string[],
+        unknown,
+        unknown,
+        unknown,
+      ];
+      expect(labels).toEqual(['linux']);
+      expect(containerSpawn).toBeUndefined();
     });
 
     it('respects the maxJobs cap (re-drives only the oldest)', async () => {
@@ -1348,6 +1692,7 @@ describe('Dispatcher', () => {
         'old',
         'run-old',
         [],
+        undefined,
         undefined,
         undefined,
       );
@@ -2082,6 +2427,7 @@ describe('Dispatcher', () => {
         [],
         undefined,
         undefined,
+        undefined,
       );
     });
   });
@@ -2489,5 +2835,38 @@ describe('Dispatcher', () => {
       expect(queue.requeue).toHaveBeenCalledWith('job-s');
       expect(onAckTimeout).toHaveBeenCalledWith('a1', 'job-s', 'run-s');
     });
+  });
+});
+
+describe('containerSpawnFor', () => {
+  it('offers a spawn for a job that names a finalized image', () => {
+    expect(containerSpawnFor({ container: 'python:3.12' })).toEqual({ image: 'python:3.12' });
+    expect(containerSpawnFor({ container: { image: 'python:3.12' } })).toEqual({
+      image: 'python:3.12',
+    });
+  });
+
+  it('carries the orchestrator-resolved authconfig through', () => {
+    expect(
+      containerSpawnFor({
+        container: { image: 'reg:5000/a/b:1' },
+        containerRegistryAuth: { username: 'u', password: 'p', serveraddress: 'reg:5000' },
+      }),
+    ).toEqual({
+      image: 'reg:5000/a/b:1',
+      authconfig: { username: 'u', password: 'p', serveraddress: 'reg:5000' },
+    });
+  });
+
+  it('offers NO spawn for a job that builds its image from a dockerfile', () => {
+    // This is what routes a dockerfile job to the nesting topology: the image
+    // does not exist until an agent has cloned and built it, so the scaler must
+    // not try to boot an agent from it.
+    expect(containerSpawnFor({ container: { dockerfile: '.kici/ci.Dockerfile' } })).toBeUndefined();
+  });
+
+  it('offers no spawn for a job with no container at all', () => {
+    expect(containerSpawnFor({})).toBeUndefined();
+    expect(containerSpawnFor(undefined)).toBeUndefined();
   });
 });

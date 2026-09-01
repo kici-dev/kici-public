@@ -19,6 +19,7 @@
  * verifying execution state.
  */
 
+import { setupStepsFirst } from '../reporting/step-display-order.js';
 import { Hono } from 'hono';
 import { createLogger } from '@kici-dev/shared';
 import { CANONICAL_STATUSES } from '@kici-dev/engine';
@@ -49,17 +50,6 @@ const logger = createLogger({ prefix: 'admin-runs' });
  * an empty result into a rejected request.
  */
 export const RUN_STATUSES: ReadonlySet<string> = new Set<string>(CANONICAL_STATUSES);
-
-/** Safely parse a JSON string, returning null on invalid input. */
-function safeJsonParse(value: string | null | undefined): unknown {
-  if (!value) return null;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Parse an ISO-8601 timestamp; return null on invalid input so the caller
  * can turn it into a 400 with a clear message.
@@ -416,6 +406,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
             'step_type',
           ])
           .where('run_id', '=', runId)
+          .orderBy(setupStepsFirst())
           .orderBy('step_index', 'asc')
           .execute();
         stepsByJob = new Map();
@@ -446,14 +437,18 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminRunEnv
               jobId: job.job_id,
               jobName: job.job_name,
               status: job.status,
-              matrixValues: safeJsonParse(job.matrix_values),
+              // `matrix_values` and `runs_on_labels` are JSONB, so the driver
+              // already returns a parsed object/array. Passing one back through
+              // `JSON.parse` throws on the coerced string and yields null, which
+              // is what made every job report no routing labels.
+              matrixValues: job.matrix_values ?? null,
               agentId: job.agent_id,
               startedAt: job.started_at?.toISOString() ?? null,
               completedAt: job.completed_at?.toISOString() ?? null,
               durationMs: job.duration_ms,
               errorMessage: job.error_message,
               routingReason: visibleRoutingReason(job.status, job.routing_reason),
-              runsOnLabels: safeJsonParse(job.runs_on_labels as string | null),
+              runsOnLabels: job.runs_on_labels ?? null,
               createdAt: job.created_at.toISOString(),
               needs: needsByJob.get(job.job_name) ?? null,
             };

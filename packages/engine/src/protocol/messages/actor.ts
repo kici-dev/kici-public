@@ -104,22 +104,36 @@ export const actorPrincipalSchema = z.discriminatedUnion('type', [
 export type ActorPrincipal = z.infer<typeof actorPrincipalSchema>;
 
 /**
+ * Separator {@link stringifyActor} appends when a `user` / `api_key` actor acted
+ * through an agent, as `${type}:${id}${ACTOR_AGENT_SUFFIX}${label}`.
+ *
+ * Exported because a reader that splits the persisted string on its first colon
+ * gets `${id}${ACTOR_AGENT_SUFFIX}${label}` rather than the id — so any consumer
+ * comparing a stored subject against a live one has to strip this suffix, and
+ * must strip the same string this function writes.
+ */
+export const ACTOR_AGENT_SUFFIX = ' via agent:';
+
+/**
  * Convert an ActorPrincipal to a colon-prefixed string suitable for DB
  * persistence in columns like `execution_runs.triggered_by` / `.cancelled_by`.
  * The inverse of parseActor().
  *
- * Format: `${type}:${id}` where id is the variant's natural identifier.
- * Extra metadata (api_key.ownerSub, platform_operator.reason) is NOT
+ * Format: `${type}:${id}` where id is the variant's natural identifier, plus
+ * {@link ACTOR_AGENT_SUFFIX} and the label when the actor acted through an
+ * agent. Extra metadata (api_key.ownerSub, platform_operator.reason) is NOT
  * round-tripped through the string form — callers that need full fidelity
  * must persist the actor object separately (e.g. in `access_log.actor_meta`).
  */
 export function stringifyActor(actor: ActorPrincipal): string {
   switch (actor.type) {
     case 'user':
-      return actor.agent ? `user:${actor.sub} via agent:${actor.agent.label}` : `user:${actor.sub}`;
+      return actor.agent
+        ? `user:${actor.sub}${ACTOR_AGENT_SUFFIX}${actor.agent.label}`
+        : `user:${actor.sub}`;
     case 'api_key':
       return actor.agent
-        ? `api_key:${actor.keyId} via agent:${actor.agent.label}`
+        ? `api_key:${actor.keyId}${ACTOR_AGENT_SUFFIX}${actor.agent.label}`
         : `api_key:${actor.keyId}`;
     case 'service_account':
       return `service_account:${actor.id}`;

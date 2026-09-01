@@ -111,6 +111,34 @@ describe('AgentRegistry', () => {
       );
     });
 
+    it('threads scalerManaged into the roster upsert, both ways', async () => {
+      const scaler = makeStore();
+      const scalerReg = new AgentRegistry({ rosterStore: scaler, instanceId: 'orch-A' });
+      scalerReg.register('s1', mockWs(), ['role:web'], 'linux', 'x64', undefined, 1, {
+        scalerManaged: true,
+      });
+      await Promise.resolve();
+      expect(scaler.upsert).toHaveBeenCalledWith(expect.objectContaining({ scalerManaged: true }));
+
+      const fleet = makeStore();
+      const fleetReg = new AgentRegistry({ rosterStore: fleet, instanceId: 'orch-A' });
+      fleetReg.register('f1', mockWs(), ['role:web'], 'linux', 'x64', undefined, 1, {
+        scalerManaged: false,
+      });
+      await Promise.resolve();
+      expect(fleet.upsert).toHaveBeenCalledWith(expect.objectContaining({ scalerManaged: false }));
+    });
+
+    it('defaults scalerManaged to false when the metadata omits it', async () => {
+      // A fleet agent registers with no scaler metadata at all. Defaulting true
+      // would drop every such host out of `runsOnAll`.
+      const store = makeStore();
+      const reg = new AgentRegistry({ rosterStore: store, instanceId: 'orch-A' });
+      reg.register('a1', mockWs(), ['linux']);
+      await Promise.resolve();
+      expect(store.upsert).toHaveBeenCalledWith(expect.objectContaining({ scalerManaged: false }));
+    });
+
     it('defaults lifecycleClass to ephemeral when token agent_type unknown', async () => {
       const store = makeStore();
       const reg = new AgentRegistry({ rosterStore: store, instanceId: 'orch-A' });

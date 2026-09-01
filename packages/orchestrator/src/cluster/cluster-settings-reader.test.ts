@@ -273,6 +273,23 @@ describe('clampCacheMaxEntries', () => {
     }
   });
 
+  it('clamps the fallback itself when it exceeds the ceiling', () => {
+    // A stored garbage value (0 / negative / NaN) triggers the fallback path.
+    // If the configured default is above the ceiling, the fallback must still
+    // be bounded — otherwise the LRU constructor gets an unclamped max and can
+    // throw during boot, the exact failure this clamp exists to prevent.
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(clampCacheMaxEntries(bad, CACHE_MAX_ENTRIES_CEILING + 1)).toBe(
+        CACHE_MAX_ENTRIES_CEILING,
+      );
+    }
+    // A fallback at or below the ceiling is returned unchanged.
+    expect(clampCacheMaxEntries(0, 500)).toBe(500);
+    // A fractional fallback is floored, matching the stored-value path — the LRU
+    // constructor rejects a non-integer max, so neither branch may hand it one.
+    expect(clampCacheMaxEntries(0, 500.9)).toBe(500);
+  });
+
   it('floors a fractional value so the LRU never sees a non-integer max', () => {
     expect(clampCacheMaxEntries(500.9, 500)).toBe(500);
   });

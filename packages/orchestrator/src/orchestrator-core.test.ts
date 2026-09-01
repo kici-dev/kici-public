@@ -1,45 +1,41 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import type { Kysely } from 'kysely';
+
+/**
+ * The shared-pipeline adapter is recorded rather than executed: these tests own
+ * the composition root's wiring (is the adapter reached, with which context and
+ * which deps bag), while the adapter's own behavior is covered beside it in
+ * `pipeline/internal-event-pipeline.test.ts`.
+ */
+const adapter = vi.hoisted(() => ({
+  calls: [] as Array<{ decision: unknown; lockFile: unknown; ctx: any; deps: unknown }>,
+}));
+
+vi.mock('./pipeline/internal-event-pipeline.js', () => ({
+  dispatchInternalEventViaPipeline: async (
+    decision: unknown,
+    lockFile: unknown,
+    ctx: any,
+    deps: unknown,
+  ) => {
+    adapter.calls.push({ decision, lockFile, ctx, deps });
+    return { runId: 'run-1', repo: ctx.repoIdentifier, workflow: 'notify' };
+  },
+}));
+
 import {
   upstreamBaseNamesFromNeeds,
   buildMatrixOutputsEnvelope,
   buildHostOutputsEnvelope,
   buildUpstreamOutputsByBase,
   buildUpstreamStatusesByBase,
-  buildInternalJobConfigForWorkflow,
-  internalJobRunsOnSelectors,
+  buildOnEventMatched,
+  buildSummonCallback,
+  gatherInvokeResults,
+  mergeUpstreamOutputs,
 } from './orchestrator-core.js';
-
-describe('internalJobRunsOnSelectors', () => {
-  it('partitions a lock job runsOn LabelMatcher[] into exact label strings + regex patterns (never raw matcher objects)', () => {
-    // Regression: internal-event (cron / ctx.emit) dispatch used to pass the
-    // raw LabelMatcher objects as runsOnLabels, which crashed peer-registry's
-    // `requiredLabels.map((l) => l.toLowerCase())` ("l.toLowerCase is not a
-    // function") in coordinator routing and matched no agent in direct dispatch.
-    expect(
-      internalJobRunsOnSelectors({
-        runsOn: [
-          { kind: 'exact', value: 'role:web' },
-          { kind: 'regex', source: '^kici:host:box-', flags: '' },
-        ],
-        excludeLabels: [{ kind: 'regex', source: '-canary$', flags: '' }],
-      }),
-    ).toEqual({
-      runsOnLabels: ['role:web'],
-      runsOnPatterns: [{ kind: 'regex', source: '^kici:host:box-', flags: '' }],
-      excludeLabels: [],
-      excludePatterns: [{ kind: 'regex', source: '-canary$', flags: '' }],
-    });
-  });
-
-  it('returns empty selectors for a job with no runsOn (matches any agent)', () => {
-    expect(internalJobRunsOnSelectors({})).toEqual({
-      runsOnLabels: [],
-      runsOnPatterns: [],
-      excludeLabels: [],
-      excludePatterns: [],
-    });
-  });
-});
+import { SummonRefusedError } from './pipeline/invoke-gate.js';
+import type { Database } from './db/types.js';
 
 describe('upstreamBaseNamesFromNeeds', () => {
   it('returns [] for undefined / non-array', () => {
@@ -208,98 +204,331 @@ describe('buildUpstreamStatusesByBase', () => {
   });
 });
 
-describe('buildInternalJobConfigForWorkflow dispatchInputs', () => {
-  const job = { id: 'j', name: 'j', steps: [], needs: [] };
+/**
+ * Fluent Kysely stub for `mergeUpstreamOutputs` / `gatherInvokeResults`. Returns
+ * seeded rows per table; both `execution_jobs` queries hit the same table, so it
+ * discriminates the proxy-children query (which filters `job_kind`) from the
+ * upstream-outputs query by inspecting the recorded where-clauses.
+ */
+function stubDb(seed: {
+  /** Rows returned by the `job_kind = Gate` seed query (each is a gate's own row). */
+  gates?: Array<{ job_name: string | null }>;
+  proxies?: Array<{
+    base_job_name: string | null;
+    summoned_run_id: string | null;
+    status: string | null;
+    outputs: string | null;
+  }>;
+  runs?: Array<{ run_id: string; repo_identifier: string; workflow_name: string }>;
+  upstreamJobs?: Array<{
+    job_id: string;
+    job_name: string;
+    outputs: unknown;
+    matrix_values: unknown;
+    variant_kind?: string | null;
+    variant_label?: string | null;
+    status?: string | null;
+  }>;
+}): Kysely<Database> {
+  const makeChain = (table: string) => {
+    const whereArgs: unknown[][] = [];
+    const chain: Record<string, unknown> = {
+      select: () => chain,
+      selectAll: () => chain,
+      where: (...args: unknown[]) => {
+        whereArgs.push(args);
+        return chain;
+      },
+      orderBy: () => chain,
+      execute: async () => {
+        if (table === 'execution_jobs') {
+          const kindArg = whereArgs.find((a) => a[0] === 'job_kind');
+          if (kindArg?.[2] === 'gate') return seed.gates ?? [];
+          if (kindArg?.[2] === 'proxy') return seed.proxies ?? [];
+          return seed.upstreamJobs ?? [];
+        }
+        if (table === 'execution_runs') return seed.runs ?? [];
+        return []; // run_secret_outputs — none in these tests
+      },
+    };
+    return chain;
+  };
+  return { selectFrom: (t: string) => makeChain(t) } as unknown as Kysely<Database>;
+}
 
-  it('stamps defaults-only schedule inputs for a cron fire', () => {
-    const wf = {
-      name: 'sched-wf',
-      source: 'test/repo',
-      triggers: [
+describe('gatherInvokeResults (moved into orchestrator-core)', () => {
+  it('maps a gate’s proxy children to InvokeResult[] keyed by gate name', async () => {
+    const db = stubDb({
+      proxies: [
         {
-          _type: 'schedule',
-          cronExpression: '0 0 * * *',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+          base_job_name: 'repo-tests',
+          summoned_run_id: 'r1',
+          status: 'success',
+          outputs: JSON.stringify({ coverage: '92' }),
         },
       ],
-    };
-    const cfg = buildInternalJobConfigForWorkflow(wf, job);
-    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
-  });
-
-  it('resolves inputs of the schedule that actually fired when several are declared', () => {
-    const wf = {
-      name: 'multi-sched-wf',
-      source: 'test/repo',
-      triggers: [
-        {
-          _type: 'schedule',
-          cronExpression: '0 9 * * 1',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
-        },
-        {
-          _type: 'schedule',
-          cronExpression: '0 18 * * 5',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'quick' } },
-        },
-      ],
-    };
-    // Event carries the SECOND schedule's cron → its inputs (default 'quick') win.
-    const cfg = buildInternalJobConfigForWorkflow(wf, job, undefined, {
-      cronExpression: '0 18 * * 5',
-      timezone: 'UTC',
+      runs: [{ run_id: 'r1', repo_identifier: 'myorg/backend', workflow_name: 'unit' }],
     });
-    expect(cfg.dispatchInputs).toEqual({ mode: 'quick' });
+    const res = await gatherInvokeResults(db, 'gate-run', ['repo-tests']);
+    expect(res['repo-tests'][0]).toMatchObject({
+      repo: 'myorg/backend',
+      workflow: 'unit',
+      runId: 'r1',
+      status: 'success',
+    });
+    expect(res['repo-tests'][0].outputs.coverage).toBe('92');
   });
 
-  it('falls back to the first schedule when the event carries no cron', () => {
-    const wf = {
-      name: 'multi-sched-wf',
-      source: 'test/repo',
-      triggers: [
+  it('yields an empty InvokeResult[] for a gate that summoned zero subscribers', async () => {
+    // An optional gate whose source repos all opted out has a `job_kind = Gate`
+    // row but no proxy children. `.result` must stay an (empty) array, not fall
+    // through to the plain single-job outputs shape.
+    const db = stubDb({ gates: [{ job_name: 'repo-tests' }], proxies: [] });
+    const res = await gatherInvokeResults(db, 'gate-run', ['repo-tests']);
+    expect(res['repo-tests']).toEqual([]);
+    expect(Array.isArray(res['repo-tests'])).toBe(true);
+  });
+
+  it('does not seed a regular (non-gate) upstream job', async () => {
+    // Only a Gate row seeds a key; a declared need that is a regular job keeps
+    // resolving through the normal outputs path (no invoke key at all).
+    const db = stubDb({ gates: [], proxies: [] });
+    const res = await gatherInvokeResults(db, 'run', ['not-a-gate']);
+    expect(res).toEqual({});
+  });
+});
+
+describe('mergeUpstreamOutputs invoke gate', () => {
+  it('builds upstreamInvokeResults for a gate upstream declared in needs', async () => {
+    const db = stubDb({
+      proxies: [
         {
-          _type: 'schedule',
-          cronExpression: '0 9 * * 1',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+          base_job_name: 'repo-tests',
+          summoned_run_id: 'r1',
+          status: 'success',
+          outputs: JSON.stringify({ coverage: '92' }),
         },
         {
-          _type: 'schedule',
-          cronExpression: '0 18 * * 5',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'quick' } },
+          base_job_name: 'repo-tests',
+          summoned_run_id: 'r2',
+          status: 'failed',
+          outputs: null,
         },
       ],
-    };
-    const cfg = buildInternalJobConfigForWorkflow(wf, job);
-    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
+      runs: [
+        { run_id: 'r1', repo_identifier: 'myorg/backend', workflow_name: 'unit' },
+        { run_id: 'r2', repo_identifier: 'myorg/backend', workflow_name: 'lint' },
+      ],
+      // The gate row + its proxy children as they appear to the upstream-outputs
+      // query; the gate itself produces no outputs.
+      upstreamJobs: [{ job_id: 'g', job_name: 'repo-tests', outputs: null, matrix_values: null }],
+    });
+    const { upstreamInvokeResults, upstreamJobOutputs } = await mergeUpstreamOutputs(
+      db,
+      'gate-run',
+      'deploy',
+      ['repo-tests'],
+      undefined,
+      'a'.repeat(64),
+    );
+    expect(upstreamInvokeResults).toBeDefined();
+    expect(upstreamInvokeResults!['repo-tests'].map((r) => r.runId)).toEqual(['r1', 'r2']);
+    expect(upstreamInvokeResults!['repo-tests'].map((r) => r.status)).toEqual([
+      'success',
+      'failed',
+    ]);
+    expect(upstreamInvokeResults!['repo-tests'][0].outputs.coverage).toBe('92');
+    // The gate itself contributes no plain outputs.
+    expect(upstreamJobOutputs?.['repo-tests']).toBeUndefined();
   });
 
-  it('omits dispatchInputs for a non-schedule internal event workflow', () => {
-    const wf = {
-      name: 'wc-wf',
-      source: 'test/repo',
-      triggers: [{ _type: 'workflow_complete', status: ['success'] }],
-    };
-    const cfg = buildInternalJobConfigForWorkflow(wf, job);
-    expect('dispatchInputs' in cfg).toBe(false);
+  it('returns undefined upstreamInvokeResults when no need names a gate', async () => {
+    const db = stubDb({
+      upstreamJobs: [
+        { job_id: 'b', job_name: 'build', outputs: JSON.stringify({ v: 1 }), matrix_values: null },
+      ],
+    });
+    const { upstreamInvokeResults } = await mergeUpstreamOutputs(
+      db,
+      'run',
+      'deploy',
+      ['build'],
+      undefined,
+      'a'.repeat(64),
+    );
+    expect(upstreamInvokeResults).toBeUndefined();
+  });
+});
+
+/**
+ * Both internal-event entry points dispatch through the SHARED pipeline
+ * adapter, so a `kiciEvent()` subscriber, a cron fire and an invoke-gate summon
+ * all resolve their bound contexts, scoped secrets and protection rules exactly
+ * as a webhook-triggered run does.
+ */
+describe('internal-event dispatch entry points', () => {
+  beforeEach(() => {
+    adapter.calls.length = 0;
   });
 
-  it('propagates a job container image so it selects the container backend on the agent', () => {
-    const wf = { name: 'ctr-wf', source: 'test/repo', triggers: [] };
-    const containerJob = { name: 'j', steps: [], needs: [], container: 'node:20' };
-    const cfg = buildInternalJobConfigForWorkflow(wf, containerJob);
-    // Without this the agent's determineExecutionMode never sees the field and
-    // a container:-field job silently runs bare-metal.
-    expect(cfg.container).toBe('node:20');
+  const dispatcherRef = { current: {} as never };
+  const bundle = { repoUrlBuilder: { buildCloneUrl: (r: string) => `https://git/${r}.git` } };
+  const providerRegistryRef = {
+    current: { getByRoutingKey: () => bundle } as never,
+  };
+  const lockFile = { workflows: [{ name: 'notify' }] };
+  const decision = { workflowName: 'notify' };
+
+  /** A ProcessingDeps factory whose identity the assertions can recognize. */
+  const depsFactory = () => ({ marker: 'live-deps' }) as never;
+
+  it('dispatches a matched internal event through the shared pipeline', async () => {
+    const onEventMatched = buildOnEventMatched(dispatcherRef, providerRegistryRef, {
+      current: depsFactory,
+    });
+
+    await onEventMatched(
+      { id: 'evt-1', eventName: 'kici.scaler.scale-up', payload: {} },
+      lockFile,
+      [decision],
+      {
+        routingKey: 'github:1',
+        repoIdentifier: 'acme/infra',
+        providerContext: { installationId: 77 },
+      },
+    );
+
+    expect(adapter.calls).toHaveLength(1);
+    expect(adapter.calls[0].decision).toBe(decision);
+    expect(adapter.calls[0].lockFile).toBe(lockFile);
+    expect(adapter.calls[0].ctx.event.eventName).toBe('kici.scaler.scale-up');
+    // The provider bundle reaches the adapter. Without it every job dispatches
+    // with an empty repo URL AND the run is classified as a local-working-tree
+    // dispatch, so the workflow source can never be materialized.
+    expect(adapter.calls[0].ctx.bundle).toBe(bundle);
+    expect(adapter.calls[0].ctx.providerContext).toEqual({ installationId: 77 });
+    // The factory is invoked per dispatch, so the bag is always the live one.
+    expect(adapter.calls[0].deps).toEqual({ marker: 'live-deps' });
   });
 
-  it('omits container when the job has none', () => {
-    const wf = { name: 'plain-wf', source: 'test/repo', triggers: [] };
-    const cfg = buildInternalJobConfigForWorkflow(wf, job);
-    expect('container' in cfg).toBe(false);
+  /**
+   * The dispatch loop wraps each decision in try/catch, so an unpopulated ref
+   * that returned early would swallow EVERY internally triggered run behind a
+   * debug line — a cron schedule that silently never fires. Throwing is what
+   * makes the mis-wiring visible.
+   */
+  it('fails loudly when no ProcessingDeps factory is wired', async () => {
+    const onEventMatched = buildOnEventMatched(dispatcherRef, providerRegistryRef, {
+      current: null,
+    });
+
+    await expect(
+      onEventMatched({ id: 'evt-1', eventName: 'x', payload: {} }, lockFile, [decision]),
+    ).rejects.toThrow(/ProcessingDeps/);
+    expect(adapter.calls).toHaveLength(0);
+  });
+
+  const eventRouter = {
+    matchKiciEventSubscribers: () => [
+      {
+        reg: {
+          routingKey: 'github:1',
+          repoIdentifier: 'acme/infra',
+          providerContext: { installationId: 99 },
+        },
+        lockFile,
+        decisions: [decision],
+      },
+    ],
+  } as never;
+
+  it('summons a source-repo subscriber through the same shared pipeline', async () => {
+    const summon = buildSummonCallback(dispatcherRef, providerRegistryRef, eventRouter, {
+      current: depsFactory,
+    });
+
+    const spawned = await summon({
+      event: 'acme.deploy.requested',
+      payload: { env: 'stg' },
+      sourceRepo: 'acme/infra',
+      chainDepth: 3,
+      summonedByRunId: 'gate-run',
+    });
+
+    expect(adapter.calls).toHaveLength(1);
+    // The summoner's depth reaches the adapter so the chain-depth circuit
+    // breaker still bounds recursion.
+    expect(adapter.calls[0].ctx.chainDepth).toBe(3);
+    // Same two fields the summon path used to lose silently.
+    expect(adapter.calls[0].ctx.bundle).toBe(bundle);
+    expect(adapter.calls[0].ctx.providerContext).toEqual({ installationId: 99 });
+    expect(spawned).toEqual([{ runId: 'run-1', repo: 'acme/infra', workflow: 'notify' }]);
+  });
+
+  /**
+   * The composition root's own stop on the reservation. `runInvokeGate` refuses
+   * a reserved gate name first, but this callback is injected — it does not
+   * inherit that check — and it is what actually reaches the dispatch adapter.
+   * A `kici.`-named gate would forge a scaler event; a `__`-named one would
+   * summon a run the trust classifier could read as orchestrator-minted.
+   *
+   * It THROWS rather than returning `[]`: a gate carrying `optional: true`
+   * reads zero summoned runs as a green skip, so a refusal returned as an empty
+   * array would report success for work that was declined — which is what would
+   * happen if the two reservation checks were ever reordered.
+   */
+  it.each([['__schedule_fire'], ['kici.scaler.scale-up']])(
+    'refuses to summon for the reserved event name %s',
+    async (event) => {
+      const summon = buildSummonCallback(dispatcherRef, providerRegistryRef, eventRouter, {
+        current: depsFactory,
+      });
+
+      await expect(
+        summon({
+          event,
+          sourceRepo: 'acme/infra',
+          chainDepth: 0,
+          summonedByRunId: 'gate-run',
+        }),
+      ).rejects.toThrow(SummonRefusedError);
+
+      expect(adapter.calls).toHaveLength(0);
+    },
+  );
+
+  it('returns an empty array — not a throw — when the event matches no subscriber', async () => {
+    // The control for the pair above: an empty result is still a real outcome,
+    // and a gate may legitimately declare it `optional`. Only a REFUSAL throws.
+    const noSubscribers = { matchKiciEventSubscribers: () => [] } as never;
+    const summon = buildSummonCallback(dispatcherRef, providerRegistryRef, noSubscribers, {
+      current: depsFactory,
+    });
+
+    const spawned = await summon({
+      event: 'acme.nobody.subscribes',
+      sourceRepo: 'acme/infra',
+      chainDepth: 0,
+      summonedByRunId: 'gate-run',
+    });
+
+    expect(spawned).toEqual([]);
+    expect(adapter.calls).toHaveLength(0);
+  });
+
+  it('fails loudly when the summon path has no ProcessingDeps factory wired', async () => {
+    const summon = buildSummonCallback(dispatcherRef, providerRegistryRef, eventRouter, {
+      current: null,
+    });
+
+    await expect(
+      summon({
+        event: 'acme.deploy.requested',
+        sourceRepo: 'acme/infra',
+        chainDepth: 0,
+        summonedByRunId: 'gate-run',
+      }),
+    ).rejects.toThrow(/ProcessingDeps/);
+    expect(adapter.calls).toHaveLength(0);
   });
 });

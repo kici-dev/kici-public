@@ -148,7 +148,7 @@ Generate a fixture template for an event type. Useful for creating custom test p
 kici fixture <event> [options]
 ```
 
-**Valid events:** `pr:open`, `pr:sync`, `pr:close`, `pr:reopen`, `push`, `tag`, `comment`, `review`, `review_comment`, `release`, `dispatch`, `create`, `delete`, `status`, `workflow_run`, `fork`, `star`, `watch`, `kici_event`, `workflow_complete`, `job_complete`, `generic_webhook`, `schedule`, `lifecycle` (many support `:action` suffixes, e.g. `comment:edited`, `release:published`, `lifecycle:workflow_complete`). `webhook:<source>` is a shorthand alias for `generic_webhook:<source>`.
+**Valid events:** `pr:open`, `pr:sync`, `pr:close`, `pr:reopen`, `push`, `tag`, `comment`, `review`, `review_comment`, `release`, `dispatch`, `create`, `delete`, `status`, `workflow_run`, `fork`, `star`, `watch`, `kici_event`, `workflow_complete`, `workflows_failed_batch`, `job_complete`, `generic_webhook`, `schedule`, `lifecycle` (many support `:action` suffixes, e.g. `comment:edited`, `release:published`, `lifecycle:workflow_complete`). `webhook:<source>` is a shorthand alias for `generic_webhook:<source>`.
 
 **Examples:**
 
@@ -178,7 +178,7 @@ Generate TypeScript declaration files from orchestrator environment metadata. Th
 kici types [options]
 ```
 
-**Prerequisites:** Must be authenticated via `kici login`.
+**Prerequisites:** Authenticate via `kici login` to fetch the real key set. Without it, `kici types` writes an empty stub (see "Offline behavior" below).
 
 **Output:** `.kici/types/secrets.d.ts`
 
@@ -200,7 +200,9 @@ kici types --kici-dir packages/app/.kici
 
 After generating types, `ctx.secrets.get('MY_KEY')` and `ctx.secrets.expose('DB_HOST')` gain autocomplete and type checking in your IDE.
 
-**Git workflow:** Commit the generated `.kici/types/secrets.d.ts` so team members get type checking without needing orchestrator access. Run `kici types` to refresh when environments change.
+**Git workflow:** `.kici/types/secrets.d.ts` is a local development aid, not source — its content is a snapshot of one org's secret keys fetched from the Platform. `kici init` gitignores `.kici/types/`, so the file stays out of version control. Each team member runs `kici types` (or an authenticated `kici compile`) to generate their own copy. Do not commit it: a stale committed copy would type-check against secret keys that no longer exist.
+
+**Offline behavior:** When the Platform cannot be reached — not logged in, no active org, or offline — `kici types` never fails. If a `secrets.d.ts` already exists, `kici types` keeps it untouched, so a transient outage does not wipe your real key set. If the file is absent (a fresh clone or unauthenticated CI), `kici types` writes a valid empty stub. Type checking then degrades to "no known keys" (any key name is accepted) rather than breaking with "module has no exported member". Run `kici types` again once authenticated to refresh it.
 
 **Auto-regeneration:** `kici compile` automatically runs `kici types` after successful compilation when authenticated. See the [kici compile](#kici-compile) section for details.
 
@@ -285,7 +287,7 @@ kici docs llm sdk | claude -- "Read this and help me author a deploy workflow"
 kici docs llm --out kici-llms-index.txt
 ```
 
-Bundles are regenerated from `docs/` every time `@kici-dev/compiler` is built, so they always match your installed CLI version. The index lists each task bundle — `getting-started`, `sdk`, `sdk-runtime`, `cli`, `patterns`, `features`, `providers`, `architecture` — with its size and a one-line purpose; pass the bundle id as the topic. Every cross-reference link inside a bundle is an absolute `docs.kici.dev` URL. The same files are published online following the [llms.txt convention](https://llmstxt.org/).
+Bundles are regenerated from `docs/` every time `@kici-dev/compiler` is built, so they always match your installed CLI version. The index lists each task bundle — `getting-started`, `sdk`, `sdk-runtime`, `cli`, `patterns`, `features`, `features-execution`, `providers`, `architecture` — with its size and a one-line purpose; pass the bundle id as the topic. Every cross-reference link inside a bundle is an absolute `docs.kici.dev` URL. The same files are published online following the [llms.txt convention](https://llmstxt.org/).
 
 ## Reference
 

@@ -40,6 +40,12 @@ const KEY_SEPARATOR = '\u0000';
  * reason `groupCandidates` keeps it in the group key — it selects the provider
  * bundle that mints the clone credentials.
  *
+ * `sourceRepoIdentifier` is its own component, placed next to `sourceSha` so the
+ * source repo and its commit stay adjacent. Every event already carries its
+ * source repo, so the event digest covers it too — but keying it explicitly
+ * makes that coverage structural rather than incidental: an event shape that
+ * stopped carrying the source repo could otherwise collide two repos' rounds.
+ *
  * The candidate list and the event are folded in as a SHA-256 digest of their
  * JSON, so the key stays a bounded string no matter how large a payload is. Both
  * are rebuilt by the same code from the same delivery, so a genuine redelivery
@@ -54,6 +60,7 @@ export function globalEvalRoundCacheKey(args: {
   workflowRepoIdentifier: string;
   workflowSha: string;
   workflowRoutingKey: string;
+  sourceRepoIdentifier: string;
   sourceSha: string;
   /** The exact per-candidate payload the round job carries. */
   candidates: unknown;
@@ -72,6 +79,7 @@ export function globalEvalRoundCacheKey(args: {
     args.workflowRepoIdentifier,
     args.workflowSha,
     args.workflowRoutingKey,
+    args.sourceRepoIdentifier,
     args.sourceSha,
     digest,
   ].join(KEY_SEPARATOR);

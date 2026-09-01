@@ -163,7 +163,7 @@ For each disabled operation:
 - **The page banner** at the top of any page containing at least one disabled operation lists every disabled op on that page plus the CLI equivalent. If every operation on the page is disabled, the banner escalates to "this page is read-only".
 - **The Security policy page** (Settings → Security → Dashboard policy) renders the full 27-row matrix, grouped by category, with the live state and the `kici-admin` command for each row.
 
-A control disabled by policy is visually distinct from a control disabled by RBAC: the policy lock icon is universal across the org and points at `kici-admin`; the RBAC disable points at the org's role configuration. Both can apply at once — RBAC wins (the user simply can't see the data).
+A control disabled by policy is visually distinct from a control disabled by RBAC: the policy lock icon is universal across the org and points at `kici-admin`. The RBAC disable points at the org's role configuration. Both can apply at once — RBAC wins (the user can't see the data).
 
 ## Defense in depth
 
@@ -192,7 +192,9 @@ A static-grep build-time test asserts that every operation in the registry has a
 
 ### Layer 3 — orchestrator handler gate
 
-The orchestrator's `dashboard.*` WebSocket handlers re-check the policy from the orchestrator's own database at request time and refuse the operation if it's disabled. Defense in depth: the control plane's cache could be stale, the control plane itself could misbehave, or a future code path could open a different way of reaching the orchestrator. The orchestrator enforces independently.
+The orchestrator's `dashboard.*` WebSocket handlers re-check the policy against the orchestrator's own database and refuse the operation if it's disabled. Defense in depth: the control plane's cache could be stale, the control plane itself could misbehave, or a future code path could open a different way of reaching the orchestrator. The orchestrator enforces independently.
+
+The map is read through a short-lived per-process cache rather than queried on every request. A policy write drops that cache on every orchestrator in the cluster, not only the one that served the write, so a flip takes effect at this layer within a second. See [Propagation across a cluster](#propagation-across-a-cluster).
 
 A policy-denied request at this layer:
 
@@ -235,22 +237,34 @@ The full input-mode behavior is documented in [Secrets — operator path](./secr
 
 ## Wire shape
 
-The orchestrator's policy view is broadcast to the control plane on every WebSocket auth handshake and on every `kici-admin` policy change as an `orch.capabilities.update` message. The message carries the full 24-operation map plus an opaque `policyVersion` so the control plane can cache-invalidate cleanly:
+The orchestrator's policy view is broadcast to the control plane on every WebSocket auth handshake and on every `kici-admin` policy change as an `orch.capabilities.update` message. The message wraps the orchestrator's whole capabilities object, so the control plane replaces its per-org cache wholesale instead of merging:
 
 ```json
 {
   "type": "orch.capabilities.update",
-  "dashboardWrites": {
-    "secrets.set": false,
-    "variables.set": false,
-    "secrets.delete": true,
-    "...": "<remaining 21 operations>"
-  },
-  "policyVersion": "2026-05-17T12:34:56.789Z"
+  "capabilities": {
+    "dashboardWrites": {
+      "secrets.set": false,
+      "variables.set": "encrypted"
+    }
+  }
 }
 ```
 
-The dashboard's `GET /api/v1/orgs/:customerId/capabilities` endpoint reads this cache and returns the same shape to the SPA.
+The `dashboardWrites` map is **sparse**: only operations that deviate from the permissive default appear. A missing key resolves to allowed, so an orchestrator running the default policy sends an empty map rather than all 27 operations. A value is either `false` (blocked) or a policy state such as `"encrypted"` (allowed only as a browser-sealed write).
+
+The dashboard's `GET /api/v1/orgs/:customerId/orchestrators/:clusterName/capabilities` endpoint reads this cache and expands the sparse map into a full row per operation for the SPA.
+
+## Propagation across a cluster
+
+A high-availability cluster runs several coordinators against one orchestrator database, and every one of them holds its own Platform connection under the same cluster name. `kici-admin` writes the policy through whichever coordinator its `--url` points at, so that coordinator alone would otherwise know about the flip.
+
+The write therefore announces itself over the shared database. `kici-admin org-settings dashboard-writes set` (and `reset`) emits a `dashboard_write_policy_change` notification on the customer id from inside the same transaction that persists the policy, which means:
+
+- A write that rolls back announces nothing.
+- Every coordinator — including one that is temporarily out of touch with its peers, as long as it can still reach the database — drops its cached map, re-reads the policy, and sends a fresh `orch.capabilities.update`.
+
+Both effects matter. The first keeps each coordinator's own handler gate honest. The second is what the dashboard sees. The control plane caches capabilities per orchestrator connection and resolves a cluster name to one of them. Without the announcement, the dashboard could keep reporting an operation as enabled for as long as the cluster stayed up. Convergence is typically well under a second, so a policy flip is in force cluster-wide by the time the next dashboard poll lands.
 
 ## See also
 

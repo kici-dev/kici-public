@@ -15,6 +15,7 @@ export {
   type RequestContext,
 } from './request-context.js';
 export { formatBytes } from './format-bytes.js';
+export { redactConfig, scrubText } from './diagnostics-redaction.js';
 export { REPO_ANCHOR, HOME_ANCHOR } from './cache-anchors.js';
 export { formatDuration, formatUptime } from './format-duration.js';
 export {

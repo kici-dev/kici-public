@@ -25,6 +25,7 @@ import type {
 } from '@kici-dev/engine';
 import { TERMINAL_JOB_STATES, ExecutionJobStatus, ScalerEventType } from '@kici-dev/engine';
 import type { PeerRegistry, PeerInfo } from './peer-registry.js';
+import { WorkerEviction, type EvictionHooks } from './worker-eviction.js';
 import type { PeerClient } from './peer-client.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
@@ -121,6 +122,8 @@ export interface RunCoordinatorDeps {
   ) => Promise<boolean>;
   /** Fallback: send a message via server-side (incoming) peer connection (fire-and-forget). */
   sendToPeerViaHandler?: (targetInstanceId: string, msg: PeerToPeerMessage) => boolean;
+  /** Close a peer's incoming socket by instanceId (used by worker eviction). */
+  closePeerViaHandler?: (targetInstanceId: string, code: number, reason: string) => void;
   ackTimeoutMs?: number;
   /** Stale peer timeout in ms. Default: 60000 (60s). */
   staleTimeoutMs?: number;
@@ -157,7 +160,17 @@ interface RerouteTracking {
   labelSets: string[][];
   /** Connections already tried (this instance + every failed peer), for loop prevention. */
   triedConnections: string[];
-  /** Armed spawn-window timer; cleared on first progress or terminal cleanup. */
+  /**
+   * Set once the shared `execution_jobs` row showed the peer had started the
+   * job. Latched, so a later database fault cannot make the backstop re-dispatch
+   * a job already known to be running.
+   */
+  peerStarted: boolean;
+  /**
+   * Armed spawn-window timer; cleared on first progress or terminal cleanup.
+   * Re-armed as a reap poll once `peerStarted` latches, because a peer
+   * COORDINATOR relays nothing that would otherwise release the entry.
+   */
   windowTimer: NodeJS.Timeout | undefined;
 }
 
@@ -205,9 +218,22 @@ export class RunCoordinator {
   /** Stale eviction timer handle. */
   private staleEvictionTimer: ReturnType<typeof setInterval> | null = null;
 
+  /** Plan-ceiling worker eviction (drain-then-disconnect). */
+  private readonly workerEviction: WorkerEviction;
+
+  /** Per-peer "no in-flight rerouted jobs" callbacks, fired by worker drain. */
+  private readonly evictionIdleCallbacks = new Map<string, () => void>();
+
+  private readonly closePeerViaHandler?: (
+    targetInstanceId: string,
+    code: number,
+    reason: string,
+  ) => void;
+
   constructor(deps: RunCoordinatorDeps) {
     this.instanceId = deps.instanceId;
     this.peerRegistry = deps.peerRegistry;
+    this.closePeerViaHandler = deps.closePeerViaHandler;
     this.dispatcher = deps.dispatcher;
     this.executionTracker = deps.executionTracker;
     this.checkRunReporter = deps.checkRunReporter;
@@ -219,6 +245,61 @@ export class RunCoordinator {
       deps.getRerouteSpawnWindowMs ?? (async () => DEFAULT_REROUTE_SPAWN_WINDOW_MS);
     this.getRerouteAckTimeoutMs = deps.getRerouteAckTimeoutMs ?? (async () => this.ackTimeoutMs);
     this.getRerouteMaxHops = deps.getRerouteMaxHops ?? (async () => DEFAULT_MAX_HOPS);
+
+    const evictionHooks: EvictionHooks = {
+      // Permanently deprioritize the peer so the dispatch NAK-backoff filter
+      // skips it (same map the exponential backoff consults). No new dispatch
+      // reaches a draining worker.
+      markIneligible: (id) =>
+        this.nakTracker.set(id, {
+          count: Number.MAX_SAFE_INTEGER,
+          backoffUntil: Number.MAX_SAFE_INTEGER,
+        }),
+      // Restore dispatch eligibility: drop the permanent NAK entry and any idle
+      // registration. Called on a cancelled drain and after a drained peer is
+      // disconnected, so a re-admitted instance is not silently starved.
+      clearIneligible: (id) => {
+        this.nakTracker.delete(id);
+        this.evictionIdleCallbacks.delete(id);
+      },
+      runningJobCount: (id) => this.runningJobCountForPeer(id),
+      onPeerIdle: (id, cb) => this.evictionIdleCallbacks.set(id, cb),
+      closePeer: (id, code, reason) => {
+        this.peerRegistry.markDisconnected(id);
+        this.closePeerViaHandler?.(id, code, reason);
+      },
+    };
+    this.workerEviction = new WorkerEviction(this.peerRegistry, evictionHooks, logger);
+  }
+
+  /** In-flight rerouted jobs currently attributed to a peer. */
+  private runningJobCountForPeer(instanceId: string): number {
+    let count = 0;
+    for (const runJobs of this.reroutedJobs.values()) {
+      for (const tracking of runJobs.values()) {
+        if (tracking.peerId === instanceId) count++;
+      }
+    }
+    return count;
+  }
+
+  /** Fire a registered drain idle-callback once the peer has no in-flight jobs. */
+  private fireIdleIfDrained(instanceId: string): void {
+    const cb = this.evictionIdleCallbacks.get(instanceId);
+    if (cb && this.runningJobCountForPeer(instanceId) === 0) {
+      this.evictionIdleCallbacks.delete(instanceId);
+      cb();
+    }
+  }
+
+  /**
+   * Reconcile this coordinator's workers against the pushed ceiling. Invoked on
+   * every `plan.headroom` frame: when `evictExcess` is set, the newest workers
+   * past `ceiling` are drained; otherwise any in-flight drain is cancelled and
+   * the worker restored, so a raised ceiling rescues it.
+   */
+  reconcileWorkerEviction(ceiling: number, evictExcess: boolean): void {
+    this.workerEviction.reconcile(ceiling, evictExcess);
   }
 
   /**
@@ -626,10 +707,14 @@ export class RunCoordinator {
       if (runJobs) {
         const entry = runJobs.get(msg.jobId);
         if (entry?.windowTimer) clearTimeout(entry.windowTimer);
+        const drainedPeerId = entry?.peerId;
         runJobs.delete(msg.jobId);
         if (runJobs.size === 0) {
           this.reroutedJobs.delete(msg.runId);
         }
+        // A draining worker's last in-flight job just went terminal — let
+        // eviction disconnect it now rather than waiting out the drain timeout.
+        if (drainedPeerId) this.fireIdleIfDrained(drainedPeerId);
       }
     }
 
@@ -1130,16 +1215,11 @@ export class RunCoordinator {
     // timer fires handleRerouteSpawnTimeout to re-dispatch instead of stranding
     // the run until the ~20-min stale detector. Cleared on the first progress
     // (onPeerJobProgress) or on terminal cleanup.
-    const window = await this.getRerouteSpawnWindowMs(job);
-    const windowTimer = setTimeout(() => {
-      void this.handleRerouteSpawnTimeout(runId, jobId).catch((err) => {
-        logger.error('Reroute spawn-window handler failed', {
-          runId,
-          jobId,
-          error: toErrorMessage(err),
-        });
-      });
-    }, window);
+    const windowTimer = this.armRerouteWindow(
+      runId,
+      jobId,
+      await this.getRerouteSpawnWindowMs(job),
+    );
 
     runJobs.set(jobId, {
       peerId,
@@ -1148,6 +1228,7 @@ export class RunCoordinator {
       job,
       labelSets,
       triedConnections: [...triedConnections],
+      peerStarted: false,
       windowTimer,
     });
 
@@ -1161,6 +1242,107 @@ export class RunCoordinator {
       this.executionTracker.registerJobName(runId, jobId, job.jobName);
       await this.executionTracker.markJobReroutedToPeer(runId, jobId, peerId);
     }
+  }
+
+  /** Arm a spawn-window / reap timer that fires {@link handleRerouteSpawnTimeout}. */
+  private armRerouteWindow(runId: string, jobId: string, windowMs: number): NodeJS.Timeout {
+    return setTimeout(() => {
+      void this.handleRerouteSpawnTimeout(runId, jobId).catch((err) => {
+        logger.error('Reroute spawn-window handler failed', {
+          runId,
+          jobId,
+          error: toErrorMessage(err),
+        });
+      });
+    }, windowMs);
+  }
+
+  /**
+   * Whether the reroute target has actually started the job, read from the
+   * shared `execution_jobs` row.
+   *
+   * A read failure answers "not running" so a transient database fault cannot
+   * silently disable the backstop — the re-dispatch it then performs is the
+   * behavior that shipped before this check existed, and it is idempotent.
+   * Only the FIRST observation goes through this path: once `peerStarted`
+   * latches, a read fault can no longer bounce a running job.
+   */
+  private async rerouteTargetIsRunning(
+    runId: string,
+    jobId: string,
+    tracked: RerouteTracking,
+  ): Promise<boolean> {
+    if (!this.executionTracker) return false;
+    try {
+      return await this.executionTracker.hasJobStarted(runId, jobId);
+    } catch (err) {
+      logger.warn('Could not read rerouted job state; treating the spawn window as elapsed', {
+        runId,
+        jobId,
+        peerId: tracked.peerId,
+        error: toErrorMessage(err),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * The peer owns the job, so the backstop must not re-dispatch it. Release the
+   * tracking entry once the shared row is terminal, otherwise re-arm the window
+   * as a reap poll.
+   *
+   * The entry cannot simply be dropped here: cancel propagation still needs it
+   * while the job runs. It also cannot simply be kept, because a peer
+   * COORDINATOR relays no terminal `job.progress` — the shared row IS its
+   * report — so nothing else would ever release it and `reroutedJobs` would
+   * grow for the lifetime of the process. A read fault re-arms (never releases),
+   * so a transient fault costs one more poll rather than tracking.
+   */
+  private async reapOrDeferRerouteTracking(
+    runId: string,
+    jobId: string,
+    runJobs: Map<string, RerouteTracking>,
+    tracked: RerouteTracking,
+  ): Promise<void> {
+    if (tracked.windowTimer) clearTimeout(tracked.windowTimer);
+    tracked.windowTimer = undefined;
+
+    let terminal = false;
+    try {
+      terminal = (await this.executionTracker?.isJobTerminal(runId, jobId)) ?? false;
+    } catch (err) {
+      logger.warn('Could not read rerouted job state; keeping the tracking entry', {
+        runId,
+        jobId,
+        peerId: tracked.peerId,
+        error: toErrorMessage(err),
+      });
+    }
+
+    if (terminal) {
+      runJobs.delete(jobId);
+      if (runJobs.size === 0) this.reroutedJobs.delete(runId);
+      logger.info('Rerouted job reached a terminal state on its peer — tracking released', {
+        runId,
+        jobId,
+        jobName: tracked.jobName,
+        peerId: tracked.peerId,
+      });
+      this.fireIdleIfDrained(tracked.peerId);
+      return;
+    }
+
+    tracked.windowTimer = this.armRerouteWindow(
+      runId,
+      jobId,
+      await this.getRerouteSpawnWindowMs(tracked.job),
+    );
+    logger.info('Rerouted job is running on its peer — spawn-window backstop disarmed', {
+      runId,
+      jobId,
+      jobName: tracked.jobName,
+      peerId: tracked.peerId,
+    });
   }
 
   /**
@@ -1177,6 +1359,26 @@ export class RunCoordinator {
     const runJobs = this.reroutedJobs.get(runId);
     const tracked = runJobs?.get(jobId);
     if (!runJobs || !tracked) return; // Progress arrived / already re-dispatched.
+
+    // Silence on the wire is not evidence the spawn failed. `onPeerJobProgress`
+    // — the only thing that disarms this timer — fires on a relayed
+    // `job.progress`, which only a WORKER peer sends: a worker has no database,
+    // so relaying is its only channel. A peer COORDINATOR shares this
+    // instance's database and writes the job's status straight to
+    // `execution_jobs`, so it relays nothing and this backstop would cancel a
+    // job that is running perfectly well — which is what happens to any
+    // coordinator-to-coordinator reroute whose job outlives the window (a slow
+    // scaler spawn, a long checkout, a big dependency install).
+    //
+    // So consult the shared row before treating the peer as failed, and latch
+    // the answer: from then on the entry is only ever deferred or reaped, never
+    // re-dispatched. With no tracker wired, this reads false and the original
+    // behavior stands.
+    if (tracked.peerStarted || (await this.rerouteTargetIsRunning(runId, jobId, tracked))) {
+      tracked.peerStarted = true;
+      await this.reapOrDeferRerouteTracking(runId, jobId, runJobs, tracked);
+      return;
+    }
 
     // Remove tracking + clear the timer BEFORE re-dispatch so a concurrent
     // trigger (Layer A window vs. Layer B NAK) sees the entry gone and no-ops.

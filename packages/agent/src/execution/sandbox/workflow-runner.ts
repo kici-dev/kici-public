@@ -27,6 +27,7 @@ import { makeStreamingZxLog } from '../streaming-zx-log.js';
 import {
   ExecutionJobStatus,
   ExecutionStepStatus,
+  reservedEventNamePrefix,
   LogStream,
   TimeoutReason,
 } from '@kici-dev/engine';
@@ -67,6 +68,7 @@ import type {
   DynamicJobNeed,
   FanoutPosition,
   EventDefinition,
+  InvokeResult,
 } from '@kici-dev/sdk';
 import type {
   OutputsMap,
@@ -94,6 +96,7 @@ import type {
   ArtifactResponseIpc,
   StepApprovalResolvedIpc,
   JobExecutionRequest,
+  GitGrantResponseIpc,
 } from './ipc-protocol.js';
 import type { SandboxStepResult } from './types.js';
 import {
@@ -119,7 +122,7 @@ import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { expandInitDirectives } from '../env-init/presets/expand.js';
 import { armJobDeadline } from './job-deadline.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
-import { gitClone } from '../../checkout/git-clone.js';
+import { cloneJobRepos, type CloneJobReposRequest } from '../../checkout/clone-job-repos.js';
 import { restoreDeps, excludeScratchFromGit } from '../dep-restore.js';
 import { installDeps } from '../dep-installer.js';
 import {
@@ -430,6 +433,76 @@ const EMIT_RESPONSE_TIMEOUT_MS = 5_000;
  * (per research doc pitfall 5: event was already persisted by orchestrator,
  * so it will still be routed even if the ack is lost).
  */
+
+/** In-flight git write-grant requests, keyed by requestId. */
+const pendingGitGrants = new Map<string, (r: GitGrantResponseIpc) => void>();
+
+/** How long to wait for the agent to answer a grant request. */
+const GIT_GRANT_TIMEOUT_MS = 60_000;
+
+function waitForGitGrant(requestId: string): Promise<GitGrantResponseIpc> {
+  return new Promise<GitGrantResponseIpc>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingGitGrants.delete(requestId);
+      // Fail closed: a timed-out elevation must NOT silently proceed as if it
+      // had been granted, or a push would run on read-only credentials and the
+      // error would surface as a confusing auth failure much later.
+      resolve({
+        type: 'git.grant.response',
+        requestId,
+        error: 'timed out waiting for the agent to answer a git write-grant request',
+      });
+    }, GIT_GRANT_TIMEOUT_MS);
+    pendingGitGrants.set(requestId, (r) => {
+      clearTimeout(timer);
+      pendingGitGrants.delete(requestId);
+      resolve(r);
+    });
+  });
+}
+
+/**
+ * Open a write window for one repository, run `fn`, and close it.
+ *
+ * The revoke rides a `finally`, so a throwing callback still closes the
+ * window — and the agent's TTL is the backstop if this process dies outright.
+ */
+export async function withRepoWrite(
+  repository: string,
+  opts: { permissions?: Record<string, string>; credential?: string },
+  fn: () => Promise<void>,
+  send: (msg: RunnerToAgentMessage) => void,
+  wait: (requestId: string) => Promise<GitGrantResponseIpc>,
+): Promise<void> {
+  const requestId = randomUUID();
+  send({
+    type: 'git.grant.request',
+    requestId,
+    op: 'elevate',
+    repository,
+    permissions: opts.permissions ?? { contents: 'write' },
+    ...(opts.credential ? { credentialName: opts.credential } : {}),
+  });
+  const granted = await wait(requestId);
+  if (granted.error) {
+    throw new Error(`Cannot open a git write window for '${repository}': ${granted.error}`);
+  }
+
+  try {
+    await fn();
+  } finally {
+    const revokeId = randomUUID();
+    send({
+      type: 'git.grant.request',
+      requestId: revokeId,
+      op: 'revoke',
+      grantId: granted.grantId,
+    });
+    // Do not await the revoke: the window is already logically closed, the
+    // agent revokes on receipt, and a hung agent must not turn a successful
+    // push into a failed step.
+  }
+}
 function waitForEmitResponse(requestId: string): Promise<EventEmitResponse> {
   return new Promise<EventEmitResponse>((resolve) => {
     const timer = setTimeout(() => {
@@ -1040,6 +1113,8 @@ function dispatchAgentMessage(msg: AgentToRunnerMessage): void {
     if (pending) {
       pending.resolve(msg);
     }
+  } else if (msg.type === 'git.grant.response') {
+    pendingGitGrants.get(msg.requestId)?.(msg);
   } else if (msg.type === 'concurrency.ack') {
     if (pendingConcurrencyAck) {
       pendingConcurrencyAck.resolve(msg);
@@ -1166,6 +1241,7 @@ export function buildStepNeedsContext(
   declaredNeeds: readonly unknown[] | undefined,
   upstreamJobOutputs: Record<string, Record<string, unknown>> | undefined,
   upstreamJobStatuses: Record<string, ExecutionJobStatus> | undefined,
+  upstreamInvokeResults?: Record<string, InvokeResult[]>,
 ): NeedsContext | undefined {
   if (!declaredNeeds || declaredNeeds.length === 0) return undefined;
 
@@ -1173,11 +1249,22 @@ export function buildStepNeedsContext(
   const jobs: Record<string, Record<string, unknown>> = {};
   const groups: Record<string, string[]> = {};
   const snapStatuses: Record<string, ExecutionJobStatus> = {};
+  const invokeResults: Record<string, InvokeResult[]> = {};
   const resolvedNeeds: DynamicJobNeed[] = [];
 
   for (const need of declaredNeeds) {
     const base = needBaseName(need);
     if (!base) continue;
+
+    // An upstream naming an invoke gate resolves to its per-run results on
+    // `.result` (an InvokeResult[]), NOT to the group shape its proxy children
+    // (`${gate} (...)`) would otherwise imply. Checked before the fan-out branch
+    // so the SDK builder emits the InvokeNeedEntry shape.
+    if (base.kind === 'job' && upstreamInvokeResults?.[base.key]) {
+      invokeResults[base.key] = upstreamInvokeResults[base.key];
+      resolvedNeeds.push(base.key);
+      continue;
+    }
 
     // Child names that fanned out from this base (matrix / host children share
     // the `${base} (...)` naming) come from the statuses map keyed per-child.
@@ -1205,6 +1292,7 @@ export function buildStepNeedsContext(
   }
 
   const snapshot: UpstreamSnapshot = { jobs, groups, statuses: snapStatuses };
+  if (Object.keys(invokeResults).length > 0) snapshot.invokeResults = invokeResults;
   return buildNeedsContext(snapshot, resolvedNeeds);
 }
 
@@ -1386,6 +1474,24 @@ export function resolveEmitEventName(nameOrDefinition: string | EventDefinition)
 }
 
 /**
+ * Reject a user `ctx.emit` whose event name uses a reserved prefix: `kici.`
+ * (KiCI-internal system events — the event scaler's scale-up / scale-down) or
+ * `__` (the events the orchestrator mints for itself). A workflow step must
+ * forge neither — a `__` name is dispatched as a TRUSTED ref and skips the
+ * event-storm rate limiter, so emitting one would be a privilege escalation,
+ * not merely a naming collision. Throws a clear error at the emit call; the
+ * orchestrator enforces the same reservation authoritatively.
+ */
+export function assertUserEmittableEventName(eventName: string): void {
+  const reservedPrefix = reservedEventNamePrefix(eventName);
+  if (reservedPrefix) {
+    throw new Error(
+      `event name prefix "${reservedPrefix}" is reserved for KiCI internal events and cannot be emitted from a workflow step (got "${eventName}")`,
+    );
+  }
+}
+
+/**
  * Sanitize a raw identifier into a valid temp label: lowercase, every
  * non-`[a-z0-9-]` char to `-`, falling back to `'step'` when the result is
  * empty. Applied to both the caller-supplied `ctx.mktemp(label)` and the
@@ -1535,6 +1641,11 @@ export function createSandboxStepContext(
       // Accept either an ad-hoc event name or a defineEvent() definition; the
       // typed overload passes the definition object, so resolve its name here.
       const eventName = resolveEmitEventName(nameOrDefinition);
+      // The `kici.` and `__` prefixes are reserved — KiCI-internal system
+      // events and the orchestrator's own minted events; a user step must not
+      // forge either. Reject client-side for a clear error at the emit call;
+      // the orchestrator rejects it authoritatively too.
+      assertUserEmittableEventName(eventName);
       const reqId = randomUUID();
       const request: EventEmitRequest = {
         type: 'event.emit',
@@ -1569,6 +1680,28 @@ export function createSandboxStepContext(
     mktempFile: (label?: string, opts?: { suffix?: string }) =>
       jobTempScope.mktempFile(sanitizeTempLabel(label ?? stepName), opts),
     kici,
+    // The job's own checkout, as a handle. Present for every job — unlike
+    // `sourceRepo`/`workflowRepo`, which exist only for a global workflow.
+    // `withWrite` opens a bounded write window for THIS repository; see the
+    // git-credential design for why the window is scoped to the repository and
+    // the callback rather than to the step.
+    repo: {
+      identifier: repoIdentifierFromUrl(request.repoUrl),
+      path: workDir,
+      ref: request.ref,
+      sha: request.sha,
+      withWrite: (
+        opts: { permissions?: Record<string, string>; credential?: string },
+        fn: () => Promise<void>,
+      ) =>
+        withRepoWrite(
+          repoIdentifierFromUrl(request.repoUrl),
+          opts,
+          fn,
+          sendMessage,
+          waitForGitGrant,
+        ),
+    },
     // Build, sign, and persist a provenance attestation. The identity token is
     // relayed via ctx.kici.oidc.token (P1.4); the bundle is uploaded over the
     // provenance.request IPC -> agent WS -> orchestrator presigned PUT.
@@ -1602,6 +1735,7 @@ export function createSandboxStepContext(
         request.jobNeeds,
         request.upstreamJobOutputs,
         request.upstreamJobStatuses,
+        request.upstreamInvokeResults,
       );
       return needs ? { needs } : {};
     })(),
@@ -1684,85 +1818,20 @@ async function cloneRepoIfRequested(
   sourceDir: string,
   isGlobal: boolean,
 ): Promise<void> {
-  if (request.checkout === false) return;
-
-  if (request.fullRepo) {
-    trace('fullRepo mode -- skipping git clone, workspace from overlay');
-    await fsPromises.mkdir(workDir, { recursive: true });
-    sendMessage({
-      type: 'log.line',
-      stepIndex: -1,
-      line: '[workflow-runner] Full-repo mode: skipping git clone (workspace from overlay tarball)',
-    });
-    return;
-  }
-
-  if (isGlobal) {
-    trace(`starting dual-clone (global workflow)`);
-    await fsPromises.mkdir(workflowDir, { recursive: true });
-    await fsPromises.mkdir(sourceDir, { recursive: true });
-
-    const workflowAuth = request.workflowAuth ?? request.sourceAuth;
-    const sourceAuth = request.sourceAuth ?? request.workflowAuth;
-
-    sendMessage({
-      type: 'log.line',
-      stepIndex: -1,
-      line: `[workflow-runner] Global workflow: cloning workflow repo ${request.workflowRepoUrl} ref=${request.workflowRef} into ${workflowDir}`,
-    });
-    await gitClone({
-      repoUrl: request.workflowRepoUrl!,
-      ref: request.workflowRef ?? '',
-      sha: request.workflowSha ?? '',
-      workDir: workflowDir,
-      gitAuth: workflowAuth,
-      token: workflowAuth ? undefined : request.token,
-    });
-    trace('workflow repo clone complete');
-    // Hide dep-restore scratch dirs from `git status` in the workflow repo's
-    // working tree. `.kici/` (and therefore the scratch dirs) lives in the
-    // workflow repo for global workflows, not the source repo — so only this
-    // clone gets the exclude rule. See dep-restore.ts#excludeScratchFromGit.
-    await excludeScratchFromGit(workflowDir);
-
-    sendMessage({
-      type: 'log.line',
-      stepIndex: -1,
-      line: `[workflow-runner] Global workflow: cloning source repo ${request.repoUrl} ref=${request.ref} into ${sourceDir}`,
-    });
-    await gitClone({
-      repoUrl: request.repoUrl,
-      ref: request.ref,
-      sha: request.sha,
-      workDir: sourceDir,
-      gitAuth: sourceAuth,
-      token: sourceAuth ? undefined : request.token,
-    });
-    trace('source repo clone complete');
-    sendMessage({ type: 'log.line', stepIndex: -1, line: '[workflow-runner] Dual-clone complete' });
-    return;
-  }
-
-  trace('starting git clone');
-  sendMessage({
-    type: 'log.line',
-    stepIndex: -1,
-    line: `[workflow-runner] Cloning ${request.repoUrl} ref=${request.ref} into ${workDir}`,
-  });
-  await gitClone({
-    repoUrl: request.repoUrl,
-    ref: request.ref,
-    sha: request.sha,
-    workDir,
-    gitAuth: request.sourceAuth,
-    token: request.sourceAuth ? undefined : request.token,
-  });
-  // Hide dep-restore scratch dirs from `git status` in the cloned working
-  // tree. See dep-restore.ts#excludeScratchFromGit for why this lives here
-  // (post-clone) rather than in dep-restore itself.
-  await excludeScratchFromGit(workDir);
-  sendMessage({ type: 'log.line', stepIndex: -1, line: '[workflow-runner] Clone complete' });
-  trace('git clone complete');
+  // Delegates to the shared implementation so a host-side checkout and an
+  // in-sandbox one cannot drift apart. This side routes progress to IPC.
+  await cloneJobRepos(
+    request as unknown as CloneJobReposRequest,
+    { workDir, workflowDir, sourceDir },
+    {
+      isGlobal,
+      log: (line) => {
+        trace(line);
+        sendMessage({ type: 'log.line', stepIndex: -1, line: `[workflow-runner] ${line}` });
+      },
+      excludeScratchFromGit,
+    },
+  );
 }
 
 /**
@@ -2353,6 +2422,13 @@ async function runCancelPathHooks(args: {
     line: `[kici] Cancel complete, job status: ${cancelFailureReason ? 'failed' : 'cancelled'}`,
   });
 
+  // The graceful cancel path ran the declared onCancel + cleanup hooks in-band,
+  // so tell the supervisor its completion hooks ran — otherwise the between-jobs
+  // phase would re-run cleanup out-of-band and execute it twice. The force-abort
+  // path above returns before here without the marker, which is correct: it
+  // skipped the hooks, so the out-of-band re-run SHOULD fire for it.
+  maskedSend({ type: 'completion-hooks-done' });
+
   return { finalStatus: ExecutionJobStatus.enum.failed, cancelFailureReason };
 }
 
@@ -2878,6 +2954,32 @@ async function runInitPhaseOrFailJob(args: {
  * 7. Execute steps sequentially with IPC reporting
  * 8. Send job.complete and exit
  */
+/**
+ * Extract + normalize the job's steps, or return an empty set for a cleanup-only
+ * re-run (which runs no steps and skips the generator re-evaluation this would
+ * otherwise trigger). Owns the `apiTransport` closure the generator uses.
+ */
+async function extractStepsForRun(
+  workflow: Workflow,
+  request: JobExecutionRequest,
+  globalRepoInfo: GeneratorRepoPair | undefined,
+): Promise<{
+  normalizedSteps: Step[];
+  nodes: StepNode[];
+  refMap: StepRefMap;
+  driftDroppedJobs: string[];
+}> {
+  if (request.cleanupOnly) {
+    return { normalizedSteps: [], nodes: [], refMap: new WeakMap(), driftDroppedJobs: [] };
+  }
+  const apiTransport = async (method: string, params?: Record<string, unknown>) => {
+    const reqId = randomUUID();
+    sendMessage({ type: 'agent.api.request', requestId: reqId, method, params: params ?? {} });
+    return waitForApiResponse(reqId);
+  };
+  return extractAndNormalizeSteps(workflow, request, apiTransport, globalRepoInfo);
+}
+
 async function main(): Promise<void> {
   trace(`main() started, isForkMode=${isForkMode}, pid=${process.pid}`);
   sendMessage({ type: 'ready' });
@@ -2923,26 +3025,33 @@ async function main(): Promise<void> {
     jobDeadlineAbort.abort();
   });
 
-  // Phase 1: clone (if checkout enabled) + overlay tarball
-  await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
-  await applyOverlayIfRequested(request, workflowDir);
-  await makeOverlayGitUsable(request, workflowDir);
-  if (aborted) abortAndExit('aborted after clone');
+  // A between-jobs out-of-band cleanup re-run reuses the preserved workdir: the
+  // clone, dependency install, and source tarball are already in place, so
+  // phases 1–2b are skipped and only the declared cleanup hooks run below.
+  if (!request.cleanupOnly) {
+    // Phase 1: clone (if checkout enabled) + overlay tarball
+    await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
+    await applyOverlayIfRequested(request, workflowDir);
+    await makeOverlayGitUsable(request, workflowDir);
+    if (aborted) abortAndExit('aborted after clone');
 
-  // Phase 2: deps (cache restore or inline install)
-  await installDependenciesIfNeeded(workflowDir, request);
-  if (aborted) abortAndExit('aborted after deps');
+    // Phase 2: deps (cache restore or inline install)
+    await installDependenciesIfNeeded(workflowDir, request);
+    if (aborted) abortAndExit('aborted after deps');
 
-  // Phase 2b: restore cached source tarball over .kici/ if present
-  await restoreSourceTarballIfRequested(workflowDir, request);
+    // Phase 2b: restore cached source tarball over .kici/ if present
+    await restoreSourceTarballIfRequested(workflowDir, request);
+  }
 
   // Phase 3: load workflow module + install output capture
   const loaded = await loadWorkflowModuleWithCapture(workflowDir, request, isGlobal, maskedSend);
   const module: Record<string, unknown> = loaded.module;
   const workflow = extractWorkflow(module, request.workflowName);
 
-  // Phase 4: concurrency group eval (may exit the process for wait/cancel)
-  await evaluateConcurrencyGroupIfPresent(workflow, request);
+  // Phase 4: concurrency group eval (may exit the process for wait/cancel).
+  // Skipped for a cleanup-only re-run — the slot was already released when the
+  // original job ended; re-acquiring it here would wait or cancel spuriously.
+  if (!request.cleanupOnly) await evaluateConcurrencyGroupIfPresent(workflow, request);
 
   // Phase 5: inject the global-workflow env + repo pair, then extract steps
   // (dynamic source eval or static lookup) and normalize.
@@ -2954,20 +3063,9 @@ async function main(): Promise<void> {
   // did, and `extractStepsFromDynamicJob` fails the job on that mismatch.
   const globalRepoInfo = setupGlobalWorkflowEnv(request, isGlobal, workflowDir, sourceDir);
 
-  const apiTransport = async (method: string, params?: Record<string, unknown>) => {
-    const reqId = randomUUID();
-    sendMessage({
-      type: 'agent.api.request',
-      requestId: reqId,
-      method,
-      params: params ?? {},
-    });
-    return waitForApiResponse(reqId);
-  };
-  const { normalizedSteps, nodes, refMap, driftDroppedJobs } = await extractAndNormalizeSteps(
+  const { normalizedSteps, nodes, refMap, driftDroppedJobs } = await extractStepsForRun(
     workflow,
     request,
-    apiTransport,
     globalRepoInfo,
   );
 
@@ -2975,18 +3073,30 @@ async function main(): Promise<void> {
   const { operatorSecretKeys, outputsMap, secretOutputs, jobOutputsMap } =
     buildOutputInfrastructure(request, refMap, loaded.sdkSetters);
 
-  // Phase 7: job-level rules — may early-exit with skipped steps
+  // Phase 7: job-level rules — may early-exit with skipped steps. Skipped for a
+  // cleanup-only re-run: rules gate whether steps run, and a re-run runs none —
+  // its only purpose is to drive the declared cleanup regardless of rules.
   const job = findJob(workflow, request.jobName);
-  // Resolve changed files (ground truth = the source clone) before rule eval,
-  // only when a job or step rule could read ctx.changedFiles.
-  const jobHasRules = (job?.rules?.length ?? 0) > 0;
-  const anyStepHasRules = normalizedSteps.some((s) => (s.rules?.length ?? 0) > 0);
-  await resolveChangedFilesForRules(request, sourceDir, jobHasRules || anyStepHasRules);
-  await maybeSkipJobOnRules(job, request, normalizedSteps, globalRepoInfo);
-  if (aborted) abortAndExit('aborted after rules');
+  if (!request.cleanupOnly) {
+    // Resolve changed files (ground truth = the source clone) before rule eval,
+    // only when a job or step rule could read ctx.changedFiles.
+    const jobHasRules = (job?.rules?.length ?? 0) > 0;
+    const anyStepHasRules = normalizedSteps.some((s) => (s.rules?.length ?? 0) > 0);
+    await resolveChangedFilesForRules(request, sourceDir, jobHasRules || anyStepHasRules);
+    await maybeSkipJobOnRules(job, request, normalizedSteps, globalRepoInfo);
+    if (aborted) abortAndExit('aborted after rules');
+  }
 
   // Phase 8: collect job hooks
   const jobHooks = collectJobHooks(job);
+
+  // Tell the supervisor whether this job declares failure/cleanup hooks, so a
+  // between-jobs out-of-band re-run can be decided even if the runner is later
+  // hard-killed before its completion hooks run.
+  maskedSend({
+    type: 'hooks-declared',
+    declaresCleanup: Boolean(jobHooks.onFailure || jobHooks.cleanup),
+  });
 
   // Phase 9: switch from prepare-phase capture to per-step capture
   flushOutputCapture();
@@ -3006,19 +3116,28 @@ async function main(): Promise<void> {
   // Per-job init phase (after clone + module load, before the step
   // loop). Each init spec runs through the SAME sandbox shell steps use; on the
   // first failure/timeout the job fails before any step runs (no step loop).
-  await runInitPhaseOrFailJob({
-    job,
-    stepCwd,
-    envFiles,
-    operatorSecretKeys,
-    maskedSend,
-  });
+  // Skipped on a cleanup-only re-run: re-running init would re-execute the
+  // job's setup commands (restarting the very daemons the reap removes), and an
+  // init failure calls process.exit(1) before the step loop, which would skip
+  // the declared cleanup this re-run exists to run.
+  if (!request.cleanupOnly) {
+    await runInitPhaseOrFailJob({
+      job,
+      stepCwd,
+      envFiles,
+      operatorSecretKeys,
+      maskedSend,
+    });
+  }
 
-  // Declarative cache infrastructure + Phase 9b job-level cache restore.
+  // Declarative cache infrastructure + Phase 9b job-level cache restore. On a
+  // cleanup-only re-run, pass no cache specs so the restore side effect (which
+  // could clobber the preserved post-execution state the cleanup hook inspects)
+  // is skipped; the step loop still needs the deps object, but runs no steps.
   const { cachePhaseDeps, jobCacheSpecs, jobCacheRestore } = await setupJobCache(
     stepCwd,
     normalizedSteps.length,
-    job?.cache,
+    request.cleanupOnly ? undefined : job?.cache,
     maskedSend,
   );
 
@@ -3088,6 +3207,9 @@ async function main(): Promise<void> {
     abortStep: (stepIndex) => stepAbortControllers.get(stepIndex)?.abort(),
     getStepAbortSignal: (stepIndex) => stepAbortControllers.get(stepIndex)?.signal,
     checkMode: request.checkMode,
+    // A cleanup-only re-run declares no steps, so drive the completion sequence
+    // down the failed path (onFailure + cleanup) as if the job had failed.
+    ...(request.cleanupOnly ? { forceInitialFailure: true } : {}),
     createStepContext: createStepCtxWithCapture,
     sendIpc: maskedSend,
     defaultTimeoutMs,

@@ -21,6 +21,7 @@ export {
   WORKFLOW_MODIFICATION_JOB_ID,
   SECURITY_HOLD_JOB_IDS,
   SECURITY_HOLD_JOB_LABELS,
+  isSecurityHoldJobId,
   INSTALL_JOB_ID_PREFIX,
   installGateJobId,
 } from './held-run-job-id.js';

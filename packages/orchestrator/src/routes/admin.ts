@@ -25,7 +25,10 @@ import { createDbRoutes } from './admin-db.js';
 import { createBackendRoutes } from './admin-backends.js';
 import { createOrgSettingsRoutes } from './admin-org-settings.js';
 import { createTrustPolicyRoutes } from './admin-trust-policy.js';
+import { createHeldRunRoutes, type HeldRunReleaseWiring } from './admin-held-runs.js';
+import { HeldRunStore } from '../contexts/held-runs.js';
 import { TrustPolicyStore } from '../security/trust-policy-store.js';
+import { TrustDirectoryStore } from '../security/trust-directory-store.js';
 import { createClusterSettingsRoutes } from './admin-cluster-settings.js';
 import { createClusterNameRoutes } from './admin-cluster-name.js';
 import { createMaintenanceRoutes } from './admin-maintenance.js';
@@ -164,6 +167,14 @@ export interface AdminRouteDeps {
     runId?: string;
     includeRejected?: boolean;
   }) => Promise<{ minted: number; stillPending: number; rejected: number }>;
+  /**
+   * Optional -- the resume wiring behind `kici-admin held-run approve|reject`.
+   * When set (alongside `db` + `accessLog`), the local held-run read and
+   * decision routes are mounted; they refuse with 409 on a Platform-attached
+   * orchestrator. Unset leaves them unmounted, which is the honest state for an
+   * app that cannot dispatch a released hold.
+   */
+  heldRunRelease?: HeldRunReleaseWiring;
 }
 
 /** Hono env type for admin routes with context variables. */
@@ -785,7 +796,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   }
 
   // Mount trust-policy routes (optional -- only when db is provided).
-  // Backs the `kici-admin trust-policy {show,set}` subcommands. PATCH refuses
+  // Backs the `kici-admin trust-policy {show,set,directory}` subcommands. PATCH refuses
   // server-side on a Platform-attached orchestrator, where the Platform owns
   // the policy and the next push would clobber a local write.
   // The audit sink is part of the mount condition, not an optional extra: the
@@ -800,9 +811,36 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       '/api/v1/admin',
       createTrustPolicyRoutes({
         store: new TrustPolicyStore(deps.db),
+        directory: new TrustDirectoryStore(deps.db),
         rbac: deps.rbac,
         mode: deps.mode ?? 'platform',
         accessLog,
+      }),
+    );
+  }
+
+  // Mount held-run routes (optional -- db, an audit sink, AND the resume
+  // wiring). Backs the `kici-admin held-run {list,approve,reject}` subcommands,
+  // which refuse server-side on a Platform-attached orchestrator where the
+  // Platform's own held-run trust gate is the authority.
+  //
+  // The resume wiring is part of the mount condition rather than an optional
+  // extra: without it an approve would flip the row and never dispatch the job
+  // it released, which reads as success and does nothing. The audit sink is in
+  // the condition for the same reason it is on the trust-policy route — a
+  // locally-answered hold that lands unattributed is worse than one that cannot
+  // be answered at all.
+  if (deps.db && deps.accessLog && deps.heldRunRelease) {
+    app.route(
+      '/api/v1/admin',
+      createHeldRunRoutes({
+        store: new HeldRunStore(deps.db),
+        directory: new TrustDirectoryStore(deps.db),
+        db: deps.db,
+        rbac: deps.rbac,
+        mode: deps.mode ?? 'platform',
+        accessLog: deps.accessLog,
+        release: deps.heldRunRelease,
       }),
     );
   }

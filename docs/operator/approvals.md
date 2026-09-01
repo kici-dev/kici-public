@@ -71,6 +71,10 @@ A held element waits up to its expiry. An **explicit** gate (an `approval` block
 
 With `allow_self_approval` set to `false`, the user who triggered a run cannot approve a gate on that run; another eligible approver must. This is the control for environments where author sign-off must be independent. It defaults to `true` because an author's _voluntary_ gate is usually a reminder for themselves; the mandatory environment-reviewer layer remains the real control for untrusted contributors.
 
+The rule applies to the **principal** that triggered the run, not only to a person signed in to the dashboard. A run triggered by a user through an agent, by a service account, or by an internal system component is subject to the same refusal when that same principal tries to approve it.
+
+One case stays outside the rule: a run triggered by an API key is recorded under the key's own identity, while an approve from that key's owner arrives under the owner's user identity. The two are not matched, so the owner can approve a run their key triggered. Use a team or an `approvers:` clause that excludes the key owner when you need that separation.
+
 ## The dashboard approval queue
 
 The approval queue page lists held elements pending approval. It shows held runs at all three scopes (step, job, workflow) — the `Scope` column carries a badge for each — and, for each, the **per-clause progress** — which clauses are satisfied and by whom, and how many remain (for example, `leads ✓ · cto ✗ — 1/2`). Each decision is attributed to the real approver. Approve and reject actions are available to users with the required permission; the run detail page shows who approved each clause.
@@ -87,6 +91,16 @@ A held element is released the same way regardless of whether it was held by an 
 - **`kici approve` / `kici reject`** — the developer CLI, acting as the authenticated user. See [`kici approve`](../user/approvals.md#approving-from-the-cli).
 
 Both paths run through the same eligibility check and the same resume logic: on full satisfaction the held element is re-dispatched (for a job or workflow) or unblocked (for a step); any single rejection fails the element and the run.
+
+### What a successful answer means
+
+An approve or a reject answers as soon as the decision is **recorded**, not when its consequence finishes. The decision is durable at that point. The hold has left the pending queue, a second answer on the same hold is refused as already resolved, and the resume (or the cancellation) is under way.
+
+The consequence itself can take a few more seconds. Releasing a workflow-scoped hold replays the whole dispatch — re-evaluating triggers, re-reading the lock file, routing the jobs — and rejecting one cancels the run and completes every status check the held dispatch had queued. So after a successful answer, expect the approval queue to clear at once and the run to leave `held` shortly after, rather than both at the same instant.
+
+A consequence that fails is recorded, not lost. It appears as a `held_run.approve` or `held_run.reject` entry in the access log with the outcome `error` and the failure message — readable in the dashboard activity view and with `kici-admin access-log`. A resume that cannot rebuild its dispatch also fails the run itself and completes the status checks it was blocking, so the pull request never sits behind a check that can no longer clear.
+
+A job can also be held by a [security hold](security/security.md#security-approval-queue) at the same time — that one takes `ci_trust:write`, not `contexts:write`. Both holds must be released before the job runs, and each carries its own expiry, so the first deadline to arrive cancels the run. From the CLI, `--job` names both, so pass `--hold-type reviewer` or `--hold-type security` to pick one.
 
 ## Agent occupancy during step-level holds
 

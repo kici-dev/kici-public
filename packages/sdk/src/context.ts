@@ -224,6 +224,27 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   isTestRun: boolean;
   /**
+   * The job's own checked-out repository.
+   *
+   * Present for every job that checks out (unlike `sourceRepo` / `workflowRepo`,
+   * which exist only for a global workflow). `withWrite` opens a write window
+   * for THIS repository, bounded by the repository and by the callback's
+   * duration — not by the step: steps running concurrently in the same job can
+   * push to the same repository while it is open, but cannot reach a different
+   * one. It throws before any git runs when the forge will not grant what was
+   * requested.
+   */
+  repo?: {
+    identifier: string;
+    path: string;
+    ref?: string;
+    sha?: string;
+    withWrite(
+      opts: { permissions?: Record<string, string>; credential?: string },
+      fn: () => Promise<void>,
+    ): Promise<void>;
+  };
+  /**
    * Workflow repo metadata -- only set for global workflows.
    * The registering repo where the workflow code is defined.
    * For non-global workflows, this is undefined (the workflow repo IS the source repo).

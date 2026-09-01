@@ -81,6 +81,76 @@ describe('evaluateBranchGate', () => {
     expect(result.reason).toContain('production');
   });
 
+  it('passes an internally-triggered run whose branch matches', () => {
+    // The setup the docs present as canonical: a nightly scheduled deploy bound
+    // to a `production` context restricted to the default branch. A scheduled
+    // run presents its registration's default branch, so the restriction
+    // accepts it.
+    const env = makeEnv({ branchRestrictions: ['main', 'release/*'] });
+    const result = evaluateBranchGate(env, makeCtx({ branch: 'main', internallyTriggered: true }));
+    expect(result.action).toBe('pass');
+  });
+
+  it('names the real branch when an internally-triggered run does not match', () => {
+    const env = makeEnv({ branchRestrictions: ['release/*'] });
+    const result = evaluateBranchGate(env, makeCtx({ branch: 'main', internallyTriggered: true }));
+    expect(result.action).toBe('reject');
+    // An ordinary mismatch, so the reason names the branch the operator can act
+    // on rather than the no-branch cause.
+    expect(result.reason).toContain("Branch 'main' not allowed");
+    expect(result.reason).not.toContain('carries no branch');
+  });
+
+  it('names the missing branch for an internally-triggered run that carries none', () => {
+    const env = makeEnv({ branchRestrictions: ['main', 'release/*'] });
+    // A registration whose default branch was never captured, or an emitting
+    // run that is gone: the field the matcher requires a branch in is empty.
+    const result = evaluateBranchGate(env, makeCtx({ branch: '', internallyTriggered: true }));
+    expect(result.action).toBe('reject');
+    expect(result.reason).toContain('production');
+    expect(result.reason).toContain('carries no branch');
+    // The empty value must not be quoted as a branch name an operator could go
+    // and add to the restriction list — no such branch exists.
+    expect(result.reason).not.toContain("Branch ''");
+  });
+
+  it('still rejects a branchless internally-triggered run against a catch-all', () => {
+    // `*` matches any branch NAME, so a gate that only compared strings could
+    // let a branchless run through. The flag is not a weakening: it rejects a
+    // case the pattern would otherwise have to decide with nothing to match.
+    const env = makeEnv({ branchRestrictions: ['*'] });
+    expect(evaluateBranchGate(env, makeCtx({ branch: 'main' })).action).toBe('pass');
+    const result = evaluateBranchGate(env, makeCtx({ branch: '', internallyTriggered: true }));
+    expect(result.action).toBe('reject');
+    expect(result.reason).toContain('carries no branch');
+  });
+
+  it('leaves a webhook-triggered run on the pattern path', () => {
+    const env = makeEnv({ branchRestrictions: ['main'] });
+    // Same context, `internallyTriggered` absent: the pattern still decides.
+    expect(evaluateBranchGate(env, makeCtx({ branch: 'main' })).action).toBe('pass');
+    const rejected = evaluateBranchGate(env, makeCtx({ branch: 'develop' }));
+    expect(rejected.action).toBe('reject');
+    expect(rejected.reason).toContain('develop');
+  });
+
+  it('applies the trigger-type filter to an internally-triggered run unchanged', () => {
+    // The companion fact: `triggerType` IS a real name on these runs, so a
+    // trigger-type filter is the restriction that works where a branch one
+    // cannot.
+    const env = makeEnv({ triggerTypeFilters: ['schedule'] });
+    expect(
+      evaluateBranchGate(env, makeCtx({ triggerType: 'schedule', internallyTriggered: true }))
+        .action,
+    ).toBe('pass');
+    const rejected = evaluateBranchGate(
+      env,
+      makeCtx({ triggerType: 'kici_event', internallyTriggered: true }),
+    );
+    expect(rejected.action).toBe('reject');
+    expect(rejected.reason).toContain('kici_event');
+  });
+
   it('should pass when no trigger type filters', () => {
     const result = evaluateBranchGate(makeEnv(), makeCtx({ triggerType: 'pull_request' }));
     expect(result.action).toBe('pass');
@@ -310,7 +380,7 @@ describe('evaluateProtectionRules', () => {
       makeCtx(),
       0,
       'group-1',
-      'known', // known contributor, but context requires trusted
+      'unknown', // a fork ref, and the context sets a minimumTrust floor
     );
     expect(result.action).toBe('hold');
     expect(result.holdType).toBe(HoldType.enum.security);
@@ -340,7 +410,7 @@ describe('evaluateProtectionRules', () => {
   it('should skip trust gate when no trustTier provided', async () => {
     const env = makeEnv({ minimumTrust: 'trusted' });
     const result = await evaluateProtectionRules(env, makeCtx(), 0, 'group-1');
-    // No trustTier = pass through trust gate (push event)
+    // No trustTier = pass through trust gate (an unresolved tier)
     expect(result.action).toBe('pass');
   });
 

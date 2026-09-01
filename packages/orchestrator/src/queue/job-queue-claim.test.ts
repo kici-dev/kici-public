@@ -174,6 +174,69 @@ describeDb('JobQueue claim — exactly one claimant per job (real Postgres)', ()
     expect(second).toBeNull();
   });
 
+  // ── The suitability post-filter ─────────────────────────────────────────
+  //
+  // The gate has to run BEFORE the transition. A row claimed and then put back
+  // is stranded Dispatched for the width of the round trip, and every put-back
+  // spends one of the job's bounded dispatch attempts — so an agent that can
+  // never serve the job would fail it outright by polling.
+
+  it('a rejected row is left Pending, never claimed and released', async () => {
+    const id = await queue.enqueue(jobInput());
+
+    const job = await queue.dequeueForLabels(['linux', 'docker'], [], 'agent-a', () => false);
+
+    expect(job).toBeNull();
+    expect(await statusOf(id)).toEqual({ status: DispatchQueueStatus.Pending, agentId: null });
+  });
+
+  it('an accepted row is claimed atomically through the post-filter path', async () => {
+    const id = await queue.enqueue(jobInput());
+
+    const first = await queue.dequeueForLabels(['linux', 'docker'], [], 'agent-a', () => true);
+    const second = await queue.dequeueForLabels(['linux', 'docker'], [], 'agent-b', () => true);
+
+    expect(first?.id).toBe(id);
+    expect(second).toBeNull();
+    expect(await statusOf(id)).toEqual({
+      status: DispatchQueueStatus.Dispatched,
+      agentId: 'agent-a',
+    });
+  });
+
+  it('the post-filter skips a rejected row and claims the next one', async () => {
+    const rejected = await queue.enqueue(jobInput({ jobName: 'wrong-shape' }));
+    const accepted = await queue.enqueue(jobInput({ jobName: 'right-shape' }));
+
+    const job = await queue.dequeueForLabels(
+      ['linux', 'docker'],
+      [],
+      'agent-a',
+      (candidate) => candidate.jobName === 'right-shape',
+    );
+
+    expect(job?.id).toBe(accepted);
+    expect(await statusOf(rejected)).toEqual({
+      status: DispatchQueueStatus.Pending,
+      agentId: null,
+    });
+  });
+
+  it('the post-filter path still applies the regex matchers', async () => {
+    await queue.enqueue(
+      jobInput({
+        runsOnLabels: [],
+        runsOnPatterns: [{ kind: 'regex', source: '^kici:host:box-', flags: '' }],
+      }),
+    );
+
+    const wrongHost = await queue.dequeueForLabels(['kici:host:other'], [], 'agent-a', () => true);
+    const rightHost = await queue.dequeueForLabels(['kici:host:box-02'], [], 'agent-b', () => true);
+
+    expect(wrongHost).toBeNull();
+    expect(rightHost).not.toBeNull();
+  });
+
   // ── The claim IS the transition ─────────────────────────────────────────
 
   it('a won claim leaves the row dispatched and owned, before markDispatched runs', async () => {

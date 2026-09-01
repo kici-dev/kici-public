@@ -108,6 +108,25 @@ sops infra/ci/creds.enc.yaml
 - **`--skip-public`** skips the entire public phase. Use it for infra-only re-runs that should not touch the public repository.
 - The phase is **idempotent**. Re-running a release at the same version detects already-completed work and skips it: the changelog step skips when a `## v<version>` section is already present, the projection/push skips when the `v<version>` tag already exists, and the GitHub-release step skips when a release for that version already exists.
 
+### Release scope: all five surfaces (maintainers)
+
+One `pnpm release:prod` ships **every** production surface. It deploys the hosted Platform and infrastructure first, then publishes the artifacts:
+
+1. **Platform / infra** — the hosted control plane and fleet.
+2. **Container images** — the orchestrator and agent images.
+3. **npm packages** — the nine publishable packages.
+4. **Docs** — the documentation site, repointed to the fresh content-addressed bundle on the CDN.
+5. **Marketing** — the apex site at `kici.dev`, repointed the same way.
+
+The apex marketing site ships with the release by default, so a production release never silently leaves it behind. Before the first step runs, the release prints a **scope manifest** — one `SHIP` / `SKIP` line per surface — so you can confirm what the release will move (the manifest also prints under `--dry-run`).
+
+Each surface has its own skip flag for a targeted re-run:
+
+- **`--skip-marketing`** trims only the apex marketing surface within the CDN step. Use it when a transient marketing-side build failure should not hold back an otherwise-ready release; publish the apex on its own afterward with `pnpm publish:marketing`.
+- **`--skip-cdn`** is the superset — it skips the whole CDN step, so both docs and marketing stay put.
+
+The manifest attributes every skipped surface to the flag that suppressed it, so a surface skipped by the `--skip-cdn` superset reads `SKIP … (--skip-cdn)`, not `--skip-marketing`.
+
 ---
 
 ## Container images

@@ -1,12 +1,15 @@
+import { requiredRuntimeLabelsFor } from '../pipeline/dispatch-matched-workflow.js';
 import type { AgentRegistry } from './registry.js';
 import {
   DispatchQueueStatus,
   MAX_DISPATCH_ATTEMPTS,
+  resourcesFromJobConfig,
   type JobQueue,
   type QueuedJob,
   type QueuedJobInput,
 } from '../queue/job-queue.js';
 import type { ScaleResult, ScalerRedispatchTrigger } from '../scaler/types.js';
+import type { ResolvedContainerSpawn } from '../scaler/types.js';
 import type { ResourceRequest, RunsOnPick } from '@kici-dev/engine';
 import type { AgentEntry } from './registry.js';
 import { requestContext, createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -114,6 +117,55 @@ type DispatchResult =
  * (app.ts or server.ts) provides an onDispatch that looks up the agent's
  * WS from the registry and sends the job.dispatch message.
  */
+
+/**
+ * The job's container spawn, assembled from what dispatch already resolved.
+ *
+ * Both pieces are on `jobConfig` by the time a job is queued: `container` from
+ * the lock, and `containerRegistryAuth` resolved orchestrator-side. Nothing is
+ * re-resolved here — a second resolution would be a second chance to disagree.
+ *
+ * A job that BUILDS its image (`container.dockerfile`) carries no `image`, so
+ * this returns `undefined` and no per-job-image spawn happens. That is load
+ * bearing, not incidental: the image does not exist until an agent has cloned
+ * and built it, so the job has to be run by an ordinary agent that nests the
+ * container. `dispatcher.test.ts` pins it.
+ *
+ * Exported for that test — the behaviour is a routing decision, and a routing
+ * decision that only holds by accident is one refactor away from breaking.
+ */
+/**
+ * Labels a job needs from a REGISTERED agent, beyond what its `runsOn` names.
+ *
+ * A `container.dockerfile` job additionally needs a host that can build an
+ * image, which the agent self-reports as `kici:runtime:container-build`. Applied
+ * here and not to the scaler consult: a backend is chosen by exact label-set
+ * containment, so requiring a label no pool declares would strand the job
+ * `queued-no-backend` instead of spawning anything.
+ */
+function matchLabelsFor(job: {
+  runsOnLabels: string[];
+  jobConfig?: Record<string, unknown> | undefined;
+}): string[] {
+  const extra = requiredRuntimeLabelsFor(job.jobConfig?.container);
+  return extra.length === 0 ? job.runsOnLabels : [...job.runsOnLabels, ...extra];
+}
+
+export function containerSpawnFor(jobConfig: Record<string, unknown> | undefined) {
+  const container = jobConfig?.container;
+  const image =
+    typeof container === 'string'
+      ? container
+      : typeof (container as { image?: unknown } | undefined)?.image === 'string'
+        ? (container as { image: string }).image
+        : undefined;
+  if (!image) return undefined;
+
+  const authconfig = jobConfig?.containerRegistryAuth as
+    { username: string; password: string; serveraddress: string } | undefined;
+  return { image, ...(authconfig ? { authconfig } : {}) };
+}
+
 export class Dispatcher {
   private readonly registry: AgentRegistry;
   private readonly queue: JobQueue;
@@ -127,8 +179,20 @@ export class Dispatcher {
         excludeLabels: string[],
         resources?: ResourceRequest,
         orgId?: string,
+        containerSpawn?: ResolvedContainerSpawn,
       ) => Promise<ScaleResult>)
     | undefined;
+
+  /** See the constructor dep of the same name. */
+  private readonly canPrespawnedAgentServe?:
+    | ((
+        agentId: string,
+        job: { resources?: ResourceRequest; hasOwnContainerImage: boolean },
+      ) => boolean)
+    | undefined;
+
+  /** See the constructor dep of the same name. */
+  private readonly isPrespawnedAgent?: ((agentId: string) => boolean) | undefined;
 
   /**
    * Single-flight guard for `retryPendingScaleRequests`. The capacity-freed
@@ -273,7 +337,34 @@ export class Dispatcher {
       excludeLabels: string[],
       resources?: ResourceRequest,
       orgId?: string,
+      /**
+       * The job's own container image plus registry credentials, already
+       * resolved at dispatch. Present means the backend spawns THAT image with
+       * the KiCI runtime injected instead of the pool's fixed agent image.
+       */
+      containerSpawn?: ResolvedContainerSpawn,
     ) => Promise<ScaleResult>;
+    /**
+     * Optional scaler predicate: may this pre-spawned (warm) agent serve this
+     * job? A warm agent is generic — started before the job existed, at the
+     * pool's shape and running the pool's image, both of which are fixed when
+     * it starts. When the predicate returns false the agent is skipped and the
+     * job falls through to `onNoMatchingAgent`, which spawns one that fits.
+     * Absent (no scaler) means every agent is eligible.
+     */
+    canPrespawnedAgentServe?: (
+      agentId: string,
+      job: { resources?: ResourceRequest; hasOwnContainerImage: boolean },
+    ) => boolean;
+    /**
+     * Whether this scaler pre-spawned the agent, i.e. whether
+     * `canPrespawnedAgentServe` can ever answer false for it. The queue drain
+     * (agent asks for work, rather than job looks for an agent) uses it to
+     * decide whether the suitability predicate is worth carrying into the
+     * claim: for every ordinary agent it is not, and the drain keeps its
+     * single-statement fast path.
+     */
+    isPrespawnedAgent?: (agentId: string) => boolean;
     /** Max reconnection delay from agent config (default 60s). Used to derive grace period. */
     maxReconnectDelayMs?: number;
     /** Callback fired when a job is permanently failed before/outside agent execution. */
@@ -307,6 +398,8 @@ export class Dispatcher {
     this.metrics = deps.metrics;
     this.onDispatch = deps.onDispatch;
     this.onNoMatchingAgent = deps.onNoMatchingAgent;
+    this.canPrespawnedAgentServe = deps.canPrespawnedAgentServe;
+    this.isPrespawnedAgent = deps.isPrespawnedAgent;
     this.isDraining = deps.isDraining ?? (() => false);
     this.maxReconnectDelayMs = deps.maxReconnectDelayMs ?? 60_000;
     this.onJobFailedPermanently = deps.onJobFailedPermanently;
@@ -354,7 +447,7 @@ export class Dispatcher {
     }
 
     const availableRaw = this.registry.findAvailable(
-      job.runsOnLabels,
+      matchLabelsFor(job),
       job.runsOnPatterns ?? [],
       job.excludeLabels ?? [],
       job.excludePatterns ?? [],
@@ -366,7 +459,14 @@ export class Dispatcher {
     // are satisfied, so exclude any matched agent whose reboot-pending flag is
     // set — the job then queues (held) until the host reboots back and the
     // reconnect clears the flag, at which point onAgentAvailable drains it.
-    const available = await this.filterRebootPending(availableRaw);
+    //
+    // Suitability gate: a warm agent whose fixed-at-spawn shape or image does
+    // not fit this job is dropped too, so the job falls through to the scale
+    // path below and gets an agent that does fit.
+    const available = this.filterUnsuitablePrespawned(
+      await this.filterRebootPending(availableRaw),
+      job,
+    );
 
     if (available.length > 0) {
       // Select per the job's runsOn.pick policy (deterministic-by-agentId by
@@ -462,13 +562,20 @@ export class Dispatcher {
 
     // Consult scaler with the real queue jobId for binding.
     if (this.onNoMatchingAgent) {
+      const containerSpawn = containerSpawnFor(job.jobConfig);
       const scaleResult = await this.onNoMatchingAgent(
         job.runsOnLabels,
         jobId,
         job.runId,
         job.excludeLabels ?? [],
-        job.resources,
+        // Same reading as the fit gate: the typed mirror is optional and this
+        // path takes an input built by a caller, not a row the queue
+        // materialized. Resources apply only at spawn time, so a shape read as
+        // absent here starts the job's own agent at the label-set default and
+        // the job runs at a size it did not ask for.
+        job.resources ?? resourcesFromJobConfig(job.jobConfig),
         typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
+        containerSpawn,
       );
 
       if (
@@ -532,6 +639,7 @@ export class Dispatcher {
       const pending = await this.queue.listPending(maxJobs);
       let redriven = 0;
       for (const job of pending) {
+        const containerSpawn = containerSpawnFor(job.jobConfig);
         const result = await this.onNoMatchingAgent(
           job.runsOnLabels,
           job.id,
@@ -539,6 +647,7 @@ export class Dispatcher {
           job.excludeLabels ?? [],
           job.resources,
           typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
+          containerSpawn,
         );
         if (result.action === 'spawning') redriven++;
       }
@@ -762,6 +871,63 @@ export class Dispatcher {
   }
 
   /**
+   * Drop pre-spawned (warm) agents that cannot serve this job. Sibling of
+   * {@link filterRebootPending}: both remove candidates `findAvailable` matched
+   * on labels but that are unusable for a reason labels cannot express.
+   *
+   * A warm agent's cpu, memory and container image are all set when it starts
+   * and cannot change afterwards, so a job asking for something else has to get
+   * an agent of its own. Dropping the candidate here is what sends it down the
+   * ordinary `onNoMatchingAgent` scale path. No-op when no scaler is wired.
+   */
+  private filterUnsuitablePrespawned<T extends { agentId: string }>(
+    agents: T[],
+    job: { resources?: ResourceRequest; jobConfig?: Record<string, unknown> | undefined },
+  ): T[] {
+    const predicate = this.canPrespawnedAgentServe;
+    if (!predicate || agents.length === 0) return agents;
+    const fit = this.prespawnedFitFor(job);
+    return agents.filter((a) => predicate(a.agentId, fit));
+  }
+
+  /**
+   * The fit question for one job: the shape it declares, and whether it brings
+   * its own container image.
+   *
+   * The shape comes from `jobConfig.resources` when the typed `resources`
+   * mirror is absent, because the mirror is optional and several dispatch paths
+   * never fill it — a job reaching {@link dispatch} straight off the webhook
+   * pipeline or off a worker's reroute handler carries its declaration in
+   * `jobConfig` alone. Reading only the mirror there reports a job that
+   * declares nothing, which admits it onto a pre-spawned agent of some other
+   * size — the exact mismatch this gate exists to refuse.
+   */
+  private prespawnedFitFor(job: {
+    resources?: ResourceRequest;
+    jobConfig?: Record<string, unknown> | undefined;
+  }): { resources?: ResourceRequest; hasOwnContainerImage: boolean } {
+    const declared = job.resources ?? resourcesFromJobConfig(job.jobConfig);
+    return {
+      ...(declared ? { resources: declared } : {}),
+      hasOwnContainerImage: containerSpawnFor(job.jobConfig) !== undefined,
+    };
+  }
+
+  /**
+   * The queue-drain half of {@link filterUnsuitablePrespawned}: a per-job
+   * predicate for one agent, or undefined when this agent needs no check.
+   *
+   * Undefined is the common answer — an ordinary agent is not pre-spawned, so
+   * the predicate could only ever say yes, and returning one would cost the
+   * drain its single-statement fast path for nothing.
+   */
+  private prespawnedFitFilterFor(agentId: string): ((job: QueuedJob) => boolean) | undefined {
+    const predicate = this.canPrespawnedAgentServe;
+    if (!predicate || !this.isPrespawnedAgent?.(agentId)) return undefined;
+    return (job) => predicate(agentId, this.prespawnedFitFor(job));
+  }
+
+  /**
    * Release a reboot-pending host on its real reconnect (down-then-up). Clears
    * the persisted flag so the very next `onAgentAvailable` drain dispatches the
    * held post-restart job. Call this ONLY from the (re-)register path — a fresh
@@ -837,9 +1003,26 @@ export class Dispatcher {
       // Pinned host-fanout children for THIS agent drain first (they can only
       // run here), then fall back to the generic label drain (which excludes
       // jobs pinned to a different agent).
+      //
+      // The generic drain is the mirror of `dispatch()`: this agent asks for
+      // any label-matching job rather than a job looking for an agent, so the
+      // same suitability gate has to apply — an `agent.status` tick would
+      // otherwise hand a pre-spawned agent the very job `dispatch()` just
+      // refused it. It is carried into the claim rather than checked after,
+      // because a claimed-then-released row is stranded Dispatched for a window
+      // and burns one of the job's bounded dispatch attempts.
+      //
+      // The pinned drain is deliberately NOT gated: a pin is authoritative and
+      // was resolved against the roster when the child was materialized, so
+      // filtering it would strand the job rather than reroute it.
       job =
         (await this.queue.dequeueByPinnedAgent(agentId, agentLabels)) ??
-        (await this.queue.dequeueForLabels(agentLabels, agentMandatoryLabels, agentId));
+        (await this.queue.dequeueForLabels(
+          agentLabels,
+          agentMandatoryLabels,
+          agentId,
+          this.prespawnedFitFilterFor(agentId),
+        ));
     } finally {
       if (!job) this.registry.decrementActiveJobs(agentId);
     }
@@ -1069,11 +1252,19 @@ export class Dispatcher {
     const job = await this.queue.getFullJobById(jobId);
     if (!job || job.status !== DispatchQueueStatus.Pending) return;
 
-    const available = this.registry.findAvailable(
-      job.runsOnLabels,
-      job.runsOnPatterns ?? [],
-      job.excludeLabels ?? [],
-      job.excludePatterns ?? [],
+    // Label-routed, exactly like `dispatch()`: the candidates here are idle
+    // agents that merely match, not the agent this job was bound to. So the
+    // same suitability gate applies — an unsuitable warm agent is dropped and
+    // the job falls through to the scaler below. A job-bound agent is never a
+    // pre-spawned one, so its own agent can never be filtered out from under it.
+    const available = this.filterUnsuitablePrespawned(
+      this.registry.findAvailable(
+        matchLabelsFor(job),
+        job.runsOnPatterns ?? [],
+        job.excludeLabels ?? [],
+        job.excludePatterns ?? [],
+      ),
+      job,
     );
     if (available.length > 0) {
       const dispatched = await this.dispatchBoundJob(
@@ -1083,6 +1274,9 @@ export class Dispatcher {
       if (dispatched) return;
     }
     if (this.onNoMatchingAgent) {
+      // A requeued container job needs its spawn context too — without it the
+      // retry would scale a plain agent for a job that requires its own image.
+      const containerSpawn = containerSpawnFor(job.jobConfig);
       await this.onNoMatchingAgent(
         job.runsOnLabels,
         jobId,
@@ -1090,6 +1284,7 @@ export class Dispatcher {
         job.excludeLabels ?? [],
         job.resources,
         typeof job.jobConfig?.cacheOrgId === 'string' ? job.jobConfig.cacheOrgId : undefined,
+        containerSpawn,
       );
     }
   }
@@ -1132,7 +1327,7 @@ export class Dispatcher {
       const pending = await this.queue.listPending(maxJobs);
       let placed = 0;
       for (const job of pending) {
-        const target = this.selectConnectedTargetForPending(job);
+        const target = await this.selectConnectedTargetForPending(job);
         if (!target) continue;
         if (await this.dispatchBoundJob(target, job.id)) placed++;
       }
@@ -1153,18 +1348,32 @@ export class Dispatcher {
    * host-fanout child may run ONLY on its pinned agent — and `dequeueById`
    * ignores the pin — so a pinned job is routed to its own agent and never
    * offered to `findAvailable`, which would mis-deliver it to any label match.
+   *
+   * Reboot-pending gate: a host whose `restart` job just completed is still
+   * connected but about to reboot, so its held post-restart job must NOT be
+   * re-driven into the about-to-die box. This is the safety-net re-drive's
+   * counterpart of the same gate in `dispatch()` / `dispatchPinned` /
+   * `drainForAgent`; without it this path re-drives the held job onto the
+   * reboot-pending host and defeats the hold.
    */
-  private selectConnectedTargetForPending(job: QueuedJob): string | null {
+  private async selectConnectedTargetForPending(job: QueuedJob): Promise<string | null> {
     if (job.pinnedAgentId) {
       const agent = this.registry.get(job.pinnedAgentId);
       if (!agent || agent.activeJobs >= agent.maxConcurrency) return null;
+      if ((await this.rosterStore?.isRebootPending(job.pinnedAgentId, Date.now())) ?? false) {
+        return null;
+      }
       return job.pinnedAgentId;
     }
-    const available = this.registry.findAvailable(
-      job.runsOnLabels,
+    const availableRaw = this.registry.findAvailable(
+      matchLabelsFor(job),
       job.runsOnPatterns ?? [],
       job.excludeLabels ?? [],
       job.excludePatterns ?? [],
+    );
+    const available = this.filterUnsuitablePrespawned(
+      await this.filterRebootPending(availableRaw),
+      job,
     );
     if (available.length === 0) return null;
     return selectAgent(available, job.jobConfig).agentId;

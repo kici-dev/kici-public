@@ -42,6 +42,7 @@ Dropdown filters appear above the table:
 A "More filters" button reveals additional filters:
 
 - **Trigger type** -- filter by push, pull_request, tag, dispatch, etc.
+- **Source** -- filter by the source that delivered the event. Options are the org's routing keys, labelled with the source kind so two GitHub sources backing repositories with the same path stay distinguishable.
 
 Filters persist in URL query parameters (e.g. `/runs?status=failed&branch=main`), making filtered views shareable and bookmark-friendly. A "Clear filters" button appears when any filter is active.
 
@@ -155,7 +156,7 @@ The content area has the following tabs:
 - **Artifacts** -- named, durable build outputs the run uploaded via `ctx.artifacts.upload`, one row per artifact with the producing job, size, content hash, and creation time. Use **Download** on any row to fetch it directly from storage (the link points straight at the stored object, so the bytes never pass through the control plane). Artifacts expire after the orchestrator's configured retention, after which they no longer appear here. See [Artifacts](../sdk/artifacts.md) for the SDK API that produces them.
 - **Attestations** -- build-provenance attestations produced by the run's steps (via `ctx.attestProvenance`), one row per attested artifact with a **verified** badge and a bundle download. See [Build provenance and attestations](../provenance.md#viewing-attestations-in-the-dashboard) for what the badge checks and how to verify a bundle against a specific file.
 
-On wide desktop (>= 1200px), Metadata is shown in a dedicated sidebar panel instead of as a tab.
+Metadata is a tab only on mobile. On medium desktop (< 1200px) it opens in a drawer from a "Show metadata" button, and on wide desktop (>= 1200px) it has its own sidebar panel.
 
 ### Metadata
 
@@ -164,7 +165,9 @@ The metadata panel shows detailed information organized into sections:
 - **Run metadata** -- run ID, status, trigger event, branch, commit SHA (linked to provider), workflow name (linked to source file on provider), duration, and timestamps. The **Triggered by** line carries an **agent badge** (with the agent's label) when the run was triggered or cancelled through an agent credential — an agent PAT or an agent org key — so an agent-driven run is obvious from its detail page
 - **Job metadata** -- job name, status, agent ID, matrix values (if present), duration
 - **Step metadata** -- step name, step index, status, duration
-- **Trust context** (PR-triggered runs only) -- shows the contributor's trust tier (trusted, known, or unknown), lock file source (head or base branch), and secrets access level
+- **Trust context** (any run that carries a trust tier, including cron and event-triggered runs) -- shows the contributor when the run has one, the trust tier (trusted, known, or unknown), and the lock file (head or base branch)
+
+A run whose recorded tier is anything other than `trusted` also shows a **Reduced privilege** banner at the top of the page. It names each reduction the orchestrator applied. Install and registry secrets were withheld, and the build cache was isolated to that run. A run that read the base branch's definitions gets a third line, saying workflow changes on the ref did not take effect. Without the banner the difference is invisible: the build fails on a missing private dependency with nothing on the page explaining why.
 
 Provider-specific links (e.g., GitHub commit URL, branch URL, PR link, workflow source file link) are automatically generated based on the repository context. The workflow name in the metadata panel is a clickable link to the `.kici/workflows/<name>.ts` source file on the provider (e.g. GitHub blob view).
 
@@ -278,9 +281,9 @@ The log viewer uses virtualized scrolling to handle large outputs. Only the visi
 
 ## Run retention
 
-Your plan sets a **run retention window** — how far back the dashboard serves run history. The window applies to the run list and to individual runs alike: once a run is older than the window, opening its link, reading its jobs, step logs, payload, timeline, artifacts, or attestations, and rerunning it all stop working.
+Your plan sets a **run retention window** — how far back the dashboard serves run history. The window applies to the run list and to individual runs alike. Once a run is older than the window, opening its link, reading its jobs, step logs, payload, timeline, artifacts, or attestations, and rerunning it all stop working.
 
-Opening a link to a run that has aged out shows an **Outside your retention window** page naming your organization's window, rather than "Run not found" — the run existed, it is simply past what the plan covers. A run that never existed (or belongs to another organization) still shows the ordinary not-found page.
+Opening a link to a run that has aged out shows an **Outside your retention window** page naming your organization's window, rather than "Run not found". The run existed; it is past what the plan covers. A run that never existed (or belongs to another organization) still shows the ordinary not-found page.
 
 A few consequences worth knowing:
 

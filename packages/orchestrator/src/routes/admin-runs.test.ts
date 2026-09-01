@@ -328,6 +328,36 @@ describe('admin run routes', () => {
       expect(res.status).toBe(404);
     });
 
+    // `runs_on_labels` and `matrix_values` are JSONB, so the driver hands back a
+    // parsed array/object. Both fixtures below use that real shape: with a JSON
+    // string instead, the route could re-parse it and still look correct while
+    // returning null against a live database for every job.
+    it('passes JSONB columns through as the driver already parsed them', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-matrix',
+          job_name: 'build[node-18]',
+          status: 'success',
+          matrix_values: { node: '18' },
+          agent_id: 'agent-1',
+          started_at: now,
+          completed_at: now,
+          duration_ms: 1000,
+          error_message: null,
+          runs_on_labels: ['kici:scaler:github-actions', 'kici:os:linux'],
+          created_at: now,
+        },
+      ]);
+      deps.mockDb.mockExecute.mockResolvedValueOnce([]); // execution_job_needs
+      const res = await request(app, '/run-1/jobs', { token: validToken });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobs[0].runsOnLabels).toEqual(['kici:scaler:github-actions', 'kici:os:linux']);
+      expect(body.jobs[0].matrixValues).toEqual({ node: '18' });
+    });
+
     it('returns jobs for a run without steps by default', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
@@ -342,7 +372,7 @@ describe('admin run routes', () => {
           completed_at: now,
           duration_ms: 4000,
           error_message: null,
-          runs_on_labels: '["kici:os:linux"]',
+          runs_on_labels: ['kici:os:linux'],
           created_at: now,
         },
       ]);

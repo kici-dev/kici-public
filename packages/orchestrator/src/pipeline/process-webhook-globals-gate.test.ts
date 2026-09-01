@@ -112,8 +112,8 @@ function makeDeps(
       isDefaultBranchPush: () => false,
     },
     // Present so `evaluateSecurityPolicy` does not short-circuit to `pass`:
-    // the policy only applies to providers with a contributor model.
-    contributorResolver: { resolveContributor: vi.fn() },
+    // the policy only applies to providers with a fork model.
+    hasForkModel: true,
     checkStatusPoster: { provider: 'github', postCheckStatus, postGlobalWorkflowsSkippedCheck },
     // Deliberately absent: no lock file resolves, so Phase F runs.
     lockFileFetcher: over.withLockFile ? { fetchLockFile: vi.fn() } : undefined,
@@ -124,15 +124,6 @@ function makeDeps(
     dedup: { claim: vi.fn(async () => true), exists: vi.fn(), mark: vi.fn(), cleanup: vi.fn() },
     providerRegistry: { getByRoutingKey: () => bundle, getAll: () => [] },
     orchestratorMode: 'platform',
-    // A fork PR always resolves to the `unknown` tier in production
-    // (trust-resolver.ts), which is the shape these cases must use.
-    trustResolver: {
-      resolveTrustTier: vi.fn(async () => ({
-        tier: 'unknown',
-        contributorUsername: 'octocat',
-        reason: 'fork PR',
-      })),
-    },
     trustPolicyStore: {
       get: vi.fn(async () => ({
         ...policy,
@@ -266,7 +257,7 @@ describe('global-workflow dispatch honours the event trust decision', () => {
     // and its own check name, exactly like the workflow-modification check.
     const { deps, postCheckStatus, postGlobalWorkflowsSkippedCheck } = makeDeps({
       ...HOLD_ALL,
-      forkPolicy: 'reject',
+      forkPolicy: 'hold',
     });
 
     await processWebhook(makeInfo(), deps);
@@ -278,5 +269,48 @@ describe('global-workflow dispatch honours the event trust decision', () => {
     // Nothing was written to the security check by this path — neither a second
     // failure (which would double-report one decision) nor a neutral one.
     expect(postCheckStatus).not.toHaveBeenCalled();
+  });
+
+  it('posts NO check at all when the fork policy ignores the event', async () => {
+    // The point of `ignore`: the event leaves no trace a contributor can see.
+    // A skipped-globals notice would be exactly such a trace, so this is the
+    // one non-passing verdict that must post nothing — the case above proves
+    // the same fixture does post under `hold`, so this is not vacuous.
+    const { deps, dispatch, postCheckStatus, postGlobalWorkflowsSkippedCheck } = makeDeps({
+      ...HOLD_ALL,
+      forkPolicy: 'ignore',
+    });
+
+    await processWebhook(makeInfo(), deps);
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(postGlobalWorkflowsSkippedCheck).not.toHaveBeenCalled();
+    expect(postCheckStatus).not.toHaveBeenCalled();
+  });
+
+  it('drops the ignored event before it reads a lock file', async () => {
+    // The drop has to precede the lock-file fetch: every run row, check status,
+    // and clone token in this pipeline is created at or after it. Driven with
+    // `withLockFile: true` so the cache read is the observable proxy for that
+    // fetch — the same fixture reads it on every other verdict.
+    const ignored = makeDeps({ ...HOLD_ALL, forkPolicy: 'ignore' }, { withLockFile: true });
+    const held = makeDeps({ ...HOLD_ALL, forkPolicy: 'hold' }, { withLockFile: true });
+    const lockRead = (d: typeof ignored.deps) =>
+      (d as unknown as { lockFileCache: { get: ReturnType<typeof vi.fn> } }).lockFileCache.get;
+
+    const outcome = await processWebhook(makeInfo(), ignored.deps);
+    await processWebhook(makeInfo(), held.deps);
+
+    expect(outcome).toBe('skipped');
+    expect(lockRead(ignored.deps)).not.toHaveBeenCalled();
+    // Non-vacuity: the identical fixture DOES read the lock file when the
+    // verdict is one that lets the event continue.
+    expect(lockRead(held.deps)).toHaveBeenCalled();
+    // …and the policy really was consulted, so the drop is a decision and not a
+    // fixture that never got started.
+    expect(
+      (ignored.deps as unknown as { trustPolicyStore: { get: ReturnType<typeof vi.fn> } })
+        .trustPolicyStore.get,
+    ).toHaveBeenCalledWith(ORG);
   });
 });

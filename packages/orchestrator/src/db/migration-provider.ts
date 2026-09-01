@@ -120,6 +120,21 @@ import * as m112 from './migrations/112_execution_runs_workflow_repo.js';
 import * as m113 from './migrations/113_execution_runs_workflow_repo_index.js';
 import * as m114 from './migrations/114_ingest_queue_claim.js';
 import * as m115 from './migrations/115_global_workflows_cluster_switch.js';
+import * as m116 from './migrations/116_org_plan_headroom.js';
+import * as m117 from './migrations/117_invoke_gate_proxy_jobs.js';
+import * as m118 from './migrations/118_invoke_gate_scheduling.js';
+import * as m119 from './migrations/119_scaler_ha_ownership.js';
+import * as m120 from './migrations/120_cluster_settings_scaler_reaper.js';
+import * as m121 from './migrations/121_org_settings_allow_untrusted_dockerfile_builds.js';
+import * as m122 from './migrations/122_host_roster_scaler_managed.js';
+import * as m123 from './migrations/123_workflow_registrations_default_branch.js';
+import * as m124 from './migrations/124_cluster_settings_provision_backoff.js';
+import * as m125 from './migrations/125_org_trust_directory.js';
+import * as m126 from './migrations/126_held_runs_posted_pending_check.js';
+import * as m127 from './migrations/127_org_trust_policy_approval_expiry_seconds.js';
+import * as m128 from './migrations/128_execution_runs_global_eval_round.js';
+import * as m129 from './migrations/129_execution_runs_dispatch_routing_key.js';
+import * as m130 from './migrations/130_scaler_provision_outcomes.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -240,6 +255,21 @@ export function createMigrationProvider(): MigrationProvider {
         '113_execution_runs_workflow_repo_index': m113,
         '114_ingest_queue_claim': m114,
         '115_global_workflows_cluster_switch': m115,
+        '116_org_plan_headroom': m116,
+        '117_invoke_gate_proxy_jobs': m117,
+        '118_invoke_gate_scheduling': m118,
+        '119_scaler_ha_ownership': m119,
+        '120_cluster_settings_scaler_reaper': m120,
+        '121_org_settings_allow_untrusted_dockerfile_builds': m121,
+        '122_host_roster_scaler_managed': m122,
+        '123_workflow_registrations_default_branch': m123,
+        '124_cluster_settings_provision_backoff': m124,
+        '125_org_trust_directory': m125,
+        '126_held_runs_posted_pending_check': m126,
+        '127_org_trust_policy_approval_expiry_seconds': m127,
+        '128_execution_runs_global_eval_round': m128,
+        '129_execution_runs_dispatch_routing_key': m129,
+        '130_scaler_provision_outcomes': m130,
       };
     },
   };

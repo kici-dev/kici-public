@@ -142,6 +142,7 @@ Common flags for `list`:
 | `--target-id`   | Target identifier                                                                       |
 | `--from`        | ISO-8601 lower bound (inclusive)                                                        |
 | `--to`          | ISO-8601 upper bound (exclusive)                                                        |
+| `--q`           | Substring of `error_message` (trigram-indexed full-text search)                         |
 | `--agent-label` | Only rows whose acting credential carried this exact agent label                        |
 | `--agent-only`  | Only agent-attributed rows (any agent label present)                                    |
 | `--limit`       | Max results, default 50, max 200                                                        |

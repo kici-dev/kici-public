@@ -76,6 +76,75 @@ describe('InMemoryJobQueue', () => {
     expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
   });
 
+  // ── The declared shape survives the queue ────────────────────────────────
+  //
+  // A drained job's `resources` is what the pre-spawned-agent suitability gate
+  // and the scaler re-drive read. When the queue dropped it, both saw a job
+  // that declares nothing: any warm agent was admitted, and a re-drive spawned
+  // at the label-set default instead of what the job asked for.
+
+  it('carries a declared shape from jobConfig onto the drained job', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput({ jobConfig: { resources: { requests: { cpus: 8 } } } }));
+
+    const job = await queue.dequeueForLabels(['linux']);
+
+    expect(job?.resources).toEqual({ requests: { cpus: 8 } });
+  });
+
+  it('carries a declared shape passed as the top-level convenience field', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput({ resources: { requests: { cpus: 4, memory: '8g' } } }));
+
+    const job = await queue.dequeueForLabels(['linux']);
+
+    expect(job?.resources).toEqual({ requests: { cpus: 4, memory: '8g' } });
+  });
+
+  it('leaves resources undefined for a job that declares none', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput());
+
+    const job = await queue.dequeueForLabels(['linux']);
+
+    expect(job?.resources).toBeUndefined();
+  });
+
+  it('canServe skips a job the agent cannot serve and leaves it pending', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(makeInput({ jobConfig: { resources: { requests: { cpus: 8 } } } }));
+
+    // The predicate reads the very field the enqueue has to carry: a job whose
+    // resources went missing would be admitted here instead of skipped.
+    const job = await queue.dequeueForLabels(
+      ['linux'],
+      [],
+      'agent-1',
+      (candidate) => candidate.resources === undefined,
+    );
+
+    expect(job).toBeNull();
+    expect(await queue.getDepth()).toBe(1);
+  });
+
+  it('canServe skips a rejected job and drains the next one that fits', async () => {
+    const queue = new InMemoryJobQueue();
+    await queue.enqueue(
+      makeInput({ jobName: 'wrong-shape', jobConfig: { resources: { requests: { cpus: 8 } } } }),
+    );
+    await queue.enqueue(makeInput({ jobName: 'right-shape' }));
+
+    const job = await queue.dequeueForLabels(
+      ['linux'],
+      [],
+      'agent-1',
+      (candidate) => candidate.resources === undefined,
+    );
+
+    expect(job?.jobName).toBe('right-shape');
+    expect(await queue.getDepth()).toBe(1);
+  });
+
   it('getDepth returns count of pending jobs', async () => {
     const queue = new InMemoryJobQueue();
     expect(await queue.getDepth()).toBe(0);

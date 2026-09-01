@@ -21,6 +21,7 @@
  *     below and `docs/user/deprecations.md`.
  */
 import { z } from 'zod';
+import { negatedPatternReason } from '../../repo/pattern-negation.js';
 import { actorPrincipalSchema } from './actor.js';
 
 /**
@@ -33,6 +34,35 @@ export const repoPatternEntrySchema = z.object({
 });
 
 export type RepoPatternEntry = z.infer<typeof repoPatternEntrySchema>;
+
+/**
+ * Why a pattern may not be stored on a global-workflow policy list, or null
+ * when it is acceptable.
+ *
+ * The lists match each entry as a single glob, so a negated pattern inverts to
+ * "everything except" — on an allow list that allows almost every repo, on a
+ * deny list it denies almost every repo. The list's own direction already
+ * encodes allow/deny, so negation forms are rejected at write time.
+ *
+ * This is deliberately not folded into `repoPatternEntrySchema`: the schema is
+ * also the read path for rows already in `org_settings`, which must keep
+ * parsing. Evaluation handles a stored negation form by failing closed.
+ *
+ * Which forms count as a negation is not decided here: it comes from the one
+ * classifier in `repo/pattern-negation.js`, shared with the Platform's
+ * repo-scope allow-list. Keeping the verdict in one place is what stops this
+ * list and that one from reading the same pattern language two different ways —
+ * notably the regular-expression assertions `(?!…)` / `(?<!…)`, which picomatch
+ * compiles into a real inversion, and `[!…]`, which it does not.
+ */
+export function invalidRepoPatternReason(pattern: string): string | null {
+  if (pattern.trim() === '') return 'pattern is empty';
+  const negation = negatedPatternReason(pattern);
+  if (negation) {
+    return `${negation} is not allowed on a policy list — the list's direction already encodes allow/deny`;
+  }
+  return null;
+}
 
 /** Projected org-level global workflow settings. */
 export const globalWorkflowSettingsSchema = z.object({

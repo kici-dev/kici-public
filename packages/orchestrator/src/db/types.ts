@@ -8,6 +8,18 @@ import type {
 } from '@kici-dev/engine';
 
 /**
+ * Job kind stored in `execution_jobs.job_kind`. `Standard` runs steps on an
+ * agent; `Gate` is an invoke gate that summons source-repo runs; `Proxy`
+ * mirrors one summoned run's lifecycle. Mirrors the engine wire `JobKind` enum
+ * (`@kici-dev/engine`) — keep the two vocabularies in step.
+ */
+export enum JobKind {
+  Standard = 'standard',
+  Gate = 'gate',
+  Proxy = 'proxy',
+}
+
+/**
  * PostgreSQL-only database types.
  * Column names use snake_case matching the actual database column names.
  */
@@ -46,6 +58,8 @@ export interface Database {
   join_tokens: JoinTokenTable;
   org_settings: OrgSettingsTable;
   org_trust_policy: OrgTrustPolicyTable;
+  org_trust_directory: OrgTrustDirectoryTable;
+  org_plan_headroom: OrgPlanHeadroomTable;
   cluster_settings: ClusterSettingsTable;
   execution_job_needs: ExecutionJobNeedsTable;
   pending_job_contexts: PendingJobContextsTable;
@@ -58,6 +72,8 @@ export interface Database {
   scaler_spawning_agents: ScalerSpawningAgentsTable;
   scaler_agent_jobs: ScalerAgentJobsTable;
   scaler_reservations: ScalerReservationsTable;
+  scaler_pending_claims: ScalerPendingClaimsTable;
+  scaler_provision_outcomes: ScalerProvisionOutcomesTable;
   attestations: AttestationsTable;
   orchestrator_signing_keys: OrchestratorSigningKeysTable;
   dashboard_encryption_keys: DashboardEncryptionKeysTable;
@@ -439,7 +455,26 @@ export interface ExecutionRunTable {
   provider: string;
   /** Repository identifier (e.g. "owner/repo") */
   repo_identifier: string;
-  /** Git ref (branch/tag) */
+  /**
+   * The branch (or tag) the run PRESENTS — `event.targetBranch`: the branch a
+   * push landed on, the base branch of a pull request, the default branch a
+   * schedule fire executes, the branch an internal trigger inherited.
+   *
+   * It is NOT a job's checkout ref. A pull-request job checks out the PR HEAD
+   * branch, and every `QueuedJobInput.ref` carries that value instead — the two
+   * are different facts and only one of them belongs here. The distinction is
+   * load-bearing: this column is what an internally-triggered run inherits as
+   * its branch claim before the context branch gate matches it against a
+   * context's `branchRestrictions`, and a fork contributor names the head
+   * branch freely. Every writer that CREATES the row uses the presented branch.
+   * The two reroute projections (`cluster/coordinator.ts`, `worker-core.ts`)
+   * are the exception: they insert from a `job.reroute` message, which carries
+   * only the job's ref. Their row is fail-safe by conflicting — the run is
+   * registered before the first job is handed to an agent
+   * (`startRunBeforeDispatch`), so a reroute is only possible once the
+   * authoritative row exists, and their insert is
+   * `ON CONFLICT (run_id) DO NOTHING`.
+   */
   ref: string;
   /** Git commit SHA */
   sha: string;
@@ -524,6 +559,35 @@ export interface ExecutionRunTable {
    * repository that defines it rather than from the one it ran against.
    */
   workflow_repo_identifier: string | null;
+  /**
+   * True when this row records a global evaluation round rather than a
+   * workflow.
+   *
+   * A round decides which organization-wide workflows apply to an event; a
+   * round that fails is recorded as one errored run so the suppression is
+   * visible. Re-running such a run re-executes the evaluation, not a workflow,
+   * so the re-run path branches on this column. It is structural on purpose:
+   * the round job's `__globaleval__` name prefix is a string a customer
+   * workflow may also carry, and a name a customer chooses must not decide
+   * which code path a re-run takes.
+   */
+  is_global_eval_round: Generated<boolean>;
+  /**
+   * The source whose credentials `provider_context` holds, when that is not the
+   * source the event arrived on.
+   *
+   * `routing_key` records the INBOUND source. For a cross-provider global
+   * workflow the lock file resolves through another source's bundle, and the
+   * context is written from that source's credentials — so anything pairing
+   * `routing_key` with `provider_context` hands one source's credentials to
+   * another source's API client. NULL means the two are the same, which is true
+   * of every ordinary run.
+   *
+   * Read by the rerun path of a failed evaluation round, which re-drives the
+   * organization-wide pass and has to hand it the same dispatch pair the
+   * delivery used.
+   */
+  dispatch_routing_key: string | null;
   /** Human-readable reason why the run failed (null for non-failed runs). */
   failure_reason: string | null;
   /**
@@ -562,6 +626,23 @@ export interface ExecutionRunTable {
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
   archive_object_key: string | null;
+  /**
+   * For a run summoned by an invoke gate, the summoning (global) run's id. NULL
+   * for every run not summoned by a gate.
+   */
+  summoned_by_run_id: string | null;
+  /**
+   * For a summoned run, the proxy job name in the summoning run to update when
+   * this run completes. NULL for every run not summoned by a gate.
+   */
+  summoned_by_proxy_job: string | null;
+  /**
+   * How deep this run sits in an invoke chain. A webhook-triggered run is depth
+   * 0; a run summoned by an invoke gate carries its summoner's depth + 1. Read
+   * back when this run fires its own invoke gate so the chain-depth circuit
+   * breaker bounds recursion. Defaults to 0.
+   */
+  chain_depth: Generated<number>;
 }
 
 /**
@@ -586,8 +667,11 @@ export interface ExecutionJobTable {
    * or scaler backend appears. NULL whenever the job is routable.
    */
   routing_reason: ColumnType<string | null, string | null | undefined, string | null>;
-  /** Matrix values JSON (e.g. {"node": "18"}) */
-  matrix_values: string | null;
+  /**
+   * Matrix values JSON (e.g. {"node": "18"}). JSONB: the driver returns a parsed
+   * object on SELECT, while writers pass a `JSON.stringify` string.
+   */
+  matrix_values: ColumnType<Record<string, unknown> | null, string | null, string | null>;
   /** Agent ID that ran this job */
   agent_id: string | null;
   /** When the job started */
@@ -612,8 +696,12 @@ export interface ExecutionJobTable {
    * context, agent spawn). NULL for normal runs.
    */
   init_failure: ColumnType<InitFailure | null, unknown, unknown>;
-  /** Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). JSONB. */
-  runs_on_labels: string | null;
+  /**
+   * Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). JSONB:
+   * the driver returns a parsed array on SELECT, while writers pass a
+   * `JSON.stringify` string. Re-parsing it as a string yields null for every job.
+   */
+  runs_on_labels: ColumnType<string[] | null, string | null, string | null>;
   /** Last heartbeat received from agent (for stale run detection) */
   last_heartbeat_at: Date | null;
   /** JSON array of secret context names dispatched with this job */
@@ -671,6 +759,20 @@ export interface ExecutionJobTable {
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row. */
   archive_object_key: string | null;
+  /**
+   * Job kind (`JobKind`): `standard` runs steps on an agent, `gate` is an
+   * invoke gate, `proxy` mirrors a summoned run. Defaults to `standard`.
+   */
+  job_kind: Generated<string>;
+  /** For a `proxy` job, the summoned run it mirrors. NULL for every other kind. */
+  summoned_run_id: string | null;
+  /**
+   * For a `gate` job, its own wall-clock timeout in milliseconds (copied from the
+   * lock job). A gate runs no steps on an agent, so the agent-side job timeout
+   * cannot fire for it; the orchestrator sweeps this column and fails a gate whose
+   * proxies have not all terminalized in time. NULL = no gate timeout.
+   */
+  timeout_ms: number | null;
 }
 
 /**
@@ -1034,6 +1136,17 @@ export interface HeldRunsTable {
     StepApprovalPayload | string | null | undefined,
     StepApprovalPayload | string | null
   >;
+  /**
+   * Whether this hold's pending `KiCI Security` check actually reached the
+   * provider. `true` after a post returned; `false` when none was attempted or
+   * one failed; `null` on a row written before the column existed, for which
+   * the hold's shape is still the only available answer.
+   *
+   * Read through `postedPendingSecurityCheck`. It decides whether a hold has a
+   * check to terminalize — and terminalizing one it never posted CREATES a
+   * `KiCI Security` run on a commit that had none.
+   */
+  posted_pending_check: Generated<boolean | null>;
 }
 
 // Convenience types for held_runs
@@ -1467,6 +1580,19 @@ export interface WorkflowRegistrationsTable {
   disabled: ColumnType<boolean, boolean | undefined, boolean>;
   /** Git commit SHA from the push that last updated this registration */
   commit_sha: ColumnType<string | null, string | null | undefined, string | null>;
+  /**
+   * The repository's default branch, captured from the push that last updated
+   * this registration. A `__schedule_fire` run executes this branch's lock
+   * file, so this IS that run's branch when a context evaluates branch
+   * restrictions.
+   *
+   * NULL when the registration predates migration 123, or when the webhook
+   * payload named no default branch. There is no backfill: the value is only
+   * knowable from a payload, so a NULL row heals on its repo's next
+   * default-branch push. NULL presents no branch, which keeps the honest
+   * branch-gate rejection rather than inventing a branch.
+   */
+  default_branch: ColumnType<string | null, string | null | undefined, string | null>;
   /** Source file path for this workflow (e.g. ".kici/workflows/deploy.ts") */
   source_file: ColumnType<string | null, string | null | undefined, string | null>;
   /** Whether this is a global workflow (triggers across all repos under same routing key) */
@@ -1690,6 +1816,13 @@ export interface OrgSettingsTable {
    */
   allow_http_npm_registries: ColumnType<boolean, boolean | undefined, boolean>;
   /**
+   * May an UNTRUSTED ref build its job's container image from a Dockerfile?
+   *
+   * Default false. The build runs outside the job's hardened sandbox, so this
+   * is an opt-in, never inherited.
+   */
+  allow_untrusted_dockerfile_builds: ColumnType<boolean, boolean | undefined, boolean>;
+  /**
    * Per-operation policy controlling which dashboard.* writes the orch
    * accepts when routed through Platform. JSONB shape:
    * `{ [operation]: boolean }` where operation matches the engine enum
@@ -1850,8 +1983,25 @@ export interface OrgTrustPolicyTable {
   unknown_contributor_policy: string;
   /** How to treat a PR that modifies workflow files: hold | reject | allow */
   workflow_change_policy: string;
-  /** How long a security hold stays approvable before it expires */
+  /**
+   * The coarse, hours-granularity view of the security-hold window.
+   *
+   * Retained and always written, because it is the only window an older peer or
+   * CLI can read. This build derives it from `approval_expiry_seconds` on every
+   * write (rounded up, never below 1), so the two columns cannot disagree.
+   */
   approval_expiry_hours: number;
+  /**
+   * How long a security hold stays approvable before it expires, in seconds —
+   * the authoritative window, and the only granularity that can express a
+   * sub-hour hold.
+   *
+   * Nullable: NULL means no seconds value was ever written (a row predating the
+   * column, or one written by an older build), and every reader falls back to
+   * `approval_expiry_hours * 3600`. Same convention as
+   * `contexts.hold_expiry_seconds`.
+   */
+  approval_expiry_seconds: ColumnType<number | null, number | null | undefined, number | null>;
   /** Which side last wrote this row: platform | local */
   source: string;
   /** When this policy was last written */
@@ -1862,6 +2012,61 @@ export interface OrgTrustPolicyTable {
 export type OrgTrustPolicy = Selectable<OrgTrustPolicyTable>;
 export type NewOrgTrustPolicy = Insertable<OrgTrustPolicyTable>;
 export type OrgTrustPolicyUpdate = Updateable<OrgTrustPolicyTable>;
+
+/**
+ * Org trust directory (org_trust_directory) — the approval directory
+ * `/kici approve` resolves a commenter against: identity links, per-member CI
+ * trust levels, and team memberships. Sibling of `org_trust_policy`, same
+ * ownership shape: wherever a Platform is attached it pushes this next to the
+ * policy on `trust_policy.update` and the orchestrator only reads it back, so
+ * approvals survive a restart. On an independent orchestrator there is no
+ * Platform, so the operator writes it through
+ * `kici-admin trust-policy directory-set` instead.
+ *
+ * The three JSONB columns are `unknown` on the select side because the pg
+ * driver hands back whatever JSON the column holds; `TrustDirectoryStore`
+ * validates each one against the wire schema before returning it. Inserts are
+ * `JSON.stringify`d strings, matching every other JSONB column here.
+ */
+export interface OrgTrustDirectoryTable {
+  /** Customer/org identifier (primary key) */
+  customer_id: string;
+  /** JSONB array of `{ userId, provider, providerUsername, providerUserId? }` links */
+  identity_links: ColumnType<unknown, string, string>;
+  /** JSONB object mapping a KiCI user id to its `none | read | write | admin` CI trust level */
+  member_ci_trust: ColumnType<unknown, string, string>;
+  /** JSONB array of `{ teamName, memberUserIds }` entries */
+  team_memberships: ColumnType<unknown, string, string>;
+  /** When this directory was last written */
+  updated_at: ColumnType<Date, Date | undefined, Date>;
+}
+
+// Convenience types for org_trust_directory
+export type OrgTrustDirectory = Selectable<OrgTrustDirectoryTable>;
+export type NewOrgTrustDirectory = Insertable<OrgTrustDirectoryTable>;
+export type OrgTrustDirectoryUpdate = Updateable<OrgTrustDirectoryTable>;
+
+/**
+ * Org plan headroom (org_plan_headroom) — the orchestrator's cache of the
+ * Platform-owned worker ceiling pushed on `plan.headroom`. Single row
+ * (id='default'), because the orchestrator serves exactly one org. Same
+ * ownership shape as org_trust_policy: the Platform writes it, the orchestrator
+ * only reads it back, so it survives a Platform outage + a coordinator restart.
+ */
+export interface OrgPlanHeadroomTable {
+  /** Single-row sentinel id, always 'default'. */
+  id: string;
+  /** Absolute ceiling on this coordinator's connected worker peers. */
+  max_worker_peers: number;
+  /** The org's combined orchestrator limit, for the rejection reason. */
+  org_limit: number;
+  /** The org's combined orchestrator total at push time, for the rejection reason. */
+  org_total: number;
+  /** Whether the Platform asked the coordinator to drain its excess workers. */
+  evict_excess: boolean;
+  /** When this ceiling was last written. */
+  updated_at: ColumnType<Date, Date, Date>;
+}
 
 /**
  * Cluster-global settings (cluster_settings) — a single row (id='default') of
@@ -1961,6 +2166,72 @@ export interface ClusterSettingsTable {
   concurrency_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   agent_token_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
+   * How often the leader sweeps for stranded event-scaler provisions. Re-read
+   * at the end of every sweep, so a change reschedules the timer on the next
+   * tick rather than waiting for a leadership transition. NULL ⇒ the
+   * orchestrator's configured default.
+   */
+  scaler_reap_interval_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * How long an adopted event-scaler provision whose agent is registered on no
+   * coordinator may sit before it is torn down. Set it well above the peer
+   * heartbeat period: the "registered nowhere" signal is partly heartbeat
+   * derived. NULL ⇒ the orchestrator's configured default. Read per sweep.
+   */
+  scaler_reap_stranded_timeout_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
+   * How long before the reaper retries a provision whose previous teardown left
+   * the row in place. NULL ⇒ the orchestrator's configured default. Read per
+   * sweep.
+   */
+  scaler_reap_reattempt_interval_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
+   * How long an expired scaler provisioning claim is kept before the reaper's
+   * sweep deletes it. An expired claim can never be redeemed, so this only
+   * controls how long a late redeemer is told "expired" rather than "unknown
+   * code". NULL ⇒ the orchestrator's configured default. Read per sweep.
+   */
+  scaler_claim_retention_ms: ColumnType<string | null, number | null | undefined, number | null>;
+  /**
+   * First deferral applied to an external (event) scaler after one consecutive
+   * provisioning failure. Each further consecutive failure doubles it, up to
+   * `scaler_provision_backoff_max_ms`. NULL ⇒ the orchestrator's configured
+   * default. Read per spawn request.
+   */
+  scaler_provision_backoff_base_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
+   * Ceiling on the doubling above, so a long provider outage settles into a
+   * steady retry cadence instead of growing without bound. NULL ⇒ the
+   * orchestrator's configured default. Read per spawn request.
+   */
+  scaler_provision_backoff_max_ms: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
+   * How many consecutive provisioning failures a scaler may record before its
+   * refusals name repeated failure as the cause rather than a single timeout.
+   * NULL ⇒ the orchestrator's configured default. Read per spawn request.
+   */
+  scaler_provision_max_consecutive_failures: ColumnType<
+    string | null,
+    number | null | undefined,
+    number | null
+  >;
+  /**
    * Deadline for one database-backed agent-ownership lookup. Past it the lookup
    * resolves as undecided and the frame is refused without counting a
    * violation. NULL ⇒ the orchestrator's configured default.
@@ -2003,6 +2274,13 @@ export interface PendingJobContextsTable {
   job_input: ColumnType<Record<string, unknown>, string, string>;
   /** string[] of labels serialized as JSONB */
   runs_on_labels: ColumnType<string[], string, string>;
+  /**
+   * For an invoke-gate job, its invoke parameters (event, payload, optional,
+   * maxParallel, failFast) serialized as JSON. Non-null marks this pending
+   * context as a gate: when released it summons the source repo's subscribers
+   * instead of dispatching to an agent. NULL for every ordinary job.
+   */
+  invoke_config: ColumnType<string | null, string | null | undefined, string | null>;
   /** When this context was stored */
   created_at: Generated<Date>;
 }
@@ -2461,6 +2739,17 @@ export interface HostRosterTable {
   token_id: string | null;
   /** Snapshot of the token's agent_type: 'static' | 'ephemeral'. */
   lifecycle_class: string;
+  /**
+   * True when an auto-scaler backend spawned this agent. Written from the
+   * scaler manager's registration lookup (a spawn record exists for the agent
+   * id), NOT from `lifecycle_class` — that column snapshots the auth TOKEN's
+   * type and reads `ephemeral` for every agent when the auth mode is `none`.
+   *
+   * `runsOnAll` fan-out targets declared fleet members, so a true here keeps
+   * the host out of the fan-out set. Defaults false, so a row predating the
+   * column stays a fan-out target without re-registering.
+   */
+  scaler_managed: ColumnType<boolean, boolean | undefined, boolean>;
   /** JSON-encoded string[] of the post-Gate-1 validated labels. */
   labels: string;
   hostname: string | null;
@@ -2515,10 +2804,16 @@ export type HostRosterUpdate = Updateable<HostRosterTable>;
  * Scaler spawning-agents table (scaler_spawning_agents).
  *
  * One row per agent that has been spawned via a scaler backend
- * (container / bare-metal / firecracker) but has not yet registered via
- * WS. Persists `bound_job_id` so a replacement coord still issues the
- * eager-dispatch hop when the agent eventually registers. GC'd by a
- * leader-gated sweep that drops rows older than the spawn-timeout.
+ * (container / bare-metal / firecracker / event) but has not yet registered
+ * via WS. Persists `bound_job_id` so a replacement coord still issues the
+ * eager-dispatch hop when the agent eventually registers, and `run_id`
+ * alongside it so a coordinator that never spawned the agent — the
+ * leader-gated reaper routinely is not the spawner — can still attribute a
+ * provisioning failure back to the job waiting on it. Reaped per
+ * instance and adoption-aware: `listReapCandidates` narrows to event rows that
+ * are either adopted or past their spawn deadline, and the reaper tears each
+ * one down with `deleteSpawningAgent` — an adopted event agent legitimately
+ * outlives the spawn timeout, so no blanket age-based sweep may drop it.
  */
 export interface ScalerSpawningAgentsTable {
   agent_id: string;
@@ -2528,10 +2823,83 @@ export interface ScalerSpawningAgentsTable {
   job_id: ColumnType<string | null, string | null | undefined, string | null>;
   bound_job_id: ColumnType<string | null, string | null | undefined, string | null>;
   spawned_at: Generated<Date>;
+  /**
+   * The coordinator instance that spawned this agent. Scopes recovery and the
+   * per-instance reaper. NULL reads as "unknown owner" — never as "not mine".
+   */
+  owner_instance_id: ColumnType<string | null, string | null | undefined, string | null>;
+  /** The coordinator the agent actually reached when it registered. */
+  adopted_by: ColumnType<string | null, string | null | undefined, string | null>;
+  /** When the adopting coordinator claimed the agent. */
+  adopted_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  /**
+   * The scaler's mandatory labels, copied onto the row so a coordinator with no
+   * matching scaler entry can still stamp the taint and emit the teardown.
+   */
+  mandatory_labels: ColumnType<
+    string[] | null,
+    string | string[] | null | undefined,
+    string | string[] | null
+  >;
+  /** The scaler's provisioning targets, copied onto the row for the same reason. */
+  provisioning_targets: ColumnType<
+    string[] | null,
+    string | string[] | null | undefined,
+    string | string[] | null
+  >;
+  /** The scaler's roles, copied onto the row for the same reason. */
+  roles: ColumnType<
+    string[] | null,
+    string | string[] | null | undefined,
+    string | string[] | null
+  >;
+  /**
+   * The scaler backend that spawned the agent: `container`, `bare-metal`,
+   * `firecracker`, or `event`. `event` is the value every adoption and reap
+   * predicate matches on, so a row missing it can be adopted and reaped by
+   * nobody. NULL means the row predates the column.
+   */
+  backend_type: ColumnType<string | null, string | null | undefined, string | null>;
 }
 
 export type ScalerSpawningAgentRow = Selectable<ScalerSpawningAgentsTable>;
 export type NewScalerSpawningAgentRow = Insertable<ScalerSpawningAgentsTable>;
+
+/**
+ * Scaler provision-outcomes table (scaler_provision_outcomes).
+ *
+ * One row per provisioned agent id, recording what became of the provision.
+ * Outlives `scaler_spawning_agents`, whose row is deleted on teardown — so the
+ * stale-spawn prune can tell an adopted provision from one that was never
+ * adopted, which the spawn row's absence cannot.
+ *
+ * `adopted_by` is written in the same transaction as
+ * `scaler_spawning_agents.adopted_by`, inside `adoptSpawningAgent`, which is
+ * the single writer of that column. Any future writer of `adopted_by` MUST
+ * write this row too, or the prune loses the signal again.
+ */
+export interface ScalerProvisionOutcomesTable {
+  agent_id: string;
+  scaler_name: string;
+  /** The coordinator that adopted the provision. NULL means it never was. */
+  adopted_by: ColumnType<string | null, string | null | undefined, string | null>;
+  /** When it was first adopted. Never refreshed by a re-adopt. */
+  adopted_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  /**
+   * The reaper's teardown reason (`spawn-timeout` / `heartbeat-timeout`), set
+   * only once the teardown was actually delivered. Independent of `adopted_by`:
+   * a `heartbeat-timeout` condemns a provision that WAS adopted, and clearing
+   * the adoption here would restore the misattribution this table removes.
+   */
+  condemned_reason: ColumnType<string | null, string | null | undefined, string | null>;
+  /** When the reaper condemned it. */
+  condemned_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  recorded_at: Generated<Date>;
+  updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
+}
+
+export type ScalerProvisionOutcomeRow = Selectable<ScalerProvisionOutcomesTable>;
+export type NewScalerProvisionOutcomeRow = Insertable<ScalerProvisionOutcomesTable>;
 
 /**
  * Scaler agent-jobs table (scaler_agent_jobs).
@@ -2564,7 +2932,38 @@ export interface ScalerReservationsTable {
   cpu_units: number;
   mem_bytes: ColumnType<string, string | number, string | number>;
   reserved_at: Generated<Date>;
+  /**
+   * The coordinator instance holding the reservation. Scopes recovery and the
+   * per-instance reaper. NULL reads as "unknown owner" — never as "not mine".
+   */
+  owner_instance_id: ColumnType<string | null, string | null | undefined, string | null>;
 }
 
 export type ScalerReservationRow = Selectable<ScalerReservationsTable>;
 export type NewScalerReservationRow = Insertable<ScalerReservationsTable>;
+
+/**
+ * Pending provisioning claims (scaler_pending_claims).
+ *
+ * One row per outstanding event-scaler claim code, so any coordinator behind the
+ * shared endpoint can redeem a code rather than only the process that minted it.
+ * The code itself is never stored — only its sha256 — so a DB read cannot hand
+ * back a redeemable secret. Single use is enforced by a conditional UPDATE on
+ * `consumed_at`.
+ */
+export interface ScalerPendingClaimsTable {
+  claim_hash: string;
+  claim_prefix: string;
+  agent_id: string;
+  scaler_name: string;
+  labels: ColumnType<string[], string | string[], string | string[]>;
+  /** BIGINT: node-pg returns it as a string, so callers coerce on read. */
+  agent_token_ttl_ms: ColumnType<string, number | string, number | string>;
+  orchestrator_url: string;
+  expires_at: Date;
+  consumed_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
+  created_at: Generated<Date>;
+}
+
+export type ScalerPendingClaimRow = Selectable<ScalerPendingClaimsTable>;
+export type NewScalerPendingClaimRow = Insertable<ScalerPendingClaimsTable>;

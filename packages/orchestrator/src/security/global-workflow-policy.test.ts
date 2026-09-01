@@ -1,4 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// Capture the module logger so the fail-closed tests can assert the warning
+// this file emits for an unstorable stored pattern.
+const mockWarn = vi.hoisted(() => vi.fn());
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
+  return {
+    ...actual,
+    createLogger: () => ({ info: vi.fn(), warn: mockWarn, error: vi.fn(), debug: vi.fn() }),
+  };
+});
+
 import { GlobalWorkflowPolicy } from './global-workflow-policy.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 import type {
@@ -631,5 +643,151 @@ describe('GlobalWorkflowPolicy matches a dot-prefixed repository name', () => {
       expect(await policy.isElevatedAccessAllowed('github:42', DOT_REPO, ORG)).toBe(true);
       expect(await policy.isElevatedAccessAllowed('github:42', 'otherorg/x', ORG)).toBe(false);
     });
+  });
+});
+
+describe('GlobalWorkflowPolicy fails closed on a stored negation pattern', () => {
+  function settings(over: Record<string, unknown>) {
+    return makeMockDb({
+      customer_id: ORG,
+      global_workflow_allowed_repos: null,
+      global_workflow_denied_repos: null,
+      global_workflow_elevated_repos: null,
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    mockWarn.mockClear();
+  });
+
+  it('an allow-list negation entry admits nothing — not even the repo it names', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_allowed_repos: [{ pattern: '!myorg/x' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    // Under glob-negation semantics this entry would have allowed every repo
+    // except `myorg/x`. Failing closed, it allows neither.
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/x', ORG)).allowed).toBe(false);
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/y', ORG)).allowed).toBe(false);
+  });
+
+  it('a deny-list negation entry denies everything it is checked against', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_denied_repos: [{ pattern: '!myorg/x' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    // Under glob-negation semantics this entry would have admitted `myorg/x`
+    // while denying everything else. Failing closed, it denies both.
+    expect((await policy.isSourceRepoAllowed('github:1', 'myorg/x', ORG)).allowed).toBe(false);
+    expect((await policy.isSourceRepoAllowed('github:1', 'myorg/y', ORG)).allowed).toBe(false);
+  });
+
+  it('an elevated-list negation entry grants nothing', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_elevated_repos: [{ pattern: 'myorg/[^a]*' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/x', ORG)).toBe(false);
+    expect(await policy.isElevatedAccessAllowed('github:1', 'myorg/abc', ORG)).toBe(false);
+  });
+
+  it('an allow-list negative lookahead grants nothing, not every repo but one', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_allowed_repos: [{ pattern: '(?!myorg/legacy)**' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    // picomatch passes the unrecognised group into the compiled expression
+    // verbatim, so this reaches the matcher as a real lookahead and matches
+    // every repository in every organization except the one it names — a
+    // near-universal grant on a list whose purpose is restriction.
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/app', ORG)).allowed).toBe(false);
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'otherorg/x', ORG)).allowed).toBe(false);
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/legacy', ORG)).allowed).toBe(
+      false,
+    );
+  });
+
+  it('a deny-list negative lookahead blocks, rather than admitting the repo it names', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_denied_repos: [{ pattern: 'myorg/(?!secret)*' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    // Under the compiled lookahead, `myorg/secret` is the one repository this
+    // deny entry would ADMIT. Failing closed, it blocks both.
+    expect((await policy.isSourceRepoAllowed('github:1', 'myorg/secret', ORG)).allowed).toBe(false);
+    expect((await policy.isSourceRepoAllowed('github:1', 'myorg/app', ORG)).allowed).toBe(false);
+  });
+
+  it('a negative lookbehind fails closed too', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_allowed_repos: [{ pattern: '**(?<!secret)' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/app', ORG)).allowed).toBe(false);
+  });
+
+  it('the [! character class is a literal class, so it evaluates normally', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_allowed_repos: [{ pattern: 'myorg/[!s]*' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    // picomatch reads `[!s]` as the two literal characters `!` and `s`, so
+    // this entry grants strictly less than it names — a genuine restriction,
+    // not an inversion, and it is applied rather than failed closed.
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/secret', ORG)).allowed).toBe(
+      true,
+    );
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/app', ORG)).allowed).toBe(false);
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it('warns once per evaluation, naming the org and the pattern', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({ global_workflow_denied_repos: [{ pattern: '!myorg/x' }] }),
+      CLUSTER_ON,
+      false,
+    );
+    await policy.isSourceRepoAllowed('github:1', 'myorg/y', ORG);
+    expect(mockWarn).toHaveBeenCalledTimes(1);
+    const meta = mockWarn.mock.calls[0][1] as Record<string, unknown>;
+    expect(meta.customerId).toBe(ORG);
+    expect(meta.pattern).toBe('!myorg/x');
+    expect(meta.onInvalid).toBe(true);
+  });
+
+  it('a routing-key qualifier that does not match still short-circuits, with no warning', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({
+        global_workflow_denied_repos: [{ routingKey: 'github:99', pattern: '!myorg/x' }],
+      }),
+      CLUSTER_ON,
+      false,
+    );
+    expect((await policy.isSourceRepoAllowed('github:1', 'myorg/y', ORG)).allowed).toBe(true);
+    expect(mockWarn).not.toHaveBeenCalled();
+  });
+
+  it('a valid sibling entry on the same list still evaluates normally', async () => {
+    const policy = new GlobalWorkflowPolicy(
+      settings({
+        global_workflow_allowed_repos: [{ pattern: '!myorg/x' }, { pattern: 'myorg/ci-*' }],
+      }),
+      CLUSTER_ON,
+      false,
+    );
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/ci-deploy', ORG)).allowed).toBe(
+      true,
+    );
+    expect((await policy.isWorkflowRepoAllowed('github:1', 'myorg/other', ORG)).allowed).toBe(
+      false,
+    );
   });
 });

@@ -19,7 +19,12 @@ import {
   WS_CLOSE_PROTOCOL_ERROR,
   ScalerEventType,
 } from '@kici-dev/engine';
-import { createPeerHandler, type PeerHandlerDeps, type PeerWsLike } from './peer-handler.js';
+import {
+  createPeerHandler,
+  shouldAdmitWorker,
+  type PeerHandlerDeps,
+  type PeerWsLike,
+} from './peer-handler.js';
 import { PeerRegistry } from './peer-registry.js';
 
 // ── Mock WebSocket ──────────────────────────────────────────────────
@@ -1802,5 +1807,31 @@ describe('PeerHandler', () => {
         senderInstanceId: 'handler-orch',
       });
     });
+  });
+});
+
+describe('shouldAdmitWorker', () => {
+  it('never gates a coordinator peer', () => {
+    expect(shouldAdmitWorker('coordinator', 0, 5)).toBe(true);
+  });
+
+  it('never gates a roleless peer (defaults to coordinator)', () => {
+    expect(shouldAdmitWorker(undefined, 0, 5)).toBe(true);
+  });
+
+  it('admits a worker freely when no ceiling was ever received', () => {
+    expect(shouldAdmitWorker('worker', null, 5)).toBe(true);
+  });
+
+  it('admits a worker below the ceiling', () => {
+    expect(shouldAdmitWorker('worker', 2, 1)).toBe(true);
+  });
+
+  it('refuses a worker at the ceiling', () => {
+    expect(shouldAdmitWorker('worker', 1, 1)).toBe(false);
+  });
+
+  it('refuses a worker at a zero ceiling', () => {
+    expect(shouldAdmitWorker('worker', 0, 0)).toBe(false);
   });
 });

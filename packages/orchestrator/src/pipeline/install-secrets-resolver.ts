@@ -187,7 +187,24 @@ export function validateRegistryUrlScheme(
   return { ok: false, reason: `unsupported registry URL scheme ${parsed.protocol} (${url})` };
 }
 
-/** True when the resolved trust tier is anything other than 'trusted'. */
+/**
+ * True when the resolved trust tier is anything other than 'trusted'.
+ *
+ * `undefined` is the LENIENT direction here: an unresolved tier leaves install
+ * secrets in place, while `deriveCacheRefScope` maps the same `undefined` to the
+ * isolated cache scope, which is what `resolveWorkflowDockerfileBuilds` then
+ * denies unless the org opted in. `evaluateTrustGate` reads it leniently too;
+ * `deriveCacheRefScope`, `selectLockFileSource`, and the trust-policy gate's
+ * `isNonTrusted` all read the same `undefined` strictly.
+ *
+ * Several dispatch paths reach it with no tier, and the set is open — a
+ * provider bundle carrying a fork model does not keep a run out of it. Among
+ * them: an internally-triggered run whose inheritance lookup degrades, a
+ * pull-request event from a provider with no fork model, a cross-source
+ * dispatch, and a `kici run` remote test run. Treat "no tier" as its own case
+ * rather than as a proxy for any one of them. Documented for operators in
+ * `docs/user/events.md` under the trust-tier rules.
+ */
 function isUntrustedTier(tier: TrustTier | undefined): boolean {
   if (tier === undefined) return false;
   return tier !== 'trusted';

@@ -98,11 +98,34 @@ describe('trust-policy gate wiring', () => {
 
   it('passes the real per-PR signals rather than constants', () => {
     // Each signal must come from the pipeline's own state. A hardcoded `false`
-    // here would silently disable an arm while leaving every test green — which
-    // is exactly what a whole-file regex failed to catch.
+    // here would silently disable the switch while leaving every test green —
+    // which is exactly what a whole-file regex failed to catch.
     expect(EVAL_CALL).toMatch(/isForkPR:\s*event\.isForkPR\s*\?\?\s*false/);
-    expect(EVAL_CALL).toMatch(/hasWorkflowModifications:\s*security\.hasWorkflowModifications/);
     expect(EVAL_CALL).toMatch(/trustResolution:\s*trust\.trustResolution/);
+  });
+
+  it('drops an ignored event before the lock-file fetch', () => {
+    // The whole point of `ignore`: no run row, no check status, no clone token.
+    // Every one of those is created at or after the lock-file fetch, so the
+    // drop has to precede that call in source order.
+    const drop = CODE.indexOf("securityDecision.action === 'ignore'");
+    const lockFetch = CODE.indexOf('await fetchLockFileWithFallbackPhase(');
+    expect(drop).toBeGreaterThan(-1);
+    expect(lockFetch).toBeGreaterThan(-1);
+    expect(drop).toBeLessThan(lockFetch);
+    // …and the evaluation it reads must itself precede the drop.
+    const evaluate = CODE.indexOf('const securityDecision = await evaluateSecurityPolicy(');
+    expect(evaluate).toBeGreaterThan(-1);
+    expect(evaluate).toBeLessThan(drop);
+  });
+
+  it('evaluates the policy exactly once per delivery in the per-repo pipeline', () => {
+    // Two evaluations of the same signals would double-count the decision
+    // metric and open a TOCTOU window between the drop and the dispatch gate.
+    // The cross-source path has its own call against a registration's bundle,
+    // so the count here is per call SHAPE, not a whole-file total.
+    const perRepo = CODE.match(/const securityDecision = await evaluateSecurityPolicy\(/g) ?? [];
+    expect(perRepo).toHaveLength(1);
   });
 
   it('defaults the orchestrator mode to the fail-closed side', () => {
@@ -112,8 +135,8 @@ describe('trust-policy gate wiring', () => {
     expect(EVAL_CALL).not.toMatch(/mode:\s*deps\.orchestratorMode\s*\?\?\s*'independent'/);
   });
 
-  it('scopes evaluation to providers with a contributor model', () => {
-    expect(CODE).toMatch(/if\s*\(!isPREvent\s*\|\|\s*!bundle\.contributorResolver\)/);
+  it('scopes evaluation to providers with a fork model', () => {
+    expect(CODE).toMatch(/if\s*\(!isPREvent\s*\|\|\s*!bundle\.hasForkModel\)/);
   });
 
   it('gates dispatch on the decision without a disabling conjunct', () => {
@@ -146,6 +169,15 @@ describe('trust-policy gate wiring', () => {
     // untrusted code.
     expect(gate).toMatch(/default: \{[\s\S]*rejectRunForSecurityPolicy\(/);
 
+    // The `ignore` arm must survive a dead-code sweep. `declineIgnoredDispatch`
+    // answers that verdict before the gate is reached, so this arm is
+    // unreachable from the dispatch path — and because a `default` arm exists,
+    // the compiler does NOT flag its removal. Deleting it would therefore turn
+    // an `ignore` that ever reached here into the visible failed run that
+    // `default` writes, the exact artifact `ignore` exists to withhold, with no
+    // test objecting.
+    expect(gate).toMatch(/case 'ignore':/);
+
     // …and dispatch must actually invoke the gate and honour its result.
     expect(gateCode).toMatch(/const gated = await applyTrustPolicyGate\(ctx, setup, opts\);/);
     expect(gateCode).toMatch(/if \(gated\) return gated;/);
@@ -153,13 +185,17 @@ describe('trust-policy gate wiring', () => {
 });
 
 /**
- * The wish's criterion 5: the failure mode was not a wrong branch, it was a
- * WHOLE pushed object ignored for as long as it had existed. So the field list
- * is derived from the wire schema rather than written out here — adding a field
- * to `trustPolicySchema` without routing it to a decision site fails this guard
- * instead of shipping one more inert setting.
+ * Which pushed policy fields reach a decision site, and which deliberately do
+ * not. The field list is derived from the wire schema rather than written out
+ * here, so a field ADDED to `trustPolicySchema` lands in neither bucket and
+ * fails loudly instead of shipping as one more inert setting.
+ *
+ * The two deprecated fields are the deliberate no-ops. Their JSDoc on the wire
+ * schema claims they are "accepted for wire compatibility; not enforced", and
+ * this is what holds that claim to the source: an arm reintroduced for either
+ * of them would make the claim false and fail here.
  */
-describe('every pushed policy field reaches a decision site', () => {
+describe('policy fields reach the decision sites they claim to', () => {
   const GATE = stripComments(
     readFileSync(join(HERE, '..', 'security', 'trust-policy-gate.ts'), 'utf8'),
   );
@@ -167,39 +203,58 @@ describe('every pushed policy field reaches a decision site', () => {
 
   /** The evaluator body — where a policy field must be READ, not merely copied. */
   const EVALUATOR = functionBody(GATE, 'export function evaluateTrustPolicy(');
+  /** Where the hold verdict is built — the only place the window is resolved. */
+  const HOLD_FOR_FORK = functionBody(GATE, 'function holdForFork(');
 
   const FIELDS = Object.keys(trustPolicySchema.shape);
+  /** Read by no decision site; carried only because the wire schema declares them. */
+  const INERT_FIELDS = ['unknownContributorPolicy', 'workflowChangePolicy'];
 
   it('enumerates the wire fields it is guarding', () => {
     // Positive control: if the schema import ever resolves to something without
     // a shape, every per-field case below would vacuously pass over an empty
-    // list. Pin the count so a silently-empty enumeration fails loudly.
-    expect(FIELDS.length).toBeGreaterThanOrEqual(4);
+    // list. Pin the membership so a silently-empty enumeration fails loudly.
+    expect(FIELDS.length).toBeGreaterThanOrEqual(5);
     expect(FIELDS).toContain('forkPolicy');
     expect(FIELDS).toContain('approvalExpiryHours');
+    expect(FIELDS).toContain('approvalExpirySeconds');
+    for (const inert of INERT_FIELDS) expect(FIELDS).toContain(inert);
   });
 
-  /**
-   * Where each field has to show up to count as routed.
-   *
-   * The three verdict fields must appear as an ARM's `verdict:`, not merely
-   * somewhere in the evaluator. A plain `policy.forkPolicy` check was too weak
-   * to falsify: replacing the fork arm's verdict with a literal left the field
-   * still referenced by the `forkAllowsThisEvent` guard a few lines up, so the
-   * assertion stayed green over a policy value that no longer decided anything.
-   *
-   * `approvalExpiryHours` is not an arm — it sizes the hold, so it rides the
-   * hold outcome into the expiry calculation instead.
-   */
-  function expectationFor(field: string): { source: string; pattern: RegExp } {
-    if (field === 'approvalExpiryHours') {
-      return { source: DISPATCH, pattern: /decision\.approvalExpiryHours\s*\?\?/ };
-    }
-    return { source: EVALUATOR, pattern: new RegExp(`verdict:\\s*policy\\.${field}\\b`) };
-  }
+  it('routes forkPolicy into the evaluator switch', () => {
+    // The switch subject specifically, not merely a mention: a `switch` over a
+    // literal would leave `policy.forkPolicy` referenced elsewhere in the
+    // function while deciding nothing.
+    expect(EVALUATOR).toMatch(/switch \(policy\.forkPolicy\) \{/);
+  });
 
-  it.each(FIELDS)('routes %s to a decision', (field) => {
-    const { source, pattern } = expectationFor(field);
-    expect(source).toMatch(pattern);
+  it('routes both expiry spellings into the hold-expiry calculation', () => {
+    // Neither is an arm — together they name one window, so the pair rides the
+    // hold outcome into the expiry calculation instead.
+    //
+    // The gate resolves the two through `approvalExpirySecondsOf`, which is what
+    // makes an hours-only policy still size a hold; dispatch then reads the one
+    // resolved field. Asserting only the dispatch half would pass on a build
+    // whose gate had dropped the hours fallback, which is the layer the value
+    // actually comes from.
+    expect(HOLD_FOR_FORK).toMatch(/approvalExpirySeconds:\s*approvalExpirySecondsOf\(policy\)/);
+    expect(DISPATCH).toMatch(/decision\.approvalExpirySeconds\s*\?\?/);
+  });
+
+  it.each(INERT_FIELDS)('does not route %s to any decision', (field) => {
+    expect(EVALUATOR).not.toMatch(new RegExp(`policy\\.${field}\\b`));
+  });
+
+  it('accounts for every wire field', () => {
+    // A field added to the schema is neither the fork switch, nor the expiry,
+    // nor a known inert one — so it fails here until someone routes it or
+    // records it as deliberately inert.
+    const accounted = new Set([
+      'forkPolicy',
+      'approvalExpiryHours',
+      'approvalExpirySeconds',
+      ...INERT_FIELDS,
+    ]);
+    expect(FIELDS.filter((f) => !accounted.has(f))).toEqual([]);
   });
 });

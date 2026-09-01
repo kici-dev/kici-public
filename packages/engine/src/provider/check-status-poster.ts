@@ -4,10 +4,21 @@
  * Used by the CI security system to post approval/hold status checks
  * on PRs, enabling visibility into trust-tier gating decisions.
  */
+import type { CheckRunConclusion } from './check-run-conclusion.js';
 import type { ProviderType } from './types.js';
 
-/** Status values for a check run. */
-export type CheckStatus = 'pending' | 'success' | 'failure' | 'neutral';
+/**
+ * Status values for a check run: still running, or one of the terminal
+ * conclusions.
+ *
+ * The terminal half is `CheckRunConclusion` — the same vocabulary the workflow
+ * and per-job `kici/…` check runs conclude with — plus `neutral`, which those
+ * runs never use and the informational security checks do. One vocabulary means
+ * a hold that ends is reported the same way on the security check and on the
+ * `kici/…` checks of the same event: `cancelled` for a rejection, `timed_out`
+ * for an elapsed approval window.
+ */
+export type CheckStatus = 'pending' | 'neutral' | CheckRunConclusion;
 
 /** A single workflow-file change detected between base and head lock files. */
 export interface WorkflowModificationInfo {
@@ -65,9 +76,24 @@ export interface CheckStatusPoster {
    * "Held for approval" state with a completed conclusion.
    *
    * Optional so a provider bundle that has no notion of commit checks — or a
-   * hand-built one — is simply silent rather than failing the delivery.
+   * hand-built one — is silent rather than failing the delivery.
    */
   postGlobalEvalFailedCheck?(
+    repoIdentifier: string,
+    commitSha: string,
+    summary: string,
+    credentials: unknown,
+  ): Promise<void>;
+  /**
+   * Post the success conclusion on the organization-workflow-evaluation check —
+   * the same check name {@link postGlobalEvalFailedCheck} writes — after a
+   * re-run of the failed round completes cleanly, so a bot gating on all-green
+   * is unblocked without a new commit.
+   *
+   * Optional for the same reason as the failure poster: a bundle with no notion
+   * of commit checks is silent rather than failing the re-run.
+   */
+  postGlobalEvalSucceededCheck?(
     repoIdentifier: string,
     commitSha: string,
     summary: string,

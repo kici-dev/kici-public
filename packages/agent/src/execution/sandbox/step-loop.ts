@@ -133,6 +133,13 @@ export interface StepLoopOptions {
   /** Job-level hooks. */
   jobHooks?: JobHooks;
   /**
+   * Force the completion-hook sequence down the failed path (run `onFailure`
+   * then `cleanup`, not `onSuccess`) regardless of step outcomes. Set by the
+   * between-jobs out-of-band cleanup re-run, which runs no steps but must drive
+   * the declared cleanup as if the job had failed.
+   */
+  forceInitialFailure?: boolean;
+  /**
    * Declarative cache phase dependencies (cache API + IPC + pseudo-step index
    * allocator). When set, each step's own `cache` specs are restored before the
    * step's `run` and saved after (on an exact-key miss), surfacing as
@@ -1141,6 +1148,11 @@ async function runJobCompletionHooks(
     });
   }
 
+  // Signal the supervisor that completion hooks ran, so it does not re-run them
+  // out-of-band. Emitted whether or not a hook failed — a failed hook still ran;
+  // the promote-to-failed status already carries the failure.
+  opts.sendIpc({ type: 'completion-hooks-done' });
+
   return state;
 }
 
@@ -1158,7 +1170,7 @@ async function runJobCompletionHooks(
 export async function executeStepLoop(opts: StepLoopOptions): Promise<StepLoopResult> {
   const startTime = opts.startTime ?? Date.now();
   const stepResults: SandboxStepResult[] = [];
-  const state: CompletionState = { failed: false };
+  const state: CompletionState = { failed: opts.forceInitialFailure === true };
 
   // Walk the structural node list when present (sequential steps + parallel
   // groups); otherwise fall back to the flat `steps` list (unit-harness path)

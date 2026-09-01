@@ -3,7 +3,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/types.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LockFile, SimulatedEvent, WorkflowDecision } from '@kici-dev/engine';
-import { matchAllWorkflows, SCHEMA_VERSION } from '@kici-dev/engine';
+import { matchAllWorkflows, SCHEMA_VERSION, reservedEventNamePrefix } from '@kici-dev/engine';
 import { EVENT_CATCHUP_BATCH_SIZE } from './event-store.js';
 import type { EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
@@ -14,12 +14,30 @@ import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.j
 import { appendBatchItem, openOrGetBatchWindow } from './batch-accumulator.js';
 import {
   eventAttemptsHistogram,
+  eventCatchUpFailuresTotal,
   eventDispatchSuccessTotal,
   eventDlqTotal,
   eventRetryTotal,
 } from '../metrics/prometheus.js';
 
 const logger = createLogger({ prefix: 'event-router' });
+
+/**
+ * System events are exempt from the per-source event-storm rate limiter: they
+ * are orchestrator-emitted (never a user `ctx.emit`) with a bounded chain depth,
+ * so they cannot loop. Two families qualify — the `__`-prefixed workflow/
+ * job-complete events, and the reserved `kici.`-prefixed events (today: the
+ * event scaler's scale-up / scale-down), which fire on real scaling demand and
+ * must not be dropped by a 100/min bucket.
+ *
+ * "Never a user `ctx.emit`" is what the exemption rests on, and it is ENFORCED
+ * rather than assumed: both prefixes are refused at the emit path (the SDK
+ * client-side, the orchestrator's `event.emit` handler authoritatively), which
+ * is the same reservation this predicate reads.
+ */
+export function isRateExemptEventName(eventName: string): boolean {
+  return reservedEventNamePrefix(eventName) !== undefined;
+}
 
 /**
  * Input for emitting an internal event.
@@ -46,6 +64,13 @@ export interface EventMatchContext {
   repoIdentifier: string;
   /** Provider-specific credentials captured at registration time */
   providerContext: Record<string, unknown>;
+  /**
+   * The registration's default branch (`null` when it was never captured).
+   * A `__schedule_fire` run executes this branch's lock file, so the dispatch
+   * adapter presents it as that run's branch when a context evaluates branch
+   * restrictions.
+   */
+  defaultBranch: string | null;
 }
 
 export interface EventRouterOptions {
@@ -71,6 +96,30 @@ export interface EventRouterOptions {
   registrationIndex: RegistrationIndex;
   /** Stable identifier for this orchestrator process — written into `kici_events.claimed_by` for diagnostics. */
   nodeId: string;
+  /**
+   * Boot latch: resolves once this process can actually dispatch a matched
+   * event.
+   *
+   * `start()` runs its catch-up scan well before the dispatch dependencies are
+   * assembled (the `ProcessingDeps` bag is built at `createApp`), and a restart
+   * with a backlog is exactly when that window is loaded. Without the latch a
+   * backlogged event can spend all `maxDispatchAttempts` (default 5) inside the
+   * window — full-jitter backoff can re-fire almost immediately — and land in
+   * the DLQ, which is terminal loss.
+   *
+   * Consumed two DIFFERENT ways, because the two paths sit on opposite sides of
+   * the caller that resolves it:
+   *
+   * - **Live notification** — awaited inline, before leasing. The handler runs
+   *   off the pg client's event loop, so nothing upstream is blocked.
+   * - **Catch-up** — the scan is SCHEDULED behind the latch, never awaited by
+   *   `start()`. The composition root resolves the latch only after `start()`
+   *   returns, so awaiting inline would be a guaranteed startup deadlock.
+   *
+   * Absent ⇒ no gating, and the catch-up runs inline exactly as before (tests,
+   * and any caller that is ready before `start()`).
+   */
+  dispatchReady?: () => Promise<void>;
 }
 
 /**
@@ -94,6 +143,21 @@ export class EventRouter {
   private readonly config: EventRouterConfig;
   private readonly clusterSettings?: ClusterSettingsReader;
   private readonly onEventMatched: EventRouterOptions['onEventMatched'];
+  private readonly dispatchReady: EventRouterOptions['dispatchReady'];
+  /** The deferred catch-up scan, when `start()` scheduled one behind the latch. */
+  private catchUpScan: Promise<void> | null = null;
+  /**
+   * The catch-up scan ITSELF, set the moment it actually begins.
+   *
+   * Distinct from `catchUpScan`, which is the whole latch-then-scan chain.
+   * `stop()` awaits this one, never the chain: the latch is resolved by the
+   * composition root PAST `start()`, so a bootstrap that fails in between
+   * leaves it pending forever and awaiting the chain would hang shutdown.
+   * Awaiting only a scan that has begun bounds the wait by the scan.
+   */
+  private runningCatchUp: Promise<void> | null = null;
+  /** Set by `stop()` so a latch that resolves after shutdown starts no scan. */
+  private stopped = false;
   private readonly registrationIndex: RegistrationIndex;
   private readonly nodeId: string;
 
@@ -109,6 +173,7 @@ export class EventRouter {
     this.config = options.config;
     this.clusterSettings = options.clusterSettings;
     this.onEventMatched = options.onEventMatched;
+    this.dispatchReady = options.dispatchReady;
     this.registrationIndex = options.registrationIndex;
     this.nodeId = options.nodeId;
   }
@@ -118,6 +183,11 @@ export class EventRouter {
    * Runs catch-up on start to process events missed during downtime.
    */
   async start(): Promise<void> {
+    // Clear the shutdown flag. A stop→start cycle otherwise leaves it latched
+    // on, and every subsequent start silently skips its catch-up scan — the one
+    // thing the scan exists to do is recover the backlog a stop left behind.
+    this.stopped = false;
+
     // Load registrations from DB on startup.
     // This ensures events can match immediately, even before the first webhook.
     await this.registrationIndex.loadFromDb();
@@ -141,14 +211,60 @@ export class EventRouter {
     await this.client.query('LISTEN kici_event_channel');
     logger.info('LISTEN kici_event_channel active');
 
-    // Catch-up: process events missed during downtime
-    await this.catchUp();
+    // Catch-up: process events missed during downtime.
+    //
+    // With no boot latch this stays inline, exactly as before. With one it is
+    // SCHEDULED, never awaited: the only thing that resolves the latch is the
+    // composition root continuing PAST this call, so awaiting the scan here
+    // would wait on a resolve that is downstream of the wait — a startup
+    // deadlock on every boot, not merely a slow one. LISTEN is already
+    // registered above, so no live notification is missed while the scan waits.
+    if (!this.dispatchReady) {
+      await this.catchUp();
+      return;
+    }
+    this.catchUpScan = this.dispatchReady()
+      .then(() => {
+        // A shutdown between `start()` and the latch must not start a scan.
+        // Nothing awaits between this check and the assignment below, so
+        // `stop()` either sees the scan it must wait for or prevents it.
+        if (this.stopped) return;
+        this.runningCatchUp = this.catchUp();
+        return this.runningCatchUp;
+      })
+      .catch((err) => {
+        // This no longer fails the bootstrap, so the failure has to be visible
+        // on its own. The counter is what an alert can fire on; the log line
+        // carries the reason.
+        eventCatchUpFailuresTotal.add(1);
+        logger.error('Deferred catch-up scan failed', { error: toErrorMessage(err) });
+      })
+      .finally(() => {
+        this.runningCatchUp = null;
+      });
+  }
+
+  /**
+   * The deferred catch-up scan scheduled by `start()` behind the boot latch, or
+   * `null` when the scan ran inline (no latch configured).
+   *
+   * Exposed so a caller can await the scan rather than poll for its effects.
+   * `start()` deliberately does not await it — see the comment there.
+   */
+  get catchUpSettled(): Promise<void> | null {
+    return this.catchUpScan;
   }
 
   /**
    * Stop listening and release the dedicated pg client.
    */
   async stop(): Promise<void> {
+    this.stopped = true;
+    // Let a scan that is already running finish, so shutdown does not overlap
+    // it — the scan leases events and dispatches them, and tearing the client
+    // out from under it leaves those leases held by a process that is gone.
+    // The chain's own `.catch()` means this never rejects.
+    await this.runningCatchUp;
     if (this.client) {
       try {
         await this.client.query('UNLISTEN kici_event_channel');
@@ -194,12 +310,12 @@ export class EventRouter {
     }
 
     // Check circuit breaker -- rate limit.
-    // System events (__-prefixed) are orchestrator-emitted exactly once per
-    // workflow/job completion with chainDepth 0 -- they cannot loop, so the
-    // event-storm rate limiter (a guard for user ctx.emit) does not apply.
-    // User events are keyed per (source routing key + event name) so the limit
-    // is genuinely per-workflow-source, not one global bucket per event name.
-    if (!event.eventName.startsWith('__')) {
+    // System events (`__`- or `kici.`-prefixed) are orchestrator-emitted and
+    // cannot loop, so the event-storm rate limiter (a guard for user ctx.emit)
+    // does not apply — see isRateExemptEventName. User events are keyed per
+    // (source routing key + event name) so the limit is genuinely
+    // per-workflow-source, not one global bucket per event name.
+    if (!isRateExemptEventName(event.eventName)) {
       const rateKey = `${event.sourceRoutingKey ?? 'unknown'}:${event.eventName}`;
       const rateCheck = await this.circuitBreaker.checkRateLimit(rateKey);
       if (!rateCheck.allowed) {
@@ -270,6 +386,9 @@ export class EventRouter {
    * re-publishes pg_notify so a healthy node can re-dispatch.
    */
   private async onNotification(eventId: string): Promise<void> {
+    // Before leasing, not after: a lease held across the wait would have to be
+    // reclaimed by the leader scanner if bootstrap were slow.
+    await this.dispatchReady?.();
     const event = await this.eventStore.tryLeaseForProcessing(eventId, this.nodeId);
     if (!event) {
       // Already processed, leased by another node, or DLQ'd.
@@ -292,9 +411,9 @@ export class EventRouter {
       // `debugFailFirstNAttemptsByEvent` AND its current attempt count is
       // <= N, throw before the real dispatch runs. The thrown error rides
       // the same retry / DLQ path as a genuine dispatch failure. The map
-      // is only populated when KICI_TEST_MODE=1 was set at config-load
-      // time (see config/loader.ts); production never reaches this
-      // branch.
+      // is only populated by the build-time test double's injected
+      // fault-injection policy; the shipped orchestrator never reaches
+      // this branch.
       const failBudget = this.config.debugFailFirstNAttemptsByEvent?.[event.eventName];
       if (failBudget !== undefined && event.attempts <= failBudget) {
         throw new Error(
@@ -483,6 +602,7 @@ export class EventRouter {
         routingKey: reg.routingKey,
         repoIdentifier: reg.repoIdentifier,
         providerContext: reg.providerContext,
+        defaultBranch: reg.defaultBranch,
       });
     }
   }
@@ -644,6 +764,53 @@ export class EventRouter {
       payload,
       targetBranch: 'main', // N/A for internal events
     };
+  }
+
+  /**
+   * Match a kici event by name against the SOURCE repo's own `kiciEvent({ name })`
+   * subscribers, returning the matched decisions plus the synthetic lock file each
+   * was matched against.
+   *
+   * This reuses the exact match path `processSubscriptions` uses for a custom
+   * event — the `kici_event` index lookup plus `matchAllWorkflows` against a
+   * one-workflow synthetic lock file — but scoped to `sourceRepo` and without the
+   * async event-store round-trip, so an invoke gate can summon the repo's opt-in
+   * workflows synchronously and correlate each spawned run. The match is scoped to
+   * the source repo's own registrations (source == target), so no cross-repo trust
+   * check applies.
+   */
+  matchKiciEventSubscribers(
+    eventName: string,
+    payload: Record<string, unknown>,
+    sourceRepo: string,
+    sourceRoutingKey?: string,
+  ): Array<{ reg: RegisteredWorkflow; lockFile: LockFile; decisions: WorkflowDecision[] }> {
+    const simulatedEvent: SimulatedEvent = {
+      type: 'kici_event',
+      payload: { eventName, payload, sourceRepo, sourceRoutingKey },
+      targetBranch: 'main',
+    };
+    const registrations = this.registrationIndex
+      .getByEventType('kici_event')
+      .filter((reg) => reg.repoIdentifier === sourceRepo);
+    const out: Array<{
+      reg: RegisteredWorkflow;
+      lockFile: LockFile;
+      decisions: WorkflowDecision[];
+    }> = [];
+    for (const reg of registrations) {
+      const lockFile: LockFile = {
+        schemaVersion: SCHEMA_VERSION,
+        source: reg.lockEntry.source ?? { file: 'registered', export: '#default' },
+        contentHash: reg.lockEntry.contentHash ?? '',
+        workflows: [reg.lockEntry],
+      };
+      const decisions = matchAllWorkflows(lockFile.workflows, simulatedEvent).filter(
+        (d) => d.matched,
+      );
+      if (decisions.length > 0) out.push({ reg, lockFile, decisions });
+    }
+    return out;
   }
 
   /**

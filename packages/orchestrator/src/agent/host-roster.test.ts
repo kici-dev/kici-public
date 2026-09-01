@@ -435,6 +435,81 @@ describeDb('HostRosterStore', () => {
     });
   });
 
+  describe('findFanoutTargets', () => {
+    const grace = 5 * 60_000;
+
+    /** A live, label-matching roster row; `over` varies only what a test asserts on. */
+    const host = (over: Partial<Parameters<HostRosterStore['upsert']>[0]>) => ({
+      agentId: 'h1',
+      tokenId: null,
+      lifecycleClass: 'static' as const,
+      labels: ['role:web'],
+      hostname: 'h1',
+      platform: 'linux',
+      arch: 'x64',
+      instanceId: 'orch-A',
+      ...over,
+    });
+
+    it('omits a scaler-spawned host', async () => {
+      await store.upsert(host({ agentId: 'fleet-1' }));
+      await store.upsert(host({ agentId: 'scaler-1', scalerManaged: true }));
+
+      const targets = await store.findFanoutTargets([[exact('role:web')]], [], grace);
+      expect(targets.map((h) => h.agentId)).toEqual(['fleet-1']);
+    });
+
+    it('KEEPS an ephemeral-classed host that no scaler spawned', async () => {
+      // The auth-none guard. `lifecycle_class` snapshots the auth TOKEN's type,
+      // and every agent registers as `ephemeral` when the auth mode is `none` —
+      // which staging and every E2E deploy use. Keying fan-out eligibility on
+      // the class would match nothing there and fail every `runsOnAll` with
+      // "matched zero usable hosts". Eligibility keys on `scaler_managed`, so an
+      // ephemeral-classed fleet host stays a target.
+      await store.upsert(host({ agentId: 'authnone-1', lifecycleClass: 'ephemeral' }));
+
+      const targets = await store.findFanoutTargets([[exact('role:web')]], [], grace);
+      expect(targets.map((h) => h.agentId)).toEqual(['authnone-1']);
+    });
+
+    it('findMatching still returns BOTH, so inventory.query is unaffected', async () => {
+      // The `ctx.kici.inventory` guard. `findMatching` also backs the SDK's
+      // `inventory.query`, where filtering scaler agents out would make a
+      // selector return FEWER hosts than no selector at all — and would drop
+      // auto-scaler agents from a surface whose `lifecycleClass` field exists to
+      // distinguish them. The fan-out filter lives on its own method only.
+      await store.upsert(host({ agentId: 'fleet-1' }));
+      await store.upsert(host({ agentId: 'scaler-1', scalerManaged: true }));
+
+      const all = await store.findMatching([[exact('role:web')]], [], grace);
+      expect(all.map((h) => h.agentId)).toEqual(['fleet-1', 'scaler-1']);
+
+      const inventory = await store.queryInventory({ include: [[exact('role:web')]] }, grace);
+      expect(inventory.map((h) => h.agentId)).toEqual(['fleet-1', 'scaler-1']);
+    });
+
+    it('re-registration converges scaler_managed rather than keeping a stale value', async () => {
+      // Guards the `onConflict` branch of `upsert`: writing the column only in
+      // `values()` would leave a re-registering agent on whatever it was first
+      // enrolled as, in both directions.
+      await store.upsert(host({ agentId: 'h1', scalerManaged: true }));
+      expect(await store.findFanoutTargets([[exact('role:web')]], [], grace)).toEqual([]);
+
+      await store.upsert(host({ agentId: 'h1', scalerManaged: false }));
+      const targets = await store.findFanoutTargets([[exact('role:web')]], [], grace);
+      expect(targets.map((h) => h.agentId)).toEqual(['h1']);
+
+      await store.upsert(host({ agentId: 'h1', scalerManaged: true }));
+      expect(await store.findFanoutTargets([[exact('role:web')]], [], grace)).toEqual([]);
+    });
+
+    it('a host declared by the operator is never scaler-managed', async () => {
+      await store.declareStatic({ agentId: 'declared-1', labels: ['role:web'] });
+      const targets = await store.findFanoutTargets([[exact('role:web')]], [], grace);
+      expect(targets.map((h) => h.agentId)).toEqual(['declared-1']);
+    });
+  });
+
   describe('host properties + inventory', () => {
     const grace = 5 * 60_000;
     const baseUpsert = (over: Partial<Parameters<HostRosterStore['upsert']>[0]>) => ({

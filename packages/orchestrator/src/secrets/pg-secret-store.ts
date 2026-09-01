@@ -374,13 +374,17 @@ export class PgSecretStore implements SecretStore {
           keyVersion: row.key_version,
         };
         const plaintext = this.decryptWithFallback(encrypted, oldAad);
-        const reEncrypted = encrypt(plaintext, this.masterKey, row.key_version, newAad);
+        // Re-encrypt under the store's current key, so the recorded key_version
+        // must name that key's generation — not the row's stale one. Persist the
+        // version off the returned EncryptedValue so label and bytes cannot drift.
+        const reEncrypted = encrypt(plaintext, this.masterKey, this.keyVersion, newAad);
 
         await trx
           .updateTable('scoped_secrets')
           .set({
             scope: newScope,
             encrypted_value: reEncrypted.data,
+            key_version: reEncrypted.keyVersion,
             updated_at: sql`now()`,
           })
           .where('id', '=', row.id)

@@ -72,39 +72,46 @@ describe('DepCache', () => {
       expect(result).toBeNull();
     });
 
-    it('returns url without hash for entries without companion hash file', async () => {
-      // Store tarball but no hash file (simulates old cache entries)
-      await storage.put('deps/linux-x64/abc123.tar.gz', Buffer.from('tarball-data'));
+    it('treats a tarball with no pointer as a miss', async () => {
+      // A deliberate behavior change. The old layout returned a URL with an
+      // undefined hash here, so the agent downloaded the tarball with NO
+      // integrity check at all. Under content-addressing an object nothing
+      // points at is unreachable by design: report a miss and rebuild rather
+      // than hand out bytes we cannot verify.
+      await storage.put('deps/linux-x64/deadbeef.tar.gz', Buffer.from('tarball-data'));
 
-      const result = await cache.getUrlAndHash('abc123', 'linux', 'x64');
-      expect(result).not.toBeNull();
-      expect(result!.url).toContain('deps/linux-x64/abc123.tar.gz');
-      expect(result!.hash).toBeUndefined();
+      expect(await cache.getUrlAndHash('abc123', 'linux', 'x64')).toBeNull();
     });
 
-    it('returns url and hash when companion hash file exists', async () => {
-      // Store tarball and companion hash file
-      await storage.put('deps/linux-x64/abc123.tar.gz', Buffer.from('tarball-data'));
-      await storage.put('deps/linux-x64/abc123.hash', 'sha256-content-hash');
+    it('resolves the pointer and returns a url addressed by the content hash', async () => {
+      await cache.store('abc123', 'linux', 'x64', Buffer.from('tarball-data'));
 
       const result = await cache.getUrlAndHash('abc123', 'linux', 'x64');
       expect(result).not.toBeNull();
-      expect(result!.url).toContain('deps/linux-x64/abc123.tar.gz');
-      expect(result!.hash).toBe('sha256-content-hash');
+      expect(result!.hash).toBeDefined();
+      expect(result!.url).toContain(`deps/linux-x64/${result!.hash}.tar.gz`);
+    });
+
+    it('treats a pointer whose tarball is gone as a miss, not a hit', async () => {
+      // The two halves expire independently, so a live pointer can outlast its
+      // tarball. Reporting a hit there dispatches a URL that 404s on the agent.
+      await cache.store('abc123', 'linux', 'x64', Buffer.from('tarball-data'));
+      const hit = await cache.getUrlAndHash('abc123', 'linux', 'x64');
+      await storage.delete(`deps/linux-x64/${hit!.hash}.tar.gz`);
+
+      expect(await cache.getUrlAndHash('abc123', 'linux', 'x64')).toBeNull();
+      expect(await cache.has('abc123', 'linux', 'x64')).toBe(false);
     });
 
     it('uses platform-specific keys', async () => {
-      await storage.put('deps/darwin-arm64/lock1.tar.gz', Buffer.from('data'));
-      await storage.put('deps/darwin-arm64/lock1.hash', 'hash-arm64');
+      await cache.store('lock1', 'darwin', 'arm64', Buffer.from('data'));
 
-      // Should find darwin/arm64 entry
       const result = await cache.getUrlAndHash('lock1', 'darwin', 'arm64');
       expect(result).not.toBeNull();
-      expect(result!.hash).toBe('hash-arm64');
+      expect(result!.url).toContain('deps/darwin-arm64/');
 
-      // Should not find linux/x64 entry
-      const miss = await cache.getUrlAndHash('lock1', 'linux', 'x64');
-      expect(miss).toBeNull();
+      // The same lockfile on another platform is a separate entry.
+      expect(await cache.getUrlAndHash('lock1', 'linux', 'x64')).toBeNull();
     });
   });
 
@@ -147,6 +154,12 @@ describe('DepCache', () => {
       const calls: (number | undefined)[] = [];
       const recordingStorage = {
         ...storage,
+        // The pointer read is a storage read too, so it must carry the override
+        // as well — it is now the FIRST read on both paths.
+        get: async (_k: string, ttlMsOverride?: number) => {
+          calls.push(ttlMsOverride);
+          return Buffer.from('deadbeefhash');
+        },
         has: async (_k: string, ttlMsOverride?: number) => {
           calls.push(ttlMsOverride);
           return true;
@@ -164,9 +177,79 @@ describe('DepCache', () => {
       });
       await ttlCache.has('lock1', 'linux', 'x64');
       await ttlCache.getUrl('lock1', 'linux', 'x64');
-      // 7 days → ms override on every read/expiry call.
+      // 7 days → ms override on every read/expiry call. Each path now makes two
+      // reads: resolve the pointer (`get`), then the tarball (`has` / `getUrl`).
       const sevenDaysMs = 7 * 86_400_000;
-      expect(calls).toEqual([sevenDaysMs, sevenDaysMs]);
+      expect(calls).toEqual([sevenDaysMs, sevenDaysMs, sevenDaysMs, sevenDaysMs]);
     });
+  });
+});
+
+/**
+ * Two builds that share a lockfile, platform and arch also share the dep-cache
+ * keys. The tarball and its expected hash used to be two independently-written
+ * objects under lockfile-derived names, so concurrent builders could leave the
+ * `.tar.gz` from one and the `.hash` from the other — a mismatched pair the
+ * reader could not detect until the agent failed verification, durably, on
+ * every retry.
+ *
+ * Observed in production of the `cache-cross-platform` E2E category: one webhook
+ * triggers two workflows whose build jobs both run on linux-x64, and the reader
+ * downloaded builder A's tarball while holding builder B's hash.
+ *
+ * Content-addressing the tarball makes that state unrepresentable — the hash IS
+ * the key, so any pair a reader can observe is self-consistent.
+ */
+describe('DepCache — concurrent writers cannot produce a mismatched pair', () => {
+  let storage: InMemoryCacheStorage;
+  let cache: DepCache;
+
+  beforeEach(() => {
+    storage = new InMemoryCacheStorage();
+    cache = new DepCache({ storage });
+  });
+
+  /** Two builders, same lockfile/platform/arch, byte-different tarballs. */
+  const LOCK = 'sharedlock';
+  const A = Buffer.from('tarball produced by builder A');
+  const B = Buffer.from('tarball produced by builder B — different bytes');
+
+  it('returns a url whose bytes hash to the hash it returns, after interleaved writes', async () => {
+    // Interleaved worst case: A stores, B stores, and the reader looks up in
+    // between and after. Every observation must be self-consistent.
+    await cache.store(LOCK, 'linux', 'x64', A);
+    const afterA = await cache.getUrlAndHash(LOCK, 'linux', 'x64');
+    await cache.store(LOCK, 'linux', 'x64', B);
+    const afterB = await cache.getUrlAndHash(LOCK, 'linux', 'x64');
+
+    for (const observed of [afterA, afterB]) {
+      expect(observed).not.toBeNull();
+      // The url must address an object whose content hashes to `hash`.
+      const key = observed!.url.replace('https://mock-s3.example.com/', '');
+      const bytes = await storage.get(key);
+      expect(bytes).not.toBeNull();
+      const { createHash } = await import('node:crypto');
+      const actual = createHash('sha256').update(bytes!).digest('hex');
+      expect(actual).toBe(observed!.hash);
+    }
+  });
+
+  it("keeps the earlier tarball readable after a second builder's write", async () => {
+    // A reader that resolved the pointer before B landed still has a valid
+    // object to fetch — content-addressed keys are never overwritten in place.
+    await cache.store(LOCK, 'linux', 'x64', A);
+    const early = await cache.getUrlAndHash(LOCK, 'linux', 'x64');
+    await cache.store(LOCK, 'linux', 'x64', B);
+
+    const key = early!.url.replace('https://mock-s3.example.com/', '');
+    const bytes = await storage.get(key);
+    expect(bytes?.toString()).toBe(A.toString());
+  });
+
+  it('addresses the tarball by its content hash, not by the lockfile hash', async () => {
+    await cache.store(LOCK, 'linux', 'x64', A);
+    const result = await cache.getUrlAndHash(LOCK, 'linux', 'x64');
+    expect(result!.url).toContain(result!.hash);
+    expect(result!.url).not.toContain(`${LOCK}.tar.gz`);
   });
 });

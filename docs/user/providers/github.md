@@ -141,37 +141,21 @@ the manifest flow — follow these steps.
 
 5. **Pick permissions.** Minimum required:
 
-   | Scope                       | Access       | Why                                                                                                                                                       |
-   | --------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | Repository -> Contents      | Read         | Clone the repo to read the lock file                                                                                                                      |
-   | Repository -> Metadata      | Read (auto)  | Default for every App; also lets KiCI look up a pull-request author's repository access level for CI trust                                                |
-   | Repository -> Pull requests | Read         | Match `pull_request` triggers                                                                                                                             |
-   | Repository -> Checks        | Read & write | Post KiCI's enriched Check runs                                                                                                                           |
-   | Organization -> Members     | Read         | (optional, org installs) Receive `organization` / `membership` / `team` events so KiCI's CI-trust permission cache invalidates promptly on access changes |
+   | Scope                       | Access       | Why                                  |
+   | --------------------------- | ------------ | ------------------------------------ |
+   | Repository -> Contents      | Read         | Clone the repo to read the lock file |
+   | Repository -> Metadata      | Read (auto)  | Default for every App                |
+   | Repository -> Pull requests | Read         | Match `pull_request` triggers        |
+   | Repository -> Checks        | Read & write | Post KiCI's enriched Check runs      |
 
-   The first four rows cover the core flow (clone, trigger matching,
-   Check runs). The **Organization -> Members** row is only relevant if
-   you use [CI trust tiers](../../architecture/security/ci-security.md)
-   on an org-level install — see the event note below.
+   Those four cover the whole flow: clone, trigger matching, Check runs.
+   [CI trust](../../architecture/security/ci-security.md) needs no
+   permission of its own — it reads the fork relationship straight out of
+   the webhook payload and calls no GitHub API.
 
 6. **Subscribe to events.** At minimum: `push`, `pull_request`,
    `check_run`, `check_suite`. Add others (`issues`, `release`, ...) if
    your workflows use those triggers.
-
-   **For CI trust (optional but recommended on org installs):** also
-   subscribe to `member`, `organization`, `membership`, and `team`.
-   KiCI caches each pull-request author's repository access level (used
-   to decide whether workflow changes take effect immediately or are
-   held for approval — see
-   [CI security](../../architecture/security/ci-security.md)). These
-   events let the orchestrator drop stale cache entries the moment a
-   contributor's access changes. They are not required for correctness:
-   without them the cache simply ages out on its own 15-minute TTL, so a
-   permission change can take up to 15 minutes to take effect. The
-   `organization` / `membership` / `team` events require the
-   **Organization -> Members** read permission and an org-level
-   installation; `member` is a repository event covered by the default
-   Metadata permission.
 
 7. **Generate a private key.** Scroll to the bottom of the App settings
    and click _Generate a private key_. A `.pem` file downloads —

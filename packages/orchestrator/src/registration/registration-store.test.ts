@@ -715,6 +715,135 @@ describe('RegistrationStore', () => {
     });
   });
 
+  describe('replaceAll with the default branch', () => {
+    it('should store defaultBranch for new workflows', async () => {
+      const { db, mocks } = createMockDb({ trxSelectResult: [] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          defaultBranch: 'main',
+        },
+      );
+
+      expect(mocks.trxInsertValues.mock.calls[0][0].default_branch).toBe('main');
+    });
+
+    it('should store defaultBranch for existing workflows', async () => {
+      const existing = [makeRegistrationRow({ workflow_name: 'wf-1', customer_id: 'cust-1' })];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+          defaultBranch: 'main',
+        },
+      );
+
+      expect(mocks.trxUpdateSet.mock.calls[0][0].default_branch).toBe('main');
+    });
+
+    it('should write null on INSERT when no default branch was resolved', async () => {
+      const { db, mocks } = createMockDb({ trxSelectResult: [] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        {
+          customerId: 'cust-1',
+        },
+      );
+
+      expect(mocks.trxInsertValues.mock.calls[0][0].default_branch).toBeNull();
+    });
+
+    it('should PRESERVE an existing default branch when the caller supplies none', async () => {
+      // The manual registration route (`kici-admin workflow register-manual`
+      // over HTTP) restates a registration without knowing the repo's default
+      // branch. Writing null there would erase what a default-branch push
+      // proved and silently re-break a branch-restricted scheduled run, with no
+      // recovery until the repo's next default-branch push. The sibling direct
+      // path (`registerWorkflowManualDirect`) leaves the column out of its
+      // upsert for the same reason, so the two manual paths must agree.
+      const existing = [
+        makeRegistrationRow({
+          workflow_name: 'wf-1',
+          customer_id: 'cust-1',
+          default_branch: 'main',
+        }),
+      ];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        { customerId: 'cust-1' },
+      );
+
+      expect(mocks.trxUpdateSet.mock.calls[0][0]).not.toHaveProperty('default_branch');
+    });
+
+    it('should CLEAR an existing default branch when the caller explicitly passes null', async () => {
+      // Distinct from omission: an explicit null says the caller looked and the
+      // payload named none, so a stored value is stale and must go.
+      const existing = [
+        makeRegistrationRow({
+          workflow_name: 'wf-1',
+          customer_id: 'cust-1',
+          default_branch: 'main',
+        }),
+      ];
+      const { db, mocks } = createMockDb({ trxSelectResult: existing });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        { customerId: 'cust-1', defaultBranch: null },
+      );
+
+      expect(mocks.trxUpdateSet.mock.calls[0][0].default_branch).toBeNull();
+    });
+
+    it('parseRow surfaces default_branch as defaultBranch', async () => {
+      const rows = [makeRegistrationRow({ default_branch: 'main' })];
+      const { db } = createMockDb({ selectManyResult: rows });
+      const store = new RegistrationStore(db);
+
+      const result = await store.getAll();
+
+      expect(result[0].defaultBranch).toBe('main');
+    });
+
+    it('parseRow surfaces a missing default_branch as null, never a fabricated branch', async () => {
+      const rows = [makeRegistrationRow()];
+      const { db } = createMockDb({ selectManyResult: rows });
+      const store = new RegistrationStore(db);
+
+      const result = await store.getAll();
+
+      expect(result[0].defaultBranch).toBeNull();
+    });
+  });
+
   describe('getAll', () => {
     it('should return all registrations with parsed lock_entry', async () => {
       const wf = makeLockWorkflow('on-deploy');

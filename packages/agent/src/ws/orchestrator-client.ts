@@ -9,6 +9,7 @@ import {
   mergeAutoLabels,
   resolveRoleLabels,
 } from '@kici-dev/engine';
+import { runtimeFactLabels } from '../execution/image-build/runtime-facts.js';
 import {
   orchestratorToAgentMessageSchema,
   heartbeatSchema,
@@ -16,6 +17,7 @@ import {
   WS_MAX_PAYLOAD_BYTES,
   WS_CLOSE_AGENT_AUTH_FAILED,
   type AgentToOrchestratorMessage,
+  type OrchestratorToAgentMessage,
   type JobDispatch,
   type JobCancel,
   type FleetLogsRequest,
@@ -112,6 +114,14 @@ export interface OrchestratorClientOptions {
   onJobCancel: (cancel: JobCancel) => void;
   /** Agent authentication token (kat_ prefixed). When provided, sends auth.request before agent.register. */
   token?: string;
+  /**
+   * Self-bootstrap claim code. When set and no static `token` is present, the
+   * client exchanges it for its own ephemeral credentials via
+   * `scaler.claim-credentials` on WS open — before any auth / register — then
+   * adopts the minted token, agentId, and labels. A rejected or expired code
+   * fails permanently (no reconnect). Ignored when a static `token` is present.
+   */
+  scalerClaimCode?: string;
   /** Heartbeat interval in ms. Default: 30000 (30s). */
   heartbeatIntervalMs?: number;
   /** Maximum reconnect delay in ms. Default: 60000 (60s). */
@@ -208,6 +218,23 @@ export class OrchestratorClient {
     }
   >();
 
+  /** Pending scaler.claim-credentials requests awaiting orchestrator response. */
+  private readonly pendingClaimCredentialsRequests = new Map<
+    string,
+    {
+      resolve: (response: {
+        credentials?: {
+          agentToken: string;
+          agentId: string;
+          orchestratorUrl: string;
+          labels: string[];
+        };
+        error?: string;
+      }) => void;
+      reject: (err: Error) => void;
+    }
+  >();
+
   /** Pending user-cache restore/save requests awaiting orchestrator response. */
   private readonly pendingUserCacheRequests = new Map<
     string,
@@ -270,12 +297,15 @@ export class OrchestratorClient {
   >();
 
   private readonly url: string;
-  private readonly agentId: string;
-  private readonly labels: string[];
+  // Not readonly: a self-bootstrap claim exchange (scalerClaimCode) adopts the
+  // minted agentId / labels / token before the first auth + register.
+  private agentId: string;
+  private labels: string[];
   private readonly properties: Record<string, string | number | boolean>;
   private readonly onJobDispatch: (dispatch: JobDispatch) => void;
   private readonly onJobCancel: (cancel: JobCancel) => void;
-  private readonly token?: string;
+  private token?: string;
+  private readonly scalerClaimCode?: string;
   private readonly heartbeatIntervalMs: number;
   private readonly maxReconnectDelayMs: number;
   private readonly getInFlightJobs?: () => Array<{ jobId: string; runId: string }>;
@@ -301,8 +331,24 @@ export class OrchestratorClient {
    * `pendingDispatch` is set by the orchestrator when a queued job has been
    * pre-bound to this agent and the dispatch.job message is in flight. The
    * agent must defer arming the short scaler-idle timer in this case.
+   *
+   * `warmPool` is set when this agent was pre-spawned to wait for work rather
+   * than for a specific queued job. The agent must arm no idle timer at all:
+   * the orchestrator's warm-pool reaper owns its lifetime.
    */
-  onRegistered: ((info: { pendingDispatch: boolean }) => void) | null = null;
+  onRegistered: ((info: { pendingDispatch: boolean; warmPool: boolean }) => void) | null = null;
+
+  /**
+   * Callback invoked when a self-bootstrap claim exchange fails permanently
+   * (invalid / expired / already-consumed claim code, or the exchange itself
+   * errored or timed out). Only ever fires in self-bootstrap mode
+   * (`scalerClaimCode` set, no static token) — a statically-tokened agent never
+   * runs the claim exchange. A one-shot self-bootstrap agent cannot make any
+   * further progress after this, so server.ts wires it to a non-zero graceful
+   * shutdown; without it the health HTTP server keeps the process alive and a
+   * GitHub Actions run hangs until the job timeout.
+   */
+  onClaimFailedPermanently: ((reason: string) => void) | null = null;
 
   constructor(options: OrchestratorClientOptions) {
     this.url = options.url;
@@ -312,6 +358,7 @@ export class OrchestratorClient {
     this.onJobDispatch = options.onJobDispatch;
     this.onJobCancel = options.onJobCancel;
     this.token = options.token;
+    this.scalerClaimCode = options.scalerClaimCode;
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
     this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? 60_000;
     this.getInFlightJobs = options.getInFlightJobs;
@@ -448,7 +495,13 @@ export class OrchestratorClient {
   async requestUploadUrl(
     jobId: string,
     cacheType: 'source' | 'deps',
-    key: { contentHash?: string; lockfileHash?: string; platform: string; arch: string },
+    key: {
+      contentHash?: string;
+      lockfileHash?: string;
+      depsHash?: string;
+      platform: string;
+      arch: string;
+    },
   ): Promise<string> {
     const messageId = randomUUID();
     return new Promise<string>((resolve, reject) => {
@@ -596,6 +649,50 @@ export class OrchestratorClient {
         emitMsg.target = target;
       }
       this.sendDirect(emitMsg as AgentToOrchestratorMessage);
+    });
+  }
+
+  /**
+   * Send a scaler.claim-credentials WS message and await the response.
+   *
+   * Used by a provisioning workflow (via `ctx.kici.scaler.claimAgentCredentials`)
+   * to exchange a single-use claim code — delivered on a `kici.scaler.scale-up`
+   * event — for freshly minted ephemeral agent credentials. The token rides the
+   * response only; it is never logged. Times out after 15 seconds (matching the
+   * generic agent-API request timeout).
+   */
+  async sendClaimCredentials(claimCode: string): Promise<{
+    credentials?: {
+      agentToken: string;
+      agentId: string;
+      orchestratorUrl: string;
+      labels: string[];
+    };
+    error?: string;
+  }> {
+    const requestId = randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingClaimCredentialsRequests.delete(requestId);
+        reject(new Error('scaler.claim-credentials timed out'));
+      }, 15_000);
+
+      this.pendingClaimCredentialsRequests.set(requestId, {
+        resolve: (response) => {
+          clearTimeout(timer);
+          resolve(response);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      });
+
+      this.sendDirect({
+        type: 'scaler.claim-credentials',
+        requestId,
+        claimCode,
+      } as AgentToOrchestratorMessage);
     });
   }
 
@@ -1058,31 +1155,7 @@ export class OrchestratorClient {
     }
 
     this.ws.on('open', () => {
-      if (this.token) {
-        // Token provided: send auth.request first, then agent.register after auth.success
-        this._state = 'authenticating';
-        logger.info('Connected to orchestrator, sending auth.request', {
-          url: this.url,
-          agentId: this.agentId,
-        });
-
-        this.ws!.send(
-          JSON.stringify({
-            type: 'auth.request',
-            token: this.token,
-            protocolVersion: PROTOCOL_VERSION,
-          }),
-        );
-      } else {
-        // No token: send agent.register directly (unauthenticated mode)
-        this._state = 'registering';
-        logger.info('Connected to orchestrator, sending agent.register (no token)', {
-          url: this.url,
-          agentId: this.agentId,
-        });
-
-        this.sendAgentRegister();
-      }
+      void this.onWsOpen();
     });
 
     this.ws.on('message', (data: WebSocket.Data) => {
@@ -1136,6 +1209,12 @@ export class OrchestratorClient {
         pending.reject(new Error('WebSocket disconnected'));
       }
       this.pendingApiRequests.clear();
+
+      // Reject all pending scaler-credential claims on disconnect
+      for (const [_id, pending] of this.pendingClaimCredentialsRequests) {
+        pending.reject(new Error('WebSocket disconnected'));
+      }
+      this.pendingClaimCredentialsRequests.clear();
 
       // Reject all pending user-cache requests on disconnect
       for (const [_id, pending] of this.pendingUserCacheRequests) {
@@ -1196,6 +1275,120 @@ export class OrchestratorClient {
         this.ws.close();
       }
     });
+  }
+
+  /**
+   * WS-open handshake driver.
+   *
+   * Self-bootstrap runs first: when a `scalerClaimCode` is set and no static
+   * token is present, the client exchanges the single-use code for its own
+   * ephemeral credentials over `scaler.claim-credentials` — before any auth or
+   * register — and adopts the minted token, agentId, and labels. A rejected or
+   * expired code fails permanently (no reconnect), so a one-shot provisioning
+   * run exits visibly rather than looping.
+   *
+   * Then the normal handshake: with a token (static or just-minted) send
+   * `auth.request` and register after `auth.success`; without one, register
+   * directly (unauthenticated mode).
+   */
+  private async onWsOpen(): Promise<void> {
+    if (this.scalerClaimCode && !this.token) {
+      const adopted = await this.performClaimExchange(this.scalerClaimCode);
+      if (!adopted) return; // permanent failure — do not auth or register
+    }
+
+    if (this.token) {
+      // Token provided (static or minted): send auth.request first, then
+      // agent.register after auth.success.
+      this._state = 'authenticating';
+      logger.info('Connected to orchestrator, sending auth.request', {
+        url: this.url,
+        agentId: this.agentId,
+      });
+
+      this.ws!.send(
+        JSON.stringify({
+          type: 'auth.request',
+          token: this.token,
+          protocolVersion: PROTOCOL_VERSION,
+        }),
+      );
+    } else {
+      // No token: send agent.register directly (unauthenticated mode)
+      this._state = 'registering';
+      logger.info('Connected to orchestrator, sending agent.register (no token)', {
+        url: this.url,
+        agentId: this.agentId,
+      });
+
+      this.sendAgentRegister();
+    }
+  }
+
+  /**
+   * Exchange the single-use claim code for ephemeral credentials, adopting the
+   * minted token / agentId / labels on success. Returns true when credentials
+   * were adopted; false when the claim failed permanently (the connection has
+   * already been torn down with no reconnect).
+   */
+  private async performClaimExchange(claimCode: string): Promise<boolean> {
+    logger.info('Self-bootstrap: exchanging claim code for ephemeral credentials', {
+      url: this.url,
+      agentId: this.agentId,
+    });
+
+    let response: Awaited<ReturnType<typeof this.sendClaimCredentials>>;
+    try {
+      response = await this.sendClaimCredentials(claimCode);
+    } catch (err) {
+      this.failClaimPermanently(`claim exchange failed: ${toErrorMessage(err)}`);
+      return false;
+    }
+
+    if (response.error || !response.credentials) {
+      this.failClaimPermanently(response.error ?? 'orchestrator returned no credentials');
+      return false;
+    }
+
+    const { agentToken, agentId, labels } = response.credentials;
+    this.token = agentToken;
+    this.agentId = agentId;
+    this.labels = this.mergeClaimedLabels(labels);
+    logger.info('Self-bootstrap: adopted ephemeral credentials', { agentId });
+    return true;
+  }
+
+  /**
+   * Merge the claim-minted labels into the agent's own label set, deduped. The
+   * self-reported `kici:os:` / `kici:arch:` / `kici:host:` facts are derived at
+   * register time (`sendAgentRegister`), so they survive regardless.
+   */
+  private mergeClaimedLabels(claimed: string[]): string[] {
+    return [...new Set([...this.labels, ...claimed])];
+  }
+
+  /**
+   * Fail a self-bootstrap claim permanently, using the same no-reconnect
+   * mechanism as `auth.failure`: mark the auth context dead, suppress reconnect,
+   * and close the socket. A one-shot provisioning run then exits visibly.
+   */
+  private failClaimPermanently(reason: string): void {
+    logger.error(
+      'Self-bootstrap claim exchange failed -- claim code is invalid or expired. NOT retrying.',
+      { reason },
+    );
+    this.authFailed = true;
+    this.intentionalDisconnect = true;
+    if (this.ws) {
+      this.ws.close(1000, 'Claim failed');
+      this.ws = null;
+    }
+    this._state = 'disconnected';
+
+    // A one-shot self-bootstrap agent has no path forward from here. Surface the
+    // permanent failure so server.ts can terminate the process (non-zero)
+    // instead of leaving the health server to keep it alive until a job timeout.
+    this.onClaimFailedPermanently?.(reason);
   }
 
   /**
@@ -1376,6 +1569,72 @@ export class OrchestratorClient {
     return false;
   }
 
+  /**
+   * Resolve a pending scaler credential-claim request from its response
+   * message. Returns true when it handled the message. Extracted from
+   * handleMessage so that dispatcher stays under the function-length limit.
+   */
+  private handleClaimCredentialsResponse(rawMsg: {
+    type?: string;
+    requestId?: string;
+    error?: string;
+  }): boolean {
+    if (rawMsg.type !== 'scaler.claim-credentials.response') return false;
+    const pending = this.pendingClaimCredentialsRequests.get(rawMsg.requestId!);
+    if (pending) {
+      this.pendingClaimCredentialsRequests.delete(rawMsg.requestId!);
+      pending.resolve({
+        credentials: (rawMsg as Record<string, unknown>).credentials as
+          | { agentToken: string; agentId: string; orchestratorUrl: string; labels: string[] }
+          | undefined,
+        error: rawMsg.error,
+      });
+    }
+    return true;
+  }
+
+  /**
+   * Complete registration: adopt the orchestrator's negotiated capabilities,
+   * enter the `registered` state, flush everything parked while disconnected,
+   * and hand the ack's lifetime flags to `onRegistered`.
+   */
+  private handleRegisterAck(msg: Extract<OrchestratorToAgentMessage, { type: 'register.ack' }>) {
+    logger.info('Registration acknowledged by orchestrator', {
+      agentId: msg.agentId,
+      labels: msg.labels,
+      scalerManaged: msg.scalerManaged,
+      pendingDispatch: msg.pendingDispatch ?? false,
+      warmPool: msg.warmPool ?? false,
+    });
+
+    // Optional agent-facing features are gated on what this orchestrator
+    // advertises; absent means "stay on the unnegotiated behavior".
+    this.orchCapabilities = msg.capabilities;
+
+    // Transition to registered state
+    this._state = 'registered';
+    this.reconnectAttempts = 0;
+    this.startHeartbeat();
+    this.flushBuffer();
+
+    // Completes parked by the disconnect sweep go out again now that this
+    // connection's capabilities are known.
+    this.resendHeldCompletes();
+
+    this.onRegistered?.({
+      pendingDispatch: msg.pendingDispatch ?? false,
+      warmPool: msg.warmPool ?? false,
+    });
+
+    // Block MMDS access if in Firecracker/scaler-managed mode
+    if (msg.scalerManaged || this.scalerManaged) {
+      this.blockMmdsAccess();
+    }
+
+    // Send config.ack to orchestrator
+    this.sendConfigAck(msg.agentId);
+  }
+
   private handleMessage(data: WebSocket.Data): void {
     let raw: unknown;
     try {
@@ -1417,6 +1676,12 @@ export class OrchestratorClient {
           error: rawMsg.error,
         });
       }
+      return;
+    }
+
+    // Handle scaler.claim-credentials.response (orchestrator -> agent, minted
+    // ephemeral credentials for a provisioning workflow, or an error).
+    if (this.handleClaimCredentialsResponse(rawMsg)) {
       return;
     }
 
@@ -1503,36 +1768,7 @@ export class OrchestratorClient {
         }
 
         case 'register.ack': {
-          logger.info('Registration acknowledged by orchestrator', {
-            agentId: msg.agentId,
-            labels: msg.labels,
-            scalerManaged: msg.scalerManaged,
-            pendingDispatch: msg.pendingDispatch ?? false,
-          });
-
-          // Optional agent-facing features are gated on what this orchestrator
-          // advertises; absent means "stay on the unnegotiated behavior".
-          this.orchCapabilities = msg.capabilities;
-
-          // Transition to registered state
-          this._state = 'registered';
-          this.reconnectAttempts = 0;
-          this.startHeartbeat();
-          this.flushBuffer();
-
-          // Completes parked by the disconnect sweep go out again now that this
-          // connection's capabilities are known.
-          this.resendHeldCompletes();
-
-          this.onRegistered?.({ pendingDispatch: msg.pendingDispatch ?? false });
-
-          // Block MMDS access if in Firecracker/scaler-managed mode
-          if (msg.scalerManaged || this.scalerManaged) {
-            this.blockMmdsAccess();
-          }
-
-          // Send config.ack to orchestrator
-          this.sendConfigAck(msg.agentId);
+          this.handleRegisterAck(msg);
           break;
         }
 
@@ -1798,6 +2034,10 @@ export class OrchestratorClient {
     const autoLabels = [
       ...deriveOsArchLabels(os.platform(), os.arch()),
       hostLabel(os.hostname()),
+      // What this host can do with containers. A self-reported FACT, like
+      // os/arch/host — the orchestrator cannot know it, and the scaler cannot
+      // predict it when it mints the agent's token.
+      ...runtimeFactLabels(),
       ...resolveRoleLabels(this.roles),
     ];
     const allLabels = mergeAutoLabels(this.labels, autoLabels);

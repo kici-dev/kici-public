@@ -5,6 +5,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Hono } from 'hono';
 import { createConfigAdminRoutes, type ConfigRouteDeps } from './admin-config.js';
+import { AUTH_ERROR } from './admin-auth.js';
 import type { SharedConfigStore } from '../config/shared-store.js';
 import type { ConfigReloader } from '../config/reload.js';
 import type { AppConfig } from '../config/types.js';
@@ -69,6 +70,7 @@ describe('admin-config routes', () => {
       const { app } = createTestApp();
       const res = await app.request('/admin/config/export', { method: 'GET' });
       expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: AUTH_ERROR.missing });
     });
 
     it('returns 401 with invalid token', async () => {
@@ -78,6 +80,8 @@ describe('admin-config routes', () => {
         headers: { Authorization: 'Bearer wrong-token' },
       });
       expect(res.status).toBe(401);
+      // Deliberately distinct from the DB-backed routers' AUTH_ERROR.invalid.
+      expect(await res.json()).toEqual({ error: 'Invalid token' });
     });
 
     it('returns 503 when admin token not configured', async () => {

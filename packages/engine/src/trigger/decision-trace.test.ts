@@ -8,6 +8,7 @@ import {
   createGlobalFilterTraceEntry,
   createTraceEntry,
   createWorkflowDecision,
+  TRACE_TEXT_MAX,
 } from './decision-trace.js';
 
 /** A workflow whose triggers matched — the state both global gates run against. */
@@ -173,5 +174,40 @@ describe('createCommitMessageTraceEntry', () => {
     });
     expect(entry.reason?.length).toBeLessThan(500);
     expect(entry.reason).toContain('…');
+  });
+});
+
+describe('trace text bounding', () => {
+  it('truncates every free-text field a trace entry carries', () => {
+    const entry = createTraceEntry(
+      'paths',
+      'i'.repeat(5_000),
+      'v'.repeat(100_000),
+      false,
+      'r'.repeat(5_000),
+    );
+
+    // The `check` label is a fixed vocabulary and is left alone; the three
+    // fields fed from event content are each bounded on their own.
+    expect(entry.check).toBe('paths');
+    expect(entry.pattern.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);
+    expect(entry.value.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);
+    expect(entry.reason?.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);
+    expect(entry.value).toContain('…');
+  });
+
+  it('leaves a short entry byte-identical', () => {
+    const entry = createTraceEntry('branch', 'main', 'main', true, 'ok');
+    expect(entry).toEqual({
+      check: 'branch',
+      pattern: 'main',
+      value: 'main',
+      passed: true,
+      reason: 'ok',
+    });
+  });
+
+  it('keeps an absent reason absent rather than truncating it into a string', () => {
+    expect(createTraceEntry('branch', 'main', 'main', true).reason).toBeUndefined();
   });
 });

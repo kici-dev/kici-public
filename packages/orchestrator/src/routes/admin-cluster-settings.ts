@@ -45,6 +45,7 @@ const COLUMNS = {
   eventLogMaxPayloadBytes: 'event_log_max_payload_bytes',
   lockFileMaxBytes: 'lock_file_max_bytes',
   webhookDedupTtlMs: 'webhook_dedup_ttl_ms',
+  /** @deprecated Read and written; no runtime read consumes it. Removed at v1.0.0. */
   contributorCacheTtlMs: 'contributor_cache_ttl_ms',
   eventRouterEventTtlSeconds: 'event_router_event_ttl_seconds',
   eventRouterMaxDispatchAttempts: 'event_router_max_dispatch_attempts',
@@ -70,6 +71,13 @@ const COLUMNS = {
   globalEvalCandidateTimeoutMs: 'global_eval_candidate_timeout_ms',
   globalEvalCacheMax: 'global_eval_cache_max',
   globalEvalWaitTimeoutMs: 'global_eval_wait_timeout_ms',
+  scalerReapIntervalMs: 'scaler_reap_interval_ms',
+  scalerReapStrandedTimeoutMs: 'scaler_reap_stranded_timeout_ms',
+  scalerReapReattemptIntervalMs: 'scaler_reap_reattempt_interval_ms',
+  scalerClaimRetentionMs: 'scaler_claim_retention_ms',
+  scalerProvisionBackoffBaseMs: 'scaler_provision_backoff_base_ms',
+  scalerProvisionBackoffMaxMs: 'scaler_provision_backoff_max_ms',
+  scalerProvisionMaxConsecutiveFailures: 'scaler_provision_max_consecutive_failures',
 } as const;
 
 type CamelKnob = keyof typeof COLUMNS;
@@ -104,6 +112,7 @@ const updateSchema = z.object({
   eventLogMaxPayloadBytes: z.number().int().min(1024).nullable().optional(),
   lockFileMaxBytes: z.number().int().min(1024).nullable().optional(),
   webhookDedupTtlMs: z.number().int().min(1000).nullable().optional(),
+  /** @deprecated Still accepted and stored; no runtime read consumes it. Removed at v1.0.0. */
   contributorCacheTtlMs: z.number().int().min(1000).nullable().optional(),
   eventRouterEventTtlSeconds: z.number().int().min(1).nullable().optional(),
   eventRouterMaxDispatchAttempts: z.number().int().min(1).nullable().optional(),
@@ -161,6 +170,51 @@ const updateSchema = z.object({
    * merely waited for an agent.
    */
   globalEvalWaitTimeoutMs: z.number().int().min(1000).nullable().optional(),
+  /**
+   * Event-scaler provision reaper. All four are read per sweep, so a change
+   * lands on the next tick with no restart — the interval itself reschedules
+   * the timer at the end of the sweep that observed it.
+   *
+   * Floor of 5s on the interval: the sweep does a table scan plus a delete, so
+   * a sub-second value would hammer the database for a backstop whose whole
+   * point is to run rarely.
+   */
+  scalerReapIntervalMs: z.number().int().min(5000).nullable().optional(),
+  /**
+   * Set the stranded window well above the peer heartbeat period. "Registered
+   * nowhere in the cluster" is partly heartbeat-derived, so a short window can
+   * read a peer that has not yet reported its agents as a strand and tear down
+   * a live provision. The floor is one minute, not a safe setting.
+   */
+  scalerReapStrandedTimeoutMs: z.number().int().min(60_000).nullable().optional(),
+  scalerReapReattemptIntervalMs: z.number().int().min(60_000).nullable().optional(),
+  /**
+   * Retention for expired provisioning claims. Floor of 0: an expired claim can
+   * never be redeemed, so purging it the moment it expires is a legitimate
+   * setting — it only costs a late redeemer the "expired" diagnostic.
+   */
+  scalerClaimRetentionMs: z.number().int().min(0).nullable().optional(),
+  /**
+   * External-provision backoff. All three are read per spawn request, so a
+   * change lands on the next request with no restart.
+   *
+   * Floor of 1s on the base: the point of the deferral is to stop hammering a
+   * provider that is already refusing work, and a sub-second first step defers
+   * nothing in practice. The ceiling carries the same floor, so no setting can
+   * cap a deferral below one second. Their ORDERING is checked in the PATCH
+   * handler instead, against the effective pair — the patch overlaid on the
+   * stored row. A patch that lowers only the ceiling carries no base for a
+   * schema-level check to compare it against, and that is the case an operator
+   * actually reaches.
+   */
+  scalerProvisionBackoffBaseMs: z.number().int().min(1000).nullable().optional(),
+  scalerProvisionBackoffMaxMs: z.number().int().min(1000).nullable().optional(),
+  /**
+   * Floor of 1: the count is "how many consecutive failures before the refusal
+   * names repeated failure", and 0 would mean a scaler that has never failed is
+   * already past its limit.
+   */
+  scalerProvisionMaxConsecutiveFailures: z.number().int().min(1).nullable().optional(),
   /**
    * Verified-tier origin for browser-sealed dashboard writes. Must be an
    * absolute http(s) origin (the dashboard fetches `<issuer>/.well-known/jwks.json`
@@ -322,6 +376,30 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
               `globalEvalCandidateTimeoutMs (${candidateBudget}) must be less than ` +
               `globalEvalRoundTimeoutMs (${roundBudget}): a per-candidate budget that ` +
               'can consume the whole round suppresses every sibling workflow in it',
+          },
+          400,
+        );
+      }
+
+      // Third ordering constraint, on the same terms as the two above. The
+      // external-provision backoff is `min(base * 2^(n-1), ceiling)`, so a
+      // ceiling below the base collapses it to a constant from the very first
+      // failure — the growth the two knobs exist to express never happens, and
+      // nothing at runtime reports that it did not. Same null semantics: the
+      // pair is only comparable when both are set.
+      const backoffBase = merged[COLUMNS.scalerProvisionBackoffBaseMs];
+      const backoffCeiling = merged[COLUMNS.scalerProvisionBackoffMaxMs];
+      if (
+        typeof backoffBase === 'number' &&
+        typeof backoffCeiling === 'number' &&
+        backoffCeiling < backoffBase
+      ) {
+        return c.json(
+          {
+            error:
+              `scalerProvisionBackoffMaxMs (${backoffCeiling}) must be at least ` +
+              `scalerProvisionBackoffBaseMs (${backoffBase}): a ceiling below the base ` +
+              'collapses the backoff to a constant from the first failure',
           },
           400,
         );

@@ -16,7 +16,6 @@ const base = {
   dispatcher,
   db,
   orchestratorId: 'orch',
-  testMode: false,
 };
 
 const orchestratorSigner = {

@@ -70,6 +70,17 @@ interface BuildCheckRunSummaryOptions {
   traceIds: { requestId: string; runId: string };
   /** Total job duration in milliseconds. */
   jobDurationMs?: number;
+  /**
+   * Bytes a caller will add around the returned summary — the reduced-privilege
+   * note it prepends, the annotation-count line it appends — subtracted from
+   * the byte budget below.
+   *
+   * Without it the budget is spent in full here and the caller's own bytes push
+   * the final string over the API's cap, which rejects the entire update and
+   * leaves the check run unresolved. Reserving instead drops one more tier of
+   * log lines, which costs context rather than the whole report.
+   */
+  reservedBytes?: number;
 }
 
 interface BuildAnnotationsOptions {
@@ -88,7 +99,33 @@ interface BuildProgressTextOptions {
 // ---------------------------------------------------------------------------
 
 /** GitHub Checks API output.summary byte limit. */
-const SUMMARY_BYTE_LIMIT = 65_535;
+export const SUMMARY_BYTE_LIMIT = 65_535;
+
+/**
+ * Cut `summary` so it fits the API's cap, whatever a caller wrapped around it.
+ *
+ * The last line of defence, not the primary mechanism: `reservedBytes` is what
+ * keeps a summary readable by dropping log tiers, and this only runs when the
+ * final string is still over. Truncating at a UTF-8 boundary matters — a cut
+ * through a multi-byte sequence produces a replacement character and can leave
+ * the string one byte over the cap it was cut to fit.
+ */
+export function clampSummaryToLimit(summary: string, limit = SUMMARY_BYTE_LIMIT): string {
+  const buf = Buffer.from(summary, 'utf-8');
+  if (buf.byteLength <= limit) return summary;
+  const notice = '\n\n_Summary truncated due to size limits._';
+  const noticeBytes = Buffer.byteLength(notice, 'utf-8');
+  // A limit too small to hold the notice would be blown by the notice itself,
+  // so drop it rather than return something still over. Unreachable from the
+  // default cap; stated so the return value never overshoots its own argument.
+  const keep = limit >= noticeBytes ? limit - noticeBytes : limit;
+  const tail = limit >= noticeBytes ? notice : '';
+  // `toString` on a slice that ends mid-sequence yields one replacement
+  // character per orphaned byte — wider than the bytes it replaced, so it can
+  // push the result back over the very cap it was cut to fit. Trim them.
+  const head = buf.subarray(0, keep).toString('utf-8');
+  return `${head.replace(/\uFFFD+$/, '')}${tail}`;
+}
 
 /** Maximum annotations per GitHub Checks API request. */
 const MAX_ANNOTATIONS = 50;
@@ -145,7 +182,8 @@ function progressEmoji(status: string): string {
  * Build a rich markdown summary for a GitHub Check run output.summary field.
  *
  * Includes: headline, step table, failure details with log context, trace footer.
- * Respects the 65535 byte limit with progressive log truncation.
+ * Respects the 65535 byte limit with progressive log truncation, minus whatever
+ * `reservedBytes` the caller will wrap around the result.
  */
 export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string {
   const { stepResults, logBuffer, runId, jobId, traceIds, jobName } = opts;
@@ -153,6 +191,7 @@ export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string 
   const passed = stepResults.filter((s) => s.status === 'success').length;
   const total = stepResults.length;
   const allPassed = passed === total;
+  const budget = SUMMARY_BYTE_LIMIT - (opts.reservedBytes ?? 0);
 
   // Try building with progressively fewer log lines until under byte limit
   for (const maxLogLines of LOG_LINE_TIERS) {
@@ -170,7 +209,7 @@ export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string 
       maxLogLines,
     );
 
-    if (Buffer.byteLength(summary, 'utf-8') <= SUMMARY_BYTE_LIMIT) {
+    if (Buffer.byteLength(summary, 'utf-8') <= budget) {
       return summary;
     }
   }

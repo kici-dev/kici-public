@@ -10,6 +10,7 @@ import {
   recomputeNeedsSatisfied,
   checkSchedulerInvariant,
   getFailurePropagationTargets,
+  checkAllUpstreamsSatisfied,
 } from './needs-scheduler.js';
 
 /** Build a non-fanned MaterializedJob from a minimal lock-job spec for scheduler tests. */
@@ -881,5 +882,26 @@ describe('needs-scheduler', () => {
       // notify's run_on admits the failed status so it's not skipped; cleanup depends on notify not test
       expect(targets).toEqual([]);
     });
+  });
+});
+
+describe('checkAllUpstreamsSatisfied (exported for the dispatch guard)', () => {
+  /** A job with no needs edges. */
+  const noEdgesDb = () =>
+    ({
+      selectFrom: () => ({
+        select: function (this: unknown) {
+          return this;
+        },
+        where: function (this: unknown) {
+          return this;
+        },
+        execute: async () => [],
+      }),
+    }) as never;
+
+  it('treats a job with no edges as dispatchable, so the guard no-ops for ordinary jobs', async () => {
+    const result = await checkAllUpstreamsSatisfied(noEdgesDb(), 'run-1', 'build');
+    expect(result).toEqual({ satisfied: true, action: 'dispatch' });
   });
 });

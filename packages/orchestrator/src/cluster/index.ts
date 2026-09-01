@@ -26,5 +26,13 @@ export type { RaftPersistentState } from './raft-state.js';
 export { OrphanRecovery } from './orphan-recovery.js';
 export { RunCoordinator } from './coordinator.js';
 export type { RunContext, JobToRoute, RouteResult } from './coordinator.js';
+export { PlanHeadroomStore } from './plan-headroom-store.js';
+export type { StoredPlanHeadroom } from './plan-headroom-store.js';
+export {
+  WorkerEviction,
+  selectEvictionTargets,
+  WORKER_DRAIN_TIMEOUT_MS,
+} from './worker-eviction.js';
+export type { EvictionHooks } from './worker-eviction.js';
 export { createClusterHealthRoutes } from './health-api.js';
 export type { ClusterHealthRoutesDeps } from './health-api.js';

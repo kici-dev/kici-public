@@ -12,6 +12,7 @@ import {
   matchTrigger,
 } from './matcher.js';
 import type { TraceEntry } from './decision-trace.js';
+import { TRACE_TEXT_MAX } from './decision-trace.js';
 import type {
   LockBranchPattern,
   LockWorkflow,
@@ -493,6 +494,41 @@ describe('matchWorkflowTriggers - PR triggers', () => {
     const pathsTrace = decision.checks.find((t) => t.check === 'paths');
     expect(pathsTrace?.value).toContain('unavailable');
     expect(pathsTrace?.passed).toBe(true);
+  });
+
+  it('bounds the paths trace for a pathological changed-file list', () => {
+    const workflow: LockWorkflow = {
+      name: 'test',
+      contentHash: '',
+      compileSchemaVersion: 0,
+      triggers: [
+        {
+          _type: 'pr',
+          events: [],
+          targetBranches: [],
+          sourceBranches: [],
+          paths: ['src/**'],
+        } as LockPrTrigger,
+      ],
+      jobs: [],
+    };
+
+    // A provider paginates a large pull request to thousands of files; the
+    // whole list used to land verbatim in the trace's `value`.
+    const event: SimulatedEvent = {
+      type: 'pull_request',
+      payload: {},
+      targetBranch: 'main',
+      changedFiles: Array.from({ length: 3_000 }, (_, i) => `docs/very/long/path/file-${i}.md`),
+    };
+
+    const pathsTrace = matchWorkflowTriggers(workflow, event).checks.find(
+      (t) => t.check === 'paths',
+    );
+    // Positive control: the check ran and reported its verdict, so the bound
+    // below is being read off a real entry rather than an absent one.
+    expect(pathsTrace?.passed).toBe(false);
+    expect(pathsTrace!.value.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);
   });
 });
 

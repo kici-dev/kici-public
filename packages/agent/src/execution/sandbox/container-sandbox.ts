@@ -12,8 +12,11 @@
  * - Agent-internal credentials (KICI_*, KICI_DATABASE_URL, etc.) NEVER enter the container
  * - IPC uses demuxed Docker stream with JSON-line parsing on stdout
  *
- * The container image MUST have Node.js installed (a kici/runner base image
- * is deferred -- for now this is a documented requirement).
+ * The container image does NOT need Node.js or git. KiCI provisions its own
+ * runtime — a pinned, official glibc-2.17 Node plus the runner bundle, mounted
+ * read-only at /opt/kici — and launches the runner with THAT node. The image
+ * needs only a glibc and a shell, which the preflight asserts before the
+ * container is created.
  */
 
 import { PassThrough } from 'node:stream';
@@ -22,6 +25,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import Docker from 'dockerode';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { ensureRuntimeVolume, RuntimeSubtree } from '@kici-dev/shared/container-runtime';
 import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
 import type {
   ExecutionSandbox,
@@ -37,11 +41,15 @@ import type {
   ConcurrencyReportMessage,
   AgentApiRequestIpc,
   CacheRequestIpc,
+  GitGrantRequestIpc,
   ProvenanceRequestIpc,
   ArtifactRequestIpc,
   StepApprovalRequestIpc,
 } from './ipc-protocol.js';
 import { buildRequest } from './fork-runner.js';
+import { runnerLaunchArgv, KICI_RUNTIME_NODE_DIR } from './kici-runtime.js';
+import { assertImageRunnable } from './image-preflight.js';
+import { c as tarCreate } from 'tar';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { buildContainerHardening, type SandboxHardeningOptions } from './container-hardening.js';
 
@@ -78,6 +86,47 @@ interface ContainerSandboxOptions {
   runnerPath: string;
   /** Mount target inside container (default: /opt/kici/workflow-runner.js). */
   runnerMountPath?: string;
+  /**
+   * Pre-provisioned KiCI Node tree (the directory whose `bin/node` is the
+   * injected runtime), bind-mounted read-only at `/opt/kici/node`. A HOST
+   * path, or the name of a volume already holding the tree.
+   *
+   * When supplied, the runner launches on THAT node and the image needs no
+   * Node of its own. Wins over `runtimeImage` — a caller that already has the
+   * tree should not pay a materialization to get the same one.
+   */
+  runtimeNodePath?: string;
+  /**
+   * KiCI agent image carrying `/opt/kici`, from which the Node tree is
+   * materialized into a named volume during setup.
+   *
+   * This is how an agent nesting a job container gets a runtime: a bind mount
+   * needs a HOST path, and the agent may itself be containerized, so it cannot
+   * assume `/opt/kici` exists on the host filesystem. Copying the tree out of
+   * the image into a volume once, then mounting that volume, works either way.
+   *
+   * Absent (and no `runtimeNodePath`) means no injection: the runner falls
+   * back to the image's own `node`, which is the historical contract and still
+   * correct for an image that ships one. Both modes are correct; the fallback
+   * is not a workaround for a missing mount but the mode a caller that has no
+   * runtime to inject is in.
+   */
+  runtimeImage?: string;
+  /**
+   * Tag this sandbox's image was BUILT under, when the job declared a
+   * Dockerfile rather than naming an image.
+   *
+   * Present only for a built image, and removed at teardown — a tag per run
+   * would otherwise accumulate on the host forever. Removing the tag leaves the
+   * layer cache untouched, which is what makes the next build fast, so this
+   * costs nothing but the name.
+   */
+  buildTag?: string;
+  /**
+   * Registry credentials for pulling `image`, already resolved by the
+   * orchestrator. Absent means an anonymous pull.
+   */
+  registryAuth?: { username: string; password: string; serveraddress: string };
   /**
    * Path to the pure-JS container loader-hook bundle on the HOST (bind-mounted
    * read-only). Defaults to `container-ts-loader-hook.js` next to `runnerPath`.
@@ -296,6 +345,40 @@ function relayCacheRequest(
 }
 
 /**
+ * Relay git.grant.request from the container runner to the agent's grant table
+ * via options.onGitGrantRequest, then write the response back through `stream`.
+ */
+function relayGitGrantRequest(
+  stream: NodeJS.ReadWriteStream,
+  options: JobExecutionOptions,
+  grantMsg: GitGrantRequestIpc,
+): void {
+  const writeResponse = (response: Record<string, unknown>): void => {
+    try {
+      stream.write(JSON.stringify(response) + '\n');
+    } catch {
+      // Stream may be closed
+    }
+  };
+  if (!options.onGitGrantRequest) {
+    writeResponse({
+      type: 'git.grant.response',
+      requestId: grantMsg.requestId,
+      error: 'Git credentials are not available in this agent configuration',
+    });
+    return;
+  }
+  options.onGitGrantRequest(grantMsg).then(
+    (response) => writeResponse(response as unknown as Record<string, unknown>),
+    (err) =>
+      writeResponse({
+        type: 'git.grant.response',
+        requestId: grantMsg.requestId,
+        error: toErrorMessage(err),
+      }),
+  );
+}
+/**
  * Relay provenance.request from the container runner to the orchestrator via
  * options.onProvenanceRequest, then write the response back through `stream`.
  * If the agent doesn't expose a provenance relay, write a structured error so
@@ -453,6 +536,18 @@ export class ContainerSandbox implements ExecutionSandbox {
   private readonly docker: Docker;
   private readonly image: string;
   private readonly runnerPath: string;
+  private readonly runtimeNodePath: string | undefined;
+  private readonly runtimeImage: string | undefined;
+  private readonly buildTag: string | undefined;
+  /**
+   * The runtime actually injected into this job's container — the configured
+   * path, or the volume materialized during setup. Resolved once in setup()
+   * because materialization needs the container runtime, and read by both the
+   * bind list and the runner launch.
+   */
+  private resolvedRuntimeNode: string | undefined;
+  private readonly registryAuth:
+    { username: string; password: string; serveraddress: string } | undefined;
   private readonly runnerMountPath: string;
   /** Host path to the pure-JS container loader-hook bundle (bind-mounted :ro). */
   private readonly hookHostPath: string;
@@ -476,6 +571,10 @@ export class ContainerSandbox implements ExecutionSandbox {
     this.docker = options.docker;
     this.image = options.image;
     this.runnerPath = options.runnerPath;
+    this.runtimeNodePath = options.runtimeNodePath;
+    this.runtimeImage = options.runtimeImage;
+    this.buildTag = options.buildTag;
+    this.registryAuth = options.registryAuth;
     this.runnerMountPath = options.runnerMountPath ?? '/opt/kici/workflow-runner.js';
     this.hookHostPath =
       options.hookPath ?? join(dirname(options.runnerPath), 'container-ts-loader-hook.js');
@@ -506,14 +605,54 @@ export class ContainerSandbox implements ExecutionSandbox {
       // Not present locally — pull it below.
     }
 
-    logger.info('Pulling sandbox image (not present locally)', { image: this.image });
-    const stream = await this.docker.pull(this.image);
+    // The authconfig is deliberately absent from this line — it carries a
+    // registry password, and this log reaches run output.
+    logger.info('Pulling sandbox image (not present locally)', {
+      image: this.image,
+      authenticated: this.registryAuth !== undefined,
+    });
+    const stream = await this.docker.pull(
+      this.image,
+      this.registryAuth ? { authconfig: this.registryAuth } : {},
+    );
     await new Promise<void>((resolve, reject) => {
       this.docker.modem.followProgress(stream, (err: Error | null) =>
         err ? reject(err) : resolve(),
       );
     });
     logger.info('Sandbox image pulled', { image: this.image });
+  }
+
+  /**
+   * Resolve the Node tree to inject into the job container, materializing it
+   * when only an image was configured.
+   *
+   * A configured path wins: a caller that already provisioned the tree should
+   * not pay a copy to arrive at the same one. Returning `undefined` is a real
+   * outcome, not a failure — an agent with no runtime source runs the job on
+   * the image's own `node`, which is what a `node:*` image was always doing.
+   *
+   * A materialization that FAILS is not softened into that outcome. Continuing
+   * would start the job against an image the operator never claimed ships Node,
+   * and the resulting "node: not found" says nothing about the runtime that was
+   * supposed to be there.
+   */
+  private async resolveRuntimeNode(): Promise<string | undefined> {
+    if (this.runtimeNodePath) return this.runtimeNodePath;
+    if (!this.runtimeImage) return undefined;
+
+    return await ensureRuntimeVolume({
+      docker: this.docker,
+      agentImage: this.runtimeImage,
+      // The node tree ALONE. The runner bundle and the loader hook are bound
+      // from this agent's own build, at fixed paths under /opt/kici — mounting
+      // the whole tree there would put those two binds inside a read-only
+      // mount, whose mountpoints cannot be created. Binding the agent's own
+      // runner is also what keeps the runner and the agent driving it from
+      // ever being two different versions.
+      subtree: RuntimeSubtree.enum.node,
+      onProgress: (message) => logger.info(message, { jobId: this.jobId }),
+    });
   }
 
   async setup(options: SandboxSetupOptions): Promise<void> {
@@ -539,6 +678,12 @@ export class ContainerSandbox implements ExecutionSandbox {
       : { hostConfig: {} as Partial<Docker.HostConfig>, user: undefined };
     this.resolvedUser = hardened.user;
 
+    // Resolve the runtime BEFORE the bind list, which mounts it. A configured
+    // path is taken verbatim; otherwise the tree is materialized out of the
+    // agent image into a named volume, reused across every later job on this
+    // host that shares the image.
+    this.resolvedRuntimeNode = await this.resolveRuntimeNode();
+
     const binds = this.buildBinds(options, hardened.hostConfig);
 
     // Ensure the image is present before createContainer — dockerode does NOT
@@ -546,6 +691,15 @@ export class ContainerSandbox implements ExecutionSandbox {
     // whose image was never pulled, or was reaped by a disk-pressure image
     // prune, fails with a 404 "No such image" instead of running.
     await this.ensureImagePresent();
+
+    // AFTER the pull, never before: the probe creates a container from the
+    // image, which a not-yet-pulled image cannot satisfy. Only when we inject
+    // the runtime — the glibc requirement exists BECAUSE a glibc-linked node
+    // is mounted in, so a job supplying its own node from the image is
+    // unaffected and preflighting it would reject images that work.
+    if (this.resolvedRuntimeNode) {
+      await assertImageRunnable(this.docker, this.image);
+    }
 
     // Create container:
     // - sleep infinity keeps it alive for the entire job
@@ -584,6 +738,56 @@ export class ContainerSandbox implements ExecutionSandbox {
       name: this.containerName,
       containerId: this.container.id.slice(0, 12),
     });
+
+    if (options.workspaceFromHost) {
+      await this.copyWorkspaceIn(options.workDir);
+    }
+  }
+
+  /**
+   * Populate the container's `/workspace` volume from the host working tree.
+   *
+   * `/workspace` is a container-owned anonymous volume rather than a host bind,
+   * which is what dissolves the host-uid vs container-uid conflict once
+   * `CapDrop: ['ALL']` removes CAP_DAC_OVERRIDE — so the tree is streamed in as
+   * a tar rather than mounted.
+   *
+   * A failure here is fatal on purpose. Swallowing it would start the job
+   * against an EMPTY workspace, which surfaces as a baffling "file not found"
+   * in whichever step happens to touch the repo first.
+   */
+  private async copyWorkspaceIn(workDir: string): Promise<void> {
+    const started = Date.now();
+    try {
+      // `portable` drops uid/gid and mtime noise so the archive lands owned by
+      // the container user rather than replaying host ownership.
+      const stream = tarCreate({ cwd: workDir, portable: true }, ['.']);
+
+      // The stream errors ASYNCHRONOUSLY (an unreadable or missing workDir
+      // surfaces after tarCreate returned), so without racing it the failure
+      // escapes this try/catch and the job starts on an empty workspace.
+      const streamFailed = new Promise<never>((_, reject) => {
+        stream.on('error', reject);
+      });
+      await Promise.race([
+        (
+          this.container as unknown as {
+            putArchive(s: unknown, o: { path: string }): Promise<unknown>;
+          }
+        ).putArchive(stream, { path: '/workspace' }),
+        streamFailed,
+      ]);
+    } catch (err) {
+      throw new Error(
+        `Failed to copy the host workspace into the sandbox container: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    logger.info('Copied host workspace into sandbox', {
+      name: this.containerName,
+      durationMs: Date.now() - started,
+    });
   }
 
   /**
@@ -616,6 +820,11 @@ export class ContainerSandbox implements ExecutionSandbox {
       `${this.runnerPath}:${this.runnerMountPath}:ro`,
       `${this.hookHostPath}:${HOOK_MOUNT_PATH}:ro`,
     ];
+
+    // Read-only: a job must not be able to rewrite the runtime it runs under.
+    if (this.resolvedRuntimeNode) {
+      binds.push(`${this.resolvedRuntimeNode}:${KICI_RUNTIME_NODE_DIR}:ro`);
+    }
 
     for (const dir of options.extraReadOnlyBinds ?? []) {
       if (dir) binds.push(`${dir}:${dir}:ro`);
@@ -690,7 +899,9 @@ export class ContainerSandbox implements ExecutionSandbox {
     // would fail that test loudly. Re-apply the resolved user explicitly since some
     // runtimes do not inherit the container's configured user into exec.
     const exec = await this.container!.exec({
-      Cmd: ['node', this.runnerMountPath],
+      Cmd: this.resolvedRuntimeNode
+        ? runnerLaunchArgv(this.runnerMountPath)
+        : ['node', this.runnerMountPath],
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
@@ -895,6 +1106,10 @@ export class ContainerSandbox implements ExecutionSandbox {
         relayApiRequest(stream, options, msg as AgentApiRequestIpc);
         return false;
 
+      case 'git.grant.request':
+        relayGitGrantRequest(stream, options, msg as GitGrantRequestIpc);
+        return false;
+
       case 'cache.request':
         relayCacheRequest(stream, options, msg as CacheRequestIpc);
         return false;
@@ -914,6 +1129,13 @@ export class ContainerSandbox implements ExecutionSandbox {
       case 'job.complete':
         applyJobComplete(msg, stepResults, state, options);
         return true;
+
+      case 'hooks-declared':
+      case 'completion-hooks-done':
+        // Between-jobs lifecycle markers. The container backend reaps the whole
+        // tree (and external state) on teardown, so it needs no out-of-band
+        // re-run — acknowledge the markers without acting on them.
+        return false;
 
       default:
         logger.warn('Unrecognized IPC message from container runner', {
@@ -961,8 +1183,30 @@ export class ContainerSandbox implements ExecutionSandbox {
 
   // --- Lifecycle: teardown ---
 
+  /**
+   * Drop the tag a `container.dockerfile` build produced.
+   *
+   * Best-effort: teardown must not fail a job that already finished. The LAYER
+   * cache — the thing that makes the next build fast — is not a tag and is
+   * untouched by this.
+   */
+  private async reclaimBuiltImage(): Promise<void> {
+    if (!this.buildTag) return;
+    try {
+      await this.docker.getImage(this.buildTag).remove({ force: true });
+    } catch {
+      // Already gone, or still referenced by something we do not own.
+    }
+  }
+
   async teardown(): Promise<void> {
-    if (!this.container) return;
+    // Before the early return, not after: a setup that failed AFTER the build —
+    // an image preflight rejecting a musl base, say — leaves a tag and no
+    // container, and that tag would otherwise stay on the host forever.
+    if (!this.container) {
+      await this.reclaimBuiltImage();
+      return;
+    }
 
     if (this.keepFailed && this.jobFailed) {
       logger.info('Keeping failed container for debugging', {
@@ -990,6 +1234,11 @@ export class ContainerSandbox implements ExecutionSandbox {
     } catch {
       // Container may already be removed.
     }
+
+    // A built image's tag is per-run, so leaving it behind accumulates one dead
+    // tag per job on the host. The keepFailed early-return above deliberately
+    // skips this: a container kept for debugging needs its image kept too.
+    await this.reclaimBuiltImage();
 
     this.container = null;
   }

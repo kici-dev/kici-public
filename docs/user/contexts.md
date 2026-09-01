@@ -5,8 +5,6 @@ description: Configure deployment contexts with variables, secrets, and protecti
 
 
 
-Contexts represent deployment targets like `staging`, `production`, or `review/PR-*`. Each context can have its own variables, bound secrets, and protection rules that control when and how jobs targeting that context can execute.
-
 ## Overview
 
 A context in KiCI provides:
@@ -88,7 +86,7 @@ job('deploy', {
 
 **Merge order — last wins.** All bound contexts are resolved on every dispatch (webhook, scheduled, and test runs alike) and merged in array order. When the same secret or variable key is defined in more than one context, the later entry in the array wins. With `contexts: ['staging', 'my-testing']`, a key defined in both resolves to `my-testing`'s value; keys defined in only one are preserved. The longest-scope-path-wins rule still applies _within_ each context.
 
-**Protection rules combine all-must-pass.** A job must satisfy **every** bound context's gates — adding a context can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all contexts; the minimum trust tier is the most restrictive across them; required reviewers are the union of all contexts' reviewers; the wait timer is the longest; and the hold expiry is the shortest. If a run is gated out, the rejection names which context and which rule rejected it (visible via `kici runs show <run-id>` and the run's rejection reason), so a mutually-exclusive set of rules surfaces as a clear failure rather than a silent perpetual rejection.
+**Protection rules combine all-must-pass.** A job must satisfy **every** bound context's gates — adding a context can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all contexts. The minimum trust tier is the most restrictive across them, and required reviewers are the union of all contexts' reviewers. The wait timer is the longest, and the hold expiry is the shortest. If a rule rejects a job, that job is not dispatched. It still appears on the run, as a failed job whose reason names the context and the rule that rejected it. Read the reason with `kici runs show <run-id>`, or on the run detail page.
 
 **Skip-on-test (allow-and-warn).** On a test or local run (`kici run remote`, `kici run <event> --local`), a bound context never rejects the run. Any bound context that disallows local execution (`allowLocalExecution: false`) — or that is not configured — is **skipped**: its variables and secrets are omitted from the merge and its gates are not evaluated. The run proceeds, and a user-visible warning naming the skipped context(s) is shown both on the `kici run remote` CLI output and on the dashboard run view. This makes the test-only-variables pattern work: with `contexts: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves just `my-testing`'s variables and warns that `staging` was skipped. If every bound context is skipped, the job runs with no environment variables. This is intentionally different from a fixture `secrets:` mapping, which is fail-closed — see the [testing guide](./testing-guide.md).
 
@@ -186,6 +184,34 @@ Allowed branches: main, release/*
 
 Jobs from other branches are rejected immediately with an error message.
 
+**Most internally-triggered runs carry a branch.** KiCI starts these runs for itself: a [schedule](./sdk/triggers.md) fire, a [custom event](./events.md), a completion trigger, a failure batch, or an [invoke gate](./global-workflows.md) summon. None comes from a branch push. A run with one source branch presents it:
+
+- A **schedule** fire executes the default branch's workflow, so it presents the repository's default branch.
+- A **`kiciEvent()` subscriber**, a **completion trigger** (`workflowComplete`, `jobComplete`) and an **invoke-gate summon** present the branch of the run behind them. That is the same branch the run behind them presented. For a pull-request run it is the branch the PR targets, not the contributor's own branch — so a subscriber of an event emitted by a PR against `main` presents `main`.
+
+A branch restriction compares that branch against your patterns like any other run. So a nightly deploy bound to a `production` context restricted to `main` runs.
+
+A branch restriction is not a trust control. It checks the branch a run presents, never where the code came from. A pull request against `main` presents `main`, whoever opened it. To gate on that, set a [minimum trust tier](#minimum-trust) on the same context.
+
+A run with no single source branch presents no branch, and a branch restriction then rejects it:
+
+- A **failure batch** (`workflowsFailedBatch`). One accumulation window of failed runs causes it, on as many branches, so no one branch is its own.
+- A **scaler event** (`kici.scaler.scale-up`, `kici.scaler.scale-down`). The orchestrator mints these itself, with no run behind them. See [autoscaling workflows](./workflows/autoscaling-workflows.md).
+- A **schedule** fire in a repository that has not pushed to its default branch since you upgraded KiCI. The default branch is captured when a push re-registers the workflows, so the first such push after the upgrade fixes it.
+- Any event whose emitting run is no longer on record.
+
+The rejection reason says so:
+
+```
+Context 'production' restricts branches: this internally-triggered run carries no
+branch, so no branch restriction can be satisfied - a scheduled run gains its
+branch after the next push to the default branch re-registers the workflow;
+alternatively bind a context without a branch restriction, or restrict by trigger
+type instead
+```
+
+To limit a context by how the run started instead of by branch, use a **trigger-type filter**: the trigger type is a real name (`schedule`, `kici_event`, `workflow_complete`, `job_complete`), so a filter that allows it works on these runs.
+
 ### Required reviewers
 
 Require manual approval before a job can proceed:
@@ -210,41 +236,44 @@ The job waits for the specified duration before proceeding. Useful for staged ro
 
 ### Minimum trust
 
-Gate job execution based on the contributor's trust tier for PR-triggered runs:
+Hold a job whose run came from a fork:
 
 ```
-Minimum trust: known
+Minimum trust: trusted
 ```
 
-| Value     | Effect                                              |
-| --------- | --------------------------------------------------- |
-| `known`   | Blocks unknown contributors; allows known + trusted |
-| `trusted` | Blocks unknown + known; allows only trusted         |
+| Value     | Effect                                                     |
+| --------- | ---------------------------------------------------------- |
+| `trusted` | Holds a run whose ref came from a fork                     |
+| `known`   | Same effect; the value is deprecated and removed at v1.0.0 |
+| (unset)   | No trust-based gating                                      |
 
-When a contributor does not meet the minimum trust level, the job is held in the security approval queue. Someone with `ci_trust:write` or higher must approve it before execution proceeds.
+Both values block the same thing. Trust comes from the git ref, and that judgement has two answers: a ref in your repository is `trusted`, a ref from a fork is `unknown`. The value you declare still decides the wording of the hold reason.
 
-Trust tier is determined by the contributor's identity link and CI trust RBAC level:
+When the gate holds a job, it enters the security approval queue. Someone with `ci_trust:write` or higher must approve it before execution proceeds.
 
-- **Trusted** -- identity-linked org member with `ci_trust:write+` AND provider write access
-- **Known** -- identity-linked member or verified collaborator via provider API
-- **Unknown** -- no identity link and no provider access, fork PRs
+A run that resolved **no** tier passes the gate. A pull request from a source with no fork model resolves none, and so does an internal run whose inheritance lookup failed. See [trust tiers on internal triggers](events.md#trust-tiers-on-internal-triggers) for the full table.
 
-The trust tier also affects which lock file is used for PR-triggered runs: trusted contributors use the PR head lock file, while known and unknown contributors use the base branch lock file. This prevents untrusted workflow modifications from affecting execution.
+The trust tier also affects which lock file a pull-request run uses: a trusted ref evaluates the head lock file, a fork ref evaluates the base branch's. A fork run additionally carries no install or registry secrets, and its build-cache writes are confined to that run. So a fork pull request cannot change what CI does, and cannot read a private-registry token, whether or not you set this gate.
+
+Set the gate on any context that carries a credential a fork run must not reach. See the [deployment checklist](../operator/security/security.md#deployment-checklist-which-contexts-need-it).
+
+An internally-triggered run carries a tier too. A schedule fire and the orchestrator's own lifecycle events are trusted. A `kiciEvent()` subscriber inherits the tier of the run that emitted the event, so a `minimumTrust` gate on the subscriber's context reads the **emitting** run's tier. See [trust tiers on internal triggers](events.md#trust-tiers-on-internal-triggers).
 
 See the [CI security architecture docs](../architecture/security/ci-security.md) for the full trust resolution flow.
 
 ### Security approval queue
 
-When a PR is held for security review — the org trust policy held it (a non-trusted contributor modified `.kici/` files, the PR came from a fork, or the contributor could not be resolved to a known identity), or a `minimumTrust` gate blocked the contributor — it enters the security approval queue. This is separate from the context approval queue: a security hold asks "is it safe to run this contributor's code at all?", while a context approval hold asks "should this job be promoted?". The two never cross — releasing a security hold needs `ci_trust:write` or higher, releasing a context approval hold needs `contexts:write` plus eligibility for one of the gate's clauses. See [Approval holds vs security holds](../architecture/approvals.md#approval-holds-vs-security-holds) for the full comparison.
+A pull request held for security review enters the security approval queue. Two things put it there: the organization's fork switch set to `hold`, and a `minimumTrust` gate blocking a fork run. This is separate from the context approval queue: a security hold asks "is it safe to run this contributor's code at all?", while a context approval hold asks "should this job be promoted?". The two never cross — releasing a security hold needs `ci_trust:write` or higher, releasing a context approval hold needs `contexts:write` plus eligibility for one of the gate's clauses. See [Approval holds vs security holds](../architecture/approvals.md#approval-holds-vs-security-holds) for the full comparison.
 
 Held runs can be approved:
 
-- Via the **dashboard** in Settings > CI trust > Approval queue
+- Via the **dashboard** on the [Approval queue](dashboard/contexts-and-secrets.md#approval-queue) page, which lists security and context holds together
 - Via a PR comment: `/kici approve` (commenter must have `ci_trust:write+`)
 
-A hold raised by the org trust policy covers the whole PR and uses the org's approval expiry (default 72 hours). A `minimumTrust` hold is raised by a context rather than by the org policy, so it uses that context's own hold expiry (default one hour).
+A hold raised by the fork switch covers the whole pull request and uses the org's approval expiry (default 72 hours). A `minimumTrust` hold is raised by a context, so it uses that context's own hold expiry (default one hour). A job carrying both a reviewer approval hold and a security hold carries both expiries, and whichever comes first cancels the run.
 
-While the org trust policy is holding a pull request, your organization's global workflows do not run for it. Approving the hold releases that pull request's own workflows; it does not retroactively run the organization's global workflows for the event.
+While the fork switch is holding a pull request, your organization's global workflows do not run for it. Approving the hold releases that pull request's own workflows; it does not retroactively run the organization's global workflows for the event.
 
 ### Concurrency limits
 
@@ -259,6 +288,10 @@ The concurrency limit is a positive integer; leave it unset for unlimited concur
 
 - **queue** -- new jobs wait in a FIFO queue (with configurable timeout, default 1 hour)
 - **cancel-pending** -- pending (queued) jobs are cancelled when the limit is reached
+
+The children of a matrix job count individually against the limit. A three-child
+matrix bound to a context with a limit of two dispatches two children and applies
+the strategy above to the third.
 
 ## Dashboard management
 
@@ -287,7 +320,7 @@ Each context has four tabs:
 
 A job's bound deployment contexts are shown as chips on the run detail page (in the job metadata panel) in the order the job declared them, and the distinct set across a run's jobs appears as compact chips on the run list. For a multi-context job the chips read left-to-right in merge order — later contexts override earlier ones on key collisions. A `(dynamic)` chip marks a context whose name is computed at runtime; it resolves to the real name once the run starts. A job that binds a single context shows one chip; a job that binds none shows no chip.
 
-If a multi-context binding is gated out, the run's failure banner names which context and which rule rejected it (the same all-must-pass detail surfaced by `kici runs show <run-id>`).
+A job a bound context rejects keeps its chips, and shows as failed because it never ran. Its failure reason names the context and the rule that rejected it. `kici runs show <run-id>` prints the same reason.
 
 ### Secrets management
 

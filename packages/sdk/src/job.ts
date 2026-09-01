@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isKnownCapability } from '@kici-dev/engine';
 import type {
+  ContainerConfig,
   GenericInitConfig,
   InitItem,
   Job,
@@ -11,6 +12,11 @@ import type {
 } from './types.js';
 import type { StepContext } from './context.js';
 import { createJobOutputProxy } from './outputs.js';
+import {
+  assertSecretName,
+  type ContainerRegistryAuth,
+  type GitCredentialMap,
+} from './git-types.js';
 
 /** A typed preset is a `'mise'` string or a `{ mise }` object — neither carries `run`. */
 function isPreset(item: InitItem): boolean {
@@ -171,6 +177,12 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
   const name = typeof nameOrOptions === 'string' ? nameOrOptions : randomUUID();
   const options = typeof nameOrOptions === 'string' ? maybeOptions! : nameOrOptions;
 
+  // An invoke gate is mutually exclusive with step code: it never runs steps on
+  // an agent, it fans out into one proxy node per triggered run.
+  if (options.invoke && ((options.steps?.length ?? 0) > 0 || 'run' in options)) {
+    throw new Error(`job('${name}'): 'invoke' is mutually exclusive with 'steps'/'run'`);
+  }
+
   // Normalize steps: if `run` shorthand is used, convert to single-step array
   let steps = options.steps ?? [];
   if (options.run) {
@@ -198,7 +210,23 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
   if (options.runsOn !== undefined && options.runsOnAll !== undefined) {
     throw new Error(`job('${name}'): runsOn and runsOnAll are mutually exclusive`);
   }
-  if (options.runsOn === undefined && options.runsOnAll === undefined) {
+
+  if (options.container !== undefined) {
+    validateContainerImageSource(name, options.container);
+  }
+  if (options.container && typeof options.container === 'object' && options.container.auth) {
+    validateContainerAuth(name, options.container.auth);
+  }
+  if (options.gitCredentials) {
+    validateGitCredentials(name, options.gitCredentials);
+  }
+  if (
+    options.invoke === undefined &&
+    options.runsOn === undefined &&
+    options.runsOnAll === undefined
+  ) {
+    // An invoke gate never dispatches to an agent, so it needs no target; every
+    // other job must name one.
     throw new Error(`job('${name}'): one of runsOn or runsOnAll is required`);
   }
   if (options.onUnreachable !== undefined && options.runsOnAll === undefined) {
@@ -219,6 +247,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     }),
     ...(options.maxParallel !== undefined && { maxParallel: options.maxParallel }),
     ...(options.failFast !== undefined && { failFast: options.failFast }),
+    ...(options.invoke !== undefined && { invoke: options.invoke }),
     steps,
     needs: options.needs,
     rules: options.rules,
@@ -227,6 +256,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     include: options.include,
     exclude: options.exclude,
     checkout: options.checkout,
+    ...(options.gitCredentials && { gitCredentials: options.gitCredentials }),
     container: options.container,
     ...(options.sandbox !== undefined && { sandbox: options.sandbox }),
     context: options.context,
@@ -247,4 +277,130 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     ...(options.approval !== undefined && { approval: options.approval }),
     result: createJobOutputProxy(name),
   };
+}
+
+/**
+ * Validate a job's named git credentials at definition time.
+ *
+ * Every `*Secret` field is a qualified `<context>:<secret-name>` reference into
+ * the secrets backend — the same form `workflow()` enforces for
+ * `registries[].tokenSecret`. Catching a pasted credential here matters because
+ * the alternative is committing it to a git repository and discovering it later
+ * as a confusing auth failure.
+ */
+/**
+ * Validate a job's container registry auth at definition time.
+ *
+ * Same contract as `gitCredentials`: every `*Secret` field is a qualified
+ * `<context>:<secret-name>` reference, and a pasted credential is refused
+ * rather than committed to a git repository. The `*Value` half is material
+ * supplied at run time and is deliberately not checked for shape.
+ */
+/**
+ * Is `p` a repo-relative path that stays inside the repository?
+ *
+ * Rejects an absolute path and any path whose `..` segments walk out of the
+ * tree. Deliberately string-only: the workflow is authored on one machine and
+ * the path is resolved on another, so there is no filesystem here to consult.
+ */
+function isInsideRepo(p: string): boolean {
+  if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) return false;
+  let depth = 0;
+  for (const part of p.split(/[\\/]+/)) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      depth -= 1;
+      if (depth < 0) return false;
+      continue;
+    }
+    depth += 1;
+  }
+  return true;
+}
+
+/**
+ * A container names exactly one image source: a finalized `image`, or a
+ * `dockerfile` the agent builds before the job runs.
+ *
+ * Refused at definition time rather than at dispatch, because the author is the
+ * only one who can fix it and the workflow file is where they are looking. The
+ * agent re-checks the paths against the real workdir — a lock file is repo
+ * content and is not trusted — but that failure reaches a run log, not an
+ * editor.
+ */
+function validateContainerImageSource(name: string, container: string | ContainerConfig): void {
+  if (typeof container === 'string') return;
+
+  const hasImage = typeof container.image === 'string' && container.image.length > 0;
+  const hasDockerfile = typeof container.dockerfile === 'string' && container.dockerfile.length > 0;
+
+  if (hasImage === hasDockerfile) {
+    throw new Error(
+      `job('${name}'): exactly one of container.image or container.dockerfile is required`,
+    );
+  }
+
+  if (!hasDockerfile) {
+    for (const field of ['context', 'target', 'args'] as const) {
+      if (container[field] !== undefined) {
+        throw new Error(`job('${name}'): container.${field} applies only to container.dockerfile`);
+      }
+    }
+    return;
+  }
+
+  if (!isInsideRepo(container.dockerfile!)) {
+    throw new Error(
+      `job('${name}'): container.dockerfile must stay inside the repository ` +
+        `(got: ${container.dockerfile})`,
+    );
+  }
+  if (container.context !== undefined && !isInsideRepo(container.context)) {
+    throw new Error(
+      `job('${name}'): container.context must stay inside the repository ` +
+        `(got: ${container.context})`,
+    );
+  }
+  if (container.auth && typeof container.auth.registry !== 'string') {
+    throw new Error(
+      `job('${name}'): container.auth.registry is required with container.dockerfile — ` +
+        `the base image is named inside the Dockerfile, so the registry cannot be derived`,
+    );
+  }
+}
+
+function validateContainerAuth(name: string, auth: ContainerRegistryAuth): void {
+  const bag = auth as unknown as Record<string, unknown>;
+  for (const [field, value] of Object.entries(bag)) {
+    if (!field.endsWith('Secret') || typeof value !== 'string') continue;
+
+    assertSecretName(value, field, 'container registry credential');
+
+    const idx = value.indexOf(':');
+    if (idx <= 0 || idx >= value.length - 1 || value.slice(idx + 1).includes(':')) {
+      throw new Error(
+        `job('${name}'): container.auth.${field} must use qualified ` +
+          `<context>:<secret-name> syntax (got: ${value})`,
+      );
+    }
+  }
+}
+
+function validateGitCredentials(name: string, credentials: GitCredentialMap): void {
+  for (const [alias, ref] of Object.entries(credentials)) {
+    const bag = ref as unknown as Record<string, unknown>;
+    for (const [field, value] of Object.entries(bag)) {
+      if (!field.endsWith('Secret') || typeof value !== 'string') continue;
+
+      assertSecretName(value, `${alias}.${field}`);
+
+      const idx = value.indexOf(':');
+      if (idx <= 0 || idx >= value.length - 1 || value.slice(idx + 1).includes(':')) {
+        throw new Error(
+          `job('${name}'): gitCredentials.${alias}.${field} must use qualified ` +
+            `<context>:<secret-name> syntax (got: ${value})`,
+        );
+      }
+    }
+  }
 }

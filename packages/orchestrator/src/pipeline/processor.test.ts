@@ -20,7 +20,14 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-import { InitFailureCategory, LockFileParseError, SCHEMA_VERSION } from '@kici-dev/engine';
+import {
+  EventLogStatus,
+  ExecutionJobStatus,
+  InitFailureCategory,
+  installGateJobId,
+  LockFileParseError,
+  SCHEMA_VERSION,
+} from '@kici-dev/engine';
 import { AgentJobFailedError } from '../cache/agent-job-failed-error.js';
 import {
   processWebhook,
@@ -28,6 +35,7 @@ import {
   resolveLockFileWithFallback,
   storePendingJobContext,
   consumePendingJobContext,
+  dispatchReadyJob,
   cleanupPendingJobContexts,
   restorePendingJobContexts,
   clearPendingJobContextsMap,
@@ -35,12 +43,21 @@ import {
   openEvalGate,
   isEvalGatePending,
   clearEvalGatesForRun,
+  extractDefaultBranch,
+  hasPendingHold,
+  PENDING_HOLD_READ_ATTEMPTS,
+  summarizeDecision,
+  DECISION_TRACE_MAX_CHECKS,
+  capDecisionSummaries,
+  DECISION_TRACE_MAX_BYTES,
   type ProcessingDeps,
 } from './processor.js';
+import type { WorkflowDecision } from '@kici-dev/engine';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderBundle } from '../provider-registry.js';
 import { ProviderRegistry } from '../provider-registry.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { HeldRunStatus } from '../contexts/held-runs.js';
 
 // -- Mock helpers --
 
@@ -778,7 +795,7 @@ describe('processWebhook', () => {
       lockFileCache: createMockLockFileCache(matrixLockFile) as any,
       pendingInits: mockPendingInits as any,
       executionTracker: makeDynamicTrackerMock() as any,
-      db: createMockDb() as any,
+      db: createMockDb().db as any,
     });
     await processWebhook(basePrInfo(), deps);
     // Let the fire-and-forget deferred-init resolution run.
@@ -945,7 +962,7 @@ describe('processWebhook', () => {
       lockFileCache: createMockLockFileCache(genMatrixLockFileFixture('gen-matrix-hash')) as any,
       pendingDynamics: mockPendingDynamics as any,
       executionTracker: mockTracker as any,
-      db: createMockDb() as any,
+      db: createMockDb().db as any,
     });
     await processWebhook(basePushInfo(), deps);
     await new Promise((r) => setTimeout(r, 50));
@@ -1012,7 +1029,7 @@ describe('processWebhook', () => {
       lockFileCache: createMockLockFileCache(genMatrixLockFileFixture('gen-fail-hash')) as any,
       pendingDynamics: mockPendingDynamics as any,
       executionTracker: mockTracker as any,
-      db: createMockDb() as any,
+      db: createMockDb().db as any,
     });
     await processWebhook(basePushInfo(), deps);
     await new Promise((r) => setTimeout(r, 50));
@@ -1915,6 +1932,67 @@ describe('processWebhook', () => {
     );
   });
 
+  /**
+   * The delivery is acknowledged before the pipeline runs, so nothing a
+   * post-acknowledgement failure decides can reach the sender. The event-log row
+   * is the per-delivery record of it, and the dashboard's failed-delivery count
+   * reads exactly `event_log.status = 'failed'` — with no writer that count is
+   * structurally always zero.
+   */
+  it('records a failed event-log row when the pipeline throws', async () => {
+    const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
+    const explodingCache = {
+      get: vi.fn().mockRejectedValue(new Error('lock store unreachable')),
+      getStats: vi.fn().mockReturnValue({ hits: 0, misses: 0, size: 0 }),
+    };
+    const deps = createDeps({
+      lockFileCache: explodingCache as any,
+      eventLog: mockEventLog as any,
+    });
+
+    // The error still propagates: the caller reverts the queue row to
+    // `buffered` for the drain pass, which it cannot do if the throw is eaten.
+    await expect(processWebhook(basePushInfo(), deps)).rejects.toThrow('lock store unreachable');
+
+    expect(mockEventLog.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        status: EventLogStatus.enum.failed,
+        errorMessage: expect.stringContaining('lock store unreachable'),
+      }),
+    );
+  });
+
+  it('still rethrows when the failed-row write itself fails', async () => {
+    // The row is best-effort; the propagation is not. Swallowing here would
+    // mark the delivery processed and lose it.
+    const mockEventLog = { record: vi.fn().mockRejectedValue(new Error('event_log down')) };
+    const explodingCache = {
+      get: vi.fn().mockRejectedValue(new Error('lock store unreachable')),
+      getStats: vi.fn().mockReturnValue({ hits: 0, misses: 0, size: 0 }),
+    };
+    const deps = createDeps({
+      lockFileCache: explodingCache as any,
+      eventLog: mockEventLog as any,
+    });
+
+    await expect(processWebhook(basePushInfo(), deps)).rejects.toThrow('lock store unreachable');
+  });
+
+  it('records no failed row when the pipeline completes', async () => {
+    // The negative control: the status is written by a throw, not by every
+    // delivery, so an unconditional writer would pass the assertion above.
+    const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
+    const deps = createDeps({ eventLog: mockEventLog as any });
+
+    await processWebhook(basePushInfo(), deps);
+
+    const statuses = mockEventLog.record.mock.calls.map((c) => (c[2] as { status: string }).status);
+    expect(statuses).not.toContain(EventLogStatus.enum.failed);
+    expect(statuses.length).toBeGreaterThan(0);
+  });
+
   it('records init-failure run when install-secrets rejects', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockTracker = {
@@ -2219,6 +2297,14 @@ describe('processWebhook', () => {
     expect((initFailure as { message: string }).message).toContain(buildRejectReason);
   });
 
+  /**
+   * Zero-based position of `initFailure` in `onBuildFailedBeforeTracking`'s
+   * positional signature (runId, workflowName, provider, repoIdentifier, ref,
+   * sha, deliveryId, providerContext, routingKey, triggerEvent, commitMessage,
+   * failureReason, initFailure, provenance).
+   */
+  const ON_BUILD_FAILED_INIT_FAILURE_ARG = 12;
+
   it('tags build-coordinator failures (pre-tracking) with build_coordination init_failure', async () => {
     // Build-coordinator timeout path: ensureBuild throws BEFORE its inner closure
     // gets to call onExecutionStarted, so buildJobTrackedEarly stays false and
@@ -2273,10 +2359,12 @@ describe('processWebhook', () => {
     await processWebhook(basePrInfo(), deps);
 
     // recordBuildFailure routes through onBuildFailedBeforeTracking because no
-    // run row was tracked early. The init_failure is the LAST positional arg.
+    // run row was tracked early. Indexed rather than read off the end: the
+    // trailing `provenance` arg sits after init_failure, so `length - 1` would
+    // silently start asserting against the wrong argument.
     expect(mockTracker.onBuildFailedBeforeTracking).toHaveBeenCalledTimes(1);
     const call = mockTracker.onBuildFailedBeforeTracking.mock.calls[0] as unknown[];
-    const initFailureArg = call[call.length - 1];
+    const initFailureArg = call[ON_BUILD_FAILED_INIT_FAILURE_ARG];
     expect(initFailureArg).toMatchObject({
       scope: 'run',
       category: InitFailureCategory.enum.build_coordination,
@@ -3881,6 +3969,148 @@ describe('processWebhook — context integration', () => {
     expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
   });
 
+  /** Tracker double shaped like the one the dispatcher-rejection tests use. */
+  function createRejectionTracker() {
+    return {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+      onJobStatus: vi.fn().mockResolvedValue(undefined),
+      onStepStatus: vi.fn(),
+      updateJobHeartbeat: vi.fn(),
+      getExecutionContext: vi.fn(),
+      getJobName: vi.fn(),
+      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
+    };
+  }
+
+  /** A context row that rejects every job bound to it (disabled context). */
+  function disabledContextRow(name: string) {
+    return {
+      id: `env-${name}`,
+      org_id: '__default__',
+      name,
+      type: 'fixed',
+      glob_pattern: null,
+      enabled: false,
+      branch_restrictions: '[]',
+      trigger_type_filters: '[]',
+      repo_patterns: '[]',
+      concurrency_limit: null,
+      concurrency_strategy: 'queue',
+      concurrency_timeout_ms: 300000,
+      required_reviewers: null,
+      wait_timer_seconds: null,
+      hold_expiry_seconds: 3600,
+      minimum_trust: null,
+      created_at: new Date(),
+      updated_at: new Date(),
+      created_by: null,
+    };
+  }
+
+  /**
+   * The `rejected-*` row a context-rule rejection records, or undefined when
+   * the rejection left no trace on the run at all.
+   */
+  function findContextRejectionRow(onJobStatus: ReturnType<typeof vi.fn>) {
+    return onJobStatus.mock.calls.find(
+      (args: unknown[]) =>
+        typeof args[1] === 'string' && (args[1] as string).startsWith('rejected-'),
+    );
+  }
+
+  it('records a context-rule rejection on the run with the rule reason', async () => {
+    // A rejection used to end at a log line and a `continue`: no row, no
+    // reason, and — with every job gated — an all-rejected guard that called
+    // it `no_agent` / 'No jobs were dispatched for this run', telling the
+    // reader no agent was available for a run that was deliberately gated.
+    const lockFile = envLockFile({ contexts: [{ value: 'production', dynamic: false }] });
+    const mockDispatcher = createMockDispatcher();
+    const mockTracker = createRejectionTracker();
+    const deps = createDeps({
+      lockFileCache: createMockLockFileCache(lockFile) as any,
+      dispatcher: mockDispatcher as any,
+      contextStore: createMockContextStore(disabledContextRow('production')) as any,
+      executionTracker: mockTracker as any,
+    });
+
+    await processWebhook(basePrInfo(), deps);
+
+    expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+    const rejectedCall = findContextRejectionRow(mockTracker.onJobStatus);
+    expect(rejectedCall).toBeDefined();
+    // Signature: (runId, jobId, status, timestamp, agentId?, data?)
+    const [, , status, , , data] = rejectedCall as unknown[];
+    expect(status).toBe(ExecutionJobStatus.enum.failed);
+    expect(data).toMatchObject({
+      initFailure: {
+        scope: 'job',
+        category: InitFailureCategory.enum.context_rules,
+        jobName: 'deploy',
+      },
+    });
+    // The reason names the offending context and the rule that rejected it,
+    // rather than a generic string.
+    const message = (data as { initFailure: { message: string } }).initFailure.message;
+    expect(message).toContain('production');
+    expect(message).toContain('disabled');
+    expect((data as { error: string }).error).toBe(message);
+    // No run-scoped `no_agent` failure: agents were never the problem. Without
+    // the rejection on the run, this records `no_agent` with
+    // 'No jobs were dispatched for this run'.
+    expect(mockTracker.recordInitFailureRun).not.toHaveBeenCalled();
+  });
+
+  it('records a partial context-rule rejection while the ungated job dispatches', async () => {
+    // The partial case wrote nothing at all: the gated job vanished from the
+    // run, so a reader saw a run that silently skipped it.
+    const lockFile = envLockFile();
+    lockFile.workflows[0].jobs = [
+      {
+        _type: 'static',
+        name: 'deploy',
+        runsOn: [{ kind: 'exact', value: 'linux' }],
+        needs: [],
+        steps: [{ name: 'Deploy', hasOutputs: false }],
+        contexts: [{ value: 'production', dynamic: false }],
+      } as (typeof lockFile.workflows)[0]['jobs'][0],
+      {
+        _type: 'static',
+        name: 'lint',
+        runsOn: [{ kind: 'exact', value: 'linux' }],
+        needs: [],
+        steps: [{ name: 'Lint', hasOutputs: false }],
+      } as (typeof lockFile.workflows)[0]['jobs'][0],
+    ];
+    const mockDispatcher = createMockDispatcher();
+    const mockTracker = createRejectionTracker();
+    const deps = createDeps({
+      lockFileCache: createMockLockFileCache(lockFile) as any,
+      dispatcher: mockDispatcher as any,
+      contextStore: createMockContextStore(disabledContextRow('production')) as any,
+      executionTracker: mockTracker as any,
+    });
+
+    await processWebhook(basePrInfo(), deps);
+
+    // The ungated job still dispatches — a rejection gates one job, not the run.
+    expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+    expect((mockDispatcher.dispatch as any).mock.calls[0][0].jobName).toBe('lint');
+
+    const rejectedCall = findContextRejectionRow(mockTracker.onJobStatus);
+    expect(rejectedCall).toBeDefined();
+    const [, , , , , data] = rejectedCall as unknown[];
+    expect(data).toMatchObject({
+      initFailure: {
+        scope: 'job',
+        category: InitFailureCategory.enum.context_rules,
+        jobName: 'deploy',
+      },
+    });
+  });
+
   it('creates held run when protection rules return hold action', async () => {
     const lockFile = envLockFile({ contexts: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
@@ -4052,7 +4282,7 @@ describe('processWebhook — context integration', () => {
     // A workflow-scoped held_runs row keyed by the synthetic install job id.
     expect(mockHeldRunStore.createHold).toHaveBeenCalledTimes(1);
     expect(mockHeldRunStore.createHold.mock.calls[0][1]).toMatchObject({
-      jobId: '__install__CI',
+      jobId: installGateJobId('CI'),
       scope: 'workflow',
       triggerSource: 'context',
       contextId: 'env-install',
@@ -4288,38 +4518,9 @@ describe('anyTriggerHasPathPatterns', () => {
   });
 });
 
-describe('issue_comment /kici approve commitSha lookup', () => {
-  it('filters held run SHA query by repo_identifier', async () => {
-    // Track the where clauses passed to the DB query chain
-    const whereClauses: Array<[string, string, unknown]> = [];
-
-    const mockSelectChain = {
-      innerJoin: vi.fn().mockReturnThis(),
-      select: vi.fn().mockReturnThis(),
-      where: vi.fn().mockImplementation(function (
-        this: typeof mockSelectChain,
-        col: string,
-        op: string,
-        val: unknown,
-      ) {
-        whereClauses.push([col, op, val]);
-        return this;
-      }),
-      orderBy: vi.fn().mockReturnThis(),
-      executeTakeFirst: vi.fn().mockResolvedValue({ sha: 'abc123' }),
-    };
-
-    const mockDb = {
-      selectFrom: vi.fn().mockReturnValue(mockSelectChain),
-    };
-
-    const mockHeldRunStore = {
-      create: vi.fn().mockResolvedValue(undefined),
-      listByQueueType: vi.fn().mockResolvedValue([]),
-      listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
-    };
-
-    // Create a provider bundle that handles issue_comment events
+describe('issue_comment /kici approve hold selection', () => {
+  /** A bundle whose normalizer understands the `issue_comment` event. */
+  function commentBundle() {
     const bundle = createMockProviderBundle();
     (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
       (eventType: string, action: string | null, payload: Record<string, unknown>) => {
@@ -4331,21 +4532,36 @@ describe('issue_comment /kici approve commitSha lookup', () => {
             payload,
             provider: 'github' as const,
             senderUsername: 'reviewer-user',
+            // An identity link is matched on the immutable numeric id alone, so
+            // without it the command is refused before any hold is selected.
+            senderUserId: '7001',
           };
         }
         return null;
       },
     );
+    return bundle;
+  }
 
-    const deps = createDeps({
-      db: mockDb as any,
-      heldRunStore: mockHeldRunStore as any,
-      providerRegistry: createMockProviderRegistry(bundle),
-    });
+  /** The commenter, linked and carrying ci_trust:write — the gate before selection. */
+  function trustedCommenter() {
+    return {
+      identityLinks: [
+        {
+          userId: 'user-1',
+          provider: 'github',
+          providerUsername: 'reviewer-user',
+          providerUserId: '7001',
+        },
+      ],
+      orgMemberPermissions: new Map([['user-1', 'write' as const]]),
+    };
+  }
 
-    const commentInfo: WebhookInfo = {
+  function commentInfo(deliveryId: string): WebhookInfo {
+    return {
       routingKey: 'github:12345',
-      deliveryId: 'delivery-comment-1',
+      deliveryId,
       event: 'issue_comment',
       action: 'created',
       provider: 'github',
@@ -4361,57 +4577,44 @@ describe('issue_comment /kici approve commitSha lookup', () => {
         sender: { login: 'reviewer-user' },
       },
     };
+  }
 
-    await processWebhook(commentInfo, deps);
-
-    // Verify the DB query included a repo_identifier filter
-    const repoFilter = whereClauses.find(
-      ([col, _op, _val]) => col === 'execution_runs.repo_identifier',
-    );
-    expect(repoFilter).toBeDefined();
-    expect(repoFilter![2]).toBe('myorg/myrepo');
-
-    // Verify the SHA lookup is ALSO scoped to the comment's PR number, so the
-    // post-approval check status lands on this PR's head commit — not the
-    // latest repo-wide hold's commit.
-    const prFilter = whereClauses.find(([col, _op, _val]) => col === 'execution_runs.pr_number');
-    expect(prFilter).toBeDefined();
-    expect(prFilter![2]).toBe(5);
-  });
-
-  it('uses resolved org ID (not __default__) for held run SHA lookup', async () => {
-    const heldRunWhereClauses: Array<[string, string, unknown]> = [];
-
-    // Mock for held_runs query chain
-    const mockHeldRunsChain = {
-      innerJoin: vi.fn().mockReturnThis(),
-      select: vi.fn().mockReturnThis(),
-      where: vi.fn().mockImplementation(function (
-        this: typeof mockHeldRunsChain,
-        col: string,
-        op: string,
-        val: unknown,
-      ) {
-        heldRunWhereClauses.push([col, op, val]);
-        return this;
-      }),
-      orderBy: vi.fn().mockReturnThis(),
-      executeTakeFirst: vi.fn().mockResolvedValue({ sha: 'abc123' }),
+  it('scopes hold selection to the comment repo and PR number', async () => {
+    // A `/kici` command must never reach a hold from another PR — or another
+    // repo — in the same org. Each selected hold is then terminalized on the
+    // commit ITS OWN run acted on, so there is no repo-wide "latest hold's sha"
+    // lookup any more: this scoping is the whole of the selection contract.
+    const mockHeldRunStore = {
+      create: vi.fn().mockResolvedValue(undefined),
+      listByQueueType: vi.fn().mockResolvedValue([]),
+      listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
     };
 
-    // Mock for sources query chain (resolveOrgId)
+    const deps = createDeps({
+      db: { selectFrom: vi.fn() } as any,
+      heldRunStore: mockHeldRunStore as any,
+      providerRegistry: createMockProviderRegistry(commentBundle()),
+      ...trustedCommenter(),
+    });
+
+    await processWebhook(commentInfo('delivery-comment-1'), deps);
+
+    expect(mockHeldRunStore.listPendingSecurityHoldsForPr).toHaveBeenCalledWith(
+      expect.any(String),
+      'myorg/myrepo',
+      5,
+    );
+    // The org-wide list is never reached — it would return holds from every PR.
+    expect(mockHeldRunStore.listByQueueType).not.toHaveBeenCalled();
+  });
+
+  it('uses the resolved org ID (not __default__) for hold selection', async () => {
     const mockSourcesChain = {
       select: vi.fn().mockReturnThis(),
       where: vi.fn().mockReturnThis(),
       executeTakeFirst: vi.fn().mockResolvedValue({ customer_id: 'org-real-123' }),
     };
-
-    const mockDb = {
-      selectFrom: vi.fn().mockImplementation((table: string) => {
-        if (table === 'sources') return mockSourcesChain;
-        return mockHeldRunsChain;
-      }),
-    };
+    const mockDb = { selectFrom: vi.fn().mockReturnValue(mockSourcesChain) };
 
     const mockHeldRunStore = {
       create: vi.fn().mockResolvedValue(undefined),
@@ -4419,54 +4622,20 @@ describe('issue_comment /kici approve commitSha lookup', () => {
       listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]),
     };
 
-    const bundle = createMockProviderBundle();
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
-      (eventType: string, action: string | null, payload: Record<string, unknown>) => {
-        if (eventType === 'issue_comment') {
-          return {
-            type: 'issue_comment' as const,
-            action: action ?? undefined,
-            targetBranch: 'main',
-            payload,
-            provider: 'github' as const,
-            senderUsername: 'reviewer-user',
-          };
-        }
-        return null;
-      },
-    );
-
     const deps = createDeps({
       db: mockDb as any,
       heldRunStore: mockHeldRunStore as any,
-      providerRegistry: createMockProviderRegistry(bundle),
+      providerRegistry: createMockProviderRegistry(commentBundle()),
+      ...trustedCommenter(),
     });
 
-    const commentInfo: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'delivery-comment-2',
-      event: 'issue_comment',
-      action: 'created',
-      provider: 'github',
-      payload: {
-        action: 'created',
-        repository: { full_name: 'myorg/myrepo', owner: { login: 'myorg' }, name: 'myrepo' },
-        comment: { body: '/kici approve' },
-        issue: {
-          number: 5,
-          pull_request: { url: 'https://api.github.com/repos/myorg/myrepo/pulls/5' },
-        },
-        installation: { id: 42 },
-        sender: { login: 'reviewer-user' },
-      },
-    };
+    await processWebhook(commentInfo('delivery-comment-2'), deps);
 
-    await processWebhook(commentInfo, deps);
-
-    // Verify the held_runs query uses the resolved org ID, not '__default__'
-    const orgFilter = heldRunWhereClauses.find(([col, _op, _val]) => col === 'held_runs.org_id');
-    expect(orgFilter).toBeDefined();
-    expect(orgFilter![2]).toBe('org-real-123');
+    expect(mockHeldRunStore.listPendingSecurityHoldsForPr).toHaveBeenCalledWith(
+      'org-real-123',
+      'myorg/myrepo',
+      5,
+    );
   });
 });
 
@@ -5539,6 +5708,8 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     registrations: ReturnType<typeof makeRepoRegistration>[];
     /** resolved org id — defaults to 'custA' (non-__default__) */
     customerId?: string;
+    /** Supplied only by tests that assert what the run row records. */
+    executionTracker?: ProcessingDeps['executionTracker'];
   }): Promise<ProcessingDeps> {
     const registry = new ProviderRegistry();
     registry.registerByRoutingKey('generic:kiciStg00001:stg-generic', opts.inboundBundle);
@@ -5571,6 +5742,16 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
           }),
         }),
       }),
+      // `recordRunStart` stamps the trust context onto the tracked run with a
+      // fire-and-forget UPDATE. Only reached once an executionTracker is wired
+      // in, so the tests that omit one never touch this branch.
+      updateTable: vi.fn().mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            execute: vi.fn().mockResolvedValue(undefined),
+          }),
+        }),
+      }),
     };
 
     return createDeps({
@@ -5578,6 +5759,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
       registrationIndex: mockRegistrationIndex as any,
       lockFileCache: (await makeFreshLockFileCache()) as any,
       db: mockDb as any,
+      ...(opts.executionTracker && { executionTracker: opts.executionTracker }),
     });
   }
 
@@ -5642,6 +5824,75 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     // Trigger matched → dispatch fired.
     expect((deps.dispatcher.dispatch as any).mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  /**
+   * The run row's `routing_key` and `provider_context` MUST name the same
+   * source, because a re-run rebuilds its provider pair out of exactly those
+   * two columns: `resolveRerunProviderBinding` (`pipeline/rerun.ts`) looks the
+   * bundle up by `routing_key` and hands it `provider_context` as the
+   * credentials, then re-fetches the lock file with that pair.
+   *
+   * A cross-provider lock-file fallback is the one delivery shape where the
+   * dispatch source is not the inbound one, so it is the only shape that can
+   * split the pair. `fetchLockFileWithFallbackPhase` swaps all three of
+   * `dispatchBundle` / `dispatchCredentials` / `resolvedFallbackRoutingKey`
+   * together, and `setupDispatchContext` overlays `info.routingKey` with the
+   * fallback key before `onExecutionStarted` writes the row — so both halves
+   * come from the fallback registration.
+   *
+   * If that ever silently drifted so the row recorded the INBOUND key beside
+   * the fallback credentials, a re-run would authenticate as the wrong
+   * installation and read the wrong tree — either failing outright or
+   * re-running against a lock file that is not the one the original run used.
+   * Nothing else asserts the pairing, so this is the pin.
+   */
+  it('records the dispatch routing key with the credentials it came from', async () => {
+    const inbound = createMockInternalBundle(null);
+    const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
+
+    const reg = makeRepoRegistration({
+      id: 'reg-1',
+      customerId: 'custA',
+      routingKey: 'github:42',
+      repoIdentifier: 'example-org/test-repo',
+      providerContext: { installationId: 12345 },
+    });
+
+    const onExecutionStarted = vi.fn().mockResolvedValue(undefined);
+    const deps = await makeFallbackDeps({
+      inboundBundle: inbound,
+      githubBundle,
+      registrations: [reg],
+      executionTracker: {
+        onExecutionStarted,
+        addJobsToRun: vi.fn().mockResolvedValue(undefined),
+        holdRunForPendingJobs: vi.fn(() => true),
+        releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+      } as any,
+    });
+
+    const inboundInfo = internalPushInfo();
+    await processWebhook(inboundInfo, deps);
+
+    // Non-vacuity: the assertion below only discriminates while the inbound
+    // source and the fallback source have different routing keys.
+    expect(inboundInfo.routingKey).not.toBe(reg.routingKey);
+
+    expect(onExecutionStarted).toHaveBeenCalledTimes(1);
+    const startCall = onExecutionStarted.mock.calls[0];
+    // Asserted as ONE pair: a row is correct only if BOTH halves name the
+    // fallback registration. Either half alone can look right while the row
+    // as a whole is unusable for a re-run.
+    expect({
+      // `onExecutionStarted` is positional: arg 7 is providerContext,
+      // arg 10 is routingKey.
+      providerContext: startCall[7],
+      routingKey: startCall[10],
+    }).toEqual({
+      providerContext: reg.providerContext,
+      routingKey: reg.routingKey,
+    });
   });
 
   // Test 3 — fallback exhaustion (multiple fetchers, none resolve).
@@ -6059,237 +6310,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
   });
 });
 
-// ── Contributor cache invalidation on membership events ──────────
-describe('processWebhook: contributor cache invalidation', () => {
-  beforeEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('invokes invalidate(provider, repo, user) for member events and does not dispatch', async () => {
-    const contributorCache = {
-      invalidate: vi.fn(),
-      invalidateByRepo: vi.fn().mockReturnValue(0),
-      invalidateByUserInOrg: vi.fn().mockReturnValue(0),
-    };
-
-    // Build a GitHub bundle whose normalizer returns a repo-user invalidation
-    // for `member` and `null` from normalizeEvent (so the pipeline early-exits
-    // without attempting to match triggers or dispatch jobs).
-    const bundle = createMockProviderBundle();
-    (
-      bundle.normalizer as unknown as { getAccessCacheInvalidations: ReturnType<typeof vi.fn> }
-    ).getAccessCacheInvalidations = vi
-      .fn()
-      .mockReturnValue([{ kind: 'repo-user', repoFullName: 'acme/frontend', username: 'alice' }]);
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
-      (eventType: string) => (eventType === 'member' ? null : null),
-    );
-
-    const deps = createDeps({
-      providerRegistry: (() => {
-        const r = new ProviderRegistry();
-        r.register('github', bundle);
-        return r;
-      })(),
-      contributorCache: contributorCache as any,
-    });
-
-    const info: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'member-delivery-001',
-      event: 'member',
-      action: 'added',
-      provider: 'github',
-      payload: {
-        action: 'added',
-        repository: { full_name: 'acme/frontend' },
-        member: { login: 'alice' },
-      },
-    };
-
-    await processWebhook(info, deps);
-
-    // The repo-user invalidation went through invalidate() with the right args.
-    expect(contributorCache.invalidate).toHaveBeenCalledTimes(1);
-    expect(contributorCache.invalidate).toHaveBeenCalledWith('github', 'acme/frontend', 'alice');
-
-    // No bulk invalidators fired.
-    expect(contributorCache.invalidateByRepo).not.toHaveBeenCalled();
-    expect(contributorCache.invalidateByUserInOrg).not.toHaveBeenCalled();
-
-    // And no workflow dispatched (membership events are not triggers).
-    expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
-  });
-
-  it('routes repo-scoped team events through invalidateByRepo', async () => {
-    const contributorCache = {
-      invalidate: vi.fn(),
-      invalidateByRepo: vi.fn().mockReturnValue(3),
-      invalidateByUserInOrg: vi.fn().mockReturnValue(0),
-    };
-
-    const bundle = createMockProviderBundle();
-    (
-      bundle.normalizer as unknown as { getAccessCacheInvalidations: ReturnType<typeof vi.fn> }
-    ).getAccessCacheInvalidations = vi
-      .fn()
-      .mockReturnValue([{ kind: 'repo', repoFullName: 'acme/backend' }]);
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockReturnValue(null);
-
-    const deps = createDeps({
-      providerRegistry: (() => {
-        const r = new ProviderRegistry();
-        r.register('github', bundle);
-        return r;
-      })(),
-      contributorCache: contributorCache as any,
-    });
-
-    const info: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'team-delivery-001',
-      event: 'team',
-      action: 'added_to_repository',
-      provider: 'github',
-      payload: {
-        action: 'added_to_repository',
-        repository: { full_name: 'acme/backend' },
-      },
-    };
-
-    await processWebhook(info, deps);
-
-    expect(contributorCache.invalidateByRepo).toHaveBeenCalledWith('github', 'acme/backend');
-    expect(contributorCache.invalidate).not.toHaveBeenCalled();
-    expect(contributorCache.invalidateByUserInOrg).not.toHaveBeenCalled();
-    expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
-  });
-
-  it('routes user-in-org events through invalidateByUserInOrg', async () => {
-    const contributorCache = {
-      invalidate: vi.fn(),
-      invalidateByRepo: vi.fn().mockReturnValue(0),
-      invalidateByUserInOrg: vi.fn().mockReturnValue(5),
-    };
-
-    const bundle = createMockProviderBundle();
-    (
-      bundle.normalizer as unknown as { getAccessCacheInvalidations: ReturnType<typeof vi.fn> }
-    ).getAccessCacheInvalidations = vi
-      .fn()
-      .mockReturnValue([{ kind: 'user-in-org', orgLogin: 'acme', username: 'charlie' }]);
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockReturnValue(null);
-
-    const deps = createDeps({
-      providerRegistry: (() => {
-        const r = new ProviderRegistry();
-        r.register('github', bundle);
-        return r;
-      })(),
-      contributorCache: contributorCache as any,
-    });
-
-    const info: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'org-delivery-001',
-      event: 'organization',
-      action: 'member_removed',
-      provider: 'github',
-      payload: {
-        action: 'member_removed',
-        organization: { login: 'acme' },
-        membership: { user: { login: 'charlie' } },
-      },
-    };
-
-    await processWebhook(info, deps);
-
-    expect(contributorCache.invalidateByUserInOrg).toHaveBeenCalledWith(
-      'github',
-      'acme',
-      'charlie',
-    );
-    expect(contributorCache.invalidate).not.toHaveBeenCalled();
-    expect(contributorCache.invalidateByRepo).not.toHaveBeenCalled();
-    expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
-  });
-
-  it('no-ops when the normalizer does not implement getAccessCacheInvalidations', async () => {
-    const contributorCache = {
-      invalidate: vi.fn(),
-      invalidateByRepo: vi.fn().mockReturnValue(0),
-      invalidateByUserInOrg: vi.fn().mockReturnValue(0),
-    };
-
-    const bundle = createMockProviderBundle();
-    // Explicitly do NOT set getAccessCacheInvalidations (default mock bundle omits it).
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockReturnValue(null);
-
-    const deps = createDeps({
-      providerRegistry: (() => {
-        const r = new ProviderRegistry();
-        r.register('github', bundle);
-        return r;
-      })(),
-      contributorCache: contributorCache as any,
-    });
-
-    const info: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'no-invalidator-001',
-      event: 'member',
-      action: 'added',
-      provider: 'github',
-      payload: { action: 'added' },
-    };
-
-    await processWebhook(info, deps);
-
-    expect(contributorCache.invalidate).not.toHaveBeenCalled();
-    expect(contributorCache.invalidateByRepo).not.toHaveBeenCalled();
-    expect(contributorCache.invalidateByUserInOrg).not.toHaveBeenCalled();
-  });
-
-  it('no-ops when the normalizer returns invalidations but no contributorCache dep is provided', async () => {
-    const bundle = createMockProviderBundle();
-    const getAccessCacheInvalidations = vi
-      .fn()
-      .mockReturnValue([{ kind: 'repo-user', repoFullName: 'acme/frontend', username: 'alice' }]);
-    (
-      bundle.normalizer as unknown as {
-        getAccessCacheInvalidations: typeof getAccessCacheInvalidations;
-      }
-    ).getAccessCacheInvalidations = getAccessCacheInvalidations;
-    (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockReturnValue(null);
-
-    const deps = createDeps({
-      providerRegistry: (() => {
-        const r = new ProviderRegistry();
-        r.register('github', bundle);
-        return r;
-      })(),
-      // contributorCache omitted on purpose.
-    });
-
-    const info: WebhookInfo = {
-      routingKey: 'github:12345',
-      deliveryId: 'no-cache-dep-001',
-      event: 'member',
-      action: 'added',
-      provider: 'github',
-      payload: {
-        action: 'added',
-        repository: { full_name: 'acme/frontend' },
-        member: { login: 'alice' },
-      },
-    };
-
-    // Should not throw — the pipeline silently skips when deps.contributorCache is absent.
-    await expect(processWebhook(info, deps)).resolves.not.toThrow();
-    expect(getAccessCacheInvalidations).toHaveBeenCalledOnce();
-  });
-});
-
 describe('resolveLockFileWithFallback — corrupt lock handling', () => {
   function inboundBundle(): ProviderBundle {
     return {
@@ -6419,5 +6439,416 @@ describe('result-aware eval gate', () => {
     expect(isEvalGatePending('run-eg-4', '__dynamic__ci__0')).toBe(true);
     // cleanup
     clearEvalGatesForRun('run-eg-4');
+  });
+});
+
+describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
+  // The needs scheduler claims a downstream on `needs_satisfied` alone and calls
+  // dispatchReadyJob, which had no held_runs check at all. So
+  // `job('deploy', { needs: ['build'], approval: true })` reached an agent the
+  // moment `build` succeeded, while its hold row still said `pending`.
+  //
+  // Every release path flips the row to `released` BEFORE dispatching, so this
+  // gate cannot block a legitimate resume — the control below is that case.
+  function dbWith(holdStatus: string | null) {
+    return {
+      selectFrom: () => ({
+        select: function (this: unknown) {
+          return this;
+        },
+        selectAll: function (this: unknown) {
+          return this;
+        },
+        where: function (this: unknown) {
+          return this;
+        },
+        // The real query filters on `status = pending`, so it yields a row
+        // only for a pending hold — the stub mirrors that rather than echoing
+        // whatever status it was given.
+        executeTakeFirst: async () =>
+          holdStatus === 'pending' ? { status: holdStatus } : undefined,
+        // The needs gate reads `execution_job_needs` with `execute`. No rows =
+        // no needs edges, which reads as dispatchable — the ordinary job these
+        // hold-gate cases model.
+        execute: async () => [],
+      }),
+      deleteFrom: () => ({
+        where: function (this: unknown) {
+          return this;
+        },
+        execute: async () => undefined,
+        returningAll: function (this: unknown) {
+          return this;
+        },
+        executeTakeFirst: async () => undefined,
+      }),
+    } as never;
+  }
+
+  const jobInput = { runId: 'run-hold', jobName: 'deploy', jobConfig: {} } as never;
+
+  it('refuses to dispatch while the hold is pending, and keeps the context', async () => {
+    await storePendingJobContext(undefined, 'run-hold', 'deploy', {
+      jobInput,
+      runsOnLabels: ['default'],
+    });
+    const dispatch = vi.fn();
+
+    await dispatchReadyJob(
+      'run-hold',
+      'deploy',
+      { dispatch } as never,
+      undefined,
+      undefined,
+      dbWith('pending'),
+    );
+
+    expect(dispatch).not.toHaveBeenCalled();
+    // The context must survive, or the eventual approval would find nothing to
+    // dispatch and the job would be stranded.
+    const still = await consumePendingJobContext(undefined, 'run-hold', 'deploy');
+    expect(still).toBeDefined();
+  });
+
+  it('keeps refusing while a SECOND hold on the same job is still pending', async () => {
+    // A job carrying an SDK `requireApproval` AND a security-typed context gate
+    // gets TWO `held_runs` rows on one (run_id, job_id), because two independent
+    // requirements gate it and it may only run once both are satisfied. This
+    // gate is the whole mechanism for that: the query filters on
+    // `status = 'pending'` and takes the first match, so releasing one row still
+    // yields the other and the job stays held. The stub models exactly that.
+    //
+    // The stub records its `where` clauses, because the filter is the load-
+    // bearing part: without `status = 'pending'` the query would take whichever
+    // of the two rows Postgres returned first, and a released row would read as
+    // "nothing is holding this job" while the other still gated it.
+    const rows = [{ status: 'released' }, { status: 'pending' }];
+    const wheres: unknown[][] = [];
+    const twoHoldDb = {
+      selectFrom: () => ({
+        select: function (this: unknown) {
+          return this;
+        },
+        selectAll: function (this: unknown) {
+          return this;
+        },
+        where: function (this: unknown, ...args: unknown[]) {
+          wheres.push(args);
+          return this;
+        },
+        executeTakeFirst: async () =>
+          // Applied by the query, not assumed by the stub: with no status
+          // filter this yields the released row, exactly as Postgres would.
+          wheres.some((w) => w[0] === 'status')
+            ? rows.find((r) => r.status === 'pending')
+            : rows[0],
+      }),
+      deleteFrom: () => ({
+        where: function (this: unknown) {
+          return this;
+        },
+        execute: async () => undefined,
+        returningAll: function (this: unknown) {
+          return this;
+        },
+        executeTakeFirst: async () => undefined,
+      }),
+    } as never;
+
+    await storePendingJobContext(undefined, 'run-two-holds', 'deploy', {
+      jobInput: { runId: 'run-two-holds', jobName: 'deploy', jobConfig: {} } as never,
+      runsOnLabels: ['default'],
+    });
+    const dispatch = vi.fn();
+
+    await dispatchReadyJob(
+      'run-two-holds',
+      'deploy',
+      { dispatch } as never,
+      undefined,
+      undefined,
+      twoHoldDb,
+    );
+
+    expect(wheres).toContainEqual(['status', '=', HeldRunStatus.Pending]);
+    expect(dispatch).not.toHaveBeenCalled();
+    // And the resume path survives for whoever answers the second hold.
+    expect(await consumePendingJobContext(undefined, 'run-two-holds', 'deploy')).toBeDefined();
+  });
+
+  it('dispatches once the hold is released', async () => {
+    // The positive control. Identical setup, differing only in hold status —
+    // so a gate that refused everything would fail here.
+    await storePendingJobContext(undefined, 'run-rel', 'deploy', {
+      jobInput: { runId: 'run-rel', jobName: 'deploy', jobConfig: {} } as never,
+      runsOnLabels: ['default'],
+    });
+    const dispatch = vi
+      .fn()
+      .mockResolvedValue({ status: 'dispatched', agentId: 'a1', jobId: 'j1' });
+
+    await dispatchReadyJob(
+      'run-rel',
+      'deploy',
+      { dispatch } as never,
+      undefined,
+      undefined,
+      dbWith('released'),
+    );
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('dispatches when there is no hold at all', async () => {
+    // The ordinary needs-gated job: no hold row, nothing to wait for.
+    await storePendingJobContext(undefined, 'run-none', 'deploy', {
+      jobInput: { runId: 'run-none', jobName: 'deploy', jobConfig: {} } as never,
+      runsOnLabels: ['default'],
+    });
+    const dispatch = vi
+      .fn()
+      .mockResolvedValue({ status: 'dispatched', agentId: 'a1', jobId: 'j1' });
+
+    await dispatchReadyJob(
+      'run-none',
+      'deploy',
+      { dispatch } as never,
+      undefined,
+      undefined,
+      dbWith(null),
+    );
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The gate is the enforcement point for "both requirements answered" on a job
+   * carrying two holds, so answering `false` on a read error dispatched a job
+   * with neither hold released. It now refuses, and retries first so a single
+   * blip does not park the job.
+   */
+  describe('a hold read that fails', () => {
+    function throwingDb(failures: number, calls: { n: number }) {
+      return {
+        selectFrom: () => ({
+          select: function (this: unknown) {
+            return this;
+          },
+          where: function (this: unknown) {
+            return this;
+          },
+          executeTakeFirst: async () => {
+            calls.n++;
+            if (calls.n <= failures) throw new Error('connection terminated');
+            return undefined; // no hold — the job would dispatch if we got here
+          },
+          // Only the hold read fails here; the needs gate reads cleanly and
+          // reports no edges, so this case isolates the hold retry ladder.
+          execute: async () => [],
+        }),
+        deleteFrom: () => ({
+          where: function (this: unknown) {
+            return this;
+          },
+          execute: async () => undefined,
+          returningAll: function (this: unknown) {
+            return this;
+          },
+          executeTakeFirst: async () => undefined,
+        }),
+      } as never;
+    }
+
+    it('refuses the dispatch once every attempt has failed', async () => {
+      const calls = { n: 0 };
+      await storePendingJobContext(undefined, 'run-db-down', 'deploy', {
+        jobInput: { runId: 'run-db-down', jobName: 'deploy', jobConfig: {} } as never,
+        runsOnLabels: ['default'],
+      });
+      const dispatch = vi.fn();
+
+      await dispatchReadyJob(
+        'run-db-down',
+        'deploy',
+        { dispatch } as never,
+        undefined,
+        undefined,
+        throwingDb(PENDING_HOLD_READ_ATTEMPTS, calls),
+      );
+
+      expect(calls.n).toBe(PENDING_HOLD_READ_ATTEMPTS);
+      expect(dispatch).not.toHaveBeenCalled();
+      // Parked, not lost: the context is still there for the release path and
+      // for the needs-scheduler recovery loop on the next start.
+      expect(await consumePendingJobContext(undefined, 'run-db-down', 'deploy')).toBeDefined();
+    });
+
+    it('dispatches when a transient failure clears within the retries', async () => {
+      // Two failures then a success, pinned as a literal rather than derived
+      // from PENDING_HOLD_READ_ATTEMPTS: a count expressed in terms of the
+      // constant moves with it, so shrinking the budget to 1 would still pass.
+      const calls = { n: 0 };
+      await storePendingJobContext(undefined, 'run-db-blip', 'deploy', {
+        jobInput: { runId: 'run-db-blip', jobName: 'deploy', jobConfig: {} } as never,
+        runsOnLabels: ['default'],
+      });
+      const dispatch = vi
+        .fn()
+        .mockResolvedValue({ status: 'dispatched', agentId: 'a1', jobId: 'j1' });
+
+      await dispatchReadyJob(
+        'run-db-blip',
+        'deploy',
+        { dispatch } as never,
+        undefined,
+        undefined,
+        throwingDb(2, calls),
+      );
+
+      expect(calls.n).toBe(3);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+
+    it('budgets enough attempts to ride out a blip', () => {
+      // The refusal is only a cheap trade because a single transient error does
+      // not park the job. One attempt would make every blip a park.
+      expect(PENDING_HOLD_READ_ATTEMPTS).toBeGreaterThanOrEqual(3);
+    });
+
+    it('hasPendingHold answers held rather than free when the read never succeeds', async () => {
+      const calls = { n: 0 };
+      const held = await hasPendingHold(throwingDb(99, calls), 'run-x', 'deploy', {
+        attempts: 2,
+        retryBaseMs: 0,
+      });
+      expect(held).toBe(true);
+      expect(calls.n).toBe(2);
+    });
+  });
+});
+
+describe('extractDefaultBranch', () => {
+  /** Minimal normalizer stub — only the hook this helper reads is populated. */
+  function normalizerWith(hook?: (p: Record<string, unknown>) => string | null) {
+    return { ...(hook && { extractDefaultBranch: hook }) } as never;
+  }
+
+  it('prefers the provider-specific normalizer hook', () => {
+    const payload = { repository: { default_branch: 'master' } };
+    expect(
+      extractDefaultBranch(
+        payload,
+        normalizerWith(() => 'trunk'),
+      ),
+    ).toBe('trunk');
+  });
+
+  it('falls back to payload.repository.default_branch when the hook returns null', () => {
+    const payload = { repository: { default_branch: 'main' } };
+    expect(
+      extractDefaultBranch(
+        payload,
+        normalizerWith(() => null),
+      ),
+    ).toBe('main');
+  });
+
+  it('falls back to payload.repository.default_branch when there is no hook', () => {
+    const payload = { repository: { default_branch: 'main' } };
+    expect(extractDefaultBranch(payload, normalizerWith())).toBe('main');
+  });
+
+  it('returns null when neither source names a default branch', () => {
+    expect(extractDefaultBranch({}, normalizerWith())).toBeNull();
+    expect(
+      extractDefaultBranch(
+        { repository: {} },
+        normalizerWith(() => null),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('summarizeDecision', () => {
+  function decisionWithChecks(count: number): WorkflowDecision {
+    return {
+      workflowName: 'build',
+      matched: true,
+      matchedTrigger: 0,
+      summary: 'Trigger conditions met',
+      checks: Array.from({ length: count }, (_, index) => ({
+        check: `check-${index}`,
+        pattern: 'main',
+        value: 'main',
+        passed: true,
+      })),
+    };
+  }
+
+  it('forwards every check when the decision is under the cap', () => {
+    const summary = summarizeDecision(decisionWithChecks(3));
+    expect(summary.checksCount).toBe(3);
+    expect(summary.checks).toHaveLength(3);
+    expect(summary.checksTruncated).toBeUndefined();
+  });
+
+  it('caps the forwarded checks and flags the truncation', () => {
+    const summary = summarizeDecision(decisionWithChecks(60));
+    expect(summary.checksCount).toBe(60);
+    expect(summary.checks).toHaveLength(DECISION_TRACE_MAX_CHECKS);
+    expect(summary.checksTruncated).toBe(true);
+  });
+
+  it('carries the full trace at exactly the cap without flagging truncation', () => {
+    const summary = summarizeDecision(decisionWithChecks(DECISION_TRACE_MAX_CHECKS));
+    expect(summary.checks).toHaveLength(DECISION_TRACE_MAX_CHECKS);
+    expect(summary.checksTruncated).toBeUndefined();
+  });
+});
+
+describe('capDecisionSummaries', () => {
+  /** A summary whose single check carries a pathological free-text value. */
+  function fatSummary(index: number, valueBytes: number): Record<string, unknown> {
+    return summarizeDecision({
+      workflowName: `wf-${index}`,
+      matched: false,
+      checks: [
+        {
+          check: 'bodyMatch (regex)',
+          pattern: '^/deploy',
+          value: 'x'.repeat(valueBytes),
+          passed: false,
+        },
+      ],
+      summary: 'No matching trigger',
+    });
+  }
+
+  it('passes a small trace through untouched', () => {
+    const summaries = [fatSummary(0, 10), fatSummary(1, 10)];
+    const capped = capDecisionSummaries(summaries);
+    expect(capped).toEqual(summaries);
+  });
+
+  it('bounds the serialized payload for a pathological trace', () => {
+    // A comment body at the provider's 64 KiB ceiling, fanned out across a
+    // hundred comment-triggered workflows: ~6 MB on one frame before the cap.
+    const summaries = Array.from({ length: 100 }, (_, i) => fatSummary(i, 65_536));
+    const capped = capDecisionSummaries(summaries);
+
+    expect(Buffer.byteLength(JSON.stringify(capped))).toBeLessThanOrEqual(DECISION_TRACE_MAX_BYTES);
+    // Positive control: it kept something and said what it dropped, rather than
+    // silently emitting an empty array.
+    expect(capped.length).toBeGreaterThan(1);
+    const marker = capped.at(-1)!;
+    expect(marker.traceTruncated).toBe(true);
+    expect(marker.decisionsOmitted).toBe(100 - (capped.length - 1));
+  });
+
+  it('keeps the marker alone when even one decision overruns the budget', () => {
+    const capped = capDecisionSummaries([fatSummary(0, DECISION_TRACE_MAX_BYTES * 2)]);
+    expect(Buffer.byteLength(JSON.stringify(capped))).toBeLessThanOrEqual(DECISION_TRACE_MAX_BYTES);
+    expect(capped).toHaveLength(1);
+    expect(capped[0]!.decisionsOmitted).toBe(1);
   });
 });

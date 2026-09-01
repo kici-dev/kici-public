@@ -9,6 +9,7 @@ import {
   ApprovalDecision,
   HoldScope,
   HoldType,
+  SECURITY_HOLD_JOB_IDS,
   TriggerSource,
   HeldRunStatus as WireHeldRunStatus,
 } from '@kici-dev/engine';
@@ -68,6 +69,91 @@ describe('HeldRunStore', () => {
 
       expect(mocks.insertInto).toHaveBeenCalledWith('held_runs');
       expect(result).toEqual(row);
+    });
+
+    it('writes the pending-check flag false, not absent', async () => {
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.create('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        contextId: 'env-001',
+        holdType: HoldType.enum.security,
+        reason: 'Requires approval',
+        expiresAt: new Date('2026-03-09T12:00:00Z'),
+      });
+
+      const values = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(values.posted_pending_check).toBe(false);
+    });
+
+    it('inserts through a supplied executor, not the store connection', async () => {
+      // Same reasoning as the `createHold` case below: the non-approval holds
+      // this writes carry a pending dispatch context written beside them, and a
+      // row that outlives a rolled-back context is a hold nothing can resume.
+      const storeDb = createMockDb({ insertedRow: makeHeldRunRow() });
+      const trx = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(storeDb.db);
+
+      await store.create(
+        'org-abc',
+        {
+          runId: 'run-001',
+          jobId: 'job-001',
+          contextId: 'env-001',
+          holdType: HoldType.enum.security,
+          reason: 'Requires approval',
+          expiresAt: new Date('2026-03-09T12:00:00Z'),
+        },
+        trx.db,
+      );
+
+      expect(trx.mocks.insertInto).toHaveBeenCalledWith('held_runs');
+      expect(storeDb.mocks.insertInto).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('markPendingCheckPosted', () => {
+    it('sets the flag true on one hold, scoped by org', async () => {
+      // Org-scoped like every other write here: a shared orchestrator database
+      // can hold two tenants, and this is the flag that decides whether a
+      // terminal check reaches a commit.
+      const { db, mocks } = createMockDb();
+      const store = new HeldRunStore(db);
+
+      await store.markPendingCheckPosted('org-abc', ['hr-001']);
+
+      expect(mocks.updateTable).toHaveBeenCalledWith('held_runs');
+      expect(mocks.updateSet).toHaveBeenCalledWith({ posted_pending_check: true });
+      expect(mocks.updateWhere).toHaveBeenCalledWith('id', 'in', ['hr-001']);
+      expect(mocks.updateWhere).toHaveBeenCalledWith('org_id', '=', 'org-abc');
+    });
+
+    it('marks every hold in ONE statement, never one per hold', async () => {
+      // A loop admits a partial mark: mark the reviewer hold, fail on the
+      // security hold, and the security row keeps `posted_pending_check:
+      // false`. The contention query then does not count it as an owner, so
+      // approving the reviewer hold terminalizes the shared `KiCI Security`
+      // check `success` while the trust hold still gates the job — a fabricated
+      // PASSING check, reached without any process dying.
+      const { db, mocks } = createMockDb();
+      const store = new HeldRunStore(db);
+
+      await store.markPendingCheckPosted('org-abc', ['hr-001', 'hr-002']);
+
+      expect(mocks.updateTable).toHaveBeenCalledTimes(1);
+      expect(mocks.updateExecute).toHaveBeenCalledTimes(1);
+      expect(mocks.updateWhere).toHaveBeenCalledWith('id', 'in', ['hr-001', 'hr-002']);
+    });
+
+    it('issues no statement for an empty id list', async () => {
+      const { db, mocks } = createMockDb();
+      const store = new HeldRunStore(db);
+
+      await store.markPendingCheckPosted('org-abc', []);
+
+      expect(mocks.updateTable).not.toHaveBeenCalled();
     });
   });
 
@@ -168,6 +254,58 @@ describe('HeldRunStore', () => {
 
       expect(mocks.insertInto).toHaveBeenCalledWith('held_runs');
       expect(result).toEqual(row);
+    });
+  });
+
+  describe('create with scope and triggerSource', () => {
+    it('writes the pair the resume router discriminates on', async () => {
+      // The org trust policy's PR-wide hold owns a whole workflow dispatch, not
+      // a job. `routeRelease` reads this pair off the released row to send it to
+      // `resumeWorkflow`; a row left on the `'job'` column default is routed to
+      // `dispatchReadyJob`, which looks up a pending job context the hold never
+      // wrote and returns without dispatching.
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.create('org-abc', {
+        runId: 'run-001',
+        jobId: SECURITY_HOLD_JOB_IDS.fork_pr,
+        contextId: null,
+        holdType: HoldType.enum.security,
+        reason: 'fork_pr',
+        expiresAt: new Date('2026-03-09T12:00:00Z'),
+        queueType: 'security',
+        scope: HoldScope.enum.workflow,
+        triggerSource: TriggerSource.enum.context,
+      });
+
+      expect(mocks.insertValues).toHaveBeenCalledWith(
+        expect.objectContaining({
+          hold_scope: HoldScope.enum.workflow,
+          trigger_source: TriggerSource.enum.context,
+        }),
+      );
+    });
+
+    it('omits both columns when unset, leaving every legacy caller unchanged', async () => {
+      // The control: both columns are NOT NULL with a default, so a caller that
+      // does not pass them must not send an explicit value — which is what makes
+      // the field additive rather than a change to what those callers write.
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.create('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        contextId: 'env-001',
+        holdType: HoldType.enum.reviewer,
+        reason: 'Requires approval',
+        expiresAt: new Date('2026-03-09T12:00:00Z'),
+      });
+
+      const values = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(values).not.toHaveProperty('hold_scope');
+      expect(values).not.toHaveProperty('trigger_source');
     });
   });
 
@@ -308,6 +446,51 @@ describe('HeldRunStore', () => {
       expect(result).toEqual(row);
     });
 
+    it('writes the pending-check flag false, not absent', async () => {
+      // `null` means "row predates the column", and the shape derivation still
+      // answers for it. A new row that omitted the flag would inherit that
+      // meaning and get the inference the flag exists to replace.
+      const { db, mocks } = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(db);
+
+      await store.createHold('org-abc', {
+        runId: 'run-001',
+        jobId: 'job-001',
+        scope: 'job',
+        triggerSource: 'explicit',
+        requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'r' },
+      });
+
+      const values = mocks.insertValues.mock.calls[0][0] as Record<string, unknown>;
+      expect(values.posted_pending_check).toBe(false);
+    });
+
+    it('inserts through a supplied executor, not the store connection', async () => {
+      // Kysely has no ambient transaction: a `this.db` insert inside a
+      // `db.transaction()` callback takes a different connection and commits
+      // on its own. So a caller that writes the hold's resume path beside the
+      // row — without which the hold can never be released — has to hand its
+      // transaction in, and this asserts the row actually goes through it.
+      const storeDb = createMockDb({ insertedRow: makeHeldRunRow() });
+      const trx = createMockDb({ insertedRow: makeHeldRunRow() });
+      const store = new HeldRunStore(storeDb.db);
+
+      await store.createHold(
+        'org-abc',
+        {
+          runId: 'run-001',
+          jobId: 'job-001',
+          scope: 'job',
+          triggerSource: 'explicit',
+          requirement: { clauses: [], expiresAt: '2026-03-09T12:00:00Z', reason: 'r' },
+        },
+        trx.db,
+      );
+
+      expect(trx.mocks.insertInto).toHaveBeenCalledWith('held_runs');
+      expect(storeDb.mocks.insertInto).not.toHaveBeenCalled();
+    });
+
     it('persists a serialized drift payload when one is supplied', async () => {
       const payload = { summaryMarkdown: '## drift', drift: { want: 1 } };
       const row = makeHeldRunRow({ hold_scope: 'step', step_index: 2, payload });
@@ -406,15 +589,46 @@ describe('HeldRunStore', () => {
       ]);
     });
 
-    it('stays scoped to workflow holds so job-scoped timer holds are untouched', async () => {
-      // A dispatch-gate timer hold is job-scoped and must keep flowing through
-      // the ordinary expiry path, not this resume sweep.
+    it('does NOT filter on scope, so a job-scoped timer hold is released too', async () => {
+      // This assertion used to be its inverse — it required
+      // `hold_scope = 'workflow'`, on the theory that a job-scoped timer hold
+      // "must keep flowing through the ordinary expiry path". That path does not
+      // resume anything: the hold was created, never released, eventually
+      // expired, and its job never dispatched. With the job registered nowhere,
+      // a sibling job's success could complete the run without it.
+      //
+      // The scope now travels on the signal instead, and `routeRelease` sends a
+      // workflow hold to the install-gate rebuild and a job hold to the job
+      // re-dispatch path.
       const { db, mocks } = createMockDb({ updatedRows: [] });
       const store = new HeldRunStore(db);
 
       await store.releaseDueWaitHolds();
 
-      expect(whereClauses(mocks)).toContainEqual(['hold_scope', '=', HoldScope.enum.workflow]);
+      const clauses = whereClauses(mocks);
+      expect(clauses).not.toContainEqual(['hold_scope', '=', HoldScope.enum.workflow]);
+      // The other filters are unchanged — this widened scope, nothing else.
+      expect(clauses).toContainEqual(['status', '=', 'pending']);
+      expect(clauses).toContainEqual(['hold_type', 'in', [HoldType.enum.timer, 'wait_timer']]);
+    });
+
+    it("carries a job-scoped row's own scope on the signal", async () => {
+      // The router keys off this. A NULL-defaulted `workflow` here would
+      // re-dispatch an entire workflow for a hold that gated one job.
+      const row = makeHeldRunRow({
+        id: 'hr-wait-job',
+        hold_type: 'wait_timer',
+        hold_scope: HoldScope.enum.job,
+        step_index: null,
+        trigger_source: TriggerSource.enum.context,
+      });
+      const { db } = createMockDb({ updatedRows: [row] });
+      const store = new HeldRunStore(db);
+
+      const signals = await store.releaseDueWaitHolds();
+
+      expect(signals).toHaveLength(1);
+      expect(signals[0].scope).toBe(HoldScope.enum.job);
     });
 
     it('returns a release signal per released row', async () => {

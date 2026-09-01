@@ -38,7 +38,9 @@ const GLOBAL_WORKFLOWS_CHECK_NAME = 'KiCI: Organization workflows';
 const GLOBAL_EVAL_CHECK_NAME = 'KiCI: Organization workflow evaluation';
 
 /** Map CheckStatus to GitHub Checks API conclusion. */
-function mapConclusion(status: CheckStatus): 'success' | 'failure' | 'neutral' {
+function mapConclusion(
+  status: CheckStatus,
+): 'success' | 'failure' | 'neutral' | 'cancelled' | 'timed_out' {
   switch (status) {
     case 'success':
       return 'success';
@@ -46,6 +48,14 @@ function mapConclusion(status: CheckStatus): 'success' | 'failure' | 'neutral' {
       return 'failure';
     case 'neutral':
       return 'neutral';
+    // A hold that ended without running anything: rejected, or its approval
+    // window elapsed. Both are conclusions the Checks API accepts on create and
+    // on update, and both are the same conclusion the `kici/…` checks of the
+    // same event carry — so the two check families agree on what happened.
+    case 'cancelled':
+      return 'cancelled';
+    case 'timed_out':
+      return 'timed_out';
     case 'pending':
       // pending has no conclusion (in_progress status)
       throw new Error('pending status has no conclusion');
@@ -252,6 +262,49 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
       });
     } catch (err) {
       logger.error('Failed to post global-eval-failed check', {
+        repoIdentifier,
+        commitSha,
+        error: toErrorMessage(err),
+      });
+      throw err;
+    }
+  }
+
+  /**
+   * Post the success conclusion on the organization-workflow-evaluation check
+   * after a re-run of a failed round completed cleanly.
+   *
+   * Deliberately the SAME check name the failure posts: GitHub keys a check run
+   * by its name on a commit, so writing the success under that name is what
+   * turns the red check green on the original commit. A second, differently
+   * named green check would leave the red one standing and keep a branch
+   * protection rule blocked with no way to clear it short of a new commit.
+   */
+  async postGlobalEvalSucceededCheck(
+    repoIdentifier: string,
+    commitSha: string,
+    summary: string,
+    credentials: unknown,
+  ): Promise<void> {
+    const octokit = this.getOctokit(credentials);
+    const [owner, repo] = repoIdentifier.split('/');
+
+    try {
+      await octokit.checks.create({
+        owner,
+        repo,
+        name: GLOBAL_EVAL_CHECK_NAME,
+        head_sha: commitSha,
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: new Date().toISOString(),
+        output: {
+          title: 'Organization workflow evaluation succeeded',
+          summary,
+        },
+      });
+    } catch (err) {
+      logger.error('Failed to post global-eval-succeeded check', {
         repoIdentifier,
         commitSha,
         error: toErrorMessage(err),

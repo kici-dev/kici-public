@@ -22,7 +22,6 @@ import {
   GitHubCloneTokenProvider,
   GitHubRepoUrlBuilder,
   GitHubCheckStatusPoster,
-  GitHubContributorResolver,
 } from '../providers/github/index.js';
 import { createInstallationOctokit } from '../providers/github/auth.js';
 import type { SourceStore, SourceWithSecrets } from './source-store.js';
@@ -250,7 +249,7 @@ export class SourceManager {
           const creds = credentials as { installationId: number };
           return createInstallationOctokit(ghConfig, creds.installationId);
         }),
-        contributorResolver: new GitHubContributorResolver(ghConfig),
+        hasForkModel: true,
       };
     }
     throw new Error(`Unsupported provider: ${source.provider}`);

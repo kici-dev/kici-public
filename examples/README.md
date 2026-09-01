@@ -1,11 +1,13 @@
 # KiCI examples
 
-Runnable templates and example workflows. Two subdirectories today:
+Runnable templates and example workflows. Four subdirectories today:
 
-| Subdirectory                   | Purpose                                                                                                             |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| [`workflows/`](./workflows/)   | Standalone `.ts` workflow definitions you can run via `pnpm kici preview`.                                          |
-| [`quickstart/`](./quickstart/) | Deployment templates for the 5-minute quickstart — `compose/` (Docker / Podman) and `bare-metal/` (native systemd). |
+| Subdirectory                                               | Purpose                                                                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`workflows/`](./workflows/)                               | Standalone `.ts` workflow definitions you can run via `pnpm kici preview`.                                                                                                                                                                                                                                                                      |
+| [`dynamic-context/`](./dynamic-context/)                   | A repo-shaped example with a real `.kici/workflows/` directory layout.                                                                                                                                                                                                                                                                          |
+| [`quickstart/`](./quickstart/)                             | Deployment templates for the 5-minute quickstart — `compose/` (Docker / Podman) and `bare-metal/` (native systemd).                                                                                                                                                                                                                             |
+| [`github-actions-autoscale/`](./github-actions-autoscale/) | A one-shot agent workflow that turns GitHub Actions minutes into a burst pool for an `event` scaler. Provision with [`github-actions-autoscale/provision.workflow.ts`](./github-actions-autoscale/provision.workflow.ts) and tear down with [`github-actions-autoscale/teardown.workflow.ts`](./github-actions-autoscale/teardown.workflow.ts). |
 
 ## Workflows
 

@@ -12,7 +12,12 @@
 
 import { randomUUID } from 'node:crypto';
 import { matcherSatisfiedBy } from '@kici-dev/engine';
-import { DispatchQueueStatus, type QueuedJobInput, type QueuedJob } from '../queue/job-queue.js';
+import {
+  DispatchQueueStatus,
+  resourcesFromJobConfig,
+  type QueuedJobInput,
+  type QueuedJob,
+} from '../queue/job-queue.js';
 
 /**
  * Combined dispatch eligibility check for the in-memory queue:
@@ -55,8 +60,17 @@ export class InMemoryJobQueue {
   /** Enqueue a job in memory and return its ID. */
   async enqueue(input: QueuedJobInput): Promise<string> {
     const id = input.jobId ?? randomUUID();
+    // `resources` is materialized exactly as the DB-backed queue does it
+    // (`JobQueue.rowToQueuedJob`): the top-level field is a convenience mirror
+    // of `jobConfig.resources`, and on the DB path only the latter survives the
+    // round trip. Not carrying it here left every consumer that reads a drained
+    // job's declared shape seeing a job that declares nothing — the
+    // pre-spawned-agent suitability gate (`canPrespawnedAgentServe`) would admit
+    // any warm agent, and the scaler re-drive would spawn at the label-set
+    // default instead of what the job asked for.
     this.jobs.set(id, {
       id,
+      resources: input.resources ?? resourcesFromJobConfig(input.jobConfig),
       runId: input.runId,
       workflowName: input.workflowName,
       jobName: input.jobName,
@@ -108,10 +122,15 @@ export class InMemoryJobQueue {
   async dequeueForLabels(
     agentLabels: string[],
     agentMandatoryLabels: string[] = [],
+    _agentId?: string,
+    canServe?: (job: QueuedJob) => boolean,
   ): Promise<QueuedJob | null> {
     for (const [id, job] of this.jobs) {
       if (job.status !== DispatchQueueStatus.Pending) continue;
       if (!matchesGate(job, agentLabels, agentMandatoryLabels)) continue;
+      // Same extra gate the DB-backed queue applies: labels cannot express
+      // whether a pre-spawned agent's fixed shape or image fits this job.
+      if (canServe && !canServe(job)) continue;
       job.status = DispatchQueueStatus.Dispatched;
       this.jobs.delete(id);
       this.dispatched.set(id, job);

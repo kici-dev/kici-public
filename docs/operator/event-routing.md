@@ -54,24 +54,28 @@ Registration happens automatically when code is pushed to the default branch:
 1. A git push to the default branch arrives via webhook
 2. The orchestrator processes the push and fetches (or compiles) the lock file
 3. `extractRegisterableWorkflows()` identifies workflows with registerable trigger types
-4. The registration store atomically replaces all registrations for that customer+repo (DELETE + INSERT in a single transaction)
+4. The registration store atomically replaces all registrations for that customer+repo in a single transaction: it updates the rows the lock file still names, inserts the new ones, and deletes the rest. A surviving row keeps its id, so a column the push does not supply (such as `disabled`) keeps its stored value
 5. The registry version is bumped, notifying cluster peers to reload their in-memory index
 6. All orchestrators in the cluster refresh their registration index if the version is newer
 
 ### Registerable trigger types
 
-The following trigger types cause a workflow to be registered:
+Two families of trigger type cause a workflow to be registered.
 
-| Trigger type        | Example                                        |
-| ------------------- | ---------------------------------------------- |
-| `kici_event`        | Custom events via `ctx.emit()`                 |
-| `workflow_complete` | Triggered when another workflow finishes       |
-| `job_complete`      | Triggered when a specific job finishes         |
-| `generic_webhook`   | External HTTP webhooks (ArgoCD, Jenkins, etc.) |
-| `schedule`          | Cron-based schedules                           |
-| `lifecycle`         | Lifecycle events (startup, shutdown, etc.)     |
+**Non-Git-provider triggers.** These have no per-repo lock file pipeline to fall back to, so the registration index is the authoritative source for matching them:
 
-Workflows with only Git-provider triggers (push, PR, tag, etc.) are not registered -- they use the standard per-event lock file pipeline.
+| Trigger type             | Example                                                     |
+| ------------------------ | ----------------------------------------------------------- |
+| `kici_event`             | Custom events via `ctx.emit()`                              |
+| `workflow_complete`      | Triggered when another workflow finishes                    |
+| `workflows_failed_batch` | Triggered once per accumulation window of workflow failures |
+| `job_complete`           | Triggered when a specific job finishes                      |
+| `generic_webhook`        | External HTTP webhooks (ArgoCD, Jenkins, etc.)              |
+| `webhook`                | Arbitrary webhook events not covered by a specific type     |
+| `schedule`               | Cron-based schedules                                        |
+| `lifecycle`              | Lifecycle events (startup, shutdown, etc.)                  |
+
+**Git-provider triggers.** `push`, `pr`, `tag`, `comment`, `review`, `review_comment`, `release`, `dispatch`, `create`, `delete`, `status`, `workflow_run`, `fork`, `star`, and `watch` are registered as well. Registration does **not** replace their normal path: a real provider webhook on the same source still matches through the per-event lock file pipeline. The index is additive, and it is what makes cross-source dispatch work. When a generic webhook targets an externally-hosted repo, the cross-source branch looks up `(customer_id, repo_identifier)` in the index. It then reuses the stored provider context (installation id, app id, …) to mint credentials for the provider bundle that actually owns the repo. Without the index a workflow whose only trigger is `push()` would be invisible to cross-source dispatch, and a generic webhook naming its repo would silently no-op.
 
 ### Registration admin
 

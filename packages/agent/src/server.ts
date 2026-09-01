@@ -44,6 +44,7 @@ import { MetricsReporter } from './metrics/metrics-reporter.js';
 import { verifyNpmAvailable } from './execution/npm-resolver.js';
 import { gcStaleAgentTmpDirs } from './execution/tmp-gc.js';
 import { issueReboot } from './execution/reboot.js';
+import { decideIdleShutdown } from './idle-shutdown.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs).
 // Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
@@ -83,9 +84,17 @@ initTelemetry({
 // so they must be imported after initTelemetry() sets up the MeterProvider.
 const { connectionStatus, jobsActive, jobsTotal } = await import('./metrics/prometheus.js');
 const { JobRunner } = await import('./execution/job-runner.js');
+const { BetweenJobsController } = await import('./execution/between-jobs-controller.js');
 
 setServiceName('agent');
 const logger = createLogger({ prefix: 'agent' });
+
+/**
+ * Consecutive between-jobs reset failures after which a `drainOnResetFailure`
+ * agent drains — a persistently dirty host stops taking work rather than
+ * running every subsequent job against unclean state.
+ */
+const RESET_FAILURE_DRAIN_THRESHOLD = 3;
 
 /**
  * Serialize the agent's current Prometheus metrics to text. The OTel
@@ -155,8 +164,20 @@ await guardStartup(logger, async () => {
   ];
   const toolErrors = validateRequiredTools(agentToolRequirements);
   if (toolErrors.length > 0) {
+    // A job-image agent runs inside the customer's own image, so a missing tool
+    // is a property of THAT image, not of the host — and the operator reading
+    // this line has no reason to connect the two. Without the hint the symptom
+    // is a job that stays queued while the scaler respawns a container that
+    // exits at startup.
+    const jobImageHint = config.jobImageAgent
+      ? `\nThis agent runs inside the job's own container image, so that image must ` +
+        `provide these tools. Either add them to the image, or run the job on a pool ` +
+        `whose agent stays outside it.`
+      : '';
     throw new Error(
-      'Agent required-tools validation failed:\n' + toolErrors.map((e) => `  - ${e}`).join('\n'),
+      'Agent required-tools validation failed:\n' +
+        toolErrors.map((e) => `  - ${e}`).join('\n') +
+        jobImageHint,
     );
   }
 
@@ -183,10 +204,25 @@ await guardStartup(logger, async () => {
   // We need a forward reference for the client since JobRunner and client reference each other.
   let client: OrchestratorClient;
 
+  // Supervisor-owned between-jobs phase (reap the process tree, re-run declared
+  // cleanup out-of-band, delete the workdir, run the operator reset command).
+  // Held here so the job-completion handler can read its consecutive-reset-
+  // failure count and drain a persistently dirty host.
+  const betweenJobsController = new BetweenJobsController({
+    config: {
+      betweenJobsResetCommand: config.betweenJobsResetCommand,
+      betweenJobsResetTimeoutMs: config.betweenJobsResetTimeoutMs,
+      betweenJobsResetRunOn: config.betweenJobsResetRunOn,
+      orphanCleanup: config.orphanCleanup,
+      drainOnResetFailure: config.drainOnResetFailure,
+    },
+  });
+
   // 4. Create JobRunner with send/upload callbacks wired to OrchestratorClient
   const jobRunner = new JobRunner({
     send: (msg) => client.send(msg),
     config,
+    betweenJobsController,
     requestUploadUrl: (jobId, cacheType, key) => client.requestUploadUrl(jobId, cacheType, key),
     sendUploadComplete: (jobId, cacheType, key) => client.sendUploadComplete(jobId, cacheType, key),
     sendEventEmit: (jobId, requestId, eventName, payload, target) =>
@@ -212,6 +248,17 @@ await guardStartup(logger, async () => {
         const result = await client.sendApiRequest(method, params ?? {});
         rebootIntent = true;
         return result;
+      }
+      // scaler.claim-credentials rides its own dedicated WS message (the minted
+      // token must not travel the generic agent.api.* envelope / be logged), so
+      // divert it to the dedicated RPC and unwrap the credentials.
+      if (method === 'scaler.claim-credentials') {
+        const claimCode = String((params ?? {}).claimCode ?? '');
+        const r = await client.sendClaimCredentials(claimCode);
+        if (r.error) {
+          throw new Error(r.error);
+        }
+        return r.credentials;
       }
       return client.sendApiRequest(method, params ?? {});
     },
@@ -244,6 +291,9 @@ await guardStartup(logger, async () => {
   // agentClientConnectionOptions so KICI_AGENT_TOKEN always reaches the client.
   client = new OrchestratorClient({
     ...agentClientConnectionOptions(config),
+    // Self-bootstrap: exchange a single-use claim code for ephemeral
+    // credentials before registering (ignored when a static token is set).
+    scalerClaimCode: config.scalerClaimCode,
     // Fleet log collection inputs: the agent's resolved config (redacted inside
     // the bundle assembler), its log directory, and current Prometheus metrics.
     getFleetBundleInputs: async () => ({
@@ -340,6 +390,20 @@ await guardStartup(logger, async () => {
               // Send final metrics snapshot on job completion
               metricsReporter.collectAndSend().catch(() => {});
 
+              // Drain a persistently dirty host: after repeated consecutive
+              // between-jobs reset failures, stop accepting new jobs (same
+              // mechanism SIGUSR1 drain uses). Opt-in via KICI_AGENT_DRAIN_ON_RESET_FAILURE.
+              if (
+                config.drainOnResetFailure &&
+                !isDraining &&
+                betweenJobsController.consecutiveResetFailures >= RESET_FAILURE_DRAIN_THRESHOLD
+              ) {
+                logger.warn('Draining agent after repeated between-jobs reset failures', {
+                  consecutive: betweenJobsController.consecutiveResetFailures,
+                });
+                isDraining = true;
+              }
+
               // After job completes, send agent.status with updated counts
               sendAgentStatus();
 
@@ -420,19 +484,39 @@ await guardStartup(logger, async () => {
   // When a scaler-managed agent reconnects, it should check if it's still idle and
   // start the idle shutdown timer (the timer was deferred during disconnection).
   //
-  // Exception: when register.ack carries `pendingDispatch: true`, the orchestrator
-  // has already pre-bound a queued job to this agent and is preparing the
-  // dispatch.job message. The work between register.ack and dispatch.job send
-  // (provider lookup, secret merging, upstream output resolution for jobs with
-  // `needs:`) can take several seconds — well past the default 5s scaler-idle
-  // timer. Arming the timer here would race the dispatch and kill the agent
-  // before the job arrives. Defer to a much longer safety timeout instead; the
-  // actual dispatch.job will cancel the timer (server.ts:165-168) when it arrives.
-  client.onRegistered = ({ pendingDispatch }) => {
-    if (!config.scalerManaged || jobRunner.activeJobs.size > 0) {
+  // Two register.ack flags override that. `warmPool: true` means the agent was
+  // pre-spawned to wait for work rather than for a queued job: the
+  // orchestrator's warm-pool reaper owns its lifetime, so arming any timer here
+  // would kill it behind the reaper's back and cycle the pool.
+  // `pendingDispatch: true` means the orchestrator pre-bound a queued job and is
+  // preparing the dispatch.job message. That work (provider lookup, secret
+  // merging, upstream output resolution for jobs with `needs:`) can take several
+  // seconds — well past the default 5s scaler-idle timer — so arming the timer
+  // would race the dispatch and kill the agent before the job arrives. Defer to a
+  // much longer safety timeout instead; the actual dispatch.job cancels the timer
+  // (server.ts:165-168) when it arrives.
+  //
+  // The branch choice itself lives in `decideIdleShutdown` so it has one
+  // implementation rather than one here and a copy in the tests.
+  client.onRegistered = ({ pendingDispatch, warmPool }) => {
+    const decision = decideIdleShutdown({
+      scalerManaged: config.scalerManaged,
+      activeJobs: jobRunner.activeJobs.size,
+      pendingDispatch,
+      warmPool,
+    });
+    if (decision === 'none') {
       return;
     }
-    if (pendingDispatch) {
+    if (decision === 'warm') {
+      logger.info('Warm-pool agent registered and ready, awaiting work');
+      if (idleShutdownTimer) {
+        clearTimeout(idleShutdownTimer);
+        idleShutdownTimer = undefined;
+      }
+      return;
+    }
+    if (decision === 'pending-dispatch') {
       const safetyMs = config.scalerPendingDispatchTimeoutMs;
       logger.info(
         `Scaler-managed agent registered with pending bound dispatch, deferring idle shutdown for ${safetyMs}ms`,
@@ -471,7 +555,7 @@ await guardStartup(logger, async () => {
   });
   logger.add(wsTransport);
 
-  // 6b. Diagnostic: forwarded-env probe. Operators / E2E can set
+  // 6b. Diagnostic: forwarded-env probe. Operators can set
   // KICI_AGENT_ENV_KICI_FC_ENV_PROBE (or any var matching the KICI_*_ENV_PROBE
   // pattern) on the process that spawns agents; it flows through the scaler's
   // env-forwarding path and lands in the agent's process.env. Logging it here
@@ -597,6 +681,21 @@ await guardStartup(logger, async () => {
       },
     ],
   });
+
+  // -- Self-bootstrap claim failure --
+
+  // A one-shot self-bootstrap agent (KICI_SCALER_CLAIM_CODE set, no static
+  // token) whose claim exchange fails permanently — invalid, expired, or
+  // already-consumed code, or an errored/timed-out exchange — can never
+  // register. The claim can legitimately expire before a GitHub-hosted runner
+  // starts (scheduling latency > claim TTL). Without this the health HTTP
+  // server keeps the process alive and the run hangs until the job timeout, so
+  // exit non-zero through the graceful-shutdown path (logs flush, the health
+  // server closes).
+  client.onClaimFailedPermanently = (reason) => {
+    logger.error('Self-bootstrap claim failed permanently, shutting down', { reason });
+    void gracefulShutdown('scaler-claim-failed', 1);
+  };
 
   // -- Drain mode (SIGUSR1) --
 

@@ -63,6 +63,8 @@ function createMockExecutionTracker() {
     updateInMemoryJob: vi.fn(),
     completeRunIfAllJobsTerminal: vi.fn().mockResolvedValue(undefined),
     markJobReroutedToPeer: vi.fn().mockResolvedValue(undefined),
+    hasJobStarted: vi.fn().mockResolvedValue(false),
+    isJobTerminal: vi.fn().mockResolvedValue(false),
   };
 }
 
@@ -1255,6 +1257,102 @@ describe('RunCoordinator', () => {
       deps.dispatcher.dispatch.mockClear();
 
       await vi.advanceTimersByTimeAsync(2000);
+
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+    });
+
+    // A peer COORDINATOR shares this instance's database and writes job status
+    // straight to `execution_jobs`; only a WORKER relays `job.progress`. So for
+    // a coordinator-to-coordinator reroute nothing ever disarms the timer, and
+    // before this check the backstop cancelled every such job that outlived the
+    // window — a slow scaler spawn, a long checkout, a big dependency install.
+    it('does not re-dispatch when the shared row shows the peer already started the job', async () => {
+      const { deps, peerClient, jobId } = await setupReroute();
+      deps.executionTracker.hasJobStarted.mockResolvedValue(true);
+      deps.dispatcher.dispatch.mockClear();
+
+      await vi.advanceTimersByTimeAsync(2000);
+
+      expect(deps.executionTracker.hasJobStarted).toHaveBeenCalledWith('run-9', jobId);
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+    });
+
+    // The disarm keeps the tracking entry so cancel propagation still reaches
+    // the peer running the job — dropping it would strand a cancelled run's
+    // work on the peer with nothing left to tell it to stop.
+    it('still propagates a cancel to the peer after the backstop is disarmed', async () => {
+      const { coordinator, deps, peerClient, jobId } = await setupReroute();
+      deps.executionTracker.hasJobStarted.mockResolvedValue(true);
+
+      await vi.advanceTimersByTimeAsync(2000);
+      coordinator.cancelRun('run-9', 'user cancelled');
+
+      expect(peerClient.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
+      );
+    });
+
+    // A read fault must not silently disable the backstop: falling back to the
+    // pre-check behavior re-dispatches, which is idempotent, where trusting the
+    // failure would strand a genuinely failed spawn until the stale detector.
+    it('re-dispatches when the shared row cannot be read', async () => {
+      const { deps, peerClient, jobId } = await setupReroute();
+      deps.executionTracker.hasJobStarted.mockRejectedValue(new Error('db down'));
+      deps.dispatcher.dispatch.mockResolvedValue({
+        status: 'dispatched',
+        agentId: 'a',
+        jobId: 'local-1',
+      });
+
+      await vi.advanceTimersByTimeAsync(1000);
+
+      expect(peerClient.send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
+      );
+      expect(deps.dispatcher.dispatch).toHaveBeenLastCalledWith(
+        expect.objectContaining({ jobId, jobName: 'gpu-job' }),
+      );
+    });
+
+    // A peer COORDINATOR relays no terminal `job.progress` — the shared row is
+    // its report — so the disarmed entry has to be reaped from the row itself.
+    // Without this the tracking map grows for the lifetime of the process.
+    it('releases the tracking entry once the shared row is terminal', async () => {
+      const { coordinator, deps, peerClient } = await setupReroute();
+      deps.executionTracker.hasJobStarted.mockResolvedValue(true);
+      deps.dispatcher.dispatch.mockClear();
+
+      // First poll: running → deferred, entry retained (cancel still reaches it).
+      await vi.advanceTimersByTimeAsync(1000);
+      // Second poll: terminal → entry released.
+      deps.executionTracker.isJobTerminal.mockResolvedValue(true);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      coordinator.cancelRun('run-9', 'user cancelled');
+      expect(peerClient.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'peer.job.cancel' }),
+      );
+      expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+    });
+
+    // The "read fault re-dispatches" fallback applies to the FIRST observation
+    // only. Once the row has shown the job running, a later fault must not
+    // bounce it — the reap poll repeats for as long as the job does.
+    it('does not re-dispatch on a read fault after the peer was seen running', async () => {
+      const { deps, peerClient } = await setupReroute();
+      deps.executionTracker.hasJobStarted.mockResolvedValue(true);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      deps.dispatcher.dispatch.mockClear();
+      deps.executionTracker.hasJobStarted.mockRejectedValue(new Error('db down'));
+      deps.executionTracker.isJobTerminal.mockRejectedValue(new Error('db down'));
+      await vi.advanceTimersByTimeAsync(3000);
 
       expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
       expect(peerClient.send).not.toHaveBeenCalledWith(

@@ -1,120 +1,22 @@
 /**
  * Shared debug-bundle archive primitives.
  *
- * Allowlist config redaction and windowed log-file archiving, used by the
- * orchestrator's in-process bundle writer, the kici-admin CLI's local bundle,
- * and the agent's fleet mini-bundle assembler. Keeping one copy means a node
- * cannot drift from the redaction posture of its peers.
+ * Windowed log-file archiving, used by the orchestrator's in-process bundle
+ * writer, the kici-admin CLI's local bundle, and the agent's fleet mini-bundle
+ * assembler. Keeping one copy means a node cannot drift from the archiving
+ * posture of its peers.
+ *
+ * The redaction primitives it applies live in `@kici-dev/core` so the `kici`
+ * CLI can reuse them without importing this package.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Archiver } from 'archiver';
+import { scrubText } from '@kici-dev/core';
 
 /** Maximum total log bytes to include in bundle (50MB). */
 export const MAX_LOG_BYTES = 50 * 1024 * 1024;
-
-/**
- * Config field names that are safe to include unredacted.
- * Everything else gets replaced with "****".
- */
-const SAFE_CONFIG_KEYS = new Set([
-  'mode',
-  'host',
-  'port',
-  'logLevel',
-  'region',
-  'environment',
-  'name',
-  'label',
-  'labels',
-  'enabled',
-  'disabled',
-  'timeout',
-  'interval',
-  'maxRetries',
-  'retries',
-  'workers',
-  'concurrency',
-  'maxConcurrency',
-  'batchSize',
-  'bufferSize',
-  'warmPool',
-  'cooldown',
-  'type',
-  'provider',
-  'scaler',
-  'driver',
-  'backend',
-  'protocol',
-  'scheme',
-  'path',
-  'basePath',
-  'metricsPath',
-  'healthPath',
-  'logFormat',
-  'logFile',
-  'logDir',
-  'dataDir',
-  'version',
-  'debug',
-  'verbose',
-  'quiet',
-  'tls',
-  'cors',
-  'rateLimiting',
-  'maxConnections',
-  'poolSize',
-  'minPool',
-  'maxPool',
-  'idleTimeout',
-  'connectTimeout',
-  'requestTimeout',
-  'shutdownTimeout',
-  'gracefulShutdown',
-]);
-
-/**
- * Redact config values using allowlist approach.
- * Only known-safe fields are preserved; everything else becomes "****".
- */
-export function redactConfig(obj: unknown, parentKey?: string): unknown {
-  if (obj === null || obj === undefined) return obj;
-
-  if (Array.isArray(obj)) {
-    return obj.map((item) => redactConfig(item, parentKey));
-  }
-
-  if (typeof obj === 'object') {
-    const result: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-      result[key] = redactConfig(value, key);
-    }
-    return result;
-  }
-
-  // Primitive values: check if the key is safe
-  if (typeof obj === 'string' && parentKey && !SAFE_CONFIG_KEYS.has(parentKey)) {
-    return '****';
-  }
-
-  // Numbers, booleans are always safe
-  if (typeof obj === 'number' || typeof obj === 'boolean') {
-    return obj;
-  }
-
-  // String with a safe key
-  if (typeof obj === 'string' && parentKey && SAFE_CONFIG_KEYS.has(parentKey)) {
-    return obj;
-  }
-
-  // Top-level string with no parent key -- redact
-  if (typeof obj === 'string') {
-    return '****';
-  }
-
-  return obj;
-}
 
 /**
  * Add log files from logDir to the archive, respecting MAX_LOG_BYTES cap
@@ -160,9 +62,15 @@ export async function addLogsToArchive(
       break;
     }
 
-    const content = fs.readFileSync(filePath, 'utf-8');
+    // Scrub before the content enters the archive: a bundle can be shared with
+    // KiCI, so this is the last point at which a credential logged into a
+    // message can be caught.
+    const content = scrubText(fs.readFileSync(filePath, 'utf-8'));
     archive.append(content, { name: `logs/${entry}` });
-    totalBytes += stat.size;
+    // Count what actually entered the archive, not what was on disk. A mask is
+    // longer than most secrets it replaces, so charging `stat.size` lets a
+    // heavily-redacted set overshoot the cap it exists to enforce.
+    totalBytes += Buffer.byteLength(content, 'utf-8');
 
     // Count lines and patterns
     const lines = content.split('\n');

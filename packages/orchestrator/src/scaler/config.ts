@@ -12,7 +12,13 @@ import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { KNOWN_ROLES, ScalerBackendType, scalerPlatformSchema } from '@kici-dev/engine';
+import {
+  KNOWN_ROLES,
+  ScalerBackendType,
+  derivePlatformTaints,
+  platformToTaints,
+  scalerPlatformSchema,
+} from '@kici-dev/engine';
 import { ImagePullPolicy } from './types.js';
 import type { ScalerConfig } from './types.js';
 
@@ -261,9 +267,37 @@ const scalerEntrySchema = z
      * leave unset.
      */
     requireSudo: z.boolean().default(false),
+
+    // ── Event-backend fields (meaningful only when `type: 'event'`) ──
+    /**
+     * Workflow refs (e.g. `org/infra`) the reserved scale-up / scale-down
+     * events are delivered to. The provisioning / teardown workflows subscribe
+     * with `kiciEvent()` and drive an external cloud instance. Required for a
+     * `type: event` scaler; ignored otherwise.
+     */
+    provisioningTargets: z.array(z.string().min(1)).optional(),
+    /**
+     * Seconds a pending provisioning claim code stays valid before it expires.
+     * @default 300
+     */
+    claimTtlSeconds: z.number().int().positive().default(300),
+    /**
+     * Seconds the ephemeral agent token minted for a claimed provision stays
+     * valid. @default 600
+     */
+    agentTokenTtlSeconds: z.number().int().positive().default(600),
   })
   .strict()
   .superRefine((data, ctx) => {
+    if (data.type === ScalerBackendType.enum.event) {
+      if (!data.provisioningTargets || data.provisioningTargets.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Event scaler "${data.name}" requires a non-empty 'provisioningTargets' array (workflow refs the scale-up/scale-down events are delivered to)`,
+          path: ['provisioningTargets'],
+        });
+      }
+    }
     if (data.type === ScalerBackendType.enum.container) {
       data.labelSets.forEach((ls, i) => {
         if (!ls.image) {
@@ -276,34 +310,69 @@ const scalerEntrySchema = z
       });
     }
     if (data.type === ScalerBackendType.enum['bare-metal']) {
+      // A bare-metal label set names what to launch: a local binary, an agent
+      // image, or both. `binaryPath` alone spawns a host process. `image`
+      // alone is job-image mode — a job that names its own container image runs
+      // IN that image with the KiCI runtime injected, which is the only thing
+      // an image-and-no-binary set can mean. Both together spawn the process,
+      // and the image is where that process materializes the runtime from when
+      // it nests a job container. Requiring `binaryPath` unconditionally made
+      // job-image mode unreachable: no validated config could express the shape
+      // that selects it.
       data.labelSets.forEach((ls, i) => {
-        if (!ls.binaryPath) {
+        if (!ls.binaryPath && !ls.image) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: `Bare-metal scaler "${data.name}" label set [${i}] requires a 'binaryPath' field`,
+            message:
+              `Bare-metal scaler "${data.name}" label set [${i}] requires a 'binaryPath' ` +
+              `(spawn a local agent process) or an 'image' (run the job's own container image ` +
+              `as the agent, with the KiCI runtime injected)`,
             path: ['labelSets', i, 'binaryPath'],
           });
         }
       });
     }
-    // Every mandatory label MUST appear in EVERY labelSet (case-insensitive).
-    // Otherwise jobs could route through a labelSet that's missing the label
-    // and bypass the gate, defeating the feature.
-    if (data.mandatoryLabels.length > 0) {
-      const mandatoryLower = data.mandatoryLabels.map((l) => l.toLowerCase());
-      data.labelSets.forEach((ls, i) => {
-        const labelsLower = new Set(ls.labels.map((l) => l.toLowerCase()));
-        for (const required of mandatoryLower) {
-          if (!labelsLower.has(required)) {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `Scaler "${data.name}" mandatoryLabel "${required}" is missing from labelSets[${i}].labels — every mandatory label must appear in every labelSet, otherwise jobs can route through this labelSet and bypass the gate`,
-              path: ['labelSets', i, 'labels'],
-            });
-          }
+    // Every label set's DERIVED gate must be reachable from that label set,
+    // otherwise no job can route through it: the matcher demands every gate
+    // label in the job's `runsOn`, and only labels the set actually matches on
+    // can supply them. The gate is the configured `mandatoryLabels`, the
+    // structured platform taints, and the legacy taints derived from the set's
+    // own labels — the same three the manager unions per label set.
+    //
+    // The reachable set is the label set plus the structured platform taints,
+    // which the manager injects into every label set as matchable labels. The
+    // legacy taints derive from the set's own labels and so are always
+    // reachable; only a configured label can be unreachable in practice, but
+    // checking the whole derived gate is what keeps this validation and the
+    // manager's gate the same rule.
+    //
+    // A bare-metal pool that declares no `platform` host-derives it at runtime,
+    // which this validation deliberately does not do: a config's validity must
+    // not depend on the machine loading it. Those taints are self-satisfying
+    // anyway, since the same resolved platform supplies both the gate and the
+    // injected label.
+    const structuredTaints = data.platform ? platformToTaints(data.platform) : [];
+    data.labelSets.forEach((ls, i) => {
+      const gate = new Set([
+        ...data.mandatoryLabels.map((l) => l.toLowerCase()),
+        ...structuredTaints.map((l) => l.toLowerCase()),
+        ...derivePlatformTaints(ls.labels),
+      ]);
+      if (gate.size === 0) return;
+      const reachable = new Set([
+        ...ls.labels.map((l) => l.toLowerCase()),
+        ...structuredTaints.map((l) => l.toLowerCase()),
+      ]);
+      for (const required of gate) {
+        if (!reachable.has(required)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `Scaler "${data.name}" gate label "${required}" is missing from labelSets[${i}].labels — every label in a label set's gate must be requestable on that label set, otherwise no job can route to it`,
+            path: ['labelSets', i, 'labels'],
+          });
         }
-      });
-    }
+      }
+    });
     if (data.type === ScalerBackendType.enum.firecracker) {
       // Scaler-level required fields
       if (!data.firecrackerPath) {

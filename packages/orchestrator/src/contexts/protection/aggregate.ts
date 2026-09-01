@@ -16,6 +16,7 @@ import {
   type ConcurrencyStrategy,
   type Context,
 } from '@kici-dev/engine';
+import { INTERNAL_TRIGGER_NO_BRANCH_DETAIL } from './branch-gate.js';
 import type { JobDispatchContext } from './pipeline.js';
 
 /** A single context's rejection under all-must-pass aggregation. */
@@ -35,6 +36,17 @@ export interface EffectiveProtection {
   concurrencyStrategy: ConcurrencyStrategy;
 }
 
+/**
+ * Rank of the `minimumTrust` floors the type admits, strictest highest.
+ *
+ * It no longer decides a verdict. `evaluateTrustGate` blocks the same tier
+ * (`'unknown'`, the fork ref) for every non-null `minimumTrust`, so which floor
+ * this picks cannot change whether a job is held. What it still decides is the
+ * WORDING: the gate names the aggregated floor in the hold reason that is
+ * written to `held_runs.reason`. So a `'trusted'` context bound alongside a
+ * `'known'` one has its stricter bar named, instead of whichever of the two the
+ * job happened to list first.
+ */
 const TRUST_RANK: Record<'known' | 'trusted', number> = { known: 1, trusted: 2 };
 
 /**
@@ -75,14 +87,23 @@ function firstFailingRule(
   env: Context,
   ctx: JobDispatchContext,
 ): { reason: ContextGateRejectReason; detail: string } | null {
-  if (
-    env.branchRestrictions.length > 0 &&
-    !env.branchRestrictions.some((p) => picomatch.isMatch(ctx.branch, p))
-  ) {
-    return {
-      reason: ContextGateRejectReason.enum.branch_restricted,
-      detail: `branch '${ctx.branch}' not allowed`,
-    };
+  if (env.branchRestrictions.length > 0) {
+    // Same verdict and the same wording as the single-context branch gate: an
+    // internally-triggered run with no branch at all cannot satisfy any
+    // restriction, and the reason names that rather than the empty value. One
+    // that carries a branch is matched below like any other run.
+    if (ctx.internallyTriggered && !ctx.branch) {
+      return {
+        reason: ContextGateRejectReason.enum.branch_restricted,
+        detail: INTERNAL_TRIGGER_NO_BRANCH_DETAIL,
+      };
+    }
+    if (!env.branchRestrictions.some((p) => picomatch.isMatch(ctx.branch, p))) {
+      return {
+        reason: ContextGateRejectReason.enum.branch_restricted,
+        detail: `branch '${ctx.branch}' not allowed`,
+      };
+    }
   }
   if (
     env.triggerTypeFilters.length > 0 &&
@@ -107,8 +128,9 @@ function firstFailingRule(
 
 /**
  * Aggregate hold/wait/queue parameters across all bound contexts, most
- * restrictive wins: trust = max tier, reviewers = sorted dedup union, wait timer
- * = max, hold expiry = min, concurrency limit = min (tightest). The concurrency
+ * restrictive wins: trust = strictest declared floor (see `TRUST_RANK` — a
+ * wording choice, not a verdict), reviewers = sorted dedup union, wait timer =
+ * max, hold expiry = min, concurrency limit = min (tightest). The concurrency
  * strategy follows the primary (first) context.
  */
 export function aggregateProtectionParams(envs: ReadonlyArray<Context>): EffectiveProtection {

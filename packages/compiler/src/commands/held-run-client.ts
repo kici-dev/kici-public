@@ -11,6 +11,28 @@ import { logger } from '@kici-dev/core';
 import { loadGlobalConfig } from '../remote/config.js';
 import type { HeldRunSummary } from '@kici-dev/engine';
 
+/**
+ * A failed held-runs request, carrying the HTTP status so a caller can tell a
+ * caller who will NEVER have the data (401 / 403 — no permission on the
+ * held-runs surface) from a transport or server failure that may succeed next
+ * time. `kici runs show` reads holds as optional detail, and reminding such a
+ * caller on every single invocation is noise, not information.
+ */
+export class HeldRunRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'HeldRunRequestError';
+  }
+
+  /** True when the caller lacks permission — retrying changes nothing. */
+  get isPermissionDenied(): boolean {
+    return this.status === 401 || this.status === 403;
+  }
+}
+
 /** Resolved auth context for a held-run command. */
 export interface HeldRunContext {
   endpoint: string;
@@ -21,25 +43,33 @@ export interface HeldRunContext {
 /**
  * Resolve the auth context, printing a clear error and returning null when the
  * CLI is not authenticated / no active org is set.
+ *
+ * `quiet` suppresses the error output for a caller whose own command does not
+ * depend on the held-run surface — `kici runs show` reads holds as extra
+ * detail on a run it can already display, so an unresolvable context must not
+ * make it print an authentication error for a command that worked.
  */
-export async function resolveHeldRunContext(): Promise<HeldRunContext | null> {
+export async function resolveHeldRunContext(
+  options: { quiet?: boolean } = {},
+): Promise<HeldRunContext | null> {
   const config = await loadGlobalConfig();
+  const fail = (message: string): null => {
+    if (!options.quiet) logger.error(pc.red(message));
+    return null;
+  };
 
   const token = config.pat ?? config.token;
   if (!token) {
-    logger.error(pc.red('Not authenticated. Run `kici login` to get started.'));
-    return null;
+    return fail('Not authenticated. Run `kici login` to get started.');
   }
 
   const endpoint = config.platformEndpoint ?? config.endpoint;
   if (!endpoint) {
-    logger.error(pc.red('No endpoint configured. Run `kici login` to configure.'));
-    return null;
+    return fail('No endpoint configured. Run `kici login` to configure.');
   }
 
   if (!config.activeOrgId) {
-    logger.error(pc.red('No active organization. Run `kici org use <name>` to set one.'));
-    return null;
+    return fail('No active organization. Run `kici org use <name>` to set one.');
   }
 
   return { endpoint, token, orgId: config.activeOrgId };
@@ -60,7 +90,7 @@ export async function listHeldRunsForRun(
   const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs?runId=${encodeURIComponent(runId)}`;
   const response = await fetch(url, { method: 'GET', headers: authHeaders(ctx.token) });
   if (!response.ok) {
-    throw new Error(await describeError(response));
+    throw new HeldRunRequestError(await describeError(response), response.status);
   }
   const data = (await response.json()) as { heldRuns?: HeldRunSummary[] };
   return data.heldRuns ?? [];

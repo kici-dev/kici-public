@@ -5,6 +5,10 @@ export { workflow } from './workflow.js';
 export { parallel, isParallelGroup, flattenStepInputs } from './parallel.js';
 export type { ParallelGroup, ParallelOptions } from './parallel.js';
 
+// Invoke-gate API (global-workflow → source-repo invocation)
+export { invokeSource } from './invoke.js';
+export type { InvokeConfig } from './invoke.js';
+
 // Approval gate API
 export { normalizeApproval } from './approval.js';
 export type {
@@ -224,7 +228,14 @@ export type {
 
 // Result-aware dynamic job generation: ctx.needs builder + snapshot proxy
 export { buildNeedsContext } from './needs-context.js';
-export type { UpstreamSnapshot, NeedsContext, NeedEntry, GroupNeedEntry } from './needs-context.js';
+export type {
+  UpstreamSnapshot,
+  NeedsContext,
+  NeedEntry,
+  GroupNeedEntry,
+  InvokeNeedEntry,
+  InvokeResult,
+} from './needs-context.js';
 
 // Cache types
 export { CacheSpecSchema, normalizeCacheSpecs } from './cache-types.js';
@@ -357,3 +368,49 @@ export type {
 
 // Zod re-export for event schema authoring
 export { z } from 'zod';
+
+// Event scaler vocabulary: the reserved scale-up / scale-down event names and
+// their payload schemas, so a provisioning or teardown workflow subscribes with
+// the same constant the orchestrator emits and parses the payload instead of
+// casting it. Defined in `@kici-dev/engine` — the shared floor between the SDK
+// and the orchestrator — and re-exported here because a workflow file may
+// import `@kici-dev/sdk` and nothing else.
+export {
+  SCALER_EVENT_NAMES,
+  ScaleDownReason,
+  ScalerScaleUpPayload,
+  ScalerScaleDownPayload,
+} from '@kici-dev/engine';
+
+// Agent cloud-init builder
+export { buildAgentCloudInit } from './agent-cloud-init.js';
+export type {
+  CloudInitCredentials,
+  ClaimCodeCredentials,
+  AgentCloudInitCredentials,
+  AgentDeliveryMode,
+  UserDataEncoding,
+  CloudInitWriteFile,
+  AgentCloudInitOptions,
+} from './agent-cloud-init.js';
+
+// Forge-typed git credentials and repo handles.
+// `resolveCredential` is deliberately NOT on the barrel yet: its consumer is the
+// agent-side clone/withWrite path, and a published export with no consumer is
+// what the public-test-surface gate exists to prevent. It joins the barrel with
+// that path.
+export { assertSecretName } from './git-types.js';
+export type {
+  ForgeName,
+  GitHubPermissions,
+  WriteOptions,
+  GitGrant,
+  Sourced,
+  ContainerRegistryAuth,
+  GitCredentialRef,
+  GitCredentialMap,
+  RepoHandle,
+  GitTokenResult,
+  GitHubApi,
+  GitApi,
+} from './git-types.js';

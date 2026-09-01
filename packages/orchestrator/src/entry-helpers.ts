@@ -10,6 +10,58 @@ import { type SourceProvider, SourceSubtype } from '@kici-dev/engine';
 import { LocalSourceConfigSchema } from './providers/local/local-source-config.js';
 
 /**
+ * Final path segment of a filesystem path or a `file://` URL, splitting on both
+ * POSIX and Windows separators.
+ *
+ * The cross-platform light bundle substitutes `import.meta.url` as
+ * `` `file://${__filename}` ``. On POSIX that is a valid `file:///abs` URL, but
+ * on Windows `__filename` is a backslash path with a drive letter, so the value
+ * becomes `file://C:\dir\file.cjs` — which does NOT string-compare equal to
+ * `pathToFileURL(argv[1]).href` (`file:///C:/dir/file.cjs`). Comparing the last
+ * segment instead sidesteps every scheme (`file://` vs `file:///`) and separator
+ * (`/` vs `\`) representation difference.
+ */
+function entryFileName(pathOrUrl: string): string {
+  const withoutQueryOrHash = pathOrUrl.replace(/[?#].*$/, '');
+  const segments = withoutQueryOrHash.split(/[\\/]/);
+  return segments[segments.length - 1] ?? '';
+}
+
+/**
+ * Decide whether the current module load is the real production orchestrator
+ * process entry and should boot the server.
+ *
+ * `server.ts` is shipped under several output filenames depending on the build:
+ * `dist/server.js` (the native/full build and the container image) and
+ * `kici-orchestrator.cjs` / `.mjs` (the cross-platform "light" bundle customers
+ * download for macOS / Windows / ARM). All of them are real production entries
+ * and MUST boot when run directly, so the guard cannot key on one filename.
+ *
+ * The one entry that inlines `server.ts` yet must NOT boot from this guard is
+ * the dev-only `server-test.js`: it imports `runServer` and boots it itself with
+ * a fault-injection policy, so a second boot from the inlined guard would run
+ * two orchestrators in one process. That is the only exclusion, so the guard
+ * fires for every process entry EXCEPT `server-test.js`.
+ *
+ * Matching is by final path segment (see {@link entryFileName}) rather than full
+ * URL-string equality: the light bundle's `import.meta.url` is
+ * `` `file://${__filename}` ``, whose Windows form (`file://C:\...`) never equals
+ * the `pathToFileURL(argv[1]).href` form (`file:///C:/...`), which would leave the
+ * Windows orchestrator loading and exiting 0 without ever starting the server.
+ * On bare import (a unit test, or any non-entry importer) `argv[1]` is the
+ * importer, whose filename differs from this module's, so the guard stays silent.
+ *
+ * @param argvPath  `process.argv[1]` — the path Node was invoked with.
+ * @param moduleUrl `import.meta.url` of the server module.
+ */
+export function isProductionEntry(argvPath: string | undefined, moduleUrl: string): boolean {
+  if (!argvPath) return false;
+  const entryName = entryFileName(argvPath);
+  const moduleName = entryFileName(moduleUrl);
+  return entryName.length > 0 && entryName === moduleName && moduleName !== 'server-test.js';
+}
+
+/**
  * A provider source for Platform registration.
  *
  * `provider` is the coarse-grained Platform-routing family (`github` /

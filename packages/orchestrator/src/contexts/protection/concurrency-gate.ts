@@ -4,9 +4,15 @@
 import { ConcurrencyStrategy, HoldType } from '@kici-dev/engine';
 import type { Context, ProtectionGateResult } from '@kici-dev/engine';
 
-/** Evaluate concurrency limits for the context. */
+/**
+ * Evaluate concurrency limits for the context.
+ *
+ * Takes only the two fields it reads rather than a whole `Context`, so the
+ * ready-dispatch re-gate can call it with the limit and strategy it resolved
+ * from a run's bound context row. Every full `Context` still satisfies it.
+ */
 export function evaluateConcurrencyGate(
-  env: Context,
+  env: Pick<Context, 'concurrencyLimit' | 'concurrencyStrategy'>,
   currentRunningCount: number,
   _concurrencyGroup: string,
 ): ProtectionGateResult {

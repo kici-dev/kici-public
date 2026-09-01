@@ -53,19 +53,6 @@ function makeDeps(opts: { rolePermitted?: boolean; selectRows?: unknown[] }) {
 
   const { db, mocks } = createMockDb({ selectRows, countResult: { count: 0 } });
 
-  // The base mock-db's selectTerminal does not include `.offset()`; the
-  // event-log handler chains `.orderBy().limit().offset().execute()`,
-  // so attach a self-returning offset spy onto the terminal. selectAll
-  // / where / orderBy / limit all return the same terminal object, so
-  // patching it once is sufficient for the whole chain.
-  const terminal = mocks.selectAll() as Record<string, unknown>;
-  if (!('offset' in terminal)) {
-    terminal.offset = vi.fn().mockReturnValue(terminal);
-  }
-  // Reset the spurious selectAll invocation we caused above so it does
-  // not contaminate any future call-count assertions.
-  mocks.selectAll.mockClear();
-
   const tokenManager = {
     validate: vi.fn().mockResolvedValue({
       id: 'tok-test',
@@ -78,7 +65,7 @@ function makeDeps(opts: { rolePermitted?: boolean; selectRows?: unknown[] }) {
   const rbac = {
     requirePermission: vi.fn().mockImplementation(() => {
       if (!rolePermitted) {
-        throw new PermissionDeniedError('test', 'event_log.read');
+        throw new PermissionDeniedError('auditor', 'event_log.read');
       }
     }),
   } as unknown as RbacEnforcer;

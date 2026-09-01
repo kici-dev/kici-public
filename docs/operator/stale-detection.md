@@ -128,6 +128,12 @@ The same scan interval also drives the **workflow deadline** scan. A workflow-le
 
 Runs with no workflow `timeout` have a null `workflow_timeout_ms` and are never deadline-enforced. Lowering `KICI_STALE_DETECTOR_SCAN_INTERVAL_MS` tightens both the heartbeat-staleness scan and this deadline scan. See [Stale detection architecture](../architecture/execution/stale-detection.md#workflow-timeout--orchestrator-run-deadline) for the full model.
 
+### Gate deadline expiry
+
+An **invoke gate** runs no steps on an agent, so the agent-side job timeout can never fire for it. The same scan interval therefore drives a third deadline scan: each tick finds non-terminal `gate` jobs whose `timeout_ms` has elapsed since the gate began summoning and fails each one. The gate's clock starts at `ready_at` — when the needs scheduler released it to summon. It falls back to `created_at` for a root gate that never carried a `ready_at`. The scan is bounded to deadlines that lapsed within the last 24 hours.
+
+Failing the gate drives its downstream `needs` cascade through the normal job-status path, carrying a `job_timeout` reason. The runs the gate summoned belong to their own source repos and are left untouched. A gate with no `timeout` has a null `timeout_ms` and is never deadline-enforced.
+
 ### Orphaned recovery jobs
 
 On startup, the stale detector cleans up jobs stuck in `recovering` state from a previous orchestrator instance. Recovery timers are in-memory and lost on restart, so any jobs still in `recovering` state are immediately failed with a descriptive error message.

@@ -151,4 +151,29 @@ describe('pending-workflow-context', () => {
     expect('bundle' in stored).toBe(false);
     expect(stored.runId).toBe('run1');
   });
+
+  it('carries the internal-trigger fields into the stored context', () => {
+    // A hold is where a summoned run waits, and this store is what the resumed
+    // dispatch is rebuilt from. Drop `chainDepth` here and the resumed run
+    // re-enters dispatch claiming to start its own chain, so the chain-depth
+    // circuit breaker fails open on the gate it goes on to fire.
+    const ctx = {
+      ...makeInputs(),
+      deps: {},
+      bundle: {},
+      triggerEventOverride: 'kici.scaler.scale-up',
+      chainDepth: 3,
+      dispatchedByFailureLifecycle: true,
+    };
+
+    const stored = toSerializableInputs(ctx as never) as Record<string, unknown>;
+
+    expect(stored.triggerEventOverride).toBe('kici.scaler.scale-up');
+    expect(stored.chainDepth).toBe(3);
+    expect(stored.dispatchedByFailureLifecycle).toBe(true);
+    // …and survive the JSON round-trip the DB column performs.
+    const roundTripped = JSON.parse(JSON.stringify(stored)) as Record<string, unknown>;
+    expect(roundTripped.chainDepth).toBe(3);
+    expect(roundTripped.triggerEventOverride).toBe('kici.scaler.scale-up');
+  });
 });

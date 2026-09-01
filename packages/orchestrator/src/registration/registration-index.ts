@@ -23,6 +23,13 @@ export interface RegisteredWorkflow {
    */
   customerId: string;
   commitSha: string | null;
+  /**
+   * The repository's default branch at last registration. A `__schedule_fire`
+   * run executes this branch's lock file, so it is the branch such a run
+   * presents to a context's branch restrictions. `null` until the repo's next
+   * default-branch push populates it.
+   */
+  defaultBranch: string | null;
   sourceFile: string | null;
 }
 
@@ -347,6 +354,7 @@ function rowToRegistered(row: RegistrationRow): RegisteredWorkflow {
     isGlobal: row.isGlobal,
     customerId: row.customerId,
     commitSha: row.commitSha,
+    defaultBranch: row.defaultBranch,
     sourceFile: row.sourceFile,
   };
 }

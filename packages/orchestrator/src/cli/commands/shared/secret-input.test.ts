@@ -69,7 +69,7 @@ describe('resolveSecretInput', () => {
       const result = await resolveSecretInput({ value: 'sk_live_123' }, err as any);
       expect(result.value).toBe('sk_live_123');
       expect(result.source).toBe('value');
-      expect(err.joined()).toMatch(/--value puts the secret in shell history/);
+      expect(err.joined()).toMatch(/--value puts the value in shell history/);
     });
 
     it('warns about empty value', async () => {

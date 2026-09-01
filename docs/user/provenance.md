@@ -150,11 +150,12 @@ commonly, an offline `{ issuer, jwks }` file for air-gapped checks.
 
 ### Why you supply it out-of-band
 
-Given there's a single issuer, why pass it at all instead of letting the
-verifier read it from the token? Because the issuer named **inside** a token
-cannot be trusted: a forged bundle could carry a token that names
-`iss: https://attacker.example` _and_ bundle a key set that "verifies" it,
-making the whole signature chain circular and self-attesting. The verifier
+The verifier already resolves a sensible default, so why is naming the trust
+root a supported step at all -- why not let the verifier read the issuer from
+the token? Because the issuer named **inside** a token cannot be trusted. A
+forged bundle could carry a token that names `iss: https://attacker.example`
+_and_ bundle a key set that "verifies" it. That makes the whole signature chain
+circular and self-attesting. The verifier
 therefore pins to an issuer you supply out-of-band and checks the token against
 _that_ — the bundle is verified against a key set you trust, not one it shipped
 with. Naming the trust root is a security requirement, not a multiple-choice

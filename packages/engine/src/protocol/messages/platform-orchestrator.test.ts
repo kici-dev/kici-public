@@ -12,11 +12,21 @@ import {
   peerDiscoverSchema,
   peerUpdateSchema,
   cacheStatsSchema,
+  clusterMembershipSchema,
+  planHeadroomSchema,
   platformToOrchestratorMessageSchema,
   orchestratorToPlatformMessageSchema,
   trustPolicyUpdateSchema,
   trustPolicySchema,
+  ForkPolicy,
   DEFAULT_APPROVAL_EXPIRY_HOURS,
+  DEFAULT_APPROVAL_EXPIRY_SECONDS,
+  MIN_APPROVAL_EXPIRY_SECONDS,
+  MAX_APPROVAL_EXPIRY_HOURS,
+  MAX_APPROVAL_EXPIRY_SECONDS,
+  SECONDS_PER_HOUR,
+  approvalExpirySecondsOf,
+  approvalExpiryHoursOf,
   collectDiscriminatorTypes,
   ORCH_TO_PLATFORM_RECOGNIZED_TYPES,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
@@ -1267,6 +1277,104 @@ describe('trustPolicySchema approvalExpiryHours validation', () => {
       false,
     );
   });
+
+  it('accepts a policy carrying no approvalExpirySeconds', () => {
+    // An older Platform sends only the hours field; the frame must still parse.
+    expect(trustPolicySchema.safeParse(validPolicy).data?.approvalExpirySeconds).toBeUndefined();
+  });
+
+  it('accepts a one-second window, the shortest expressible hold', () => {
+    const parsed = trustPolicySchema.safeParse({
+      ...validPolicy,
+      approvalExpirySeconds: MIN_APPROVAL_EXPIRY_SECONDS,
+    });
+    expect(parsed.success).toBe(true);
+    expect(MIN_APPROVAL_EXPIRY_SECONDS).toBe(1);
+  });
+
+  it('rejects a non-integer, zero, or negative approvalExpirySeconds', () => {
+    // Same two reasons as the hours field: the column is INTEGER, and a
+    // non-positive window mints a hold that is already expired when written.
+    for (const bad of [1.5, 0, -1]) {
+      expect(
+        trustPolicySchema.safeParse({ ...validPolicy, approvalExpirySeconds: bad }).success,
+      ).toBe(false);
+    }
+  });
+});
+
+describe('approval expiry resolution', () => {
+  it('prefers the seconds field when both are present', () => {
+    // Precedence: the more specific field wins, so an operator's sub-hour
+    // window is never silently replaced by the coarse spelling beside it.
+    expect(approvalExpirySecondsOf({ approvalExpiryHours: 72, approvalExpirySeconds: 30 })).toBe(
+      30,
+    );
+  });
+
+  it('converts the hours field when no seconds accompany it', () => {
+    expect(approvalExpirySecondsOf({ approvalExpiryHours: 5 })).toBe(5 * SECONDS_PER_HOUR);
+    // Explicit null (a stored column that predates the seconds value) reads the
+    // same as absent, not as zero.
+    expect(approvalExpirySecondsOf({ approvalExpiryHours: 5, approvalExpirySeconds: null })).toBe(
+      5 * SECONDS_PER_HOUR,
+    );
+  });
+
+  it('falls back to the documented default when the policy carries no window', () => {
+    expect(approvalExpirySecondsOf({})).toBe(DEFAULT_APPROVAL_EXPIRY_SECONDS);
+    expect(DEFAULT_APPROVAL_EXPIRY_SECONDS).toBe(DEFAULT_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR);
+  });
+
+  it('renders a whole-hour window back to the exact hours it came from', () => {
+    for (const hours of [1, 5, 24, DEFAULT_APPROVAL_EXPIRY_HOURS, MAX_APPROVAL_EXPIRY_HOURS]) {
+      expect(approvalExpiryHoursOf(approvalExpirySecondsOf({ approvalExpiryHours: hours }))).toBe(
+        hours,
+      );
+    }
+  });
+
+  it('rounds a sub-hour window up to one hour rather than down to zero', () => {
+    // Rounding down would hand an older peer a zero-hour window — precisely the
+    // already-expired hold the floor exists to prevent.
+    expect(approvalExpiryHoursOf(1)).toBe(1);
+    expect(approvalExpiryHoursOf(30)).toBe(1);
+    expect(approvalExpiryHoursOf(SECONDS_PER_HOUR)).toBe(1);
+    expect(approvalExpiryHoursOf(SECONDS_PER_HOUR + 1)).toBe(2);
+  });
+
+  it('keeps the two spellings expressing the same range', () => {
+    expect(MAX_APPROVAL_EXPIRY_SECONDS).toBe(MAX_APPROVAL_EXPIRY_HOURS * SECONDS_PER_HOUR);
+  });
+});
+
+describe('trustPolicySchema fork switch', () => {
+  it('accepts ignore and the legacy values', () => {
+    for (const forkPolicy of ForkPolicy.options) {
+      const parsed = trustPolicySchema.parse({
+        forkPolicy,
+        unknownContributorPolicy: 'hold',
+        workflowChangePolicy: 'hold',
+        approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+      });
+      expect(parsed.forkPolicy).toBe(forkPolicy);
+    }
+  });
+
+  it('enumerates ignore alongside the three values older peers send', () => {
+    expect([...ForkPolicy.options].sort()).toEqual(['allow', 'hold', 'ignore', 'reject']);
+  });
+
+  it('rejects a value outside the vocabulary', () => {
+    expect(
+      trustPolicySchema.safeParse({
+        forkPolicy: 'drop',
+        unknownContributorPolicy: 'hold',
+        workflowChangePolicy: 'hold',
+        approvalExpiryHours: DEFAULT_APPROVAL_EXPIRY_HOURS,
+      }).success,
+    ).toBe(false);
+  });
 });
 
 describe('staleCheckrunCleanupSchema workflow repository attribution', () => {
@@ -1323,5 +1431,90 @@ describe('staleCheckrunCleanupSchema workflow repository attribution', () => {
         runs: [{ ...baseRun, workflowRepoIdentifier: tooLong }],
       }).success,
     ).toBe(false);
+  });
+});
+
+describe('clusterMembershipSchema', () => {
+  it('accepts a snapshot of worker peers', () => {
+    const msg = {
+      type: 'cluster.membership' as const,
+      workers: [{ instanceId: 'worker-a' }, { instanceId: 'worker-b' }],
+      timestamp: 1707300000000,
+    };
+    expect(clusterMembershipSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts an empty snapshot — a coordinator with no workers', () => {
+    const msg = { type: 'cluster.membership' as const, workers: [], timestamp: 1 };
+    expect(clusterMembershipSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('rejects a snapshot past the 512-worker bound', () => {
+    const workers = Array.from({ length: 513 }, (_, i) => ({ instanceId: `w-${i}` }));
+    expect(() =>
+      clusterMembershipSchema.parse({ type: 'cluster.membership', workers, timestamp: 1 }),
+    ).toThrow();
+  });
+
+  it('rejects an empty instanceId', () => {
+    expect(() =>
+      clusterMembershipSchema.parse({
+        type: 'cluster.membership',
+        workers: [{ instanceId: '' }],
+        timestamp: 1,
+      }),
+    ).toThrow();
+  });
+
+  it('is a member of the orchestrator-to-platform union', () => {
+    const msg = { type: 'cluster.membership' as const, workers: [], timestamp: 1 };
+    expect(orchestratorToPlatformMessageSchema.parse(msg)).toEqual(msg);
+  });
+});
+
+describe('planHeadroomSchema', () => {
+  it('accepts a ceiling with its informational context', () => {
+    const msg = {
+      type: 'plan.headroom' as const,
+      maxWorkerPeers: 3,
+      orgLimit: 5,
+      orgTotal: 2,
+      evictExcess: false,
+    };
+    expect(planHeadroomSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('accepts a zero ceiling', () => {
+    const msg = {
+      type: 'plan.headroom' as const,
+      maxWorkerPeers: 0,
+      orgLimit: 2,
+      orgTotal: 2,
+      evictExcess: true,
+    };
+    expect(planHeadroomSchema.parse(msg)).toEqual(msg);
+  });
+
+  it('rejects a negative ceiling', () => {
+    expect(() =>
+      planHeadroomSchema.parse({
+        type: 'plan.headroom',
+        maxWorkerPeers: -1,
+        orgLimit: 2,
+        orgTotal: 4,
+        evictExcess: true,
+      }),
+    ).toThrow();
+  });
+
+  it('is a member of the platform-to-orchestrator union', () => {
+    const msg = {
+      type: 'plan.headroom' as const,
+      maxWorkerPeers: 1,
+      orgLimit: 5,
+      orgTotal: 4,
+      evictExcess: false,
+    };
+    expect(platformToOrchestratorMessageSchema.parse(msg)).toEqual(msg);
   });
 });

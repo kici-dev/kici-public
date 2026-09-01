@@ -31,6 +31,7 @@ import type {
   LockFile as FullLockFile,
   LockJob,
   LockWorkflow,
+  MaterializedJob,
   SimulatedEvent,
   LockFileParseError,
   ChangedFilesResult,
@@ -38,13 +39,19 @@ import type {
   WorkflowDecision,
   FileContentsFetcher,
 } from '@kici-dev/engine';
-import { EventLogStatus, EventLogSource, InitFailureCategory } from '@kici-dev/engine';
+import {
+  EventLogStatus,
+  EventLogSource,
+  ExecutionJobStatus,
+  InitFailureCategory,
+} from '@kici-dev/engine';
 import type { OrchestratorMode } from '@kici-dev/engine';
 import { isLockStaticJob } from '@kici-dev/engine';
 import { materializeFanout, matrixEnvelopeFields, partitionMatchers } from '@kici-dev/engine';
 import { matchAllWorkflows, matchWorkflowsForEvent, TraceCheck } from '@kici-dev/engine';
 import {
   appendChecks,
+  createDispatchFailureTraceEntry,
   createContentRequirementsTraceEntry,
   createGlobalFilterTraceEntry,
 } from '@kici-dev/engine';
@@ -53,10 +60,12 @@ import { ProviderRegistry } from '../provider-registry.js';
 import type { ProviderBundle } from '../provider-registry.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
-import type { TrustResolution } from '../security/trust-resolver.js';
+import { resolveRefTrust, type TrustResolution } from '../security/trust-resolver.js';
 import {
   evaluateTrustPolicy,
   resolveEffectivePolicy,
+  trustPolicyOutcomeReason,
+  READ_FAILURE_POLICY,
   type TrustPolicyOutcome,
 } from '../security/trust-policy-gate.js';
 import type { StoredTrustPolicy } from '../security/trust-policy-store.js';
@@ -66,6 +75,7 @@ import {
   type WorkflowModification,
 } from '../security/workflow-diff.js';
 import { parseKiciCommand, handleApprovalComment } from '../security/comment-handler.js';
+import type { IdentityLink, PermissionLevel } from '../security/identity-link.js';
 import { extractRegisterableWorkflows, extractGlobalWorkflows } from '../registration/extractor.js';
 import { payloadFromObject } from '../webhook/event-log.js';
 import {
@@ -76,9 +86,18 @@ import {
   crossSourceFanoutSize,
   crossSourceErrorsTotal,
   trustPolicyDecisionsTotal,
+  forkEventsIgnoredTotal,
 } from '../metrics/prometheus.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
-import { dispatchMatchedWorkflow } from './dispatch-matched-workflow.js';
+import {
+  dispatchMatchedWorkflow,
+  catchUpNeedsGatedJobs,
+  NEEDS_PENDING_JOB_ID_PREFIX,
+} from './dispatch-matched-workflow.js';
+import { resumeWorkflow, rejectWorkflow } from './resume-workflow.js';
+import { insertEdgesForRun } from './needs-scheduler.js';
+import { invokeParamsFromLockJob, isInvokeGate } from './invoke-gate.js';
+import { JobKind } from '../db/types.js';
 import { filterByContentRequirements } from './content-filter.js';
 import {
   candidateKey,
@@ -97,10 +116,15 @@ import {
   eventTypeToTriggerType,
   extractInboundRepoIdentifier,
   isDefaultBranchPush,
+  extractDefaultBranch,
   anyTriggerHasPathPatterns,
   summarizeDecision,
+  capDecisionSummaries,
   buildTriggerEvent,
   extractCommitMessage,
+  dispatchReadyJob,
+  isRootJob,
+  storePendingJobContext,
   type ProcessingDeps,
 } from './processor.js';
 import {
@@ -420,52 +444,7 @@ async function dedupAndResolveProvider(
 }
 
 /**
- * Phase A.2 — Invalidate contributor-cache entries on membership-related
- * events. Runs BEFORE normalizeEvent so it fires even for events that do not
- * map to a workflow trigger (member / organization / membership / team). The
- * 15-minute TTL remains the fallback for entries we don't explicitly drop.
- */
-function invalidateContributorCacheForEvent(
-  info: WebhookInfo,
-  deps: ProcessingDeps,
-  bundle: ProviderBundle,
-): void {
-  const invalidations = bundle.normalizer.getAccessCacheInvalidations?.(
-    info.event,
-    info.action,
-    info.payload,
-  );
-  if (!invalidations || invalidations.length === 0 || !deps.contributorCache) return;
-  const provider = bundle.normalizer.provider;
-  let totalDeleted = 0;
-  for (const inv of invalidations) {
-    switch (inv.kind) {
-      case 'repo-user':
-        totalDeleted += deps.contributorCache.invalidate(provider, inv.repoFullName, inv.username);
-        break;
-      case 'repo':
-        totalDeleted += deps.contributorCache.invalidateByRepo(provider, inv.repoFullName);
-        break;
-      case 'user-in-org':
-        totalDeleted += deps.contributorCache.invalidateByUserInOrg(
-          provider,
-          inv.orgLogin,
-          inv.username,
-        );
-        break;
-    }
-  }
-  logger.info('Invalidated contributor cache entries', {
-    deliveryId: info.deliveryId,
-    event: info.event,
-    action: info.action,
-    invalidations: invalidations.length,
-    entriesDeleted: totalDeleted,
-  });
-}
-
-/**
- * Phase A.3 — Normalise the inbound event via the provider's normalizer.
+ * Phase A.2 — Normalise the inbound event via the provider's normalizer.
  * Returns `null` (with skip metric + event log) for unknown event types.
  */
 async function normalizeWebhookEvent(
@@ -660,8 +639,14 @@ async function dispatchOneCrossSourceCandidate(args: {
   // Today an inbound generic webhook normalizes to a non-PR event and the
   // evaluator short-circuits to `pass`; routing it through the evaluator anyway
   // is what stops that from silently becoming a bypass if a registration's
-  // normalizer ever yields a PR-shaped event. Trust is unresolved on this path,
-  // which the evaluator reads as `unknown` — fail-closed, never a pass.
+  // normalizer ever yields a PR-shaped event.
+  //
+  // Note what this path does NOT establish. It resolves no trust, so the
+  // evaluator sees no tier — and a missing tier is not itself a denial: the
+  // switch turns on `isForkPR`, so an event this path reports as non-fork
+  // passes whatever the policy says. A registration whose normalizer starts
+  // emitting PR-shaped events therefore needs a fork signal it can stand
+  // behind, not just a trip through the evaluator.
   const crossSourceSecurityDecision = await evaluateSecurityPolicy({
     deps,
     bundle: regBundle,
@@ -670,7 +655,6 @@ async function dispatchOneCrossSourceCandidate(args: {
     mode: deps.orchestratorMode ?? 'platform',
     trustResolution: undefined,
     isForkPR: syntheticEvent.isForkPR ?? false,
-    hasWorkflowModifications: false,
   });
 
   let dispatchedCount = 0;
@@ -918,6 +902,56 @@ async function extractRepoAndCredentials(
 }
 
 /**
+ * Resolve the directory a `/kici approve` comment is authorized against.
+ *
+ * Two sources, and which one applies is decided by the caller that assembled
+ * these deps rather than by the orchestrator's mode:
+ *
+ * - `server.ts` holds the Platform-pushed directory in memory and refreshes it
+ *   on every `trust_policy.update`, so it always supplies both fields. An
+ *   in-memory directory therefore wins outright — reading the row instead
+ *   would answer from a cache the push has already superseded.
+ * - Every other assembly supplies neither. That includes the direct-ingress
+ *   pipeline in `app.ts`, which is the only path an independent orchestrator
+ *   has, and where the operator's own `kici-admin trust-policy directory-set`
+ *   registrations live only in the row. Reading it per command is also what
+ *   makes a registration take effect immediately rather than at the next
+ *   restart.
+ *
+ * A failed read degrades to an empty directory: the commenter is not resolved
+ * and the command is refused, which is the same fail-closed answer an absent
+ * directory already gives.
+ */
+export async function resolveApprovalDirectory(
+  deps: ProcessingDeps,
+  orgId: string,
+): Promise<{ identityLinks: IdentityLink[]; orgMemberPermissions: Map<string, PermissionLevel> }> {
+  if (deps.identityLinks !== undefined || deps.orgMemberPermissions !== undefined) {
+    return {
+      identityLinks: deps.identityLinks ?? [],
+      orgMemberPermissions: deps.orgMemberPermissions ?? new Map(),
+    };
+  }
+  if (!deps.trustDirectoryStore) {
+    return { identityLinks: [], orgMemberPermissions: new Map() };
+  }
+  try {
+    const stored = await deps.trustDirectoryStore.load(orgId);
+    if (!stored) return { identityLinks: [], orgMemberPermissions: new Map() };
+    return {
+      identityLinks: stored.identityLinks,
+      orgMemberPermissions: new Map(Object.entries(stored.memberCiTrustLevels)),
+    };
+  } catch (err) {
+    logger.warn('Failed to read the approval directory; refusing this /kici command', {
+      orgId,
+      error: toErrorMessage(err),
+    });
+    return { identityLinks: [], orgMemberPermissions: new Map() };
+  }
+}
+
+/**
  * Phase C.2 — Handle `/kici approve|reject` commands in `issue_comment` events.
  * These intercept BEFORE normal trigger matching (the comment is a command,
  * not a trigger). The function never returns early — the event continues
@@ -927,14 +961,12 @@ async function extractRepoAndCredentials(
 async function handleApprovalCommentIfPresent(args: {
   info: WebhookInfo;
   deps: ProcessingDeps;
-  bundle: ProviderBundle;
   event: SimulatedEvent;
   payload: Record<string, unknown>;
   resolvedOrgId: string;
   repoIdentifier: string;
-  credentials: Record<string, unknown>;
 }): Promise<void> {
-  const { info, deps, bundle, event, payload, resolvedOrgId, repoIdentifier, credentials } = args;
+  const { info, deps, event, payload, resolvedOrgId, repoIdentifier } = args;
   if (info.event !== 'issue_comment' || !deps.heldRunStore) return;
 
   const commentBody = (payload.comment as { body?: string } | undefined)?.body;
@@ -946,23 +978,10 @@ async function handleApprovalCommentIfPresent(args: {
   const command = parseKiciCommand(commentBody);
   if (!command) return;
 
-  // Look up the held run's commit SHA from execution_runs so the check status
-  // poster can update the right commit.
-  let commitSha: string | undefined;
-  if (deps.db) {
-    const heldRun = await deps.db
-      .selectFrom('held_runs')
-      .innerJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
-      .select(['execution_runs.sha'])
-      .where('held_runs.org_id', '=', resolvedOrgId)
-      .where('held_runs.queue_type', '=', 'security')
-      .where('held_runs.status', '=', 'pending')
-      .where('execution_runs.repo_identifier', '=', repoIdentifier)
-      .where('execution_runs.pr_number', '=', prNumber)
-      .orderBy('held_runs.created_at', 'desc')
-      .executeTakeFirst();
-    commitSha = heldRun?.sha;
-  }
+  const { identityLinks, orgMemberPermissions } = await resolveApprovalDirectory(
+    deps,
+    resolvedOrgId,
+  );
 
   const result = await handleApprovalComment({
     commentBody,
@@ -972,12 +991,44 @@ async function handleApprovalCommentIfPresent(args: {
     repoIdentifier,
     prNumber,
     orgId: resolvedOrgId,
-    identityLinks: deps.identityLinks ?? [],
-    orgMemberPermissions: deps.orgMemberPermissions ?? new Map(),
+    identityLinks,
+    orgMemberPermissions,
     heldRunStore: deps.heldRunStore,
-    checkStatusPoster: bundle.checkStatusPoster,
-    commitSha,
-    credentials,
+    db: deps.db,
+    // Each ended hold's check is completed on the commit ITS OWN run acted on,
+    // through the bundle serving that run's routing key — not on the PR head at
+    // comment time, and not through the bundle that delivered the comment.
+    resolvePoster: (routingKey) =>
+      deps.providerRegistry.getByRoutingKey(routingKey)?.checkStatusPoster,
+    // Approving a security hold RUNS the gated work. Without this the row was
+    // flipped and a green check posted while nothing dispatched.
+    onJobRelease: async (signal) => {
+      await dispatchReadyJob(
+        signal.runId,
+        signal.jobId,
+        deps.dispatcher,
+        deps.executionTracker,
+        deps.coordinator,
+        deps.db,
+        deps.invokeGateDeps,
+        // Approving the hold releases the gate, not a concurrency slot, so the
+        // group's limit is re-checked before the job dispatches.
+        deps.contextStore && deps.heldRunStore
+          ? {
+              matchContext: (o, n) => deps.contextStore!.matchContext(o, n),
+              heldRunStore: deps.heldRunStore,
+              accessLogWriter: deps.accessLogWriter,
+              routingKey: info.routingKey ?? null,
+            }
+          : undefined,
+      );
+    },
+    // The org trust policy's PR-wide hold is workflow-scoped: it fires before
+    // any job exists, so approval replays the stored dispatch instead of
+    // re-dispatching a job, and rejection cancels the run and drops that
+    // context.
+    onWorkflowRelease: (signal) => resumeWorkflow(signal, deps, deps.db),
+    onWorkflowReject: (hold, reason) => rejectWorkflow(hold, deps, deps.db, reason),
   });
 
   if (result.handled) {
@@ -1004,7 +1055,8 @@ interface TrustOutcome {
   lockFileSource: 'head' | 'base';
 }
 
-function isPullRequestEvent(eventName: string): boolean {
+/** Whether an inbound event name is one of the pull-request events. */
+export function isPullRequestEvent(eventName: string): boolean {
   return (
     eventName === 'pull_request' ||
     eventName === 'pull_request_review' ||
@@ -1013,49 +1065,44 @@ function isPullRequestEvent(eventName: string): boolean {
 }
 
 /**
- * Phase D — Resolve the trust tier for the inbound event. For PR events the
- * result drives lock-file-source selection (trusted contributors get the head
- * lock file; everyone else gets base) and the user-cache write scope; failures
- * fail-closed to base. A push to the repo's default branch is itself a trusted
- * ref — only someone with write access can land a commit there — so it resolves
- * to `trusted`, which `deriveCacheRefScope` maps to the org-shared cache scope
- * (the GitHub Actions model: default-branch builds populate the shared cache,
- * fork/PR builds are confined to a per-run isolated scope).
+ * Phase D — Resolve the trust tier for the inbound event from the git ref
+ * alone. Every ref that lives in the base repo is trusted: only a
+ * write-or-higher contributor can put one there. A fork head ref is the sole
+ * untrusted case, and it resolves to `unknown`.
  *
- * A non-PR event from a provider with no contributor model (generic webhook
- * sources, where the source's verification secret IS the trust boundary; local
- * sources, where the operator owns the on-disk repo — neither has a fork or
- * per-contributor permission concept) is likewise
- * trusted: the sender already proved ownership of the source, so its builds may
- * populate the org-shared cache.
+ * For PR events the tier drives lock-file-source selection (a trusted ref gets
+ * the head lock file; a fork ref gets base) and the user-cache write scope,
+ * which `deriveCacheRefScope` maps from `trusted` to the org-shared scope and
+ * from everything else to a per-run isolated scope.
+ *
+ * A PR event resolves a tier only for a provider that sets `hasForkModel`
+ * (GitHub), whose fork signal comes from the forge's own payload. universal-git
+ * reports an `isForkPR` too, but it compares two repo names read from fixed
+ * payload keys — `repo.full_name`, falling back to `full_name`, under each of
+ * `head` and `base` — that many forges' PR payloads do not carry, and yields
+ * `false` whenever either is absent. It fails toward trust, so it cannot carry
+ * HEAD-lock selection. Such a PR resolves
+ * no tier, which `selectLockFileSource` maps to the base lock and
+ * `deriveCacheRefScope` maps to the isolated cache scope.
  */
 /** Build a `trusted`-tier TrustResolution with a fixed audit reason. */
 function makeTrustedResolution(contributorUsername: string, reason: string): TrustResolution {
   return {
     tier: 'trusted',
     contributorUsername,
-    identityLinked: false,
-    providerPermission: 'write',
     reason,
   };
 }
 
 export async function resolveTrustForPR(args: {
   info: WebhookInfo;
-  deps: ProcessingDeps;
   bundle: ProviderBundle;
   event: SimulatedEvent;
+  /** Raw webhook payload — read only to decide whether a push targets the default branch. */
   payload: Record<string, unknown>;
-  resolvedOrgId: string;
-  repoIdentifier: string;
-  credentials: Record<string, unknown>;
 }): Promise<TrustOutcome> {
-  const { info, deps, bundle, event, payload, resolvedOrgId, repoIdentifier, credentials } = args;
+  const { info, bundle, event, payload } = args;
   const isPREvent = isPullRequestEvent(info.event);
-  const initial: TrustOutcome = {
-    trustResolution: undefined,
-    lockFileSource: selectLockFileSource(isPREvent, undefined),
-  };
 
   // A default-branch push is a trusted ref: only a write-or-higher contributor
   // can push to it. Mark it trusted so the user-cache write scope is `shared`.
@@ -1069,57 +1116,57 @@ export async function resolveTrustForPR(args: {
     };
   }
 
-  // A non-PR event from a provider with no contributor model (generic
-  // sources, where the verification secret is the trust boundary; local
-  // sources, where the operator owns the on-disk repo — neither has a fork
-  // or per-contributor permission concept) is trusted by construction.
-  if (!isPREvent && !bundle.contributorResolver) {
+  // A non-PR event from a provider with no fork model (generic sources, where
+  // the verification secret is the trust boundary; local sources, where the
+  // operator owns the on-disk repo — neither has a fork concept) is trusted by
+  // construction.
+  if (!isPREvent && !bundle.hasForkModel) {
     return {
       trustResolution: makeTrustedResolution(
         event.senderUsername ?? '',
-        'Non-PR event from a contributor-less provider (generic/local) -- trusted ref',
+        'Non-PR event from a fork-less provider (generic/local) -- trusted ref',
       ),
       lockFileSource: selectLockFileSource(isPREvent, undefined),
     };
   }
 
-  if (!isPREvent || !deps.trustResolver || !event.senderUsername) return initial;
-  const contributorResolver = bundle.contributorResolver;
-  if (!contributorResolver) return initial;
+  // Any other non-PR event (branch push, tag push) is a same-repo ref:
+  // only a write-or-higher contributor can create it. Trusted by
+  // construction — same argument as the default-branch push above.
+  if (!isPREvent) {
+    return {
+      trustResolution: makeTrustedResolution(
+        event.senderUsername ?? '',
+        'Non-default-branch push — same-repo ref, trusted by construction',
+      ),
+      lockFileSource: selectLockFileSource(isPREvent, undefined),
+    };
+  }
 
-  try {
-    const trustResolution = await deps.trustResolver.resolveTrustTier({
-      providerUsername: event.senderUsername,
-      providerUserId: event.senderUserId,
-      provider: info.provider,
-      repoIdentifier,
-      isForkPR: event.isForkPR ?? false,
-      orgId: resolvedOrgId,
-      identityLinks: deps.identityLinks ?? [],
-      orgMemberPermissions: deps.orgMemberPermissions ?? new Map(),
-      contributorResolver,
-      credentials,
-    });
-    const lockFileSource = selectLockFileSource(isPREvent, trustResolution.tier);
-    logger.info('Trust tier resolved for PR', {
-      deliveryId: info.deliveryId,
-      sender: event.senderUsername,
-      tier: trustResolution.tier,
-      lockFileSource,
-      reason: trustResolution.reason,
-    });
-    return { trustResolution, lockFileSource };
-  } catch (err) {
-    logger.warn('Trust resolution failed, defaulting to base lock file', {
-      deliveryId: info.deliveryId,
-      sender: event.senderUsername,
-      error: toErrorMessage(err),
-    });
+  // A PR from a provider with no fork model resolves no tier: its `isForkPR`
+  // compares two repo names read from fixed payload keys that many forges' PR
+  // payloads do not carry, and reads `false` when either is absent — it fails
+  // toward trust, so it cannot carry HEAD-lock selection.
+  if (!bundle.hasForkModel) {
     return {
       trustResolution: undefined,
       lockFileSource: selectLockFileSource(isPREvent, undefined),
     };
   }
+
+  const trustResolution = resolveRefTrust({
+    isForkPR: event.isForkPR ?? false,
+    contributorUsername: event.senderUsername ?? '',
+  });
+  const lockFileSource = selectLockFileSource(isPREvent, trustResolution.tier);
+  logger.info('Trust tier resolved for PR', {
+    deliveryId: info.deliveryId,
+    sender: event.senderUsername,
+    tier: trustResolution.tier,
+    lockFileSource,
+    reason: trustResolution.reason,
+  });
+  return { trustResolution, lockFileSource };
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,6 +1332,29 @@ async function fetchLockFileWithFallbackPhase(args: {
 // ---------------------------------------------------------------------------
 
 /**
+ * One materialized global-workflow job ready to dispatch: its expanded name, the
+ * lock job it came from (needed to classify the job as an invoke gate / root /
+ * needs-gated), and the built queue input.
+ */
+interface GlobalJobInput {
+  lockJobName: string;
+  lockJob: LockJob;
+  input: QueuedJobInput;
+}
+
+/**
+ * The materialized job inputs plus the fan-out artefacts the needs scheduler
+ * needs: the expanded `MaterializedJob` set and the base→children expansion map,
+ * both fed to `insertEdgesForRun` so a global run's `needs` edges are wired the
+ * same way a per-repository run's are.
+ */
+interface GlobalJobInputsResult {
+  inputs: GlobalJobInput[];
+  materialized: MaterializedJob[];
+  expansionMap: Map<string, string[]>;
+}
+
+/**
  * Build the per-job QueuedJobInput for a global workflow dispatched from the
  * inbound webhook. Shared by the lock-file-missing branch (Phase F) and the
  * post-per-repo dispatch branch (Phase J) — both paths build the same inputs
@@ -1313,7 +1383,7 @@ function buildGlobalWorkflowJobInputs(args: {
   providerRegistry: ProviderRegistry;
   /** The exact job set to dispatch, already resolved by the caller. */
   jobs: readonly LockJob[];
-}): { lockJobName: string; input: QueuedJobInput }[] {
+}): GlobalJobInputsResult {
   const {
     info,
     reg,
@@ -1333,8 +1403,9 @@ function buildGlobalWorkflowJobInputs(args: {
   // `workflowRoutingKey` below already relies on for auth.
   const regBundle = args.providerRegistry.getByRoutingKey(reg.routingKey);
   const workflowRepoUrl = regBundle?.repoUrlBuilder?.buildCloneUrl(reg.repoIdentifier) ?? '';
-  const inputs: { lockJobName: string; input: QueuedJobInput }[] = [];
-  const materialized = materializeFanout(args.jobs).jobs;
+  const inputs: GlobalJobInput[] = [];
+  const fanout = materializeFanout(args.jobs);
+  const materialized = fanout.jobs;
   // An approval gate is applied by the per-repository dispatch path only; this
   // one never consults it. `kici compile` refuses `approval` on a global
   // workflow, so a static job cannot reach here carrying one — but a job a
@@ -1393,6 +1464,7 @@ function buildGlobalWorkflowJobInputs(args: {
     };
     inputs.push({
       lockJobName: mat.expandedName,
+      lockJob,
       input: {
         runId: globalRunId,
         workflowName: globalWorkflow.name,
@@ -1413,7 +1485,7 @@ function buildGlobalWorkflowJobInputs(args: {
       },
     });
   }
-  return inputs;
+  return { inputs, materialized, expansionMap: fanout.expansionMap };
 }
 
 /**
@@ -1478,6 +1550,38 @@ function withSourceRepo(event: SimulatedEvent, repoIdentifier: string): Simulate
   return event.sourceRepo === repoIdentifier ? event : { ...event, sourceRepo: repoIdentifier };
 }
 
+/**
+ * Summarize one organization-wide decision for Platform forwarding, tagged with
+ * the repository that defines the workflow.
+ *
+ * The tag is what separates a global entry from a per-repo one in the delivery's
+ * trace: a global workflow is absent from the source repo's lock file, so its
+ * name alone tells its author nothing about where it came from.
+ */
+function summarizeGlobalDecision(
+  decision: WorkflowDecision,
+  workflowRepoIdentifier: string,
+): Record<string, unknown> {
+  return { ...summarizeDecision(decision), workflowRepoIdentifier };
+}
+
+/** The organization-wide candidates a delivery produced, with their full trace. */
+interface GlobalCandidateCollection {
+  candidates: GlobalEvalCandidate[];
+  /** One summary per global decision evaluated, matched or not. */
+  decisionSummaries: Record<string, unknown>[];
+  /**
+   * Every workflow repository whose registrations this pass actually examined —
+   * they cleared the policy and reached trigger matching, whether or not any of
+   * them produced a candidate.
+   *
+   * The universe the pass's positive signal is computed against: a repository
+   * the pass never reached (no registration index, a policy denial) is absent
+   * here, so it can never be reported as decided.
+   */
+  consideredWorkflowRepos: string[];
+}
+
 async function collectGlobalCandidates(args: {
   info: WebhookInfo;
   deps: ProcessingDeps;
@@ -1487,10 +1591,21 @@ async function collectGlobalCandidates(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
-}): Promise<GlobalEvalCandidate[]> {
+  /**
+   * When set, only registrations authored in this repository are considered.
+   *
+   * The re-run of a failed evaluation round re-drives this pass for exactly the
+   * repository whose round failed, so every other repository's globals — which
+   * already reached their verdict on the original delivery — must not be
+   * evaluated or dispatched a second time.
+   */
+  onlyWorkflowRepo?: string;
+}): Promise<GlobalCandidateCollection> {
   const { info, deps, event, resolvedOrgId, repoIdentifier, ref, dispatchBundle } = args;
+  const decisionSummaries: Record<string, unknown>[] = [];
+  const consideredWorkflowRepos = new Set<string>();
   const registrationIndex = deps.registrationIndex;
-  if (!registrationIndex) return [];
+  if (!registrationIndex) return { candidates: [], decisionSummaries, consideredWorkflowRepos: [] };
 
   const triggerType = eventTypeToTriggerType(info.event);
   const globalRegistrations = registrationIndex.getGlobalByOrgAndTriggerType(
@@ -1504,6 +1619,12 @@ async function collectGlobalCandidates(args: {
     // Skip workflows from the event's own repo (already matched via the
     // lock-file path).
     if (reg.repoIdentifier === repoIdentifier) continue;
+
+    // Scoped pass: a re-run re-evaluates one workflow repository's round, so
+    // everything authored elsewhere stays untouched.
+    if (args.onlyWorkflowRepo !== undefined && reg.repoIdentifier !== args.onlyWorkflowRepo) {
+      continue;
+    }
 
     if (deps.globalWorkflowPolicy) {
       // Policy checks key the org_settings row by `customer_id` — single row
@@ -1534,6 +1655,11 @@ async function collectGlobalCandidates(args: {
       if (!permission.allowed) continue;
     }
 
+    // Past every gate that can suppress the registration without deciding it:
+    // from here the pass reaches a real outcome for this repository's workflow,
+    // whether it matches, is filtered out, or goes to the round.
+    consideredWorkflowRepos.add(reg.repoIdentifier);
+
     const globalDecisions = matchAllWorkflows(
       [reg.lockEntry],
       withSourceRepo(event, repoIdentifier),
@@ -1541,6 +1667,7 @@ async function collectGlobalCandidates(args: {
 
     for (const gDecision of globalDecisions) {
       if (!gDecision.matched) {
+        decisionSummaries.push(summarizeGlobalDecision(gDecision, reg.repoIdentifier));
         // A `repos` mismatch is the one exclusion that used to leave no record
         // at all, so a global workflow that never fired for a repo looked
         // exactly like one that was never registered. Collected rather than
@@ -1577,6 +1704,7 @@ async function collectGlobalCandidates(args: {
           workflowRepo: reg.repoIdentifier,
           sourceRepo: repoIdentifier,
         });
+        decisionSummaries.push(summarizeGlobalDecision(decision, reg.repoIdentifier));
         continue;
       }
       candidates.push({ reg, lockEntry: reg.lockEntry, decision });
@@ -1589,7 +1717,7 @@ async function collectGlobalCandidates(args: {
       sourceRepo: repoIdentifier,
     });
   }
-  return candidates;
+  return { candidates, decisionSummaries, consideredWorkflowRepos: [...consideredWorkflowRepos] };
 }
 
 /** One global workflow this delivery dropped because its `repos` filter said no. */
@@ -1745,6 +1873,32 @@ interface ResolvedGlobalCandidate {
   jobs: readonly LockJob[];
 }
 
+/** What the eval round cleared, with the trace of everything it excluded. */
+interface ResolvedRoundCandidates {
+  resolved: ResolvedGlobalCandidate[];
+  /** One summary per candidate the round excluded, carrying its `filter` entry. */
+  decisionSummaries: Record<string, unknown>[];
+  /**
+   * The workflow repository of every round this pass could not decide.
+   *
+   * Reported rather than derived from the run rows, so a caller re-driving the
+   * pass — the re-run of a failed round — can tell a clean re-evaluation from
+   * one that failed again without reading the database back.
+   */
+  roundFailureWorkflowRepos: string[];
+  /**
+   * The workflow repository of every candidate this pass suppressed WITHOUT a
+   * verdict — no pending-eval tracker, a round that reported nothing back, or a
+   * verdict that came back indeterminate.
+   *
+   * A superset of {@link roundFailureWorkflowRepos}: a failed round is one way
+   * to reach no verdict, and the fail-closed branches are the others. Only this
+   * list can subtract such a repository from the pass's positive signal, which
+   * is why the signal is not derived from the failure list.
+   */
+  unresolvedWorkflowRepos: string[];
+}
+
 /**
  * Cap on the check summary a failed round posts.
  *
@@ -1808,6 +1962,11 @@ async function surfaceFailedEvalRound(args: {
   repoIdentifier: string;
   ref: string;
   dispatchCredentials: Record<string, unknown>;
+  /**
+   * The source `dispatchCredentials` belongs to, when a cross-provider
+   * lock-file fallback made it a different source from `info.routingKey`.
+   */
+  dispatchRoutingKey?: string;
   bundle?: ProviderBundle;
   credentials?: Record<string, unknown>;
   failure: GlobalEvalRoundFailure;
@@ -1823,11 +1982,21 @@ async function surfaceFailedEvalRound(args: {
       workflowName: `${ROUND_JOB_PREFIX}${failure.workflowRepoIdentifier}`,
       provider: info.provider,
       repoIdentifier,
-      ref: args.event.sourceBranch ?? args.event.targetBranch ?? '',
+      // The run row's `ref` is the branch the run PRESENTS, matching what
+      // `onExecutionStarted` writes everywhere else and what the context branch
+      // gate evaluates. A job's checkout ref (the PR head branch) is a different
+      // value and does not belong in this column.
+      ref: args.event.targetBranch ?? '',
       sha: ref,
       deliveryId: info.deliveryId,
       providerContext: args.dispatchCredentials,
       routingKey: info.routingKey,
+      // Paired with the context above: a re-run re-drives the pass and needs the
+      // bundle those credentials actually belong to, which for a cross-provider
+      // global is not the source the event arrived on.
+      ...(args.dispatchRoutingKey !== undefined && {
+        dispatchRoutingKey: args.dispatchRoutingKey,
+      }),
       failureReason: summary,
       triggerEvent: info.event,
       // The round exists to decide THIS repository's global workflows, so it is
@@ -1843,6 +2012,15 @@ async function surfaceFailedEvalRound(args: {
       error: toErrorMessage(err),
     });
   }
+
+  // A re-run of this round re-evaluates the original event, so the payload the
+  // round was deciding on must survive with the run row. Best-effort like the
+  // row and the check: the round already failed.
+  await storeWebhookPayload({
+    logStorage: deps.logStorage,
+    runId: failure.runId,
+    payload: info.payload,
+  });
 
   // Posted through the INBOUND event's bundle and credentials: the check lands
   // on the inbound repo, and a cross-provider lock-file fallback swaps the
@@ -1886,12 +2064,21 @@ async function resolveRoundCandidates(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /** The source `dispatchCredentials` belongs to; forwarded to the failure record. */
+  dispatchRoutingKey?: string;
   /** The inbound event's own bundle + credentials, used to post the failure check. */
   bundle?: ProviderBundle;
   credentials?: Record<string, unknown>;
-}): Promise<ResolvedGlobalCandidate[]> {
+}): Promise<ResolvedRoundCandidates> {
   const { info, deps, candidates, repoIdentifier } = args;
-  if (candidates.length === 0) return [];
+  const decisionSummaries: Record<string, unknown>[] = [];
+  if (candidates.length === 0)
+    return {
+      resolved: [],
+      decisionSummaries,
+      roundFailureWorkflowRepos: [],
+      unresolvedWorkflowRepos: [],
+    };
 
   const pendingGlobalEvals = deps.pendingGlobalEvals;
   if (!pendingGlobalEvals) {
@@ -1909,22 +2096,29 @@ async function resolveRoundCandidates(args: {
     recordUnrunCandidates(candidates.length);
     for (const candidate of candidates) {
       if (!candidate.decision) continue;
-      logGlobalDecisionTrace(
-        appendChecks(candidate.decision, [
-          createGlobalFilterTraceEntry({
-            run: false,
-            indeterminate: true,
-            reason: 'the orchestrator could not run an eval round (no pending-eval tracker)',
-          }),
-        ]),
-        {
-          deliveryId: info.deliveryId,
-          workflowRepo: candidate.reg.repoIdentifier,
-          sourceRepo: repoIdentifier,
-        },
-      );
+      const excluded = appendChecks(candidate.decision, [
+        createGlobalFilterTraceEntry({
+          run: false,
+          indeterminate: true,
+          reason: 'the orchestrator could not run an eval round (no pending-eval tracker)',
+        }),
+      ]);
+      logGlobalDecisionTrace(excluded, {
+        deliveryId: info.deliveryId,
+        workflowRepo: candidate.reg.repoIdentifier,
+        sourceRepo: repoIdentifier,
+      });
+      decisionSummaries.push(summarizeGlobalDecision(excluded, candidate.reg.repoIdentifier));
     }
-    return [];
+    return {
+      resolved: [],
+      decisionSummaries,
+      roundFailureWorkflowRepos: [],
+      // Every candidate was suppressed without a verdict. Reported so a caller
+      // cannot read the empty failure list above as a clean evaluation — this
+      // branch is deliberately not a round failure, and it decided nothing.
+      unresolvedWorkflowRepos: [...new Set(candidates.map((c) => c.reg.repoIdentifier))],
+    };
   }
 
   const { verdicts, failures } = await runGlobalEvalRounds({
@@ -1952,13 +2146,22 @@ async function resolveRoundCandidates(args: {
     },
   });
 
+  const roundFailureWorkflowRepos: string[] = [];
   for (const failure of failures) {
+    roundFailureWorkflowRepos.push(failure.workflowRepoIdentifier);
     await surfaceFailedEvalRound({ ...args, failure });
   }
 
   const resolved: ResolvedGlobalCandidate[] = [];
+  const unresolvedWorkflowRepos = new Set<string>();
   for (const candidate of candidates) {
     const verdict = verdicts.get(candidateKey(candidate));
+    // A missing or indeterminate verdict is not a decision — the round could
+    // not answer for this candidate, so its repository is not one this pass can
+    // report as evaluated.
+    if (verdict === undefined || verdict.indeterminate === true) {
+      unresolvedWorkflowRepos.add(candidate.reg.repoIdentifier);
+    }
     if (verdict?.run !== true) {
       logger.info('Global workflow skipped by eval round', {
         deliveryId: info.deliveryId,
@@ -1972,20 +2175,19 @@ async function resolveRoundCandidates(args: {
       // boolean, so its exclusion is the least visible outcome in the pipeline.
       // Recording it in the trace is what makes it answerable.
       if (candidate.decision) {
-        logGlobalDecisionTrace(
-          appendChecks(candidate.decision, [
-            createGlobalFilterTraceEntry({
-              run: false,
-              indeterminate: verdict?.indeterminate === true,
-              reason: verdict?.reason,
-            }),
-          ]),
-          {
-            deliveryId: info.deliveryId,
-            workflowRepo: candidate.reg.repoIdentifier,
-            sourceRepo: repoIdentifier,
-          },
-        );
+        const excluded = appendChecks(candidate.decision, [
+          createGlobalFilterTraceEntry({
+            run: false,
+            indeterminate: verdict?.indeterminate === true,
+            reason: verdict?.reason,
+          }),
+        ]);
+        logGlobalDecisionTrace(excluded, {
+          deliveryId: info.deliveryId,
+          workflowRepo: candidate.reg.repoIdentifier,
+          sourceRepo: repoIdentifier,
+        });
+        decisionSummaries.push(summarizeGlobalDecision(excluded, candidate.reg.repoIdentifier));
       }
       continue;
     }
@@ -1994,13 +2196,21 @@ async function resolveRoundCandidates(args: {
       jobs: [...staticJobsOf(candidate.lockEntry), ...(verdict.jobs ?? [])],
     });
   }
-  return resolved;
+  return {
+    resolved,
+    decisionSummaries,
+    roundFailureWorkflowRepos,
+    unresolvedWorkflowRepos: [...unresolvedWorkflowRepos],
+  };
 }
 
 /** One cleared global candidate's job inputs, under the run id they dispatch as. */
 interface BuiltGlobalCandidate {
   globalRunId: string;
-  inputs: { lockJobName: string; input: QueuedJobInput }[];
+  inputs: GlobalJobInput[];
+  /** The expanded job set + expansion map, threaded to `insertEdgesForRun`. */
+  materialized: MaterializedJob[];
+  expansionMap: Map<string, string[]>;
 }
 
 /**
@@ -2035,21 +2245,24 @@ function buildOneGlobalCandidate(args: {
   const { reg, lockEntry } = resolved.candidate;
   const globalRunId = randomUUID();
   enrichRequestContext({ runId: globalRunId });
+  const built = buildGlobalWorkflowJobInputs({
+    info,
+    reg,
+    globalWorkflow: lockEntry,
+    globalRunId,
+    ref: args.ref,
+    event: args.event,
+    repoIdentifier,
+    dispatchBundle: args.dispatchBundle,
+    dispatchCredentials: args.dispatchCredentials,
+    providerRegistry: args.deps.providerRegistry,
+    jobs: resolved.jobs,
+  });
   return {
     globalRunId,
-    inputs: buildGlobalWorkflowJobInputs({
-      info,
-      reg,
-      globalWorkflow: lockEntry,
-      globalRunId,
-      ref: args.ref,
-      event: args.event,
-      repoIdentifier,
-      dispatchBundle: args.dispatchBundle,
-      dispatchCredentials: args.dispatchCredentials,
-      providerRegistry: args.deps.providerRegistry,
-      jobs: resolved.jobs,
-    }),
+    inputs: built.inputs,
+    materialized: built.materialized,
+    expansionMap: built.expansionMap,
   };
 }
 
@@ -2064,8 +2277,11 @@ function buildOneGlobalCandidate(args: {
  * `execution_runs` and the recovery path drops a status whose run is unknown.
  *
  * `repoIdentifier` is the **source** repo — the one that emitted the event and
- * whose code the jobs check out. The workflow's own repo is not a column; it
- * travels per job in `jobConfig.workflowRepoIdentifier`.
+ * whose code the jobs check out. The workflow's own repo is a column of its own
+ * (`execution_runs.workflow_repo_identifier`), passed as the last argument
+ * below, and it also travels per job in `jobConfig.workflowRepoIdentifier`. The
+ * two are not redundant: the row is what the run list, the rerun path and the
+ * either-repository access predicate read, none of which see a job config.
  *
  * Written BEFORE the dispatch loop, with no jobs: the dispatcher mints the job
  * ids, so they can only be registered afterwards (via `addJobsToRun`), and
@@ -2093,9 +2309,12 @@ async function recordGlobalRunStart(args: {
     lockEntry.name,
     info.provider,
     repoIdentifier,
-    // The same ref the dispatched jobs carry, so the row and its queue rows
-    // name one branch.
-    event.sourceBranch ?? event.targetBranch,
+    // The run row's `ref` is the branch the run PRESENTS, which is what every
+    // other `onExecutionStarted` caller writes and what the context branch gate
+    // evaluates. Not the ref the dispatched jobs carry: a job's checkout ref is
+    // the PR head branch, which a fork contributor names freely, and this row is
+    // read back as a branch claim by the internal-event branch inheritance.
+    event.targetBranch,
     ref,
     info.deliveryId,
     args.dispatchCredentials,
@@ -2251,7 +2470,7 @@ async function dispatchGlobalCandidateJobs(args: {
   const { deps, built, candidate, repoIdentifier, tracker } = args;
   const dispatchedJobs: DispatchedJobEntry[] = [];
   const rejectedJobs: RejectedJobEntry[] = [];
-  for (const { lockJobName, input } of built.inputs) {
+  for (const { lockJobName, lockJob, input } of built.inputs) {
     // `baseJobName` and `matrixValues` come from the envelope
     // `buildGlobalWorkflowJobInputs` already spread into the job config, so a
     // materialized child's `execution_jobs` row carries the same identity a
@@ -2266,6 +2485,46 @@ async function dispatchGlobalCandidateJobs(args: {
       ...(envelope.matrixValues && { matrixValues: envelope.matrixValues }),
       ...(envelope.baseJobName && { baseJobName: envelope.baseJobName }),
     };
+
+    // An invoke gate never reaches an agent: register it as a synthetic pending
+    // `gate` row + stash its invoke params so the release path (`dispatchReadyJob`
+    // → `releaseInvokeGate`) summons the source repo's subscribers instead of
+    // dispatching the (stepless) job input. Root gates are nudged post-registration
+    // by `invokeRootGlobalGates`; needs-gated ones are released by the scheduler.
+    const invokeParams = invokeParamsFromLockJob(lockJob);
+    if (invokeParams) {
+      await storePendingJobContext(deps.db, built.globalRunId, lockJobName, {
+        jobInput: input,
+        runsOnLabels: [],
+        invoke: invokeParams,
+      });
+      dispatchedJobs.push({
+        jobId: `${NEEDS_PENDING_JOB_ID_PREFIX}${lockJobName}-${randomUUID()}`,
+        ...tracked,
+        jobKind: JobKind.Gate,
+        ...(invokeParams.timeoutMs !== undefined && { timeoutMs: invokeParams.timeoutMs }),
+      });
+      continue;
+    }
+
+    // A non-root job waits for the needs scheduler: hold it as a synthetic
+    // needs-pending row + stash its input for `dispatchReadyJob` to consume when
+    // its upstreams complete. Without this the global path dispatched every job
+    // at once, so a downstream `needs` edge never gated (and a gate's downstream
+    // could not be released after the gate).
+    if (!isRootJob(lockJob)) {
+      await storePendingJobContext(deps.db, built.globalRunId, lockJobName, {
+        jobInput: input,
+        runsOnLabels: input.runsOnLabels,
+      });
+      dispatchedJobs.push({
+        jobId: `${NEEDS_PENDING_JOB_ID_PREFIX}${lockJobName}-${randomUUID()}`,
+        ...tracked,
+      });
+      continue;
+    }
+
+    // Root, non-gate: dispatch straight to the queue.
     const result = await deps.dispatcher.dispatch(input);
     if (result.status === 'rejected') {
       // A rejected dispatch — a full queue — is still tracked, under a
@@ -2307,7 +2566,110 @@ async function dispatchGlobalCandidateJobs(args: {
       rejectedJobs,
       executionTracker: tracker,
     });
+    // Registration created the `execution_jobs` rows; now wire the needs graph
+    // over them and nudge any root invoke gate. This runs inside the caller's
+    // pending-jobs hold, so a gate that terminalizes immediately (zero
+    // subscribers) does not finalize the run before its downstreams are settled.
+    await wireGlobalNeedsAndGates({ deps, built, dispatchedJobs });
   }
+}
+
+/**
+ * After a global run's jobs are registered, wire its needs graph the same way a
+ * per-repository run's is: insert the static needs edges (which also marks root
+ * jobs `needs_satisfied`), catch up any downstream whose upstream already
+ * terminalized inside the dispatch window, then release every root invoke gate.
+ */
+async function wireGlobalNeedsAndGates(args: {
+  deps: ProcessingDeps;
+  built: BuiltGlobalCandidate;
+  dispatchedJobs: readonly DispatchedJobEntry[];
+}): Promise<void> {
+  const { deps, built, dispatchedJobs } = args;
+  const runId = built.globalRunId;
+  if (!deps.db || !deps.executionTracker) return;
+  try {
+    await insertEdgesForRun(deps.db, runId, built.materialized, built.expansionMap);
+    await catchUpNeedsGatedJobs({ ctx: { deps, runId }, dispatchedJobs });
+  } catch (err) {
+    logger.error('Failed to insert needs edges for organization-wide workflow run', {
+      runId,
+      error: toErrorMessage(err),
+    });
+  }
+  await invokeRootGlobalGates({ deps, built });
+}
+
+/**
+ * Release every root (no-needs) invoke gate in a global run once its jobs and
+ * edges are registered. Mirrors the per-repository `invokeRootGates`: a root gate
+ * has no upstream to fire the scheduler, so it is nudged through `dispatchReadyJob`,
+ * whose gate branch summons the source repo's subscribers instead of reaching an
+ * agent. Needs-gated gates are left for the scheduler.
+ */
+async function invokeRootGlobalGates(args: {
+  deps: ProcessingDeps;
+  built: BuiltGlobalCandidate;
+}): Promise<void> {
+  const { deps, built } = args;
+  const runId = built.globalRunId;
+  if (!deps.executionTracker || !deps.db) return;
+  const seen = new Set<string>();
+  for (const mat of built.materialized) {
+    if (!isInvokeGate(mat.lockJob) || !isRootJob(mat.lockJob)) continue;
+    if (seen.has(mat.expandedName)) continue;
+    seen.add(mat.expandedName);
+    if (!deps.invokeGateDeps) {
+      logger.error('Root invoke gate cannot summon: invoke-gate deps unavailable', {
+        runId,
+        job: mat.expandedName,
+      });
+      await deps.executionTracker.onJobStatus(
+        runId,
+        mat.expandedName,
+        ExecutionJobStatus.enum.failed,
+        Date.now(),
+        undefined,
+        { error: 'invoke gate could not run: gate dependencies unavailable' },
+      );
+      continue;
+    }
+    await dispatchReadyJob(
+      runId,
+      mat.expandedName,
+      deps.dispatcher,
+      deps.executionTracker,
+      deps.coordinator,
+      deps.db,
+      deps.invokeGateDeps,
+    );
+  }
+}
+
+/** What one organization-wide dispatch pass produced. */
+interface GlobalDispatchOutcome {
+  matchedCount: number;
+  matchedRunIds: string[];
+  /** One summary per global decision this pass reached, dispatched or excluded. */
+  decisionSummaries: Record<string, unknown>[];
+  /**
+   * The workflow repository of every evaluation round this pass could not
+   * decide. Empty means every round the pass ran reached a verdict.
+   */
+  roundFailureWorkflowRepos: string[];
+  /**
+   * Every workflow repository this pass actually evaluated: it examined that
+   * repository's registrations and reached a real outcome for each of them —
+   * dispatched, filtered out, or excluded by a verdict.
+   *
+   * The pass's POSITIVE signal, and the one a re-run gates its success check
+   * on. An empty `roundFailureWorkflowRepos` cannot carry that meaning: a pass
+   * with no registration index, no pending-eval tracker, or an event the trust
+   * policy held evaluates nothing and reports no failure either, so reading its
+   * silence as a clean verdict is the false assurance the round exists to
+   * remove.
+   */
+  decidedWorkflowRepos: string[];
 }
 
 /**
@@ -2330,9 +2692,31 @@ async function dispatchGlobalCandidates(args: {
   bundle?: ProviderBundle;
   credentials?: Record<string, unknown>;
   dispatchLogMessage: string;
-}): Promise<{ matchedCount: number; matchedRunIds: string[] }> {
+  /** The source `dispatchCredentials` belongs to; forwarded to the failure record. */
+  dispatchRoutingKey?: string;
+  /**
+   * Every workflow repository the collection examined, from
+   * {@link GlobalCandidateCollection}. The universe `decidedWorkflowRepos` is
+   * computed against; defaults to the repositories the candidates themselves
+   * name, which is the same set minus any repository whose every registration
+   * was filtered out before becoming a candidate.
+   */
+  consideredWorkflowRepos?: readonly string[];
+}): Promise<GlobalDispatchOutcome> {
   const matchedRunIds: string[] = [];
-  if (args.candidates.length === 0) return { matchedCount: 0, matchedRunIds };
+  const decisionSummaries: Record<string, unknown>[] = [];
+  const considered =
+    args.consideredWorkflowRepos ?? args.candidates.map((c) => c.reg.repoIdentifier);
+  if (args.candidates.length === 0)
+    return {
+      matchedCount: 0,
+      matchedRunIds,
+      decisionSummaries,
+      roundFailureWorkflowRepos: [],
+      // Nothing needed a verdict, so every repository the collection examined
+      // was decided by trigger matching alone.
+      decidedWorkflowRepos: [...new Set(considered)],
+    };
 
   const { immediate, needsRound } = partitionCandidates(args.candidates);
 
@@ -2345,10 +2729,16 @@ async function dispatchGlobalCandidates(args: {
       resolved: { candidate, jobs: staticJobsOf(candidate.lockEntry) },
     });
     matchedRunIds.push(await dispatchBuiltGlobalCandidate({ ...args, built, candidate }));
+    if (candidate.decision) {
+      decisionSummaries.push(
+        summarizeGlobalDecision(candidate.decision, candidate.reg.repoIdentifier),
+      );
+    }
   }
 
-  const cleared = await resolveRoundCandidates({ ...args, candidates: needsRound });
-  for (const resolved of cleared) {
+  const round = await resolveRoundCandidates({ ...args, candidates: needsRound });
+  decisionSummaries.push(...round.decisionSummaries);
+  for (const resolved of round.resolved) {
     let built: BuiltGlobalCandidate;
     try {
       built = buildOneGlobalCandidate({ ...args, resolved });
@@ -2369,15 +2759,52 @@ async function dispatchGlobalCandidates(args: {
         sourceRepo: args.repoIdentifier,
         error: toErrorMessage(err),
       });
+      // The workflow matched, so it belongs in the trace whatever happened
+      // next. Skipping the summary below would leave it absent from every
+      // record the delivery has — no run row, no job, and no trace entry —
+      // which is indistinguishable from never having been registered.
+      if (resolved.candidate.decision) {
+        decisionSummaries.push(
+          summarizeGlobalDecision(
+            appendChecks(resolved.candidate.decision, [
+              createDispatchFailureTraceEntry(`Jobs could not be built: ${toErrorMessage(err)}`),
+            ]),
+            resolved.candidate.reg.repoIdentifier,
+          ),
+        );
+      }
       continue;
     }
     matchedRunIds.push(
       await dispatchBuiltGlobalCandidate({ ...args, built, candidate: resolved.candidate }),
     );
+    if (resolved.candidate.decision) {
+      decisionSummaries.push(
+        summarizeGlobalDecision(resolved.candidate.decision, resolved.candidate.reg.repoIdentifier),
+      );
+    }
   }
 
-  return { matchedCount: matchedRunIds.length, matchedRunIds };
+  const unresolved = new Set(round.unresolvedWorkflowRepos);
+  return {
+    matchedCount: matchedRunIds.length,
+    matchedRunIds,
+    decisionSummaries,
+    roundFailureWorkflowRepos: round.roundFailureWorkflowRepos,
+    decidedWorkflowRepos: [...new Set(considered)].filter((repo) => !unresolved.has(repo)),
+  };
 }
+
+/**
+ * How the globals-skipped notice names each non-passing verdict. A `Record` over
+ * the non-passing actions, so a verdict added to `TrustPolicyOutcome` without a
+ * word here is a compile error rather than a blank in a customer-visible check.
+ */
+const GLOBALS_SKIPPED_VERB: Record<Exclude<TrustPolicyOutcome['action'], 'pass'>, string> = {
+  ignore: 'ignored',
+  hold: 'held',
+  reject: 'rejected',
+};
 
 /**
  * Post the neutral informational check recording that org global workflows were
@@ -2408,20 +2835,21 @@ async function postGlobalsSkippedCheck(args: {
 }): Promise<void> {
   const { bundle, repoIdentifier, ref, credentials, decision } = args;
   if (decision.action === 'pass') return;
+  const reason = trustPolicyOutcomeReason(decision);
   try {
     await bundle.checkStatusPoster?.postGlobalWorkflowsSkippedCheck(
       repoIdentifier,
       ref,
-      `The organization trust policy ${decision.action === 'hold' ? 'held' : 'rejected'} this ` +
-        `event (${decision.reason}), so organization-wide global workflows did not run. ` +
-        `Approving the hold releases this pull request's own workflows; it does not ` +
+      `The organization trust policy ${GLOBALS_SKIPPED_VERB[decision.action]} this ` +
+        `event${reason ? ` (${reason})` : ''}, so organization-wide global workflows did not ` +
+        `run. Approving the hold releases this pull request's own workflows; it does not ` +
         `retroactively run the organization's global workflows for this event.`,
       credentials,
     );
   } catch (err) {
     logger.warn('Failed to post globals-skipped check', {
       repoIdentifier,
-      reason: decision.reason,
+      reason,
       error: toErrorMessage(err),
     });
   }
@@ -2431,7 +2859,8 @@ async function postGlobalsSkippedCheck(args: {
  * Phase F — Lock file is missing for this repo — try global workflows in the
  * SAME ORG that target this event type. Even without a per-repo lock file,
  * global workflows in other repos may match. Returns the count of jobs
- * dispatched (used for metrics + event log).
+ * dispatched (used for metrics + event log) alongside the pass's own decision
+ * summaries, which the caller forwards as this delivery's trace.
  */
 async function tryDispatchGlobalsWithoutLockFile(args: {
   info: WebhookInfo;
@@ -2442,11 +2871,13 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
   ref: string;
   dispatchBundle: ProviderBundle;
   dispatchCredentials: Record<string, unknown>;
+  /** The source `dispatchCredentials` belongs to; forwarded to the failure record. */
+  dispatchRoutingKey?: string;
   /** The inbound event's own bundle, used to post the globals-skipped check. */
   bundle: ProviderBundle;
   credentials: Record<string, unknown>;
   securityDecision: TrustPolicyOutcome;
-}): Promise<number> {
+}): Promise<{ matchedCount: number; decisionSummaries: Record<string, unknown>[] }> {
   const {
     info,
     deps,
@@ -2467,7 +2898,7 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
       deliveryId: info.deliveryId,
       repoIdentifier,
       action: securityDecision.action,
-      reason: securityDecision.reason,
+      reason: trustPolicyOutcomeReason(securityDecision),
     });
     await postGlobalsSkippedCheck({
       bundle,
@@ -2476,9 +2907,9 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
       credentials,
       decision: securityDecision,
     });
-    return 0;
+    return { matchedCount: 0, decisionSummaries: [] };
   }
-  if (!deps.registrationIndex) return 0;
+  if (!deps.registrationIndex) return { matchedCount: 0, decisionSummaries: [] };
 
   // Refresh registration index in case external changes were made.
   if (deps.registrationStore) {
@@ -2491,7 +2922,7 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
   // `sourceRepo`.
   const globalEvent = withSourceRepo(event, repoIdentifier);
 
-  const candidates = await collectGlobalCandidates({
+  const collected = await collectGlobalCandidates({
     info,
     deps,
     event: globalEvent,
@@ -2502,11 +2933,11 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
     dispatchCredentials,
   });
 
-  const { matchedCount } = await dispatchGlobalCandidates({
+  const dispatched = await dispatchGlobalCandidates({
     info,
     deps,
     event: globalEvent,
-    candidates,
+    candidates: collected.candidates,
     repoIdentifier,
     ref,
     dispatchBundle,
@@ -2514,9 +2945,16 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
     bundle,
     credentials,
     dispatchLogMessage: 'Global workflow job dispatched (no lock file path)',
+    consideredWorkflowRepos: collected.consideredWorkflowRepos,
+    ...(args.dispatchRoutingKey !== undefined && {
+      dispatchRoutingKey: args.dispatchRoutingKey,
+    }),
   });
 
-  return matchedCount;
+  return {
+    matchedCount: dispatched.matchedCount,
+    decisionSummaries: [...collected.decisionSummaries, ...dispatched.decisionSummaries],
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,9 +2964,9 @@ async function tryDispatchGlobalsWithoutLockFile(args: {
 interface SecurityState {
   workflowModifications: WorkflowModification[];
   /**
-   * True when this PR changes `.kici/` workflow definitions. A *signal*, not a
-   * decision — the trust-policy gate turns it into an outcome, which the
-   * dispatch gate then enforces as a held run or a rejected run.
+   * True when this PR changes `.kici/` workflow definitions. Reported, not
+   * enforced: the org trust policy is the fork switch, and it reads the fork
+   * signal and the tier — never this one.
    */
   hasWorkflowModifications: boolean;
 }
@@ -2538,10 +2976,11 @@ interface SecurityState {
  * modifications by diffing base vs. head and post a neutral informational check
  * (on its own dedicated check name).
  *
- * Detection only. Whether a modification gates the run is the org trust policy's
- * call, evaluated in `evaluateSecurityPolicy` and enforced by the dispatch gate
- * — which creates the real `held_runs` row and posts the pending
- * "Held for approval" check, so `/kici approve` / reject / expiry can resolve it.
+ * Detection and legibility only: the check tells a reviewer that this PR edits
+ * the workflows it would run under. It feeds no policy decision — a PR that
+ * edits `.kici/` from the base repo is written by a contributor who could
+ * already push to it, and one from a fork is governed by the fork switch
+ * whether or not it touches `.kici/`.
  */
 export function applyWorkflowModificationsAndSecurityHold(args: {
   info: WebhookInfo;
@@ -2604,11 +3043,17 @@ export function applyWorkflowModificationsAndSecurityHold(args: {
 /**
  * Evaluate the org trust policy for a PR event.
  *
- * Scoped to providers with a contributor model — the same condition trust
- * resolution uses. A source without a `ContributorResolver` (generic, local,
- * universal-git) is trusted by construction, so it passes regardless of policy;
- * in particular, universal-git computes an `isForkPR` signal that must NOT gate
- * those sources.
+ * Scoped to providers with a fork model (`bundle.hasForkModel`): a source
+ * without one passes regardless of policy. That is not a trust claim about such
+ * a source — a PR from a fork-less provider resolves no tier at all. It is that
+ * the policy's one condition cannot be established for it: universal-git does
+ * compute an `isForkPR`, but from payload keys many forges omit, and it reads
+ * `false` when they are absent. Gating on a signal that fails toward trust
+ * would be worse than not gating.
+ *
+ * The policy read has two distinct failure shapes, and they get distinct
+ * answers: no stored row is the unconfigured default (`FAIL_CLOSED_POLICY`),
+ * while a read that THREW gets `READ_FAILURE_POLICY` — see there for why.
  */
 export async function evaluateSecurityPolicy(args: {
   deps: ProcessingDeps;
@@ -2618,31 +3063,35 @@ export async function evaluateSecurityPolicy(args: {
   mode: OrchestratorMode;
   trustResolution: TrustResolution | undefined;
   isForkPR: boolean;
-  hasWorkflowModifications: boolean;
 }): Promise<TrustPolicyOutcome> {
   const { deps, bundle, isPREvent, resolvedOrgId, mode } = args;
-  if (!isPREvent || !bundle.contributorResolver) return { action: 'pass' };
+  if (!isPREvent || !bundle.hasForkModel) return { action: 'pass' };
 
   let stored: StoredTrustPolicy | null = null;
+  let readFailed = false;
   try {
     stored = (await deps.trustPolicyStore?.get(resolvedOrgId)) ?? null;
   } catch (err) {
-    // Fall through with `stored = null`, which fails closed on a
-    // Platform-attached orchestrator. Never fail open on a read error.
-    logger.warn('Trust policy read failed; falling back to the mode default', {
+    // A failed read is not an unconfigured org, and answering both the same way
+    // is not harmless: an org whose stored policy is `hold` or `allow` would
+    // have its fork PRs dropped with no trace, on nothing more than a transient
+    // database error. Hold instead — equally fail-closed, and recoverable.
+    readFailed = true;
+    logger.warn('Trust policy read failed; holding fork PRs for this delivery', {
       orgId: resolvedOrgId,
       error: toErrorMessage(err),
     });
   }
 
-  const outcome = evaluateTrustPolicy(resolveEffectivePolicy(stored, mode), {
+  const policy = readFailed ? READ_FAILURE_POLICY : resolveEffectivePolicy(stored, mode);
+  const outcome = evaluateTrustPolicy(policy, {
     tier: args.trustResolution?.tier,
     isForkPR: args.isForkPR,
-    hasWorkflowModifications: args.hasWorkflowModifications,
   });
 
+  const reason = trustPolicyOutcomeReason(outcome);
   trustPolicyDecisionsTotal.add(1, {
-    arm: outcome.action === 'pass' ? 'none' : outcome.reason,
+    arm: reason ?? 'none',
     action: outcome.action,
   });
 
@@ -2650,7 +3099,7 @@ export async function evaluateSecurityPolicy(args: {
     logger.info('Trust policy gate decision', {
       orgId: resolvedOrgId,
       action: outcome.action,
-      reason: outcome.reason,
+      reason,
       tier: args.trustResolution?.tier,
     });
   }
@@ -2697,6 +3146,12 @@ async function registerWorkflowsOnDefaultBranchPush(args: {
   if (info.provider === 'local') return;
   if (!isDefaultBranchPush(info, event, payload, bundle.normalizer)) return;
 
+  // Non-null by construction: the guard above returned only because the pushed
+  // branch equals this value. Persisting it is what gives a `__schedule_fire`
+  // run a branch to present to a context's branch restrictions — a scheduled
+  // run executes this branch's lock file, so this IS its branch.
+  const defaultBranch = extractDefaultBranch(payload, bundle.normalizer);
+
   let registerableWorkflows = extractRegisterableWorkflows(fullLockFile);
   let globalWorkflowNames = new Set(extractGlobalWorkflows(fullLockFile).map((w) => w.name));
 
@@ -2735,6 +3190,7 @@ async function registerWorkflowsOnDefaultBranchPush(args: {
     {
       customerId: resolvedOrgId,
       commitSha: ref !== 'HEAD' ? ref : undefined,
+      defaultBranch,
       globalWorkflowNames,
     },
   );
@@ -2954,7 +3410,7 @@ async function dispatchMatchedSameSourceWorkflows(args: {
  * cross-repo `repos` patterns. Same-org scope picks up both same-source and
  * cross-source globals (cross-provider global workflows).
  */
-async function dispatchGlobalWorkflowsForOtherRepos(args: {
+export async function dispatchGlobalWorkflowsForOtherRepos(args: {
   info: WebhookInfo;
   deps: ProcessingDeps;
   eventWithFiles: SimulatedEvent;
@@ -2967,7 +3423,19 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
   bundle: ProviderBundle;
   credentials: Record<string, unknown>;
   securityDecision: TrustPolicyOutcome;
-}): Promise<{ matchedCount: number; matchedRunIds: string[] }> {
+  /**
+   * The source `dispatchCredentials` belongs to, when a cross-provider lock-file
+   * fallback made it a different source from `info.routingKey`. Persisted on a
+   * failed round's run row so its re-run can rebuild the same dispatch pair
+   * instead of handing this source's credentials to the inbound source's client.
+   */
+  dispatchRoutingKey?: string;
+  /**
+   * Restrict the pass to global workflows authored in this repository. Set by
+   * the re-run of a failed evaluation round, which re-decides that round alone.
+   */
+  onlyWorkflowRepo?: string;
+}): Promise<GlobalDispatchOutcome> {
   const {
     info,
     deps,
@@ -2990,7 +3458,7 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
       deliveryId: info.deliveryId,
       repoIdentifier,
       action: securityDecision.action,
-      reason: securityDecision.reason,
+      reason: trustPolicyOutcomeReason(securityDecision),
     });
     await postGlobalsSkippedCheck({
       bundle,
@@ -2999,16 +3467,32 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
       credentials,
       decision: securityDecision,
     });
-    return { matchedCount: 0, matchedRunIds: [] };
+    return {
+      matchedCount: 0,
+      matchedRunIds: [],
+      decisionSummaries: [],
+      roundFailureWorkflowRepos: [],
+      // The pass never ran, so it decided nothing — and it reports no round
+      // failure either, which is exactly why the caller must not read that
+      // absence as a clean evaluation.
+      decidedWorkflowRepos: [],
+    };
   }
-  if (!deps.registrationIndex) return { matchedCount: 0, matchedRunIds: [] };
+  if (!deps.registrationIndex)
+    return {
+      matchedCount: 0,
+      matchedRunIds: [],
+      decisionSummaries: [],
+      roundFailureWorkflowRepos: [],
+      decidedWorkflowRepos: [],
+    };
 
   // `eventWithFiles` is already stamped by `gatherChangedFilesAndMatchTriggers`,
   // so this is a no-op that returns the same object — stated rather than
   // assumed, so the invariant holds by construction on both global paths.
   const globalEvent = withSourceRepo(eventWithFiles, repoIdentifier);
 
-  const candidates = await collectGlobalCandidates({
+  const collected = await collectGlobalCandidates({
     info,
     deps,
     event: globalEvent,
@@ -3017,13 +3501,14 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
     ref,
     dispatchBundle,
     dispatchCredentials,
+    ...(args.onlyWorkflowRepo !== undefined && { onlyWorkflowRepo: args.onlyWorkflowRepo }),
   });
 
-  return dispatchGlobalCandidates({
+  const dispatched = await dispatchGlobalCandidates({
     info,
     deps,
     event: globalEvent,
-    candidates,
+    candidates: collected.candidates,
     repoIdentifier,
     ref,
     dispatchBundle,
@@ -3031,18 +3516,71 @@ async function dispatchGlobalWorkflowsForOtherRepos(args: {
     bundle,
     credentials,
     dispatchLogMessage: 'Global workflow job dispatched',
+    consideredWorkflowRepos: collected.consideredWorkflowRepos,
+    ...(args.dispatchRoutingKey !== undefined && {
+      dispatchRoutingKey: args.dispatchRoutingKey,
+    }),
   });
+
+  return {
+    ...dispatched,
+    decisionSummaries: [...collected.decisionSummaries, ...dispatched.decisionSummaries],
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Phase K — Forward Platform trace + record event log + final metrics
 // ---------------------------------------------------------------------------
 
+/**
+ * Forward the delivery's decision trace to the Platform on a started
+ * `execution.event`.
+ *
+ * Its own function because two dispatch paths reach it: the lock-file path via
+ * Phase K, and the no-lock-file path, whose whole point is the organization-wide
+ * pass. A repository with no `.kici/` lock file is the canonical target of an
+ * organization-wide workflow, so leaving that path silent was leaving the case
+ * the trace exists for — "why did the org's global not fire here?" — with no
+ * answer at all.
+ */
+function sendDecisionTraceEvent(args: {
+  info: WebhookInfo;
+  deps: ProcessingDeps;
+  repoIdentifier: string;
+  ref: string;
+  matchedCount: number;
+  /** The count the trace is being reported against. */
+  totalWorkflows: number;
+  decisions: Record<string, unknown>[];
+}): void {
+  const { info, deps, repoIdentifier, ref, matchedCount, totalWorkflows, decisions } = args;
+  if (!deps.platformClient) return;
+  deps.platformClient.send({
+    type: 'execution.event',
+    messageId: randomUUID(),
+    runId: randomUUID(),
+    event: 'started',
+    data: {
+      deliveryId: info.deliveryId,
+      webhookEvent: info.event,
+      action: info.action,
+      repoIdentifier,
+      ref,
+      matchedWorkflows: matchedCount,
+      totalWorkflows,
+      decisions: capDecisionSummaries(decisions),
+    },
+    timestamp: Date.now(),
+  });
+}
+
 async function forwardTracesAndRecordEventLog(args: {
   info: WebhookInfo;
   deps: ProcessingDeps;
   payload: Record<string, unknown>;
   decisions: ReturnType<typeof matchAllWorkflows>;
+  /** The organization-wide pass's own summaries, already tagged with their repo. */
+  globalDecisionSummaries: Record<string, unknown>[];
   matchedCount: number;
   matchedRunIds: string[];
   resolvedOrgId: string;
@@ -3055,6 +3593,7 @@ async function forwardTracesAndRecordEventLog(args: {
     deps,
     payload,
     decisions,
+    globalDecisionSummaries,
     matchedCount,
     matchedRunIds,
     resolvedOrgId,
@@ -3063,25 +3602,24 @@ async function forwardTracesAndRecordEventLog(args: {
     changedFilesStatus,
   } = args;
 
-  if (deps.platformClient) {
-    deps.platformClient.send({
-      type: 'execution.event',
-      messageId: randomUUID(),
-      runId: randomUUID(),
-      event: 'started',
-      data: {
-        deliveryId: info.deliveryId,
-        webhookEvent: info.event,
-        action: info.action,
-        repoIdentifier,
-        ref,
-        matchedWorkflows: matchedCount,
-        totalWorkflows: decisions.length,
-        decisions: decisions.map(summarizeDecision),
-      },
-      timestamp: Date.now(),
-    });
-  }
+  // One array over both halves — the per-repo lock file's decisions and the
+  // organization-wide pass's — so the size budget is applied to what actually
+  // goes on the wire rather than to either half alone.
+  //
+  // `totalWorkflows` counts THIS array. Reporting only the lock-file half beside
+  // a trace that also carries the organization-wide one puts two fields on one
+  // message that contradict each other.
+  const allDecisions = [...decisions.map(summarizeDecision), ...globalDecisionSummaries];
+
+  sendDecisionTraceEvent({
+    info,
+    deps,
+    repoIdentifier,
+    ref,
+    matchedCount,
+    totalWorkflows: allDecisions.length,
+    decisions: allDecisions,
+  });
 
   webhooksProcessedTotal.add(1, { result: matchedCount > 0 ? 'matched' : 'skipped' });
 
@@ -3216,6 +3754,9 @@ async function matchDispatchAndRecordOutcome(args: {
     ref,
     dispatchBundle: lockOutcome.dispatchBundle,
     dispatchCredentials: lockOutcome.dispatchCredentials,
+    ...(lockOutcome.resolvedFallbackRoutingKey !== undefined && {
+      dispatchRoutingKey: lockOutcome.resolvedFallbackRoutingKey,
+    }),
     bundle,
     credentials,
     securityDecision,
@@ -3226,6 +3767,7 @@ async function matchDispatchAndRecordOutcome(args: {
     deps,
     payload,
     decisions,
+    globalDecisionSummaries: globals.decisionSummaries,
     matchedCount: sameSource.matchedCount + globals.matchedCount,
     matchedRunIds: [...sameSource.matchedRunIds, ...globals.matchedRunIds],
     resolvedOrgId,
@@ -3241,10 +3783,57 @@ async function matchDispatchAndRecordOutcome(args: {
 // ---------------------------------------------------------------------------
 
 /**
+ * Process a webhook through the complete pipeline, recording a `failed` event-log
+ * row for a delivery the pipeline could not finish.
+ *
+ * The row is the only per-delivery record of such a failure. Nothing the pipeline
+ * decides after acknowledgement can reach the sender — `acceptWebhookDelivery`
+ * answers 202 and runs this detached — and the dashboard's webhook-activity view
+ * counts `event_log.status = 'failed'` for exactly this. Without the write that
+ * count is structurally always zero, and a post-acknowledgement failure appears
+ * in the orchestrator's own logs and nowhere a customer can see.
+ *
+ * Best-effort and non-masking: the write is wrapped, and the original error is
+ * rethrown either way. The delivery still reverts to `buffered` for the drain
+ * pass to retry, so a redelivery that succeeds writes its own `processed` row
+ * beside this one — the two are distinct rows, not a mutation.
+ */
+export async function processWebhook(
+  info: WebhookInfo,
+  deps: ProcessingDeps,
+): Promise<WebhookIngestOutcome> {
+  try {
+    return await processWebhookPipeline(info, deps);
+  } catch (err) {
+    if (deps.eventLog) {
+      try {
+        // Resolved again rather than threaded out of the pipeline: the throw may
+        // have escaped before the pipeline had an org, and this lookup is safe
+        // and idempotent (it falls back to the no-tenant anchor on its own).
+        const orgId = await resolveOrgIdSafe(deps, info.routingKey);
+        await deps.eventLog.record(info, payloadFromObject(info.payload), {
+          orgId,
+          source: deps.eventLogSource ?? EventLogSource.enum.direct,
+          status: EventLogStatus.enum.failed,
+          errorMessage: toErrorMessage(err),
+        });
+      } catch (logErr) {
+        logger.error('Failed to record a failed delivery in the event log', {
+          deliveryId: info.deliveryId,
+          routingKey: info.routingKey,
+          error: toErrorMessage(logErr),
+        });
+      }
+    }
+    throw err;
+  }
+}
+
+/**
  * Process a webhook through the complete pipeline.
  *
  * Flow:
- *   1. Dedup + provider lookup -> contributor cache invalidation -> normalize
+ *   1. Dedup + provider lookup -> normalize
  *   2. Cross-source dispatch (generic webhook fan-out, optional)
  *   3. Extract repo + credentials, handle /kici approval comments
  *   4. Trust resolution for PR events
@@ -3256,15 +3845,13 @@ async function matchDispatchAndRecordOutcome(args: {
  *   9. Match + dispatch global workflows for OTHER repos
  *  10. Forward Platform trace + record event log
  */
-export async function processWebhook(
+async function processWebhookPipeline(
   info: WebhookInfo,
   deps: ProcessingDeps,
 ): Promise<WebhookIngestOutcome> {
   const provider = await dedupAndResolveProvider(info, deps);
   if (provider.status === 'skip') return skipReasonToOutcome(provider.reason);
   const { resolvedOrgId, bundle } = provider;
-
-  invalidateContributorCacheForEvent(info, deps, bundle);
 
   const event = await normalizeWebhookEvent(info, deps, bundle, resolvedOrgId);
   if (!event) return WebhookIngestOutcome.enum.skipped;
@@ -3279,30 +3866,55 @@ export async function processWebhook(
   const { repoIdentifier, credentials } = repoCreds;
   const payload = info.payload as Record<string, unknown>;
 
+  // No `bundle` / `credentials`: each ended hold's check is completed on the
+  // commit its own run acted on, through the bundle and credentials that run
+  // recorded — not through the ones that delivered this comment.
   await handleApprovalCommentIfPresent({
     info,
     deps,
-    bundle,
     event,
     payload,
     resolvedOrgId,
     repoIdentifier,
-    credentials,
   });
 
   const ref = bundle.normalizer.extractRef(info.event, payload);
   const isPREvent = isPullRequestEvent(info.event);
 
-  const trust = await resolveTrustForPR({
-    info,
+  const trust = await resolveTrustForPR({ info, bundle, event, payload });
+
+  // Phase D.1 — the org fork switch, read ONCE for this delivery and threaded
+  // into every dispatch path below. Its signals (the tier and the fork flag) are
+  // both settled by now, so evaluating it here rather than after the lock-file
+  // fetch is what lets an `ignore` verdict drop the event before anything
+  // observable exists — no run row, no check status, no clone token.
+  const securityDecision = await evaluateSecurityPolicy({
     deps,
     bundle,
-    event,
-    payload,
+    isPREvent,
     resolvedOrgId,
-    repoIdentifier,
-    credentials,
+    // The fail-closed side is the default: a deps object built without an
+    // explicit mode must never open the gate.
+    mode: deps.orchestratorMode ?? 'platform',
+    trustResolution: trust.trustResolution,
+    isForkPR: event.isForkPR ?? false,
   });
+
+  if (securityDecision.action === 'ignore') {
+    logger.info('Fork PR event ignored by org fork policy', {
+      deliveryId: info.deliveryId,
+      orgId: resolvedOrgId,
+      repo: repoIdentifier,
+      sender: event.senderUsername,
+    });
+    forkEventsIgnoredTotal.add(1, { provider: info.provider });
+    // Same shape as the other no-dispatch exits (unknown provider, unknown
+    // event type): the delivery is recorded, counted as skipped, and reported
+    // to the ingress as `skipped`.
+    webhooksProcessedTotal.add(1, { result: 'skipped' });
+    await recordSkipEventLog(info, deps, resolvedOrgId, EventLogStatus.enum.received);
+    return WebhookIngestOutcome.enum.skipped;
+  }
 
   const lockOutcome = await fetchLockFileWithFallbackPhase({
     info,
@@ -3337,7 +3949,11 @@ export async function processWebhook(
         // declared. No organization-wide workflow is in scope here: the global
         // arm runs against registrations, never against this file.
         workflowRepoIdentifier: repoIdentifier,
-        ref: event.sourceBranch ?? event.targetBranch ?? ref,
+        // The run row's `ref` is the branch the run PRESENTS, matching what
+        // `onExecutionStarted` writes everywhere else and what the context branch
+        // gate evaluates. A job's checkout ref (the PR head branch) is a different
+        // value and does not belong in this column.
+        ref: event.targetBranch ?? ref,
         // The real commit SHA is unknown when the lock file can't be read; reuse
         // the resolved ref as the best available locator for the failed run.
         sha: ref,
@@ -3375,23 +3991,12 @@ export async function processWebhook(
       lockFileSource: trust.lockFileSource,
     });
     // The trust-policy verdict is a property of the EVENT, not of one dispatch
-    // path. This branch used to return before the policy was read at all, so a
-    // fork PR with `forkPolicy: 'reject'` still ran the org's global workflows
-    // against its head SHA with org credentials — the exact false assurance
-    // this feature exists to remove. There is no lock file here, so there is
-    // nothing to diff for workflow modifications.
-    const noLockSecurityDecision = await evaluateSecurityPolicy({
-      deps,
-      bundle,
-      isPREvent,
-      resolvedOrgId,
-      mode: deps.orchestratorMode ?? 'platform',
-      trustResolution: trust.trustResolution,
-      isForkPR: event.isForkPR ?? false,
-      hasWorkflowModifications: false,
-    });
-
-    const globalMatched = await tryDispatchGlobalsWithoutLockFile({
+    // path, so this branch enforces the same decision the lock-file path does.
+    // It used to return before the policy was read at all, so a fork PR the
+    // policy did not pass still ran the org's global workflows against its head
+    // SHA with org credentials — the exact false assurance this gate exists to
+    // remove.
+    const globals = await tryDispatchGlobalsWithoutLockFile({
       info,
       deps,
       event,
@@ -3400,9 +4005,26 @@ export async function processWebhook(
       ref,
       dispatchBundle: lockOutcome.dispatchBundle,
       dispatchCredentials: lockOutcome.dispatchCredentials,
+      ...(lockOutcome.resolvedFallbackRoutingKey !== undefined && {
+        dispatchRoutingKey: lockOutcome.resolvedFallbackRoutingKey,
+      }),
       bundle,
       credentials,
-      securityDecision: noLockSecurityDecision,
+      securityDecision,
+    });
+    const globalMatched = globals.matchedCount;
+    // The organization-wide pass IS this delivery's evaluation, so its trace is
+    // forwarded here exactly as Phase K forwards the lock-file path's. Without
+    // it, the one delivery shape a global workflow is written for — a source
+    // repository that declares no workflows of its own — reported nothing.
+    sendDecisionTraceEvent({
+      info,
+      deps,
+      repoIdentifier,
+      ref,
+      matchedCount: globalMatched,
+      totalWorkflows: globals.decisionSummaries.length,
+      decisions: globals.decisionSummaries,
     });
     // Terminal summary at parity with the lock-file path's `Webhook processed`
     // line below. This branch previously logged only a `debug` entry, so on
@@ -3433,7 +4055,10 @@ export async function processWebhook(
 
   const fullLockFile = lockOutcome.lockFile as unknown as FullLockFile;
 
-  const security = applyWorkflowModificationsAndSecurityHold({
+  // Called for the informational check it posts. Its returned report describes
+  // what the diff found; no dispatch decision on this path reads it, because
+  // the fork switch was already decided above.
+  applyWorkflowModificationsAndSecurityHold({
     info,
     bundle,
     event,
@@ -3458,19 +4083,6 @@ export async function processWebhook(
     ref,
     credentials,
     fullLockFile,
-  });
-
-  const securityDecision = await evaluateSecurityPolicy({
-    deps,
-    bundle,
-    isPREvent,
-    resolvedOrgId,
-    // The fail-closed side is the default: a deps object built without an
-    // explicit mode must never open the gate.
-    mode: deps.orchestratorMode ?? 'platform',
-    trustResolution: trust.trustResolution,
-    isForkPR: event.isForkPR ?? false,
-    hasWorkflowModifications: security.hasWorkflowModifications,
   });
 
   return matchDispatchAndRecordOutcome({

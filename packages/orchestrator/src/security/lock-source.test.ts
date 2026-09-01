@@ -1,22 +1,21 @@
 /**
- * regression: an untrusted contributor on a pull-request event must
- * never have their HEAD lock file evaluated by the orchestrator. Only
- * `tier === 'trusted'` (verified independently of the lock file via
- * `TrustResolver.resolveTrustTier`) qualifies for HEAD-branch lock
- * fetch; every other tier falls back to the base branch's lock so the
- * project's trusted maintainers control trigger evaluation, environment
- * claims, and contributor-controlled fields downstream secret
- * resolution depends on.
+ * regression: an untrusted ref on a pull-request event must never have
+ * its HEAD lock file evaluated by the orchestrator. Only
+ * `tier === 'trusted'` (a ref that lives in the base repo, resolved
+ * independently of the lock file by `resolveRefTrust`) qualifies for
+ * HEAD-branch lock fetch; every other tier falls back to the base
+ * branch's lock so the project's trusted maintainers control trigger
+ * evaluation, environment claims, and contributor-controlled fields
+ * downstream secret resolution depends on.
  *
  * Trust model (must hold):
  *   For a pull-request event from attacker model A7 (untrusted workflow
- *   contributor — fork PR sender, drive-by contributor without identity
- *   link, or org member without ci_trust write+ permission), the
- *   orchestrator's trigger evaluation runs against the base branch's
- *   lock file — NOT the contributor's HEAD branch lock. This bounds
- *   what an A7 attacker can claim about workflow triggers, jobs,
- *   `environment`, `env`, and `concurrencyGroup` fields, all of which
- *   feed downstream secret-resolution and protection-rule gates.
+ *   contributor — a fork PR sender), the orchestrator's trigger
+ *   evaluation runs against the base branch's lock file — NOT the
+ *   contributor's HEAD branch lock. This bounds what an A7 attacker can
+ *   claim about workflow triggers, jobs, `environment`, `env`, and
+ *   `concurrencyGroup` fields, all of which feed downstream
+ *   secret-resolution and protection-rule gates.
  *
  *   Removing this gate would let an A7 fork-PR sender publish a HEAD
  *   lock claiming `environment: 'prod'` and have the orchestrator
@@ -37,31 +36,28 @@ describe('lock-file source selection — A7 untrusted contributor cannot inject 
   });
 
   it('returns "base" for a PR event when trust resolution has not yet run', () => {
-    // Initial state inside `resolveTrustForPR` before async trust
-    // resolution completes. Defaulting to "base" ensures every code
-    // path that exits early (no trustResolver, no senderUsername, no
-    // contributorResolver) is gated against an A7 attacker.
+    // An absent tier is the fail-closed input: any caller that reaches
+    // lock-file selection without a resolved tier is gated against an
+    // A7 attacker.
     expect(selectLockFileSource(true, undefined)).toBe('base');
   });
 
   it('returns "base" for a PR event from an unknown contributor (fork PR / drive-by)', () => {
-    // Fork PRs always resolve to `unknown` per
-    // `TrustResolver.resolveTrustTier`. Their HEAD lock is
-    // attacker-controlled and must NOT be evaluated.
+    // Fork PRs always resolve to `unknown` per `resolveRefTrust`. Their
+    // HEAD lock is attacker-controlled and must NOT be evaluated.
     expect(selectLockFileSource(true, 'unknown')).toBe('base');
   });
 
-  it('returns "base" for a PR event from a "known" contributor', () => {
-    // `known` = identity-linked OR provider-write-access without
-    // ci_trust write+. Closer to legitimate but still not enough to
-    // override the base-branch maintainer's authority.
+  it('returns "base" for a PR event carrying the legacy "known" tier', () => {
+    // `known` is legacy vocabulary that nothing produces any more. A row
+    // stored before the ref-based model must still read as untrusted.
     expect(selectLockFileSource(true, 'known')).toBe('base');
   });
 
-  it('returns "head" only for a PR event from a fully-trusted contributor', () => {
-    // `trusted` requires identity link + provider write+ + ci_trust
-    // write+ — three independent signals, none of which an A7 attacker
-    // controls. Only this tier earns HEAD-branch lock fetch.
+  it('returns "head" only for a PR event on a trusted ref', () => {
+    // `trusted` means the head ref lives in the base repo, which an A7
+    // fork-PR sender cannot arrange. Only this tier earns HEAD-branch
+    // lock fetch.
     expect(selectLockFileSource(true, 'trusted')).toBe('head');
   });
 

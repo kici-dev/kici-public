@@ -360,6 +360,61 @@ describe('admin cluster-settings route', () => {
       expect(res.status).toBe(200);
     });
 
+    it('rejects a backoff ceiling below its base, in one patch and against the stored row', async () => {
+      // `min(base * 2^(n-1), ceiling)` with a ceiling under the base collapses
+      // to a constant from the very first failure, so the growth the two knobs
+      // exist to express never happens and nothing at runtime reports it.
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const both = await app.request(
+        '/cluster-settings',
+        patchJson({
+          scalerProvisionBackoffBaseMs: 60_000,
+          scalerProvisionBackoffMaxMs: 30_000,
+        }),
+      );
+      expect(both.status).toBe(400);
+      expect(JSON.stringify(await both.json())).toContain('scalerProvisionBackoffMaxMs');
+
+      // Control: the ordered pair lands, so the rejection above is the ordering
+      // and not the knobs being unwritable.
+      expect(
+        (
+          await app.request(
+            '/cluster-settings',
+            patchJson({
+              scalerProvisionBackoffBaseMs: 30_000,
+              scalerProvisionBackoffMaxMs: 900_000,
+            }),
+          )
+        ).status,
+      ).toBe(200);
+
+      // Lowering ONLY the ceiling is checked against the stored base.
+      const inverted = await app.request(
+        '/cluster-settings',
+        patchJson({ scalerProvisionBackoffMaxMs: 1000 }),
+      );
+      expect(inverted.status).toBe(400);
+      const get = (await (await app.request('/cluster-settings')).json()) as {
+        settings: Record<string, unknown>;
+      };
+      expect(get.settings.scalerProvisionBackoffMaxMs).toBe(900_000);
+    });
+
+    it('accepts a backoff ceiling equal to its base, which is a constant delay on purpose', async () => {
+      const { db } = makeClusterSettingsDbStub();
+      const app = buildApp(db);
+      const res = await app.request(
+        '/cluster-settings',
+        patchJson({
+          scalerProvisionBackoffBaseMs: 60_000,
+          scalerProvisionBackoffMaxMs: 60_000,
+        }),
+      );
+      expect(res.status).toBe(200);
+    });
+
     it('rejects a candidate budget at or above the round budget', async () => {
       // The adjacent axis: one candidate that can consume the whole round
       // leaves every sibling in it padded indeterminate, with no retry.

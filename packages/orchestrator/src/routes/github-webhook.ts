@@ -201,7 +201,8 @@ export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
         return c.json({ accepted: true, deliveryId }, 202);
       } catch (err) {
         // Reachable only for a failure BEFORE the delivery is queued. A pipeline
-        // failure surfaces as a `failed` event-log row plus an
+        // failure surfaces as a `failed` event-log row (written by
+        // `processWebhook`, under the delivery's resolved org) plus an
         // `orch:ingest-accept` error line, not as a 500 here.
         logger.error('Direct GitHub webhook processing error', {
           orgId,

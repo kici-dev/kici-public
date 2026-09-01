@@ -69,8 +69,25 @@ const scalerCapacitySummarySchema = z.object({
    * empty the backend has no gate. Cross-peer routing applies the same
    * rule as the local label matcher: a scaler-capacity entry only
    * matches when every mandatory label appears in the required label set.
+   *
+   * @deprecated Use {@link labelSetMandatoryLabels}, which carries one gate
+   * per label set. This field is the union across every label set, so a
+   * scaler mixing `[linux, gpu]` with `[macos, xcode]` advertises a gate that
+   * makes its linux set unroutable. It stays populated for peers that predate
+   * the per-label-set field and is removed in v1.0.0.
    */
   mandatoryLabels: z.array(z.string()).optional().default([]),
+  /**
+   * Per-label-set taint gate, index-aligned with `labelSets`: entry `i` is the
+   * gate a job must satisfy to route to `labelSets[i]`.
+   *
+   * Deliberately `.optional()` with no default. `undefined` is the only value
+   * that can mean "this peer predates the field — fall back to the scaler-wide
+   * `mandatoryLabels`"; an empty array would read as "every label set is
+   * ungated". A consumer also falls back when the length does not equal
+   * `labelSets.length`, so a malformed advertisement is never indexed into.
+   */
+  labelSetMandatoryLabels: z.array(z.array(z.string())).optional(),
 });
 
 // --- ECDH handshake ---

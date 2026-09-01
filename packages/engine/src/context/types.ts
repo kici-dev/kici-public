@@ -89,7 +89,16 @@ export interface ContextSourceOverride {
   updatedAt: string;
 }
 
-/** Trust tier for contributor-based CI execution gating (single source of truth). */
+/**
+ * Trust tier for CI execution gating (single source of truth).
+ *
+ * `'known'` is legacy vocabulary: the orchestrator's ref-based trust resolution
+ * produces only `'trusted'` (a ref in the base repo) and `'unknown'` (a ref
+ * from a fork). It still reaches runtime from a stored
+ * `execution_runs.trust_tier` row an internal event inherits, and a context can
+ * still declare it as its `minimumTrust` floor. It is slated for removal at
+ * v1.0.0, after which trust is a two-value vocabulary.
+ */
 export const TrustTierSchema = z.enum(['trusted', 'known', 'unknown']);
 export type TrustTier = z.infer<typeof TrustTierSchema>;
 

@@ -161,6 +161,18 @@ export function detectGitRoot(): string {
  * For yarn the prefix also carries the flavor (`yarn-classic` / `yarn-berry`),
  * so a classic-layout dep-cache tarball is never restored into a berry install.
  *
+ * The detected manager only orders the search; it never restricts it. Detection
+ * falls back to the AMBIENT `npm_config_user_agent` when a directory carries no
+ * signal of its own, so a repo whose root holds neither a `package.json` nor a
+ * lockfile is reported as whatever manager happened to invoke the compiler. A
+ * repo compiled under pnpm that keeps an npm `.kici/package-lock.json` was
+ * therefore searched for `pnpm-lock.yaml` only, found none, and got no hash at
+ * all — which silently disables the orchestrator's dependency cache for it, so
+ * every agent installs from the registry and an agent with no registry route
+ * cannot run the job at all. Searching every manager's candidates after the
+ * detected one's keeps the detected manager authoritative where it has real
+ * evidence, and still finds the lockfile that is actually on disk.
+ *
  * @param gitRoot - Absolute path to git repository root
  * @returns Hex SHA-256 hash string, or null if no lockfile is found
  */
@@ -173,32 +185,43 @@ export function computeLockfileHash(gitRoot: string): string | null {
       ? detectPackageManagerSync(path.join(gitRoot, '.kici'))
       : detectPackageManagerSync(gitRoot);
 
-  const candidates: string[] =
-    pm === PackageManager.Pnpm
+  // Every manager's candidates, detected-manager-first. The order is what makes
+  // the detected manager win when more than one lockfile exists.
+  const byManager = (m: PackageManager): string[] =>
+    m === PackageManager.Pnpm
       ? [path.join(gitRoot, 'pnpm-lock.yaml'), path.join(gitRoot, '.kici', 'pnpm-lock.yaml')]
-      : pm === PackageManager.Yarn
+      : m === PackageManager.Yarn
         ? [path.join(gitRoot, 'yarn.lock'), path.join(gitRoot, '.kici', 'yarn.lock')]
         : [path.join(gitRoot, '.kici', 'package-lock.json')];
 
-  // For yarn, fold the flavor (classic vs berry) into the prefix so a
-  // classic-layout tarball is never restored into a berry install (and vice
-  // versa), even on the practically-impossible identical-bytes case. Probe the
-  // dir that carried the yarn signal — same root-then-`.kici` precedence as pm.
-  const prefix =
-    pm === PackageManager.Yarn
-      ? `${pm}-${detectYarnFlavorSync(
-          detectPackageManagerSync(gitRoot) === PackageManager.Yarn
-            ? gitRoot
-            : path.join(gitRoot, '.kici'),
-        )}`
-      : pm;
+  const order: PackageManager[] = [
+    pm,
+    ...[PackageManager.Npm, PackageManager.Pnpm, PackageManager.Yarn].filter((m) => m !== pm),
+  ];
 
-  for (const lockfilePath of candidates) {
-    try {
-      const content = readFileSync(lockfilePath, 'utf-8');
+  for (const manager of order) {
+    for (const lockfilePath of byManager(manager)) {
+      let content: string;
+      try {
+        content = readFileSync(lockfilePath, 'utf-8');
+      } catch {
+        continue; // try next candidate
+      }
+      // The prefix names the manager whose lockfile actually matched, not the
+      // detected one — the hash keys a dep tarball whose on-disk layout is the
+      // matched manager's, so naming the other would let a pnpm-layout tarball
+      // be restored into an npm install.
+      //
+      // For yarn, fold the flavor (classic vs berry) into the prefix too, so a
+      // classic-layout tarball is never restored into a berry install (and vice
+      // versa), even on the practically-impossible identical-bytes case. Probe
+      // the directory the matched lockfile lives in, so the flavor describes the
+      // install that lockfile drives.
+      const prefix =
+        manager === PackageManager.Yarn
+          ? `${manager}-${detectYarnFlavorSync(path.dirname(lockfilePath))}`
+          : manager;
       return sha256(`${prefix}\n${content}`);
-    } catch {
-      // try next candidate
     }
   }
   return null;
@@ -1046,7 +1069,9 @@ function transformJob(
         'Set exactly one of runsOn (single agent) or runsOnAll (fan-out to every matching agent).',
     });
   }
-  if (job.runsOn === undefined && job.runsOnAll === undefined) {
+  // An invoke gate never dispatches to an agent, so it names no target; every
+  // other job must.
+  if (job.invoke === undefined && job.runsOn === undefined && job.runsOnAll === undefined) {
     throw compilerError('E109', `job '${job.name}': one of runsOn or runsOnAll is required`, {
       location: jobLocation,
       suggestion: 'Add runsOn: "kici:os:linux" (or another agent label) to the job.',
@@ -1140,8 +1165,17 @@ function transformJob(
     ...(job.includeUninitialized !== undefined && {
       includeUninitialized: job.includeUninitialized,
     }),
+    ...(job.gitCredentials !== undefined && { gitCredentials: job.gitCredentials }),
     ...(job.maxParallel !== undefined && { maxParallel: job.maxParallel }),
     ...(job.failFast !== undefined && { failFast: job.failFast }),
+    ...(job.invoke !== undefined && {
+      invoke: {
+        event: job.invoke.event,
+        scope: job.invoke.scope,
+        ...(job.invoke.payload !== undefined && { payload: job.invoke.payload }),
+        ...(job.invoke.optional === true && { optional: true }),
+      },
+    }),
     ...resolveNeedsForLock(job.needs, uuidToName),
     steps: transformSteps(job.steps, gitRoot, jobLocation),
     matrix: job.matrix ? transformMatrix(job.matrix, job.name, configPath) : undefined,

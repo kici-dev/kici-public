@@ -28,6 +28,21 @@ const patch = job('patch', {
 });
 ```
 
+### Which hosts are targets
+
+`runsOnAll` targets the hosts you declare as members of your fleet. A host becomes
+a target when it registers with the orchestrator under a stable agent identity, or
+when an operator declares it with `kici-admin host declare`.
+
+Agents that an auto-scaler starts are **not** targets, even when their labels match
+the predicate. An auto-scaler starts an agent at the fixed shape of its pool, so a
+pinned child would run at that shape and not at its own. Auto-scaler agents stay
+available to `runsOn` and to the queue, and `ctx.kici.inventory` continues to list
+them.
+
+The fleet preview and the host detail page in the web UI apply the same rule, so
+they show the hosts a run targets.
+
 ### Input forms
 
 `runsOnAll` accepts three shapes:

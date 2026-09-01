@@ -10,8 +10,13 @@ import type { SimulatedEvent } from '../trigger/types.js';
 import type { ProviderType } from './types.js';
 
 /**
- * Discriminated union describing which `ContributorCache` entries a webhook
- * event invalidates. Returned by `WebhookNormalizer.getAccessCacheInvalidations`.
+ * Discriminated union describing which cached provider-permission entries a
+ * webhook event invalidates. Returned by
+ * `WebhookNormalizer.getAccessCacheInvalidations`.
+ *
+ * @deprecated Trust is derived from the git ref, so the orchestrator holds no
+ * contributor-permission cache and nothing consumes these entries. Removed at
+ * v1.0.0.
  *
  * Three scopes:
  * - `repo-user`: a single `{repo, user}` permission changed (e.g. GitHub
@@ -147,17 +152,12 @@ export interface WebhookNormalizer {
   extractDefaultBranch?(payload: unknown): string | null;
 
   /**
-   * Map a webhook event to the `ContributorCache` entries it should drop.
+   * Map a webhook event to the cached provider-permission entries it implies a
+   * shift in. Events that do not imply a permission shift (most events,
+   * including `push` / `pull_request` / etc.) return `[]`.
    *
-   * Optional. When implemented, the orchestrator calls this before
-   * `normalizeEvent` and invalidates every returned entry so the next
-   * permission check hits the provider API instead of relying on stale
-   * cached data. Events that do not imply a permission shift (most events,
-   * including `push` / `pull_request` / etc.) should return `[]`.
-   *
-   * The caller is responsible for pairing the returned entries with the
-   * `provider` field of the matched bundle — this method receives no
-   * provider argument.
+   * @deprecated Trust is derived from the git ref, so the orchestrator holds no
+   * contributor-permission cache and never calls this. Removed at v1.0.0.
    *
    * @param eventType Provider-specific event type (from extractEventType).
    * @param action Event action/sub-type, if applicable.

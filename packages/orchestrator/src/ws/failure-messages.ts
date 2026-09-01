@@ -25,4 +25,6 @@ export const AgentWsInternalFailure = Object.freeze({
   eventEmitFailed: 'the orchestrator hit an internal error while emitting this event',
   /** An agent private-API handler threw for a reason other than its two deliberate rejections. */
   agentApiFailed: 'the orchestrator hit an internal error while handling this API request',
+  /** The event-scaler claim store threw while minting ephemeral credentials. */
+  scalerClaimFailed: 'the orchestrator hit an internal error while claiming scaler credentials',
 } as const);

@@ -64,19 +64,34 @@ Useful flags:
 
 ## Automatic recovery
 
-Two mechanisms recover a full data disk without operator intervention:
+**Startup disk-space guard.** Before opening its log and database handles, the
+orchestrator checks free space on the chroot volume. If it is below the
+threshold, it reaps Firecracker orphans inline and continues startup only if
+enough space was freed. If the reap cannot free enough, the orchestrator logs a
+single actionable line naming `kici-admin scaler reap-orphans` instead of
+crash-looping opaquely on a buffered write.
 
-- **Startup disk-space guard.** Before opening its log and database handles, the
-  orchestrator checks free space on the chroot volume. If it is below the
-  threshold, it reaps Firecracker orphans inline and continues startup only if
-  enough space was freed. If the reap cannot free enough, the orchestrator logs a
-  single actionable line naming `kici-admin scaler reap-orphans` instead of
-  crash-looping opaquely on a buffered write.
-- **Host safety timer (remote peers).** Remote Firecracker peers run a host-level
-  timer that invokes `kici-admin scaler reap-orphans` on a cadence. Because the
-  command no-ops while the orchestrator is healthy and reaps only when the node is
-  wedged, the timer is a safe periodic backstop that self-heals a full disk even
-  if the startup guard alone cannot free enough.
+This guard is the only recovery the orchestrator performs on its own, and it
+only runs at startup. A node that fills its disk between restarts stays full
+until something reaps it.
+
+## Recommended: a host timer as a backstop
+
+`kici-admin scaler reap-orphans` is built to be safe on a schedule, but nothing
+schedules it for you — set up a host timer yourself on each Firecracker node,
+especially a rootless edge peer you do not watch closely. Every 30 minutes is a
+reasonable cadence.
+
+Two properties make a periodic run safe:
+
+- It probes the local orchestrator health endpoint first, so on a healthy node it
+  prints a notice and exits 0 without touching anything.
+- The Firecracker reap is liveness-driven, so even when it does run it only
+  removes chroots and TAP devices of dead VMs.
+
+Use `--json` so the timer's journal records what each run freed. Do **not** add
+`--force` to a scheduled run: it skips the health gate, and the container sweep
+behind that gate removes every agent container unconditionally.
 
 ## See also
 

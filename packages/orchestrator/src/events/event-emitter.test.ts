@@ -243,4 +243,74 @@ describe('EventEmitter', () => {
       expect(emitCall.sourceJobId).toBe('job-200');
     });
   });
+
+  describe('emitScalerScaleUp', () => {
+    it('emits kici.scaler.scale-up at chainDepth 0 targeting the provisioning targets', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      const eventId = await emitter.emitScalerScaleUp(
+        {
+          scalerName: 'hetzner',
+          agentId: 'a1',
+          labels: ['cloud=hetzner'],
+          mandatoryLabels: [],
+          resources: {},
+          orchestratorUrl: 'wss://h/ws',
+          claimCode: 'claim-abc',
+          jobId: 'job-9',
+          requestId: 'r1',
+        },
+        ['org/infra'],
+      );
+
+      expect(eventId).toBe('evt-sys-001');
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.eventName).toBe('kici.scaler.scale-up');
+      expect(emitCall.chainDepth).toBe(0);
+      expect(emitCall.target).toEqual({ repos: ['org/infra'] });
+      expect(emitCall.payload.agentId).toBe('a1');
+      expect(emitCall.payload.claimCode).toBe('claim-abc');
+    });
+
+    it('rejects a malformed scale-up payload before routing', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+      await expect(
+        // Missing required fields (claimCode, orchestratorUrl, ...).
+        emitter.emitScalerScaleUp({ scalerName: 'hetzner' } as never, ['org/infra']),
+      ).rejects.toThrow();
+      expect(router.emit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('emitScalerScaleDown', () => {
+    it('emits kici.scaler.scale-down at chainDepth 0 with the reason', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+
+      await emitter.emitScalerScaleDown(
+        { scalerName: 'hetzner', agentId: 'a1', reason: 'job-complete', requestId: 'r1' },
+        ['org/infra'],
+      );
+
+      const emitCall = (router.emit as any).mock.calls[0][0];
+      expect(emitCall.eventName).toBe('kici.scaler.scale-down');
+      expect(emitCall.chainDepth).toBe(0);
+      expect(emitCall.target).toEqual({ repos: ['org/infra'] });
+      expect(emitCall.payload.reason).toBe('job-complete');
+    });
+
+    it('rejects an unknown scale-down reason before routing', async () => {
+      const router = createMockRouter();
+      const emitter = new EventEmitter(router);
+      await expect(
+        emitter.emitScalerScaleDown(
+          { scalerName: 'hetzner', agentId: 'a1', reason: 'exploded' as never, requestId: 'r1' },
+          ['org/infra'],
+        ),
+      ).rejects.toThrow();
+      expect(router.emit).not.toHaveBeenCalled();
+    });
+  });
 });

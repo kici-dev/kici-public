@@ -76,6 +76,14 @@ out of band. In a multi-orchestrator cluster a PostgreSQL advisory lock ensures
 exactly one instance migrates while the others wait, so a rolling restart never
 races the schema.
 
+**With `KICI_AUTO_MIGRATE=false`, migrate before you start the new binary.**
+The orchestrator does not check the schema at startup. An un-migrated database
+produces no boot error, only per-request write failures for whatever the new
+release added. This release is a concrete case: every security-hold insert names
+a column that migration 126 adds. On an un-migrated database the orchestrator
+cannot record a hold, and the affected webhook delivery fails. Run
+`kici-admin db migrate` first.
+
 Migrations are forward-only — there is no down-migration. Inspect applied
 migrations with `kici-admin db migrate --status` and detect schema drift with
 `kici-admin db check-schema`.

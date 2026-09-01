@@ -29,9 +29,9 @@ export interface ClusterIdentityDeps {
    */
   storagePrefix?: string;
   /**
-   * E2E escape hatch — when true, validateS3Sentinel logs a warning and
-   * returns early. Mirrors the orchestrator's
-   * `config.skipS3SentinelValidation` (KICI_SKIP_S3_SENTINEL_VALIDATION).
+   * Test-only escape hatch — when true, validateS3Sentinel logs a warning and
+   * returns early. Supplied only by the build-time test double's injected
+   * fault-injection policy; the shipped orchestrator always validates.
    */
   skipSentinelValidation?: boolean;
 }

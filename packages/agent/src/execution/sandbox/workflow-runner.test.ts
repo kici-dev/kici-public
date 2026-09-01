@@ -1495,7 +1495,66 @@ describe('buildStepNeedsContext', () => {
     expect(arr.map((e) => e.status)).toEqual(['success', 'skipped']);
     expect(arr.map((e) => e.result.ok)).toEqual([1, 2]);
   });
+
+  it('resolves an invoke-gate upstream to { result: InvokeResult[] }, not a group', () => {
+    // The gate's proxy children ARE named `${gate} (...)` and appear in the
+    // per-child statuses map, which without the invoke branch would coerce the
+    // need into a fan-out group. `upstreamInvokeResults` must take precedence.
+    const needs = buildStepNeedsContext(
+      [{ name: 'repo-tests', runOn: ['success'] }],
+      undefined,
+      { 'repo-tests (myorg/backend:unit)': 'success', 'repo-tests (myorg/backend:lint)': 'failed' },
+      {
+        'repo-tests': [
+          {
+            repo: 'myorg/backend',
+            workflow: 'unit',
+            runId: 'r1',
+            status: 'success',
+            outputs: { coverage: '92' },
+          },
+          {
+            repo: 'myorg/backend',
+            workflow: 'lint',
+            runId: 'r2',
+            status: 'failed',
+            outputs: {},
+          },
+        ],
+      },
+    );
+    // Gate need → InvokeNeedEntry: `.result` is a plain InvokeResult[] (no
+    // per-child `name`/`status` group shape, no output proxy).
+    const entry = needs!['repo-tests'] as { result: InvokeResultShape[] };
+    expect(Array.isArray(entry.result)).toBe(true);
+    expect(entry.result.map((r) => r.runId)).toEqual(['r1', 'r2']);
+    expect(entry.result.map((r) => r.repo)).toEqual(['myorg/backend', 'myorg/backend']);
+    expect(entry.result.map((r) => r.workflow)).toEqual(['unit', 'lint']);
+    expect(entry.result.map((r) => r.status)).toEqual(['success', 'failed']);
+    expect(entry.result[0].outputs.coverage).toBe('92');
+    expect(Array.isArray(needs!['repo-tests'])).toBe(false); // not a group array
+  });
+
+  it('still resolves a real matrix group when no invoke results name that base', () => {
+    const needs = buildStepNeedsContext(
+      [{ name: 'test', runOn: ['success'] }],
+      { test: { byMatrix: { a: { ok: 1 } }, merged: { ok: 1 } } },
+      { 'test (a)': 'success' },
+      { 'repo-tests': [] }, // a DIFFERENT gate — must not affect `test`
+    );
+    const arr = needs!.test as Array<{ name: string; status: string }>;
+    expect(Array.isArray(arr)).toBe(true);
+    expect(arr.map((e) => e.name)).toEqual(['test (a)']);
+  });
 });
+
+interface InvokeResultShape {
+  repo: string;
+  workflow: string;
+  runId: string;
+  status: string;
+  outputs: Record<string, unknown>;
+}
 
 describe('deriveFanout', () => {
   const req = (over: Partial<JobExecutionRequest>): JobExecutionRequest =>
@@ -1701,13 +1760,18 @@ describe('prepare-phase ordering: global repo pair precedes generator + rules', 
   );
 
   const setupAt = source.indexOf('const globalRepoInfo = setupGlobalWorkflowEnv(');
-  const extractAt = source.indexOf('await extractAndNormalizeSteps(');
+  // Step extraction is delegated to extractStepsForRun (which owns the
+  // apiTransport closure + the cleanup-only short-circuit); it forwards the repo
+  // pair to extractAndNormalizeSteps. Anchor on main()'s call site.
+  const extractAt = source.indexOf('await extractStepsForRun(');
   const rulesAt = source.indexOf('await maybeSkipJobOnRules(');
+  const helperForwardAt = source.indexOf('return extractAndNormalizeSteps(');
 
-  it('finds all three call sites (positive control — guards against a vacuous pass)', () => {
+  it('finds all call sites (positive control — guards against a vacuous pass)', () => {
     expect(setupAt).toBeGreaterThan(-1);
     expect(extractAt).toBeGreaterThan(-1);
     expect(rulesAt).toBeGreaterThan(-1);
+    expect(helperForwardAt).toBeGreaterThan(-1);
   });
 
   it('sets up the global-workflow env before the dynamic-job extraction', () => {
@@ -1719,8 +1783,11 @@ describe('prepare-phase ordering: global repo pair precedes generator + rules', 
   });
 
   it('forwards the repo pair to both consumers', () => {
+    // main() hands globalRepoInfo to the extraction helper and to the rules.
     expect(source.slice(extractAt, extractAt + 200)).toContain('globalRepoInfo');
     expect(source.slice(rulesAt, rulesAt + 200)).toContain('globalRepoInfo');
+    // …and the helper forwards it into the generator re-evaluation.
+    expect(source.slice(helperForwardAt, helperForwardAt + 200)).toContain('globalRepoInfo');
   });
 });
 

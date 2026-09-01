@@ -21,11 +21,11 @@ npx kici init
 
 This will:
 
-1. Create `.kici/` directory with `workflows/`, `tests/`, `types/`, `package.json`, and `tsconfig.json`
+1. Create `.kici/` directory with `workflows/`, `tests/`, `types/`, `package.json`, and `tsconfig.json`. The `types/` folder holds a local development aid — TypeScript declarations that `kici types` (and an authenticated `kici compile`) generate from your orchestrator's secret contexts. Its content is a snapshot of one org's secret keys, so it is not committed.
 2. Create a `.kiciignore` file with sensible defaults
 3. Let you choose from starter workflow templates (hello-world, pr-checks)
 4. Install dependencies using the package manager detected for your repo (npm, pnpm, or yarn)
-5. Update `.gitignore` to exclude `.kici/node_modules/`
+5. Update `.gitignore` to exclude `.kici/node_modules/`, and write `.kici/.gitignore` to keep the generated `types/` declarations untracked (`kici.lock.json` stays tracked — the orchestrator fetches it from your repo)
 6. Optionally install a pre-commit hook to auto-compile workflows
 
 The package manager is detected from your repo's `packageManager` field, lockfile, or the manager that invoked `kici`, defaulting to npm. Pass `--package-manager <npm|pnpm|yarn>` to override it.
@@ -346,7 +346,7 @@ For coding agents that want the entire documentation set up front, KiCI follows 
 
 - `https://kici.dev/llms.txt` — curated link index grouped by SDK / patterns / CLI / architecture.
 - `https://kici.dev/llms-full.txt` — concatenated markdown of every page indexed above.
-- `kici docs llm` — print the same `llms-full.txt` bundle to stdout, offline, straight from the installed `@kici-dev/compiler` package. Add `--index` to print the curated `llms.txt` index instead. The agent can pipe the output into its own context buffer with no network call.
+- `kici docs llm` — print the same curated `llms.txt` index to stdout, offline, straight from the installed `@kici-dev/compiler` package. `kici docs llm <topic>` prints one task bundle (`getting-started`, `patterns`, `sdk`, `sdk-runtime`, `cli`, `features`, `features-execution`, `providers`, `architecture`), and `kici docs llm full` prints the whole `llms-full.txt`. Add `--out <path>` to write to a file. The agent can pipe the output into its own context buffer with no network call.
 - `kici docs` — open the docs site in your browser.
 
 The offline bundle is regenerated from `docs/` every time the package is built, so it always matches the version of KiCI you've installed.

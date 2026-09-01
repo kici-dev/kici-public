@@ -149,6 +149,13 @@ To resolve dynamic fields, the orchestrator uses a two-phase init model:
 - All dynamic fields resolved before dispatch
 - Mixed static/dynamic fields are supported (e.g., static `context` + dynamic `env`)
 - Hold/wait/queue behavior is identical to static contexts (orchestrator handles after resolution)
+- An approval gate the **lock file** decides — a job's own `requireApproval`, or a
+  workflow-level one on a root job — is minted **before** the init job is
+  dispatched, since it needs nothing the agent computes. The job still gets its
+  init round: nothing else can resolve a dynamic value, so suppressing the round
+  would leave the job undispatchable rather than merely gated. The hold and the
+  job's stored dispatch context are then created **together**, after resolution,
+  so the job that resumes on approval carries the resolved values
 - All dynamic fields resolved in a single init call (no separate callbacks per field)
 - Init runner runs in its own agent process -- user code never executes in the orchestrator
 - Dynamic function evaluation has a 60-second timeout (configurable per-job)
@@ -187,6 +194,24 @@ evaluateProtectionRules(env, ctx, runningCount, concurrencyGroup, trustTier?)
   v
   ProtectionGateResult { action, reason, holdType?, holdUntil? }
 ```
+
+The `runningCount` argument is not a plain database count. The caller sums two
+terms and passes the total. The first term counts the jobs whose status is
+already `running`, scoped to the dispatching organization and the concurrency
+group. The second term counts the jobs the same dispatch pass has already
+admitted.
+
+The second term closes a blind spot. The database count cannot see a job the
+same pass has only just admitted, because such a job is not `running` yet. The
+tally is scoped to the same organization and concurrency group. It makes a
+matrix fan-out consume one slot per child instead of one slot in total.
+
+A job that does not reach an agent in this pass takes no such slot. A job gated
+by its `needs` is admitted here against the database count alone, and the needs
+scheduler dispatches it later without evaluating the gate again. The tally lives
+only for the duration of one dispatch pass, and it is never persisted. Two
+concurrent passes still race. That is accepted, because a concurrency limit is a
+throughput control and not an isolation boundary.
 
 ### Gate result types
 

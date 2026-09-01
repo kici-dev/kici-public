@@ -3,6 +3,7 @@ import {
   WS_MAX_PAYLOAD_BYTES,
   DASHBOARD_REQUEST_TYPE_SET,
   ORCH_CAPABILITIES,
+  PROTOCOL_VERSION,
   type OrchestratorToPlatformMessage,
 } from '@kici-dev/engine';
 import {
@@ -167,7 +168,7 @@ describe('PlatformClient', () => {
       expect(sent[0]).toEqual({
         type: 'auth.request',
         token: 'test-api-key',
-        protocolVersion: 1,
+        protocolVersion: PROTOCOL_VERSION,
         capabilities: {
           orchRole: 'coordinator',
           supportedDashboardRequests: ORCH_CAPABILITIES.supportedDashboardRequests,
@@ -317,27 +318,31 @@ describe('PlatformClient', () => {
       });
     });
 
-    it('omits dashboard request types named in testOmitDashboardRequestTypes when testMode', () => {
-      const client = createClient({
-        testMode: true,
-        testOmitDashboardRequestTypes: 'dashboard.contexts.list',
-      });
+    it('advertises the full manifest when no capabilitiesTransform is injected (shipped default)', () => {
+      // The shipped orchestrator injects no transform, so the identity default
+      // advertises every dashboard request type.
+      const client = createClient();
       const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
-      expect(advertised).not.toContain('dashboard.contexts.list');
-      // A sibling type is still advertised (only the named one is removed).
+      expect(advertised).toContain('dashboard.contexts.list');
       expect(advertised).toContain('dashboard.contexts.get');
     });
 
-    it('advertises all dashboard request types when testMode gates the omit seam off', () => {
-      // The omit seam is double-gated: without testMode the omit list is inert,
-      // so production (which leaves KICI_TEST_MODE unset) always advertises the
-      // full manifest even if the var somehow leaked in.
+    it('applies an injected capabilitiesTransform to the advertised manifest', () => {
+      // Only the build-time test double injects a transform, reproducing an
+      // older / sourceless orchestrator that predates a given capability.
       const client = createClient({
-        testMode: false,
-        testOmitDashboardRequestTypes: 'dashboard.contexts.list',
+        capabilitiesTransform: (c) => ({
+          ...c,
+          supportedDashboardRequests: (c.supportedDashboardRequests ?? []).filter(
+            (t) => t !== 'dashboard.contexts.list',
+          ),
+        }),
       });
       const advertised = client.getCapabilities().supportedDashboardRequests ?? [];
-      expect(advertised).toContain('dashboard.contexts.list');
+      // The injected transform dropped `.list`…
+      expect(advertised).not.toContain('dashboard.contexts.list');
+      // …while a sibling type is untouched.
+      expect(advertised).toContain('dashboard.contexts.get');
     });
   });
 
@@ -2265,5 +2270,98 @@ describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
     expect(
       getSentMessages(mock).find((m) => (m as { type?: string }).type === 'orch.metrics'),
     ).toBeDefined();
+  });
+});
+
+// ── plan.headroom ceiling + cluster.membership ──────────────────────
+describe('plan ceiling and worker membership', () => {
+  function makeFakeHeadroomStore() {
+    let stored: {
+      maxWorkerPeers: number;
+      orgLimit: number;
+      orgTotal: number;
+      evictExcess: boolean;
+      updatedAt: Date;
+    } | null = null;
+    return {
+      read: vi.fn(async () => stored),
+      write: vi.fn(
+        async (h: {
+          maxWorkerPeers: number;
+          orgLimit: number;
+          orgTotal: number;
+          evictExcess: boolean;
+        }) => {
+          stored = { ...h, updatedAt: new Date() };
+        },
+      ),
+    };
+  }
+
+  const flush = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it('returns null from getWorkerCeiling when no ceiling was ever received', async () => {
+    const store = makeFakeHeadroomStore();
+    const client = createClient({ planHeadroomStore: store as never });
+    expect(await client.getWorkerCeiling()).toBeNull();
+  });
+
+  it('persists a pushed ceiling and serves it back', async () => {
+    const store = makeFakeHeadroomStore();
+    const client = createClient({ planHeadroomStore: store as never });
+    const mock = authenticateClient(client);
+    simulateMessage(mock, {
+      type: 'plan.headroom',
+      maxWorkerPeers: 4,
+      orgLimit: 5,
+      orgTotal: 1,
+      evictExcess: false,
+    });
+    await flush();
+    expect(store.write).toHaveBeenCalled();
+    expect(await client.getWorkerCeiling()).toBe(4);
+  });
+
+  it('reconciles eviction on every ceiling push, carrying the evictExcess flag', async () => {
+    const store = makeFakeHeadroomStore();
+    const onPlanCeiling = vi.fn();
+    const client = createClient({ planHeadroomStore: store as never, onPlanCeiling });
+    const mock = authenticateClient(client);
+
+    // Every frame reconciles — a non-evict frame carries evictExcess=false so a
+    // raised ceiling can cancel an in-flight drain, not only start one.
+    simulateMessage(mock, {
+      type: 'plan.headroom',
+      maxWorkerPeers: 2,
+      orgLimit: 5,
+      orgTotal: 3,
+      evictExcess: false,
+    });
+    await flush();
+    expect(onPlanCeiling).toHaveBeenLastCalledWith(2, false);
+
+    simulateMessage(mock, {
+      type: 'plan.headroom',
+      maxWorkerPeers: 0,
+      orgLimit: 2,
+      orgTotal: 4,
+      evictExcess: true,
+    });
+    await flush();
+    expect(onPlanCeiling).toHaveBeenLastCalledWith(0, true);
+  });
+
+  it('reports connected worker peers on cluster.membership', () => {
+    const getWorkerPeers = vi.fn(() => [{ instanceId: 'w-1' }, { instanceId: 'w-2' }]);
+    const client = createClient({ getWorkerPeers });
+    const mock = authenticateClient(client);
+    client.sendClusterMembership();
+    const membership = getSentMessages(mock).find(
+      (m) => (m as { type?: string }).type === 'cluster.membership',
+    ) as { workers: Array<{ instanceId: string }> } | undefined;
+    expect(membership?.workers.map((w) => w.instanceId)).toEqual(['w-1', 'w-2']);
   });
 });

@@ -320,6 +320,14 @@ export function createTestStepContext(options: TestStepContextOptions = {}): Tes
             new Error('ctx.kici.oidc.token() is not available in a test step context'),
           ),
       },
+      git: {
+        github: {
+          getToken: () =>
+            Promise.reject(
+              new Error('ctx.kici.git.github.getToken() is not available in a test step context'),
+            ),
+        },
+      },
       host: {
         requestReboot: () =>
           Promise.reject(
@@ -346,6 +354,14 @@ export function createTestStepContext(options: TestStepContextOptions = {}): Tes
         restageAgent: () =>
           Promise.reject(
             new Error('ctx.kici.bootstrap.restageAgent() is not available in a test step context'),
+          ),
+      },
+      scaler: {
+        claimAgentCredentials: () =>
+          Promise.reject(
+            new Error(
+              'ctx.kici.scaler.claimAgentCredentials() is not available in a test step context',
+            ),
           ),
       },
     },

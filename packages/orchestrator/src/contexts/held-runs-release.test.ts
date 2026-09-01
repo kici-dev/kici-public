@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { Migrator } from 'kysely/migration';
-import { HoldScope, HoldType, TriggerSource } from '@kici-dev/engine';
+import { HoldScope, HoldType, installGateJobId, TriggerSource } from '@kici-dev/engine';
 import { createMigrationProvider } from '../db/migration-provider.js';
 import { HeldRunStore } from './held-runs.js';
 import type { Database } from '../db/types.js';
@@ -37,7 +37,7 @@ describeDb('HeldRunStore release helpers', () => {
   }): Promise<string> => {
     const row = await store.createHold('org-1', {
       runId: overrides.runId,
-      jobId: `__install__${overrides.runId}`,
+      jobId: installGateJobId(String(overrides.runId)),
       scope: HoldScope.enum.workflow,
       triggerSource: TriggerSource.enum.context,
       contextId: overrides.envId,

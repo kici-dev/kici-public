@@ -80,6 +80,31 @@ function getRestartMode(config: ServiceConfig): string {
 }
 
 /**
+ * Seconds a runtime must wait after SIGTERM before it SIGKILLs the container.
+ *
+ * Compose defaults this to 10s, which is shorter than either component's own
+ * graceful-shutdown budget, so a teardown that takes longer than 10s is killed
+ * partway through: the orchestrator never broadcasts `peer.leaving` and never
+ * closes its agent sockets, and the agent never finishes draining. That window
+ * is reached exactly when it matters most — the orchestrator's scaler stops
+ * each managed agent container with its own grace, so an orchestrator with
+ * agents in flight routinely needs more than 10s.
+ *
+ * Each value is its component's force-exit budget plus headroom, so the
+ * process always reaches its own timer first and the runtime's kill stays the
+ * last resort it is meant to be:
+ * - orchestrator: 30s (`setupGracefulShutdown` default) -> 45s
+ * - agent: 10s plus a ~1s abort delay in its `onForceExit` -> 20s
+ *
+ * An unrecognised component gets the larger value: over-waiting costs a few
+ * seconds on shutdown, under-waiting corrupts it.
+ */
+function stopGracePeriodSeconds(config: ServiceConfig): number {
+  const component = config.component ?? (config.name === 'kici-agent' ? 'agent' : 'orchestrator');
+  return component === 'agent' ? 20 : 45;
+}
+
+/**
  * Generate compose YAML content for a service.
  *
  * Uses a manual YAML builder to avoid adding a YAML library dependency.
@@ -106,6 +131,7 @@ function generateComposeYaml(config: ServiceConfig): string {
     `    image: ${resolveImageRef(config.name)}`,
     `    container_name: ${config.name}`,
     `    restart: ${restartMode}`,
+    `    stop_grace_period: ${stopGracePeriodSeconds(config)}s`,
     '    env_file:',
     `      - ${config.envFilePath}`,
     '    volumes:',

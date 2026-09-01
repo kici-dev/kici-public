@@ -428,17 +428,17 @@ Synopsis: `kici-admin peer list`
 
 ### `kici-admin peer prune-credentials`
 
-DELETE peer_credentials rows whose instance_id does NOT LIKE <filter> (direct-DB only, destructive). Used by cluster e2e to wipe stale staging peer credentials while leaving e2e-* peers intact. HTTP mode is intentionally unsupported: the call site is a warm-deploy preflight run while the orchestrator is stopped, mirroring peer reset-raft-state.
+DELETE peer_credentials rows whose instance_id does NOT LIKE <filter> (direct-DB only, destructive). Intended as a warm-deploy preflight to wipe stale peer credentials while keeping selected peers. HTTP mode is intentionally unsupported: the call site runs while the orchestrator is stopped, mirroring peer reset-raft-state.
 
 Synopsis: `kici-admin peer prune-credentials [options]`
 
 **Options**
 
-| Option                 | Default | Description                                                                                   |
-| ---------------------- | ------- | --------------------------------------------------------------------------------------------- |
-| `--filter <pattern>`   |         | SQL LIKE pattern for instance_ids to KEEP (e.g. "e2e-%"). Rows that do NOT match are deleted. |
-| `--database-url <url>` |         | Use direct DB access (offline mode, required)                                                 |
-| `--json`               | `false` | Emit JSON { deleted } on stdout                                                               |
+| Option                 | Default | Description                                                                                    |
+| ---------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `--filter <pattern>`   |         | SQL LIKE pattern for instance_ids to KEEP (e.g. "keep-%"). Rows that do NOT match are deleted. |
+| `--database-url <url>` |         | Use direct DB access (offline mode, required)                                                  |
+| `--json`               | `false` | Emit JSON { deleted } on stdout                                                                |
 
 ### `kici-admin peer reset-raft-state`
 

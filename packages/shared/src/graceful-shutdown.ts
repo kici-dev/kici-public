@@ -49,8 +49,12 @@ export interface GracefulShutdownOptions {
  * trigger shutdown programmatically (e.g., from SIGUSR1 drain handlers).
  */
 export interface ShutdownHandle {
-  /** Trigger shutdown with the given reason string. */
-  shutdown(signal: string): Promise<void>;
+  /**
+   * Trigger shutdown with the given reason string. Pass a non-zero `code` for a
+   * deliberate-but-failed stop (e.g. a one-shot agent whose self-bootstrap claim
+   * was rejected) so the process exits non-zero; omit it for a clean stop.
+   */
+  shutdown(signal: string, code?: number): Promise<void>;
 }
 
 /**
@@ -156,7 +160,8 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
     });
   }
 
-  // The public handle is for intentional shutdowns (drain handlers, tests) —
-  // always the clean exit code.
-  return { shutdown: (signal: string) => gracefulShutdown(signal) };
+  // The public handle is for intentional shutdowns (drain handlers, tests).
+  // The clean exit code (0) is the default; a caller may pass a non-zero code
+  // for a deliberate-but-failed stop.
+  return { shutdown: (signal: string, code = 0) => gracefulShutdown(signal, code) };
 }

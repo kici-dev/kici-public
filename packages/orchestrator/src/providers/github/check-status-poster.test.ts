@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { GitHubCheckStatusPoster } from './check-status-poster.js';
+import { CheckRunConclusion } from '@kici-dev/engine';
 import type { WorkflowModification } from '../../security/workflow-diff.js';
 
 function createMockOctokit() {
@@ -116,6 +117,32 @@ describe('GitHubCheckStatusPoster', () => {
       expect(createCall.status).toBe('completed');
     });
 
+    it('maps the hold-ended conclusions, on create and on update alike', async () => {
+      // A hold that ends without dispatching anything concludes `cancelled`
+      // (rejected) or `timed_out` (approval window elapsed) — the same
+      // conclusions the run's `kici/…` checks carry. The update arm is the one
+      // that runs in practice: the hold already put a pending check on the
+      // commit, so `listForRef` finds it.
+      for (const conclusion of [
+        CheckRunConclusion.enum.cancelled,
+        CheckRunConclusion.enum.timed_out,
+      ]) {
+        mockOctokit = createMockOctokit();
+        poster = new GitHubCheckStatusPoster(() => mockOctokit as any);
+        await poster.postCheckStatus('o/r', 'sha1', conclusion, 't', 's', {});
+        const createCall = mockOctokit.checks.create.mock.calls[0][0];
+        expect(createCall.conclusion).toBe(conclusion);
+        expect(createCall.status).toBe('completed');
+        expect(createCall.completed_at).toBeDefined();
+
+        mockOctokit.checks.listForRef.mockResolvedValue({ data: { check_runs: [{ id: 555 }] } });
+        await poster.postCheckStatus('o/r', 'sha1', conclusion, 't', 's', {});
+        expect(mockOctokit.checks.update).toHaveBeenCalledWith(
+          expect.objectContaining({ check_run_id: 555, status: 'completed', conclusion }),
+        );
+      }
+    });
+
     it('throws on API error', async () => {
       mockOctokit.checks.listForRef.mockRejectedValue(new Error('API error'));
 
@@ -214,6 +241,48 @@ describe('GitHubCheckStatusPoster', () => {
       mockOctokit.checks.create.mockRejectedValue(new Error('403 Forbidden'));
 
       await expect(poster.postGlobalEvalFailedCheck('o/r', 'sha', 's', {})).rejects.toThrow(
+        '403 Forbidden',
+      );
+    });
+  });
+
+  describe('postGlobalEvalSucceededCheck', () => {
+    it('creates a success conclusion under the SAME name the failure posts', async () => {
+      // The shared name is what makes a re-run clear the failing check instead
+      // of leaving it red beside a second, green one.
+      await poster.postGlobalEvalSucceededCheck(
+        'owner/repo',
+        'abc123',
+        'Re-evaluated the organization workflows from `acme/org-workflows`: 2 admitted.',
+        {},
+      );
+
+      expect(mockOctokit.checks.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: 'owner',
+          repo: 'repo',
+          name: 'KiCI: Organization workflow evaluation',
+          head_sha: 'abc123',
+          status: 'completed',
+          conclusion: 'success',
+          output: {
+            title: 'Organization workflow evaluation succeeded',
+            summary: expect.stringContaining('acme/org-workflows'),
+          },
+        }),
+      );
+
+      // Same reasoning as the failure poster: the security hold owns the single
+      // "KiCI Security" run per commit, so this must neither look it up nor
+      // update it.
+      expect(mockOctokit.checks.listForRef).not.toHaveBeenCalled();
+      expect(mockOctokit.checks.update).not.toHaveBeenCalled();
+    });
+
+    it('throws on API error', async () => {
+      mockOctokit.checks.create.mockRejectedValue(new Error('403 Forbidden'));
+
+      await expect(poster.postGlobalEvalSucceededCheck('o/r', 'sha', 's', {})).rejects.toThrow(
         '403 Forbidden',
       );
     });

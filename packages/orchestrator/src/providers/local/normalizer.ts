@@ -150,8 +150,9 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Map membership-related local-source webhook events to ContributorCache
-   * invalidations.
+   * Map membership-related local-source webhook events to permission-cache
+   * invalidations. See WebhookNormalizer.getAccessCacheInvalidations, which is
+   * deprecated and has no caller.
    *
    * Local-source payloads are GitHub-shaped by design, so the mapping
    * mirrors the GitHub normalizer exactly:
@@ -160,9 +161,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
    * - `organization`: user-in-org
    * - `membership`: user-in-org
    * - `team` (repo-scoped actions only): repo
-   *
-   * This lets membership-invalidation paths be exercised through
-   * `sendLocalWebhook()` without requiring a real GitHub App.
    */
   getAccessCacheInvalidations(
     eventType: string,

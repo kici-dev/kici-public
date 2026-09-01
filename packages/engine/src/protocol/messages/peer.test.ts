@@ -304,6 +304,50 @@ describe('peerHeartbeatSchema', () => {
     const parsed = peerHeartbeatSchema.parse(msg);
     expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual([]);
   });
+
+  it('accepts scalerCapacity carrying a per-label-set gate index-aligned with labelSets', () => {
+    const msg = {
+      ...valid,
+      scalerCapacity: [
+        {
+          name: 'mixed-pool',
+          type: 'container',
+          labelSets: [
+            ['linux', 'gpu'],
+            ['macos', 'xcode'],
+          ],
+          maxAgents: 5,
+          activeCount: 1,
+          mandatoryLabels: ['gpu', 'macos'],
+          labelSetMandatoryLabels: [['gpu'], ['macos']],
+        },
+      ],
+    };
+    const parsed = peerHeartbeatSchema.parse(msg);
+    expect(parsed.scalerCapacity![0].labelSetMandatoryLabels).toEqual([['gpu'], ['macos']]);
+    // The scaler-wide union stays populated alongside it for peers that
+    // predate the per-label-set field.
+    expect(parsed.scalerCapacity![0].mandatoryLabels).toEqual(['gpu', 'macos']);
+  });
+
+  it('leaves labelSetMandatoryLabels undefined when omitted, never defaulting it to []', () => {
+    const msg = {
+      ...valid,
+      scalerCapacity: [
+        {
+          labelSets: [['linux', 'x64']],
+          maxAgents: 5,
+          activeCount: 1,
+          mandatoryLabels: ['gpu'],
+          // labelSetMandatoryLabels intentionally omitted (legacy peer)
+        },
+      ],
+    };
+    const parsed = peerHeartbeatSchema.parse(msg);
+    // `[]` would read as "every label set is ungated"; only `undefined` can
+    // mean "fall back to the scaler-wide gate".
+    expect(parsed.scalerCapacity![0].labelSetMandatoryLabels).toBeUndefined();
+  });
 });
 
 describe('peerClusterSettings request/response schemas', () => {

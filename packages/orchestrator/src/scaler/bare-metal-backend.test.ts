@@ -642,6 +642,32 @@ describe('BareMetalScalerBackend', () => {
 
       expect(backend.labelSets).toEqual(newLabelSets);
     });
+
+    it('applies a new maxAgents on reload', () => {
+      const backend = createBackend();
+      expect(backend.maxAgents).toBe(5);
+
+      const result = backend.reload([{ labels: ['linux', 'new'], binaryPath: '/new/path' }], {
+        maxAgents: 9,
+      });
+
+      expect(result.valid).toBe(true);
+      expect(backend.maxAgents).toBe(9);
+    });
+
+    it('keeps the current maxAgents when the opts argument is omitted', () => {
+      const backend = createBackend();
+      backend.reload([{ labels: ['linux', 'new'], binaryPath: '/new/path' }]);
+      expect(backend.maxAgents).toBe(5);
+    });
+
+    it('leaves maxAgents untouched when the new label sets are invalid', () => {
+      const backend = createBackend();
+      const result = backend.reload([{ labels: ['linux', 'node20'] }], { maxAgents: 9 });
+
+      expect(result.valid).toBe(false);
+      expect(backend.maxAgents).toBe(5);
+    });
   });
 
   describe('type', () => {

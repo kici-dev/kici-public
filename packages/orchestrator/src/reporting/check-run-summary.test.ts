@@ -3,6 +3,8 @@ import {
   buildCheckRunSummary,
   buildAnnotations,
   buildProgressText,
+  clampSummaryToLimit,
+  SUMMARY_BYTE_LIMIT,
   type StepResultData,
   type StepProgressEntry,
 } from './check-run-summary.js';
@@ -425,5 +427,83 @@ describe('buildProgressText', () => {
     const text = buildProgressText({ steps, traceIds });
 
     expect(text).toContain('\u23ED Deploy');
+  });
+});
+
+describe('the summary byte budget', () => {
+  /**
+   * Step results whose rendered summary lands just under the cap — 64751 bytes,
+   * 784 of headroom. That is the only band where a caller's own bytes decide
+   * whether the update is accepted, so it is the band the reservation governs.
+   * The fixture carries no log lines, so every truncation tier renders the same
+   * string: a reservation the builder honours can only be met by falling
+   * through to the minimal summary, which is exactly what the assertions read.
+   */
+  function nearCapSteps(): StepResultData[] {
+    return Array.from({ length: 32 }, (_, i) => ({
+      name: `step-${i}`,
+      status: 'failed' as const,
+      error: 'e'.repeat(1960),
+    }));
+  }
+
+  const base = {
+    jobName: 'test',
+    logBuffer: new StepLogBuffer(),
+    runId: 'run-1',
+    jobId: 'job-1',
+    traceIds,
+  };
+
+  it('spends the whole cap when nothing is reserved', () => {
+    const summary = buildCheckRunSummary({ ...base, stepResults: nearCapSteps() });
+    const size = Buffer.byteLength(summary, 'utf-8');
+    // Non-vacuity for the reservation case below: without a reservation the
+    // builder really does return something inside the last kilobyte of the
+    // cap, which is the only band where reserving changes the answer.
+    expect(size).toBeLessThanOrEqual(SUMMARY_BYTE_LIMIT);
+    expect(size).toBeGreaterThan(SUMMARY_BYTE_LIMIT - 1024);
+  });
+
+  it('leaves room for a caller that will wrap the result', () => {
+    const reservedBytes = 1024;
+    const summary = buildCheckRunSummary({
+      ...base,
+      stepResults: nearCapSteps(),
+      reservedBytes,
+    });
+    expect(Buffer.byteLength(summary, 'utf-8')).toBeLessThanOrEqual(
+      SUMMARY_BYTE_LIMIT - reservedBytes,
+    );
+  });
+});
+
+describe('clampSummaryToLimit', () => {
+  it('returns a summary that already fits, unchanged', () => {
+    expect(clampSummaryToLimit('short')).toBe('short');
+  });
+
+  it('cuts an over-cap summary down to the cap and says so', () => {
+    const clamped = clampSummaryToLimit('x'.repeat(SUMMARY_BYTE_LIMIT + 500));
+    expect(Buffer.byteLength(clamped, 'utf-8')).toBeLessThanOrEqual(SUMMARY_BYTE_LIMIT);
+    expect(clamped).toContain('Summary truncated due to size limits.');
+  });
+
+  it('does not leave a replacement character from a split multi-byte sequence', () => {
+    // A cut through a 4-byte emoji yields U+FFFD, which is both wrong to show
+    // and larger than the bytes it replaced — so it can put the result back
+    // over the very cap it was cut to fit.
+    // The truncation notice is 41 bytes, so a limit of 43 leaves two bytes of
+    // head — landing inside a 4-byte emoji. Node renders each orphaned byte as
+    // its own 3-byte U+FFFD, so an untrimmed head would be 6 bytes and the
+    // result 47: over the 43 it was cut to fit.
+    const clamped = clampSummaryToLimit('🙂'.repeat(40), 43);
+    expect(Buffer.byteLength(clamped, 'utf-8')).toBeLessThanOrEqual(43);
+    expect(clamped).not.toContain('\uFFFD');
+
+    // A limit too small even for the notice still respects the limit.
+    expect(Buffer.byteLength(clampSummaryToLimit('🙂'.repeat(40), 6), 'utf-8')).toBeLessThanOrEqual(
+      6,
+    );
   });
 });

@@ -1,6 +1,7 @@
 import type { z } from 'zod';
 import type { $ as Shell } from 'zx';
 import type { RetryBackoff } from '@kici-dev/core';
+import type { GitCredentialMap, ContainerRegistryAuth } from './git-types.js';
 import type {
   ResourceRequest,
   RunsOnAllInput,
@@ -513,10 +514,43 @@ export { DYNAMIC_JOB_NEEDS_TAG };
  * When set, all steps run inside the specified container.
  */
 export interface ContainerConfig {
-  /** Docker image name (e.g., 'node:20-alpine') */
-  image: string;
+  /**
+   * Docker image name (e.g., 'node:20-alpine'). Mutually exclusive with
+   * `dockerfile`; exactly one of the two is required.
+   */
+  image?: string;
+  /**
+   * Repo-relative path to a Dockerfile the agent builds before the job runs.
+   * Mutually exclusive with `image`.
+   *
+   * The build runs on the agent host, NOT inside the job's hardened sandbox.
+   * See the container-jobs documentation for the trust model and the
+   * untrusted-ref rule.
+   */
+  dockerfile?: string;
+  /**
+   * Repo-relative build context. Defaults to the repository root.
+   * Meaningful only with `dockerfile`.
+   */
+  context?: string;
+  /** Build stage to stop at (`--target`). Meaningful only with `dockerfile`. */
+  target?: string;
+  /**
+   * Build arguments. Meaningful only with `dockerfile`.
+   *
+   * Plain strings only, deliberately: a build argument is recorded in the
+   * image's history, so a secret placed here is readable by anyone who can
+   * inspect the image. Pass a secret to a step instead.
+   */
+  args?: Record<string, string>;
   /** Additional environment variables for the container */
   env?: Record<string, string>;
+  /**
+   * Private-registry credentials. With `image` they pull that image; with
+   * `dockerfile` they pull the Dockerfile's own `FROM` base — and must name
+   * the registry, because there is no image reference to derive it from.
+   */
+  auth?: ContainerRegistryAuth;
 }
 
 /**
@@ -689,6 +723,13 @@ export interface Job<TOutputs = Record<string, unknown>, TName extends string = 
   readonly maxParallel?: number;
   /** Halt the fan-out on first child failure, skipping the remainder. Default `false`. */
   readonly failFast?: boolean;
+  /**
+   * Invoke the source repo's opt-in workflows and gate on them. Mutually
+   * exclusive with `steps` / `run` — an invoke job never runs step code on an
+   * agent; it fans out into one proxy node per triggered run. Built by
+   * `invokeSource()`.
+   */
+  readonly invoke?: import('./invoke.js').InvokeConfig;
   readonly steps: readonly StepInput[];
   readonly needs?: ReadonlyArray<
     | Job
@@ -709,6 +750,17 @@ export interface Job<TOutputs = Record<string, unknown>, TName extends string = 
   readonly exclude?: MatrixExclude[];
   /** When false, agent skips git clone (default: true). Useful for deploy/notify jobs. */
   readonly checkout?: boolean;
+  /**
+   * Named git credentials available to every step in this job.
+   *
+   * Values are **secret names**, resolved from the secrets backend — never
+   * secret material. `default` is used whenever a call names no credential;
+   * any other key is referenced by name, e.g.
+   * `kici.git.clone({ repo, credential: 'forge' })`.
+   *
+   * Omit entirely and the source credential applies, which is all a read needs.
+   */
+  readonly gitCredentials?: GitCredentialMap;
   /** Docker image for job execution. All steps run inside the container. */
   readonly container?: string | ContainerConfig;
   /** Per-job sandbox escape hatch (container jobs only); granted within the operator allow-list. */
@@ -828,6 +880,13 @@ export interface JobOptions {
    */
   failFast?: boolean;
   /**
+   * Invoke the source repo's opt-in workflows and gate on them. Mutually
+   * exclusive with `steps` / `run` — an invoke job never runs step code on an
+   * agent; it fans out into one proxy node per triggered run. Built by
+   * `invokeSource()`.
+   */
+  invoke?: import('./invoke.js').InvokeConfig;
+  /**
    * Steps to execute in this job. Accepts Step objects and bare async functions.
    * Mutually exclusive with `run`.
    */
@@ -867,6 +926,17 @@ export interface JobOptions {
   exclude?: MatrixExclude[];
   /** When false, agent skips git clone (default: true). Useful for deploy/notify jobs. */
   checkout?: boolean;
+  /**
+   * Named git credentials available to every step in this job.
+   *
+   * Values are **secret names**, resolved from the secrets backend — never
+   * secret material. `default` is used whenever a call names no credential;
+   * any other key is referenced by name, e.g.
+   * `kici.git.clone({ repo, credential: 'forge' })`.
+   *
+   * Omit entirely and the source credential applies, which is all a read needs.
+   */
+  gitCredentials?: GitCredentialMap;
   /**
    * Docker image for job execution.
    * Simple string form for image name, object form for additional config.

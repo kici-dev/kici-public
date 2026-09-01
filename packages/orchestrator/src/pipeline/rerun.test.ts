@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { handleRerun, type RerunDeps } from './rerun.js';
+import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
+import { handleRerun, settlePendingRoundReevaluations, type RerunDeps } from './rerun.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 // The generic mock DB cannot enforce real `INSERT … ON CONFLICT` dedup
@@ -29,6 +29,24 @@ vi.mock('./request-idempotency.js', () => ({
   claimRequestId: vi.fn(async (_db: unknown, requestId: string) => idempotency.claim(requestId)),
   pruneRequestIdempotency: vi.fn(async () => 0),
 }));
+
+// The organization-wide pass is driven end-to-end by its own suite
+// (`process-webhook-globals-eval-round.test.ts`). Here it is stubbed so the
+// round-rerun tests observe WHAT the rerun asks it to do — the scope, the
+// repository, the commit — rather than re-testing the pass itself. Everything
+// else in `process-webhook.js` stays real.
+const globalsPass = vi.hoisted(() => ({
+  impl: null as null | ((args: Record<string, unknown>) => Promise<unknown>),
+}));
+
+vi.mock('./process-webhook.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./process-webhook.js')>();
+  return {
+    ...actual,
+    dispatchGlobalWorkflowsForOtherRepos: (args: Record<string, unknown>) =>
+      globalsPass.impl!(args),
+  };
+});
 
 // --- Mock helpers ---
 
@@ -72,6 +90,8 @@ function createMockProviderBundle() {
       extractRoutingKey: vi.fn(),
       extractDeliveryId: vi.fn(),
       extractEventType: vi.fn(),
+      extractCredentials: vi.fn().mockReturnValue({}),
+      isDefaultBranchPush: vi.fn().mockReturnValue(false),
       verifySignature: vi.fn(),
     },
     lockFileFetcher: {
@@ -643,6 +663,410 @@ describe('handleRerun', () => {
       expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
       const dispatchedJob = dispatcher.dispatch.mock.calls[0][0];
       expect(dispatchedJob.repoUrl).toBe('https://github.com/owner/repo.git');
+    });
+  });
+
+  /**
+   * Re-running a failed global evaluation round re-evaluates the original event.
+   *
+   * A round decides which organization-wide workflows apply to an event; a round
+   * that fails suppresses every workflow it was deciding on and is recorded as
+   * one errored run. Re-running that run re-drives the evaluation for the round's
+   * own workflow repository — it resolves no workflow out of a lock file, so the
+   * cross-repository refusal (which exists to stop exactly that) does not apply.
+   */
+  describe('re-running a failed global evaluation round', () => {
+    const SOURCE_REPO = 'owner/source-repo';
+    const WORKFLOW_REPO = 'owner/org-workflows';
+
+    /**
+     * The round's run row.
+     *
+     * It also carries the `event` / `action` / `org_id` columns the delivery's
+     * `event_log` row holds: the mock DB serves one configured row to every
+     * select whose predicates it satisfies, and both queries filter on values
+     * this row declares. `org_id` matching `customer_id` is what makes the
+     * org-scoped delivery lookup find it — a fixture whose `org_id` names
+     * another tenant is the regression case below.
+     */
+    const ROUND_RUN = {
+      ...TERMINAL_RUN,
+      status: 'failed',
+      workflow_name: '__globaleval__owner/org-workflows',
+      repo_identifier: SOURCE_REPO,
+      workflow_repo_identifier: WORKFLOW_REPO,
+      is_global_eval_round: true,
+      customer_id: 'org-1',
+      delivery_id: 'del-round-1',
+      org_id: 'org-1',
+      event: 'push',
+      action: null,
+    };
+
+    let dispatchGlobals: Mock<(args: Record<string, unknown>) => Promise<unknown>>;
+    let postSucceeded: Mock<(...args: unknown[]) => Promise<void>>;
+    let normalizeEvent: Mock<(...args: unknown[]) => unknown>;
+
+    beforeEach(() => {
+      dispatchGlobals = vi
+        .fn<(args: Record<string, unknown>) => Promise<unknown>>()
+        .mockResolvedValue({
+          matchedCount: 2,
+          matchedRunIds: ['new-1', 'new-2'],
+          decisionSummaries: [],
+          roundFailureWorkflowRepos: [],
+          decidedWorkflowRepos: [WORKFLOW_REPO],
+        });
+      globalsPass.impl = dispatchGlobals;
+
+      postSucceeded = vi.fn<(...args: unknown[]) => Promise<void>>().mockResolvedValue(undefined);
+      normalizeEvent = vi.fn<(...args: unknown[]) => unknown>().mockReturnValue({
+        type: 'push',
+        payload: {},
+        targetBranch: 'main',
+        provider: 'github',
+      });
+      providerBundle.normalizer.normalizeEvent =
+        normalizeEvent as unknown as typeof providerBundle.normalizer.normalizeEvent;
+      (providerBundle.normalizer as any).extractCredentials = vi.fn().mockReturnValue({
+        token: 'inbound-token',
+      });
+      (providerBundle as any).checkStatusPoster = {
+        provider: 'github',
+        postGlobalEvalSucceededCheck: postSucceeded,
+      };
+      (providerBundle as any).changedFilesFetcher = {
+        getChangedFiles: vi.fn().mockResolvedValue({ files: ['a.ts'], status: 'fetched' }),
+      };
+
+      deps.db = makeMockDb(ROUND_RUN) as any;
+      deps.processingDeps = () => ({ orchestratorMode: 'platform' }) as any;
+    });
+
+    /**
+     * Re-run the round, then settle the re-evaluation it detached.
+     *
+     * The request is answered as soon as the claim is taken: the round itself is
+     * a dispatched agent job whose budget is minutes, and the relayed dashboard
+     * call it answers has ten seconds. So an assertion about the PASS has to
+     * wait for the detached work rather than for the call — and settling also
+     * keeps a still-running re-evaluation from reaching the next test's mocks.
+     */
+    async function rerunRound(
+      requestId: string,
+      actor: string | null = null,
+    ): Promise<{ newRunId: string }> {
+      const result = await handleRerun('original-run-123', actor, null, deps, requestId);
+      await settlePendingRoundReevaluations();
+      return result;
+    }
+
+    it('answers the request before the round it detached has finished', async () => {
+      // The defect this guards: the whole re-evaluation used to run inside the
+      // reply, so a round that takes longer than the relay's ten-second budget
+      // — which every real round does — returned a gateway timeout to the
+      // operator while completing unobserved.
+      let releaseRound: () => void = () => {};
+      const roundStarted = new Promise<void>((startResolve) => {
+        dispatchGlobals.mockImplementation(async () => {
+          startResolve();
+          await new Promise<void>((r) => {
+            releaseRound = r;
+          });
+          return {
+            matchedCount: 1,
+            matchedRunIds: ['new-1'],
+            decisionSummaries: [],
+            roundFailureWorkflowRepos: [],
+            decidedWorkflowRepos: [WORKFLOW_REPO],
+          };
+        });
+      });
+
+      const result = await handleRerun('original-run-123', null, null, deps, 'req-round-async');
+
+      // Answered while the round is still in flight — the point of the fix.
+      expect(result.newRunId).toBe('original-run-123');
+      await roundStarted;
+      expect(postSucceeded).not.toHaveBeenCalled();
+
+      // And the detached work still completes and posts its check.
+      releaseRound();
+      await settlePendingRoundReevaluations();
+      expect(postSucceeded).toHaveBeenCalledTimes(1);
+    });
+
+    it('bypasses the cross-repository refusal and re-drives the scoped pass', async () => {
+      await rerunRound('req-round-1', 'user@test.com');
+
+      expect(dispatchGlobals).toHaveBeenCalledTimes(1);
+      const passArgs = dispatchGlobals.mock.calls[0][0];
+      // Scoped to the round's own workflow repository: every other repo's globals
+      // already reached their verdict on the original delivery.
+      expect(passArgs.onlyWorkflowRepo).toBe(WORKFLOW_REPO);
+      expect(passArgs.repoIdentifier).toBe(SOURCE_REPO);
+      expect(passArgs.ref).toBe('abc123def');
+      // No workflow is resolved out of the source repo's lock file — that is the
+      // whole reason the refusal does not apply here.
+      expect(providerBundle.lockFileFetcher!.fetchLockFile).not.toHaveBeenCalled();
+    });
+
+    it('scopes the delivery lookup to the round’s own org', async () => {
+      const { db: scopedDb, mocks } = createMockDb({ selectFirstRow: ROUND_RUN });
+      deps.db = scopedDb as any;
+
+      await rerunRound('req-round-org-scope');
+
+      // `event_log`'s uniqueness is composite — (org_id, delivery_id) — and for
+      // a generic source the delivery id is entirely sender-supplied, so a
+      // lookup by delivery id alone can read another tenant's row.
+      expect(mocks.selectWhere.mock.calls).toContainEqual(['org_id', '=', 'org-1']);
+      expect(mocks.selectWhere.mock.calls).toContainEqual(['delivery_id', '=', 'del-round-1']);
+    });
+
+    it('does not read an event_log row that belongs to another org', async () => {
+      // Same `delivery_id`, different tenant: a second org's generic source can
+      // choose `X-Delivery-Id` freely, so this row is reachable by delivery id
+      // alone. Scoping by org is what keeps it out of this round's re-evaluation.
+      deps.db = makeMockDb({ ...ROUND_RUN, org_id: 'org-2' }) as any;
+
+      await expect(
+        handleRerun('original-run-123', null, null, deps, 'req-round-other-org'),
+      ).rejects.toThrow(/no event log entry for delivery/);
+      expect(dispatchGlobals).not.toHaveBeenCalled();
+    });
+
+    it('refuses a round that recorded no workflow repository', async () => {
+      // The pass skips every registration authored in the source repository
+      // BEFORE it applies the scope, so scoping on the source repo matches
+      // nothing, evaluates nothing, and reports no failure — which the success
+      // check would then read as a clean re-evaluation. There is no reading of a
+      // NULL column that re-evaluates anything, so refusing is the honest answer.
+      deps.db = makeMockDb({ ...ROUND_RUN, workflow_repo_identifier: null }) as any;
+
+      await expect(
+        handleRerun('original-run-123', 'user@test.com', null, deps, 'req-round-null'),
+      ).rejects.toThrow(/records no workflow repository/);
+      expect(dispatchGlobals).not.toHaveBeenCalled();
+    });
+
+    /**
+     * A cross-provider global resolves its lock file through ANOTHER source's
+     * bundle, so the round's `provider_context` holds that source's dispatch
+     * credentials while its `routing_key` names the inbound one. Pairing the two
+     * hands one source's credentials to the other source's API client.
+     */
+    describe('a round whose dispatch source is not the inbound source', () => {
+      const DISPATCH_KEY = 'github:99';
+      let dispatchBundle: ReturnType<typeof createMockProviderBundle>;
+
+      beforeEach(() => {
+        dispatchBundle = createMockProviderBundle();
+        (deps.providerRegistry as any).getByRoutingKey = vi
+          .fn()
+          .mockImplementation((key: string) =>
+            key === DISPATCH_KEY ? dispatchBundle : providerBundle,
+          );
+        deps.db = makeMockDb({ ...ROUND_RUN, dispatch_routing_key: DISPATCH_KEY }) as any;
+      });
+
+      it('hands the pass the bundle the stored credentials belong to', async () => {
+        await rerunRound('req-round-dispatch');
+
+        const passArgs = dispatchGlobals.mock.calls[0][0];
+        // The dispatch pair: the fallback source's bundle with the credentials
+        // recorded from that same source.
+        expect(passArgs.dispatchBundle).toBe(dispatchBundle);
+        expect(passArgs.dispatchCredentials).toEqual({ installationId: 42 });
+        expect(passArgs.dispatchRoutingKey).toBe(DISPATCH_KEY);
+        // The inbound pair, unchanged: the check lands on the repository that
+        // emitted the event, through its own source.
+        expect(passArgs.bundle).toBe(providerBundle);
+        expect(passArgs.credentials).toEqual({ token: 'inbound-token' });
+      });
+
+      it("fetches changed files with the inbound source's own credentials", async () => {
+        await rerunRound('req-round-changed-files');
+
+        const fetcher = (providerBundle as any).changedFilesFetcher.getChangedFiles;
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        // The fetch reads the INBOUND repository through the inbound bundle, so
+        // it must carry the inbound credentials — never the stored dispatch ones.
+        expect(fetcher.mock.calls[0][3]).toEqual({ token: 'inbound-token' });
+      });
+
+      it('refuses when the recorded dispatch source is no longer registered', async () => {
+        (deps.providerRegistry as any).getByRoutingKey = vi
+          .fn()
+          .mockImplementation((key: string) => (key === DISPATCH_KEY ? undefined : providerBundle));
+
+        await expect(
+          handleRerun('original-run-123', null, null, deps, 'req-round-dispatch-gone'),
+        ).rejects.toThrow(/dispatch source github:99 is no longer registered/);
+        expect(dispatchGlobals).not.toHaveBeenCalled();
+      });
+    });
+
+    it('posts the success check on the original commit through the inbound repo', async () => {
+      await rerunRound('req-round-2', 'user@test.com');
+
+      expect(postSucceeded).toHaveBeenCalledTimes(1);
+      const [repo, sha, summary, credentials] = postSucceeded.mock.calls[0];
+      expect(repo).toBe(SOURCE_REPO);
+      expect(sha).toBe('abc123def');
+      // Names the workflow repo it re-evaluated: one shared check name serves
+      // every round on the commit, so the summary is what tells them apart.
+      expect(summary).toContain(WORKFLOW_REPO);
+      // The INBOUND repo's credentials, never the dispatch context (which for a
+      // cross-provider global belongs to another source).
+      expect(credentials).toEqual({ token: 'inbound-token' });
+    });
+
+    it('posts no success check when the scoped round failed again', async () => {
+      dispatchGlobals.mockResolvedValue({
+        matchedCount: 0,
+        matchedRunIds: [],
+        decisionSummaries: [],
+        roundFailureWorkflowRepos: [WORKFLOW_REPO],
+        decidedWorkflowRepos: [],
+      });
+
+      await rerunRound('req-round-3', 'user@test.com');
+
+      // The pass's own failure surfacing already posted the fresh failure check.
+      expect(postSucceeded).not.toHaveBeenCalled();
+    });
+
+    it('posts no success check when the pass reported no verdict for the round', async () => {
+      // The false-assurance case: a coordinator with no pending-eval tracker (or
+      // no registration index) suppresses every candidate, deliberately raises
+      // no round failure, and evaluates nothing. Reading that silence as a clean
+      // re-evaluation would flip the gating check to success and unblock a merge
+      // bot on work that provably did not run.
+      dispatchGlobals.mockResolvedValue({
+        matchedCount: 0,
+        matchedRunIds: [],
+        decisionSummaries: [],
+        roundFailureWorkflowRepos: [],
+        decidedWorkflowRepos: [],
+      });
+
+      await rerunRound('req-round-undecided', 'user@test.com');
+
+      expect(dispatchGlobals).toHaveBeenCalledTimes(1);
+      expect(postSucceeded).not.toHaveBeenCalled();
+    });
+
+    it('posts the success check for a repo the pass decided but admitted nothing for', async () => {
+      // The other half of the same rule: "decided" is the positive signal, not
+      // "dispatched something". A round whose verdicts all came back `run: false`
+      // evaluated the repository fully and cleanly.
+      dispatchGlobals.mockResolvedValue({
+        matchedCount: 0,
+        matchedRunIds: [],
+        decisionSummaries: [],
+        roundFailureWorkflowRepos: [],
+        decidedWorkflowRepos: [WORKFLOW_REPO],
+      });
+
+      await rerunRound('req-round-decided-empty', 'user@test.com');
+
+      expect(postSucceeded).toHaveBeenCalledTimes(1);
+    });
+
+    it('posts no success check when the trust policy skipped the pass', async () => {
+      // A pass the policy did not admit evaluated nothing, so it reports no
+      // round failure either. Reading that as a clean re-evaluation would post
+      // success for work that never ran.
+      dispatchGlobals.mockImplementation(async (args) => {
+        const decision = args.securityDecision as { action: string };
+        if (decision.action !== 'pass') {
+          return {
+            matchedCount: 0,
+            matchedRunIds: [],
+            decisionSummaries: [],
+            roundFailureWorkflowRepos: [],
+            decidedWorkflowRepos: [],
+          };
+        }
+        throw new Error('the policy-skipped case must not reach the evaluating branch');
+      });
+      // A fork PR the org policy holds. `hasForkModel` is what brings the
+      // policy into play at all, and the fail-closed default holds the event.
+      normalizeEvent.mockReturnValue({
+        type: 'pr',
+        payload: {},
+        targetBranch: 'main',
+        provider: 'github',
+        isForkPR: true,
+      });
+      (providerBundle as any).hasForkModel = true;
+      deps.db = makeMockDb({ ...ROUND_RUN, event: 'pull_request', action: 'opened' }) as any;
+
+      await rerunRound('req-round-policy');
+
+      expect(dispatchGlobals).toHaveBeenCalledTimes(1);
+      expect(postSucceeded).not.toHaveBeenCalled();
+    });
+
+    it('fails with an actionable error when the payload was not stored', async () => {
+      logStorage = createMockLogStorage(null);
+      deps.logStorage = logStorage as any;
+
+      await expect(
+        handleRerun('original-run-123', 'user@test.com', null, deps, 'req-round-4'),
+      ).rejects.toThrow(/payload was not stored/);
+      expect(dispatchGlobals).not.toHaveBeenCalled();
+    });
+
+    it('rejects an event it can no longer normalize on both hops of a re-send', async () => {
+      // `normalizeEvent` is read-only validation, so it must run BEFORE the
+      // requestId claim: claimed first, the second hop of a relay failover
+      // re-send short-circuits on the claim and answers HTTP 200 with the round's
+      // own run id — telling the operator the re-run succeeded when nothing ran.
+      const requestId = 'req-round-normalize-first';
+      normalizeEvent.mockReturnValue(null);
+
+      await expect(handleRerun('original-run-123', null, null, deps, requestId)).rejects.toThrow(
+        /no longer one this orchestrator normalizes/,
+      );
+      await expect(handleRerun('original-run-123', null, null, deps, requestId)).rejects.toThrow(
+        /no longer one this orchestrator normalizes/,
+      );
+      expect(dispatchGlobals).not.toHaveBeenCalled();
+    });
+
+    it('throws the same reconstruction failure on both hops of a failover re-send', async () => {
+      // The read-only reconstruction runs BEFORE the requestId claim, so a hop
+      // that could not rebuild the delivery does not leave the claim behind for
+      // the re-send to report as a success.
+      const requestId = 'req-round-validate-first';
+      deps.db = makeMockDb({ ...ROUND_RUN, delivery_id: null }) as any;
+
+      await expect(handleRerun('original-run-123', null, null, deps, requestId)).rejects.toThrow(
+        /records no delivery id/,
+      );
+      await expect(handleRerun('original-run-123', null, null, deps, requestId)).rejects.toThrow(
+        /records no delivery id/,
+      );
+      expect(dispatchGlobals).not.toHaveBeenCalled();
+    });
+
+    it('re-evaluates once across a failover re-send of the same requestId', async () => {
+      const requestId = 'req-round-dedupe';
+      await rerunRound(requestId);
+      await rerunRound(requestId);
+
+      expect(dispatchGlobals).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns the round run id, so a re-send answers identically', async () => {
+      const requestId = 'req-round-stable';
+      const first = await rerunRound(requestId);
+      const second = await rerunRound(requestId);
+
+      expect(first.newRunId).toBe('original-run-123');
+      expect(second.newRunId).toBe(first.newRunId);
     });
   });
 });

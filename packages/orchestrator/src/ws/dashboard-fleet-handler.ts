@@ -106,7 +106,9 @@ export async function handleFleetPreviewRequest(
       estimatedChildCount: 0,
     };
   }
-  const matched = await deps.rosterStore.findMatching(
+  // Mirrors the dispatcher's resolver so the preview shows the hosts the run
+  // would actually target — auto-scaler agents are not fan-out targets.
+  const matched = await deps.rosterStore.findFanoutTargets(
     predicate.include,
     predicate.exclude,
     deps.rosterGraceMs,
@@ -151,6 +153,16 @@ export async function handleFleetWorkflowsForHostRequest(
 ): Promise<DashboardFleetWorkflowsForHostResponse> {
   const entry = await deps.rosterStore.getInventory(agentId, deps.rosterGraceMs);
   if (!entry) {
+    return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
+  }
+  // Mirrors `findFanoutTargets`, the resolver the dispatcher and the preview
+  // both use: an auto-scaler-spawned agent is never a `runsOnAll` fan-out
+  // target, so no workflow fans out to it however well its labels match.
+  // Without this the host page would name fan-outs no run ever produces.
+  // The flag is read off the roster row rather than `entry` because
+  // `HostInventoryEntry` is the SDK-facing `ctx.kici.inventory` shape.
+  const row = await deps.rosterStore.get(agentId);
+  if (row?.scaler_managed) {
     return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
   }
   const labelSet = new Set(entry.labels);

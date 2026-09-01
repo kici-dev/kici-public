@@ -467,6 +467,68 @@ describe('DashboardRegistrationsHandler', () => {
       expect(statusFilter![1]).toBe('not in');
       expect(statusFilter![2]).toEqual([...TERMINAL_RUN_STATES]);
     });
+
+    /**
+     * This arm terminalizes a run with a direct UPDATE, so it reaches neither
+     * `onExecutionComplete` nor `onRunTerminalCleanup` — the two places the
+     * pending job contexts are otherwise dropped. A cancelled run's needs-gated
+     * jobs are exactly the ones still holding a context.
+     */
+    it('drops the pending job contexts of every run it cancels', async () => {
+      const reg = makeRegistrationRow({ id: 'reg-del-2' });
+      deleteStore.getById.mockResolvedValue(reg);
+
+      const contextDeletes: Array<{ table: string; where: unknown[][] }> = [];
+      const updateChain = {
+        set: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        execute: vi.fn().mockResolvedValue({ numUpdatedRows: 1n }),
+      };
+      const selectChain = {
+        select: vi.fn().mockReturnThis(),
+        where: vi.fn().mockReturnThis(),
+        execute: vi.fn().mockResolvedValue([{ run_id: 'run-a' }, { run_id: 'run-b' }]),
+        executeTakeFirst: vi.fn().mockResolvedValue(undefined),
+      };
+
+      deleteDb = {
+        selectFrom: vi.fn().mockReturnValue(selectChain),
+        updateTable: vi.fn().mockReturnValue(updateChain),
+        deleteFrom: vi.fn((table: string) => {
+          const entry = { table, where: [] as unknown[][] };
+          contextDeletes.push(entry);
+          const chain: Record<string, unknown> = {
+            where: vi.fn((...args: unknown[]) => {
+              entry.where.push(args);
+              return chain;
+            }),
+            execute: vi.fn().mockResolvedValue([]),
+            executeTakeFirst: vi.fn().mockResolvedValue({ numDeletedRows: 1n }),
+          };
+          return chain;
+        }),
+      };
+
+      deleteHandler = new DashboardRegistrationsHandler({
+        db: deleteDb as unknown as Kysely<Database>,
+        registrationStore: deleteStore as unknown as RegistrationStore,
+        registrationIndex: deleteIndex as unknown as RegistrationIndex,
+        send: deleteSend,
+        orgId: 'cust-1',
+      });
+
+      await deleteHandler.handle({
+        type: 'dashboard.registration.delete',
+        requestId: 'req-del-2',
+        registrationId: 'reg-del-2',
+        cancelActiveRuns: true,
+      });
+
+      const cleaned = contextDeletes
+        .filter((d) => d.table === 'pending_job_contexts')
+        .map((d) => d.where.find((w) => w[0] === 'run_id')?.[2]);
+      expect(cleaned).toEqual(['run-a', 'run-b']);
+    });
   });
 
   describe('not-found results', () => {

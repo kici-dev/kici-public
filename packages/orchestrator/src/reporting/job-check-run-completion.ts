@@ -122,6 +122,12 @@ function postJobCheckRunCompletion(
     installationId: execContext.installationId,
     routingKey: execContext.routingKey,
     description,
+    // The run's trust posture, so the completion summary can say why a job on
+    // an untrusted ref behaved differently. Absent when trust never resolved.
+    ...(execContext.trustTier !== undefined && { trustTier: execContext.trustTier }),
+    ...(execContext.lockFileSource !== undefined && {
+      lockFileSource: execContext.lockFileSource,
+    }),
     // Pass additional data for enriched summaries
     data: input.data,
     runIdForLogs: input.runId,

@@ -17,6 +17,18 @@ export interface RejectOptions {
   job?: string;
   /** Match a step-scoped hold by its step index. */
   step?: string;
+  /**
+   * Match one hold by its own id. The escape hatch for an ambiguity nothing
+   * else resolves; the error listing prints the ids when it needs to.
+   */
+  hold?: string;
+  /**
+   * Narrow to holds of one type (`reviewer` / `timer` / `concurrency` /
+   * `security`). A job carrying an SDK `requireApproval` AND a security-typed
+   * context gate has two pending holds under one job name, and this is what
+   * separates them.
+   */
+  holdType?: string;
   /** Required rejection reason. */
   reason?: string;
 }
@@ -39,7 +51,12 @@ export async function rejectCommand(runId: string, options: RejectOptions = {}):
     if (!ctx) return false;
 
     const holds = await listHeldRunsForRun(ctx, runId);
-    const resolution = resolveHeldRunId(holds, { job: options.job, step: options.step });
+    const resolution = resolveHeldRunId(holds, {
+      job: options.job,
+      step: options.step,
+      holdId: options.hold,
+      holdType: options.holdType,
+    });
     if (!resolution.ok) {
       logger.error(pc.red(resolution.error));
       return false;

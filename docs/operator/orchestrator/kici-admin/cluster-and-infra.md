@@ -187,40 +187,47 @@ Synopsis: `kici-admin cluster-settings reset [options]`
 
 **Options**
 
-| Option                                              | Default | Description                                           |
-| --------------------------------------------------- | ------- | ----------------------------------------------------- |
-| `--format <format>`                                 | `table` | Output format: json\|table                            |
-| `--max-github-payload-bytes`                        |         | Clear only Max GitHub payload bytes                   |
-| `--event-log-max-payload-bytes`                     |         | Clear only Event-log max payload bytes                |
-| `--lock-file-max-bytes`                             |         | Clear only Lock-file max bytes                        |
-| `--webhook-dedup-ttl-ms`                            |         | Clear only Webhook dedup TTL (ms)                     |
-| `--contributor-cache-ttl-ms`                        |         | Clear only Contributor-cache TTL (ms)                 |
-| `--event-router-event-ttl-seconds`                  |         | Clear only Event-router event TTL (s)                 |
-| `--event-router-max-dispatch-attempts`              |         | Clear only Event-router max dispatch attempts         |
-| `--queue-max-depth`                                 |         | Clear only Queue max depth                            |
-| `--reroute-flap-grace-ms`                           |         | Clear only Reroute flap grace (ms)                    |
-| `--max-fanout-hosts`                                |         | Clear only Max fanout hosts                           |
-| `--event-router-rate-limit-per-workflow-per-minute` |         | Clear only Event-router rate limit (/wf/min)          |
-| `--cache-max-tarball-bytes`                         |         | Clear only Cache max tarball bytes                    |
-| `--cache-ttl-days`                                  |         | Clear only Cache TTL (days)                           |
-| `--check-run-tracking-ttl-days`                     |         | Clear only Check-run tracking TTL (days)              |
-| `--concurrency-wait-timeout-ms`                     |         | Clear only Concurrency wait timeout (ms)              |
-| `--agent-token-ttl-ms`                              |         | Clear only Agent token TTL (ms)                       |
-| `--ownership-db-check-timeout-ms`                   |         | Clear only Ownership DB check timeout (ms)            |
-| `--unroutable-grace-ms`                             |         | Clear only Unroutable fast-fail grace (ms)            |
-| `--ingest-overflow-claim-timeout-ms`                |         | Clear only Ingest queue claim timeout (ms)            |
-| `--lockfile-cache-max`                              |         | Clear only Lock-file cache max entries                |
-| `--lockfile-cache-max-bytes`                        |         | Clear only Lock-file cache max bytes                  |
-| `--lockfile-cache-ttl-ms`                           |         | Clear only Lock-file cache TTL (ms)                   |
-| `--content-cache-max`                               |         | Clear only Content cache max entries                  |
-| `--content-cache-max-bytes`                         |         | Clear only Content cache max bytes                    |
-| `--content-cache-ttl-ms`                            |         | Clear only Content cache TTL (ms)                     |
-| `--global-eval-round-timeout-ms`                    |         | Clear only Global eval round timeout (ms)             |
-| `--global-eval-candidate-timeout-ms`                |         | Clear only Global eval candidate timeout (ms)         |
-| `--global-eval-cache-max`                           |         | Clear only Global eval round-result cache max entries |
-| `--global-eval-wait-timeout-ms`                     |         | Clear only Global eval wait timeout (ms)              |
-| `--dashboard-verified-issuer`                       |         | Clear only Dashboard verified issuer                  |
-| `--global-workflows-enabled`                        |         | Clear only Global workflows enabled                   |
+| Option                                              | Default | Description                                                                                     |
+| --------------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `--format <format>`                                 | `table` | Output format: json\|table                                                                      |
+| `--max-github-payload-bytes`                        |         | Clear only Max GitHub payload bytes                                                             |
+| `--event-log-max-payload-bytes`                     |         | Clear only Event-log max payload bytes                                                          |
+| `--lock-file-max-bytes`                             |         | Clear only Lock-file max bytes                                                                  |
+| `--webhook-dedup-ttl-ms`                            |         | Clear only Webhook dedup TTL (ms)                                                               |
+| `--contributor-cache-ttl-ms`                        |         | Clear only Contributor-cache TTL (ms) [deprecated: inert — no code reads it; removed at v1.0.0] |
+| `--event-router-event-ttl-seconds`                  |         | Clear only Event-router event TTL (s)                                                           |
+| `--event-router-max-dispatch-attempts`              |         | Clear only Event-router max dispatch attempts                                                   |
+| `--queue-max-depth`                                 |         | Clear only Queue max depth                                                                      |
+| `--reroute-flap-grace-ms`                           |         | Clear only Reroute flap grace (ms)                                                              |
+| `--max-fanout-hosts`                                |         | Clear only Max fanout hosts                                                                     |
+| `--event-router-rate-limit-per-workflow-per-minute` |         | Clear only Event-router rate limit (/wf/min)                                                    |
+| `--cache-max-tarball-bytes`                         |         | Clear only Cache max tarball bytes                                                              |
+| `--cache-ttl-days`                                  |         | Clear only Cache TTL (days)                                                                     |
+| `--check-run-tracking-ttl-days`                     |         | Clear only Check-run tracking TTL (days)                                                        |
+| `--concurrency-wait-timeout-ms`                     |         | Clear only Concurrency wait timeout (ms)                                                        |
+| `--agent-token-ttl-ms`                              |         | Clear only Agent token TTL (ms)                                                                 |
+| `--ownership-db-check-timeout-ms`                   |         | Clear only Ownership DB check timeout (ms)                                                      |
+| `--unroutable-grace-ms`                             |         | Clear only Unroutable fast-fail grace (ms)                                                      |
+| `--ingest-overflow-claim-timeout-ms`                |         | Clear only Ingest queue claim timeout (ms)                                                      |
+| `--lockfile-cache-max`                              |         | Clear only Lock-file cache max entries                                                          |
+| `--lockfile-cache-max-bytes`                        |         | Clear only Lock-file cache max bytes                                                            |
+| `--lockfile-cache-ttl-ms`                           |         | Clear only Lock-file cache TTL (ms)                                                             |
+| `--content-cache-max`                               |         | Clear only Content cache max entries                                                            |
+| `--content-cache-max-bytes`                         |         | Clear only Content cache max bytes                                                              |
+| `--content-cache-ttl-ms`                            |         | Clear only Content cache TTL (ms)                                                               |
+| `--global-eval-round-timeout-ms`                    |         | Clear only Global eval round timeout (ms)                                                       |
+| `--global-eval-candidate-timeout-ms`                |         | Clear only Global eval candidate timeout (ms)                                                   |
+| `--global-eval-cache-max`                           |         | Clear only Global eval round-result cache max entries                                           |
+| `--global-eval-wait-timeout-ms`                     |         | Clear only Global eval wait timeout (ms)                                                        |
+| `--scaler-reap-interval-ms`                         |         | Clear only Scaler reap interval (ms)                                                            |
+| `--scaler-reap-stranded-timeout-ms`                 |         | Clear only Scaler reap stranded timeout (ms)                                                    |
+| `--scaler-reap-reattempt-interval-ms`               |         | Clear only Scaler reap re-attempt interval (ms)                                                 |
+| `--scaler-claim-retention-ms`                       |         | Clear only Scaler claim retention (ms)                                                          |
+| `--scaler-provision-backoff-base-ms`                |         | Clear only Scaler provision backoff base (ms)                                                   |
+| `--scaler-provision-backoff-max-ms`                 |         | Clear only Scaler provision backoff max (ms)                                                    |
+| `--scaler-provision-max-consecutive-failures`       |         | Clear only Scaler provision max consecutive failures                                            |
+| `--dashboard-verified-issuer`                       |         | Clear only Dashboard verified issuer                                                            |
+| `--global-workflows-enabled`                        |         | Clear only Global workflows enabled                                                             |
 
 ### `kici-admin cluster-settings set`
 
@@ -230,40 +237,47 @@ Synopsis: `kici-admin cluster-settings set [options]`
 
 **Options**
 
-| Option                                                      | Default | Description                                                   |
-| ----------------------------------------------------------- | ------- | ------------------------------------------------------------- |
-| `--format <format>`                                         | `table` | Output format: json\|table                                    |
-| `--max-github-payload-bytes <value>`                        |         | Max GitHub payload bytes (integer >= 1024)                    |
-| `--event-log-max-payload-bytes <value>`                     |         | Event-log max payload bytes (integer >= 1024)                 |
-| `--lock-file-max-bytes <value>`                             |         | Lock-file max bytes (integer >= 1024)                         |
-| `--webhook-dedup-ttl-ms <value>`                            |         | Webhook dedup TTL (ms) (integer >= 1000)                      |
-| `--contributor-cache-ttl-ms <value>`                        |         | Contributor-cache TTL (ms) (integer >= 1000)                  |
-| `--event-router-event-ttl-seconds <value>`                  |         | Event-router event TTL (s) (integer >= 1)                     |
-| `--event-router-max-dispatch-attempts <value>`              |         | Event-router max dispatch attempts (integer >= 1)             |
-| `--queue-max-depth <value>`                                 |         | Queue max depth (integer >= 1)                                |
-| `--reroute-flap-grace-ms <value>`                           |         | Reroute flap grace (ms) (integer >= 1000)                     |
-| `--max-fanout-hosts <value>`                                |         | Max fanout hosts (integer >= 1)                               |
-| `--event-router-rate-limit-per-workflow-per-minute <value>` |         | Event-router rate limit (/wf/min) (integer >= 1)              |
-| `--cache-max-tarball-bytes <value>`                         |         | Cache max tarball bytes (integer >= 1024)                     |
-| `--cache-ttl-days <value>`                                  |         | Cache TTL (days) (integer >= 1)                               |
-| `--check-run-tracking-ttl-days <value>`                     |         | Check-run tracking TTL (days) (integer >= 0)                  |
-| `--concurrency-wait-timeout-ms <value>`                     |         | Concurrency wait timeout (ms) (integer >= 1000)               |
-| `--agent-token-ttl-ms <value>`                              |         | Agent token TTL (ms) (integer >= 1000)                        |
-| `--ownership-db-check-timeout-ms <value>`                   |         | Ownership DB check timeout (ms) (integer >= 100)              |
-| `--unroutable-grace-ms <value>`                             |         | Unroutable fast-fail grace (ms) (integer >= 0)                |
-| `--ingest-overflow-claim-timeout-ms <value>`                |         | Ingest queue claim timeout (ms) (integer >= 60000)            |
-| `--lockfile-cache-max <value>`                              |         | Lock-file cache max entries (integer 1-100000)                |
-| `--lockfile-cache-max-bytes <value>`                        |         | Lock-file cache max bytes (integer >= 1024)                   |
-| `--lockfile-cache-ttl-ms <value>`                           |         | Lock-file cache TTL (ms) (integer >= 1000)                    |
-| `--content-cache-max <value>`                               |         | Content cache max entries (integer 1-100000)                  |
-| `--content-cache-max-bytes <value>`                         |         | Content cache max bytes (integer >= 1024)                     |
-| `--content-cache-ttl-ms <value>`                            |         | Content cache TTL (ms) (integer >= 1000)                      |
-| `--global-eval-round-timeout-ms <value>`                    |         | Global eval round timeout (ms) (integer >= 1000)              |
-| `--global-eval-candidate-timeout-ms <value>`                |         | Global eval candidate timeout (ms) (integer >= 1000)          |
-| `--global-eval-cache-max <value>`                           |         | Global eval round-result cache max entries (integer 1-100000) |
-| `--global-eval-wait-timeout-ms <value>`                     |         | Global eval wait timeout (ms) (integer >= 1000)               |
-| `--dashboard-verified-issuer <value>`                       |         | Dashboard verified issuer (an absolute http(s) URL)           |
-| `--global-workflows-enabled <value>`                        |         | Global workflows enabled (true\|false)                        |
+| Option                                                      | Default | Description                                                                                            |
+| ----------------------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------ |
+| `--format <format>`                                         | `table` | Output format: json\|table                                                                             |
+| `--max-github-payload-bytes <value>`                        |         | Max GitHub payload bytes (integer >= 1024)                                                             |
+| `--event-log-max-payload-bytes <value>`                     |         | Event-log max payload bytes (integer >= 1024)                                                          |
+| `--lock-file-max-bytes <value>`                             |         | Lock-file max bytes (integer >= 1024)                                                                  |
+| `--webhook-dedup-ttl-ms <value>`                            |         | Webhook dedup TTL (ms) (integer >= 1000)                                                               |
+| `--contributor-cache-ttl-ms <value>`                        |         | Contributor-cache TTL (ms) (integer >= 1000) [deprecated: inert — no code reads it; removed at v1.0.0] |
+| `--event-router-event-ttl-seconds <value>`                  |         | Event-router event TTL (s) (integer >= 1)                                                              |
+| `--event-router-max-dispatch-attempts <value>`              |         | Event-router max dispatch attempts (integer >= 1)                                                      |
+| `--queue-max-depth <value>`                                 |         | Queue max depth (integer >= 1)                                                                         |
+| `--reroute-flap-grace-ms <value>`                           |         | Reroute flap grace (ms) (integer >= 1000)                                                              |
+| `--max-fanout-hosts <value>`                                |         | Max fanout hosts (integer >= 1)                                                                        |
+| `--event-router-rate-limit-per-workflow-per-minute <value>` |         | Event-router rate limit (/wf/min) (integer >= 1)                                                       |
+| `--cache-max-tarball-bytes <value>`                         |         | Cache max tarball bytes (integer >= 1024)                                                              |
+| `--cache-ttl-days <value>`                                  |         | Cache TTL (days) (integer >= 1)                                                                        |
+| `--check-run-tracking-ttl-days <value>`                     |         | Check-run tracking TTL (days) (integer >= 0)                                                           |
+| `--concurrency-wait-timeout-ms <value>`                     |         | Concurrency wait timeout (ms) (integer >= 1000)                                                        |
+| `--agent-token-ttl-ms <value>`                              |         | Agent token TTL (ms) (integer >= 1000)                                                                 |
+| `--ownership-db-check-timeout-ms <value>`                   |         | Ownership DB check timeout (ms) (integer >= 100)                                                       |
+| `--unroutable-grace-ms <value>`                             |         | Unroutable fast-fail grace (ms) (integer >= 0)                                                         |
+| `--ingest-overflow-claim-timeout-ms <value>`                |         | Ingest queue claim timeout (ms) (integer >= 60000)                                                     |
+| `--lockfile-cache-max <value>`                              |         | Lock-file cache max entries (integer 1-100000)                                                         |
+| `--lockfile-cache-max-bytes <value>`                        |         | Lock-file cache max bytes (integer >= 1024)                                                            |
+| `--lockfile-cache-ttl-ms <value>`                           |         | Lock-file cache TTL (ms) (integer >= 1000)                                                             |
+| `--content-cache-max <value>`                               |         | Content cache max entries (integer 1-100000)                                                           |
+| `--content-cache-max-bytes <value>`                         |         | Content cache max bytes (integer >= 1024)                                                              |
+| `--content-cache-ttl-ms <value>`                            |         | Content cache TTL (ms) (integer >= 1000)                                                               |
+| `--global-eval-round-timeout-ms <value>`                    |         | Global eval round timeout (ms) (integer >= 1000)                                                       |
+| `--global-eval-candidate-timeout-ms <value>`                |         | Global eval candidate timeout (ms) (integer >= 1000)                                                   |
+| `--global-eval-cache-max <value>`                           |         | Global eval round-result cache max entries (integer 1-100000)                                          |
+| `--global-eval-wait-timeout-ms <value>`                     |         | Global eval wait timeout (ms) (integer >= 1000)                                                        |
+| `--scaler-reap-interval-ms <value>`                         |         | Scaler reap interval (ms) (integer >= 5000)                                                            |
+| `--scaler-reap-stranded-timeout-ms <value>`                 |         | Scaler reap stranded timeout (ms) (integer >= 60000)                                                   |
+| `--scaler-reap-reattempt-interval-ms <value>`               |         | Scaler reap re-attempt interval (ms) (integer >= 60000)                                                |
+| `--scaler-claim-retention-ms <value>`                       |         | Scaler claim retention (ms) (integer >= 0)                                                             |
+| `--scaler-provision-backoff-base-ms <value>`                |         | Scaler provision backoff base (ms) (integer >= 1000)                                                   |
+| `--scaler-provision-backoff-max-ms <value>`                 |         | Scaler provision backoff max (ms) (integer >= 1000)                                                    |
+| `--scaler-provision-max-consecutive-failures <value>`       |         | Scaler provision max consecutive failures (integer >= 1)                                               |
+| `--dashboard-verified-issuer <value>`                       |         | Dashboard verified issuer (an absolute http(s) URL)                                                    |
+| `--global-workflows-enabled <value>`                        |         | Global workflows enabled (true\|false)                                                                 |
 
 ### `kici-admin cluster-settings show`
 

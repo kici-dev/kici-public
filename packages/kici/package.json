@@ -1,6 +1,6 @@
 {
   "name": "kici",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Developer CLI for the KiCI CI/CD stack. Compile workflows, run them locally, and interact with a remote orchestrator from the command line.",
   "keywords": [
     "ci",

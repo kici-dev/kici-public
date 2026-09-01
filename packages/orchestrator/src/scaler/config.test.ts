@@ -165,7 +165,7 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/requires an 'image' field/);
   });
 
-  it('rejects bare-metal scaler without binaryPath', () => {
+  it('rejects a bare-metal label set that names neither a binary nor an image', () => {
     const config = {
       version: 1,
       scalers: [
@@ -178,7 +178,50 @@ describe('scalerFileSchema', () => {
       ],
     };
 
-    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'binaryPath' field/);
+    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'binaryPath'/);
+  });
+
+  it('accepts a bare-metal label set that names an image and no binary', () => {
+    // Job-image mode: a job that names its own container image runs IN that
+    // image with the KiCI runtime injected. Requiring binaryPath unconditionally
+    // made that mode unreachable — no validated config could express its shape.
+    const config = {
+      version: 1,
+      scalers: [
+        {
+          name: 'bare-metal-job-image',
+          type: 'bare-metal',
+          maxAgents: 2,
+          labelSets: [{ labels: ['linux'], image: 'quay.io/kici-dev/kici-agent:1.2.3' }],
+        },
+      ],
+    };
+
+    expect(() => scalerFileSchema.parse(config)).not.toThrow();
+  });
+
+  it('accepts a bare-metal label set that names both a binary and an image', () => {
+    // Spawns the process; the image is where that process materializes the
+    // KiCI runtime from when it nests a job container.
+    const config = {
+      version: 1,
+      scalers: [
+        {
+          name: 'bare-metal-both',
+          type: 'bare-metal',
+          maxAgents: 2,
+          labelSets: [
+            {
+              labels: ['linux'],
+              binaryPath: '/usr/local/bin/kici-agent',
+              image: 'quay.io/kici-dev/kici-agent:1.2.3',
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(() => scalerFileSchema.parse(config)).not.toThrow();
   });
 
   it('validates globalMaxAgents must be positive', () => {
@@ -821,9 +864,47 @@ describe('mandatoryLabels validation', () => {
         },
       ],
     };
-    expect(() => scalerFileSchema.parse(config)).toThrow(
-      /mandatoryLabel.*gpu.*missing from labelSets/,
-    );
+    expect(() => scalerFileSchema.parse(config)).toThrow(/gate label.*gpu.*missing from labelSets/);
+  });
+
+  it('accepts a scaler whose label sets declare different platforms', () => {
+    const config = {
+      version: 1,
+      scalers: [
+        {
+          name: 'mixed',
+          type: 'container',
+          maxAgents: 5,
+          labelSets: [
+            // Each set's legacy taint derives from its own labels, so each
+            // gate is reachable from the set it gates. The scaler-wide union
+            // (`macos`) is not required of the linux set.
+            { labels: ['linux', 'gpu'], image: 'gpu:latest' },
+            { labels: ['macos', 'xcode'], image: 'mac:latest' },
+          ],
+        },
+      ],
+    };
+    expect(() => scalerFileSchema.parse(config)).not.toThrow();
+  });
+
+  it('accepts a configured gate label supplied only by the structured platform taint', () => {
+    const config = {
+      version: 1,
+      scalers: [
+        {
+          name: 'win-pool',
+          type: 'container',
+          maxAgents: 5,
+          platform: { os: 'windows', arch: 'x64' },
+          // `windows` is injected as a matchable label from the structured
+          // field, so the gate is reachable without declaring it by hand.
+          mandatoryLabels: ['windows'],
+          labelSets: [{ labels: ['ci'], image: 'win:latest' }],
+        },
+      ],
+    };
+    expect(() => scalerFileSchema.parse(config)).not.toThrow();
   });
 
   it('reports the offending labelSet index in the error', () => {
@@ -1186,5 +1267,78 @@ describe('parseMemoryString', () => {
     expect(() => parseMemoryString('abc')).toThrow(/Invalid memory format/);
     expect(() => parseMemoryString('')).toThrow(/Invalid memory format/);
     expect(() => parseMemoryString('512b')).toThrow(/Invalid memory format/);
+  });
+});
+
+describe('event scaler config', () => {
+  it('accepts a type:event entry with provisioningTargets and defaults the TTLs', () => {
+    const cfg = scalerFileSchema.parse({
+      version: 1,
+      scalers: [
+        {
+          name: 'hetzner',
+          type: 'event',
+          maxAgents: 5,
+          provisioningTargets: ['org/infra'],
+          labelSets: [{ labels: ['cloud=hetzner'] }],
+        },
+      ],
+    });
+    expect(cfg.scalers[0].type).toBe('event');
+    expect(cfg.scalers[0].provisioningTargets).toEqual(['org/infra']);
+    expect(cfg.scalers[0].claimTtlSeconds).toBe(300);
+    expect(cfg.scalers[0].agentTokenTtlSeconds).toBe(600);
+  });
+
+  it('honors explicit claimTtlSeconds / agentTokenTtlSeconds', () => {
+    const cfg = scalerFileSchema.parse({
+      version: 1,
+      scalers: [
+        {
+          name: 'hetzner',
+          type: 'event',
+          maxAgents: 5,
+          provisioningTargets: ['org/infra'],
+          claimTtlSeconds: 120,
+          agentTokenTtlSeconds: 900,
+          labelSets: [{ labels: ['cloud=hetzner'] }],
+        },
+      ],
+    });
+    expect(cfg.scalers[0].claimTtlSeconds).toBe(120);
+    expect(cfg.scalers[0].agentTokenTtlSeconds).toBe(900);
+  });
+
+  it('rejects a type:event entry with no provisioningTargets', () => {
+    expect(() =>
+      scalerFileSchema.parse({
+        version: 1,
+        scalers: [
+          {
+            name: 'hetzner',
+            type: 'event',
+            maxAgents: 5,
+            labelSets: [{ labels: ['cloud=hetzner'] }],
+          },
+        ],
+      }),
+    ).toThrow(/provisioningTargets/);
+  });
+
+  it('rejects a type:event entry with an empty provisioningTargets array', () => {
+    expect(() =>
+      scalerFileSchema.parse({
+        version: 1,
+        scalers: [
+          {
+            name: 'hetzner',
+            type: 'event',
+            maxAgents: 5,
+            provisioningTargets: [],
+            labelSets: [{ labels: ['cloud=hetzner'] }],
+          },
+        ],
+      }),
+    ).toThrow(/provisioningTargets/);
   });
 });

@@ -72,7 +72,7 @@ export async function resolveSecretInput(
   let result: SecretInputResult;
   if (opts.value !== undefined) {
     stderr.write(
-      'warning: --value puts the secret in shell history. Prefer --prompt, --from-stdin, --from-env, or --from-file.\n',
+      'warning: --value puts the value in shell history. Prefer --prompt, --from-stdin, --from-env, or --from-file.\n',
     );
     result = { value: opts.value, source: 'value' };
   } else if (opts.fromEnv !== undefined) {

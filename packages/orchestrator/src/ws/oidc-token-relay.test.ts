@@ -83,7 +83,9 @@ describe('createOidcTokenHandler', () => {
   function buildHandler(
     response: unknown,
     calls?: { count: number },
-    extra?: { testMode?: boolean; testMintDeferAudience?: string; testMintRejectAudience?: string },
+    extra?: {
+      initialMintFault?: (audience: string) => boolean;
+    },
   ) {
     const platformClient = {
       sendRequestAndAwait: async (_type: string, payload: Record<string, unknown>) => {
@@ -97,11 +99,15 @@ describe('createOidcTokenHandler', () => {
       dispatcher,
       platformClient,
       orchestratorId: 'orch-1',
-      testMode: extra?.testMode ?? false,
-      testMintDeferAudience: extra?.testMintDeferAudience,
-      testMintRejectAudience: extra?.testMintRejectAudience,
+      initialMintFault: extra?.initialMintFault,
     });
   }
+
+  /** A defer predicate that fires only for the given marker audience. */
+  const deferFor =
+    (marker: string) =>
+    (audience: string): boolean =>
+      audience === marker;
 
   it('mints for an owned job, supplying the dispatcher-resolved runId', async () => {
     const handler = buildHandler({
@@ -167,8 +173,8 @@ describe('createOidcTokenHandler', () => {
     });
   });
 
-  describe('mint-defer fault injection (test-only)', () => {
-    it('force-defers the initial mint when test-mode + audience matches the marker', async () => {
+  describe('mint-defer fault injection (test-only, injected predicate)', () => {
+    it('force-defers the initial mint when the injected predicate matches the defer marker', async () => {
       const calls = { count: 0 };
       // A result response would normally succeed; the injection must short-circuit
       // BEFORE the Platform relay, so the client is never called.
@@ -179,28 +185,24 @@ describe('createOidcTokenHandler', () => {
           result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
         },
         calls,
-        { testMode: true, testMintDeferAudience: 'kici-provenance' },
+        { initialMintFault: deferFor('kici-provenance') },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance' });
       expect(res).toEqual({ deferred: true, code: 'unavailable' });
       expect(calls.count).toBe(0);
     });
 
-    it('does NOT defer when test-mode is off even if the marker env is set', async () => {
-      const handler = buildHandler(
-        {
-          type: 'oidc.mint.response',
-          requestId: 'x',
-          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
-        },
-        undefined,
-        { testMode: false, testMintDeferAudience: 'kici-provenance' },
-      );
+    it('does NOT defer when no predicate is injected (shipped default)', async () => {
+      const handler = buildHandler({
+        type: 'oidc.mint.response',
+        requestId: 'x',
+        result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+      });
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance' });
       expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
     });
 
-    it('does NOT defer a non-matching audience under test-mode', async () => {
+    it('does NOT defer a non-matching audience under the injected predicate', async () => {
       const handler = buildHandler(
         {
           type: 'oidc.mint.response',
@@ -208,15 +210,15 @@ describe('createOidcTokenHandler', () => {
           result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
         },
         undefined,
-        { testMode: true, testMintDeferAudience: 'kici-provenance' },
+        { initialMintFault: deferFor('kici-provenance') },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
       expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
     });
   });
 
-  describe('mint-reject fault injection — initial mint defers (test-only)', () => {
-    it('force-defers the initial mint for the reject-marker audience under test-mode', async () => {
+  describe('mint-reject fault injection — initial mint defers (test-only, injected predicate)', () => {
+    it('force-defers the initial mint for the reject-marker audience via the injected predicate', async () => {
       const calls = { count: 0 };
       // The initial agent mint must defer for the reject audience too, so a
       // pending_attestations row is created that the retrier later rejects.
@@ -228,14 +230,14 @@ describe('createOidcTokenHandler', () => {
           result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
         },
         calls,
-        { testMode: true, testMintRejectAudience: 'kici-provenance-reject' },
+        { initialMintFault: deferFor('kici-provenance-reject') },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance-reject' });
       expect(res).toEqual({ deferred: true, code: 'unavailable' });
       expect(calls.count).toBe(0);
     });
 
-    it('does NOT defer the reject audience when test-mode is off (real mint attempted)', async () => {
+    it('does NOT defer the reject audience when no predicate is injected (real mint attempted)', async () => {
       const calls = { count: 0 };
       const handler = buildHandler(
         {
@@ -244,14 +246,13 @@ describe('createOidcTokenHandler', () => {
           result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
         },
         calls,
-        { testMode: false, testMintRejectAudience: 'kici-provenance-reject' },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance-reject' });
       expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
       expect(calls.count).toBe(1);
     });
 
-    it('does NOT defer a non-matching audience even with the reject marker set', async () => {
+    it('does NOT defer a non-matching audience even with the reject predicate injected', async () => {
       const handler = buildHandler(
         {
           type: 'oidc.mint.response',
@@ -259,10 +260,53 @@ describe('createOidcTokenHandler', () => {
           result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
         },
         undefined,
-        { testMode: true, testMintRejectAudience: 'kici-provenance-reject' },
+        { initialMintFault: deferFor('kici-provenance-reject') },
       );
       const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
       expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+    });
+  });
+
+  describe('mint fault injection — injected predicate (direct)', () => {
+    it('defers when the injected initialMintFault predicate returns true', async () => {
+      const calls = { count: 0 };
+      const seen: string[] = [];
+      // The injected predicate alone drives the seam and must short-circuit
+      // BEFORE the Platform relay.
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        calls,
+        {
+          initialMintFault: (audience) => {
+            seen.push(audience);
+            return audience === 'kici-provenance';
+          },
+        },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'kici-provenance' });
+      expect(res).toEqual({ deferred: true, code: 'unavailable' });
+      expect(calls.count).toBe(0);
+      expect(seen).toEqual(['kici-provenance']);
+    });
+
+    it('mints normally when the injected predicate returns false', async () => {
+      const calls = { count: 0 };
+      const handler = buildHandler(
+        {
+          type: 'oidc.mint.response',
+          requestId: 'x',
+          result: { token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' },
+        },
+        calls,
+        { initialMintFault: () => false },
+      );
+      const res = await handler('agent-1', { jobId: 'job-1', audience: 'sigstore' });
+      expect(res).toEqual({ token: 'eyJ.a.b', expiresIn: 600, jti: 'run-1:job-1' });
+      expect(calls.count).toBe(1);
     });
   });
 });

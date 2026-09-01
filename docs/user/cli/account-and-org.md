@@ -344,7 +344,6 @@ Synopsis: `kici init [options]`
 | `--private-registry <url>`         |                        | Scaffold a workflow registries: entry pointing at <url>                                             |
 | `--private-registry-scope <scope>` |                        | Optional npm package scope (e.g. @my-org) for the private registry                                  |
 | `--private-registry-secret <ref>`  | `production:NPM_TOKEN` | Qualified secret reference (env:NAME) the private registry token comes from                         |
-| `--use-verdaccio-local`            | `false`                |                                                                                                     |
 
 ### `kici login`
 

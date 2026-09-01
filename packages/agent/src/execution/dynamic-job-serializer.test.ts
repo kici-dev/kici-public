@@ -407,6 +407,30 @@ describe('serializeJobsToLock', () => {
     await expect(serializeJobsToLock(jobs, mockCtx())).rejects.toThrow("Duplicate job name 'dup'");
   });
 
+  it('throws when a name collides with the shared round accumulator', async () => {
+    const seenNames = new Set<string>();
+    const first = [job('build', { runsOn: 'linux', steps: [step('s1', async () => {})] })];
+    const second = [job('build', { runsOn: 'linux', steps: [step('s1', async () => {})] })];
+
+    // First generator's output serializes fine and seeds the accumulator.
+    await serializeJobsToLock(first, mockCtx(), new Set(), new Set(), seenNames);
+    expect(seenNames.has('build')).toBe(true);
+
+    // Second generator re-emitting 'build' now collides across the round.
+    await expect(
+      serializeJobsToLock(second, mockCtx(), new Set(), new Set(), seenNames),
+    ).rejects.toThrow("Duplicate job name 'build'");
+  });
+
+  it('does not dedup across separate calls without a shared accumulator', async () => {
+    const first = [job('build', { runsOn: 'linux', steps: [step('s1', async () => {})] })];
+    const second = [job('build', { runsOn: 'linux', steps: [step('s1', async () => {})] })];
+
+    // No shared set: each call dedups only its own output, so both succeed.
+    await expect(serializeJobsToLock(first, mockCtx())).resolves.toHaveLength(1);
+    await expect(serializeJobsToLock(second, mockCtx())).resolves.toHaveLength(1);
+  });
+
   it('throws when exceeding max job limit', async () => {
     const jobs = Array.from({ length: MAX_DYNAMIC_JOBS + 1 }, (_, i) =>
       job(`job-${i}`, { runsOn: 'linux', steps: [step('s1', async () => {})] }),
@@ -555,5 +579,27 @@ describe('serializeJobsToLock', () => {
       },
     ]);
     expect(result[1].dependsOnGroups).toEqual(['test-shards']);
+  });
+});
+
+describe('serializeJobsToLock — generated invoke gate', () => {
+  it('carries the invoke field (incl. optional) across the wire', async () => {
+    const { invokeSource } = await import('@kici-dev/sdk');
+    const jobs = [job('docker', { invoke: invokeSource('myorg.docker-test', { optional: true }) })];
+    const result = await serializeJobsToLock(jobs, mockCtx());
+    expect(result).toHaveLength(1);
+    expect(result[0].invoke).toEqual({
+      event: 'myorg.docker-test',
+      scope: 'source',
+      optional: true,
+    });
+  });
+
+  it('omits invoke.optional for a require-by-default generated gate', async () => {
+    const { invokeSource } = await import('@kici-dev/sdk');
+    const jobs = [job('node', { invoke: invokeSource('myorg.node-test') })];
+    const result = await serializeJobsToLock(jobs, mockCtx());
+    expect(result[0].invoke?.event).toBe('myorg.node-test');
+    expect(result[0].invoke && 'optional' in result[0].invoke).toBe(false);
   });
 });

@@ -228,6 +228,29 @@ export interface QueuedJob {
 }
 
 /**
+ * The resource shape a job declares, read from the one location that always
+ * carries it.
+ *
+ * `jobConfig.resources` is where the declaration is stored and transported: it
+ * is what `job_config` holds across the DB round trip and what a worker
+ * receives over the wire. The typed `resources` field on {@link QueuedJobInput}
+ * and {@link QueuedJob} is a convenience mirror, and it is optional — several
+ * dispatch paths build their input without it (the worker's reroute handler and
+ * the webhook dispatch path among them). So a consumer that reads only the
+ * mirror sees a job that declares nothing, and a shape-sensitive decision made
+ * on that reading is wrong rather than merely unaware.
+ *
+ * Callers that hold a mirror still prefer it — it is the same value — and fall
+ * back here.
+ */
+export function resourcesFromJobConfig(
+  jobConfig: Record<string, unknown> | undefined,
+): ResourceRequest | undefined {
+  const declared = jobConfig?.resources;
+  return declared && typeof declared === 'object' ? (declared as ResourceRequest) : undefined;
+}
+
+/**
  * DB-backed FIFO job dispatch queue using Kysely (PostgreSQL only).
  * Uses SQL-based JSONB containment queries (@> operator) for label matching.
  */
@@ -357,13 +380,24 @@ export class JobQueue {
    * @param agentLabels Labels the agent provides.
    * @param agentMandatoryLabels Mandatory labels the spawning scaler declared
    *   (empty for static / non-scaler agents).
+   * @param canServe Optional extra predicate applied to every candidate row
+   *   before it is claimed. Labels cannot express whether a pre-spawned agent's
+   *   fixed cpu / memory / image fit a job, so a caller that has to answer that
+   *   supplies it here — the row must never be claimed and put back, because a
+   *   claim-then-release both strands it as Dispatched for a window and burns a
+   *   dispatch attempt. Supplying it opts out of the single-statement fast
+   *   path, so pass it only for an agent that actually needs the check.
    * @returns The matching job, or null if none found.
    */
   async dequeueForLabels(
     agentLabels: string[],
     agentMandatoryLabels: string[] = [],
     agentId?: string,
+    canServe?: (job: QueuedJob) => boolean,
   ): Promise<QueuedJob | null> {
+    if (canServe) {
+      return this.claimWithPostFilter(agentLabels, agentMandatoryLabels, agentId, canServe);
+    }
     // Fast path: pattern-free rows, single-statement atomic claim (the 99% hot
     // path) — the row leaves Pending in the same statement that selects it, so
     // the caller's markDispatched only re-affirms a transition already made.
@@ -529,6 +563,46 @@ export class JobQueue {
       const job = this.rowToQueuedJob(row);
       if (!jobPatternsSatisfiedBy(job, labelSet)) continue;
       // Another agent may have won the conditional claim; only return on success.
+      if (await this.claimRowById(row.id, agentId)) return job;
+    }
+    return null;
+  }
+
+  /**
+   * Both drain passes at once, with an extra JS predicate between the SELECT
+   * and the claim.
+   *
+   * Same shape as {@link claimWithPatterns} and for the same reason: the filter
+   * has to run BEFORE the row transitions, so the claim is a conditional
+   * `status = Pending` UPDATE by id rather than the embedded sub-select the
+   * fast path uses. Claiming first and releasing on a rejection is not an
+   * option — it strands the row as Dispatched for the width of the round trip
+   * and spends one of the job's bounded dispatch attempts every time an
+   * unsuitable agent polls.
+   *
+   * It covers pattern-free rows too, which the fast path would otherwise take
+   * first, so the predicate is applied to every candidate rather than to the
+   * pattern-bearing minority. Losing a claim continues to the next candidate,
+   * exactly as the pattern pass does.
+   */
+  private async claimWithPostFilter(
+    agentLabels: string[],
+    agentMandatoryLabels: string[],
+    agentId: string | undefined,
+    canServe: (job: QueuedJob) => boolean,
+  ): Promise<QueuedJob | null> {
+    const labelSet = new Set(agentLabels);
+    const rows = await this.drainBaseQuery(agentLabels, agentMandatoryLabels, agentId)
+      .selectAll()
+      .orderBy('created_at', 'asc')
+      .limit(10)
+      .forUpdate()
+      .skipLocked()
+      .execute();
+    for (const row of rows) {
+      const job = this.rowToQueuedJob(row);
+      if (!jobPatternsSatisfiedBy(job, labelSet)) continue;
+      if (!canServe(job)) continue;
       if (await this.claimRowById(row.id, agentId)) return job;
     }
     return null;
@@ -1430,10 +1504,7 @@ export class JobQueue {
    */
   private rowToQueuedJob(row: DispatchQueueItem): QueuedJob {
     const jobConfig = JSON.parse(row.job_config) as Record<string, unknown>;
-    const resources =
-      jobConfig.resources && typeof jobConfig.resources === 'object'
-        ? (jobConfig.resources as ResourceRequest)
-        : undefined;
+    const resources = resourcesFromJobConfig(jobConfig);
     return {
       id: row.id,
       runId: row.run_id,

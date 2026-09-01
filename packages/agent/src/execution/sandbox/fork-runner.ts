@@ -19,6 +19,7 @@ import type {
   ConcurrencyReportMessage,
   AgentApiRequestIpc,
   CacheRequestIpc,
+  GitGrantRequestIpc,
   ProvenanceRequestIpc,
   ArtifactRequestIpc,
   StepApprovalRequestIpc,
@@ -27,6 +28,48 @@ import type {
 import { buildSanitizedEnv } from './env-sanitizer.js';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { toErrorMessage } from '@kici-dev/shared';
+
+/**
+ * Best-effort SIGKILL/SIGTERM of an entire process group led by `pid`.
+ * `process.kill(-pid, signal)` targets the group whose leader is `pid` (the
+ * child was spawned `detached`, so its pid is its group id). Returns 1 when the
+ * group was signalled, 0 when it was already gone (ESRCH) or the pid is invalid.
+ * We cannot cheaply count members, so the caller treats a non-zero return as
+ * "reap attempted".
+ */
+export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): number {
+  if (pid === undefined || !Number.isInteger(pid) || pid <= 1) return 0;
+  try {
+    process.kill(-pid, signal);
+    return 1;
+  } catch {
+    // ESRCH = group already gone; any other error is treated as "nothing
+    // signalled" — the caller only distinguishes reaped-something from not.
+    return 0;
+  }
+}
+
+/**
+ * SIGTERM the job's process group, wait a short grace, then SIGKILL. No-op
+ * (returns 0) when the child was not spawned detached or has no pid. Returns the
+ * count of reap attempts that signalled a live group (0, 1, or 2).
+ */
+export async function reapGroup(
+  pid: number | undefined,
+  detached: boolean,
+  killFn: (p: number | undefined, s: NodeJS.Signals) => number = killProcessGroup,
+  sleepMs = 2000,
+): Promise<number> {
+  if (!detached || pid === undefined) return 0;
+  // A 0 from the SIGTERM attempt is ESRCH — the whole group is already gone (if
+  // any member, including a backgrounded daemon, were alive the group signal
+  // would succeed and return 1). Nothing left to escalate, so skip the grace
+  // wait rather than pay it on every job whose tree exited cleanly.
+  const termed = killFn(pid, 'SIGTERM');
+  if (termed === 0) return 0;
+  await new Promise((r) => setTimeout(r, sleepMs));
+  return termed + killFn(pid, 'SIGKILL');
+}
 
 /** Options for creating a fork-based runner. */
 interface ForkRunnerOptions {
@@ -58,6 +101,18 @@ interface ForkRunnerOptions {
    * Defaults to 30_000 (30 seconds).
    */
   maxGracePeriodMs?: number;
+  /**
+   * Spawn the runner child `detached` so it leads its own process group. Set by
+   * the bare-metal backend when orphan cleanup is on and bwrap is off, so the
+   * between-jobs phase can reap a backgrounded daemon that reparented to init.
+   * Ignored under bwrap (its PID namespace already contains the tree).
+   */
+  detachProcessGroup?: boolean;
+  /**
+   * Between-jobs out-of-band cleanup re-run: the runner reuses the preserved
+   * workdir and runs only the job's declared cleanup / onFailure hooks.
+   */
+  cleanupOnly?: boolean;
 }
 
 /**
@@ -89,6 +144,30 @@ export interface ForkRunnerHandle {
    *                      Capped by the agent's maxGracePeriodMs.
    */
   cancel: (force: boolean, gracePeriodMs?: number) => void;
+  /**
+   * Whether this runner leads its own detached process group (bare-metal,
+   * non-bwrap, orphan cleanup on). Drives whether `reap()` does anything.
+   */
+  detached: boolean;
+  /**
+   * True once the runner emitted `completion-hooks-done` (its onSuccess /
+   * onFailure / cleanup hooks ran). Stays false when the child exits before
+   * signalling, which is the between-jobs phase's cue to re-run declared
+   * cleanup out-of-band.
+   */
+  completionHooksRan: boolean;
+  /**
+   * True once the runner reported (via `hooks-declared`) that the job declares
+   * an `onFailure` / `cleanup` hook. Recorded early so it survives a later hard
+   * kill; gates whether the out-of-band cleanup re-run is attempted.
+   */
+  declaresCleanup: boolean;
+  /**
+   * SIGTERM → grace → SIGKILL the runner's process group, reaping any daemon it
+   * backgrounded. No-op (resolves 0) when the runner is not detached; returns
+   * the number of reap attempts that signalled a live group.
+   */
+  reap: () => Promise<number>;
 }
 
 /**
@@ -96,10 +175,15 @@ export interface ForkRunnerHandle {
  *
  * Maps orchestrator dispatch fields to the subset needed by the workflow runner.
  */
-export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecutionRequest {
+export function buildRequest(
+  dispatch: JobDispatch,
+  workDir: string,
+  extra?: { cleanupOnly?: boolean; credentialHelperPath?: string },
+): JobExecutionRequest {
   const jobConfig = dispatch.jobConfig as Record<string, unknown>;
 
   return {
+    ...(extra?.cleanupOnly ? { cleanupOnly: true } : {}),
     runId: dispatch.runId,
     jobId: dispatch.jobId,
     workDir,
@@ -110,6 +194,7 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
     sourceAuth: dispatch.sourceAuth,
     workflowAuth: dispatch.workflowAuth,
 
+    ...(extra?.credentialHelperPath ? { credentialHelperPath: extra.credentialHelperPath } : {}),
     sourceTarUrl: dispatch.sourceTarUrl,
     sourceTarHash: dispatch.sourceTarHash,
     depsUrl: dispatch.depsUrl,
@@ -177,6 +262,10 @@ export function buildRequest(dispatch: JobDispatch, workDir: string): JobExecuti
     upstreamJobStatuses: dispatch.upstreamJobStatuses as
       Record<string, import('@kici-dev/engine').ExecutionJobStatus> | undefined,
     jobNeeds: jobConfig.needs as readonly unknown[] | undefined,
+
+    // Per-invoke-gate results for a standard downstream job's ctx.needs['<gate>'].result.
+    upstreamInvokeResults: dispatch.upstreamInvokeResults as
+      Record<string, import('@kici-dev/engine').InvokeResult[]> | undefined,
 
     // Private-registry install auth (Phase 4 of private-registry plan).
     npmRegistries: dispatch.npmRegistries,
@@ -481,6 +570,9 @@ function spawnRunnerChild(
       env: sanitizedEnv,
       stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
       cwd: effectiveWorkDir || undefined,
+      // Own process group so the between-jobs reap can signal the whole tree.
+      // Keep the IPC channel + pipes; never .unref() (the supervisor awaits exit).
+      detached: options.detachProcessGroup === true,
     });
   }
   return { child, pidAssigned: Boolean(child.pid) };
@@ -539,8 +631,15 @@ interface ForkRunnerCtx {
   startTime: number;
   resolve: (result: JobExecutionResult) => void;
   cancelTimers: NodeJS.Timeout[];
-  state: { forkState: ForkState; jobCompleted: boolean };
+  state: {
+    forkState: ForkState;
+    jobCompleted: boolean;
+    completionHooksRan: boolean;
+    declaresCleanup: boolean;
+  };
   stderrLines: string[];
+  /** When true, the `ready` handler tells the runner to run cleanup-only. */
+  cleanupOnly: boolean;
 }
 
 function clearAllCancelTimers(ctx: ForkRunnerCtx): void {
@@ -627,6 +726,28 @@ function relayCacheRequest(msg: CacheRequestIpc, ctx: ForkRunnerCtx): void {
   );
 }
 
+/** Relay `git.grant.request` to the agent's grant table and pipe the response
+ *  (or an error response, or a "not configured" response when the callback
+ *  isn't wired) back into the sandbox runner. */
+function relayGitGrantRequest(msg: GitGrantRequestIpc, ctx: ForkRunnerCtx): void {
+  if (!ctx.execOptions.onGitGrantRequest) {
+    safeSendToChild(ctx.child, {
+      type: 'git.grant.response',
+      requestId: msg.requestId,
+      error: 'Git credentials are not available in this agent configuration',
+    });
+    return;
+  }
+  ctx.execOptions.onGitGrantRequest(msg).then(
+    (response) => safeSendToChild(ctx.child, response),
+    (err) =>
+      safeSendToChild(ctx.child, {
+        type: 'git.grant.response',
+        requestId: msg.requestId,
+        error: toErrorMessage(err),
+      }),
+  );
+}
 /** Relay `provenance.request` and pipe the orchestrator response (or an error
  *  response, or a "not configured" response when the callback isn't wired) back
  *  into the sandbox runner. */
@@ -753,7 +874,10 @@ function relayChildIpcMessage(
     case 'ready':
       safeSendToChild(ctx.child, {
         type: 'execute',
-        request: buildRequest(dispatch, ctx.effectiveWorkDir),
+        request: buildRequest(dispatch, ctx.effectiveWorkDir, {
+          cleanupOnly: ctx.cleanupOnly,
+          credentialHelperPath: ctx.execOptions.credentialHelperPath,
+        }),
       });
       return;
     case 'log.line':
@@ -813,6 +937,9 @@ function relayChildIpcMessage(
     case 'agent.api.request':
       relayAgentApiRequest(msg as AgentApiRequestIpc, ctx);
       return;
+    case 'git.grant.request':
+      relayGitGrantRequest(msg as GitGrantRequestIpc, ctx);
+      return;
     case 'cache.request':
       relayCacheRequest(msg as CacheRequestIpc, ctx);
       return;
@@ -824,6 +951,12 @@ function relayChildIpcMessage(
       return;
     case 'approval.request':
       relayApprovalRequest(msg as StepApprovalRequestIpc, ctx);
+      return;
+    case 'hooks-declared':
+      ctx.state.declaresCleanup = msg.declaresCleanup;
+      return;
+    case 'completion-hooks-done':
+      ctx.state.completionHooksRan = true;
       return;
     case 'job.complete':
       handleJobComplete(msg, dispatch, ctx);
@@ -877,6 +1010,7 @@ function buildCancelFn(
   ctx: ForkRunnerCtx,
   defaultGracePeriodMs: number,
   agentMaxGracePeriodMs: number,
+  detached: boolean,
 ): (force: boolean, gracePeriodMs?: number) => void {
   const doForceCancel = (): void => {
     ctx.state.forkState = 'force_killing';
@@ -886,6 +1020,9 @@ function buildCancelFn(
     } catch {
       // Process may already be dead
     }
+    // Kill the whole group too, so a cancelled job's backgrounded daemons die
+    // immediately; the between-jobs reap() is idempotent over this.
+    if (detached) killProcessGroup(child.pid, 'SIGKILL');
     clearAllCancelTimers(ctx);
   };
 
@@ -962,6 +1099,10 @@ export function createForkRunner(
       abort: async () => {},
       kill: noopFn,
       cancel: noopFn,
+      detached: false,
+      completionHooksRan: false,
+      declaresCleanup: false,
+      reap: async () => 0,
     };
   }
 
@@ -973,9 +1114,17 @@ export function createForkRunner(
   // ForkRunnerHandle can clear timers synchronously without waiting for the
   // child's exit handler to fire.
   const cancelTimers: NodeJS.Timeout[] = [];
-  const sharedState: { forkState: ForkState; jobCompleted: boolean } = {
+  const detached = options.detachProcessGroup === true;
+  const sharedState: {
+    forkState: ForkState;
+    jobCompleted: boolean;
+    completionHooksRan: boolean;
+    declaresCleanup: boolean;
+  } = {
     forkState: 'running',
     jobCompleted: false,
+    completionHooksRan: false,
+    declaresCleanup: false,
   };
 
   // cancelFn is assigned synchronously inside the result Promise so the handle
@@ -993,13 +1142,14 @@ export function createForkRunner(
       cancelTimers,
       state: sharedState,
       stderrLines,
+      cleanupOnly: options.cleanupOnly === true,
     };
 
     process.stderr.write(
       `[fork-runner] Child process spawned: pid=${child.pid}, runner=${options.runnerPath}, cwd=${effectiveWorkDir}\n`,
     );
 
-    cancelFn = buildCancelFn(child, ctx, defaultGracePeriodMs, agentMaxGracePeriodMs);
+    cancelFn = buildCancelFn(child, ctx, defaultGracePeriodMs, agentMaxGracePeriodMs, detached);
 
     child.on('message', (msg: RunnerToAgentMessage) => relayChildIpcMessage(msg, dispatch, ctx));
     child.on('exit', (code, signal) => handleChildExitWithoutCompletion(code, signal, ctx));
@@ -1037,5 +1187,13 @@ export function createForkRunner(
       cancelTimers.length = 0;
     },
     cancel: (force: boolean, gracePeriodMs?: number) => cancelFn(force, gracePeriodMs),
+    detached,
+    get completionHooksRan() {
+      return sharedState.completionHooksRan;
+    },
+    get declaresCleanup() {
+      return sharedState.declaresCleanup;
+    },
+    reap: () => reapGroup(child.pid, detached),
   };
 }

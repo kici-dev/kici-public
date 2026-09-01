@@ -15,37 +15,47 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 <!-- BEGIN GENERATED: agent-env (do not edit; run the doc generator) -->
 
-| Env var                                | Required | Default    | Type                                    | Aliases | Description |
-| -------------------------------------- | -------- | ---------- | --------------------------------------- | ------- | ----------- |
-| `KICI_AGENT_COMMAND`                   | no       |            | string                                  |         |             |
-| `KICI_AGENT_ID`                        | no       |            | string                                  |         |             |
-| `KICI_AGENT_IS_ORCHESTRATOR_HOST`      | no       |            | string                                  |         |             |
-| `KICI_AGENT_PAYLOAD_DIR`               | no       |            | string                                  |         |             |
-| `KICI_AGENT_TOKEN`                     | no       |            | string                                  |         |             |
-| `KICI_BACKPRESSURE_MODE`               | no       | "pause"    | enum:pause\|drop                        |         |             |
-| `KICI_DEFAULT_STEP_TIMEOUT_MS`         | no       | 1800000    | number                                  |         |             |
-| `KICI_DOCKER_KEEP_FAILED`              | no       | "false"    | string                                  |         |             |
-| `KICI_EXECUTION_MODE`                  | no       |            | enum:container\|bare-metal\|firecracker |         |             |
-| `KICI_GITHUB_TOKEN`                    | no       |            | string                                  |         |             |
-| `KICI_IN_PLACE`                        | no       | "false"    | string                                  |         |             |
-| `KICI_LABELS`                          | no       |            | string                                  |         |             |
-| `KICI_MAX_LOG_SIZE_BYTES`              | no       | 10485760   | number                                  |         |             |
-| `KICI_ORCHESTRATOR_URL`                | yes      |            | string                                  |         |             |
-| `KICI_PORT`                            | no       | 8080       | number                                  |         |             |
-| `KICI_PROPERTIES`                      | no       |            | string                                  |         |             |
-| `KICI_ROLES`                           | no       |            | string                                  |         |             |
-| `KICI_SANDBOX`                         | no       | "false"    | string                                  |         |             |
-| `KICI_SANDBOX_HARDENED`                | no       | "true"     | string                                  |         |             |
-| `KICI_SANDBOX_MEMORY_BYTES`            | no       | 2147483648 | number                                  |         |             |
-| `KICI_SANDBOX_NANO_CPUS`               | no       | 2000000000 | number                                  |         |             |
-| `KICI_SANDBOX_NETWORK`                 | no       | "isolated" | enum:isolated\|host                     |         |             |
-| `KICI_SANDBOX_PIDS_LIMIT`              | no       | 512        | number                                  |         |             |
-| `KICI_SANDBOX_READONLY_ROOTFS`         | no       | "false"    | string                                  |         |             |
-| `KICI_SANDBOX_USER`                    | no       |            | string                                  |         |             |
-| `KICI_SCALER_IDLE_TIMEOUT`             | no       | 5000       | number                                  |         |             |
-| `KICI_SCALER_MANAGED`                  | no       |            | string                                  |         |             |
-| `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` | no       | 60000      | number                                  |         |             |
-| `KICI_TRUSTED_ENV`                     | no       | "false"    | string                                  |         |             |
+| Env var                                    | Required | Default    | Type                                    | Aliases | Description |
+| ------------------------------------------ | -------- | ---------- | --------------------------------------- | ------- | ----------- |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND`    | no       |            | string                                  |         |             |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON`     | no       | "always"   | enum:always\|on-failure                 |         |             |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS` | no       | 60000      | number                                  |         |             |
+| `KICI_AGENT_COMMAND`                       | no       |            | string                                  |         |             |
+| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | no       | "false"    | string                                  |         |             |
+| `KICI_AGENT_ID`                            | no       |            | string                                  |         |             |
+| `KICI_AGENT_IS_ORCHESTRATOR_HOST`          | no       |            | string                                  |         |             |
+| `KICI_AGENT_ORPHAN_CLEANUP`                | no       | "true"     | string                                  |         |             |
+| `KICI_AGENT_PAYLOAD_DIR`                   | no       |            | string                                  |         |             |
+| `KICI_AGENT_TOKEN`                         | no       |            | string                                  |         |             |
+| `KICI_BACKPRESSURE_MODE`                   | no       | "pause"    | enum:pause\|drop                        |         |             |
+| `KICI_CONTAINER_BUILD_CLI`                 | no       |            | enum:docker\|podman                     |         |             |
+| `KICI_DEFAULT_STEP_TIMEOUT_MS`             | no       | 1800000    | number                                  |         |             |
+| `KICI_DOCKER_KEEP_FAILED`                  | no       | "false"    | string                                  |         |             |
+| `KICI_EXECUTION_MODE`                      | no       |            | enum:container\|bare-metal\|firecracker |         |             |
+| `KICI_GITHUB_TOKEN`                        | no       |            | string                                  |         |             |
+| `KICI_IN_PLACE`                            | no       | "false"    | string                                  |         |             |
+| `KICI_JOB_IMAGE_AGENT`                     | no       |            | string                                  |         |             |
+| `KICI_LABELS`                              | no       |            | string                                  |         |             |
+| `KICI_MAX_LOG_SIZE_BYTES`                  | no       | 10485760   | number                                  |         |             |
+| `KICI_ORCHESTRATOR_URL`                    | yes      |            | string                                  |         |             |
+| `KICI_PORT`                                | no       | 8080       | number                                  |         |             |
+| `KICI_PROPERTIES`                          | no       |            | string                                  |         |             |
+| `KICI_ROLES`                               | no       |            | string                                  |         |             |
+| `KICI_RUNTIME_IMAGE`                       | no       |            | string                                  |         |             |
+| `KICI_RUNTIME_NODE_SOURCE`                 | no       |            | string                                  |         |             |
+| `KICI_SANDBOX`                             | no       | "false"    | string                                  |         |             |
+| `KICI_SANDBOX_HARDENED`                    | no       | "true"     | string                                  |         |             |
+| `KICI_SANDBOX_MEMORY_BYTES`                | no       | 2147483648 | number                                  |         |             |
+| `KICI_SANDBOX_NANO_CPUS`                   | no       | 2000000000 | number                                  |         |             |
+| `KICI_SANDBOX_NETWORK`                     | no       | "isolated" | enum:isolated\|host                     |         |             |
+| `KICI_SANDBOX_PIDS_LIMIT`                  | no       | 512        | number                                  |         |             |
+| `KICI_SANDBOX_READONLY_ROOTFS`             | no       | "false"    | string                                  |         |             |
+| `KICI_SANDBOX_USER`                        | no       |            | string                                  |         |             |
+| `KICI_SCALER_CLAIM_CODE`                   | no       |            | string                                  |         |             |
+| `KICI_SCALER_IDLE_TIMEOUT`                 | no       | 5000       | number                                  |         |             |
+| `KICI_SCALER_MANAGED`                      | no       |            | string                                  |         |             |
+| `KICI_SCALER_PENDING_DISPATCH_TIMEOUT`     | no       | 60000      | number                                  |         |             |
+| `KICI_TRUSTED_ENV`                         | no       | "false"    | string                                  |         |             |
 
 <!-- END GENERATED: agent-env -->
 
@@ -112,6 +122,20 @@ Two agent-launch profiles change how a dispatched job is prepared. Both are set 
 
 `KICI_IN_PLACE` exists for running an operator's own already-built working tree directly — module-relative paths, installed dependencies, and build output are all present because nothing is copied. See [Local development plane](../orchestrator/local-dev-plane.md).
 
+## Between-jobs lifecycle (reused agents)
+
+A reused agent serves many jobs in turn on a shared host (the bare-metal / in-place profiles). After every job it runs a supervisor-owned cleanup phase, so one job's leftovers never reach the next. The phase, in order: reap the finished job's process tree, re-run declared cleanup out-of-band if the job process was hard-killed, delete the work directory, then run the optional operator reset command. All of it is a no-op on an ephemeral agent, which is discarded after one job.
+
+| Variable                                   | Default   | Effect                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KICI_AGENT_ORPHAN_CLEANUP`                | `true`    | Reap a finished job's leaked process tree. The agent runs each job in its own process group and signals the whole group when the job ends, so a backgrounded daemon cannot survive into the next job. Set `false` to signal only the runner and leave a backgrounded process alive on purpose. |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND`    | _(unset)_ | A host-reset command run between jobs (for example, pruning a container cache). Unset disables it. It runs after the reap and work-directory deletion. Fail-open: a failure never fails the finished job and never crashes the agent.                                                          |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS` | `60000`   | Timeout for the reset command.                                                                                                                                                                                                                                                                 |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON`     | `always`  | When the reset command runs: `always`, or `on-failure` to run it only after a failed job.                                                                                                                                                                                                      |
+| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | `false`   | When `true`, the agent stops accepting new jobs after repeated consecutive reset failures, so a persistently dirty host stops taking work.                                                                                                                                                     |
+
+Set a reset command when jobs on a shared host leave state the reap and work-directory deletion do not cover — a container image cache, a package cache, or a scratch mount. The `orphanCleanup` reap and the out-of-band cleanup re-run apply to the bare-metal / in-place profiles; the reset command runs for any backend but is meaningful only where jobs share a host. This phase is the primary cross-job cleanup; the agent's startup temp-directory sweep stays as a backstop.
+
 ## Co-located orchestrator guard
 
 Set `KICI_AGENT_IS_ORCHESTRATOR_HOST=true` when the agent shares a host with the orchestrator. A workflow's `restartHost()` step is then refused locally (`refusing to reboot the orchestrator host`), so a fleet-wide reboot workflow cannot take the control plane down with it. Defaults to `false`; the orchestrator refuses the same request independently.
@@ -132,6 +156,7 @@ For workflows that specify `container` in their job configuration, the agent exe
 Requirements:
 
 - A container runtime (Docker or Podman) must be installed and accessible on the agent host
+- `KICI_RUNTIME_IMAGE` set to a `kici-agent` image, so the job's image needs neither Node nor git (see [The injected runtime](#the-injected-runtime) below)
 - When the agent itself runs in a container, the runtime socket must be mounted into it:
 
 ```yaml
@@ -144,12 +169,100 @@ Podman exposes its socket at a different path (`/run/podman/podman.sock` rootful
 The agent:
 
 1. Creates a job container from the specified image (already-present images are used as-is; a missing image is pulled on demand first) with `/workspace` as a container-owned volume
-2. Starts the workflow runner inside the container via a single exec — the repository clone, dependency install, and every step all run inside the container
-3. Removes the container (and its workspace volume) after job completion
+2. Clones the repository on the host, then copies the tree into the container's `/workspace` volume — so the job's image needs no git, and clone credentials never enter it
+3. Starts the workflow runner inside the container via a single exec — the dependency install and every step run inside the container
+4. Removes the container (and its workspace volume) after job completion
 
 Job containers are hardened by default: all Linux capabilities dropped, no-new-privileges, cgroup PID/memory/CPU caps, and a private tmpfs `/tmp`, tunable via the `KICI_SANDBOX_*` variables above. See [Agent security](../security/agent-security.md) for the full isolation model and the per-job `sandbox:` escape hatch.
 
 Set `KICI_DOCKER_KEEP_FAILED=true` to preserve failed containers for debugging. The container name follows the pattern `kici-sandbox-{jobId}-{timestamp}`.
+
+### What a job image must provide
+
+| Requirement                                                                         | Applies to                                                                | Checked                                          |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
+| glibc (`/lib64/ld-linux-x86-64.so.2` on x64, `/lib/ld-linux-aarch64.so.1` on arm64) | every container job                                                       | image preflight, before the container is created |
+| `/bin/sh`                                                                           | every container job                                                       | image preflight, before the container is created |
+| `git` on `PATH`                                                                     | only an image that runs the agent itself (a scaler's per-job-image spawn) | agent startup                                    |
+| `bash` on `PATH`                                                                    | only an image that runs the agent itself                                  | agent startup                                    |
+
+Node and npm are never required — both come from the injected runtime. The
+preflight runs only when a runtime is injected; without one the image supplies
+its own Node and the glibc requirement does not apply. The two startup checks
+are not preflighted: the agent exits and the job waits for an agent that never
+registers, so the message names the image as the thing that must supply them.
+
+See [Container jobs](../../user/container-jobs.md) for the same table from the
+workflow author's side.
+
+### Building the job image from a Dockerfile
+
+A job may point `container` at a Dockerfile in the repository instead of naming
+an image. The agent clones, builds, and runs the job in the result.
+
+That needs `docker` or `podman` on the agent host's **`PATH`** — a runtime
+socket alone is not enough, because KiCI shells out to the CLI rather than
+driving the build over the API. One build path means one set of Dockerfile
+semantics: `.dockerignore` and BuildKit behave as they do on the author's own
+machine, instead of depending on which agent picked the job up. A host without a
+CLI fails the job with a message naming what to install.
+
+The agent reports what it found at registration, as self-reported labels
+alongside `kici:os:*` and `kici:arch:*`:
+
+| Label                          | Meaning                                                      |
+| ------------------------------ | ------------------------------------------------------------ |
+| `kici:runtime:docker`          | a docker socket answered — the agent can run a job container |
+| `kici:runtime:podman`          | a podman socket answered                                     |
+| `kici:runtime:container-build` | a build CLI is on `PATH` — the agent can build a job image   |
+
+The last one is separate on purpose: an agent given only a mounted runtime
+socket can **run** a container but not **build** one, because the build shells
+out to the CLI. The orchestrator routes a Dockerfile job only to an agent that
+reports `kici:runtime:container-build`, so a pool without a CLI is skipped at
+routing time rather than failing the job at build time.
+
+You may also name any of these in a job's `runsOn` to steer work yourself.
+
+`KICI_CONTAINER_BUILD_CLI` (`docker` | `podman`) picks which. Unset, the agent
+prefers `docker` and falls back to `podman`. Set it explicitly on a host that has
+both CLIs but whose container runtime is the other one. The build and the job
+container must land on the same daemon; otherwise the sandbox starts on a daemon
+that has never seen the image.
+
+The built image is tagged `kici-build:<runId>-<jobName>`, labelled
+`kici-managed=true`, and removed when the job finishes. The layer cache is what
+makes the next build fast, and it is not a tag, so it survives.
+
+The build runs on the host, outside the job container's hardened posture. The
+orchestrator refuses one on an untrusted ref unless the organization opted in
+(`kici-admin org-settings allow-untrusted-dockerfile-builds`).
+
+### The injected runtime
+
+A job may name any image, and that image is not required to ship Node. The agent
+mounts its own Node build into the job container, read-only at `/opt/kici/node`,
+and starts the workflow runner with it.
+
+`KICI_RUNTIME_IMAGE` names where that build comes from: a `kici-agent` image,
+which carries it at `/opt/kici`. The agent copies the build out of the image
+into a named volume the first time it is needed on that host, then reuses the
+volume. Point it at the image whose version matches this agent.
+
+An agent an auto-scaler spawns gets this set for you, from the image the pool is
+configured with. Set it yourself on an agent you start by hand.
+
+Two consequences of leaving it unset:
+
+- A `container` job runs on the image's own `node`. That works for an image
+  that ships one, and fails for one that does not.
+- The image preflight does not run, so a musl image such as `alpine` is not
+  refused up front.
+
+`KICI_RUNTIME_NODE_SOURCE` is the alternative for a host that provisions the
+build out of band: a directory whose `bin/node` is the runtime, or the name of
+a volume holding it. It takes precedence over `KICI_RUNTIME_IMAGE`, and nothing
+is copied.
 
 ## Authentication
 

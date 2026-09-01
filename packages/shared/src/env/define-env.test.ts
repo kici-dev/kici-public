@@ -314,15 +314,16 @@ describe('validateUnknownKiciVars', () => {
     ).not.toThrow();
   });
 
-  it('allowlists KICI_TEST_ISOLATION (the vitest config-isolation marker)', () => {
-    // Every vitest config in this repo sets KICI_TEST_ISOLATION at config-eval
-    // time (hack/lib/vitest-isolation.ts), and every service a test spawns
-    // inherits it. It is not a config typo — it must not trip the scanner.
+  it('allowlists KICI_CONFIG_DIR (the vitest config-isolation dir)', () => {
+    // Every vitest config in this repo sets KICI_CONFIG_DIR to an isolated dir
+    // at config-eval time (hack/lib/vitest-isolation.ts), and every service a
+    // test spawns inherits it. It is a real CLI var, not a config typo — it
+    // must not trip the scanner.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],
         {},
-        { KICI_SECRET_KEY: 'x', KICI_TEST_ISOLATION: '1' },
+        { KICI_SECRET_KEY: 'x', KICI_CONFIG_DIR: '/tmp/kici-test-config-xyz' },
       ),
     ).not.toThrow();
   });

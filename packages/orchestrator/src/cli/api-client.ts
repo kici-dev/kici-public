@@ -106,6 +106,27 @@ export function firstCauseMessage(err: unknown): string {
   return '';
 }
 
+/**
+ * True when a rejected `fetch` failed at the transport layer, as opposed to
+ * failing while the request was still being built.
+ *
+ * `fetch` uses a `TypeError` for both, so they are easy to conflate — but only
+ * a transport failure means the orchestrator was actually dialled. Measured
+ * against Node 24's undici:
+ *
+ *   closed port    → TypeError('fetch failed')                       cause: Error(ECONNREFUSED)
+ *   invalid header → TypeError('Headers.append: … invalid header …') cause: undefined
+ *   invalid URL    → TypeError('Failed to parse URL from …')         cause: Error(ERR_INVALID_URL)
+ *
+ * The discriminator is therefore the message, NOT the presence of a `cause`:
+ * the invalid-URL case carries one. undici uses exactly `fetch failed` for a
+ * transport failure and a descriptive message for everything it rejects before
+ * opening a connection.
+ */
+export function isTransportFailure(err: unknown): boolean {
+  return err instanceof TypeError && err.message === 'fetch failed';
+}
+
 export async function fetchAdminApi(
   url: string,
   init: RequestInit,
@@ -114,6 +135,22 @@ export async function fetchAdminApi(
   try {
     return await fetch(url, init);
   } catch (err) {
+    // A request we could never build is not a connectivity problem, and saying
+    // "cannot reach" sends the operator to check ports and firewalls for what is
+    // actually a malformed argument. The common shape is a credential carrying a
+    // stray newline — e.g. read out of an env file that declares the key twice.
+    if (!isTransportFailure(err)) {
+      // Trim a trailing period: undici's messages end with one, and appending
+      // ours produces `… invalid header value..` in an operator-facing string.
+      const detail = (err instanceof Error ? err.message : String(err)).replace(/\.$/, '');
+      throw new Error(
+        `the admin API request to ${baseUrl} could not be built: ${detail}. ` +
+          `The orchestrator was NOT contacted — this is a malformed request, not a ` +
+          `connectivity problem. A token or URL carrying a newline or stray whitespace is ` +
+          `the usual cause; check KICI_ADMIN_TOKEN / --token and KICI_ADMIN_URL / --url.`,
+        { cause: err },
+      );
+    }
     // undici puts the actionable detail (ECONNREFUSED, EAI_AGAIN, …) on `cause`,
     // but not always usefully: the cause is sometimes an Error with an empty
     // message, and sometimes an AggregateError whose detail sits in `.errors`

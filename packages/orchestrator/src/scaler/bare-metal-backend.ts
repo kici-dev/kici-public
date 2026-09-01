@@ -19,9 +19,20 @@ import {
 import { createLogger, type ToolRequirement } from '@kici-dev/shared';
 import { normalizeLabelSet } from './label-matcher.js';
 import { ScalerEventType } from './types.js';
+import Docker from 'dockerode';
+import { detectRuntime } from './container-backend.js';
+import {
+  pullImageIfMissing,
+  ensureRuntimeVolume,
+  runtimeInjectBind,
+  injectedAgentCommand,
+} from '@kici-dev/shared/container-runtime';
+import { KICI_RUNTIME_DOCKER_LABEL } from './container-routing.js';
+import type { ResolvedContainerSpawn } from './types.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type {
   ScalerBackend,
+  ScalerDestroyContext,
   ScalerEntry,
   ManagedAgent,
   LabelSetConfig,
@@ -35,7 +46,10 @@ import type {
 
 /** Extended ManagedAgent that includes the ChildProcess reference */
 interface BareMetalManagedAgent extends ManagedAgent {
-  process: ChildProcess;
+  /** Absent for a container-backed agent, which has no local child process. */
+  process?: ChildProcess;
+  /** Set for a container-backed agent; `destroy` removes it instead of killing a PID. */
+  containerId?: string;
 }
 
 export interface BareMetalScalerBackendOptions {
@@ -78,7 +92,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
   readonly type = ScalerBackendType.enum['bare-metal'];
   readonly spawnsOnLocalHost = true;
   readonly logsSource = 'bare-metal';
-  readonly maxAgents: number;
+  maxAgents: number;
 
   private _labelSets: LabelSetConfig[];
   private readonly name: string;
@@ -217,11 +231,11 @@ export class BareMetalScalerBackend implements ScalerBackend {
     orchestratorUrl: string,
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
-    _spawnContext?: SpawnContext,
-    // The bare-metal backend spawns a local process quickly; the abort signal is
-    // accepted for interface parity but not threaded — the ScalerManager
-    // deadline race still releases the semaphore slot if the spawn ever hangs.
-    _signal?: AbortSignal,
+    spawnContext?: SpawnContext,
+    // Threaded only on the container path, whose image pull can be slow. The
+    // local-process path still spawns quickly enough that the ScalerManager
+    // deadline race is the only guard it needs.
+    signal?: AbortSignal,
   ): Promise<ManagedAgent> {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
@@ -285,7 +299,13 @@ export class BareMetalScalerBackend implements ScalerBackend {
     // labels). The ephemeral token is bound to exactly this set so register-
     // time labels pass the scope gate; the agent adds only self-reported
     // os/arch/host facts on top, which the gate exempts.
-    const fullLabels = scalerAgentLabels(labelSet, this.type, this.name, this.roles);
+    const fullLabels = scalerAgentLabels(
+      labelSet,
+      this.type,
+      this.name,
+      this.roles,
+      spawnContext?.platformTaints,
+    );
 
     // 2.5. Create ephemeral agent token if token store is available
     if (this.tokenStore) {
@@ -300,6 +320,13 @@ export class BareMetalScalerBackend implements ScalerBackend {
     env.KICI_SCALER_MANAGED = '1';
     env.KICI_EXECUTION_MODE = 'bare-metal';
     env.KICI_PORT = '0';
+
+    // Where the agent materializes the KiCI runtime from when it NESTS a job
+    // container. A bare-metal agent is a plain host process with no /opt/kici
+    // of its own, so without an image to copy the tree out of a `container:`
+    // job could only run on an image that ships Node itself. A label set that
+    // declares no image leaves that historical contract in force.
+    if (matchedLabelSet.image) env.KICI_RUNTIME_IMAGE = matchedLabelSet.image;
 
     // 3.5. Backpressure mode (before label-set env so explicit env: can override)
     if (matchedLabelSet.backpressureMode) {
@@ -320,6 +347,33 @@ export class BareMetalScalerBackend implements ScalerBackend {
           `workflow steps (minus the agent's own KiCI identity secrets). ` +
           `KICI_SANDBOX=${env.KICI_SANDBOX ?? 'false'}.`,
       );
+    }
+
+    // Dual mode: a job that declared its own container image runs IN that
+    // image, with the KiCI runtime injected, rather than as a local process.
+    // Everything above — the env, the ephemeral token, the label set — is
+    // identical either way; only the launch differs.
+    //
+    // OPT-IN, not automatic. A `container:` job already worked here the other
+    // way round: this backend spawned a local agent, and that agent nested a
+    // job container. Taking the job-image path for every such job silently
+    // flips the topology of jobs that work today — which is exactly what broke
+    // two green scaler:bare-metal cases when it was automatic.
+    //
+    // The opt-in is the label set's own shape: one that declares an `image`
+    // and NO `binaryPath` has no local binary to spawn, so it can only mean
+    // job-image mode. An operator who wants the old behaviour changes nothing.
+    const jobImageMode = matchedLabelSet.image !== undefined && !matchedLabelSet.binaryPath;
+    if (spawnContext?.container && jobImageMode) {
+      return await this.spawnContainerAgent({
+        agentId,
+        labelSet,
+        container: spawnContext.container,
+        agentImage: matchedLabelSet.image,
+        env,
+        emit,
+        ...(signal ? { signal } : {}),
+      });
     }
 
     // Resolve cgroup wrapping: enforce only on Linux when enforceCgroups is true
@@ -415,6 +469,102 @@ export class BareMetalScalerBackend implements ScalerBackend {
     return managed;
   }
 
+  /**
+   * Launch the agent inside the job's own container image.
+   *
+   * The bare-metal backend historically only ran a local process, which meant a
+   * job naming its own image could not use this pool at all. With the KiCI
+   * runtime injected, the image needs neither Node nor git, so an arbitrary
+   * customer image can host the agent.
+   *
+   * Split out of `spawn()` because that function is already near the 200-line
+   * ceiling and the two launches share nothing past the env.
+   */
+  private async spawnContainerAgent(args: {
+    agentId: string;
+    labelSet: string[];
+    container: ResolvedContainerSpawn;
+    agentImage: string | undefined;
+    env: Record<string, string>;
+    emit: (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => void;
+    signal?: AbortSignal;
+  }): Promise<ManagedAgent> {
+    const { agentId, labelSet, container, agentImage, env, emit, signal } = args;
+
+    const runtime = await detectRuntime();
+    if (!runtime) {
+      // Fail fast and say WHY: routing should have kept this job away from a
+      // runtime-less pool, so reaching here means the label requirement was
+      // bypassed and the operator needs to know which half is wrong.
+      throw new Error(
+        `Job requires a container runtime, but scaler "${this.name}" found none on this host. ` +
+          `Install docker or podman, or route container jobs to a pool that advertises ` +
+          `${KICI_RUNTIME_DOCKER_LABEL}.`,
+      );
+    }
+    if (!agentImage) {
+      throw new Error(
+        `Scaler "${this.name}" cannot run a container job: its label set declares no agent ` +
+          `image, which is where the injected KiCI runtime comes from.`,
+      );
+    }
+
+    // Tell the agent it IS the job's image, so it runs the steps here instead
+    // of nesting a second container from the same image.
+    env.KICI_JOB_IMAGE_AGENT = '1';
+
+    const docker = new Docker({ socketPath: runtime.socketPath });
+
+    await pullImageIfMissing({
+      docker,
+      image: container.image,
+      ...(container.authconfig ? { authconfig: container.authconfig } : {}),
+      ...(signal ? { signal } : {}),
+      onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
+    });
+
+    const runtimeVolume = await ensureRuntimeVolume({
+      docker,
+      agentImage,
+      ...(signal ? { signal } : {}),
+      onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
+    });
+
+    emit(ScalerEventType.enum['scaler.provisioning'], 'creating container');
+    const created = await docker.createContainer({
+      Image: container.image,
+      Env: Object.entries(env).map(([k, v]) => `${k}=${v}`),
+      // The agent runs on the INJECTED node, never the image's own — the image
+      // is not required to ship one.
+      Cmd: injectedAgentCommand(),
+      Labels: {
+        'kici-managed': 'true',
+        'kici-scaler-name': this.name,
+        'kici-agent-id': agentId,
+        'kici-labels': normalizeLabelSet(labelSet),
+      },
+      HostConfig: { Binds: [runtimeInjectBind(runtimeVolume)], AutoRemove: false },
+    });
+    await created.start();
+
+    const managed: BareMetalManagedAgent = {
+      id: agentId,
+      labelSet,
+      backendRef: created.id,
+      containerId: created.id,
+      spawnedAt: Date.now(),
+      state: 'running',
+    };
+    this.agents.set(managed.id, managed);
+
+    emit(
+      ScalerEventType.enum['scaler.ready'],
+      `agent container started (${created.id.slice(0, 12)}) on ${container.image}`,
+    );
+    emit(ScalerEventType.enum['agent.connecting'], 'waiting for agent WS registration');
+    return managed;
+  }
+
   getScalerContext(agentId: string): Record<string, unknown> | undefined {
     const managed = this.agents.get(agentId);
     if (!managed) return undefined;
@@ -432,7 +582,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
     };
   }
 
-  async destroy(managedId: string): Promise<void> {
+  async destroy(managedId: string, _context?: ScalerDestroyContext): Promise<void> {
+    // _context (teardown reason) is only meaningful to the event backend.
     const managed = this.agents.get(managedId);
     if (!managed) return;
 
@@ -443,6 +594,23 @@ export class BareMetalScalerBackend implements ScalerBackend {
     if (capture) {
       capture.close();
       this.logCaptures.delete(managedId);
+    }
+
+    // A container-backed agent has no PID to signal — remove the container.
+    if (managed.containerId) {
+      try {
+        const runtime = await detectRuntime();
+        if (runtime) {
+          await new Docker({ socketPath: runtime.socketPath })
+            .getContainer(managed.containerId)
+            .remove({ force: true });
+        }
+      } catch {
+        // Already gone, or the runtime disappeared — either way there is
+        // nothing left to reap, and the tracking entry must still be dropped.
+      }
+      this.agents.delete(managedId);
+      return;
     }
 
     const pid = parseInt(managed.backendRef, 10);
@@ -479,6 +647,62 @@ export class BareMetalScalerBackend implements ScalerBackend {
   }
 
   /**
+   * Force-reclaim a container-mode agent this backend no longer tracks.
+   *
+   * `destroy()` opens with an in-memory map lookup, so an orchestrator restart
+   * makes it a silent no-op while the container keeps running. The container
+   * backend's own startup sweep does not cover this one either: it removes every
+   * `kici-managed` container, but it only runs when a container scaler is
+   * configured, and a bare-metal-only deployment has none.
+   *
+   * The host-local evidence is the container itself: `spawnContainerAgent` stamps
+   * `kici-agent-id` and `kici-scaler-name` onto it, and a container listing only
+   * ever names containers on this host. So a coordinator cannot reach a peer's
+   * compute through this path — a wrongly-routed agent id simply matches nothing.
+   *
+   * A process-mode agent is NOT reclaimed here. Its PID lives in the in-memory
+   * entry alone, so a restart leaves no durable, host-local artifact to key off,
+   * and reclaiming it would need a persistence mechanism this backend does not
+   * have. Scanning the process table instead would risk signalling a recycled
+   * PID.
+   *
+   * @returns `true` when a container for `managedId` was found and removed.
+   */
+  async reapUnowned(managedId: string): Promise<boolean> {
+    if (this.agents.has(managedId)) {
+      // Still tracked, so `destroy()` owns this id and unwinds it in full.
+      return false;
+    }
+
+    const runtime = await detectRuntime();
+    if (!runtime) return false;
+    const docker = new Docker({ socketPath: runtime.socketPath });
+
+    const found = await docker.listContainers({
+      all: true,
+      filters: { label: [`kici-agent-id=${managedId}`, `kici-scaler-name=${this.name}`] },
+    });
+    if (found.length === 0) return false;
+
+    createLogger({ prefix: 'bare-metal-backend' }).warn(
+      'bare-metal: reclaiming an unowned agent container',
+      { managedId, containers: found.length },
+    );
+
+    let reaped = false;
+    for (const info of found) {
+      try {
+        await docker.getContainer(info.Id).remove({ force: true });
+        reaped = true;
+      } catch {
+        // Already gone, or the runtime disappeared — either way there is
+        // nothing left to reap.
+      }
+    }
+    return reaped;
+  }
+
+  /**
    * Get the LogCapture for a managed agent (used by ScalerManager for log forwarding).
    */
   getLogCapture(managedId: string): LogCapture | undefined {
@@ -490,12 +714,20 @@ export class BareMetalScalerBackend implements ScalerBackend {
     await Promise.allSettled(ids.map((id) => this.destroy(id)));
   }
 
-  reload(labelSets: LabelSetConfig[]): ValidationResult {
-    // Validate: all bare-metal label sets must have binaryPath
+  reload(
+    labelSets: LabelSetConfig[],
+    opts?: { maxAgents?: number; entry?: ScalerEntry },
+  ): ValidationResult {
+    // A label set names what to launch: a local binary, an agent image
+    // (job-image mode), or both. Mirrors the same rule the config schema
+    // enforces at load — a reload that accepted a narrower set than the initial
+    // parse would fail a SIGHUP on a file that started the process fine.
     const errors: string[] = [];
     labelSets.forEach((ls, i) => {
-      if (!ls.binaryPath) {
-        errors.push(`Label set [${i}] requires a 'binaryPath' field for bare-metal backend`);
+      if (!ls.binaryPath && !ls.image) {
+        errors.push(
+          `Label set [${i}] requires a 'binaryPath' or an 'image' field for bare-metal backend`,
+        );
       }
     });
 
@@ -504,6 +736,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
     }
 
     this._labelSets = labelSets;
+    if (opts?.maxAgents !== undefined) {
+      this.maxAgents = opts.maxAgents;
+    }
     this.warnNetworkPolicy(labelSets, createLogger({ prefix: 'bare-metal-backend' }));
     return { valid: true };
   }
@@ -566,9 +801,14 @@ export class BareMetalScalerBackend implements ScalerBackend {
    * Returns true if the process exited, false if timed out.
    */
   private waitForExit(managed: BareMetalManagedAgent, timeoutMs: number): Promise<boolean> {
+    const child = managed.process;
+    // A container-backed agent has no child process; `destroy` removes the
+    // container and returns before ever reaching here.
+    if (!child) return Promise.resolve(true);
+
     return new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
-        managed.process.removeListener('exit', onExit);
+        child.removeListener('exit', onExit);
         resolve(false);
       }, timeoutMs);
 
@@ -578,13 +818,13 @@ export class BareMetalScalerBackend implements ScalerBackend {
       };
 
       // Check if already dead
-      if (managed.process.exitCode !== null || managed.process.signalCode !== null) {
+      if (child.exitCode !== null || child.signalCode !== null) {
         clearTimeout(timer);
         resolve(true);
         return;
       }
 
-      managed.process.once('exit', onExit);
+      child.once('exit', onExit);
     });
   }
 }

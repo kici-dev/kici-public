@@ -108,19 +108,14 @@ export interface OidcTokenHandlerDeps {
   };
   platformClient: MintPlatformClient;
   orchestratorId: string;
-  /** Test-only fault-injection master switch (config.testMode). */
-  testMode: boolean;
   /**
-   * Test-only: force-defer the *initial* agent mint for any job requesting this
-   * OIDC audience (config.testMintDeferAudience). Ignored unless `testMode`.
+   * Test-only fault-injection predicate over the requested OIDC `audience`,
+   * supplied only by the build-time test double. Returning `true` short-circuits
+   * the *initial* mint to a transient defer BEFORE the real Platform relay is
+   * contacted — it can only defer/reject, never forge or weaken a signature.
+   * Undefined (the shipped default) means no fault injection.
    */
-  testMintDeferAudience?: string;
-  /**
-   * Test-only: force the *initial* agent mint to defer for this OIDC audience
-   * (config.testMintRejectAudience) so a pending row is created, which the
-   * retrier then terminally rejects. Ignored unless `testMode`.
-   */
-  testMintRejectAudience?: string;
+  initialMintFault?: (audience: string) => boolean;
 }
 
 /**
@@ -138,25 +133,17 @@ export function createOidcTokenHandler(
     if (!owned) {
       throw new MintRejectedError(`job ${jobId} not owned by agent ${agentId}`);
     }
-    // Test-only fault injection: force the initial agent mint to defer for a
-    // marker audience so an E2E can exercise the deferred-attestation retry
-    // path with a REAL run. Two markers defer here: testMintDeferAudience
-    // (retrier later succeeds → serve path) and testMintRejectAudience (retrier
-    // later terminally rejects → markRejected → --include-rejected re-arm path).
-    // Double-gated (testMode AND a marker) so production — which leaves both
-    // unset — never reaches it. The retrier's re-mint uses requestMint directly
-    // and applies the reject knob at its own call site (server.ts).
-    if (
-      deps.testMode &&
-      ((deps.testMintDeferAudience && audience === deps.testMintDeferAudience) ||
-        (deps.testMintRejectAudience && audience === deps.testMintRejectAudience))
-    ) {
-      logger.warn(
-        'mint-defer fault-injection ACTIVE — forcing a transient mint failure. ' +
-          'Production deployments must clear KICI_TEST_MODE + ' +
-          'KICI_TEST_MINT_DEFER_AUDIENCE / KICI_TEST_MINT_REJECT_AUDIENCE.',
-        { jobId, audience },
-      );
+    // Test-only fault injection: the build-time test double supplies
+    // `initialMintFault` to force the initial agent mint to defer for a marker
+    // audience, so an E2E can exercise the deferred-attestation retry path with
+    // a REAL run. The predicate can only defer/reject BEFORE the real Platform
+    // relay is contacted — never forge or weaken a signature. The shipped
+    // orchestrator leaves it undefined, so this branch is never reached.
+    if (deps.initialMintFault?.(audience)) {
+      logger.warn('mint-defer fault-injection ACTIVE via injected policy.', {
+        jobId,
+        audience,
+      });
       return { deferred: true, code: 'unavailable' };
     }
     try {

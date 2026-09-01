@@ -20,10 +20,13 @@ import {
   CacheStepType,
   CacheRunEventType,
 } from '@kici-dev/engine';
-import type { LogStream } from '@kici-dev/engine';
+import type { LockJob, LogStream } from '@kici-dev/engine';
 import type { ChangedFilesStatus } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
 import { gitClone, type GitAuth } from '../checkout/git-clone.js';
+import { cloneJobRepos, type CloneJobReposRequest } from '../checkout/clone-job-repos.js';
+import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
+import { startJobGitCredentials, type JobGitCredentials } from '../checkout/job-git-credentials.js';
 import { computeChangedFiles, type ChangedFilesResult } from '../checkout/changed-files.js';
 import { loadWorkflowSource, extractWorkflow } from './workflow-loader.js';
 import { packKiciSource } from './source-packer.js';
@@ -53,6 +56,8 @@ import { buildKiciApi, buildNeedsContext } from '@kici-dev/sdk';
 import type { DynamicJobNeed, RepoInfo, EventPayload } from '@kici-dev/sdk';
 import type { $ as Shell } from 'zx';
 import { LogStreamer } from './log-streamer.js';
+import { CONTAINER_BUILD_STEP_INDEX, runJobImageBuild } from './image-build/build-step.js';
+import { buildJobImage, resolveBuildCli, sandboxSocketPath } from './image-build/build-engine.js';
 import { runCaptured, type CaptureSink } from './console-capture.js';
 import { applyOverlay } from './overlay-applier.js';
 import { installDeps } from './dep-installer.js';
@@ -80,6 +85,7 @@ import {
   fileCloneSourceBinds,
 } from './sandbox/index.js';
 import { stepsTotal, stepDurationSeconds, cloneDurationSeconds } from '../metrics/prometheus.js';
+import { BetweenJobsController, type AfterJobContext } from './between-jobs-controller.js';
 
 const logger = createLogger({ prefix: 'job-runner' });
 
@@ -367,11 +373,23 @@ export interface JobRunnerDeps {
   send: (msg: AgentToOrchestratorMessage) => void;
   /** Agent config */
   config: AppConfig;
+  /**
+   * Supervisor-owned between-jobs phase, run after every job to reap the
+   * process tree, re-run declared cleanup out-of-band, delete the workdir, and
+   * run the operator reset command. Optional so unit harnesses can omit it.
+   */
+  betweenJobsController?: BetweenJobsController;
   /** Request a pre-signed S3 upload URL from the orchestrator via WS request-response. */
   requestUploadUrl: (
     jobId: string,
     cacheType: 'source' | 'deps',
-    key: { contentHash?: string; lockfileHash?: string; platform: string; arch: string },
+    key: {
+      contentHash?: string;
+      lockfileHash?: string;
+      depsHash?: string;
+      platform: string;
+      arch: string;
+    },
   ) => Promise<string>;
   /** Notify orchestrator that an S3 upload is complete (for metadata initialization). */
   sendUploadComplete: (
@@ -574,8 +592,15 @@ export function resolveRunnerBundlePath(runnerPath: string): string {
  */
 function determineExecutionMode(
   jobConfig: Record<string, unknown>,
-  agentConfig: Pick<AppConfig, 'executionMode' | 'scalerManaged'>,
+  agentConfig: Pick<AppConfig, 'executionMode' | 'scalerManaged' | 'jobImageAgent'>,
 ): ExecutionMode {
+  // This agent IS the job's image — the scaler spawned it from `container:`
+  // with the KiCI runtime injected. Nesting another container from the same
+  // image would need a runtime inside a runtime; run the steps right here.
+  if (agentConfig.jobImageAgent) {
+    return 'bare-metal';
+  }
+
   // Container config in job dispatch takes highest priority
   const containerConfig = jobConfig.container;
   if (containerConfig) {
@@ -672,6 +697,8 @@ export class JobRunner {
   private readonly _sendRunEvent: JobRunnerDeps['sendRunEvent'];
   private readonly _sendConcurrencyReport: JobRunnerDeps['sendConcurrencyReport'];
   private readonly _sendApiRequest?: JobRunnerDeps['sendApiRequest'];
+  /** Live git credentials per job, so the sandbox can reach the grant table. */
+  private readonly jobGitCredentials = new Map<string, JobGitCredentials>();
   private readonly _requestUserCache?: JobRunnerDeps['requestUserCache'];
   private readonly _relayProvenance?: JobRunnerDeps['relayProvenance'];
   private readonly _requestUserArtifact?: JobRunnerDeps['requestUserArtifact'];
@@ -683,9 +710,28 @@ export class JobRunner {
   /** Active sandbox for the current job (used for abort). */
   private activeSandbox: ExecutionSandbox | null = null;
 
+  /** Supervisor-owned between-jobs phase (reap / cleanup re-run / reset). */
+  private readonly betweenJobsController?: BetweenJobsController;
+
+  /**
+   * Facts about the just-finished standard job, captured before sandbox
+   * teardown so the between-jobs controller (run in `execute`'s `.finally`) can
+   * reach them. Null for special job types (init / build / dynamic), which run
+   * no sandbox — the controller then only deletes the workdir and resets.
+   */
+  private betweenJobsFacts: {
+    completionHooksRan: boolean;
+    declaresCleanup: boolean;
+    backend: ExecutionMode;
+    jobFailed: boolean;
+    reap: () => Promise<number>;
+    cleanupSpawn?: (workDir: string, signal: AbortSignal) => Promise<void>;
+  } | null = null;
+
   constructor(deps: JobRunnerDeps) {
     this.send = deps.send;
     this.config = deps.config;
+    this.betweenJobsController = deps.betweenJobsController;
     this.requestUploadUrl = deps.requestUploadUrl;
     this.sendUploadComplete = deps.sendUploadComplete;
     this.sendEventEmit = deps.sendEventEmit;
@@ -725,17 +771,117 @@ export class JobRunner {
       (dispatch.jobConfig as Record<string, unknown>).checkout = false;
     }
 
+    this.betweenJobsFacts = null;
+
+    // Stand up git credentials for this job: the helper socket git talks to and
+    // the grant table `withWrite` elevates. Started before the job so every
+    // clone it makes is configured to use the helper, and torn down in the same
+    // `finally` as the workdir so a failed job cannot leak the socket.
+    const gitCredentials = await this.startGitCredentials(
+      jobId,
+      dispatch.jobConfig as Record<string, unknown>,
+    );
+
     // Track this job
     const completionPromise = this.runJob(dispatch, workDir, abortController).finally(async () => {
+      const facts = this.betweenJobsFacts;
       this.activeJobs.delete(jobId);
       this.activeSandbox = null;
-      // Clean up work directory (no-op for the in-place profile).
-      await cleanup();
+      this.betweenJobsFacts = null;
+      this.jobGitCredentials.delete(jobId);
+      await gitCredentials?.close().catch(() => {
+        /* best effort — the socket lives in the job dir, reaped with it */
+      });
+
+      // Between-jobs phase: reap the process tree, re-run declared cleanup
+      // out-of-band, delete the workdir, run the operator reset. Owns the
+      // workdir deletion so the out-of-band re-run can use the preserved dir
+      // first. A throw here must never break the supervisor loop — the job has
+      // already been reported.
+      await this.runBetweenJobsPhase(facts, workDir, cleanup);
     });
 
     this.activeJobs.set(jobId, { abortController, completionPromise, runId: dispatch.runId });
 
     return completionPromise;
+  }
+
+  /**
+   * Stand up per-job git credentials, or `undefined` when the agent has no
+   * orchestrator relay (unit harnesses, offline local runs).
+   *
+   * A failure here must not fail the job: without a helper, git falls back to
+   * its own mechanisms exactly as it did before this existed. The job simply
+   * cannot push.
+   */
+  private async startGitCredentials(
+    jobId: string,
+    jobConfig: Record<string, unknown>,
+  ): Promise<JobGitCredentials | undefined> {
+    if (!this._sendApiRequest) return undefined;
+    try {
+      const { path: dir } = await makeTempDir(`gitcred-${jobId}`);
+      const credentials = await startJobGitCredentials({
+        jobId,
+        dir,
+        sendApiRequest: this._sendApiRequest,
+        // Declared on the job as `gitCredentials`; rides the lock file through
+        // `jobConfig`, so no dispatch-schema change was needed. Values are
+        // secret NAMES — the orchestrator resolves them.
+        credentials: jobConfig.gitCredentials as
+          Readonly<Record<string, Readonly<Record<string, string>>>> | undefined,
+      });
+      this.jobGitCredentials.set(jobId, credentials);
+      return credentials;
+    } catch (err) {
+      logger.warn('Could not start git credentials for job; git push will not work', {
+        jobId,
+        error: toErrorMessage(err),
+      });
+      return undefined;
+    }
+  }
+  /**
+   * Run the supervisor-owned between-jobs phase after a job finishes. Delegates
+   * to the injected `BetweenJobsController` (out-of-band cleanup → reap →
+   * workdir delete → operator reset) with facts captured before sandbox
+   * teardown. When no controller is wired (unit harnesses) it just deletes the
+   * workdir, preserving the historical behavior. Never throws.
+   */
+  private async runBetweenJobsPhase(
+    facts: JobRunner['betweenJobsFacts'],
+    workDir: string,
+    deleteWorkdir: () => Promise<void>,
+  ): Promise<void> {
+    if (!this.betweenJobsController) {
+      // No between-jobs phase configured: preserve the workdir-cleanup behavior.
+      await deleteWorkdir().catch((err) =>
+        logger.warn('Work directory cleanup error', { error: toErrorMessage(err) }),
+      );
+      return;
+    }
+
+    // Facts are absent for special job types (init / build / dynamic): they run
+    // no sandbox, so there is nothing to reap or re-run — only delete + reset.
+    const ctx: AfterJobContext = {
+      completionHooksRan: facts?.completionHooksRan ?? true,
+      jobFailed: facts?.jobFailed ?? false,
+      backend: facts?.backend ?? 'bare-metal',
+      declaresCleanup: facts?.declaresCleanup ?? false,
+      workDir,
+      reap: facts?.reap ?? (() => Promise.resolve(0)),
+      deleteWorkdir,
+      ...(facts?.cleanupSpawn ? { cleanupSpawn: facts.cleanupSpawn } : {}),
+    };
+
+    try {
+      await this.betweenJobsController.afterJob(ctx);
+    } catch (err) {
+      logger.error('Between-jobs phase error', { error: toErrorMessage(err) });
+      // The workdir may not have been deleted if the controller threw early;
+      // ensure it is removed so a reused agent does not accumulate workdirs.
+      await deleteWorkdir().catch(() => {});
+    }
   }
 
   /**
@@ -872,6 +1018,12 @@ export class JobRunner {
 
     // Create sandbox for this job
     let sandbox: ExecutionSandbox | undefined;
+    // Backend + failure disposition, captured for the between-jobs facts below.
+    // jobFailed defaults to true: an agent-side throw before a result is a
+    // failure, and a job that leaked a daemon and then threw is exactly the
+    // leak the reap targets, so it must still be reaped.
+    let backend: ExecutionMode = 'bare-metal';
+    let jobFailed = true;
 
     // Owned here (not inside runSandboxExecution) so an execution that throws
     // still flushes whatever the failing step had already streamed. Without it
@@ -886,6 +1038,7 @@ export class JobRunner {
         return;
       }
       sandbox = setupResult.sandbox;
+      backend = setupResult.executionMode;
 
       const result = await this.runSandboxExecution(
         dispatch,
@@ -893,6 +1046,7 @@ export class JobRunner {
         abortController,
         logStreamers,
       );
+      jobFailed = result.status !== ExecutionJobStatus.enum.success;
 
       this.reportExecutionResult(dispatch, result, logStreamers);
     } catch (error) {
@@ -909,8 +1063,27 @@ export class JobRunner {
       });
     } finally {
       clearInterval(heartbeatTimer);
-      // Always tear down the sandbox
       if (sandbox) {
+        // Capture the facts the between-jobs controller needs BEFORE teardown —
+        // and on the throw path too, so a job that leaked a daemon and then hit
+        // an agent-side error is still reaped. completionHooksRan /
+        // declaresCleanup read the (still-live) runner handle; reap + the
+        // cleanup-only re-run bind to this sandbox.
+        const jobSandbox = sandbox;
+        this.betweenJobsFacts = {
+          completionHooksRan: jobSandbox.completionHooksRan ?? true,
+          declaresCleanup: jobSandbox.declaresCleanup ?? false,
+          backend,
+          jobFailed,
+          reap: () => jobSandbox.reap?.() ?? Promise.resolve(0),
+          ...(jobSandbox.runCleanupOnly
+            ? {
+                cleanupSpawn: (wd: string, sig: AbortSignal) => jobSandbox.runCleanupOnly!(wd, sig),
+              }
+            : {}),
+        };
+        // Always tear down the sandbox (kills the runner child; the process
+        // group survives for the reap in the between-jobs phase).
         this.emitRunEvent(runId, 'agent.teardown', { jobId });
         await sandbox.teardown().catch((err) => {
           logger.warn('Sandbox teardown error', {
@@ -932,7 +1105,11 @@ export class JobRunner {
     dispatch: JobDispatch,
     workDir: string,
     abortController: AbortController,
-  ): Promise<{ sandbox: ExecutionSandbox; sanitizedEnv: Record<string, string> } | null> {
+  ): Promise<{
+    sandbox: ExecutionSandbox;
+    sanitizedEnv: Record<string, string>;
+    executionMode: ExecutionMode;
+  } | null> {
     const { runId, jobId, jobConfig } = dispatch;
 
     // Check for abort before sandbox creation
@@ -945,6 +1122,7 @@ export class JobRunner {
     const executionMode = determineExecutionMode(jobConfig as Record<string, unknown>, {
       executionMode: this.config.executionMode,
       scalerManaged: this.config.scalerManaged,
+      jobImageAgent: this.config.jobImageAgent,
     });
     const runnerPath = resolveRunnerPath();
     // Secrets are NOT injected into env vars -- they flow through IPC to ctx.secrets.
@@ -957,6 +1135,45 @@ export class JobRunner {
       trustedEnv: this.config.trustedEnv,
     });
 
+    // Step 1b: For a container job, clone on the HOST rather than inside the
+    // customer's image. Two things fall out of that: the image needs no git,
+    // and clone-time credentials stay on the host where the credential helper
+    // already works — instead of needing a route into a container hardened
+    // with `CapDrop: ALL`, which would hand anything in /workspace a direct
+    // line to the credential broker.
+    //
+    // The runner is then told the checkout is already done, so it does not
+    // re-clone over the tree we copy in.
+    const hostCheckout =
+      executionMode === 'container' && (jobConfig as Record<string, unknown>).checkout !== false;
+    if (hostCheckout) {
+      const isGlobal = (jobConfig as Record<string, unknown>).isGlobalWorkflow === true;
+      await cloneJobRepos(
+        dispatch as unknown as CloneJobReposRequest,
+        {
+          workDir,
+          workflowDir: isGlobal ? join(workDir, 'workflow') : workDir,
+          sourceDir: isGlobal ? join(workDir, 'source') : workDir,
+        },
+        {
+          isGlobal,
+          log: (line) => logger.info(`[host-checkout] ${line}`, { jobId }),
+          excludeScratchFromGit,
+        },
+      );
+      (jobConfig as Record<string, unknown>).checkout = false;
+    }
+
+    // Step 1c: A job may declare a Dockerfile instead of an image. Build it
+    // here — after the clone, whose tree is the build context, and before the
+    // sandbox, which runs the tag the build produces.
+    const builtImage = await this.buildJobImageIfDeclared(
+      dispatch,
+      jobConfig as Record<string, unknown>,
+      workDir,
+      abortController,
+    );
+
     logger.info('Creating execution sandbox', { executionMode, jobId, runnerPath });
 
     const sandbox = this.createSandbox(executionMode, {
@@ -964,6 +1181,8 @@ export class JobRunner {
       env: sanitizedEnv,
       jobId,
       jobConfig: jobConfig as Record<string, unknown>,
+      registryAuth: dispatch.containerRegistryAuth,
+      ...(builtImage ? { builtImage } : {}),
     });
 
     this.activeSandbox = sandbox;
@@ -976,6 +1195,7 @@ export class JobRunner {
       workDir,
       env: sanitizedEnv,
       extraReadOnlyBinds: fileCloneSourceBinds(dispatch.repoUrl),
+      ...(hostCheckout ? { workspaceFromHost: true } : {}),
     });
 
     if (abortController.signal.aborted) {
@@ -996,7 +1216,7 @@ export class JobRunner {
       envVars: this.collectEnvVars(sanitizedEnv),
     });
 
-    return { sandbox, sanitizedEnv };
+    return { sandbox, sanitizedEnv, executionMode };
   }
 
   /**
@@ -1102,8 +1322,24 @@ export class JobRunner {
         };
       },
       onApiRequest: this._sendApiRequest
-        ? withBootstrapInterception(async (method, params) => this._sendApiRequest!(method, params))
+        ? withBootstrapInterception(async (method, params) => {
+            // A git credential request from `ctx.kici.git.github.getToken()`
+            // reaches the orchestrator directly rather than through the
+            // credential helper, so it carries no ref of its own. Attach the
+            // job's declared credential here, where the map lives.
+            const patched =
+              method === GIT_CREDENTIAL_REQUEST_METHOD
+                ? (this.jobGitCredentials.get(jobId)?.withRef(params ?? {}) ?? params)
+                : params;
+            return this._sendApiRequest!(method, patched);
+          })
         : undefined,
+      // Wire the git write-grant relay: sandbox runner -> agent grant table.
+      // Unlike its siblings this does NOT reach the orchestrator directly — the
+      // grant lives in the agent, because the credential helper git spawns is a
+      // separate process that consults the agent, not the runner.
+      onGitGrantRequest: this.jobGitCredentials.get(jobId)?.onGitGrantRequest,
+      credentialHelperPath: this.jobGitCredentials.get(jobId)?.helperPath,
       // Wire user-cache relay: sandbox runner -> agent WS -> orchestrator
       onCacheRequest: this._requestUserCache
         ? async (request) => this._requestUserCache!(jobId, request)
@@ -1561,7 +1797,13 @@ export class JobRunner {
     logger.info('Requesting dep upload URL from orchestrator', {
       lockfileHash: buildConfig.lockfileHash,
     });
-    const depUploadUrl = await this.requestUploadUrl(dispatch.jobId, 'deps', depKey);
+    // Send the tarball's own hash with the REQUEST, not just the completion:
+    // the object is stored under that hash, so the orchestrator needs it to
+    // sign the URL. We already have it — `packNodeModules` returned it above.
+    const depUploadUrl = await this.requestUploadUrl(dispatch.jobId, 'deps', {
+      ...depKey,
+      depsHash: hash,
+    });
     logger.info('Uploading dep tarball to S3', {
       size: tarball.length,
       hash: hash.slice(0, 12),
@@ -1737,7 +1979,10 @@ export class JobRunner {
 
     logger.info('Starting global eval round', {
       jobId,
-      candidateCount: config.candidates.length,
+      // Read defensively: the opening log line runs before the `try` below, so a
+      // malformed dispatch with a missing/non-array `candidates` must not throw
+      // here — the guard inside the `try` turns that into a reported failure.
+      candidateCount: Array.isArray(config.candidates) ? config.candidates.length : 0,
       workflowRepoIdentifier: config.workflowRepoIdentifier,
     });
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
@@ -1771,6 +2016,12 @@ export class JobRunner {
     }, this.config.jobHeartbeatIntervalMs);
 
     try {
+      // Validate the dispatch shape inside the `try` so a malformed dispatch is
+      // reported as a failed verdict rather than rejecting execute() silently.
+      if (!Array.isArray(config.candidates)) {
+        throw new Error('Global eval round dispatch is malformed: `candidates` must be an array');
+      }
+
       if (abortController.signal.aborted) {
         await closeStreamer();
         this.sendStepStatus(
@@ -2183,20 +2434,16 @@ export class JobRunner {
       //    calls inside the DynamicJobFn body or inside matrix fns would be
       //    invisible (zx pipes child stdio to an internal VoidStream and only
       //    surfaces it through the log callback).
-      const { $: zx$ } = await import('zx');
-      // `verbose: true` + `makeStreamingZxLog` honors the per-invocation
-      // quiet/verbose intent: a `$({ quiet: true })` call (e.g. a sops decrypt)
-      // is flagged `verbose: false` by zx and dropped from the streamed log,
-      // so a decrypted secret never leaks into the eval log.
-      const scopedDollar = zx$({
-        cwd: workDir,
-        env: { ...process.env } as Record<string, string>,
-        verbose: true,
-        quiet: false,
-        log: makeStreamingZxLog((line, stream) =>
-          evalStreamer.addLine(line, stream),
-        ) as unknown as (entry: unknown) => void,
-      }) as unknown as typeof zx$;
+      // `buildEvalShell` resolves the LIVE `process.env` (never a spread), so a
+      // workflow module that sets an env var at import time is visible to a
+      // subprocess the DynamicJobFn shells out to — matching the global eval
+      // round rather than snapshotting env before the module loads. Its
+      // `verbose: true` + `makeStreamingZxLog` wiring honors a per-call
+      // `quiet: true` (e.g. a sops decrypt), so a decrypted secret never leaks
+      // into the eval log.
+      const scopedDollar = await buildEvalShell(workDir, (line, stream) =>
+        evalStreamer.addLine(line, stream),
+      );
 
       const evalSink: CaptureSink = { addLine: (line) => evalStreamer.addLine(line) };
 
@@ -2350,6 +2597,68 @@ export class JobRunner {
   }
 
   /**
+   * Build the job's container image when it declared a Dockerfile, and return
+   * the tag the sandbox must run.
+   *
+   * Returns `undefined` for every other job — one with no container, or one
+   * naming a finalized image — which is the common case and costs nothing.
+   *
+   * Extracted from `setupSandboxForExecution` so that function stays inside the
+   * 200-line ceiling, and so the build's streamer lifecycle is visibly bounded
+   * by one `finally`.
+   */
+  private async buildJobImageIfDeclared(
+    dispatch: JobDispatch,
+    jobConfig: Record<string, unknown>,
+    workDir: string,
+    abortController: AbortController,
+  ): Promise<string | undefined> {
+    const container = jobConfig.container as LockJob['container'];
+    if (!container || typeof container === 'string' || !container.dockerfile) return undefined;
+
+    const streamer = this.createStepStreamer(dispatch, CONTAINER_BUILD_STEP_INDEX);
+    try {
+      return await runJobImageBuild({
+        container,
+        workDir,
+        jobId: dispatch.jobId,
+        // Same resolution fork-runner uses for the runner request: a matrix leg
+        // carries its expanded `name`, everything else its plain one.
+        jobName:
+          (jobConfig.name as string | undefined) ??
+          (jobConfig.baseJobName as string | undefined) ??
+          'job',
+        onLog: (line) => streamer.addLine(line),
+        build: async (spec, onLog) =>
+          buildJobImage({
+            spec,
+            cli: resolveBuildCli({ configured: this.config.containerBuildCli }),
+            // The sandbox's own socket, so the build and the container that
+            // runs it land on the same daemon.
+            socketPath: sandboxSocketPath(),
+            ...(dispatch.containerRegistryAuth
+              ? { authconfig: dispatch.containerRegistryAuth }
+              : {}),
+            onLog,
+            signal: abortController.signal,
+          }),
+        sendStepStatus: (name, state, data) =>
+          this.sendStepStatus(
+            dispatch,
+            CONTAINER_BUILD_STEP_INDEX,
+            name,
+            state,
+            data,
+            streamer.getTotalBytes(),
+          ),
+      });
+    } finally {
+      await streamer.flush();
+      streamer.destroy();
+    }
+  }
+
+  /**
    * Create the appropriate sandbox backend based on execution mode.
    */
   private createSandbox(
@@ -2359,15 +2668,21 @@ export class JobRunner {
       env: Record<string, string>;
       jobId: string;
       jobConfig: Record<string, unknown>;
+      registryAuth?: { username: string; password: string; serveraddress: string } | undefined;
+      /** Tag produced by a `container.dockerfile` build, when the job had one. */
+      builtImage?: string | undefined;
     },
   ): ExecutionSandbox {
     switch (mode) {
       case 'container': {
         const containerConfig = opts.jobConfig.container;
+        // A job that declared a Dockerfile has already been built; run THAT tag.
+        // It is local by construction, so the sandbox's pull path never fires.
         const image =
-          typeof containerConfig === 'string'
+          opts.builtImage ??
+          (typeof containerConfig === 'string'
             ? containerConfig
-            : ((containerConfig as { image: string })?.image ?? 'node:20-alpine');
+            : ((containerConfig as { image?: string })?.image ?? 'node:20-alpine'));
 
         return new ContainerSandbox({
           docker: new Docker(),
@@ -2398,6 +2713,21 @@ export class JobRunner {
             networkMode: this.config.sandboxNetwork === 'host' ? 'host' : 'default',
             grant: opts.jobConfig.sandboxGrant as ResolvedSandboxGrant | undefined,
           },
+          // Resolved by the ORCHESTRATOR — the lock carries secret names and
+          // the agent never resolves them itself. Absent on an older
+          // orchestrator, which pulls anonymously exactly as before.
+          ...(opts.registryAuth ? { registryAuth: opts.registryAuth } : {}),
+          // Reclaimed at teardown; see ContainerSandbox.buildTag.
+          ...(opts.builtImage ? { buildTag: opts.builtImage } : {}),
+          // Where the injected KiCI runtime comes from, so the job's image
+          // needs neither Node nor git. A pre-provisioned tree wins; otherwise
+          // the sandbox materializes one out of the agent image. Both unset
+          // leaves the historical contract in force — the runner launches on
+          // the image's own `node`.
+          ...(this.config.runtimeNodeSource
+            ? { runtimeNodePath: this.config.runtimeNodeSource }
+            : {}),
+          ...(this.config.runtimeImage ? { runtimeImage: this.config.runtimeImage } : {}),
         });
       }
 
@@ -2414,6 +2744,10 @@ export class JobRunner {
           env: opts.env,
           sandbox: this.config.sandbox,
           sandboxNetwork: this.config.sandboxNetwork,
+          // Reap a finished job's leaked process tree (bwrap already contains
+          // it via its PID namespace, so detach only applies to the non-bwrap
+          // fork branch inside the sandbox).
+          orphanCleanup: this.config.orphanCleanup,
         });
     }
   }

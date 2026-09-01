@@ -172,6 +172,10 @@ vi.mock('./dep-installer.js', () => ({
 // Mock dep-restore (used by init jobs)
 vi.mock('./dep-restore.js', () => ({
   restoreDeps: vi.fn().mockResolvedValue(undefined),
+  // The host checkout hides dep-restore scratch dirs from `git status` in the
+  // freshly cloned tree; omitting it here makes the real module's export
+  // undefined and the call site throw.
+  excludeScratchFromGit: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Mock dep-packer (used by build jobs)
@@ -436,6 +440,76 @@ describe('JobRunner', () => {
     expect(mockSandboxInstance.setup).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.executeJob).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
+  });
+
+  it('job-image agent runs bare-metal instead of nesting another container', async () => {
+    // The scaler spawned this agent FROM the job's image with the runtime
+    // injected, so it is already inside the image the job asked for. Nesting a
+    // second container from the same image would need a runtime inside a
+    // runtime.
+    const deps = makeDeps();
+    deps.config = { ...deps.config, jobImageAgent: true } as typeof deps.config;
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'python:3.12-slim',
+      },
+    });
+
+    await new JobRunner(deps).execute(dispatch);
+
+    expect(BareMetalSandbox).toHaveBeenCalled();
+    expect(ContainerSandbox).not.toHaveBeenCalled();
+  });
+
+  it('container mode: clones on the HOST and tells the runner not to re-clone', async () => {
+    const { gitClone } = await import('../checkout/git-clone.js');
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'python:3.12-slim',
+      },
+    });
+
+    await new JobRunner(makeDeps()).execute(dispatch);
+
+    // Cloning on the host is what lets the image ship without git, and keeps
+    // clone-time credentials out of a CapDrop:ALL container.
+    expect(gitClone).toHaveBeenCalled();
+
+    // The workspace is copied in, and the runner must not clone over it.
+    const setupArg = (mockSandboxInstance.setup as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0][0] as { workspaceFromHost?: boolean };
+    expect(setupArg.workspaceFromHost).toBe(true);
+    expect((dispatch.jobConfig as Record<string, unknown>).checkout).toBe(false);
+  });
+
+  it('bare-metal mode: does NOT clone on the host — the runner still does it', async () => {
+    const { gitClone } = await import('../checkout/git-clone.js');
+    vi.mocked(gitClone).mockClear();
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+      },
+    });
+
+    await new JobRunner(makeDeps()).execute(dispatch);
+
+    // Bare-metal already runs against workDir directly, so a host clone here
+    // would be a second clone of the same tree.
+    expect(gitClone).not.toHaveBeenCalled();
+    const setupArg = (mockSandboxInstance.setup as unknown as { mock: { calls: unknown[][] } }).mock
+      .calls[0][0] as { workspaceFromHost?: boolean };
+    expect(setupArg.workspaceFromHost).toBeUndefined();
   });
 
   it('container mode with object config: ContainerSandbox created with correct image', async () => {
@@ -1422,6 +1496,26 @@ describe('global eval round: shell cwd matches the sandbox re-evaluation', () =>
   });
 });
 
+describe('handleDynamicJobFn eval shell: live env, matching the round', () => {
+  // The non-global DynamicJobFn path builds its eval shell through
+  // buildEvalShell, which resolves the LIVE process.env — never an
+  // `env: { ...process.env }` spread, which would snapshot env before the
+  // workflow module loads and hide any var a module sets at import time from a
+  // subprocess the DynamicJobFn shells out to. This matches the global eval
+  // round. The env-live behavior itself is covered by the buildEvalShell
+  // behavioral test above; this asserts the call site is wired through it.
+  const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
+  const jobRunnerSrc = read('./job-runner.ts');
+
+  it('builds the DynamicJobFn shell through buildEvalShell(workDir, ...)', () => {
+    expect(jobRunnerSrc).toContain('const scopedDollar = await buildEvalShell(workDir,');
+  });
+
+  it('does not snapshot env with a { ...process.env } spread', () => {
+    expect(jobRunnerSrc).not.toContain('{ ...process.env }');
+  });
+});
+
 describe('buildEvalShell', () => {
   const PROBE = 'KICI_BUILD_EVAL_SHELL_PROBE';
   afterEach(() => {
@@ -1479,5 +1573,38 @@ describe('buildEvalShell', () => {
     closed = true;
     await shell`echo after-close`;
     expect(seen.join('\n')).not.toContain('after-close');
+  });
+});
+
+describe('JobRunner global eval round — malformed dispatch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    logStreamerInstances.length = 0;
+    resetSandboxMocks();
+  });
+
+  it('missing candidates: resolves and reports a failed verdict naming candidates', async () => {
+    const deps = makeDeps();
+    const runner = new JobRunner(deps);
+
+    // A global-eval-round dispatch with `candidates` omitted. The opening log
+    // line reads `config.candidates.length` before the handler's `try`, so the
+    // defect it guards against is a throw that rejects execute() with no verdict.
+    const dispatch = makeDispatch({
+      jobConfig: {
+        globalEvalRound: true,
+        workflowRepoIdentifier: 'org/repo',
+      } as unknown as JobDispatch['jobConfig'],
+    });
+
+    // Must RESOLVE (not reject) — the malformed dispatch is turned into a
+    // reported job failure, not an unhandled rejection.
+    await expect(runner.execute(dispatch)).resolves.toBeUndefined();
+
+    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
+    const failed = jobStatuses.find((m) => (m as { state: string }).state === 'failed') as
+      { state: string; data?: { error?: string } } | undefined;
+    expect(failed).toBeDefined();
+    expect(failed?.data?.error).toMatch(/candidates/);
   });
 });

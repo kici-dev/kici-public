@@ -21,7 +21,6 @@ import type {
   ChangedFilesFetcher,
   CloneTokenProvider,
   RepoUrlBuilder,
-  ContributorResolver,
   CheckStatusPoster,
   ProviderType,
 } from '@kici-dev/engine';
@@ -61,7 +60,15 @@ export interface ProviderBundle {
   changedFilesFetcher?: ChangedFilesFetcher;
   cloneTokenProvider?: CloneTokenProvider;
   repoUrlBuilder?: RepoUrlBuilder;
-  contributorResolver?: ContributorResolver;
+  /**
+   * This provider has a fork model: a head ref can live outside the base repo,
+   * so the fork trust policy applies to its pull-request events. True for
+   * GitHub. Absent for providers whose trust boundary is something else — a
+   * generic source's verification secret, a local source's on-disk ownership —
+   * and for universal-git, which reports an `isForkPR` signal that must not
+   * gate it.
+   */
+  hasForkModel?: boolean;
   checkStatusPoster?: CheckStatusPoster;
   /**
    * Local `file://` in-place profile: this bundle's `repoBasePath` is the

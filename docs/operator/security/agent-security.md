@@ -231,6 +231,16 @@ The sandbox environment is constructed from a 7-layer merge (later overrides ear
    - `NODE_PATH` -- Node.js module resolution
    - `TZ` -- Timezone
 
+   On Windows the allowlist additionally copies the system variables the OS
+   itself needs to run a command: `PATHEXT` (without it the OS cannot resolve a
+   bare command name such as `jq` to its `.exe`), `SystemRoot`, `windir`,
+   `COMSPEC`, `TEMP`, `TMP`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`,
+   `PROCESSOR_ARCHITECTURE`, and `NUMBER_OF_PROCESSORS`. None of them carry
+   credentials -- the allowlist's job is to keep `KICI_*`, `DATABASE_URL`, and
+   `PLATFORM_TOKEN` out, and these are none of those. They are copied on every
+   platform where the host sets them; on Linux and macOS the host normally does
+   not.
+
 2. **Sandbox defaults** -- `FORCE_COLOR=1` and similar defaults to ensure correct tool behavior in non-TTY environments
 
 3. **KICI\_\* system vars** -- Orchestrator-generated variables passed via `userEnv`

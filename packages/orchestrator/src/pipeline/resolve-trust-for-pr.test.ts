@@ -2,18 +2,19 @@ import { describe, it, expect } from 'vitest';
 import { resolveTrustForPR } from './process-webhook.js';
 
 /**
- * Focused coverage for the trust-resolution phase's non-PR branches that feed
- * the user-cache write scope (`deriveCacheRefScope` maps tier 'trusted' →
- * shared, everything else → isolated):
+ * Trust resolution is derived from the git ref alone. Every ref in the base
+ * repo is trusted — a default-branch push, a topic-branch push, a same-repo PR
+ * — because only a write-or-higher contributor can put a ref there. A fork
+ * head ref is the single untrusted case and resolves to `unknown`.
  *
- *   1. A push to the repo's default branch is trusted (only a write-or-higher
- *      contributor can land a commit there).
- *   2. A non-PR event from a provider with no contributor model (generic /
- *      internal source — the verification secret is the trust boundary) is
- *      trusted by construction.
- *   3. A non-default-branch push from a real provider (one that HAS a
- *      contributor resolver) carries no trust resolution (fails closed →
- *      isolated).
+ * The tier feeds two consumers: `deriveCacheRefScope` (trusted → org-shared
+ * cache, everything else → per-run isolated) and lock-file-source selection
+ * (`head` for a trusted PR ref, `base` otherwise).
+ *
+ * A PR event resolves a tier only for a provider that sets `hasForkModel`.
+ * Elsewhere the fork signal is read from fixed payload keys many forges omit,
+ * so it fails toward trust; such a PR deliberately resolves nothing and reads
+ * the base lock.
  */
 
 function makeArgs(opts: {
@@ -21,26 +22,24 @@ function makeArgs(opts: {
   targetBranch: string;
   defaultBranch: string;
   senderUsername?: string;
-  /** When true, the bundle exposes a contributor resolver (real provider). */
-  hasContributorResolver?: boolean;
+  /** When true, the bundle is a provider with a fork model (GitHub). */
+  hasForkModel?: boolean;
+  isForkPR?: boolean;
 }) {
   return {
     info: { event: opts.event, provider: 'local', routingKey: 'rk' } as never,
-    deps: { trustResolver: undefined } as never,
     bundle: {
       normalizer: {
         extractDefaultBranch: () => opts.defaultBranch,
       },
-      contributorResolver: opts.hasContributorResolver ? ({} as never) : undefined,
+      hasForkModel: opts.hasForkModel,
     } as never,
     event: {
       targetBranch: opts.targetBranch,
       senderUsername: opts.senderUsername,
+      isForkPR: opts.isForkPR,
     } as never,
     payload: { repository: { default_branch: opts.defaultBranch } },
-    resolvedOrgId: 'org-1',
-    repoIdentifier: '.',
-    credentials: {},
   };
 }
 
@@ -52,7 +51,7 @@ describe('resolveTrustForPR — non-PR trust resolution', () => {
         targetBranch: 'master',
         defaultBranch: 'master',
         senderUsername: 'octo',
-        hasContributorResolver: true,
+        hasForkModel: true,
       }),
     );
     expect(out.trustResolution).toBeDefined();
@@ -60,7 +59,7 @@ describe('resolveTrustForPR — non-PR trust resolution', () => {
     expect(out.trustResolution!.contributorUsername).toBe('octo');
   });
 
-  it('marks any non-PR event from a contributor-less provider as trusted', async () => {
+  it('marks any non-PR event from a fork-less provider as trusted', async () => {
     // generic/internal source firing a custom (non-push) event on any branch.
     const out = await resolveTrustForPR(
       makeArgs({
@@ -74,15 +73,88 @@ describe('resolveTrustForPR — non-PR trust resolution', () => {
     expect(out.trustResolution!.tier).toBe('trusted');
   });
 
-  it('does not mark a non-default-branch push from a real provider as trusted', async () => {
+  it('marks a non-default-branch push from a fork-model provider as trusted', async () => {
+    // The ref lives in the base repo, so only a write-or-higher contributor
+    // could have created it.
     const out = await resolveTrustForPR(
       makeArgs({
         event: 'push',
         targetBranch: 'feature/x',
         defaultBranch: 'master',
-        hasContributorResolver: true,
+        senderUsername: 'octo',
+        hasForkModel: true,
+      }),
+    );
+    expect(out.trustResolution).toBeDefined();
+    expect(out.trustResolution!.tier).toBe('trusted');
+    expect(out.trustResolution!.reason).toContain('same-repo ref');
+  });
+});
+
+describe('resolveTrustForPR — PR trust resolution', () => {
+  it('resolves a same-repo PR as trusted and reads the head lock file', async () => {
+    const out = await resolveTrustForPR(
+      makeArgs({
+        event: 'pull_request',
+        targetBranch: 'master',
+        defaultBranch: 'master',
+        senderUsername: 'octo',
+        hasForkModel: true,
+        isForkPR: false,
+      }),
+    );
+    expect(out.trustResolution).toBeDefined();
+    expect(out.trustResolution!.tier).toBe('trusted');
+    expect(out.lockFileSource).toBe('head');
+  });
+
+  it('resolves a fork PR as unknown and falls back to the base lock file', async () => {
+    const out = await resolveTrustForPR(
+      makeArgs({
+        event: 'pull_request',
+        targetBranch: 'master',
+        defaultBranch: 'master',
+        senderUsername: 'stranger',
+        hasForkModel: true,
+        isForkPR: true,
+      }),
+    );
+    expect(out.trustResolution).toBeDefined();
+    expect(out.trustResolution!.tier).toBe('unknown');
+    expect(out.trustResolution!.contributorUsername).toBe('stranger');
+    expect(out.lockFileSource).toBe('base');
+  });
+
+  it('resolves a PR with no sender username rather than returning nothing', async () => {
+    const out = await resolveTrustForPR(
+      makeArgs({
+        event: 'pull_request',
+        targetBranch: 'master',
+        defaultBranch: 'master',
+        hasForkModel: true,
+        isForkPR: true,
+      }),
+    );
+    expect(out.trustResolution).toBeDefined();
+    expect(out.trustResolution!.tier).toBe('unknown');
+    expect(out.trustResolution!.contributorUsername).toBe('');
+  });
+
+  it('resolves no tier for a PR from a provider with no fork model', async () => {
+    // universal-git normalizes Gitea/Gogs/GitLab pull_request events and reports
+    // an `isForkPR` built from two repo names read off fixed payload keys that
+    // many forges omit, which reads `false` when either is absent. Trusting it
+    // would hand a fork's HEAD lock file to trigger evaluation.
+    const out = await resolveTrustForPR(
+      makeArgs({
+        event: 'pull_request',
+        targetBranch: 'master',
+        defaultBranch: 'master',
+        senderUsername: 'stranger',
+        isForkPR: false,
       }),
     );
     expect(out.trustResolution).toBeUndefined();
+    expect(out.lockFileSource).toBe('base');
   });
 });

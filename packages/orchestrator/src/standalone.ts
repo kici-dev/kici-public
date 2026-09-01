@@ -54,6 +54,7 @@ const { bootstrapOrchestrator } = await import('./orchestrator-core.js');
 const { buildContextSecretResolver } = await import('./secrets/context-secret-resolver.js');
 const { ContextStore } = await import('./contexts/context-store.js');
 const { VariableStore } = await import('./contexts/variable-store.js');
+const { createIndependentApprovalExtras } = await import('./approvals/independent-wiring.js');
 
 import type { OrchestratorHooks } from './orchestrator-core.js';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
@@ -111,6 +112,12 @@ await guardStartup(logger, async () => {
       : undefined,
 
     onSubsystemsReady: async (sub) => {
+      // The approval subsystem. Independent mode has no Platform, so the direct
+      // GitHub ingress in `app.ts` is the ONLY pipeline it has — and that
+      // pipeline reads `heldRunStore` off these extras. See
+      // `createIndependentApprovalExtras` for what was inert without them.
+      const approvals = createIndependentApprovalExtras(sub);
+
       // One coordinator shared by every sibling peer-client of this
       // orchestrator: it owns the credential file and serializes token-joins so
       // a reconnect storm never cascades credential revocations across siblings.
@@ -150,15 +157,7 @@ await guardStartup(logger, async () => {
             draining: false,
             capabilities: { s3LogAccess: !!sub.cacheStorage },
             ...(sub.scalerManager && {
-              scalerCapacity: sub.scalerManager.getStatus().backends.map((b) => ({
-                name: b.name,
-                type: b.type,
-                labelSets: b.labelSets,
-                maxAgents: b.maxAgents,
-                activeCount: b.activeCount,
-                spawnsOnLocalHost: b.spawnsOnLocalHost,
-                mandatoryLabels: b.mandatoryLabels,
-              })),
+              scalerCapacity: sub.scalerManager.getRoutableCapacity(),
             }),
             configVersion: sub.localConfigVersion,
             registryVersion: sub.registrationIndex.getVersion(),
@@ -279,6 +278,11 @@ await guardStartup(logger, async () => {
             contextStore: new ContextStore(sub.db),
             variableStore: new VariableStore(sub.db),
           }),
+
+          // The approval subsystem: the held-run store the dispatch pipeline
+          // and the stale detector both read, plus the release callbacks the
+          // detector resumes a lapsed wait / freed concurrency slot through.
+          ...approvals,
         },
 
         configReloaderExtras: {

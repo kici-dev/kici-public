@@ -31,6 +31,7 @@ import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createInstallationOctokit, type GitHubAppConfig } from '../providers/github/auth.js';
 import { githubCheckRunTotal } from '../metrics/prometheus.js';
+import { buildReducedPrivilegeNote } from '../security/reduced-privilege-note.js';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type { StepLogBuffer } from './step-log-buffer.js';
 import {
@@ -40,6 +41,7 @@ import {
   type StepResultData,
   type SourceLocationData,
   type CheckAnnotation,
+  clampSummaryToLimit,
   type StepProgressEntry,
 } from './check-run-summary.js';
 import type { CheckRunTrackingKey, CheckRunTrackingStore } from './check-run-tracking-store.js';
@@ -204,6 +206,15 @@ interface UpdateJobStatusOptions {
   runIdForLogs?: string;
   /** Job ID for StepLogBuffer lookup. */
   jobId?: string;
+  /**
+   * The run's resolved trust tier and lock-file branch. When the tier is
+   * anything other than `trusted`, the completion summary leads with the
+   * reduced-privilege note so a contributor reading a failed job on a fork pull
+   * request can see which parts of the build environment the run did not have.
+   * Both absent for a run whose trust never resolved.
+   */
+  trustTier?: string;
+  lockFileSource?: string;
 }
 
 /**
@@ -226,6 +237,44 @@ interface UpdateWorkflowStatusOptions {
   requestId?: string;
   /** Explicit runId for trace context (falls back to AsyncLocalStorage context). */
   runId?: string;
+  /**
+   * The run's resolved trust tier and lock-file branch, same contract as
+   * {@link UpdateJobStatusOptions}. The roll-up check carries the note too: a
+   * contributor who reads only `kici/<workflow>` — the one branch protection
+   * usually requires — would otherwise see a run fail with no explanation.
+   */
+  trustTier?: string;
+  lockFileSource?: string;
+}
+
+/**
+ * Options for completeUndispatchedCheckRuns.
+ */
+export interface CompleteUndispatchedCheckRunsOptions {
+  provider: string;
+  owner: string;
+  repo: string;
+  sha: string;
+  workflowName: string;
+  /** See {@link SetPendingOptions.workflowRepoIdentifier}. */
+  workflowRepoIdentifier?: string;
+  /**
+   * The job names `setPending` / `setPendingAwait` created a check run for.
+   * Pass the same list that call used, or the names will not match the check
+   * runs on the commit.
+   */
+  jobNames: string[];
+  installationId?: number;
+  /** Routing key for per-app credential lookup (e.g., "github:12345"). */
+  routingKey?: string;
+  /** Explicit requestId for trace context (falls back to AsyncLocalStorage context). */
+  requestId?: string;
+  /** Explicit runId for trace context (falls back to AsyncLocalStorage context). */
+  runId?: string;
+  /** The conclusion to complete each check run with. */
+  conclusion: CheckRunConclusion;
+  /** The check-run output body. The title stays the standard `KiCI: <label>` form. */
+  summary: string;
 }
 
 /**
@@ -310,8 +359,39 @@ export class CheckRunReporter {
    * still find every key for a runId at cleanup time.
    */
   private readonly runIdToKeys = new Map<string, Set<string>>();
+  /**
+   * Per-key serialization of GitHub check-run PATCHes. Two updates for one
+   * check run must never be in flight at GitHub simultaneously: the terminal
+   * `completed` write and an earlier `in_progress` write race last-write-wins,
+   * and if the `in_progress` PATCH lands second it reopens the check run to the
+   * permanently-unresolved `{ status: in_progress, conclusion: <terminal> }`
+   * state. The `terminalSent` re-check inside `updateCheckRun` cannot help once
+   * an `in_progress` PATCH has passed it and is awaiting the network — it is a
+   * check-then-await. Chaining every PATCH for a key through this map makes the
+   * re-check and the PATCH atomic relative to the completion write.
+   */
+  private readonly updateLocks = new Map<string, Promise<void>>();
 
   constructor(private deps: CheckRunReporterDeps) {}
+
+  /**
+   * Run `fn` after every previously-queued check-run PATCH for `key` has
+   * settled, so all updates to one check run execute strictly in order. The
+   * chain swallows prior errors (each is surfaced to its own caller) so one
+   * failed PATCH does not wedge the key.
+   */
+  private runUpdateExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.updateLocks.get(key) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.updateLocks.set(
+      key,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
 
   /**
    * Update the provider registry used for per-routing-key credential lookup.
@@ -400,6 +480,107 @@ export class CheckRunReporter {
         workflowName: opts.workflowName,
       });
     });
+  }
+
+  /**
+   * Complete the queued check runs of a workflow that never dispatched a job.
+   *
+   * `setPendingAwait` creates `kici/<workflow>` and one
+   * `kici/<workflow>/job/<name>` per static job before the pipeline knows
+   * whether the workflow will run. When the workflow then ends without
+   * dispatching one — a hold rejected or expired, or any pre-dispatch init
+   * failure — none of these names ever reaches a job or run record, so
+   * `updateJobStatus` and `updateWorkflowStatus` are never called for them, and
+   * `doCleanupStaleCheckRuns` skips them because that sweep only updates check
+   * runs whose status is `in_progress`. They stay `queued` on the commit, which
+   * on a pull request reads as a check that never finishes and blocks branch
+   * protection.
+   *
+   * Completes only the check runs this reporter can resolve an id for (L1 cache
+   * or the `check_run_tracking` row), and skips a key already latched terminal.
+   *
+   * The build check `kici/<workflow>/setup` is deliberately not in the set,
+   * because that latch does not reliably cover it. `setBuildComplete` stamps
+   * `terminal_sent_at` on the row but adds nothing to the in-process
+   * `terminalSent` set, and `resolveCheckRunId` returns on an L1 hit without
+   * reading the row — so a build check this process completed a moment ago
+   * resolves with no latch, and completing it again would overwrite a real
+   * build conclusion. An unreadable row is the harmless direction: it yields
+   * no id and the name is skipped.
+   */
+  async completeUndispatchedCheckRuns(opts: CompleteUndispatchedCheckRunsOptions): Promise<void> {
+    if (opts.provider !== 'github') {
+      logger.debug('Check runs not supported for provider, skipping', { provider: opts.provider });
+      return;
+    }
+
+    const githubConfig = this.resolveGithubConfig(opts.routingKey);
+    if (!githubConfig || !opts.installationId) {
+      logger.debug('GitHub config or installationId missing, skipping undispatched completion', {
+        hasConfig: !!githubConfig,
+        hasInstallationId: !!opts.installationId,
+      });
+      return;
+    }
+
+    const octokit = createInstallationOctokit(githubConfig, opts.installationId);
+    const traceIds = this.resolveTraceIds(opts);
+    const detailsUrl = this.buildDetailsUrl(traceIds.runId);
+    const label = this.workflowLabel(opts);
+    const summary = this.appendTraceIds(opts.summary, traceIds);
+
+    // The same names `doSetPending` created, built through the same
+    // `workflowLabel` seam so a cross-repository global run addresses its own
+    // qualified check rather than the acted-on repository's same-named one.
+    const targets = [
+      { name: `kici/${label}`, title: `KiCI: ${label}` },
+      ...opts.jobNames.map((jobName) => ({
+        name: `kici/${label}/job/${jobName}`,
+        title: `KiCI: ${label}/${jobName}`,
+      })),
+    ];
+
+    let completed = 0;
+    for (const target of targets) {
+      const key = this.checkRunKey(opts.owner, opts.repo, opts.sha, target.name);
+      const checkRunId = await this.resolveCheckRunId(key);
+      if (!checkRunId) {
+        logger.debug('Check run ID not found for undispatched completion, skipping', { key });
+        continue;
+      }
+      if (this.terminalSent.has(key)) continue;
+      // Latch before the PATCH, exactly as `doUpdateJobStatus` does: a status
+      // arriving while this completion is in flight must not schedule an
+      // `in_progress` update behind it.
+      this.terminalSent.add(key);
+      await this.updateCheckRun(
+        octokit,
+        {
+          owner: opts.owner,
+          repo: opts.repo,
+          check_run_id: checkRunId,
+          status: 'completed',
+          conclusion: opts.conclusion,
+          completed_at: new Date().toISOString(),
+          output: { title: target.title, summary },
+          ...(detailsUrl && { details_url: detailsUrl }),
+        },
+        key,
+        opts.runId,
+      );
+      completed++;
+    }
+
+    if (completed > 0) {
+      logger.info('Completed check runs for a workflow that never dispatched', {
+        owner: opts.owner,
+        repo: opts.repo,
+        sha: opts.sha,
+        workflowName: opts.workflowName,
+        conclusion: opts.conclusion,
+        completed,
+      });
+    }
   }
 
   /**
@@ -532,6 +713,7 @@ export class CheckRunReporter {
         this.inProgressSent.delete(key);
         this.terminalSent.delete(key);
         this.checkRunIds.delete(key);
+        this.updateLocks.delete(key);
       }
       this.runIdToKeys.delete(runId);
     }
@@ -911,6 +1093,12 @@ export class CheckRunReporter {
     let summary: string;
     let annotations: CheckAnnotation[] | undefined;
 
+    // The run's reduced-privilege posture, resolved before the summary is built
+    // so its bytes come out of the summary's budget rather than being added on
+    // top of a summary that already spent it. `\n\n` is the separator below.
+    const postureNote = buildReducedPrivilegeNote(opts.trustTier, opts.lockFileSource);
+    const reservedBytes = postureNote ? Buffer.byteLength(`${postureNote}\n\n`, 'utf-8') : 0;
+
     if (
       (opts.state === ExecutionJobStatus.enum.failed ||
         opts.state === ExecutionJobStatus.enum.cancelled ||
@@ -932,6 +1120,7 @@ export class CheckRunReporter {
         jobId: opts.jobId,
         traceIds,
         jobDurationMs: opts.data.durationMs as number | undefined,
+        reservedBytes,
       });
 
       // Build annotations from source locations
@@ -969,12 +1158,26 @@ export class CheckRunReporter {
         jobId: opts.jobId ?? '',
         traceIds,
         jobDurationMs: opts.data.durationMs as number | undefined,
+        reservedBytes,
       });
     } else {
       // Fallback: use description or default
       const { description } = this.mapJobConclusion(opts.state, opts.description);
       summary = this.appendTraceIds(description, traceIds);
     }
+
+    // Lead with the run's reduced-privilege posture when it has one. On a fork
+    // pull request the trust policy let run, this check and the workflow-level
+    // roll-up are the only two the contributor gets: the job fails on a
+    // dependency the run was never given, and nothing else on the pull request
+    // says so. This one carries the failing step, so the note leads it.
+    if (postureNote) summary = `${postureNote}\n\n${summary}`;
+
+    // The annotation-count line above is appended after the summary's own
+    // budget was spent, so the total can still exceed the API cap even with
+    // `reservedBytes` accounted for. A rejected update leaves the check run
+    // unresolved, which is worse than a truncated one.
+    summary = clampSummaryToLimit(summary);
 
     const { conclusion } = this.mapJobConclusion(opts.state, opts.description);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
@@ -1029,6 +1232,11 @@ export class CheckRunReporter {
     );
     const traceIds = this.resolveTraceIds(opts);
     const detailsUrl = this.buildDetailsUrl(traceIds.runId);
+    // Same note as the per-job check. No byte budgeting here: this summary is a
+    // one-line conclusion plus the trace footer, orders of magnitude under the
+    // cap that `doUpdateJobStatus` has to manage.
+    const postureNote = buildReducedPrivilegeNote(opts.trustTier, opts.lockFileSource);
+    const rollup = this.appendTraceIds(description, traceIds);
 
     await this.updateCheckRun(
       octokit,
@@ -1041,7 +1249,7 @@ export class CheckRunReporter {
         completed_at: new Date().toISOString(),
         output: {
           title: `KiCI: ${label}`,
-          summary: this.appendTraceIds(description, traceIds),
+          summary: postureNote ? `${postureNote}\n\n${rollup}` : rollup,
         },
         ...(detailsUrl && { details_url: detailsUrl }),
       },
@@ -1718,6 +1926,36 @@ export class CheckRunReporter {
         summary: string;
         annotations?: CheckAnnotation[];
       };
+      details_url?: string;
+    },
+    trackingKey?: string,
+    trackingRunId?: string,
+  ): Promise<void> {
+    // Serialize every PATCH for one check run so the latch re-check in
+    // `updateCheckRunLocked` and its network PATCH are atomic relative to the
+    // completion write — see `updateLocks`. Keyed on the tracking key when
+    // present (the workflow-level and job-level checks have distinct keys, so
+    // they do not block each other) and on the check-run id otherwise.
+    const lockKey = trackingKey ?? `checkrun:${params.check_run_id}`;
+    return this.runUpdateExclusive(lockKey, () =>
+      this.updateCheckRunLocked(octokit, params, trackingKey, trackingRunId),
+    );
+  }
+
+  private async updateCheckRunLocked(
+    octokit: Octokit,
+    params: {
+      owner: string;
+      repo: string;
+      check_run_id: number;
+      status: 'completed' | 'in_progress';
+      conclusion?: CheckRunConclusion;
+      completed_at?: string;
+      output: {
+        title: string;
+        summary: string;
+        annotations?: CheckAnnotation[];
+      };
       /**
        * Optional URL shown as "Details" on the GitHub Check. See
        * `createCheckRun` — same alias-based shape.
@@ -1749,6 +1987,18 @@ export class CheckRunReporter {
      */
     trackingRunId?: string,
   ): Promise<void> {
+    // Final latch re-check, as close to the PATCH as possible. A caller
+    // (`doUpdateStepProgress` / `flushProgress`) checks `terminalSent` before
+    // its own awaits, but the job can complete in that window — `doUpdateJobStatus`
+    // latches the key (synchronously, before its own completed PATCH) and then
+    // resolves the check run to `completed`. Issuing this `in_progress` PATCH now
+    // would land AFTER that completion and reopen the check run: GitHub keeps the
+    // terminal `conclusion` but flips `status` back to `in_progress`, the
+    // permanently-unresolved state the latch exists to prevent. A `completed`
+    // write is the terminal itself and always proceeds.
+    if (params.status === 'in_progress' && trackingKey && this.terminalSent.has(trackingKey)) {
+      return;
+    }
     let patchAccepted = false;
     try {
       const updateParams: Record<string, unknown> = {

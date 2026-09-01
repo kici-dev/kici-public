@@ -7,7 +7,7 @@ description: 'Generated schema of the normalized event envelope passed to rules 
 
 ## The envelope
 
-The normalized event envelope is the single event contract in KiCI. Rules receive it as `ctx.event`, and every dynamic function — `environment:`, `env:`, and `concurrencyGroup:` resolvers, generated jobs, and a workflow's `concurrency.group` — receives the same envelope as its argument.
+The normalized event envelope is the single event contract in KiCI. Rules receive it as `ctx.event`, and every dynamic function — `context:`, `env:`, and `concurrencyGroup:` resolvers, generated jobs, and a workflow's `concurrency.group` — receives the same envelope as its argument.
 
 Narrow on the `type` field to branch per trigger kind (`if (event.type === 'push')`). The raw provider webhook body is nested at `payload`; the typed variants below describe its shape per event type.
 

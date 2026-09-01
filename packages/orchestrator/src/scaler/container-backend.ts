@@ -22,9 +22,16 @@ import {
 } from './nftables.js';
 import { parseMemoryString } from './config.js';
 import { ImagePullPolicy, ScalerEventType } from './types.js';
+import {
+  pullImageIfMissing,
+  ensureRuntimeVolume,
+  runtimeInjectBind,
+  injectedAgentCommand,
+} from '@kici-dev/shared/container-runtime';
 import type { AgentTokenStore } from '../agent/token-store.js';
 import type {
   ScalerBackend,
+  ScalerDestroyContext,
   ManagedAgent,
   LabelSetConfig,
   LogCapture,
@@ -176,7 +183,7 @@ export interface ContainerScalerBackendOptions {
 export class ContainerScalerBackend implements ScalerBackend {
   readonly type = ScalerBackendType.enum.container;
   readonly spawnsOnLocalHost: boolean;
-  readonly maxAgents: number;
+  maxAgents: number;
 
   private _labelSets: LabelSetConfig[];
   private readonly name: string;
@@ -409,6 +416,34 @@ export class ContainerScalerBackend implements ScalerBackend {
     return this.agents.size;
   }
 
+  /**
+   * The full label set the agent will present, and the ephemeral token bound to
+   * exactly that set.
+   *
+   * The binding is the point: the agent's register-time labels must not trip the
+   * scope gate, and the only labels it may add on top are the self-reported
+   * os/arch/host facts the gate exempts. The pool's platform taints are NOT such
+   * a fact — they are a routing grant, so the manager asserts them here via
+   * `spawnContext` rather than letting the agent claim them.
+   */
+  private async mintAgentIdentity(
+    labelSet: string[],
+    agentId: string,
+    spawnContext: SpawnContext | undefined,
+  ): Promise<{ fullLabels: string[]; agentToken?: string }> {
+    const fullLabels = scalerAgentLabels(
+      labelSet,
+      this.type,
+      this.name,
+      this.roles,
+      spawnContext?.platformTaints,
+    );
+    if (!this.tokenStore) return { fullLabels };
+    const tokenTtlMs = this.tokenTtlProvider ? await this.tokenTtlProvider() : this.tokenTtlMs;
+    const agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
+    return { fullLabels, agentToken };
+  }
+
   async spawn(
     labelSet: string[],
     agentId: string,
@@ -464,18 +499,11 @@ export class ContainerScalerBackend implements ScalerBackend {
         }
       }
 
-      // Full label set the agent will present (base + scaler-assigned kici:
-      // labels). Bind the ephemeral token to exactly this set so the agent's
-      // register-time labels don't trip the scope gate — the agent adds only
-      // self-reported os/arch/host facts on top, which the gate exempts.
-      const fullLabels = scalerAgentLabels(labelSet, this.type, this.name, this.roles);
-
-      // Create ephemeral agent token if token store is available
-      let agentToken: string | undefined;
-      if (this.tokenStore) {
-        const tokenTtlMs = this.tokenTtlProvider ? await this.tokenTtlProvider() : this.tokenTtlMs;
-        agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
-      }
+      const { fullLabels, agentToken } = await this.mintAgentIdentity(
+        labelSet,
+        agentId,
+        spawnContext,
+      );
 
       // Build env array
       const env: string[] = [
@@ -484,6 +512,12 @@ export class ContainerScalerBackend implements ScalerBackend {
         `KICI_LABELS=${fullLabels.join(',')}`,
         `KICI_SCALER_MANAGED=1`,
         `KICI_EXECUTION_MODE=bare-metal`,
+        // Where the agent materializes the KiCI runtime from when it NESTS a
+        // job container. The pool's own agent image carries /opt/kici and is
+        // present on this host by construction, so it is the one image the
+        // agent can always reach. Unused by a per-job-image spawn, which runs
+        // the steps directly rather than nesting.
+        `KICI_RUNTIME_IMAGE=${matchedLabelSet.image!}`,
         ...(agentToken ? [`KICI_AGENT_TOKEN=${agentToken}`] : []),
         ...(matchedLabelSet.backpressureMode
           ? [`KICI_BACKPRESSURE_MODE=${matchedLabelSet.backpressureMode}`]
@@ -524,37 +558,43 @@ export class ContainerScalerBackend implements ScalerBackend {
       // Pull image based on pull policy. Default IfNotPresent: KiCI agent
       // images are pinned + immutable, so re-pulling on every spawn only storms
       // the registry/socket. A label set on a moving tag sets `Always`.
-      const pullPolicy = matchedLabelSet.imagePullPolicy ?? ImagePullPolicy.enum.IfNotPresent;
-      let shouldPull = pullPolicy === ImagePullPolicy.enum.Always;
+      // A job that declared its own container image is spawned on THAT image,
+      // with the KiCI runtime injected so it needs neither Node nor git. Absent
+      // one, the pool's fixed agent image is used exactly as before — the agent
+      // image already carries the runtime, so nothing is injected into it.
+      const jobContainer = spawnContext?.container;
+      const spawnImage = jobContainer?.image ?? matchedLabelSet.image!;
 
-      if (pullPolicy === ImagePullPolicy.enum.IfNotPresent) {
-        try {
-          await this.docker.getImage(matchedLabelSet.image!).inspect({
-            abortSignal: signal,
-          } as Docker.ImageInspectOptions & {
-            abortSignal?: AbortSignal;
-          });
-          shouldPull = false;
-        } catch {
-          shouldPull = true;
-        }
-      }
+      await pullImageIfMissing({
+        docker: this.docker,
+        image: spawnImage,
+        // A per-job image is the customer's, not ours — it is not pinned and
+        // immutable the way an agent image is, so the label set's policy does
+        // not describe it.
+        ...(!jobContainer && matchedLabelSet.imagePullPolicy
+          ? { pullPolicy: matchedLabelSet.imagePullPolicy }
+          : {}),
+        ...(jobContainer?.authconfig ? { authconfig: jobContainer.authconfig } : {}),
+        ...(signal ? { signal } : {}),
+        onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
+      });
 
-      if (shouldPull) {
-        // A spawn already past its deadline before the pull begins would
-        // otherwise start a long image pull that only unwinds on the next
-        // abortable await; reject up front so the semaphore slot frees promptly.
-        if (signal?.aborted) throw signal.reason ?? new Error('scaler spawn aborted');
-        emit(ScalerEventType.enum['scaler.provisioning'], `pulling image ${matchedLabelSet.image}`);
-        const stream = await this.docker.pull(matchedLabelSet.image!, {
-          abortSignal: signal,
+      // Inject the KiCI runtime for a per-job image. Materialized out of the
+      // agent image into a named volume, because a bind mount needs a HOST path
+      // and the orchestrator may itself be containerized.
+      if (jobContainer) {
+        // Tell the agent it IS the job's image. Without this it sees the job's
+        // `container:` field, decides it needs a container, and nests a second
+        // one from the same image — a runtime inside a runtime.
+        env.push('KICI_JOB_IMAGE_AGENT=1');
+
+        const runtimeVolume = await ensureRuntimeVolume({
+          docker: this.docker,
+          agentImage: matchedLabelSet.image!,
+          ...(signal ? { signal } : {}),
+          onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
         });
-        await new Promise<void>((resolve, reject) => {
-          this.docker.modem.followProgress(stream, (err: Error | null) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
+        binds.push(runtimeInjectBind(runtimeVolume));
       }
 
       // Create container attached to the isolated network
@@ -562,7 +602,12 @@ export class ContainerScalerBackend implements ScalerBackend {
       const normalizedLabelSetStr = normalizeLabelSet(labelSet);
       const container = await this.docker.createContainer({
         abortSignal: signal,
-        Image: matchedLabelSet.image!,
+        Image: spawnImage,
+        // A per-job image declares its own CMD, so the agent has to be named
+        // explicitly or the container runs the customer's entrypoint and no
+        // agent ever registers. The pool's own agent image already starts the
+        // agent by default, so it keeps its CMD.
+        ...(jobContainer ? { Cmd: injectedAgentCommand() } : {}),
         Env: env,
         Labels: {
           'kici-managed': 'true',
@@ -699,7 +744,9 @@ export class ContainerScalerBackend implements ScalerBackend {
     };
   }
 
-  async destroy(managedId: string): Promise<void> {
+  async destroy(managedId: string, _context?: ScalerDestroyContext): Promise<void> {
+    // _context (teardown reason) is only meaningful to the event backend; a
+    // container teardown is the same regardless of why it was requested.
     const managed = this.agents.get(managedId);
     if (!managed) return;
 
@@ -765,7 +812,10 @@ export class ContainerScalerBackend implements ScalerBackend {
     await Promise.allSettled(ids.map((id) => this.destroy(id)));
   }
 
-  reload(labelSets: LabelSetConfig[]): ValidationResult {
+  reload(
+    labelSets: LabelSetConfig[],
+    opts?: { maxAgents?: number; entry?: ScalerEntry },
+  ): ValidationResult {
     // Validate: all container label sets must have an image
     const errors: string[] = [];
     labelSets.forEach((ls, i) => {
@@ -779,6 +829,9 @@ export class ContainerScalerBackend implements ScalerBackend {
     }
 
     this._labelSets = labelSets;
+    if (opts?.maxAgents !== undefined) {
+      this.maxAgents = opts.maxAgents;
+    }
     return { valid: true };
   }
 

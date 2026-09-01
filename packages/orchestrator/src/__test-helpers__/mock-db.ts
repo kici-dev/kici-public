@@ -15,8 +15,41 @@
  *
  * Each test can configure return values via options and access the
  * underlying vi.fn() mocks for assertions via the `mocks` property.
+ *
+ * ## The select chain APPLIES the query (contract)
+ *
+ * A select chain does not return `selectRows` / `selectFirstRow` verbatim. It
+ * evaluates the `.where(...)` predicates and the `.select([...])` projection the
+ * code under test issued, so a test observes the query instead of restating it:
+ * dropping a filter or a projected column changes what the test sees.
+ *
+ * - **Per query, not per test.** Every `db.selectFrom(...)` builds a fresh chain
+ *   with its own predicate list, so two queries in one test cannot inherit each
+ *   other's filters. The `mocks.select*` spies stay shared across the whole
+ *   test, so existing clause assertions are unaffected.
+ * - **Only the shapes the evaluator reads.** `.where(column, op, value)` is
+ *   evaluated; an `eb` callback or a raw `sql` fragment is recorded and skipped.
+ *   `.select()` is applied only when every argument is a plain column string, so
+ *   an aggregate or `eb` projection leaves rows untouched.
+ * - **A predicate on a column the fixture omits does not exclude the row.** To
+ *   pin a filter, the fixture row must declare the column that filter reads.
+ * - **`executeTakeFirstOrThrow` yields `{}`** when the configured row does not
+ *   satisfy the query, rather than throwing as Kysely would.
+ *
+ * `mock-db-query.ts` holds the evaluator and states the same contract with its
+ * reasoning; `mock-db-query.test.ts` tests it directly.
  */
-import { vi } from 'vitest';
+import { type Mock, vi } from 'vitest';
+import {
+  type MockDbPredicate,
+  type ProjectedColumn,
+  filterRows,
+  parseSelectArgs,
+  parseWhereArgs,
+  projectRow,
+  projectRows,
+  rowMatches,
+} from './mock-db-query.js';
 
 // ── Options ──────────────────────────────────────────────────────
 
@@ -129,6 +162,124 @@ function resolveInsertReturning(options: MockDbOptions): unknown {
   return 'insertReturning' in options ? options.insertReturning : DEFAULT_INSERT_ROW;
 }
 
+/**
+ * A spy the chain both records on and CALLS.
+ *
+ * The bare `ReturnType<typeof vi.fn>` used across {@link MockDbMocks} widens to
+ * `Mock<Constructable | Procedure>`, which TypeScript refuses to call — fine for
+ * an interface that is only ever asserted against, not for one the chain invokes.
+ */
+type CallableSpy = Mock<(...args: any[]) => any>;
+
+/** The shared select-chain spies every per-query chain records through. */
+interface SelectChainSpies {
+  selectAll: CallableSpy;
+  select: CallableSpy;
+  where: CallableSpy;
+  orderBy: CallableSpy;
+  limit: CallableSpy;
+  offset: CallableSpy;
+  forUpdate: CallableSpy;
+  skipLocked: CallableSpy;
+  execute: CallableSpy;
+  executeTakeFirst: CallableSpy;
+  executeTakeFirstOrThrow: CallableSpy;
+}
+
+/** Methods that only chain — they record on a shared spy and return the chain. */
+const CHAINING_METHODS = [
+  'orderBy',
+  'limit',
+  'offset',
+  'forUpdate',
+  'skipLocked',
+] as const satisfies readonly (keyof SelectChainSpies)[];
+
+/** Methods that chain but carry no shared spy of their own. */
+const UNSPIED_CHAINING_METHODS = [
+  'or',
+  'returningAll',
+  'distinct',
+  'groupBy',
+  'innerJoin',
+  'leftJoin',
+] as const;
+
+/**
+ * Build one `selectFrom(...)` query chain.
+ *
+ * Each call gets its own predicate list and projection, so two queries in the
+ * same test cannot contaminate each other's filters — while every call still
+ * records through the SHARED spies in `spies`, so `mocks.selectWhere` and
+ * friends keep observing the whole test as they always have.
+ *
+ * The terminals delegate to the shared `execute` / `executeTakeFirst` /
+ * `executeTakeFirstOrThrow` spies and then apply this chain's own WHERE and
+ * SELECT to whatever came back. Delegating first is what keeps a test's
+ * `mocks.selectExecute.mockResolvedValue(...)` override working — and makes the
+ * override subject to the same filtering as the configured rows.
+ */
+function buildSelectChain(spies: SelectChainSpies): Record<string, any> {
+  const predicates: MockDbPredicate[] = [];
+  let projection: ProjectedColumn[] | undefined;
+  const chain: Record<string, any> = {};
+
+  // Every chain method is itself a `vi.fn()`, not a plain closure. A test may
+  // walk the chain to assert per-query — `db.selectFrom.mock.results[0].value
+  // .select` — and a plain function there fails with "is not a spy". Recording
+  // on BOTH the per-chain spy and the shared one keeps that walk working while
+  // `mocks.selectWhere` still observes the whole test.
+  chain.where = vi.fn((...args: unknown[]) => {
+    spies.where(...args);
+    predicates.push(parseWhereArgs(args));
+    return chain;
+  });
+  chain.select = vi.fn((...args: unknown[]) => {
+    spies.select(...args);
+    projection = parseSelectArgs(args);
+    return chain;
+  });
+  chain.selectAll = vi.fn((...args: unknown[]) => {
+    spies.selectAll(...args);
+    projection = undefined;
+    return chain;
+  });
+  for (const method of CHAINING_METHODS) {
+    chain[method] = vi.fn((...args: unknown[]) => {
+      spies[method](...args);
+      return chain;
+    });
+  }
+  for (const method of UNSPIED_CHAINING_METHODS) {
+    chain[method] = vi.fn(() => chain);
+  }
+
+  const shape = <T>(row: T): T => (projection ? projectRow(row, projection) : row);
+
+  chain.execute = async (...args: unknown[]) => {
+    const rows = (await spies.execute(...args)) as unknown[] | undefined;
+    if (!Array.isArray(rows)) return rows;
+    const kept = filterRows(rows, predicates);
+    return projection ? projectRows(kept, projection) : kept;
+  };
+  chain.executeTakeFirst = async (...args: unknown[]) => {
+    const row = await spies.executeTakeFirst(...args);
+    if (row === undefined || row === null) return row;
+    return rowMatches(row, predicates) ? shape(row) : undefined;
+  };
+  chain.executeTakeFirstOrThrow = async (...args: unknown[]) => {
+    const row = await spies.executeTakeFirstOrThrow(...args);
+    if (row === undefined || row === null) return row;
+    // A configured row the query excludes surfaces as the same empty object the
+    // mock already returns when nothing is configured. Kysely itself would
+    // throw `NoResultError`; the empty object keeps the failure inside the
+    // assertions rather than turning it into control flow the code may catch.
+    return rowMatches(row, predicates) ? shape(row) : {};
+  };
+
+  return chain;
+}
+
 /** The `createMockDb` options the update chain reads. */
 interface UpdateChainOptions {
   updatedRow: unknown;
@@ -216,79 +367,40 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   const insertReturning = resolveInsertReturning(options);
 
   // ── Select chain ─────────────────────────────────────────────
+  // The shared spies below are the assertion surface AND the row source; each
+  // `selectFrom(...)` builds its own chain over them (see `buildSelectChain`),
+  // which is what lets one query's WHERE stay out of the next query's.
   const selectExecute = vi.fn().mockResolvedValue(selectRows);
   const selectExecuteTakeFirst = vi.fn().mockResolvedValue(selectFirstRow);
   const selectExecuteTakeFirstOrThrow = vi
     .fn()
     .mockResolvedValue(selectFirstRow ?? selectRows[0] ?? {});
 
-  // Self-referencing where/orderBy/limit chain
-  const selectTerminal: Record<string, any> = {
-    execute: selectExecute,
-    executeTakeFirst: selectExecuteTakeFirst,
-    executeTakeFirstOrThrow: selectExecuteTakeFirstOrThrow,
+  const selectChainSpies: SelectChainSpies = {
+    selectAll: vi.fn(),
+    select: vi.fn(),
     where: vi.fn(),
     orderBy: vi.fn(),
     limit: vi.fn(),
-    or: vi.fn(),
-    returningAll: vi.fn(),
+    offset: vi.fn(),
     forUpdate: vi.fn(),
     skipLocked: vi.fn(),
-    distinct: vi.fn(),
-    innerJoin: vi.fn(),
-    leftJoin: vi.fn(),
+    execute: selectExecute,
+    executeTakeFirst: selectExecuteTakeFirst,
+    executeTakeFirstOrThrow: selectExecuteTakeFirstOrThrow,
   };
-  selectTerminal.where = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.orderBy = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.limit = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.offset = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.or = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.returningAll = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.forUpdate = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.skipLocked = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.distinct = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.innerJoin = vi.fn().mockReturnValue(selectTerminal);
-  selectTerminal.leftJoin = vi.fn().mockReturnValue(selectTerminal);
-
-  const selectAll = vi.fn().mockReturnValue(selectTerminal);
-  const select = vi.fn().mockReturnValue(selectTerminal);
+  const selectAll = selectChainSpies.selectAll;
+  const select = selectChainSpies.select;
 
   // ── Count chain (fn.countAll) ────────────────────────────────
+  // A `db.fn.countAll().as(alias)` argument is not a plain column name, so the
+  // projection is left unmodelled and the aggregate row flows through the
+  // ordinary `selectFirstRow` path.
   const countExecuteTakeFirst = vi.fn().mockResolvedValue(countResult);
-  const _countSelect = vi.fn().mockReturnValue({
-    where: vi.fn().mockReturnValue({
-      executeTakeFirst: countExecuteTakeFirst,
-    }),
-  });
   const countAs = vi.fn().mockReturnValue('count');
   const countAll = vi.fn().mockReturnValue({ as: countAs });
 
-  const selectFromReturn: Record<string, any> = {
-    selectAll,
-    select: vi.fn().mockImplementation((...args: any[]) => {
-      // When called with fn.countAll, return count chain
-      // otherwise return selectTerminal
-      select(...args);
-      return selectTerminal;
-    }),
-    // Joins issued before .select() (e.g. attestations ⋈ execution_jobs) chain
-    // back to the same object so a following .select() still reaches the
-    // terminal. Mirrors selectTerminal's own join methods.
-    innerJoin: vi.fn().mockImplementation(() => selectFromReturn),
-    leftJoin: vi.fn().mockImplementation(() => selectFromReturn),
-    // `.where()` applied before `.select()` (filter builders that narrow the
-    // base query, and any query whose projection depends on the caller) chains
-    // back to the same object so a following `.select()` still reaches the
-    // terminal. It records through the SAME spy as the post-projection
-    // `.where()`: a predicate is a predicate whichever side of `.select()` it
-    // was added on, and a test counting predicates must not silently miss the
-    // ones added first.
-    where: vi.fn().mockImplementation((...args: any[]) => {
-      selectTerminal.where(...args);
-      return selectFromReturn;
-    }),
-  };
-  const selectFrom = vi.fn().mockReturnValue(selectFromReturn);
+  const selectFrom = vi.fn().mockImplementation(() => buildSelectChain(selectChainSpies));
 
   // ── Insert chain ─────────────────────────────────────────────
   const insertExecute = vi.fn().mockResolvedValue(undefined);
@@ -408,14 +520,14 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
     selectFrom,
     selectAll,
     select,
-    selectWhere: selectTerminal.where,
-    selectOrderBy: selectTerminal.orderBy,
-    selectLimit: selectTerminal.limit,
+    selectWhere: selectChainSpies.where,
+    selectOrderBy: selectChainSpies.orderBy,
+    selectLimit: selectChainSpies.limit,
     selectExecute,
     selectExecuteTakeFirst,
     selectExecuteTakeFirstOrThrow,
-    selectForUpdate: selectTerminal.forUpdate,
-    selectSkipLocked: selectTerminal.skipLocked,
+    selectForUpdate: selectChainSpies.forUpdate,
+    selectSkipLocked: selectChainSpies.skipLocked,
 
     insertInto,
     insertValues,

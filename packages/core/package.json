@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/core",
-  "version": "0.5.0",
+  "version": "0.6.1",
   "description": "Light shared utilities for the KiCI stack (logging, errors, formatting, crypto, zx init, the TypeScript ESM loader hook). No server-side dependencies.",
   "keywords": [
     "ci",
@@ -51,6 +51,10 @@
     "./idempotency": {
       "import": "./dist/idempotency.js",
       "types": "./dist/idempotency.d.ts"
+    },
+    "./diagnostics-redaction": {
+      "import": "./dist/diagnostics-redaction.js",
+      "types": "./dist/diagnostics-redaction.d.ts"
     },
     "./ci-env": {
       "import": "./dist/ci-env.js",

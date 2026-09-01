@@ -1032,14 +1032,50 @@ describe('JobQueue', () => {
   });
 
   describe('markExpired', () => {
+    // The sweep selects `status = pending AND expires_at IS NOT NULL AND
+    // expires_at < now`. Every fixture row below carries those columns so the
+    // mock db can actually evaluate the predicates, and each test seeds one
+    // decoy per predicate — a row the sweep must leave alone. Drop any of the
+    // three filters and a decoy comes back, so the counts below fail.
+    const EXPIRED_AT = '2020-01-01T00:00:00.000Z';
+    const NOT_YET_EXPIRED_AT = '2999-01-01T00:00:00.000Z';
+    const expirable = { status: DispatchQueueStatus.Pending, expires_at: EXPIRED_AT };
+    const decoys = [
+      // Already claimed — the status filter must exclude it.
+      {
+        id: 'decoy-dispatched',
+        run_id: 'run-9',
+        job_name: 'decoy',
+        status: DispatchQueueStatus.Dispatched,
+        expires_at: EXPIRED_AT,
+      },
+      // No timeout at all — the `IS NOT NULL` filter must exclude it.
+      {
+        id: 'decoy-no-expiry',
+        run_id: 'run-9',
+        job_name: 'decoy',
+        status: DispatchQueueStatus.Pending,
+        expires_at: null,
+      },
+      // Still inside its timeout — the `< now` filter must exclude it.
+      {
+        id: 'decoy-future',
+        run_id: 'run-9',
+        job_name: 'decoy',
+        status: DispatchQueueStatus.Pending,
+        expires_at: NOT_YET_EXPIRED_AT,
+      },
+    ];
+
     it('returns details of expired jobs', async () => {
       const expiredRows = [
         // The pg driver auto-parses jsonb, so labels arrive as a real array...
-        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: ['linux'] },
+        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: ['linux'], ...expirable },
         // ...while a non-parsing driver (and the test doubles) hand back JSON text.
-        { id: 'q-2', run_id: 'run-2', job_name: 'test', runs_on_labels: '["gpu"]' },
+        { id: 'q-2', run_id: 'run-2', job_name: 'test', runs_on_labels: '["gpu"]', ...expirable },
         // A row with no selector columns at all degrades to empty, never throws.
-        { id: 'q-3', run_id: 'run-1', job_name: 'deploy' },
+        { id: 'q-3', run_id: 'run-1', job_name: 'deploy', ...expirable },
+        ...decoys,
       ];
       const db = createMockDb({ selectRows: expiredRows as any });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
@@ -1087,8 +1123,15 @@ describe('JobQueue', () => {
       // and its run stuck non-terminal forever. The sibling row proves the
       // whole batch still comes back, not just the healthy prefix.
       const expiredRows = [
-        { id: 'q-1', run_id: 'run-1', job_name: 'build', runs_on_labels: '{not json' },
-        { id: 'q-2', run_id: 'run-1', job_name: 'test', runs_on_labels: '["linux"]' },
+        {
+          id: 'q-1',
+          run_id: 'run-1',
+          job_name: 'build',
+          runs_on_labels: '{not json',
+          ...expirable,
+        },
+        { id: 'q-2', run_id: 'run-1', job_name: 'test', runs_on_labels: '["linux"]', ...expirable },
+        ...decoys,
       ];
       const db = createMockDb({ selectRows: expiredRows as any });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
@@ -1118,14 +1161,24 @@ describe('JobQueue', () => {
           run_id: 'run-1',
           job_name: 'build',
           last_provisioning_error: 'spawn node ENOENT',
+          ...expirable,
         },
-        { id: 'q-2', run_id: 'run-2', job_name: 'test', last_provisioning_error: null },
+        {
+          id: 'q-2',
+          run_id: 'run-2',
+          job_name: 'test',
+          last_provisioning_error: null,
+          ...expirable,
+        },
+        ...decoys,
       ];
       const db = createMockDb({ selectRows: expiredRows as any });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
       const result = await queue.markExpired();
 
+      // Only the two genuinely-expired rows come back; the decoys are filtered.
+      expect(result).toHaveLength(2);
       // The reaper reads the spawn-failure detail off the expired-job info.
       expect(result[0].lastProvisioningError).toBe('spawn node ENOENT');
       // Rows without a recorded failure map to null.

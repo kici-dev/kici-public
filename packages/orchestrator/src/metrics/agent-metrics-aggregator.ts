@@ -9,8 +9,8 @@
  * make Mimir cardinality grow with the number of agents that have ever
  * existed (every ephemeral firecracker microVM minted a fresh ID), which
  * is unbounded. The caller-side dashboard filters by `scaler` instead,
- * which has a fixed enum of values (`stateful` / `container` /
- * `firecracker` / `bare-metal`).
+ * which has a fixed enum of values (`stateful`, plus every
+ * `ScalerBackendType`).
  *
  * Aggregation rules per metric kind:
  *   - counter / upDownCounter / gauge → SUM across agents in the pool

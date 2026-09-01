@@ -87,14 +87,16 @@ import { ObserverRegistry } from './ws/observer-registry.js';
 import { configureSecureWsServer } from './ws/server-options.js';
 import {
   ScalerManager,
+  type ScalerManagerDeps,
   ContainerScalerBackend,
-  BareMetalScalerBackend,
-  FirecrackerScalerBackend,
   InMemoryIpAllocator,
+  createScalerBackend,
   loadScalerConfig,
   detectLabelSetOverlaps,
 } from './scaler/index.js';
+import type { AgentTokenStore } from './agent/token-store.js';
 import type {
+  BackendFactoryContext,
   ScalerBackend,
   ScalerConfig,
   ScalerEvent,
@@ -170,6 +172,12 @@ async function initializeWorkerScaler(
   tokenStore: StaticAgentTokenStore,
   onScalerEvent: (runId: string, jobId: string, event: ScalerEvent) => void,
   tokenTtlProvider: () => Promise<number>,
+  /**
+   * Read-only view of the agent registry, used by the warm pool to count the
+   * agents that could already serve a job for a label set. Built before the
+   * scaler, so it is passed directly rather than late-bound.
+   */
+  agentRegistry: ScalerManagerDeps['agentRegistry'],
 ): Promise<{ manager: ScalerManager; config: ScalerConfig } | null> {
   if (!config.scalerConfigPath) return null;
 
@@ -192,88 +200,27 @@ async function initializeWorkerScaler(
     process.exit(1);
   }
 
+  // One shared factory with the leader, so the two hosts cannot drift apart.
+  const factoryCtx: BackendFactoryContext = {
+    scalerConfig,
+    tokenStore: tokenStore as unknown as AgentTokenStore,
+    injectAgentToken: config.agentAuth === 'token',
+    tokenTtlMs: config.agentTokenTtlMs,
+    // Honor the fleet-wide agent_token_ttl_ms pulled from the leader (DB-less
+    // workers cannot read cluster_settings directly); falls back to
+    // config.agentTokenTtlMs until the first pull lands.
+    tokenTtlProvider,
+    ipAllocator: ({ cidr, gateway, netmask }) =>
+      new InMemoryIpAllocator({ cidr, gateway, netmask }),
+    // No event emitter and no database in worker mode: `type: event` is
+    // unsupported here, and the factory skips it with a warning.
+    logger,
+  };
+
   const backendResults = await Promise.all(
     scalerConfig.scalers.map(async (s) => {
-      if (s.type === 'container') {
-        return {
-          name: s.name,
-          backend: await ContainerScalerBackend.create({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            host: s.host,
-            socketPath: s.socketPath,
-            runtime: s.runtime,
-            defaultResources: scalerConfig.defaults?.resources,
-            extraHosts: s.extraHosts,
-            networkIsolation: s.networkIsolation,
-            tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // Honor the fleet-wide agent_token_ttl_ms pulled from the leader
-            // (DB-less workers cannot read cluster_settings directly); falls
-            // back to config.agentTokenTtlMs until the first pull lands.
-            tokenTtlProvider,
-            roles: s.roles,
-          }),
-        };
-      } else if (s.type === 'bare-metal') {
-        return {
-          name: s.name,
-          backend: new BareMetalScalerBackend({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            defaultResources: scalerConfig.defaults?.resources,
-            tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // See the container backend above — honor the leader-pulled TTL.
-            tokenTtlProvider,
-            roles: s.roles,
-            enforceCgroups: s.enforceCgroups,
-          }),
-        };
-      } else if (s.type === 'firecracker') {
-        const fcNet = scalerConfig.firecracker;
-        const cidr = fcNet?.cidr ?? '10.0.0.0/24';
-        const bridgeName = fcNet?.bridgeName ?? 'kici-br0';
-        const gateway = fcNet?.gateway ?? '10.0.0.1';
-        const netmask = fcNet?.netmask ?? '255.255.255.0';
-        const table = fcNet?.table ?? 'kici';
-        const autoProvisionHost = fcNet?.autoProvisionHost ?? true;
-        const ipAllocator = new InMemoryIpAllocator({ cidr, gateway, netmask });
-        return {
-          name: s.name,
-          backend: new FirecrackerScalerBackend({
-            name: s.name,
-            labelSets: s.labelSets,
-            maxAgents: s.maxAgents,
-            ipAllocator,
-            firecrackerPath: s.firecrackerPath!,
-            jailerPath: s.jailerPath!,
-            kernelPath: s.kernelPath!,
-            chrootBaseDir: s.chrootBaseDir,
-            uid: s.uid!,
-            gid: s.gid!,
-            vcpuCount: s.vcpuCount,
-            memSizeMib: s.memSizeMib,
-            bridgeName,
-            cidr,
-            gateway,
-            netmask,
-            table,
-            autoProvisionHost,
-            tokenStore: config.agentAuth === 'token' ? (tokenStore as any) : undefined,
-            tokenTtlMs: config.agentTokenTtlMs,
-            // See the container backend above — honor the leader-pulled TTL.
-            tokenTtlProvider,
-            roles: s.roles,
-            requireSudo: s.requireSudo,
-          }),
-        };
-      } else {
-        logger.warn(`Unsupported scaler type "${s.type}" for scaler "${s.name}", skipping`);
-        return null;
-      }
+      const backend = await createScalerBackend(s, factoryCtx);
+      return backend ? { name: s.name, backend } : null;
     }),
   );
 
@@ -289,6 +236,10 @@ async function initializeWorkerScaler(
   const scalerManager = new ScalerManager({
     config: scalerConfig,
     backends,
+    agentRegistry,
+    instanceId: config.cluster.instanceId,
+    // The worker has no database, so no claim store and no event plane: a
+    // provisioning code is always redeemed by a coordinator.
     machineLedger: {
       dir: config.machineLedgerDir,
       instanceId: config.cluster.instanceId,
@@ -296,6 +247,8 @@ async function initializeWorkerScaler(
     onScalerEvent,
     // The worker has no DB; the spawn deadline is the cluster-wide default.
     spawnTimeoutMs: config.scalerSpawnTimeoutMs,
+    // The reloaded config, not the boot-time one — see orchestrator-core.
+    createBackend: (entry, cfg) => createScalerBackend(entry, { ...factoryCtx, scalerConfig: cfg }),
   });
 
   // Run orphan cleanup for container backends
@@ -351,6 +304,8 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
       Array<Record<string, unknown>> | undefined;
     const dispatchInstallEnvSecrets = job.jobConfig.installEnvSecrets as
       Record<string, string> | undefined;
+    const dispatchContainerRegistryAuth = job.jobConfig.containerRegistryAuth as
+      { username: string; password: string; serveraddress: string } | undefined;
     // The coordinator pre-resolves a clone token in its onJobReroute path
     // (mintSourceAuth at the dispatch site) and stuffs it into
     // jobConfig.cloneToken — workers have no provider credentials of their
@@ -367,6 +322,7 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
           k !== 'runPublicKey' &&
           k !== 'npmRegistries' &&
           k !== 'installEnvSecrets' &&
+          k !== 'containerRegistryAuth' &&
           k !== 'cloneToken',
       ),
     );
@@ -407,6 +363,9 @@ function buildWorkerOnDispatch(agentRegistry: AgentRegistry) {
           Object.keys(dispatchInstallEnvSecrets).length > 0 && {
             installEnvSecrets: dispatchInstallEnvSecrets,
           }),
+        ...(dispatchContainerRegistryAuth && {
+          containerRegistryAuth: dispatchContainerRegistryAuth,
+        }),
       }),
     );
 
@@ -675,6 +634,7 @@ export async function bootstrapWorker(
       });
     },
     workerTokenTtlProvider,
+    agentRegistry,
   );
   const scalerManager = scalerResult?.manager ?? null;
   const scalerConfig = scalerResult?.config ?? null;
@@ -694,8 +654,22 @@ export async function bootstrapWorker(
     metrics: noopMetrics,
     onDispatch,
     onNoMatchingAgent: scalerManager
-      ? async (labels, jobId, runId, excludeLabels, resources, orgId) =>
-          scalerManager.requestScale(labels, jobId, runId, excludeLabels, resources, orgId)
+      ? async (labels, jobId, runId, excludeLabels, resources, orgId, containerSpawn) =>
+          scalerManager.requestScale(
+            labels,
+            jobId,
+            runId,
+            excludeLabels,
+            resources,
+            orgId,
+            containerSpawn,
+          )
+      : undefined,
+    canPrespawnedAgentServe: scalerManager
+      ? (agentId, job) => scalerManager.canPrespawnedAgentServe(agentId, job)
+      : undefined,
+    isPrespawnedAgent: scalerManager
+      ? (agentId) => scalerManager.isPrespawnedAgent(agentId)
       : undefined,
     // The worker has no DB; the deadline is the cluster-wide default.
     getAckTimeoutMs: async () => config.dispatchAckTimeoutMs,
@@ -753,15 +727,7 @@ export async function bootstrapWorker(
     draining,
     capabilities: { s3LogAccess: false },
     ...(scalerManager && {
-      scalerCapacity: scalerManager.getStatus().backends.map((b) => ({
-        name: b.name,
-        type: b.type,
-        labelSets: b.labelSets,
-        maxAgents: b.maxAgents,
-        activeCount: b.activeCount,
-        spawnsOnLocalHost: b.spawnsOnLocalHost,
-        mandatoryLabels: b.mandatoryLabels,
-      })),
+      scalerCapacity: scalerManager.getRoutableCapacity(),
     }),
     configVersion: 0,
     registryVersion: 0,

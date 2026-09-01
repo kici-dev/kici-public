@@ -179,7 +179,7 @@ Synopsis: `kici-admin event`
 
 ### `kici-admin event emit`
 
-INSERT a row into kici_events and fire pg_notify — simulates agent ctx.emit() for e2e tests
+INSERT a row into kici_events and fire pg_notify — manually emit an internal event (mirrors agent ctx.emit())
 
 Synopsis: `kici-admin event emit <name> [options]`
 
@@ -573,7 +573,7 @@ Synopsis: `kici-admin workflow list [options]`
 
 ### `kici-admin workflow register-manual`
 
-Manually upsert workflow_registrations rows from a lock file + bump registry_versions. Transactional. Used by E2E helpers that seed registrations without a real push event.
+Manually upsert workflow_registrations rows from a lock file + bump registry_versions. Transactional. Seeds workflow registrations without a real push event.
 
 Synopsis: `kici-admin workflow register-manual [options]`
 

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { JobDispatch, JobCancel, AgentToOrchestratorMessage } from '@kici-dev/engine';
+import { decideIdleShutdown } from './idle-shutdown.js';
 
 /**
  * Tests for server.ts wiring logic.
@@ -308,6 +309,42 @@ describe('Server wiring: drain mode', () => {
   });
 });
 
+describe('Server wiring: drain-on-reset-failure gate', () => {
+  // Mirrors the job-completion `.finally` gate in server.ts: drain only when
+  // opted in, not already draining, and the controller's consecutive-reset
+  // failures have reached the threshold. Kept as a mirror (like the other
+  // wiring tests in this file) because the gate is inline in server.ts.
+  const RESET_FAILURE_DRAIN_THRESHOLD = 3;
+  function shouldDrain(
+    drainOnResetFailure: boolean,
+    isDraining: boolean,
+    consecutiveResetFailures: number,
+  ): boolean {
+    return (
+      drainOnResetFailure &&
+      !isDraining &&
+      consecutiveResetFailures >= RESET_FAILURE_DRAIN_THRESHOLD
+    );
+  }
+
+  it('drains once the threshold is reached and the flag is set', () => {
+    expect(shouldDrain(true, false, 3)).toBe(true);
+    expect(shouldDrain(true, false, 4)).toBe(true);
+  });
+
+  it('does not drain below the threshold', () => {
+    expect(shouldDrain(true, false, 2)).toBe(false);
+  });
+
+  it('does not drain when the opt-in flag is off', () => {
+    expect(shouldDrain(false, false, 5)).toBe(false);
+  });
+
+  it('does not re-trigger when already draining', () => {
+    expect(shouldDrain(true, true, 5)).toBe(false);
+  });
+});
+
 describe('Server wiring: cancel callback', () => {
   it('routes cancel to jobRunner.cancel()', () => {
     const jobRunner = createMockJobRunner();
@@ -489,8 +526,11 @@ describe('Server wiring: scaler idle shutdown', () => {
 
     // Step 2: Simulate reconnection (onRegistered callback fires)
     client.state = 'registered';
-    // This mimics client.onRegistered callback from server.ts:
-    if (jobRunner.activeJobs.size === 0) {
+    // Route the branch through the same `decideIdleShutdown` the real
+    // client.onRegistered uses, so this case cannot drift from server.ts.
+    if (
+      decideIdleShutdown({ scalerManaged: true, activeJobs: jobRunner.activeJobs.size }) === 'idle'
+    ) {
       startIdleShutdownTimer();
     }
 
@@ -520,7 +560,9 @@ describe('Server wiring: scaler idle shutdown', () => {
 
     // Step 2: Reconnection
     client.state = 'registered';
-    if (jobRunner.activeJobs.size === 0) {
+    if (
+      decideIdleShutdown({ scalerManaged: true, activeJobs: jobRunner.activeJobs.size }) === 'idle'
+    ) {
       startIdleShutdownTimer();
     }
 

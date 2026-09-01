@@ -11,6 +11,7 @@
  * - run.rerun.request: re-runs a completed workflow run
  * - run.cancel.request: cancels a running workflow run
  */
+import { setupStepsFirst } from '../reporting/step-display-order.js';
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
 import type {
@@ -214,16 +215,12 @@ interface DashboardHandlerDeps {
    */
   eventStore?: EventStore | null;
   /**
-   * **Test-only.** Master switch for fault-injection knobs. When false the
-   * handler ignores every test-only knob below even if it is set.
+   * **Test-only fault injection**, supplied only by the build-time test double:
+   * `handleRerunRequest` awaits this hook before invoking `onRerun`, so an HA
+   * E2E can force a slow first coordinator and trigger a relay failover.
+   * Undefined (the shipped default) means no delay.
    */
-  testMode?: boolean;
-  /**
-   * **Test-only.** When set (and `testMode` is true), `handleRerunRequest`
-   * sleeps this many ms before invoking `onRerun`, so an HA E2E can force a
-   * slow first coordinator and trigger a relay failover. Ignored in production.
-   */
-  testRerunDelayMs?: number;
+  beforeRerun?: () => Promise<void>;
 }
 
 export class DashboardHandler {
@@ -243,8 +240,7 @@ export class DashboardHandler {
   private readonly eventStore: EventStore | null;
   private readonly retryAttestations: DashboardHandlerDeps['retryAttestations'];
   private readonly provenanceSigningIssuer: string | null;
-  private readonly testMode: boolean;
-  private readonly testRerunDelayMs: number | undefined;
+  private readonly beforeRerun: (() => Promise<void>) | undefined;
 
   constructor(deps: DashboardHandlerDeps) {
     this.db = deps.db;
@@ -263,8 +259,7 @@ export class DashboardHandler {
     this.coldStore = deps.coldStore ?? null;
     this.eventStore = deps.eventStore ?? null;
     this.retryAttestations = deps.retryAttestations;
-    this.testMode = deps.testMode ?? false;
-    this.testRerunDelayMs = deps.testRerunDelayMs;
+    this.beforeRerun = deps.beforeRerun;
   }
 
   /**
@@ -480,6 +475,8 @@ export class DashboardHandler {
           'base_job_name',
           'variant_kind',
           'variant_label',
+          'job_kind',
+          'summoned_run_id',
           'agent_id',
           'started_at',
           'completed_at',
@@ -518,6 +515,7 @@ export class DashboardHandler {
           'group_id',
         ])
         .where('run_id', '=', msg.runId)
+        .orderBy(setupStepsFirst())
         .orderBy('step_index', 'asc')
         .execute();
 
@@ -2244,12 +2242,11 @@ export class DashboardHandler {
     const ctx = this.contextOrFallback(resolved);
 
     try {
-      // Test-only: slow the first coordinator so an HA E2E can force a relay
-      // failover and exercise the requestId idempotency claim.
-      if (this.testMode && this.testRerunDelayMs) {
-        logger.warn('rerun-delay fault-injection ACTIVE', { ms: this.testRerunDelayMs });
-        await new Promise((r) => setTimeout(r, this.testRerunDelayMs));
-      }
+      // Test-only: the build-time test double injects `beforeRerun` to slow the
+      // first coordinator so an HA E2E can force a relay failover and exercise
+      // the requestId idempotency claim. The shipped orchestrator leaves it
+      // undefined, so no delay is applied.
+      if (this.beforeRerun) await this.beforeRerun();
       const result = await this.onRerun(
         msg.runId,
         stringifyActor(msg.actor),
@@ -3418,6 +3415,8 @@ export class DashboardHandler {
       base_job_name: typeof r.base_job_name === 'string' ? r.base_job_name : null,
       variant_kind: typeof r.variant_kind === 'string' ? r.variant_kind : null,
       variant_label: typeof r.variant_label === 'string' ? r.variant_label : null,
+      job_kind: typeof r.job_kind === 'string' ? r.job_kind : null,
+      summoned_run_id: typeof r.summoned_run_id === 'string' ? r.summoned_run_id : null,
       agent_id: typeof r.agent_id === 'string' ? r.agent_id : null,
       started_at: coerceToDate(r.started_at),
       completed_at: coerceToDate(r.completed_at),

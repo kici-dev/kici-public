@@ -1,5 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { StaleRunDetector, type StaleRunDetectorDeps } from './stale-run-detector.js';
+import {
+  CheckRunConclusion,
+  HoldScope,
+  HoldType,
+  INSTALL_JOB_ID_PREFIX,
+  installGateJobId,
+  SECURITY_HOLD_JOB_IDS,
+} from '@kici-dev/engine';
+import {
+  clearPendingWorkflowContextsMap,
+  loadPendingWorkflowContext,
+  storePendingWorkflowContext,
+} from '../pipeline/pending-workflow-context.js';
 
 // Mock Prometheus metrics
 vi.mock('../metrics/prometheus.js', () => ({
@@ -61,6 +74,7 @@ function createDeps() {
 
   const checkRunReporter = {
     updateJobStatus: vi.fn(),
+    completeUndispatchedCheckRuns: vi.fn().mockResolvedValue(undefined),
   };
 
   const scalerManager = {
@@ -113,6 +127,11 @@ function createSequentialDb(config: {
       const cfg = config.updates[idx] ?? { executeTakeFirstResult: { numUpdatedRows: 0n } };
       return createChainableMock({ executeTakeFirstResult: cfg.executeTakeFirstResult });
     }),
+    // `deletePendingWorkflowContext` runs inside the expiry sweep. Without this
+    // it threw into the sweep's own catch, which logs and moves on — so the
+    // whole tail of the sweep was silently skipped in every test that reached
+    // it.
+    deleteFrom: vi.fn(() => createChainableMock({})),
   };
 
   return db as unknown as StaleRunDetectorDeps['db'];
@@ -140,6 +159,107 @@ function makeDeps(
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+describe('StaleRunDetector — wait-timer release routing', () => {
+  /** A minimal detector whose only live dependency is the held-run store. */
+  function detectorWith(
+    released: Array<Record<string, unknown>>,
+    handlers: {
+      onWorkflowRelease?: ReturnType<typeof vi.fn>;
+      onJobRelease?: ReturnType<typeof vi.fn>;
+    },
+  ) {
+    const mocks = createDeps();
+    const deps = makeDeps(createSequentialDb({ selects: [], updates: [] }), mocks);
+    return new StaleRunDetector({
+      ...deps,
+      heldRunStore: {
+        releaseDueWaitHolds: vi.fn().mockResolvedValue(released),
+        expireOverdue: vi.fn().mockResolvedValue(0),
+        listOverdue: vi.fn().mockResolvedValue([]),
+      } as unknown as StaleRunDetectorDeps['heldRunStore'],
+      ...handlers,
+    } as StaleRunDetectorDeps);
+  }
+
+  /** Drive the private sweep directly — it is the unit under test. */
+  const sweep = (d: StaleRunDetector) =>
+    (d as unknown as { releaseDueWaitHolds(): Promise<void> }).releaseDueWaitHolds();
+
+  it('routes a JOB-scoped wait release to the job path, not the workflow path', async () => {
+    // Before job-scoped timer holds were released at all, this sweep filtered
+    // them out entirely; routing them to onWorkflowRelease would re-dispatch a
+    // whole workflow instead of the one job that was held.
+    const onJobRelease = vi.fn().mockResolvedValue(undefined);
+    const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);
+    const d = detectorWith(
+      [
+        {
+          holdId: 'h1',
+          runId: 'r1',
+          jobId: 'build',
+          stepIndex: null,
+          scope: 'job',
+          triggerSource: 'context',
+        },
+      ],
+      { onJobRelease, onWorkflowRelease },
+    );
+
+    await sweep(d);
+
+    expect(onJobRelease).toHaveBeenCalledTimes(1);
+    expect(onJobRelease.mock.calls[0][0]).toMatchObject({ runId: 'r1', jobId: 'build' });
+    expect(onWorkflowRelease).not.toHaveBeenCalled();
+  });
+
+  it('still routes a WORKFLOW-scoped wait release to the install-gate path', async () => {
+    // The positive control: the pre-existing behaviour must be untouched.
+    const onJobRelease = vi.fn().mockResolvedValue(undefined);
+    const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);
+    const d = detectorWith(
+      [
+        {
+          holdId: 'h2',
+          runId: 'r2',
+          jobId: INSTALL_JOB_ID_PREFIX,
+          stepIndex: null,
+          scope: 'workflow',
+          triggerSource: 'context',
+        },
+      ],
+      { onJobRelease, onWorkflowRelease },
+    );
+
+    await sweep(d);
+
+    expect(onWorkflowRelease).toHaveBeenCalledTimes(1);
+    expect(onJobRelease).not.toHaveBeenCalled();
+  });
+
+  it('sweeps even when only a job-release handler is wired', async () => {
+    // The guard used to require onWorkflowRelease, so an orchestrator wired for
+    // job releases only would have skipped the sweep entirely.
+    const onJobRelease = vi.fn().mockResolvedValue(undefined);
+    const d = detectorWith(
+      [
+        {
+          holdId: 'h3',
+          runId: 'r3',
+          jobId: 'deploy',
+          stepIndex: null,
+          scope: 'job',
+          triggerSource: 'context',
+        },
+      ],
+      { onJobRelease },
+    );
+
+    await sweep(d);
+
+    expect(onJobRelease).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('StaleRunDetector', () => {
   beforeEach(() => {
@@ -348,6 +468,402 @@ describe('StaleRunDetector', () => {
     );
   });
 
+  it('scan() fails an expired WORKFLOW-scoped hold instead of resuming it', async () => {
+    // The org trust policy's PR-wide hold is workflow-scoped and stores a
+    // dispatch context, so a released one replays that dispatch. Expiry is the
+    // opposite outcome and must never take that path: an approval window that
+    // ran out is a denial, not a deferred approval.
+    const mocks = createDeps();
+    const db = createSequentialDb({
+      selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
+      updates: [],
+    });
+
+    // The context the hold stored. Without it the "dropped" assertion below
+    // would pass on a run that never had one.
+    clearPendingWorkflowContextsMap();
+    await storePendingWorkflowContext(undefined, {
+      runId: 'run-fork',
+      resolvedOrgId: 'org-7',
+    } as never);
+    expect(await loadPendingWorkflowContext(undefined, 'run-fork')).not.toBeNull();
+
+    const heldRunStore = {
+      // A security hold carries `hold_type: 'security'`, which the wait-timer
+      // sweep's own `hold_type` filter excludes — so it only ever reaches the
+      // expire path, never `releaseDueWaitHolds`.
+      releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
+      listOverdue: vi.fn().mockResolvedValue([
+        {
+          id: 'hold-fork',
+          org_id: 'org-7',
+          run_id: 'run-fork',
+          job_id: SECURITY_HOLD_JOB_IDS.fork_pr,
+          hold_scope: 'workflow',
+        },
+      ]),
+      expireOverdue: vi.fn().mockResolvedValue(1),
+    } as unknown as StaleRunDetectorDeps['heldRunStore'];
+    const failRun = vi.fn().mockResolvedValue(undefined);
+    const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);
+    const onJobRelease = vi.fn().mockResolvedValue(undefined);
+
+    const detector = new StaleRunDetector({
+      ...makeDeps(db, mocks),
+      heldRunStore,
+      failRun,
+      onWorkflowRelease,
+      onJobRelease,
+    } as StaleRunDetectorDeps);
+    await detector.scan();
+
+    expect(failRun).toHaveBeenCalledWith('run-fork', expect.stringContaining('Approval expired'));
+    expect(onWorkflowRelease).not.toHaveBeenCalled();
+    expect(onJobRelease).not.toHaveBeenCalled();
+    // Expiry consumes the stored dispatch context too. Only a release or a
+    // rejection would otherwise drop it, and an unanswered hold reaches
+    // neither — so for a fork PR nobody approves, the common outcome, the row
+    // would accumulate until a restart swept it as terminal.
+    expect(await loadPendingWorkflowContext(undefined, 'run-fork')).toBeNull();
+  });
+
+  it('scan() leaves a JOB-scoped expired hold no workflow context to drop', async () => {
+    // The control: the cleanup is keyed on scope, not run on every expiry. A
+    // job-scoped hold never wrote a workflow context, and a sweep that deleted
+    // by run id regardless could take out a context belonging to a different,
+    // still-live hold on the same run.
+    const mocks = createDeps();
+    const db = createSequentialDb({
+      selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
+      updates: [],
+    });
+    clearPendingWorkflowContextsMap();
+    await storePendingWorkflowContext(undefined, {
+      runId: 'run-job',
+      resolvedOrgId: 'org-7',
+    } as never);
+
+    const heldRunStore = {
+      releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
+      listOverdue: vi.fn().mockResolvedValue([
+        {
+          id: 'hold-job',
+          org_id: 'org-7',
+          run_id: 'run-job',
+          job_id: 'build',
+          hold_scope: 'job',
+        },
+      ]),
+      expireOverdue: vi.fn().mockResolvedValue(1),
+    } as unknown as StaleRunDetectorDeps['heldRunStore'];
+
+    const detector = new StaleRunDetector({
+      ...makeDeps(db, mocks),
+      heldRunStore,
+      failRun: vi.fn().mockResolvedValue(undefined),
+    } as StaleRunDetectorDeps);
+    await detector.scan();
+
+    expect(await loadPendingWorkflowContext(undefined, 'run-job')).not.toBeNull();
+    expect(mocks.checkRunReporter.completeUndispatchedCheckRuns).not.toHaveBeenCalled();
+    clearPendingWorkflowContextsMap();
+  });
+
+  it('scan() completes the queued check runs of an expired WORKFLOW-scoped hold', async () => {
+    // `failRun` above writes DB rows only — a held run has no in-memory run for
+    // it to fire `onExecutionComplete` from, and the stale check-run sweep only
+    // touches `in_progress` — so without this the `kici/<workflow>` and per-job
+    // checks the dispatch posted stay `queued` on the commit forever.
+    const mocks = createDeps();
+    const db = createSequentialDb({
+      selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
+      updates: [],
+    });
+
+    clearPendingWorkflowContextsMap();
+    await storePendingWorkflowContext(undefined, {
+      runId: 'run-fork',
+      resolvedOrgId: 'org-7',
+      repoIdentifier: 'acme/app',
+      ref: 'cafebabe',
+      credentials: { installationId: 42 },
+      info: { provider: 'github', routingKey: 'github:1' },
+      workflow: {
+        name: 'CI',
+        jobs: [
+          { _type: 'static', name: 'build' },
+          { _type: 'dynamic', name: 'gen' },
+        ],
+      },
+    } as never);
+
+    const heldRunStore = {
+      releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
+      listOverdue: vi.fn().mockResolvedValue([
+        {
+          id: 'hold-fork',
+          org_id: 'org-7',
+          run_id: 'run-fork',
+          job_id: SECURITY_HOLD_JOB_IDS.fork_pr,
+          hold_scope: 'workflow',
+        },
+      ]),
+      expireOverdue: vi.fn().mockResolvedValue(1),
+    } as unknown as StaleRunDetectorDeps['heldRunStore'];
+
+    const detector = new StaleRunDetector({
+      ...makeDeps(db, mocks),
+      heldRunStore,
+      failRun: vi.fn().mockResolvedValue(undefined),
+    } as StaleRunDetectorDeps);
+    await detector.scan();
+
+    expect(mocks.checkRunReporter.completeUndispatchedCheckRuns).toHaveBeenCalledTimes(1);
+    expect(mocks.checkRunReporter.completeUndispatchedCheckRuns.mock.calls[0][0]).toMatchObject({
+      provider: 'github',
+      routingKey: 'github:1',
+      owner: 'acme',
+      repo: 'app',
+      sha: 'cafebabe',
+      workflowName: 'CI',
+      jobNames: ['build'],
+      installationId: 42,
+      runId: 'run-fork',
+      conclusion: CheckRunConclusion.enum.timed_out,
+    });
+    clearPendingWorkflowContextsMap();
+  });
+
+  /**
+   * The `KiCI Security` check the org trust policy's PR-wide hold posted as
+   * `pending`. `failRun` writes DB rows and no check run, so an unanswered hold
+   * left it `in_progress` on the commit forever.
+   */
+  describe('scan() completes the security check of an expired hold', () => {
+    /**
+     * The `execution_runs` row the settled security check is addressed from —
+     * the same repo, sha, effective routing key and credentials the pending
+     * check was posted under.
+     */
+    const RUN_ROW = {
+      repo_identifier: 'acme/app',
+      sha: 'cafebabe',
+      routing_key: 'github:1',
+      provider_context: { installationId: 42 },
+    };
+
+    /** Seed a hold on `job_id` + `holdScope`, with a stored dispatch context. */
+    async function runExpirySweep(
+      jobId: string,
+      postCheckStatus: ReturnType<typeof vi.fn>,
+      holdScope: string = HoldScope.enum.workflow,
+      contenders: unknown[] = [],
+    ) {
+      const mocks = createDeps();
+      const db = createSequentialDb({
+        selects: [
+          { executeResult: [] },
+          { executeResult: [] },
+          { executeResult: [] },
+          // The settler's own two reads: the hold's run row, then the other
+          // holds still pending on that commit.
+          { executeTakeFirstResult: RUN_ROW },
+          { executeResult: contenders },
+        ],
+        updates: [],
+      });
+
+      clearPendingWorkflowContextsMap();
+      await storePendingWorkflowContext(undefined, {
+        runId: 'run-expiring',
+        resolvedOrgId: 'org-7',
+        repoIdentifier: 'acme/app',
+        ref: 'cafebabe',
+        credentials: { installationId: 42 },
+        info: { provider: 'github', routingKey: 'github:1' },
+        workflow: { name: 'CI', jobs: [{ _type: 'static', name: 'build' }] },
+      } as never);
+
+      const heldRunStore = {
+        releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
+        listOverdue: vi.fn().mockResolvedValue([
+          {
+            id: 'hold-expiring',
+            org_id: 'org-7',
+            run_id: 'run-expiring',
+            job_id: jobId,
+            hold_scope: holdScope,
+            hold_type: HoldType.enum.security,
+            // An install-gate row carries one, because
+            // `holdWorkflowForInstallGate` writes it through `createHold` — and
+            // that is the clause which would otherwise accept it, so a row
+            // without one would pass even with the install-gate guard removed
+            // from the ownership predicate.
+            approval_requirement: jobId.startsWith(INSTALL_JOB_ID_PREFIX)
+              ? { clauses: [], expiresAt: 'x', reason: 'r' }
+              : null,
+          },
+        ]),
+        expireOverdue: vi.fn().mockResolvedValue(1),
+      } as unknown as StaleRunDetectorDeps['heldRunStore'];
+
+      const detector = new StaleRunDetector({
+        ...makeDeps(db, mocks),
+        heldRunStore,
+        failRun: vi.fn().mockResolvedValue(undefined),
+        resolveCheckStatusPoster: () => ({ postCheckStatus }) as never,
+      } as StaleRunDetectorDeps);
+      await detector.scan();
+      clearPendingWorkflowContextsMap();
+      return mocks;
+    }
+
+    it('closes it as timed_out, under the same summary the kici/ checks carry', async () => {
+      const postCheckStatus = vi.fn().mockResolvedValue(undefined);
+      const mocks = await runExpirySweep(SECURITY_HOLD_JOB_IDS.fork_pr, postCheckStatus);
+
+      expect(postCheckStatus).toHaveBeenCalledTimes(1);
+      const [repoIdentifier, sha, status, title, summary, credentials] =
+        postCheckStatus.mock.calls[0];
+      expect(repoIdentifier).toBe('acme/app');
+      expect(sha).toBe('cafebabe');
+      expect(status).toBe(CheckRunConclusion.enum.timed_out);
+      expect(title).toBe('Approval window elapsed');
+      expect(summary).toContain('The approval window for this run elapsed');
+      // The next step a contributor can actually take.
+      expect(summary).toContain('Push a new commit');
+      expect(credentials).toEqual({ installationId: 42 });
+      // One event, one story: the two check families say the same thing.
+      expect(mocks.checkRunReporter.completeUndispatchedCheckRuns.mock.calls[0][0].summary).toBe(
+        summary,
+      );
+    });
+
+    it('does NOT post one for an expired install-gate hold', async () => {
+      // `postCheckStatus` CREATES the named run when it finds none, and an
+      // install-gate hold posts no pending security check — so posting here
+      // would put a `KiCI Security` check on a commit that never had one. The
+      // `kici/…` completion still runs, which is what proves the expiry took
+      // the same path and only the security post was withheld.
+      const postCheckStatus = vi.fn().mockResolvedValue(undefined);
+      const mocks = await runExpirySweep(installGateJobId('CI'), postCheckStatus);
+
+      expect(postCheckStatus).not.toHaveBeenCalled();
+      expect(mocks.checkRunReporter.completeUndispatchedCheckRuns).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the check of an expired JOB-scoped hold too', async () => {
+      // A job-scoped security hold posts the same shared check and never
+      // reaches the workflow-only branch, so before this it timed out with the
+      // check still `in_progress` — permanently, since the row leaves
+      // `pending` and `listOverdue` never sees it again.
+      const postCheckStatus = vi.fn().mockResolvedValue(undefined);
+      const mocks = await runExpirySweep('build (18)', postCheckStatus, HoldScope.enum.job);
+
+      expect(postCheckStatus).toHaveBeenCalledTimes(1);
+      const [repoIdentifier, sha, status, title, summary] = postCheckStatus.mock.calls[0];
+      expect(repoIdentifier).toBe('acme/app');
+      expect(sha).toBe('cafebabe');
+      expect(status).toBe(CheckRunConclusion.enum.timed_out);
+      expect(title).toBe('Approval window elapsed');
+      expect(summary).toContain('The approval window for a job in this run elapsed');
+      expect(summary).toContain('Push a new commit');
+      // A job-scoped hold owns no workflow dispatch context, so the `kici/…`
+      // family is left to the run's own reporting.
+      expect(mocks.checkRunReporter.completeUndispatchedCheckRuns).not.toHaveBeenCalled();
+    });
+
+    it('settles once for a commit whose whole batch expires in one sweep', async () => {
+      // `expireOverdue()` runs AFTER this loop, so every hold in the batch is
+      // still `pending` in the database while its siblings are being routed.
+      // Without excluding the batch, each hold would see the other as a live
+      // contender, neither would post, and the shared check would stay
+      // `in_progress` forever — the exact leak this task closes. And with the
+      // commit tracked, the second hold does not repeat the identical write.
+      const postCheckStatus = vi.fn().mockResolvedValue(undefined);
+      const mocks = createDeps();
+      const overdue = [
+        {
+          id: 'hold-a',
+          org_id: 'org-7',
+          run_id: 'run-expiring',
+          job_id: 'build (18)',
+          hold_scope: HoldScope.enum.job,
+          hold_type: HoldType.enum.security,
+          approval_requirement: null,
+        },
+        {
+          id: 'hold-b',
+          org_id: 'org-7',
+          run_id: 'run-expiring',
+          job_id: 'build (20)',
+          hold_scope: HoldScope.enum.job,
+          hold_type: HoldType.enum.security,
+          approval_requirement: null,
+        },
+      ];
+      const db = createSequentialDb({
+        selects: [
+          { executeResult: [] },
+          { executeResult: [] },
+          { executeResult: [] },
+          // hold-a: its run row, then the pending set — which contains BOTH
+          // rows, because neither has been flipped yet.
+          { executeTakeFirstResult: RUN_ROW },
+          { executeResult: overdue },
+          // hold-b: its run row, then the same pending set. The commit is
+          // already settled, so it returns before that contention query ever
+          // runs — the row is configured anyway so that dropping the batch
+          // exclusion makes hold-b refuse too, rather than quietly picking up
+          // the post hold-a was denied.
+          { executeTakeFirstResult: RUN_ROW },
+          { executeResult: overdue },
+        ],
+        updates: [],
+      });
+
+      const detector = new StaleRunDetector({
+        ...makeDeps(db, mocks),
+        heldRunStore: {
+          releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
+          listOverdue: vi.fn().mockResolvedValue(overdue),
+          expireOverdue: vi.fn().mockResolvedValue(2),
+        } as unknown as StaleRunDetectorDeps['heldRunStore'],
+        failRun: vi.fn().mockResolvedValue(undefined),
+        resolveCheckStatusPoster: () => ({ postCheckStatus }) as never,
+      } as StaleRunDetectorDeps);
+      await detector.scan();
+
+      expect(postCheckStatus).toHaveBeenCalledTimes(1);
+      expect(postCheckStatus.mock.calls[0][2]).toBe(CheckRunConclusion.enum.timed_out);
+    });
+
+    it('leaves it pending while another hold on the same commit still owns it', async () => {
+      // The check is one named run per commit. Expiring one hold of a matrix
+      // that is still held must not resolve it — the remaining hold's own
+      // ending is what closes it.
+      const postCheckStatus = vi.fn().mockResolvedValue(undefined);
+      await runExpirySweep(
+        SECURITY_HOLD_JOB_IDS.fork_pr,
+        postCheckStatus,
+        HoldScope.enum.workflow,
+        [
+          {
+            id: 'hold-sibling',
+            org_id: 'org-7',
+            run_id: 'run-other',
+            job_id: 'build (20)',
+            hold_scope: HoldScope.enum.job,
+            hold_type: HoldType.enum.security,
+            approval_requirement: null,
+          },
+        ],
+      );
+
+      expect(postCheckStatus).not.toHaveBeenCalled();
+    });
+  });
+
   it('scan() releases overdue wait-timer workflow holds via onWorkflowRelease', async () => {
     const mocks = createDeps();
     const db = createSequentialDb({
@@ -358,7 +874,7 @@ describe('StaleRunDetector', () => {
     const waitSignal = {
       holdId: 'hold-wait',
       runId: 'run-wait',
-      jobId: '__install__CI',
+      jobId: installGateJobId('CI'),
       scope: 'workflow',
       stepIndex: null,
       triggerSource: 'context',
@@ -786,5 +1302,61 @@ describe('StaleRunDetector', () => {
 
     expect(mocks.scalerManager.onAgentDisconnected).not.toHaveBeenCalled();
     expect(mocks.dispatcher.onAgentDisconnect).not.toHaveBeenCalled();
+  });
+});
+
+describe('StaleRunDetector — the reaped job carries the run trust posture', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('forwards the run trust posture onto a reaped job check-run completion', async () => {
+    // A reap posts a completion check like any other. On a degraded fork run
+    // that check is one of only two the contributor gets, so dropping the
+    // posture here hides the explanation on exactly the path that most needs
+    // it. `known` is legacy vocabulary `resolveRefTrust` no longer produces, so
+    // a forwarded value can only have come from the run row.
+    const mocks = createDeps();
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [staleJob({ trust_tier: 'known', lock_file_source: 'base' })] },
+        { executeResult: [] },
+        { executeResult: [] },
+      ],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    expect(mocks.checkRunReporter.updateJobStatus).toHaveBeenCalledWith(
+      expect.objectContaining({ trustTier: 'known', lockFileSource: 'base' }),
+    );
+  });
+
+  it('omits both fields for a run whose trust never resolved', async () => {
+    // Positive control: the same path over a row with NULL trust columns must
+    // forward nothing, so the assertion above cannot be passing on a harness
+    // that echoes the fields unconditionally.
+    const mocks = createDeps();
+    const db = createSequentialDb({
+      selects: [
+        { executeResult: [staleJob({ trust_tier: null, lock_file_source: null })] },
+        { executeResult: [] },
+        { executeResult: [] },
+      ],
+      updates: [{ executeTakeFirstResult: { numUpdatedRows: 1n } }],
+    });
+
+    const detector = new StaleRunDetector(makeDeps(db, mocks));
+    await detector.scan();
+
+    const opts = mocks.checkRunReporter.updateJobStatus.mock.calls[0][0];
+    expect(opts).not.toHaveProperty('trustTier');
+    expect(opts).not.toHaveProperty('lockFileSource');
   });
 });

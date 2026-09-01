@@ -16,6 +16,24 @@ export interface UpstreamSnapshot {
   jobs: Record<string, Record<string, unknown>>;
   groups: Record<string, string[]>;
   statuses?: Record<string, ExecutionJobStatus>;
+  /**
+   * Maps an invoke-gate job name to its ordered per-run results, one entry per
+   * run the gate triggered. Present only when the upstream is an invoke gate.
+   */
+  invokeResults?: Record<string, InvokeResult[]>;
+}
+
+/**
+ * One invoked-run result exposed on an invoke-gate upstream's
+ * `ctx.needs[gate].result` array — one entry per run the gate triggered.
+ * `outputs` carries the invoked run's non-secret declared outputs.
+ */
+export interface InvokeResult {
+  readonly repo: string;
+  readonly workflow: string;
+  readonly runId: string;
+  readonly status: string;
+  readonly outputs: Readonly<Record<string, unknown>>;
 }
 
 /**
@@ -36,8 +54,22 @@ export interface GroupNeedEntry<T = Record<string, unknown>> {
   status: ExecutionJobStatus;
 }
 
-/** A single-job need exposes `{ result, status }`; a group need exposes an ordered array. */
-export type NeedEntry<T = Record<string, unknown>> = SingleNeedEntry<T> | GroupNeedEntry[];
+/**
+ * An invoke-gate need entry: `ctx.needs['<gate>'].result` is an ordered array of
+ * {@link InvokeResult}, one per run the gate triggered.
+ */
+export interface InvokeNeedEntry {
+  result: readonly InvokeResult[];
+}
+
+/**
+ * A single-job need exposes `{ result, status }`; a group need exposes an
+ * ordered array of `{ name, result, status }`; an invoke-gate need exposes
+ * `{ result }` — an ordered array of {@link InvokeResult} on `.result`, one per
+ * triggered run.
+ */
+export type NeedEntry<T = Record<string, unknown>> =
+  SingleNeedEntry<T> | GroupNeedEntry[] | InvokeNeedEntry;
 
 /** The resolved `ctx.needs` map keyed by job name or group name. */
 export type NeedsContext = Record<string, NeedEntry>;
@@ -69,7 +101,12 @@ export function buildNeedsContext(
   const out: NeedsContext = {};
   for (const need of declaredNeeds) {
     const { kind, key } = needKey(need);
-    if (kind === 'group') {
+    const invokeResults = snapshot.invokeResults?.[key];
+    if (kind === 'job' && invokeResults !== undefined) {
+      // An invoke-gate upstream exposes its per-run results on `.result` — an
+      // ordered array, one entry per run the gate triggered.
+      out[key] = { result: invokeResults };
+    } else if (kind === 'group') {
       const members = snapshot.groups[key] ?? [];
       out[key] = members.map((name) => ({
         name,

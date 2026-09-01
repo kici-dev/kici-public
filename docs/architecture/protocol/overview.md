@@ -130,7 +130,7 @@ Sent by the connecting party (orchestrator to Platform, or agent to orchestrator
 | --------------- | ---------------- | -------- | ------------------------------------------------------------------------------------------ |
 | type            | `"auth.request"` | Yes      | Message discriminator                                                                      |
 | token           | string           | Yes      | API key or authentication token                                                            |
-| protocolVersion | number (int > 0) | Yes      | Protocol version (currently `1`)                                                           |
+| protocolVersion | number (int > 0) | Yes      | Protocol version (currently `2`; the minimum accepted is `1`)                              |
 | capabilities    | OrchCapabilities | No       | Orchestrator capabilities (optional for backward compat with pre-capability orchestrators) |
 
 **OrchCapabilities fields:**
@@ -165,7 +165,7 @@ Every field after `connectionId` is optional so an orchestrator can connect to a
 
 ### auth.failure
 
-Sent by the server when authentication fails. The WebSocket connection is closed immediately after this message -- with code `4010` (`WS_CLOSE_AGENT_AUTH_FAILED`) on the agent channel and `4001` (`WS_CLOSE_UNAUTHORIZED`) on the dashboard channel. See the [close-code table](./dashboard.md#websocket-close-codes) for the full inventory.
+Sent by the server when authentication fails. The WebSocket connection is closed immediately after this message -- with code `4010` (`WS_CLOSE_AGENT_AUTH_FAILED`) on the agent channel and `4001` (`WS_CLOSE_UNAUTHORIZED`) on the dashboard channel. The one exception is a rejected protocol version: the agent channel still sends `auth.failure` but closes with `4005` (`WS_CLOSE_PROTOCOL_ERROR`), so a version mismatch is distinguishable from a bad token. See the [close-code table](./dashboard.md#websocket-close-codes) for the full inventory.
 
 | Field  | Type             | Required | Description                   |
 | ------ | ---------------- | -------- | ----------------------------- |

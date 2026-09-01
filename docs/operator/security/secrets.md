@@ -178,7 +178,7 @@ curl -X DELETE $KICI_ADMIN_URL/api/v1/admin/secrets/<org-id>/production/KICI_DAT
 A secret key may contain letters, digits, `_`, `.` and `-`, up to 256
 characters. Every write plane enforces this -- the CLI, the admin API, the
 dashboard's add-secret form, and the `.kici/secrets.yaml` / `.kici/.secrets`
-seeding that `kici run local` performs -- and a key outside the set is refused
+seeding that `kici run <event> --local` performs -- and a key outside the set is refused
 before anything is stored:
 
 ```
@@ -722,6 +722,10 @@ performed:
 Both refusals apply on the dashboard too, which reports them as the rename's
 error message. The status codes above are the admin HTTP API's; the dashboard
 answers `400` for either refusal and carries the same message.
+
+For the PostgreSQL store, the re-encryption uses the orchestrator's current
+master key, and each renamed row records that key's version. A rotation audit
+that counts rows by key version therefore stays accurate after a rename.
 
 ### Auto-discovery and sync
 

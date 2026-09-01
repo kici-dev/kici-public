@@ -30,6 +30,16 @@ export interface RegistrationRow {
    */
   customerId: string;
   commitSha: string | null;
+  /**
+   * The repository's default branch, captured from the push that last updated
+   * this registration. A `__schedule_fire` run executes this branch's lock
+   * file, so this is the branch such a run presents to a context's branch
+   * restrictions.
+   *
+   * `null` when the registration predates the column or the payload named no
+   * default branch — the run then presents no branch and the gate rejects.
+   */
+  defaultBranch: string | null;
   sourceFile: string | null;
   created_at: Date;
   updated_at: Date;
@@ -47,6 +57,18 @@ interface ReplaceAllOptions {
    */
   customerId: string;
   commitSha?: string;
+  /**
+   * The repository's default branch, read off the registering push's payload.
+   * Persisted so a `__schedule_fire` run can present it as its own branch.
+   *
+   * Three states, and the difference between the last two is load-bearing on an
+   * UPDATE: a string is written; `null` means the caller LOOKED and the payload
+   * named none, so the stored value is cleared; **omitting the field** means the
+   * caller does not know, and an already-captured branch is preserved. Only a
+   * default-branch push knows a repository's default branch, so a caller that
+   * is not one (the manual registration route) must not erase what one proved.
+   */
+  defaultBranch?: string | null;
   sourceFile?: string;
   /** Set of workflow names that should be marked as global */
   globalWorkflowNames?: Set<string>;
@@ -147,6 +169,13 @@ export class RegistrationStore {
         if (row) {
           // UPDATE existing row -- preserves the UUID and cron_last_fired FK
           // NOTE: do NOT include 'disabled' -- that would reset manually-disabled workflows
+          // NOTE: include 'default_branch' only when the caller SUPPLIED it --
+          // omitting it preserves an already-captured branch. Only a
+          // default-branch push knows the value, so the manual registration
+          // route (which supplies nothing) must not erase what a push proved and
+          // silently re-break a branch-restricted scheduled run. The sibling
+          // direct path, `registerWorkflowManualDirect`, leaves the column out
+          // of its upsert for the same reason.
           await trx
             .updateTable('workflow_registrations')
             .set({
@@ -154,6 +183,9 @@ export class RegistrationStore {
               trigger_types: [...new Set(w.triggers.map((t) => t._type))],
               provider_context: JSON.stringify(providerContext),
               commit_sha: options.commitSha ?? null,
+              ...(options.defaultBranch !== undefined && {
+                default_branch: options.defaultBranch,
+              }),
               source_file: options.sourceFile ?? `.kici/workflows/${w.name}.ts`,
               is_global: isGlobal,
               updated_at: new Date(),
@@ -173,6 +205,7 @@ export class RegistrationStore {
               provider_context: JSON.stringify(providerContext),
               customer_id: options.customerId,
               commit_sha: options.commitSha ?? null,
+              default_branch: options.defaultBranch ?? null,
               source_file: options.sourceFile ?? `.kici/workflows/${w.name}.ts`,
               is_global: isGlobal,
             })
@@ -343,6 +376,7 @@ function parseRow(row: WorkflowRegistration): RegistrationRow {
     isGlobal: row.is_global ?? false,
     customerId: row.customer_id,
     commitSha: row.commit_sha ?? null,
+    defaultBranch: row.default_branch ?? null,
     sourceFile: row.source_file ?? null,
     created_at: row.created_at,
     updated_at: row.updated_at,

@@ -18,6 +18,24 @@ export interface JobDispatchContext {
   repository: string;
   runId: string;
   jobId: string;
+  /**
+   * True when the run was triggered by the orchestrator itself (a schedule
+   * fire, a workflow/job completion, a failure batch, a `kiciEvent()`, an
+   * invoke-gate summon) rather than by a provider webhook.
+   *
+   * Such a run usually DOES carry a branch, and `branch` is then matched
+   * against the restriction patterns like any other run's: a schedule fire
+   * presents its registration's default branch, and every other internal
+   * trigger inherits the branch of the run that emitted its event.
+   *
+   * The flag matters only when `branch` is EMPTY — a failure batch or a scaler
+   * event (many runs behind it, or none), a registration whose default branch
+   * has never been captured, an emitting run that is gone. The branch gate then
+   * rejects naming that cause, instead of quoting the empty value as a branch
+   * name an operator could add to the restriction list. It never weakens the
+   * gate: a run with no branch cannot satisfy a restriction, `*` included.
+   */
+  internallyTriggered?: boolean;
 }
 
 /** Evaluate all protection rules for a context. */

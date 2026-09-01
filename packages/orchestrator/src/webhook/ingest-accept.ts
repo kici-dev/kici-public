@@ -137,10 +137,11 @@ export async function acceptWebhookDelivery(
  *
  * Nothing this function decides can reach the sender — the response is long
  * gone — so every outcome has to land somewhere a human or a test can find it:
- * the event log carries the per-delivery record (the pipeline writes a `failed`
- * row on a throw), this function emits one structured line naming the delivery
- * and a remedy, and the queue row itself either clears or reverts to `buffered`
- * for the drain pass to retry.
+ * the event log carries the per-delivery record (`processWebhook` writes a
+ * `failed` row on a throw, under the delivery's resolved org, which is what the
+ * dashboard's failed-delivery count reads), this function emits one structured
+ * line naming the delivery and a remedy, and the queue row itself either clears
+ * or reverts to `buffered` for the drain pass to retry.
  */
 async function runQueuedDelivery(
   info: WebhookInfo,

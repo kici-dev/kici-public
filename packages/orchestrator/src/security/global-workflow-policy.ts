@@ -1,7 +1,11 @@
 import type { Kysely } from 'kysely';
 import { getRepoGlobMatcher } from '@kici-dev/engine';
+import { invalidRepoPatternReason } from '@kici-dev/engine/protocol/dashboard-global-workflows';
+import { createLogger } from '@kici-dev/shared';
 import type { Database, OrgSettingsRepoPatternEntry } from '../db/types.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
+
+const logger = createLogger({ prefix: 'global-workflow-policy' });
 
 interface GlobalWorkflowPermission {
   allowed: boolean;
@@ -99,8 +103,9 @@ export class GlobalWorkflowPolicy {
     if (allowedRepos === null || allowedRepos.length === 0) {
       return { allowed: true };
     }
+    // Allow list: an unstorable entry grants nothing.
     const allowed = allowedRepos.some((entry) =>
-      matchesEntry(entry, workflowRoutingKey, workflowRepoIdentifier),
+      matchesEntry(entry, workflowRoutingKey, workflowRepoIdentifier, customerId, false),
     );
     if (!allowed) {
       return {
@@ -134,8 +139,10 @@ export class GlobalWorkflowPolicy {
     if (!deniedRepos || deniedRepos.length === 0) {
       return { allowed: true };
     }
+    // Deny list: an unstorable entry blocks. This is the one site whose
+    // fail-closed direction is `true` — a match here denies the event.
     const denied = deniedRepos.some((entry) =>
-      matchesEntry(entry, eventRoutingKey, sourceRepoIdentifier),
+      matchesEntry(entry, eventRoutingKey, sourceRepoIdentifier, customerId, true),
     );
     if (denied) {
       return {
@@ -173,8 +180,9 @@ export class GlobalWorkflowPolicy {
     if (await this.clusterGate()) return false;
     const settings = await this.getSettings(customerId);
     if (!settings?.global_workflow_elevated_repos) return false;
+    // Elevated list: an unstorable entry grants nothing.
     return settings.global_workflow_elevated_repos.some((entry) =>
-      matchesEntry(entry, workflowRoutingKey, repoIdentifier),
+      matchesEntry(entry, workflowRoutingKey, repoIdentifier, customerId, false),
     );
   }
 
@@ -207,12 +215,35 @@ export class GlobalWorkflowPolicy {
  * did not do what its pattern said, in the one direction where failing means
  * letting an event through. `.github` is an ordinary repository name, so this
  * was reachable rather than theoretical.
+ *
+ * A pattern the write path refuses (`invalidRepoPatternReason`) can still be
+ * present in a stored row, so the match resolves it to `onInvalid` rather than
+ * handing it to the glob matcher, whose negation semantics would invert the
+ * entry's meaning.
  */
 function matchesEntry(
   entry: OrgSettingsRepoPatternEntry,
   routingKey: string,
   repoIdentifier: string,
+  customerId: string,
+  /**
+   * The verdict for an entry whose pattern is invalid. Always the fail-closed
+   * direction of the list being evaluated: `false` on an allow list or the
+   * elevated list (the entry grants nothing), `true` on a deny list (the entry
+   * blocks).
+   */
+  onInvalid: boolean,
 ): boolean {
   if (entry.routingKey !== undefined && entry.routingKey !== routingKey) return false;
+  const invalid = invalidRepoPatternReason(entry.pattern);
+  if (invalid) {
+    logger.warn('Invalid global-workflow policy pattern fails closed', {
+      customerId,
+      pattern: entry.pattern,
+      reason: invalid,
+      onInvalid,
+    });
+    return onInvalid;
+  }
   return getRepoGlobMatcher(entry.pattern)(repoIdentifier);
 }

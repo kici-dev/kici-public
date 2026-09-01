@@ -21,6 +21,7 @@
 
 import { MetricNames, MetricService, type MetricName } from './metric-catalog.generated.js';
 import { ExecutionRunStatus } from '../protocol/messages/execution-status.js';
+import { ScalerBackendType } from '../scaler/scaler-backend-type.js';
 
 /**
  * Per-label policy: enum-constrained values OR a cardinality cap.
@@ -62,16 +63,27 @@ export const ORCH_PUSHED_METRIC_NAMES: ReadonlySet<MetricName> = new Set(
     .map(([key]) => MetricNames[key]),
 );
 
-/** Closed enum of the four scaler-backend label values an agent can carry. */
-const AGENT_SCALER_VALUES = ['stateful', 'container', 'firecracker', 'bare-metal'] as const;
+/**
+ * Closed enum of the `scaler` label values an agent can carry: every scaler
+ * backend type the orchestrator can resolve for a managed agent, plus
+ * `stateful` for a static agent no scaler manages (the fallback
+ * `AgentMetricsAggregator.resolveScalerLabel` stamps when the lookup returns
+ * null). Derived from `ScalerBackendType` rather than restated, so adding a
+ * backend cannot silently drop every `kici_agent_*` series that backend's
+ * agents emit as `bad_label_value`.
+ */
+const AGENT_SCALER_VALUES = ['stateful', ...ScalerBackendType.options] as const;
 
 /**
  * Closed enum of scaler-backend TYPE values the orchestrator's own
  * resource-usage gauges carry on their `scalerType` rollup label.
- * `__global__` is the orchestrator-wide rollup row; the other four match
- * `AGENT_SCALER_VALUES`. Exported so the policy tests can assert against it.
+ * `__global__` is the orchestrator-wide rollup row; every other value comes
+ * from `ScalerManager`'s own `backends` map, so the enum is `ScalerBackendType`
+ * itself — NOT `AGENT_SCALER_VALUES`, which additionally carries the
+ * agent-only `stateful` and predates the `event` backend. Exported so the
+ * policy tests can assert against it.
  */
-export const ORCH_SCALER_VALUES = ['__global__', ...AGENT_SCALER_VALUES] as const;
+export const ORCH_SCALER_VALUES = ['__global__', ...ScalerBackendType.options] as const;
 
 /**
  * Closed enum of the scheduled jobs the orchestrator runs. MUST mirror
@@ -155,6 +167,23 @@ export const METRIC_LABEL_POLICY: Partial<
     scalerType: { values: ORCH_SCALER_VALUES },
     machinePool: { maxUniqueValues: 50 },
   },
+  // Warm-pool gauges fan out per (scaler, labelSet). Both are operator-chosen
+  // and bounded by the scaler config, so cap them the way the sibling gauges
+  // cap `scaler` rather than enum-constraining either.
+  kici_orch_scaler_warm_pool_target: {
+    scaler: { maxUniqueValues: 50 },
+    labelSet: { maxUniqueValues: 100 },
+  },
+  kici_orch_scaler_warm_pool_ready: {
+    scaler: { maxUniqueValues: 50 },
+    labelSet: { maxUniqueValues: 100 },
+  },
+  kici_orch_scaler_warm_pool_in_flight: {
+    scaler: { maxUniqueValues: 50 },
+    labelSet: { maxUniqueValues: 100 },
+  },
+  kici_orch_scaler_warm_pool_spawns_total: { scaler: { maxUniqueValues: 50 } },
+  kici_orch_scaler_warm_pool_reaped_total: { scaler: { maxUniqueValues: 50 } },
   kici_orch_install_secrets_decisions_total: {
     // `hold` covers the workflow-scoped held-run path: a protection gate that
     // returns hold / wait / queue collapses to a single `hold` decision in the

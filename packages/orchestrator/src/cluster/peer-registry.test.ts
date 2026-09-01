@@ -1299,6 +1299,147 @@ describe('PeerRegistry', () => {
     });
   });
 
+  // ── per-label-set gate on peer scaler capacity ────────────────────────
+  describe('per-label-set gate on peer scaler capacity', () => {
+    /** Advertise one mixed-platform scaler on a fresh peer. */
+    const advertise = (
+      instanceId: string,
+      capacity: Record<string, unknown>[],
+      activeCount = 0,
+    ): void => {
+      registry.addPeer({
+        instanceId,
+        connectionId: `conn-${instanceId}`,
+        address: null,
+        routingKeys: [],
+      });
+      registry.updateHeartbeat(instanceId, {
+        type: 'peer.heartbeat',
+        instanceId,
+        term: 1,
+        leaderId: null,
+        draining: false,
+        agents: [],
+        capabilities: { s3LogAccess: false },
+        scalerCapacity: capacity.map((c) => ({
+          maxAgents: 5,
+          activeCount,
+          ...c,
+        })) as never,
+        timestamp: Date.now(),
+      });
+    };
+
+    // A NEW peer advertising the per-label-set gate. The scaler-wide union
+    // (['gpu', 'macos']) would refuse both sets.
+    const newPeerCapacity = [
+      {
+        labelSets: [
+          ['linux', 'gpu'],
+          ['macos', 'xcode'],
+        ],
+        mandatoryLabels: ['gpu', 'macos'],
+        labelSetMandatoryLabels: [['gpu'], ['macos']],
+      },
+    ];
+
+    it('new peer → routes on the per-label-set gate, not the scaler-wide union', () => {
+      advertise('orch-new', newPeerCapacity);
+      expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(1);
+      expect(registry.findPeersWithCapacity([['macos', 'xcode']])).toHaveLength(1);
+    });
+
+    it('new peer → still refuses a label set whose own gate is unsatisfied', () => {
+      advertise('orch-new', newPeerCapacity);
+      // `xcode` is a subset of label set 1, but its gate demands `macos`.
+      expect(registry.findPeersWithCapacity([['xcode']])).toHaveLength(0);
+    });
+
+    it('old peer → falls back to the scaler-wide union when the field is absent', () => {
+      advertise('orch-old', [
+        {
+          labelSets: [
+            ['linux', 'gpu'],
+            ['macos', 'xcode'],
+          ],
+          mandatoryLabels: ['gpu', 'macos'],
+          // labelSetMandatoryLabels omitted — a peer that predates the field.
+        },
+      ]);
+      // The union gate is applied, exactly as before the field existed.
+      expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(0);
+      expect(registry.findPeersWithLabels([['linux', 'gpu']])).toHaveLength(0);
+    });
+
+    it('falls back to the scaler-wide union when the per-set array is misaligned', () => {
+      advertise('orch-bad', [
+        {
+          labelSets: [
+            ['linux', 'gpu'],
+            ['macos', 'xcode'],
+          ],
+          mandatoryLabels: ['gpu', 'macos'],
+          // One entry for two label sets — no trustworthy alignment.
+          labelSetMandatoryLabels: [['gpu']],
+        },
+      ]);
+      expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(0);
+    });
+
+    it('does not admit a peer whose gate and labels come from different label sets', () => {
+      advertise('orch-split', [
+        {
+          labelSets: [
+            // Set 0 supplies `linux` but is gated on `gpu`.
+            ['linux'],
+            // Set 1 satisfies a `gpu` gate but does not supply `linux`.
+            ['gpu'],
+          ],
+          mandatoryLabels: ['gpu'],
+          labelSetMandatoryLabels: [['gpu'], []],
+        },
+      ]);
+      // Evaluating the gate and the subset test on different sets would admit
+      // this peer; on the same set neither one matches.
+      expect(registry.findPeersWithCapacity([['linux']])).toHaveLength(0);
+      expect(registry.findPeersWithLabels([['linux']])).toHaveLength(0);
+    });
+
+    it('empty required labels match only an ungated label set', () => {
+      advertise('orch-mixed', [
+        {
+          labelSets: [['linux', 'gpu'], ['linux']],
+          mandatoryLabels: ['gpu'],
+          labelSetMandatoryLabels: [['gpu'], []],
+        },
+      ]);
+      expect(registry.findPeersWithCapacity([[]])).toHaveLength(1);
+
+      advertise('orch-all-gated', newPeerCapacity);
+      registry.markDisconnected('orch-mixed');
+      expect(registry.findPeersWithCapacity([[]])).toHaveLength(0);
+    });
+
+    it('folds case on both the gate and the subset test, as the local matcher does', () => {
+      advertise('orch-cased', [
+        {
+          // Declared with capitals, as a config may spell them. The peer's own
+          // `findBackendForLabels` lowercases both sides, so it accepts a
+          // lowercase `runsOn` — peer selection must reach the same verdict.
+          labelSets: [['Linux', 'GPU']],
+          mandatoryLabels: ['GPU'],
+          labelSetMandatoryLabels: [['GPU']],
+        },
+      ]);
+      expect(registry.findPeersWithCapacity([['linux', 'gpu']])).toHaveLength(1);
+      expect(registry.findPeersWithLabels([['linux', 'gpu']])).toHaveLength(1);
+      // The gate still bites: `linux` alone does not request `gpu`.
+      expect(registry.findPeersWithCapacity([['linux']])).toHaveLength(0);
+      // And a label the set does not supply is still refused.
+      expect(registry.findPeersWithCapacity([['linux', 'gpu', 'cuda']])).toHaveLength(0);
+    });
+  });
+
   // ── markDisconnected / markConnected ────────────────────────────────
 
   describe('markDisconnected / markConnected', () => {
@@ -1815,6 +1956,76 @@ describe('PeerRegistry', () => {
       expect(evicted).toEqual(['stale-peer']);
       expect(registry.getPeer('stale-peer')!.connected).toBe(false);
       expect(registry.getPeer('fresh-peer')!.connected).toBe(true);
+    });
+  });
+
+  // ── getConnectedWorkerPeers + connectedAt ───────────────────────────
+  describe('getConnectedWorkerPeers', () => {
+    function addWorker(instanceId: string): void {
+      registry.addPeer({
+        instanceId,
+        connectionId: instanceId,
+        address: null,
+        routingKeys: [],
+        role: 'worker',
+      });
+    }
+
+    it('excludes disconnected workers', () => {
+      addWorker('w-1');
+      addWorker('w-2');
+      registry.markDisconnected('w-2');
+      expect(registry.getConnectedWorkerPeers().map((p) => p.instanceId)).toEqual(['w-1']);
+    });
+
+    it('excludes coordinator peers, which hold their own Platform connection', () => {
+      registry.addPeer({
+        instanceId: 'c-1',
+        connectionId: 'c-1',
+        address: null,
+        routingKeys: [],
+        role: 'coordinator',
+      });
+      addWorker('w-1');
+      expect(registry.getConnectedWorkerPeers().map((p) => p.instanceId)).toEqual(['w-1']);
+    });
+
+    it('excludes a roleless peer, which defaults to coordinator', () => {
+      registry.addPeer({ instanceId: 'p-1', connectionId: 'p-1', address: null, routingKeys: [] });
+      expect(registry.getConnectedWorkerPeers()).toEqual([]);
+    });
+  });
+
+  describe('connectedAt', () => {
+    it('records when a peer connected, so eviction can pick the newest', () => {
+      const before = Date.now();
+      registry.addPeer({
+        instanceId: 'w-1',
+        connectionId: 'w-1',
+        address: null,
+        routingKeys: [],
+        role: 'worker',
+      });
+      expect(registry.getPeer('w-1')?.connectedAt).toBeGreaterThanOrEqual(before);
+    });
+
+    it('does not reset connectedAt on a reconnect of a still-connected peer', () => {
+      registry.addPeer({
+        instanceId: 'w-1',
+        connectionId: 'w-1',
+        address: null,
+        routingKeys: [],
+        role: 'worker',
+      });
+      const first = registry.getPeer('w-1')!.connectedAt;
+      registry.addPeer({
+        instanceId: 'w-1',
+        connectionId: 'w-1b',
+        address: '1.2.3.4',
+        routingKeys: ['k'],
+        role: 'worker',
+      });
+      expect(registry.getPeer('w-1')!.connectedAt).toBe(first);
     });
   });
 });

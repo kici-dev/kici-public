@@ -12,6 +12,7 @@
  * (Cold-store fallback stays a dashboard-handler concern — the agent read path
  * is warm-only in v1.)
  */
+import { setupStepsFirst } from './step-display-order.js';
 import type { Kysely } from 'kysely';
 import { ExecutionJobStatus, type InitFailure } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
@@ -64,6 +65,8 @@ export interface RunDetailJobRow {
   base_job_name: string | null;
   variant_kind: string | null;
   variant_label: string | null;
+  job_kind: string | null;
+  summoned_run_id: string | null;
   started_at: Date | null;
   completed_at: Date | null;
   duration_ms: number | null;
@@ -119,6 +122,8 @@ export function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJo
       baseJobName: job.base_job_name ?? null,
       variantKind: job.variant_kind ?? null,
       variantLabel: job.variant_label ?? null,
+      jobKind: job.job_kind ?? null,
+      summonedRunId: job.summoned_run_id ?? null,
       startedAt: job.started_at ? job.started_at.getTime() : null,
       completedAt: job.completed_at ? job.completed_at.getTime() : null,
       durationMs: job.duration_ms ?? null,
@@ -289,6 +294,7 @@ export async function aggregateRunDetail(
         'group_id',
       ])
       .where('run_id', '=', runId)
+      .orderBy(setupStepsFirst())
       .orderBy('step_index', 'asc')
       .execute(),
     db

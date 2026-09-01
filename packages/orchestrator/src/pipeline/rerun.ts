@@ -39,6 +39,15 @@ import {
 import { isLockStaticJob, TERMINAL_RUN_STATES, matrixEnvelopeFields } from '@kici-dev/engine';
 import type { LockFile as FullLockFile, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
 import { webhookPayloadPath } from './webhook-payload-store.js';
+import {
+  dispatchGlobalWorkflowsForOtherRepos,
+  evaluateSecurityPolicy,
+  isPullRequestEvent,
+  resolveTrustForPR,
+} from './process-webhook.js';
+import type { ProcessingDeps } from './processor.js';
+import type { WebhookInfo } from '../webhook/handler.js';
+import type { ProviderType, SimulatedEvent } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'rerun' });
 
@@ -86,6 +95,17 @@ export interface RerunDeps {
    * cold-store wired up.
    */
   coldStore: ColdStore | null;
+  /**
+   * The live webhook-processing bag, assembled on demand.
+   *
+   * Only the re-run of a failed global evaluation round needs it: that re-run
+   * re-drives the organization-wide pass, which reaches deps an ordinary
+   * workflow re-run never touches (the registration index, the policy reader,
+   * the pending-eval tracker). Supplied by the entry point that already
+   * assembles the bag for the inbound webhook path, so the two cannot drift.
+   * Absent means round re-runs are not available on this deployment.
+   */
+  processingDeps?: (() => ProcessingDeps) | null;
 }
 
 /**
@@ -127,6 +147,14 @@ export async function handleRerun(
 ): Promise<{ newRunId: string }> {
   // 1-3. Load + validate the original run (with cold-store replay fallback).
   const originalRun = await loadAndValidateOriginalRun(originalRunId, routingKeyHint, deps);
+
+  // A failed global evaluation round is re-run as a re-evaluation of the
+  // original event, not as a workflow re-run: the round decided nothing, so
+  // there is no workflow to resolve and re-dispatch. Routed structurally on the
+  // run row's own marker, never on the round job's name.
+  if (originalRun.is_global_eval_round === true) {
+    return rerunGlobalEvalRound(originalRun, deps, requestId);
+  }
 
   // 4. Load webhook payload from object storage (optional — cron/schedule runs have no payload)
   const payload = await loadWebhookPayload(originalRunId, deps);
@@ -292,7 +320,19 @@ async function loadAndValidateOriginalRun(
     throw new Error('Test runs cannot be re-run');
   }
 
-  // 4. An organization-wide workflow that ran against another repository
+  // 4. A failed global evaluation round is exempt from the cross-repository
+  // refusal below. A round is definitionally cross-repository — it exists to
+  // decide one repository's global workflows against another repository's event
+  // — so the refusal would reject every one of them. The reasoning the refusal
+  // rests on does not apply either: the round path resolves no workflow out of
+  // `repo_identifier`'s lock file, so there is no same-named workflow it could
+  // silently run instead. It re-evaluates the original event and dispatches
+  // only what the evaluation itself admits.
+  if (originalRun.is_global_eval_round === true) {
+    return originalRun as OriginalRunRow;
+  }
+
+  // 5. An organization-wide workflow that ran against another repository
   // cannot be re-run. Everything below resolves the workflow out of
   // `repo_identifier`'s lock file, and for such a run that column is the
   // repository the workflow ran AGAINST, not the one that defines it. So the
@@ -321,6 +361,16 @@ async function loadAndValidateOriginalRun(
   // authorization question first — which of the two repositories may re-execute
   // this, and with whose credentials — and lift BOTH refusals deliberately.
   // Widen them into that decision; do not simply delete this one.
+  //
+  // That question is answered for exactly one case: a failed global evaluation
+  // round, which both tiers admit ahead of this comparison. Scope on the source
+  // repository is enough to re-run one, because a member holding it can already
+  // trigger the identical round by pushing a commit — the re-run grants no
+  // capability they lack. It re-evaluates the original event through the same
+  // policy axes and dispatches whatever that evaluation admits; it never lets a
+  // caller choose which workflow runs. The refusal below still stands for every
+  // ordinary organization-wide workflow run, where the substitution it guards
+  // against is reachable.
   if (
     originalRun.workflow_repo_identifier &&
     originalRun.workflow_repo_identifier !== originalRun.repo_identifier
@@ -355,6 +405,536 @@ async function loadWebhookPayload(
   }
 }
 
+/** The provider bundle + context a re-run resolves out of the original run's row. */
+interface RerunProviderBinding {
+  providerBundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
+  providerContext: Record<string, unknown>;
+  routingKey: string;
+}
+
+/**
+ * Resolve the provider bundle and stored provider context for a run being
+ * re-run.
+ *
+ * Shared by the workflow re-run and the evaluation-round re-run so the two
+ * cannot disagree about which source a run belongs to, or about how its
+ * `provider_context` column is parsed.
+ */
+function resolveRerunProviderBinding(
+  originalRun: OriginalRunRow,
+  deps: RerunDeps,
+): RerunProviderBinding {
+  if (!originalRun.routing_key) {
+    throw new Error(
+      `Re-run failed: original run ${originalRun.run_id} has no routing_key — cannot select provider bundle`,
+    );
+  }
+  const providerBundle = deps.providerRegistry.getByRoutingKey(originalRun.routing_key);
+  if (!providerBundle) {
+    throw new Error(`Provider bundle for routing key ${originalRun.routing_key} not registered`);
+  }
+  const providerContext = JSON.parse(
+    typeof originalRun.provider_context === 'string'
+      ? originalRun.provider_context
+      : JSON.stringify(originalRun.provider_context ?? {}),
+  );
+  return { providerBundle, providerContext, routingKey: originalRun.routing_key };
+}
+
+/**
+ * The provider event name + action the original delivery carried.
+ *
+ * `execution_runs` records neither: the event name arrives in a provider header,
+ * not in the payload, so it cannot be recovered from the stored payload either.
+ * The delivery's own `event_log` row is where it lives, and a round's run row
+ * carries the delivery id that addresses it. That row is written at the end of
+ * the delivery, after the round's failure is recorded, so it is present for
+ * every re-run an operator can actually reach.
+ *
+ * Addressed by `(org_id, delivery_id)` — the table's own uniqueness — never by
+ * the delivery id alone. A generic source's delivery id is taken verbatim from
+ * a sender-supplied header, so one tenant can choose an id another tenant's
+ * round already carries; a lookup by id alone would then re-evaluate one org's
+ * global workflows against another org's event shape, and with no `ORDER BY`
+ * the row it picked would not even be stable.
+ */
+async function loadDeliveryEventName(
+  originalRun: OriginalRunRow,
+  deps: RerunDeps,
+): Promise<{ event: string; action: string | null }> {
+  const deliveryId = originalRun.delivery_id;
+  if (!deliveryId) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: it records no delivery id, so the ` +
+        `event it was deciding cannot be identified. Push a new commit to re-evaluate the ` +
+        `organization's workflows.`,
+    );
+  }
+  const row = await deps.db
+    .selectFrom('event_log')
+    .select(['event', 'action'])
+    .where('org_id', '=', originalRun.customer_id)
+    .where('delivery_id', '=', deliveryId)
+    .executeTakeFirst();
+  if (!row?.event) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: no event log entry for delivery ` +
+        `${deliveryId} is available, so the event it was deciding cannot be reconstructed. ` +
+        `Push a new commit to re-evaluate the organization's workflows.`,
+    );
+  }
+  return { event: row.event, action: row.action ?? null };
+}
+
+/**
+ * Re-run of a failed global evaluation round: re-drive the organization-wide
+ * pass for the round's workflow repo from the stored webhook payload.
+ *
+ * This is a re-evaluation, not a workflow re-run — the pass itself dispatches
+ * whatever it admits, exactly as it would have on the original delivery. Every
+ * input is recomputed against current state, which is what lets a fixed
+ * workflow repository flip the verdict without a new commit.
+ */
+async function rerunGlobalEvalRound(
+  originalRun: OriginalRunRow,
+  deps: RerunDeps,
+  requestId: string,
+): Promise<{ newRunId: string }> {
+  const payload = await loadWebhookPayload(originalRun.run_id, deps);
+  if (!payload) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: its webhook payload was not stored. ` +
+        `Push a new commit to re-evaluate the organization's workflows.`,
+    );
+  }
+  const buildProcessingDeps = deps.processingDeps;
+  if (!buildProcessingDeps) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: this orchestrator is not wired for ` +
+        `organization-wide dispatch. Push a new commit to re-evaluate the organization's workflows.`,
+    );
+  }
+
+  // Read-only reconstruction FIRST — ALL of it, for the same reason the workflow
+  // path validates before claiming: every step below throws identically on both
+  // hops of a relay failover re-send, so doing one after the claim would let the
+  // first hop's failure be reported to the second as a success — HTTP 200 with
+  // the round's own run id, telling the operator a re-run happened when nothing
+  // ran. Anything that can throw belongs above the claim, not merely most of it.
+  const binding = resolveRerunProviderBinding(originalRun, deps);
+  const dispatch = resolveRoundDispatchBinding(originalRun, deps, binding);
+  const delivery = await loadDeliveryEventName(originalRun, deps);
+  const workflowRepo = resolveRoundWorkflowRepo(originalRun);
+  const event = normalizeRoundEvent(originalRun, binding.providerBundle, delivery, payload);
+
+  // The round's own re-evaluation is what dispatches, so the claim guards it
+  // exactly as it guards a workflow re-run's dispatch. On a relay failover
+  // re-send a sibling coordinator already owns this requestId and has already
+  // re-evaluated, so this hop does nothing further.
+  const { claimed } = await claimRequestId(deps.db, requestId);
+  if (!claimed) {
+    logger.info('Eval-round rerun requestId already claimed by a sibling; returning', {
+      runId: originalRun.run_id,
+      requestId,
+    });
+    return { newRunId: originalRun.run_id };
+  }
+
+  // The re-evaluation runs DETACHED, and the request is answered now — the same
+  // shape the delivery that first dispatched this round already has. A generic
+  // webhook is answered 202 the moment the delivery is durably queued
+  // (`routes/webhooks.ts`), explicitly NOT asserting that anything matched or
+  // dispatched; the whole pipeline, `runGlobalEvalRounds` included, runs after
+  // the response is sent, and its outcomes reach the event log, the run list
+  // and the check.
+  //
+  // Awaiting the round here answers no caller. A round is a dispatched job: it
+  // hands an evaluation job to an agent, which clones both repositories and
+  // runs every candidate's filter, and its own budget is minutes. The requester
+  // is a relayed dashboard call whose budget is ten seconds, so the await
+  // guaranteed a gateway timeout on a re-evaluation that then completed
+  // unobserved — the Re-run button could not succeed on any failed round.
+  //
+  // Nothing is lost by answering early. The response carries the round's OWN
+  // run id, not a freshly minted one — a re-evaluation creates no run of its
+  // own, and whatever it admits has its own ids already — so the value is known
+  // before the round starts. Everything that can refuse has already run above:
+  // the reconstruction is complete and the claim is taken, so a failure past
+  // this point is operational, and is read from the round exactly as it is for
+  // a delivery.
+  const reevaluation = reevaluateGlobalRound({
+    originalRun,
+    payload,
+    processingDeps: buildProcessingDeps(),
+    binding,
+    dispatch,
+    delivery,
+    workflowRepo,
+    event,
+  })
+    .then((outcome) => {
+      logger.info('Re-evaluated a failed global eval round', {
+        runId: originalRun.run_id,
+        workflowRepo: outcome.workflowRepo,
+        admitted: outcome.matchedCount,
+        decided: outcome.decided,
+        failedAgain: outcome.failedAgain,
+        skippedByPolicy: outcome.skippedByPolicy,
+      });
+    })
+    .catch((err: unknown) => {
+      // Reported here or nowhere: the requester was answered before this ran.
+      logger.error('Eval-round re-evaluation failed after the request was answered', {
+        runId: originalRun.run_id,
+        workflowRepo,
+        requestId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    })
+    .finally(() => {
+      pendingRoundReevaluations.delete(reevaluation);
+    });
+  pendingRoundReevaluations.add(reevaluation);
+
+  return { newRunId: originalRun.run_id };
+}
+
+/**
+ * Re-evaluations started but not yet settled.
+ *
+ * Membership is the only handle on work nobody awaits: a detached promise
+ * cannot otherwise be observed. Every entry carries its own `catch` above, so
+ * nothing in this set can reject.
+ */
+const pendingRoundReevaluations = new Set<Promise<void>>();
+
+/**
+ * Settle every detached re-evaluation started so far.
+ *
+ * Nothing in a running orchestrator calls this — the re-evaluation is detached
+ * precisely so no request waits on it. It exists so a caller that needs the
+ * work to have finished (a test asserting on the pass) can wait for it
+ * deterministically instead of racing the microtask queue.
+ */
+export async function settlePendingRoundReevaluations(): Promise<void> {
+  while (pendingRoundReevaluations.size > 0) {
+    await Promise.all([...pendingRoundReevaluations]);
+  }
+}
+
+/** The bundle a round's stored `provider_context` actually belongs to. */
+interface RoundDispatchBinding {
+  bundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
+  routingKey: string;
+}
+
+/**
+ * The provider bundle whose credentials the round's `provider_context` holds.
+ *
+ * `routing_key` names the source the event ARRIVED on; `provider_context` holds
+ * the DISPATCH credentials, and for a cross-provider global those are two
+ * different sources — the lock file resolved through the other source's bundle.
+ * Pairing the inbound bundle with the stored context hands one source's
+ * credentials to the other source's API client: the fetch either fails or reads
+ * the wrong tree, every candidate drops indeterminate, and the round decides
+ * nothing.
+ *
+ * `dispatch_routing_key` is NULL for every run whose dispatch source is the
+ * inbound one — every ordinary run, and every round recorded before the column
+ * existed — so it reads back as the inbound key.
+ *
+ * Throws, so it belongs with the pre-claim reconstruction: a source that has
+ * since been removed is a reason to refuse, not to re-evaluate with the wrong
+ * credentials.
+ */
+function resolveRoundDispatchBinding(
+  originalRun: OriginalRunRow,
+  deps: RerunDeps,
+  inbound: RerunProviderBinding,
+): RoundDispatchBinding {
+  const routingKey = originalRun.dispatch_routing_key ?? inbound.routingKey;
+  if (routingKey === inbound.routingKey) {
+    return { bundle: inbound.providerBundle, routingKey };
+  }
+  const bundle = deps.providerRegistry.getByRoutingKey(routingKey);
+  if (!bundle) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: its dispatch source ${routingKey} ` +
+        `is no longer registered, so the credentials it ran with cannot be paired with a ` +
+        `provider. Re-register the source, or push a new commit to re-evaluate the ` +
+        `organization's workflows.`,
+    );
+  }
+  return { bundle, routingKey };
+}
+
+/**
+ * The repository whose global workflows the round was deciding.
+ *
+ * A round is definitionally cross-repository — it exists to decide ONE
+ * repository's global workflows against ANOTHER repository's event — so a round
+ * row always records the defining repository, and `crossRepoWorkflowRepoOf` can
+ * only narrow it away when the two repositories are equal, which the pass's own
+ * same-repo skip makes impossible.
+ *
+ * There is therefore no reading of a NULL column that re-evaluates anything:
+ * the pass drops every registration authored in the source repository BEFORE it
+ * applies the scope, so falling back to the source repository would scope the
+ * pass to nothing — no candidates, no round, no failure — and a success check
+ * gated on the absence of a failure would then report a clean re-evaluation for
+ * work that never ran. A round row reaching this path without the column is a
+ * defect in whatever wrote it, and refusing is the only honest answer.
+ */
+function resolveRoundWorkflowRepo(originalRun: OriginalRunRow): string {
+  const workflowRepo = originalRun.workflow_repo_identifier;
+  if (!workflowRepo) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: it records no workflow repository, ` +
+        `so there is nothing to scope the re-evaluation to. Push a new commit to re-evaluate the ` +
+        `organization's workflows.`,
+    );
+  }
+  return workflowRepo;
+}
+
+/**
+ * The normalized form of the delivery the round was deciding.
+ *
+ * Read-only, and it throws — so it runs before the requestId claim, never
+ * inside the re-evaluation.
+ */
+function normalizeRoundEvent(
+  originalRun: OriginalRunRow,
+  providerBundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>,
+  delivery: { event: string; action: string | null },
+  payload: Record<string, unknown>,
+): SimulatedEvent {
+  const event = providerBundle.normalizer.normalizeEvent(delivery.event, delivery.action, payload);
+  if (!event) {
+    throw new Error(
+      `Cannot re-run evaluation round ${originalRun.run_id}: the '${delivery.event}' event it was ` +
+        `deciding is no longer one this orchestrator normalizes.`,
+    );
+  }
+  return event;
+}
+
+/** What a re-evaluated round produced. */
+interface RoundReevaluation {
+  workflowRepo: string;
+  matchedCount: number;
+  /**
+   * The pass reported reaching a verdict for this workflow repository. The one
+   * condition the success check is posted on — see `reevaluateGlobalRound`.
+   */
+  decided: boolean;
+  /** The re-evaluation ran and could not decide the round again. */
+  failedAgain: boolean;
+  /** The trust policy did not admit the event, so nothing was evaluated. */
+  skippedByPolicy: boolean;
+}
+
+/**
+ * Rebuild the original delivery's inputs and re-drive the organization-wide
+ * pass, scoped to the round's own workflow repository, then settle its check.
+ */
+async function reevaluateGlobalRound(opts: {
+  originalRun: OriginalRunRow;
+  payload: Record<string, unknown>;
+  processingDeps: ProcessingDeps;
+  binding: RerunProviderBinding;
+  /** Resolved by {@link resolveRoundDispatchBinding} before the claim. */
+  dispatch: RoundDispatchBinding;
+  delivery: { event: string; action: string | null };
+  /** Resolved by {@link resolveRoundWorkflowRepo} before the claim. */
+  workflowRepo: string;
+  /** Normalized by {@link normalizeRoundEvent} before the claim. */
+  event: SimulatedEvent;
+}): Promise<RoundReevaluation> {
+  const { originalRun, payload, processingDeps, binding, dispatch, delivery, workflowRepo, event } =
+    opts;
+  const { providerBundle, providerContext, routingKey } = binding;
+  const { event: eventName, action } = delivery;
+
+  // The inbound event's own credentials, re-extracted from the payload — the
+  // same read the delivery made. `provider_context` holds the DISPATCH
+  // credentials the round ran with, which for a cross-provider global are
+  // another source's and must not be used to read or write the inbound repo.
+  const credentials = providerBundle.normalizer.extractCredentials(payload) as Record<
+    string,
+    unknown
+  >;
+
+  const info: WebhookInfo = {
+    routingKey,
+    // Distinct from the original delivery id so the re-evaluation's own dedup,
+    // logs and traces are not mistaken for the delivery that first failed.
+    deliveryId: `${originalRun.delivery_id}-rerun-${Date.now()}`,
+    event: eventName,
+    action,
+    provider: originalRun.provider as ProviderType,
+    payload,
+  };
+
+  const eventWithFiles = await withChangedFiles({
+    event,
+    bundle: providerBundle,
+    info,
+    payload,
+    credentials,
+    repoIdentifier: originalRun.repo_identifier,
+  });
+
+  const trust = await resolveTrustForPR({ info, bundle: providerBundle, event, payload });
+  const securityDecision = await evaluateSecurityPolicy({
+    deps: processingDeps,
+    bundle: providerBundle,
+    isPREvent: isPullRequestEvent(eventName),
+    resolvedOrgId: originalRun.customer_id,
+    mode: processingDeps.orchestratorMode ?? 'platform',
+    trustResolution: trust.trustResolution,
+    isForkPR: event.isForkPR ?? false,
+  });
+
+  const outcome = await dispatchGlobalWorkflowsForOtherRepos({
+    info,
+    deps: processingDeps,
+    eventWithFiles,
+    resolvedOrgId: originalRun.customer_id,
+    repoIdentifier: originalRun.repo_identifier,
+    ref: originalRun.sha,
+    // The dispatch pair the delivery used, rebuilt from the round's own row:
+    // the bundle the stored credentials belong to, with those credentials.
+    dispatchBundle: dispatch.bundle,
+    dispatchCredentials: providerContext,
+    dispatchRoutingKey: dispatch.routingKey,
+    // The inbound pair, which is what the check lands through.
+    bundle: providerBundle,
+    credentials,
+    securityDecision,
+    onlyWorkflowRepo: workflowRepo,
+  });
+
+  // Gated on the pass's POSITIVE signal, never on the absence of a failure.
+  // Several paths reach this point having evaluated nothing at all and reported
+  // no round failure either — a coordinator with no pending-eval tracker, one
+  // with no registration index, an event the trust policy did not admit. Posting
+  // success on their silence tells a merge bot to unblock on work that provably
+  // did not run, which is the exact false assurance the round exists to remove.
+  const decided = outcome.decidedWorkflowRepos.includes(workflowRepo);
+  const failedAgain = outcome.roundFailureWorkflowRepos.includes(workflowRepo);
+  const skippedByPolicy = securityDecision.action !== 'pass';
+  if (decided) {
+    await postRoundSucceededCheck({
+      bundle: providerBundle,
+      originalRun,
+      credentials,
+      workflowRepo,
+      matchedCount: outcome.matchedCount,
+    });
+  } else {
+    logger.warn('Eval-round rerun reached no verdict; leaving the check as it stands', {
+      runId: originalRun.run_id,
+      workflowRepo,
+      failedAgain,
+      skippedByPolicy,
+    });
+  }
+  return {
+    workflowRepo,
+    matchedCount: outcome.matchedCount,
+    decided,
+    failedAgain,
+    skippedByPolicy,
+  };
+}
+
+/**
+ * Stamp the re-evaluated event with the source repository's changed files.
+ *
+ * Unconditional, unlike the delivery path's fetch: that path skips the fetch
+ * when no trigger in the source repo's lock file uses path patterns, and a
+ * scoped re-evaluation has no such lock file to read. An error carries
+ * `unavailable`, which every path filter downstream already treats
+ * conservatively.
+ */
+async function withChangedFiles(opts: {
+  event: SimulatedEvent;
+  bundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
+  info: WebhookInfo;
+  payload: Record<string, unknown>;
+  credentials: Record<string, unknown>;
+  repoIdentifier: string;
+}): Promise<SimulatedEvent> {
+  const { event, bundle, info, payload, credentials, repoIdentifier } = opts;
+  const base: SimulatedEvent = { ...event, sourceRepo: repoIdentifier };
+  if (!bundle.changedFilesFetcher) {
+    return { ...base, changedFiles: [], changedFilesStatus: 'unavailable' };
+  }
+  try {
+    const fetched = await bundle.changedFilesFetcher.getChangedFiles(
+      repoIdentifier,
+      info.event,
+      payload,
+      credentials,
+    );
+    return { ...base, changedFiles: fetched.files, changedFilesStatus: fetched.status };
+  } catch (err) {
+    logger.warn('Changed files unavailable for an eval-round rerun', {
+      repoIdentifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { ...base, changedFiles: [], changedFilesStatus: 'unavailable' };
+  }
+}
+
+/**
+ * Post the success conclusion on the organization-workflow-evaluation check for
+ * a round that re-evaluated cleanly.
+ *
+ * Through the INBOUND repository's bundle and credentials, for the same reason
+ * the failure post uses them: the check lands on the repository that emitted the
+ * event, never on the one that defines the workflows.
+ *
+ * Known residual, deliberately not solved here: two rounds from different
+ * workflow repositories can fail on one push, and both post the single shared
+ * check name (last-write-wins — the collision pre-exists on the failure side).
+ * Re-running one of them then posts success on that shared name even though the
+ * other repository's round is still broken. The operator ruling keeps one check
+ * name, so the summary names the repository this re-evaluation covered rather
+ * than widening the name.
+ *
+ * Best-effort: the re-evaluation already happened and its workflows are already
+ * dispatched, so a provider refusing the write must not fail the re-run.
+ */
+async function postRoundSucceededCheck(opts: {
+  bundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
+  originalRun: OriginalRunRow;
+  credentials: Record<string, unknown>;
+  workflowRepo: string;
+  matchedCount: number;
+}): Promise<void> {
+  const { bundle, originalRun, credentials, workflowRepo, matchedCount } = opts;
+  const summary =
+    `Re-evaluated the organization's global workflows from \`${workflowRepo}\`: ` +
+    `${matchedCount} workflow(s) admitted for this commit.`;
+  try {
+    await bundle.checkStatusPoster?.postGlobalEvalSucceededCheck?.(
+      originalRun.repo_identifier,
+      originalRun.sha,
+      summary,
+      credentials,
+    );
+  } catch (err) {
+    logger.warn('Failed to post the global-eval-succeeded check', {
+      runId: originalRun.run_id,
+      repoIdentifier: originalRun.repo_identifier,
+      workflowRepo,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 /**
  * Phase 5: re-fetch the lock file at the original SHA and locate the
  * workflow that was originally run. Throws on missing routing_key,
@@ -365,25 +945,14 @@ async function resolveRerunWorkflow(
   originalRun: OriginalRunRow,
   deps: RerunDeps,
 ): Promise<ResolvedRerunWorkflow> {
-  if (!originalRun.routing_key) {
-    throw new Error(
-      `Re-run failed: original run ${originalRun.run_id} has no routing_key — cannot select provider bundle`,
-    );
-  }
-  const providerBundle = deps.providerRegistry.getByRoutingKey(originalRun.routing_key);
-  if (!providerBundle) {
-    throw new Error(`Provider bundle for routing key ${originalRun.routing_key} not registered`);
-  }
+  const { providerBundle, providerContext, routingKey } = resolveRerunProviderBinding(
+    originalRun,
+    deps,
+  );
 
   if (!providerBundle.lockFileFetcher) {
     throw new Error(`Provider ${originalRun.provider} does not support lock file fetching`);
   }
-
-  const providerContext = JSON.parse(
-    typeof originalRun.provider_context === 'string'
-      ? originalRun.provider_context
-      : JSON.stringify(originalRun.provider_context ?? {}),
-  );
 
   const lockFile = await providerBundle.lockFileFetcher.fetchLockFile(
     originalRun.repo_identifier,
@@ -412,7 +981,7 @@ async function resolveRerunWorkflow(
     fullLockFile,
     providerContext,
     providerBundle,
-    routingKey: originalRun.routing_key,
+    routingKey,
   };
 }
 

@@ -211,3 +211,46 @@ describe('reportJobCheckRunCompletion', () => {
     expect(updateJobStatus).not.toHaveBeenCalled();
   });
 });
+
+describe('reportJobCheckRunCompletion — the run trust posture', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('forwards the run trust posture so the completion summary can name it', () => {
+    // `known` is legacy vocabulary `resolveRefTrust` no longer produces, so a
+    // forwarded value proves the run's own context was read rather than a
+    // literal supplied here.
+    const { updateJobStatus, deps } = makeDeps({
+      ...execContext,
+      trustTier: 'known',
+      lockFileSource: 'base',
+    });
+
+    reportJobCheckRunCompletion(deps, {
+      runId: 'run-1',
+      jobId: 'job-1',
+      jobName: 'build',
+      status: ExecutionJobStatus.enum.failed,
+    });
+
+    expect(updateJobStatus.mock.calls[0][0]).toMatchObject({
+      trustTier: 'known',
+      lockFileSource: 'base',
+    });
+  });
+
+  it('omits both fields for a run whose trust never resolved', () => {
+    const { updateJobStatus, deps } = makeDeps();
+
+    reportJobCheckRunCompletion(deps, {
+      runId: 'run-1',
+      jobId: 'job-1',
+      jobName: 'build',
+      status: ExecutionJobStatus.enum.success,
+    });
+
+    expect(updateJobStatus.mock.calls[0][0]).not.toHaveProperty('trustTier');
+    expect(updateJobStatus.mock.calls[0][0]).not.toHaveProperty('lockFileSource');
+  });
+});

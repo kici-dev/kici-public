@@ -46,6 +46,9 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
     ...(context.workflowRepoIdentifier && {
       workflowRepoIdentifier: context.workflowRepoIdentifier,
     }),
+    // Present only for a global evaluation round's own run row, which the
+    // Platform's re-run refusal reads to admit a round's re-evaluation.
+    ...(context.isGlobalEvalRound === true && { isGlobalEvalRound: true }),
     ...(context.provider && { repoProvider: context.provider }),
     ...(context.localWorkingTree && { localWorkingTree: true }),
     sha: context.sha,

@@ -157,8 +157,9 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Map GitHub membership-related webhook events to ContributorCache
-   * invalidations. See WebhookNormalizer.getAccessCacheInvalidations.
+   * Map GitHub membership-related webhook events to permission-cache
+   * invalidations. See WebhookNormalizer.getAccessCacheInvalidations, which is
+   * deprecated and has no caller.
    *
    * Covered event types:
    *

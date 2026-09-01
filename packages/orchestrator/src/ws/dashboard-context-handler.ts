@@ -15,10 +15,10 @@ import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { HeldRunStatus } from '../contexts/held-runs.js';
 import type { HeldRunStore, ReleaseSignal } from '../contexts/held-runs.js';
 import type { TeamMembershipLookup } from '../approvals/approval-resolver.js';
-import { applyDecision } from '../approvals/apply-decision.js';
+import { applyDecision, type ApplyDecisionDeps } from '../approvals/apply-decision.js';
+import { adminActorSub, triggererSubjectFor } from '../approvals/triggerer-subject.js';
 import type {
   AccessLogAction,
-  AccessLogOutcome,
   AccessLogTargetType,
   ActorPrincipal,
   DashboardPlatformToOrchMessage,
@@ -49,6 +49,7 @@ import type {
   ConcurrencyStrategy,
 } from '@kici-dev/engine';
 import {
+  AccessLogOutcome,
   ApprovalDecision,
   ContextDeleteErrorCode,
   HeldRunQueueType,
@@ -61,7 +62,7 @@ import { ContextDeleteBlockedError } from '../contexts/context-store.js';
 import type { ContextStore } from '../contexts/context-store.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 import type { BindingStore } from '../contexts/binding-store.js';
-import type { Database } from '../db/types.js';
+import type { Database, HeldRun } from '../db/types.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
@@ -161,10 +162,22 @@ export interface ApprovalHandlerDeps {
   resumeStep?: (signal: ReleaseSignal) => Promise<void>;
   /** Notify a waiting agent that a step hold was rejected (step scope). */
   rejectStep?: (heldRunId: string, reason?: string) => Promise<void> | void;
-  /** Resume a released workflow install-gate hold (workflow scope). */
+  /** Resume a released workflow-scoped hold (install gate or trust policy). */
   resumeWorkflow?: (signal: ReleaseSignal) => Promise<void>;
-  /** Cancel a rejected workflow install-gate hold (workflow scope). */
-  rejectWorkflow?: (runId: string) => Promise<void>;
+  /**
+   * Cancel a rejected workflow-scoped hold (install gate, trust policy, or an
+   * SDK workflow-level `requireApproval`), recording the rejecter's own reason
+   * as the run's cancellation reason. The hold row tells those apart, and the
+   * resolved boolean says whether a terminal `KiCI Security` check was written
+   * — see `onWorkflowReject` on `ApplyDecisionDeps`.
+   */
+  rejectWorkflow?: (hold: HeldRun, reason?: string) => Promise<boolean>;
+  /**
+   * Terminalize the `KiCI Security` check of any hold this handler ends that
+   * `rejectWorkflow` did not report on — see `settleSecurityCheck` on
+   * `ApplyDecisionDeps`.
+   */
+  settleSecurityCheck?: ApplyDecisionDeps['settleSecurityCheck'];
 }
 
 /**
@@ -1741,11 +1754,17 @@ export class DashboardContextHandler {
   /**
    * Resolve the actor's Keycloak sub for approval attribution. Only `user` and
    * `platform_operator` actors carry a `sub`; others fall back to a stable id.
+   *
+   * The `service:` namespace comes from {@link adminActorSub} rather than a
+   * literal here: `applyDecision`'s self-approval gate compares this value
+   * against {@link triggererSubjectFor}'s output, so the two renderings of one
+   * principal have to be produced by the same code or the gate compares strings
+   * that can never be equal.
    */
   private actorSub(actor: HeldRunApproveRequest['actor']): string {
     if (actor.type === 'user' || actor.type === 'platform_operator') return actor.sub;
     if (actor.type === 'api_key') return actor.ownerSub;
-    if (actor.type === 'service_account') return `service:${actor.id}`;
+    if (actor.type === 'service_account') return adminActorSub(actor.id);
     return `system:${actor.component}`;
   }
 
@@ -1767,6 +1786,11 @@ export class DashboardContextHandler {
    * Route an approve/reject through the shared `applyDecision` applier:
    * eligibility check, real attribution, multi-clause accumulation, and the
    * resume-after-approval re-dispatch. Sends the matching response message.
+   *
+   * The response goes out as soon as the decision is durable, not when its
+   * consequence finishes — see `ApplyDecisionResult.consequence`. The audit
+   * entry is attached to that consequence instead, so there is still exactly one
+   * per decision and it still carries the real outcome.
    */
   private async applyApprovalDecision(
     msg: HeldRunApproveRequest | HeldRunRejectRequest,
@@ -1802,9 +1826,10 @@ export class DashboardContextHandler {
             .select('triggered_by')
             .where('run_id', '=', runId)
             .executeTakeFirst();
-          // triggered_by is stored as "user:sub" / "key:name"; strip the prefix.
-          const raw = row?.triggered_by ?? undefined;
-          return raw?.includes(':') ? raw.slice(raw.indexOf(':') + 1) : raw;
+          // The same mapper the admin route uses. A bare prefix strip is wrong
+          // in three of the five actor shapes and left this gate inert for each
+          // of them — see `triggererSubjectFor`.
+          return triggererSubjectFor(row?.triggered_by);
         },
         onJobRelease: (signal) => approvals.resumeJob(signal),
         onStepRelease: approvals.resumeStep ? (signal) => approvals.resumeStep!(signal) : undefined,
@@ -1815,8 +1840,9 @@ export class DashboardContextHandler {
           ? (signal) => approvals.resumeWorkflow!(signal)
           : undefined,
         onWorkflowReject: approvals.rejectWorkflow
-          ? (runId) => approvals.rejectWorkflow!(runId)
+          ? (hold, rejectReason) => approvals.rejectWorkflow!(hold, rejectReason)
           : undefined,
+        settleSecurityCheck: approvals.settleSecurityCheck,
       },
       { heldRunId: msg.heldRunId, actorSub: this.actorSub(msg.actor), decision, reason },
     );
@@ -1834,17 +1860,50 @@ export class DashboardContextHandler {
       return;
     }
 
-    this.recordAccess(
-      msg.actor,
-      auditAction,
-      { type: 'held_run', id: msg.heldRunId },
-      msg.requestId,
-      'allowed',
-      result.status === 'pending'
-        ? `pending: ${result.remainingClauses} clause(s) remain`
-        : undefined,
-    );
+    // The decision is durable, so it is answered now. A `released` or
+    // `rejected` decision still has a consequence to run — the resume replay,
+    // or the reject's run cancellation and check-run completion — and it is
+    // deliberately not part of this answer: the Platform proxies every
+    // dashboard request under one ten-second relay budget, and a workflow-scoped
+    // fork-PR resume measured 9.8 s of that, so an approval that fully
+    // succeeded was answering 504 and the operator's natural retry then hit
+    // "already resolved".
     this.deps.send({ type: responseType, requestId: msg.requestId });
+
+    if (!result.consequence) {
+      // Nothing followed the record — a non-satisfying approve leaves the hold
+      // pending, so the audit entry is complete as soon as it is written.
+      this.recordAccess(
+        msg.actor,
+        auditAction,
+        { type: 'held_run', id: msg.heldRunId },
+        msg.requestId,
+        'allowed',
+        result.status === 'pending'
+          ? `pending: ${result.remainingClauses} clause(s) remain`
+          : undefined,
+      );
+      return;
+    }
+
+    // ONE audit entry per decision, written when its consequence settles so the
+    // recorded outcome is the real one. This is where a failed resume surfaces
+    // for the operator: `kici-admin access-log` and the dashboard's activity
+    // view both read this table, and the entry carries the failure message.
+    // The applier logs it too, and `resumeWorkflow` independently fails the run
+    // and completes the check runs it stranded. The entry is not awaited — a
+    // consequence can outlive this handler's turn, and blocking the dashboard
+    // message loop on it is exactly the coupling being removed.
+    void result.consequence.then((outcome) => {
+      this.recordAccess(
+        msg.actor,
+        auditAction,
+        { type: 'held_run', id: msg.heldRunId },
+        msg.requestId,
+        outcome.ok ? AccessLogOutcome.enum.allowed : AccessLogOutcome.enum.error,
+        outcome.ok ? undefined : outcome.error,
+      );
+    });
   }
 
   private async handleHeldRunApprove(msg: HeldRunApproveRequest): Promise<void> {

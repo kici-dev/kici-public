@@ -32,7 +32,25 @@ export enum HeldRunStatus {
 
 /**
  * Reason a run was held in the security queue. Persisted verbatim in
- * `held_runs.reason` and switched on by `buildSecurityHoldSummary`.
+ * `held_runs.reason` and whose vocabulary `buildSecurityHoldSummary` switches
+ * on.
+ *
+ * Each value names why a run sits in the queue. The enum stays whole because
+ * compiling code still names all four: `buildSecurityHoldSummary` renders one
+ * branch per value. Dropping a member breaks that, and breaks the parity test
+ * that pins `SECURITY_HOLD_JOB_IDS`' three policy-reason keys to this enum's
+ * options — the engine constant cannot import the enum, so that coupling lives
+ * only in the orchestrator's test. Nothing validates `held_runs.reason` against
+ * this enum, so a stored value is not rejected anywhere.
+ *
+ * - `fork_pr` — the org trust policy's fork switch held the run.
+ * - `context_trust` — a context's minimum-trust gate held the run.
+ * - `workflow_modification` — deprecated; no longer raised. Modifications to
+ *   `.kici/` are surfaced on their own informational check and no longer feed
+ *   a policy arm. Removed at v1.0.0.
+ * - `unknown_contributor` — deprecated; no longer raised. The policy turns on
+ *   whether the pull request came from a fork, not on who opened it. Removed
+ *   at v1.0.0.
  */
 export const SecurityHoldReason = z.enum([
   'workflow_modification',
@@ -53,6 +71,20 @@ export interface CreateHeldRunData {
   expiresAt: Date;
   /** Queue type: 'context' (default) or 'security'. */
   queueType?: 'context' | 'security';
+  /**
+   * Granularity of the held element. Omit to leave the column at its `'job'`
+   * default. The org trust policy's PR-wide hold passes `'workflow'`: it fires
+   * before any job is materialized and resumes by rebuilding the whole workflow
+   * dispatch, so `routeRelease` must send it to the workflow resume path.
+   */
+  scope?: HoldScope;
+  /**
+   * What triggered the hold. Omit to leave the column at its `'context'`
+   * default. Written explicitly by the trust-policy hold so its release signal
+   * carries the pair `routeRelease` discriminates on rather than relying on a
+   * column default to supply half of it.
+   */
+  triggerSource?: TriggerSource;
 }
 
 /**
@@ -130,9 +162,19 @@ export interface ListHeldRunsOptions {
 export class HeldRunStore {
   constructor(private readonly db: Kysely<Database>) {}
 
-  /** Create a new held run with pending status. */
-  async create(orgId: string, data: CreateHeldRunData): Promise<HeldRun> {
-    return this.db
+  /**
+   * Create a new held run with pending status.
+   *
+   * `exec` is the executor the INSERT runs through, defaulting to the store's
+   * own connection. A caller that writes something the row cannot exist without
+   * — the job's pending dispatch context, without which the hold can never be
+   * resumed — passes its enclosing transaction, so the two land or roll back
+   * together. Handed in rather than taken from an ambient scope: Kysely has no
+   * such scope, so a `this.db` insert inside a `db.transaction()` callback runs
+   * on a different connection and commits on its own.
+   */
+  async create(orgId: string, data: CreateHeldRunData, exec: Executor = this.db): Promise<HeldRun> {
+    return exec
       .insertInto('held_runs')
       .values({
         org_id: orgId,
@@ -143,6 +185,15 @@ export class HeldRunStore {
         queue_type: data.queueType ?? 'context',
         reason: data.reason,
         expires_at: data.expiresAt,
+        // Nothing has been posted yet — the pending check is posted after this
+        // row lands, and `markPendingCheckPosted` records it only once the
+        // provider has accepted it. Written explicitly so `null` keeps meaning
+        // "row predates the column" and nothing else.
+        posted_pending_check: false,
+        // Both columns are NOT NULL with a default, so an omitted field leaves
+        // the row exactly as every caller predating these fields wrote it.
+        ...(data.scope !== undefined && { hold_scope: data.scope }),
+        ...(data.triggerSource !== undefined && { trigger_source: data.triggerSource }),
       })
       .returningAll()
       .executeTakeFirstOrThrow();
@@ -152,9 +203,15 @@ export class HeldRunStore {
    * Create a generalized approval hold (workflow/job/step scope, explicit or
    * context trigger) carrying a normalized `ApprovalRequirement`. Returns
    * the created row.
+   *
+   * `exec` carries the same meaning it does on {@link create}.
    */
-  async createHold(orgId: string, data: CreateHoldData): Promise<HeldRun> {
-    return this.db
+  async createHold(
+    orgId: string,
+    data: CreateHoldData,
+    exec: Executor = this.db,
+  ): Promise<HeldRun> {
+    return exec
       .insertInto('held_runs')
       .values({
         org_id: orgId,
@@ -165,6 +222,8 @@ export class HeldRunStore {
         queue_type: data.queueType ?? 'context',
         reason: data.requirement.reason,
         expires_at: new Date(data.requirement.expiresAt),
+        // Same as `create`: recorded true only by `markPendingCheckPosted`.
+        posted_pending_check: false,
         hold_scope: data.scope,
         step_index: data.stepIndex ?? null,
         trigger_source: data.triggerSource,
@@ -175,6 +234,46 @@ export class HeldRunStore {
       })
       .returningAll()
       .executeTakeFirstOrThrow();
+  }
+
+  /**
+   * Record that the pending `KiCI Security` check reached the provider, for
+   * every hold that gates it, so the settle that ends one knows it has a check
+   * to terminalize.
+   *
+   * Written AFTER the post returns, never before. The two orders fail
+   * differently and the failures are not equivalent: recording first and dying
+   * before the post leaves a row claiming a check the commit does not have, and
+   * the settle then CREATES one — a completed `KiCI Security` run appearing on a
+   * commit nothing ever held. Recording second leaves the opposite residue, a
+   * real pending check the settle declines to close, which is the same stuck
+   * check the fire-and-forget post could already produce. A fabricated failing
+   * check on a pull request is worse than a stuck one, so the write goes last.
+   *
+   * **One statement for all of them, not one per hold.** A commit's check run is
+   * shared by every hold on it, and the settle asks the contention query which
+   * of them still owns it. Marking them in a loop admits a PARTIAL mark: mark
+   * the reviewer hold, fail on the security hold, and the security row keeps
+   * `posted_pending_check: false` — so it is not counted as a contender, and
+   * approving the reviewer hold terminalizes the shared check `success` while
+   * the trust hold still gates the job. That is a fabricated PASSING check,
+   * which is the worse direction, reached without any process dying: a
+   * deadlock, a statement timeout or a lost connection between the two UPDATEs
+   * is enough. A single `WHERE id IN (…)` either marks every hold or none.
+   *
+   * The residual window is therefore one statement issued immediately after the
+   * provider call returns — narrow, and not only reachable by a process death,
+   * which is why the caller logs its failure rather than treating it as
+   * impossible.
+   */
+  async markPendingCheckPosted(orgId: string, heldRunIds: readonly string[]): Promise<void> {
+    if (heldRunIds.length === 0) return;
+    await this.db
+      .updateTable('held_runs')
+      .set({ posted_pending_check: true })
+      .where('id', 'in', [...heldRunIds])
+      .where('org_id', '=', orgId)
+      .execute();
   }
 
   /** INSERT one decision row using the given executor (root or transaction). */
@@ -509,18 +608,24 @@ export class HeldRunStore {
   }
 
   /**
-   * Release overdue workflow timer holds. The install-gate wait action pauses
-   * the workflow as a held run; on timer expiry it must RESUME (not fail like
-   * a reviewer-hold expiry). Flips each overdue pending `hold_type` timer,
-   * `hold_scope='workflow'` row to `released` and returns a `ReleaseSignal`
-   * per row so the caller can resume the workflow. Runs BEFORE
-   * `expireOverdue()` so these rows leave the pending pool before the
-   * expire-and-fail sweep sees them.
+   * Release overdue timer holds at ANY scope. A wait action pauses its element
+   * as a held run; on timer expiry it must RESUME (not fail like a reviewer-hold
+   * expiry). Flips each overdue pending timer row to `released` and returns a
+   * `ReleaseSignal` per row, carrying the row's own scope so the caller can
+   * route it — `routeRelease` sends a workflow-scoped one to the install-gate
+   * rebuild and a job-scoped one to the job re-dispatch path.
    *
-   * The filter matches every persisted spelling of the timer hold type, so a
-   * row an un-upgraded orchestrator wrote as `wait_timer` still resumes rather
-   * than falling through to the expire-and-fail sweep. `hold_scope` is what
-   * keeps job-scoped dispatch-gate timer holds out of this sweep.
+   * Runs BEFORE `expireOverdue()` so these rows leave the pending pool before
+   * the expire-and-fail sweep sees them. That ordering is load-bearing, not
+   * incidental: `expireOverdue` is not scope-filtered, so a released-but-not-yet-
+   * resumed row would otherwise be expired out from under its resume.
+   *
+   * The filter matches every persisted spelling of the timer hold type, so a row
+   * an un-upgraded orchestrator wrote as `wait_timer` still resumes rather than
+   * falling through to the expire-and-fail sweep. It deliberately does NOT
+   * filter on `hold_scope`: a job-scoped timer hold used to be excluded here,
+   * which left it with no release path at all — created, never released,
+   * eventually expired, its job never dispatched.
    */
   async releaseDueWaitHolds(): Promise<ReleaseSignal[]> {
     const rows = await this.db
@@ -528,7 +633,6 @@ export class HeldRunStore {
       .set({ status: HeldRunStatus.Released, resolved_at: sql`now()` })
       .where('status', '=', HeldRunStatus.Pending)
       .where('hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.timer))
-      .where('hold_scope', '=', HoldScope.enum.workflow)
       .where('expires_at', '<', sql<Date>`now()`)
       .returningAll()
       .execute();
@@ -536,11 +640,61 @@ export class HeldRunStore {
       holdId: row.id,
       runId: row.run_id,
       jobId: row.job_id,
-      scope: (row.hold_scope as HoldScope) ?? HoldScope.enum.workflow,
+      // `hold_scope` is NOT NULL DEFAULT 'job' (migration 034), so there is no
+      // value to default. Defaulting a missing one to `workflow` would send a
+      // job-scoped hold down the install-gate path, re-dispatching a whole
+      // workflow instead of the one job that was held.
+      scope: row.hold_scope as HoldScope,
       stepIndex: row.step_index,
-      // Wait-timer install-gate holds are always context-triggered.
+      // A wait-timer hold is always context-triggered — it comes from a
+      // context's `wait_timer_seconds`, never from an SDK `requireApproval`.
       triggerSource: (row.trigger_source as TriggerSource) ?? TriggerSource.enum.context,
     }));
+  }
+
+  /**
+   * Every pending queued (concurrency) hold, with the org and concurrency group
+   * it belongs to — the input to the periodic release sweep, which needs to know
+   * WHICH groups have someone waiting before it looks up any limits.
+   *
+   * Returns the pair rather than full rows: the sweep only groups by it, and
+   * `listQueuedHoldsForContext` fetches the rows it actually releases.
+   */
+  async listAllQueuedHolds(): Promise<
+    Array<{ orgId: string | null; concurrencyGroup: string | null }>
+  > {
+    const rows = await this.db
+      .selectFrom('held_runs')
+      .innerJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
+      .select(['held_runs.org_id as orgId', 'execution_runs.context as concurrencyGroup'])
+      .where('held_runs.status', '=', HeldRunStatus.Pending)
+      .where('held_runs.hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.concurrency))
+      .execute();
+    return rows;
+  }
+
+  /**
+   * List the pending queued (concurrency) holds for one context's concurrency
+   * group, oldest first.
+   *
+   * Joined to `execution_runs` and filtered by `customer_id` as well as
+   * `context`: a context NAME is not unique across tenants, so without the org
+   * predicate one org's completing job could release another org's queued hold.
+   * Oldest-first is the release order — a queue that released newest-first would
+   * starve whoever waited longest.
+   */
+  async listQueuedHoldsForContext(orgId: string, concurrencyGroup: string): Promise<HeldRun[]> {
+    return this.db
+      .selectFrom('held_runs')
+      .innerJoin('execution_runs', 'execution_runs.run_id', 'held_runs.run_id')
+      .selectAll('held_runs')
+      .where('held_runs.org_id', '=', orgId)
+      .where('held_runs.status', '=', HeldRunStatus.Pending)
+      .where('held_runs.hold_type', 'in', persistedHoldTypeSpellings(HoldType.enum.concurrency))
+      .where('execution_runs.context', '=', concurrencyGroup)
+      .where('execution_runs.customer_id', '=', orgId)
+      .orderBy('held_runs.created_at', 'asc')
+      .execute() as unknown as Promise<HeldRun[]>;
   }
 
   /**

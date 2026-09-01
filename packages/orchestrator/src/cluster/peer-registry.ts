@@ -9,25 +9,58 @@
 import type { PeerHeartbeat, PeerCapabilities, ScalerCapacitySummary } from '@kici-dev/engine';
 
 /**
- * Apply the same mandatory-label gate the local label matcher applies, but
- * to a peer's advertised scaler-capacity entry. A scaler-capacity entry is
- * only routable for `requiredLabels` when every label in its `mandatoryLabels`
- * is present in `requiredLabels`. The empty-required-labels short-circuit
- * mirrors `findBackendForLabels`: an empty target only matches a scaler with
- * no gate.
+ * The taint gate for one label set of a peer's advertised scaler-capacity
+ * entry.
+ *
+ * Prefers the index-aligned `labelSetMandatoryLabels`, falling back to the
+ * scaler-wide `mandatoryLabels` when it is absent (a peer that predates the
+ * per-label-set field) or when its length does not match `labelSets` — a
+ * mismatched array carries no trustworthy alignment, so indexing into it would
+ * apply one label set's gate to another. Falling back to the union over-gates,
+ * which is the safe direction: a wrong index could under-gate and send a job to
+ * a peer that cannot run it.
+ */
+function scalerGateForLabelSet(sc: ScalerCapacitySummary, index: number): string[] {
+  const perSet = sc.labelSetMandatoryLabels;
+  if (perSet && perSet.length === sc.labelSets.length) return perSet[index] ?? [];
+  return sc.mandatoryLabels ?? [];
+}
+
+/**
+ * Apply the same per-label-set gate the local label matcher applies, but to a
+ * peer's advertised scaler-capacity entry. The entry is routable for
+ * `requiredLabels` when SOME label set both supplies every required label and
+ * has its own gate satisfied by them.
+ *
+ * The gate check and the subset check are deliberately evaluated on the same
+ * label set. Splitting them into two independent passes would admit a peer
+ * whose gate is satisfied by one label set and whose labels are supplied by
+ * another — a dispatch the peer then refuses locally.
+ *
+ * The empty-required-labels short-circuit mirrors `findBackendForLabels`: an
+ * empty target only matches an ungated label set.
+ *
+ * Both tests fold case exactly as `findBackendForLabels` does, so a peer is
+ * selected for the labels its own scaler matcher will accept. A case-sensitive
+ * subset test made a scaler declaring `Docker` invisible to a `runsOn: docker`
+ * job across the cluster, while the peer that owns it matched the job locally.
  */
 function scalerCapacityMatchesRequiredLabels(
   sc: ScalerCapacitySummary,
   requiredLabels: string[],
 ): boolean {
-  const mandatory = sc.mandatoryLabels ?? [];
-  if (requiredLabels.length === 0) {
-    // Empty required labels: only scalers without a gate can match.
-    return mandatory.length === 0;
-  }
-  if (mandatory.length === 0) return true;
   const requiredLower = new Set(requiredLabels.map((l) => l.toLowerCase()));
-  return mandatory.every((m) => requiredLower.has(m.toLowerCase()));
+  return sc.labelSets.some((scalerLabels, i) => {
+    const mandatory = scalerGateForLabelSet(sc, i);
+    if (requiredLabels.length === 0) {
+      // Empty required labels: only an ungated label set can match, and it
+      // supplies every (zero) required label trivially.
+      return mandatory.length === 0;
+    }
+    if (!mandatory.every((m) => requiredLower.has(m.toLowerCase()))) return false;
+    const scalerLabelSet = new Set(scalerLabels.map((l) => l.toLowerCase()));
+    return [...requiredLower].every((label) => scalerLabelSet.has(label));
+  });
 }
 
 /**
@@ -85,6 +118,8 @@ export interface PeerInfo {
   routingKeys: string[];
   connected: boolean;
   lastHeartbeatAt: number;
+  /** When this peer first connected. Distinct from `lastHeartbeatAt`, which moves; this does not. */
+  connectedAt: number;
   agents: PeerAgentInfo[];
   draining: boolean;
   capabilities: PeerCapabilities;
@@ -125,6 +160,12 @@ export interface PeerRegistryOptions {
   onClusterSettingsVersionBehind?: (peerVersion: number) => void;
   /** Called when a peer transitions to disconnected state. */
   onPeerDisconnected?: (instanceId: string) => void;
+  /**
+   * Called when the connected-peer set changes (a fresh add or a
+   * markDisconnected), so a coordinator can re-report its `cluster.membership`
+   * snapshot to the Platform without waiting for the periodic interval.
+   */
+  onMembershipChange?: () => void;
 }
 
 export class PeerRegistry {
@@ -136,12 +177,14 @@ export class PeerRegistry {
   private readonly onRegistryVersionBehind?: (peerVersion: number) => void;
   private readonly onClusterSettingsVersionBehind?: (peerVersion: number) => void;
   private readonly onPeerDisconnected?: (instanceId: string) => void;
+  private readonly onMembershipChange?: () => void;
 
   constructor(options?: PeerRegistryOptions) {
     this.onConfigVersionBehind = options?.onConfigVersionBehind;
     this.onRegistryVersionBehind = options?.onRegistryVersionBehind;
     this.onClusterSettingsVersionBehind = options?.onClusterSettingsVersionBehind;
     this.onPeerDisconnected = options?.onPeerDisconnected;
+    this.onMembershipChange = options?.onMembershipChange;
   }
 
   /**
@@ -199,6 +242,10 @@ export class PeerRegistry {
       routingKeys: info.routingKeys,
       connected: true,
       lastHeartbeatAt: Date.now(),
+      // Set once on the fresh-peer branch only. The reconnect branch above
+      // must NOT reset it — a flapping peer would otherwise keep resetting
+      // itself to "newest" and become permanently un-evictable.
+      connectedAt: Date.now(),
       agents: [], // Always start empty — auth response or heartbeat populates
       draining: false, // Fresh connection = not draining
       capabilities: { s3LogAccess: false },
@@ -210,6 +257,10 @@ export class PeerRegistry {
       clusterSettingsVersion: 0,
       role: info.role ?? 'coordinator',
     });
+    // A fresh add (or a disconnected peer reconnecting) changes the connected
+    // set, so a coordinator re-reports membership. The metadata-only reconnect
+    // branch above returns before this and correctly does not fire.
+    this.onMembershipChange?.();
   }
 
   /**
@@ -369,14 +420,12 @@ export class PeerRegistry {
           // Must have capacity to spawn more agents
           if (sc.activeCount >= sc.maxAgents) return false;
 
-          // Check if any scaler label set matches any required label set
-          return labelSets.some((requiredLabels) => {
-            if (!scalerCapacityMatchesRequiredLabels(sc, requiredLabels)) return false;
-            return sc.labelSets.some((scalerLabels) => {
-              const scalerLabelSet = new Set(scalerLabels);
-              return requiredLabels.every((label) => scalerLabelSet.has(label));
-            });
-          });
+          // Check if any scaler label set matches any required label set. The
+          // gate and the subset test are applied to the same label set inside
+          // the helper.
+          return labelSets.some((requiredLabels) =>
+            scalerCapacityMatchesRequiredLabels(sc, requiredLabels),
+          );
         });
 
         if (hasScalerCapacity) {
@@ -419,13 +468,9 @@ export class PeerRegistry {
       // Check scaler backends (no capacity filter)
       if (peer.scalerCapacity) {
         const hasMatchingScaler = peer.scalerCapacity.some((sc) =>
-          labelSets.some((requiredLabels) => {
-            if (!scalerCapacityMatchesRequiredLabels(sc, requiredLabels)) return false;
-            return sc.labelSets.some((scalerLabels) => {
-              const scalerLabelSet = new Set(scalerLabels);
-              return requiredLabels.every((label) => scalerLabelSet.has(label));
-            });
-          }),
+          labelSets.some((requiredLabels) =>
+            scalerCapacityMatchesRequiredLabels(sc, requiredLabels),
+          ),
         );
 
         if (hasMatchingScaler) {
@@ -451,6 +496,8 @@ export class PeerRegistry {
       // Notify Raft so it can re-evaluate election state (e.g., self-elect
       // when all peers disconnect in a 2-node cluster).
       this.onPeerDisconnected?.(instanceId);
+      // The connected set shrank, so a coordinator re-reports membership.
+      this.onMembershipChange?.();
     }
   }
 
@@ -531,6 +578,17 @@ export class PeerRegistry {
    */
   getWorkerPeers(): PeerInfo[] {
     return [...this.peers.values()].filter((p) => p.role === 'worker');
+  }
+
+  /**
+   * Currently-connected worker peers.
+   *
+   * A peer that advertises no role registers as a coordinator (see `addPeer`),
+   * so a worker predating the role field is not counted here. That under-counts,
+   * which errs permissive, and it self-heals as workers upgrade.
+   */
+  getConnectedWorkerPeers(): PeerInfo[] {
+    return [...this.peers.values()].filter((p) => p.connected && p.role === 'worker');
   }
 
   /**

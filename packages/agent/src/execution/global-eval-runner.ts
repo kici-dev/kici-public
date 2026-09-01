@@ -163,6 +163,7 @@ async function generateDynamicJobs(
   };
 
   const jobs: LockJob[] = [];
+  const seenNames = new Set<string>();
   for (const generator of generators) {
     const context = buildGeneratorContext({
       workflowName: workflow.name,
@@ -174,7 +175,9 @@ async function generateDynamicJobs(
       kici: shared.kici,
     });
     const generated = await generator(context);
-    jobs.push(...(await serializeJobsToLock(generated, serializerCtx)));
+    jobs.push(
+      ...(await serializeJobsToLock(generated, serializerCtx, undefined, undefined, seenNames)),
+    );
   }
   return jobs;
 }
@@ -287,7 +290,6 @@ export async function runGlobalEvalRound(
   // never sees.
   const restoreEnv = applyGlobalWorkflowEnv(args.repos);
 
-  const shared = buildRoundState(args);
   // `withTimeout` races rather than cancels, so on a round timeout the loop may
   // still be running and still appending. Copy out of `settled` instead of
   // returning it, or the caller's result object would keep mutating after the
@@ -295,6 +297,7 @@ export async function runGlobalEvalRound(
   const settled: GlobalEvalCandidateResult[] = [];
   let stopReason: string | undefined;
   try {
+    const shared = buildRoundState(args);
     await withTimeout(
       () => evaluateAllCandidates(shared, settled, Date.now() + args.roundTimeoutMs),
       args.roundTimeoutMs,

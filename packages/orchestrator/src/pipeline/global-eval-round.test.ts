@@ -3,6 +3,7 @@ import type { LockJobOrFactory, LockWorkflow } from '@kici-dev/engine';
 import {
   candidateKey,
   groupCandidates,
+  narrowVerdict,
   partitionCandidates,
   runGlobalEvalRounds,
   truncateReasonText,
@@ -1301,5 +1302,33 @@ describe('truncateReasonText edges', () => {
 
   it('returns empty for a non-positive max', () => {
     expect(truncateReasonText('anything', 0)).toBe('');
+  });
+});
+
+describe('narrowVerdict preserves generated invoke jobs', () => {
+  it('keeps the invoke field (incl. optional) on a generated job', () => {
+    const raw = {
+      workflowName: 'org-pipeline',
+      run: true,
+      jobs: [
+        {
+          _type: 'static',
+          name: 'docker',
+          steps: [],
+          needs: [],
+          invoke: { event: 'myorg.docker-test', scope: 'source', optional: true },
+        },
+      ],
+    };
+    const result = narrowVerdict(raw, 'org-pipeline');
+    expect(result.run).toBe(true);
+    expect(result.indeterminate).toBeUndefined();
+    const job = result.jobs?.[0] as {
+      name: string;
+      invoke?: { event: string; optional?: boolean };
+    };
+    expect(job.name).toBe('docker');
+    expect(job.invoke?.event).toBe('myorg.docker-test');
+    expect(job.invoke?.optional).toBe(true);
   });
 });

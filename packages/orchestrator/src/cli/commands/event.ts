@@ -1,13 +1,13 @@
 /**
- * Event emission CLI commands for kici-admin (phase 28.10 plan 03 artifact).
+ * Event emission CLI commands for kici-admin.
  *
  *   event emit <name> --payload-file <path> [--source-routing-key <k>] [--source-repo <r>]
  *                     [--database-url] [--json]
  *
- * Dogfooded landing pad for `e2e/helpers/internal-webhook.ts` emitInternalEvent()
- * — simulates what `agent ctx.emit()` does from within a step execution by
- * inserting a row into `kici_events` and firing `pg_notify('kici_event_channel',
- * <id>)` so the orchestrator EventRouter picks it up immediately.
+ * Landing pad for manually emitting an internal event (mirrors what
+ * `agent ctx.emit()` does from within a step execution) by inserting a row into
+ * `kici_events` and firing `pg_notify('kici_event_channel', <id>)` so the
+ * orchestrator EventRouter picks it up immediately.
  *
  * Dual-mode: HTTP (`POST /api/v1/admin/events/emit`) or `--database-url`
  * (direct DB via `emitKiciEventDirect` from `@kici-dev/shared`).
@@ -31,7 +31,7 @@ export function registerEventCommands(program: Command, getClient: () => AdminAp
   event
     .command('emit <name>')
     .description(
-      'INSERT a row into kici_events and fire pg_notify — simulates agent ctx.emit() for e2e tests',
+      'INSERT a row into kici_events and fire pg_notify — manually emit an internal event (mirrors agent ctx.emit())',
     )
     .requiredOption(
       '--payload-file <path>',

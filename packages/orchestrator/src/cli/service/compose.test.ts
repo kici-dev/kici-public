@@ -154,6 +154,50 @@ describe('ComposeServiceManager', () => {
       expect(content).toContain(`image: quay.io/kici-dev/kici-agent:0.1.15@sha256:${DIGEST}`);
     });
 
+    it("grants the orchestrator more stop grace than compose's 10s default", async () => {
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      await mgr.install(testConfig);
+
+      // Compose kills at 10s by default, while the orchestrator's own
+      // graceful-shutdown budget is 30s — so without this it is SIGKILLed
+      // partway through, before it broadcasts `peer.leaving` or closes its
+      // agent sockets.
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain('stop_grace_period: 45s');
+    });
+
+    it('grants the agent a stop grace above its own force-exit budget', async () => {
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      const agentConfig: ServiceConfig = { ...testConfig, name: 'kici-agent', component: 'agent' };
+      await mgr.install(agentConfig);
+
+      // The agent force-exits at 10s and then waits ~1s for abort handlers, so
+      // compose's 10s default kills it before its own timer can fire.
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain('stop_grace_period: 20s');
+    });
+
+    it('infers the agent grace from the service name when component is absent', async () => {
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      await mgr.install({ ...testConfig, name: 'kici-agent' });
+
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain('stop_grace_period: 20s');
+    });
+
+    it('falls back to the longer grace for an unrecognised service name', async () => {
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      await mgr.install({ ...testConfig, name: 'kici-something-new' });
+
+      // Over-waiting costs seconds; under-waiting corrupts the shutdown.
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain('stop_grace_period: 45s');
+    });
+
     it('includes env_file in compose YAML', async () => {
       const { ComposeServiceManager } = await import('./compose.js');
       const mgr = new ComposeServiceManager();

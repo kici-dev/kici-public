@@ -1,5 +1,35 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+/**
+ * Records every `sql` tagged-template the module issues, so the cross-peer
+ * `pg_notify` can be asserted without a real Postgres executor (the fake db
+ * below implements only the three Kysely builders the module uses).
+ */
+const rawQueries = vi.hoisted(
+  () => [] as Array<{ text: string; values: unknown[]; executedOn: unknown }>,
+);
+
+vi.mock('kysely', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown>;
+  return {
+    ...actual,
+    sql: new Proxy(actual.sql as object, {
+      apply(_target: unknown, _thisArg: unknown, args: unknown[]) {
+        const strings = args[0] as TemplateStringsArray;
+        const values = args.slice(1);
+        return {
+          execute: async (executedOn: unknown) => {
+            rawQueries.push({ text: strings.join('?'), values, executedOn });
+            return { rows: [] };
+          },
+        };
+      },
+    }),
+  };
+});
+
 import {
+  DASHBOARD_WRITE_POLICY_CHANNEL,
   DashboardWritePolicyDisabledError,
   assertDashboardWriteAllowed,
   dashboardWritePolicyEvents,
@@ -10,7 +40,10 @@ import {
   resolveFullPolicyView,
   setDashboardWritePolicy,
 } from './dashboard-write-policy.js';
-import { DASHBOARD_WRITE_OPERATION_VALUES } from '@kici-dev/engine/protocol/dashboard-write-operations';
+import {
+  DASHBOARD_WRITE_OPERATION_VALUES,
+  DashboardWritePolicyState,
+} from '@kici-dev/engine/protocol/dashboard-write-operations';
 import type { ActorPrincipal } from '@kici-dev/engine';
 
 interface FakeRow {
@@ -118,7 +151,13 @@ const actor: ActorPrincipal = { type: 'user', sub: 'zit-12345' };
 beforeEach(() => {
   invalidateDashboardWritePolicyCache();
   dashboardWritePolicyEvents.removeAllListeners();
+  rawQueries.length = 0;
 });
+
+/** The `pg_notify` calls recorded during the current test, if any. */
+function notifyCalls() {
+  return rawQueries.filter((q) => q.text.includes('pg_notify'));
+}
 
 afterEach(() => {
   invalidateDashboardWritePolicyCache();
@@ -285,6 +324,37 @@ describe('setDashboardWritePolicy', () => {
     const arg = eventSpy.mock.calls[0]?.[0] as { customerId: string; policy: unknown };
     expect(arg.customerId).toBe('customer-1');
     expect(arg.policy).toEqual({ 'secrets.set': 'disabled' });
+  });
+
+  it('notifies the cluster channel from inside the write transaction', async () => {
+    const { db } = makeFakeDb();
+    await setDashboardWritePolicy(
+      db,
+      'customer-1',
+      { 'secrets.set': DashboardWritePolicyState.enum.disabled },
+      { actor },
+    );
+    const calls = notifyCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].values).toEqual([DASHBOARD_WRITE_POLICY_CHANNEL, 'customer-1']);
+    // The fake transaction hands the same handle to its callback, so the
+    // executor being that handle is what proves the NOTIFY rides the write's
+    // transaction rather than a separate connection — Postgres then queues it
+    // until commit, and a rolled-back write notifies nobody.
+    expect(calls[0].executedOn).toBe(db);
+  });
+
+  it('does not notify when nothing changed', async () => {
+    const { db } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': false } },
+    ]);
+    await setDashboardWritePolicy(
+      db,
+      'customer-1',
+      { 'secrets.set': DashboardWritePolicyState.enum.disabled },
+      { actor },
+    );
+    expect(notifyCalls()).toHaveLength(0);
   });
 
   it('invalidates the cache so subsequent reads pick up the change', async () => {

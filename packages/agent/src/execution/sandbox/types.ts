@@ -5,6 +5,8 @@ import type {
   ConcurrencyReportMessage,
   ConcurrencyAckMessage,
   CacheRequestIpc,
+  GitGrantRequestIpc,
+  GitGrantResponseIpc,
   CacheResponseIpc,
   ProvenanceRequestIpc,
   ProvenanceResponseIpc,
@@ -60,6 +62,32 @@ export interface ExecutionSandbox {
    * - Firecracker: no-op (VM lifecycle managed by scaler)
    */
   teardown(): Promise<void>;
+
+  /**
+   * SIGTERM → grace → SIGKILL the finished job's process group, reaping any
+   * daemon a step backgrounded. Returns the number of reap attempts that
+   * signalled a live group. Only the bare-metal backend reaps a process group;
+   * others (which reap their whole tree on teardown) omit this.
+   */
+  reap?(): Promise<number>;
+
+  /**
+   * Whether the runner signalled that its completion hooks ran before it exited.
+   * `false` means the runner was hard-killed before running declared cleanup —
+   * the between-jobs phase's cue to re-run it out-of-band. Absent ⇒ treated as
+   * `true` (no re-run) for backends that reap their whole tree.
+   */
+  readonly completionHooksRan?: boolean;
+
+  /** Whether the job declares an `onFailure` / `cleanup` hook (bare-metal). */
+  readonly declaresCleanup?: boolean;
+
+  /**
+   * Re-run the finished job's declared cleanup / onFailure hooks out-of-band,
+   * against the preserved workdir, in a fresh bounded child. Resolves on success
+   * and rejects on failure so the caller can time it out. Bare-metal only.
+   */
+  runCleanupOnly?(workDir: string, signal: AbortSignal): Promise<void>;
 }
 
 // --- Setup options ---
@@ -81,6 +109,19 @@ export interface SandboxSetupOptions {
    * inside `executeJob`, so it ignores this field.
    */
   extraReadOnlyBinds?: string[];
+  /**
+   * Populate the sandbox workspace from `workDir` instead of letting the runner
+   * clone inside it.
+   *
+   * Set when the AGENT already cloned on the host. The container backend packs
+   * `workDir` and copies it into the container's `/workspace` volume; the
+   * bare-metal backend already runs against `workDir` directly and ignores it.
+   *
+   * Cloning on the host is what lets a container image ship without git — and
+   * it puts clone-time credentials on the host, where the credential helper
+   * already works, instead of needing a route into a hardened container.
+   */
+  workspaceFromHost?: boolean;
 }
 
 // --- Job execution options ---
@@ -131,6 +172,25 @@ export interface JobExecutionOptions {
    * working — the runner falls back to a "not configured" cache response.
    */
   onCacheRequest?: (request: CacheRequestIpc) => Promise<CacheResponseIpc>;
+  /**
+   * Callback for opening or closing a git write grant on behalf of the sandbox.
+   *
+   * The grant lives in the AGENT's grant table because the credential helper
+   * git spawns is a separate process that consults the agent, not the sandbox
+   * runner. Optional so harnesses that don't thread git credentials keep
+   * working — the runner falls back to a "not configured" error response.
+   */
+  onGitGrantRequest?: (request: GitGrantRequestIpc) => Promise<GitGrantResponseIpc>;
+  /**
+   * Absolute path to the agent's git credential helper.
+   *
+   * Threaded into the execution request so the runner configures it on every
+   * clone. Set for the bare-metal (fork) backend, whose runner is a host
+   * process that can reach the agent's socket. Deliberately NOT set by the
+   * container backend: git runs inside the container and has no route to it —
+   * see the dual-mode container work.
+   */
+  credentialHelperPath?: string;
   /**
    * Callback for relaying a provenance bundle upload request from the sandbox to
    * the orchestrator. The sandbox runner sends `provenance.request` IPC; the

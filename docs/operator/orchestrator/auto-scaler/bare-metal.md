@@ -7,9 +7,39 @@ The bare-metal backend provisions agents as host child processes (`child_process
 
 ## Bare-metal-specific fields
 
-**Label-set-level field:**
+**Label-set-level fields:**
 
-- `binaryPath` — Filesystem path to the agent binary. Required on every bare-metal label set.
+- `binaryPath` — Filesystem path to the agent binary. The scaler spawns this
+  process for each job.
+- `image` — A `kici-agent` container image. It has two uses, described in
+  [Container jobs](#container-jobs) below.
+
+Every bare-metal label set needs at least one of the two. A set with only
+`binaryPath` spawns a host process, which is the classic bare-metal pool.
+
+## Container jobs
+
+A job may name its own container image with the `container` field. KiCI runs
+such a job with its own Node build mounted read-only, so the image needs neither
+Node nor git. A bare-metal agent is a plain host process and carries no such
+build, so the label set's `image` is where it comes from:
+
+- **`binaryPath` and `image`** — The pool spawns the agent process as usual.
+  When that agent takes a `container` job, it starts the job's container and
+  copies the Node build out of `image` into a named volume, which it then
+  mounts into the job container. The copy runs once per agent image on that
+  host and is reused afterwards.
+- **`image` only** — The pool runs the job's own image _as_ the agent, with
+  the same Node build mounted in. There is no host process. Use this for a pool
+  that only ever runs container jobs. The agent runs inside the job's image here,
+  so that image must also ship `git` and `bash`; the agent refuses to start
+  without them.
+- **`binaryPath` only** — No Node build is available to inject, so a
+  `container` job runs on the image's own `node`. That works for an image
+  that ships one, such as `node:24-slim`.
+
+The host needs docker or podman for any of this. See
+[Container jobs](../../../user/container-jobs.md) for the job-side contract.
 
 **Scaler-level field:**
 
@@ -84,7 +114,7 @@ For a non-Linux bare-metal pool, prefer declaring the structured `platform: { os
 
 ### Key notes
 
-- **Warm pool support**: Bare-metal scalers support warm pools just like container scalers. When `warmPool` is configured, idle agent processes are pre-spawned and consumed on demand. Without a warm pool, agents spawn on demand when a job arrives. The `maxAgents` field controls maximum concurrency (how many simultaneous jobs can run).
+- **Warm pool support**: Bare-metal scalers accept a `warmPool` block and keep its agents ready like every other backend (see [Warm pool](./common-config.md#warm-pool)). Starting a bare-metal process takes seconds, so a warm pool saves little here — the default `size: 0` is the right choice for most bare-metal pools. The `maxAgents` field controls maximum concurrency (how many simultaneous jobs can run).
 
 - **Intermittent availability**: Remote orchestrators (especially developer laptops) may be intermittently available. When the machine is off or disconnected, jobs requiring its labels will fail with a clear error message ("No orchestrator in cluster handles labels: ..."). This is expected behavior -- the cluster coordinator handles it gracefully.
 

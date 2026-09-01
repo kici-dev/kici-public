@@ -53,6 +53,18 @@ describe('buildExecutionStatusFrame', () => {
     expect(built.repoIdentifier).toBe(SOURCE_REPO);
   });
 
+  it('marks an evaluation round so the Platform can admit its re-run', () => {
+    const built = frame(context({ isGlobalEvalRound: true }));
+    expect(built.isGlobalEvalRound).toBe(true);
+  });
+
+  it('omits the round marker entirely for an ordinary run', () => {
+    // Same absent-means-absent contract as the workflow repo: the Platform
+    // upsert leaves a recorded value alone when the key is missing.
+    const built = frame(context());
+    expect('isGlobalEvalRound' in built).toBe(false);
+  });
+
   it('keeps every other optional field conditional on the context', () => {
     // A minimal context must not manufacture keys; the same absent-means-absent
     // contract the workflow repo relies on holds for its neighbours.

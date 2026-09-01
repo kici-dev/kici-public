@@ -342,4 +342,74 @@ describe('findBackendForLabels', () => {
       expect(findBackendForLabels(['linux', 'gpu'], scalers, ['spot'])).toBeNull();
     });
   });
+
+  // ── per-label-set gate (labelSetMandatoryLabels) ──────────────────────
+  describe('per-label-set mandatory gate', () => {
+    // A scaler mixing platforms: the union of the two gates is
+    // ['gpu', 'macos'], which no sensible job requests in full.
+    const mixed = {
+      name: 'mixed',
+      labelSets: [{ labels: ['linux', 'gpu'] }, { labels: ['macos', 'xcode'] }],
+      mandatoryLabels: ['gpu', 'macos'],
+      labelSetMandatoryLabels: [['gpu'], ['macos']],
+    };
+
+    it('routes to a label set whose own gate is satisfied, ignoring a sibling set gate', () => {
+      expect(findBackendForLabels(['linux', 'gpu'], [mixed])).toEqual({
+        scalerName: 'mixed',
+        labelSetIndex: 0,
+      });
+      expect(findBackendForLabels(['macos', 'xcode'], [mixed])).toEqual({
+        scalerName: 'mixed',
+        labelSetIndex: 1,
+      });
+    });
+
+    it('still refuses a label set whose own gate is unsatisfied', () => {
+      // `xcode` alone is a subset of label set 1, but its gate demands `macos`.
+      expect(findBackendForLabels(['xcode'], [mixed])).toBeNull();
+    });
+
+    it('falls back to the scaler-wide gate when the per-set array is absent', () => {
+      const legacy = {
+        name: 'legacy',
+        labelSets: [{ labels: ['linux', 'gpu'] }, { labels: ['macos', 'xcode'] }],
+        mandatoryLabels: ['gpu', 'macos'],
+      };
+      // The union gate is applied, exactly as before the per-set field existed.
+      expect(findBackendForLabels(['linux', 'gpu'], [legacy])).toBeNull();
+      expect(findBackendForLabels(['gpu', 'macos'], [legacy])).toBeNull();
+    });
+
+    it('falls back to the scaler-wide gate when the per-set array is misaligned', () => {
+      const misaligned = {
+        name: 'misaligned',
+        labelSets: [{ labels: ['linux', 'gpu'] }, { labels: ['macos', 'xcode'] }],
+        mandatoryLabels: ['gpu', 'macos'],
+        // One entry for two label sets — no trustworthy alignment, so the
+        // union is applied rather than indexing into a shorter array.
+        labelSetMandatoryLabels: [['gpu']],
+      };
+      expect(findBackendForLabels(['linux', 'gpu'], [misaligned])).toBeNull();
+    });
+
+    it('empty runsOn picks the first ungated label set, not only the first scaler', () => {
+      const scalers = [
+        {
+          name: 'mixed',
+          labelSets: [{ labels: ['linux', 'gpu'] }, { labels: ['linux'] }],
+          mandatoryLabels: ['gpu'],
+          labelSetMandatoryLabels: [['gpu'], []],
+        },
+      ];
+      expect(findBackendForLabels([], scalers)).toEqual({
+        scalerName: 'mixed',
+        labelSetIndex: 1,
+      });
+    });
+
+    it('empty runsOn still matches nothing when every label set is gated', () => {
+      expect(findBackendForLabels([], [mixed])).toBeNull();
+    });
+  });
 });

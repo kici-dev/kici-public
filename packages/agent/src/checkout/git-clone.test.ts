@@ -382,4 +382,109 @@ describe('gitClone', () => {
     expect(env!.GIT_SSH_COMMAND).toContain('StrictHostKeyChecking=yes');
     expect(env!.GIT_SSH_COMMAND).toContain('UserKnownHostsFile=');
   });
+
+  describe('credential helper configuration', () => {
+    it('writes the helper and useHttpPath into the clone config', async () => {
+      await gitClone({
+        repoUrl: 'https://github.com/org/repo.git',
+        ref: 'main',
+        sha: 'abc123',
+        workDir: '/tmp/work',
+        credentialHelperPath: '/opt/kici/git-credential-kici',
+      });
+
+      const configCalls = execFileSyncCalls.filter((c) => c.args.includes('config'));
+      const helper = configCalls.find((c) => c.args.includes('credential.helper'));
+      const useHttpPath = configCalls.find((c) => c.args.includes('credential.useHttpPath'));
+      expect(helper!.args).toEqual([
+        '-C',
+        '/tmp/work',
+        'config',
+        'credential.helper',
+        '/opt/kici/git-credential-kici',
+      ]);
+      expect(useHttpPath!.args).toContain('true');
+    });
+
+    it('configures the helper even when no sha is verified', async () => {
+      // The sha check returns early; the helper must still be configured or a
+      // later push on that tree would have no credential source.
+      await gitClone({
+        repoUrl: 'https://github.com/org/repo.git',
+        ref: 'main',
+        sha: '',
+        workDir: '/tmp/work',
+        credentialHelperPath: '/opt/kici/git-credential-kici',
+      });
+      expect(execFileSyncCalls.some((c) => c.args.includes('credential.helper'))).toBe(true);
+    });
+
+    it('writes no secret into the clone config', async () => {
+      await gitClone({
+        repoUrl: 'https://github.com/org/repo.git',
+        ref: 'main',
+        sha: 'abc123',
+        workDir: '/tmp/work',
+        token: 'ghs_secret123',
+        credentialHelperPath: '/opt/kici/git-credential-kici',
+      });
+
+      const configCalls = execFileSyncCalls.filter((c) => c.args.includes('config'));
+      for (const call of configCalls) {
+        expect(call.args.join(' ')).not.toContain('ghs_secret123');
+      }
+    });
+
+    it('leaves the config untouched when no helper path is supplied', async () => {
+      await gitClone({
+        repoUrl: 'https://github.com/org/repo.git',
+        ref: 'main',
+        sha: 'abc123',
+        workDir: '/tmp/work',
+      });
+      expect(execFileSyncCalls.some((c) => c.args.includes('credential.helper'))).toBe(false);
+    });
+  });
+
+  describe('ssh auth lifetime', () => {
+    const sshAuth = {
+      kind: 'ssh' as const,
+      secret: '-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n',
+    };
+
+    it('defers key cleanup to the registry instead of deleting it at clone end', async () => {
+      const deferred: Array<() => Promise<void>> = [];
+      await gitClone({
+        repoUrl: 'git@github.com:org/repo.git',
+        ref: 'main',
+        sha: '',
+        workDir: '/tmp/work',
+        gitAuth: sshAuth,
+        sshCleanupRegistry: { defer: (fn) => deferred.push(fn) },
+      });
+      // Handed over, not run — the key must outlive the clone so a later push
+      // can use it.
+      expect(deferred).toHaveLength(1);
+    });
+
+    it('hands the key over even when the clone throws', async () => {
+      const deferred: Array<() => Promise<void>> = [];
+      vi.mocked(execFileSync).mockImplementation(((cmd: unknown, args: unknown[]) => {
+        if ((args as string[]).includes('clone')) throw new Error('clone failed');
+        return Buffer.from('');
+      }) as any);
+
+      await expect(
+        gitClone({
+          repoUrl: 'git@github.com:org/repo.git',
+          ref: 'main',
+          sha: '',
+          workDir: '/tmp/work',
+          gitAuth: sshAuth,
+          sshCleanupRegistry: { defer: (fn) => deferred.push(fn) },
+        }),
+      ).rejects.toThrow();
+      expect(deferred).toHaveLength(1);
+    });
+  });
 });

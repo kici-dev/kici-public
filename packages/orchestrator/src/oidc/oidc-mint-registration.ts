@@ -64,9 +64,13 @@ export interface OidcMintRegistrationInput {
   };
   db: Kysely<Database>;
   orchestratorId: string;
-  testMode: boolean;
-  testMintDeferAudience?: string;
-  testMintRejectAudience?: string;
+  /**
+   * Test-only fault-injection predicate forwarded to the relay mint handler,
+   * supplied only by the build-time test double. Only ever defers — the
+   * anti-forgery choke point is preserved. Undefined (the shipped default) means
+   * no fault injection.
+   */
+  initialMintFault?: (audience: string) => boolean;
 }
 
 /** Decide which mint handler (if any) backs `OIDC_TOKEN_REQUEST_METHOD`. */
@@ -97,9 +101,7 @@ export function selectOidcMintRegistration(
         dispatcher: input.dispatcher,
         platformClient: input.platformClient,
         orchestratorId: input.orchestratorId,
-        testMode: input.testMode,
-        testMintDeferAudience: input.testMintDeferAudience,
-        testMintRejectAudience: input.testMintRejectAudience,
+        initialMintFault: input.initialMintFault,
       }),
     };
   }

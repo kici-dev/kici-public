@@ -3,7 +3,13 @@ title: kici-admin CLI reference
 description: Complete reference for the kici-admin orchestrator administration CLI
 ---
 
-The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, tokens, sources, database migrations, diagnostics, clustering, and service lifecycle. It communicates with the orchestrator's admin HTTP API using Bearer token authentication.
+The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, tokens, sources, database migrations, diagnostics, clustering, and service lifecycle. Most commands reach the orchestrator over its admin HTTP API using Bearer token authentication.
+
+Some command groups deliberately bypass that API, because they must work while the orchestrator is down (or before it exists):
+
+- **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `peer`, `host`, `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`. Several API-backed commands also offer a direct-DB mode through the same flag — each one says so in its guide entry.
+- **Local host only** (no orchestrator, no database): `firecracker`, `scaler`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
+- **Own transport**: `join` connects straight to the Platform relay or a peer orchestrator.
 
 ## Installation
 
@@ -12,6 +18,8 @@ The `kici-admin` binary is provided by the `kici-admin` npm package, which re-ex
 ```bash
 npm install -g kici-admin
 ```
+
+The same package also installs a second binary, `kici-agent`, which runs the KiCI agent. That is what puts an agent on `PATH` for a bare-metal scaler's `binaryPath:` — see the [bare-metal quickstart](../../user/quickstart/bare-metal.md).
 
 For standalone (single-executable) deployments, see [Packaging guide](../distribution/sea-binaries.md).
 
@@ -61,6 +69,16 @@ These options apply to every command:
 
 Running `--help` on any command works without a token.
 
+## Output streams
+
+The `kici-admin` binary routes every diagnostic log line to **stderr**. Only command output — a table, or the payload of a `--json` / `--format json` run — goes to **stdout**. So you can pipe stdout straight into a parser:
+
+```bash
+kici-admin runs list --json | jq -r '.runs[].runId'
+```
+
+The CLI sets `KICI_LOG_STDERR=1` for you when it starts. Set it yourself only if you invoke the orchestrator CLI module through some other entry point and want the same split.
+
 ## RBAC roles
 
 Tokens are assigned one of three roles. The role determines which admin API operations are permitted:
@@ -109,28 +127,29 @@ The full command reference is split by area:
 - [Agents, peers & hosts](./kici-admin/agents-peers-hosts.md) — `agent`, `peer`, `join`, `host`
 - [Runs, execution & events](./kici-admin/runs-execution-events.md) — `runs`, `execution`, `check-run`, `queue`, `registration`, `workflow`, `event`, `event-dlq`
 - [Cluster & infrastructure](./kici-admin/cluster-and-infra.md) — `orchestrator`, `cluster`, `cluster-name`, `cluster-settings`, `scaler`, `firecracker`
-- [Org settings](./kici-admin/org-settings.md) — `org-settings`, `trust-policy`
+- [Org settings](./kici-admin/org-settings.md) — `org-settings`, `trust-policy`, `held-run`
 - [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
 
 Each area page carries a `## Guide` section (per-namespace concepts and worked examples) and a `## Reference` section (the always-current generated signature list for that area's commands).
 
 ## Environment variables summary
 
-| Variable                     | Scope        | Description                                         |
-| ---------------------------- | ------------ | --------------------------------------------------- |
-| `KICI_ADMIN_URL`             | CLI          | Orchestrator URL (default: `http://localhost:8080`) |
-| `KICI_ADMIN_TOKEN`           | CLI          | Admin API Bearer token (required)                   |
-| `KICI_BOOTSTRAP_ADMIN_TOKEN` | Orchestrator | Fixed bootstrap token (idempotent)                  |
-| `KICI_SECRET_KEY`            | Orchestrator | 64-char hex AES-256 master key                      |
-| `KICI_SECRET_KEY_FILE`       | Orchestrator | Path to master key file                             |
-| `KICI_SECRET_KEY_OLD`        | Orchestrator | Previous key for dual-key rotation                  |
-| `KICI_AUTO_MIGRATE`          | Orchestrator | Set `false` to disable auto-migration               |
-| `KICI_AGENT_TOKEN`           | Agent        | Agent authentication token                          |
-| `KICI_BACKEND_VAULT_URL`     | CLI          | Vault/OpenBao URL for backend commands              |
-| `KICI_BACKEND_ROLE_ID`       | CLI          | Vault AppRole role ID for backend commands          |
-| `KICI_BACKEND_SECRET_ID`     | CLI          | Vault AppRole secret ID for backend commands        |
-| `KICI_BACKEND_TOKEN`         | CLI          | Vault token for backend commands                    |
-| `KICI_BACKEND_PG_URL`        | CLI          | PG connection string for backend commands           |
+| Variable                     | Scope        | Description                                               |
+| ---------------------------- | ------------ | --------------------------------------------------------- |
+| `KICI_ADMIN_URL`             | CLI          | Orchestrator URL (default: `http://localhost:8080`)       |
+| `KICI_ADMIN_TOKEN`           | CLI          | Admin API Bearer token (required)                         |
+| `KICI_DATABASE_URL`          | CLI          | Postgres URL for direct-DB commands (or `--database-url`) |
+| `KICI_BOOTSTRAP_ADMIN_TOKEN` | Orchestrator | Fixed bootstrap token (idempotent)                        |
+| `KICI_SECRET_KEY`            | Orchestrator | 64-char hex AES-256 master key                            |
+| `KICI_SECRET_KEY_FILE`       | Orchestrator | Path to master key file                                   |
+| `KICI_SECRET_KEY_OLD`        | Orchestrator | Previous key for dual-key rotation                        |
+| `KICI_AUTO_MIGRATE`          | Orchestrator | Set `false` to disable auto-migration                     |
+| `KICI_AGENT_TOKEN`           | Agent        | Agent authentication token                                |
+| `KICI_BACKEND_VAULT_URL`     | CLI          | Vault/OpenBao URL for backend commands                    |
+| `KICI_BACKEND_ROLE_ID`       | CLI          | Vault AppRole role ID for backend commands                |
+| `KICI_BACKEND_SECRET_ID`     | CLI          | Vault AppRole secret ID for backend commands              |
+| `KICI_BACKEND_TOKEN`         | CLI          | Vault token for backend commands                          |
+| `KICI_BACKEND_PG_URL`        | CLI          | PG connection string for backend commands                 |
 
 ## See also
 

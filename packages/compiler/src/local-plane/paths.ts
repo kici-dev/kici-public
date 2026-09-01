@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -11,10 +12,30 @@ export const PLANE_STAMP_VERSION = 3;
 /**
  * Root directory of the local dev plane's state, following the same
  * `KICI_CONFIG_DIR` → `~/.kici` convention the rest of the CLI uses.
+ *
+ * RESOLVED THROUGH SYMLINKS, deliberately. The plane is a singleton on fixed
+ * ports, so a caller may reach it through a config dir that only symlinks
+ * `local` at the durable one — `pnpm deploy:stg` does exactly that, to run
+ * against a throwaway config dir carrying no credentials while still reusing
+ * the warm plane.
+ *
+ * Without resolving, the plane's Postgres is started with a data directory
+ * addressed through that ephemeral path and keeps it open. When the caller
+ * removes its temp dir, Postgres PANICs — `could not open file
+ * "<tmp>/local/pgdata/global/pg_control"` — and shuts the whole plane down,
+ * taking every later phase with it. Resolving first means Postgres only ever
+ * sees the durable path, so a caller's temp dir can come and go beneath it.
+ *
+ * A path that does not exist yet resolves to itself: a fresh plane creates it.
  */
 export function planeRoot(): string {
   const base = process.env.KICI_CONFIG_DIR ?? path.join(os.homedir(), '.kici');
-  return path.join(base, 'local');
+  const root = path.join(base, 'local');
+  try {
+    return fs.realpathSync(root);
+  } catch {
+    return root;
+  }
 }
 
 /**

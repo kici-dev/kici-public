@@ -130,6 +130,28 @@ interface JobCompleteMessage {
   droppedJobs?: string[];
 }
 
+/**
+ * Emitted once, right after the runner extracts the job's hooks, so the
+ * supervisor knows whether the job declares `onFailure` / `cleanup` even if the
+ * runner is later hard-killed before those hooks run. The between-jobs phase
+ * uses it to decide whether an out-of-band cleanup re-run is warranted.
+ */
+export interface HooksDeclaredMessage {
+  type: 'hooks-declared';
+  /** True when the job declares an `onFailure` or `cleanup` completion hook. */
+  declaresCleanup: boolean;
+}
+
+/**
+ * The runner's job-completion hooks (onSuccess / onFailure / cleanup) have run.
+ * Emitted once, whether or not a hook failed. Its absence when the child exits
+ * tells the supervisor the runner was killed before its declared cleanup ran,
+ * so the between-jobs phase re-runs that cleanup out-of-band.
+ */
+export interface CompletionHooksDoneMessage {
+  type: 'completion-hooks-done';
+}
+
 /** Request to emit a custom event from a workflow step (runner -> agent). */
 export interface EventEmitRequest {
   type: 'event.emit';
@@ -200,6 +222,32 @@ export interface CacheRequestIpc {
   sizeBytes?: number;
 }
 
+/** Git write-grant operations (runner -> agent). */
+export type GitGrantOp = 'elevate' | 'revoke';
+
+/**
+ * Open or close a write window for one repository (runner -> agent).
+ *
+ * `withWrite` sends `elevate` before running its callback and `revoke` in a
+ * `finally`. The grant lives in the AGENT's grant table — the credential helper
+ * git spawns is a separate process and consults the agent, not the runner —
+ * which is why this is an agent-directed IPC call rather than an orchestrator
+ * one. Mirrors the {@link CacheRequestIpc} relay pattern.
+ */
+export interface GitGrantRequestIpc {
+  type: 'git.grant.request';
+  /** UUID for correlating the response. */
+  requestId: string;
+  op: GitGrantOp;
+  /** `owner/repo`. `elevate` only. */
+  repository?: string;
+  /** Permissions to request from the forge. `elevate` only. */
+  permissions?: Record<string, string>;
+  /** Named credential from the job's `gitCredentials` map. `elevate` only. */
+  credentialName?: string;
+  /** Grant id returned by a previous `elevate`. `revoke` only. */
+  grantId?: string;
+}
 /**
  * Request a step-level approval hold (runner -> agent). The sandbox runner
  * blocks the step loop before a `requireApproval` step; the agent relays this
@@ -294,12 +342,15 @@ export type RunnerToAgentMessage =
   | LogLineMessage
   | StepSecretMountMessage
   | JobCompleteMessage
+  | HooksDeclaredMessage
+  | CompletionHooksDoneMessage
   | EventEmitRequest
   | ConcurrencyReportMessage
   | AgentApiRequestIpc
   | CacheRequestIpc
   | ProvenanceRequestIpc
   | ArtifactRequestIpc
+  | GitGrantRequestIpc
   | StepApprovalRequestIpc;
 
 // --- Agent -> Runner messages (from agent process to workflow runner) ---
@@ -383,6 +434,25 @@ export interface CacheResponseIpc {
   error?: string;
 }
 
+/**
+ * Result of a git write-grant operation (agent -> runner).
+ *
+ * `granted` reports what the forge ACTUALLY allowed, never an echo of the
+ * request — a static credential comes back unscoped because an SSH key or PAT
+ * cannot be narrowed. `error` is set when the pre-flight found the grant
+ * narrower than requested, which fails the elevation before any git runs.
+ */
+export interface GitGrantResponseIpc {
+  type: 'git.grant.response';
+  /** Matches the original request's requestId. */
+  requestId: string;
+  /** Grant id to pass to a later `revoke`. `elevate` only, on success. */
+  grantId?: string;
+  /** What the credential can actually do. `elevate` only, on success. */
+  granted?: { scoped: false } | { scoped: true; permissions: Record<string, string> };
+  /** Error description (present when elevation or revocation failed). */
+  error?: string;
+}
 /**
  * Resolution of a step-level approval hold (agent -> runner). Relayed from the
  * orchestrator's `step.approval-resolved` WS message. On `approved` the runner
@@ -469,7 +539,8 @@ export type AgentToRunnerMessage =
   | CacheResponseIpc
   | ProvenanceResponseIpc
   | ArtifactResponseIpc
-  | StepApprovalResolvedIpc;
+  | StepApprovalResolvedIpc
+  | GitGrantResponseIpc;
 
 // --- Job execution request ---
 
@@ -520,6 +591,15 @@ export interface JobExecutionRequest {
 
   /** URL to a pre-packed `.kici/` source tarball (skip clone if present). */
   sourceTarUrl?: string;
+  /**
+   * Absolute path to the agent's git credential helper, when one is available.
+   *
+   * The runner configures it on every clone it makes, so each later git network
+   * operation asks the agent for a freshly minted credential rather than
+   * relying on one captured at clone time. Absent for a container job, whose
+   * git has no route to the agent's socket — see the dual-mode container work.
+   */
+  credentialHelperPath?: string;
   /** SHA-256 hash of the source tarball bytes for integrity verification. */
   sourceTarHash?: string;
 
@@ -620,6 +700,15 @@ export interface JobExecutionRequest {
    * Defaults to `apply` when unset.
    */
   checkMode?: CheckMode;
+  /**
+   * Between-jobs out-of-band cleanup re-run. When true, the runner reuses the
+   * preserved workdir (no clone, no deps, no concurrency / rule / step
+   * evaluation) and runs ONLY the job's `onFailure` + `cleanup` hooks with a
+   * synthesized failed outcome — the durable re-run for a job whose runner was
+   * hard-killed before its in-band completion hooks ran. Bare-metal / in-place
+   * only; the supervisor never sets it for a normally-finished job.
+   */
+  cleanupOnly?: boolean;
   /** When true, skip git clone -- use overlay tarball as complete workspace. */
   fullRepo?: boolean;
 
@@ -674,6 +763,14 @@ export interface JobExecutionRequest {
 
   /** This job's declared upstream needs (normalized lock edges) used to shape ctx.needs for steps. */
   jobNeeds?: readonly unknown[];
+
+  /**
+   * Per-invoke-gate results for any upstream invoke gate this job `needs`, keyed
+   * by gate job name. Populated for a standard `run:`/step downstream job so
+   * `ctx.needs['<gate>'].result` is an `InvokeResult[]` rather than the fan-out
+   * group shape its proxy children would otherwise imply.
+   */
+  upstreamInvokeResults?: Record<string, import('@kici-dev/engine').InvokeResult[]>;
 
   /** Resolved private npm registries for `npm install` auth (token bytes already filled). */
   npmRegistries?: ReadonlyArray<{

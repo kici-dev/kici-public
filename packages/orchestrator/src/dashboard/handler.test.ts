@@ -995,7 +995,10 @@ describe('DashboardHandler', () => {
   describe('handleArtifactsList', () => {
     function fakeArtifactStore(entries: unknown[], downloadUrlExpiresInSeconds = 900) {
       return {
-        listForRunWithUrls: vi.fn(async () => ({ artifacts: entries, downloadUrlExpiresInSeconds })),
+        listForRunWithUrls: vi.fn(async () => ({
+          artifacts: entries,
+          downloadUrlExpiresInSeconds,
+        })),
       } as never;
     }
 
@@ -1932,6 +1935,74 @@ describe('DashboardHandler', () => {
       expect(response.requestId).toBe('req-r3');
       expect(response.error).toBe('Run is not in a terminal state');
       expect(response.newRunId).toBeUndefined();
+    });
+
+    it('awaits an injected beforeRerun before onRerun', async () => {
+      const { db } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const order: string[] = [];
+      const beforeRerun = vi.fn(async () => {
+        order.push('before');
+      });
+      const onRerun = vi.fn(async () => {
+        order.push('rerun');
+        return { newRunId: 'new-run-inj' };
+      });
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        send,
+        onCancel: noopCallbacks.onCancel,
+        onManualSchedule: noopCallbacks.onManualSchedule,
+        onRerun,
+        // Injected directly by the build-time test double.
+        beforeRerun,
+      });
+
+      const msg: RunRerunRequest = {
+        type: 'run.rerun.request',
+        requestId: 'req-inj',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-inj',
+      };
+
+      await handler.handleRerunRequest(msg);
+
+      expect(beforeRerun).toHaveBeenCalledOnce();
+      // beforeRerun is awaited strictly before onRerun.
+      expect(order).toEqual(['before', 'rerun']);
+      expect(send.mock.calls[0][0].newRunId).toBe('new-run-inj');
+    });
+
+    it('does not delay when no beforeRerun is injected (shipped default)', async () => {
+      const { db } = createMockDb();
+      const logStorage = createMockLogStorage();
+      const send = vi.fn();
+      const onRerun = vi.fn().mockResolvedValue({ newRunId: 'new-run-cfg' });
+
+      const handler = new DashboardHandler({
+        db,
+        logStorage,
+        send,
+        onCancel: noopCallbacks.onCancel,
+        onManualSchedule: noopCallbacks.onManualSchedule,
+        onRerun,
+        // No beforeRerun → the shipped orchestrator applies no delay.
+      });
+
+      const msg: RunRerunRequest = {
+        type: 'run.rerun.request',
+        requestId: 'req-cfg',
+        actor: { type: 'user', sub: 'u1' },
+        runId: 'run-cfg',
+      };
+
+      await handler.handleRerunRequest(msg);
+
+      expect(onRerun).toHaveBeenCalledOnce();
+      expect(send.mock.calls[0][0].newRunId).toBe('new-run-cfg');
     });
   });
 

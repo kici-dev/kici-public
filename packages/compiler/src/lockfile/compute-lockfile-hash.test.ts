@@ -70,6 +70,57 @@ describe('computeLockfileHash', () => {
     expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
   });
 
+  // Detection falls back to the ambient `npm_config_user_agent` when a directory
+  // carries no signal of its own, so the manager that INVOKED the compiler leaks
+  // into the answer for a repo whose root holds neither a package.json nor a
+  // lockfile. Every case above deletes that variable in beforeEach, which is why
+  // none of them could see this: the search was restricted to the guessed
+  // manager's candidates, found none, and returned null — silently disabling the
+  // orchestrator's dependency cache for the repo.
+  it('hashes .kici/package-lock.json even when compiled under pnpm', async () => {
+    process.env.npm_config_user_agent = 'pnpm/11.3.0 npm/? node/v24.15.0 linux x64';
+    await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
+    expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('hashes .kici/package-lock.json even when compiled under yarn', async () => {
+    process.env.npm_config_user_agent = 'yarn/1.22.22 npm/? node/v24.15.0 linux x64';
+    await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
+    expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  // The ambient guess must not change the KEY either: the prefix names the
+  // manager whose lockfile actually matched, so the same repo hashes the same
+  // whoever compiled it. A prefix that tracked the guess would give one repo two
+  // dep-cache keys and halve the hit rate for no reason.
+  it('is independent of which manager invoked the compiler', async () => {
+    await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
+
+    delete process.env.npm_config_user_agent;
+    const clean = computeLockfileHash(root);
+    process.env.npm_config_user_agent = 'pnpm/11.3.0 npm/? node/v24.15.0 linux x64';
+    const underPnpm = computeLockfileHash(root);
+
+    expect(clean).not.toBeNull();
+    expect(underPnpm).toBe(clean);
+  });
+
+  // Ordering, not restriction: a real root pnpm workspace still wins over a
+  // stray `.kici/package-lock.json`, so the widened search cannot demote a
+  // manager that has actual evidence on disk.
+  it('prefers the detected manager when both lockfiles exist', async () => {
+    await writeFile(join(root, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.0.0' }));
+    await writeFile(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
+
+    const both = computeLockfileHash(root);
+    await rm(join(root, '.kici', 'package-lock.json'));
+    const pnpmOnly = computeLockfileHash(root);
+
+    expect(both).not.toBeNull();
+    expect(both).toBe(pnpmOnly);
+  });
+
   it('produces different hashes for classic vs berry on identical yarn.lock bytes', async () => {
     const lock = '# yarn lockfile\nfoo@^1:\n  version "1.0.0"\n';
 

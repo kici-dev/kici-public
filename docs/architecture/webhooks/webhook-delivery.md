@@ -93,9 +93,9 @@ The orchestrator reassembles the body from the chunked stream, verifies the sign
 3. **Event normalization:** Use the provider's `WebhookNormalizer` to map the event/action to a `SimulatedEvent` (e.g., `push` -> `{ type: 'push', targetBranch: '...' }`)
 4. **Repo and credential extraction:** Extract repository identifier and provider-specific credentials from the payload (e.g., GitHub installation ID)
 5. **Command interception:** For `issue_comment` events, intercept `/kici approve` and `/kici reject` commands via `handleApprovalComment()` for security hold management (before normal trigger matching)
-6. **Trust resolution (PR events):** For pull request events, resolve the contributor's trust tier to determine lock file source (head for trusted, base for untrusted)
+6. **Trust resolution (PR events):** For pull request events, resolve the tier from the head ref — a fork ref is `unknown`, a same-repo ref is `trusted` — and pick the lock file source (head for trusted, base for untrusted). Then evaluate the org fork switch: an `ignore` verdict drops the delivery here, before any lock file is fetched
 7. **Lock file fetch:** Use the provider's `LockFileFetcher` (through LRU cache) to fetch `.kici/kici.lock.json` from the repository at the commit SHA. For untrusted PRs, fetches both base and head lock files in parallel
-8. **Workflow modification detection:** For untrusted PR events, compare base and head lock files via `detectWorkflowModifications()` and apply security holds when non-trusted contributors modify workflow files
+8. **Workflow modification detection:** For untrusted PR events, compare base and head lock files via `detectWorkflowModifications()` and post the neutral `KiCI: Workflow changes` check. The change is informational — the run evaluates the base lock file, so the modified definitions are inert for it
 9. **Registration extraction (default-branch push):** On pushes to the default branch, extract registerable workflows and persist them for cluster-wide event matching
 10. **Event router notification:** After the registrations are persisted, if event routing is active, emit a `registration.updated` event via `eventRouter.emit()`. Workflow event subscriptions are the persisted registrations themselves; the event router matches emitted events against them through the registration index
 11. **Changed files:** Use the provider's `ChangedFilesFetcher` to get files changed in this push/PR (for path-based trigger filtering; skipped when no workflow uses path filters)
@@ -178,13 +178,13 @@ When a workflow's `contentHash` is not in the cache:
 2. The build coordinator is invoked with `ensureBuild(coalescingKey, triggerBuild)` where the coalescing key combines `contentHash` and `lockfileHash` (e.g., `abc123:def456`)
 3. If another build for the same coalescing key is already in-flight, the request coalesces on the same Promise
 4. A build agent job is dispatched with `buildOnly: true` in the job config (plus `buildSourceNeeded` / `buildDepsNeeded` flags)
-5. The build agent clones the repo, runs `npm ci`, packs the `.kici/` source tarball (`source/{contentHash}.tar.gz`) and — if missing — the deps tarball (`deps/{platform}-{arch}/{lockfileHash}.tar.gz`), and uploads both via pre-signed PUT URLs
+5. The build agent clones the repo, runs `npm ci`, packs the `.kici/` source tarball (`source/{contentHash}.tar.gz`) and — if missing — the deps tarball (`deps/{platform}-{arch}/{depsHash}.tar.gz`, addressed by its own content hash, plus a `{lockfileHash}.hash` pointer), and uploads both via pre-signed PUT URLs
 6. After the build completes, the orchestrator retrieves the source + deps URLs and dispatches execution jobs with them
 7. If the build fails or times out, execution is skipped entirely for that workflow with a "Build failed" check status. Workflows containing dynamic job entries are allowed to proceed with their dynamic eval jobs (which compile from source inside the sandbox).
 
 ### Lock files without a content hash
 
-Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 34; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+Workflows without a `contentHash` field (schema version 1 lock files) bypass the cache entirely. Agents compile from source. Regenerate lock files with `pnpm kici compile` to enable caching. The current lock file schema version is 39; rather than requiring an exact match, the orchestrator accepts a compatibility window of schema versions — a lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 

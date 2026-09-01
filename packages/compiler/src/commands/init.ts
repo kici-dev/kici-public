@@ -49,8 +49,6 @@ export interface InitOptions {
   packageManager?: string;
   /** JavaScript-only mode (no TypeScript, no dependencies) */
   mjs?: boolean;
-  /** Write .npmrc pointing @kici-dev scope to local Verdaccio */
-  useVerdaccioLocal?: boolean;
   /** Private registry URL to scaffold a `registries:` entry for. */
   privateRegistry?: string;
   /** Optional npm scope (e.g. `@my-org`) the private registry serves. */
@@ -135,11 +133,18 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
       await writeFile(kiciIgnorePath, kiciIgnoreTemplate, 'utf-8');
     }
 
+    // Scaffold .kici/.gitignore so the generated type declarations under
+    // types/ stay untracked. Their content is a snapshot of one org's secret
+    // keys fetched from the Platform, so they are a local development aid, not
+    // source — kici.lock.json is deliberately NOT ignored (the orchestrator
+    // fetches it from the repo, so it genuinely is source).
+    await writeKiciGitignore(kiciDir);
+
     // Standalone (self-contained .kici/) vs integrate (join the detected
     // workspace so workflows can import sibling packages). Flags win; a
     // detected workspace prompts interactively and defaults to standalone in
     // CI / non-TTY.
-    const devMode = options.useVerdaccioLocal || (await detectDevelopmentMode());
+    const devMode = await detectDevelopmentMode();
     const mode = await resolveScaffoldMode(options);
     const useVerdaccio = devMode;
 
@@ -561,6 +566,30 @@ async function generateTsConfig(): Promise<string> {
   baseConfig.compilerOptions.paths = typeScriptPaths;
 
   return JSON.stringify(baseConfig, null, 2) + '\n';
+}
+
+/** The single entry `kici init` scaffolds into `.kici/.gitignore`. */
+const KICI_GITIGNORE_TEMPLATE = `# Generated type declarations (\`kici types\` / authenticated \`kici compile\`).
+# A snapshot of one org's secret keys — a local development aid, not source.
+types/
+`;
+
+/**
+ * Scaffold `.kici/.gitignore` so the generated `types/` declarations stay
+ * untracked. Never overwrites an existing file — the customer may have edited
+ * it. Deliberately ignores only `types/`, NOT `kici.lock.json` (the
+ * orchestrator fetches the lock from the repo, so it genuinely is source).
+ *
+ * @param kiciDir - The resolved `.kici` directory path.
+ */
+export async function writeKiciGitignore(kiciDir: string): Promise<void> {
+  const gitignorePath = path.join(kiciDir, '.gitignore');
+  if (await checkExists(gitignorePath)) {
+    logger.info(pc.gray('Skipping .kici/.gitignore (already exists)'));
+    return;
+  }
+  logger.info(pc.gray('Writing .kici/.gitignore'));
+  await writeFile(gitignorePath, KICI_GITIGNORE_TEMPLATE, 'utf-8');
 }
 
 /**

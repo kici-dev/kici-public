@@ -15,6 +15,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { sql, type Kysely, type Updateable } from 'kysely';
 import type { Database, ExecutionJobTable } from '../db/types.js';
+import { JobKind } from '../db/types.js';
+import { aggregateGateStatus } from '../pipeline/invoke-gate.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import {
   ExecutionJobStatus,
@@ -83,6 +85,50 @@ function crossRepoWorkflowRepoOf(args: {
     : undefined;
 }
 
+/**
+ * The `chain_depth` column value for a run recorded by a pre-dispatch path (a
+ * hold, an init failure, or a build that failed before tracking started).
+ *
+ * Stamped on the INSERT rather than by a follow-up UPDATE because these paths
+ * write the row and return: there is no later dispatch step to stamp it. A held
+ * run that lost its depth is the failure this exists to prevent — it is
+ * resumable, so it can go on to fire its own invoke gate, and the chain-depth
+ * circuit breaker reads the column back. A `0` there is not "unknown", it is
+ * "this run starts a chain", so the breaker fails OPEN and an unbounded summon
+ * recursion goes undetected.
+ *
+ * **Depth 0 writes nothing, deliberately.** `0` is already the column's
+ * default, so stating it produces the identical row — and skipping it is the
+ * same rule `stampChainDepth` applies on the normal dispatch path, so every
+ * writer of this column agrees on when it writes at all. The layer above (the
+ * dispatch context, and the adapter that fills it) does carry an explicit `0`
+ * verbatim, because a context is serialized and resumed and normalizing there
+ * would lose what the caller stated; the normalization happens once, here, at
+ * the column.
+ */
+function inheritedChainDepth(chainDepth: number | undefined): { chain_depth?: number } {
+  return chainDepth !== undefined && chainDepth > 0 ? { chain_depth: chainDepth } : {};
+}
+
+/**
+ * The `trigger_decision` blob for a run recorded by a pre-dispatch path.
+ *
+ * These paths write the row before any decision summary exists, so the column
+ * has always been `null` — and stays `null` unless the dispatch was a
+ * failure-lifecycle one, in which case the marker
+ * `EventRouter.isFailureLifecycleRun` reads back is the whole blob.
+ *
+ * A HELD run is the case that makes it load-bearing: it resumes onto this same
+ * row (`onExecutionStarted` no-ops on the conflict), completes, and its
+ * completion is what a `workflows_failed_batch` accumulator would otherwise
+ * fold back into the batch that spawned it — a notifier re-triggering itself.
+ * An init failure records the same marker for consistency, not for a reader:
+ * that path emits no completion event today.
+ */
+function failureLifecycleTriggerDecision(dispatched: boolean | undefined): string | null {
+  return dispatched ? JSON.stringify({ dispatchedByFailureLifecycle: true }) : null;
+}
+
 /** Context passed to onExecutionComplete for commit status updates. */
 export interface ExecutionContext {
   workflowName: string;
@@ -102,6 +148,12 @@ export interface ExecutionContext {
    * `execution.status`.
    */
   workflowRepoIdentifier?: string;
+  /**
+   * True when this run records a global evaluation round rather than a
+   * workflow. Forwarded to the Platform so its own re-run refusal can admit the
+   * round's re-evaluation.
+   */
+  isGlobalEvalRound?: boolean;
   /** Git branch or tag (e.g. "main", "feature/foo"). */
   ref?: string;
   /** Trigger event type (e.g. "push", "pr:open"). */
@@ -130,6 +182,15 @@ export interface ExecutionContext {
    * subscriptions can match on it. Null/undefined for success or non-terminal.
    */
   failureClass?: RunFailureClass | null;
+  /**
+   * Resolved trust tier of the run's ref, and which branch's lock file it was
+   * evaluated against. Mirror the `execution_runs.trust_tier` /
+   * `lock_file_source` columns; both absent for a run whose trust never
+   * resolved. Read by the check-run reporter to name the reduced-privilege
+   * posture on a job's completion summary.
+   */
+  trustTier?: string;
+  lockFileSource?: string;
   /** Workflow-level concurrency config from the lock file. */
   concurrency?: {
     cancelInProgress?: boolean;
@@ -143,7 +204,7 @@ interface WorkflowCompleteCallbackData {
   workflowName: string;
   status: string;
   duration: number;
-  jobResults: Array<{ name: string; status: string }>;
+  jobResults: Array<{ name: string; status: string; outputs?: Record<string, unknown> }>;
   routingKey?: string;
   repo: string;
   /** Why the run failed (`RunFailureClass`); carried onto the `__workflow_complete` event. */
@@ -177,6 +238,24 @@ export interface ExecutionTrackerDeps {
     context: ExecutionContext,
     description?: string,
   ) => void;
+  /**
+   * Drop the in-process state a run leaves behind — its pending job contexts
+   * and its still-open eval gates.
+   *
+   * Separate from {@link ExecutionTrackerDeps.onExecutionComplete} because that
+   * callback is NOT the terminalization chokepoint it reads as. It fires on the
+   * three paths that finish a run whose jobs ran (`completeRun`, and both
+   * stale-detector arms) and on none of the paths that terminalize a run whose
+   * jobs never did — `failRun` (the expired-approval sweep and every
+   * pre-dispatch abort) and `cancelHeldRun` (an install gate rejected). Those
+   * are exactly the runs most likely to be holding a pending job context, since
+   * a context is only stored for a job that was gated rather than dispatched.
+   *
+   * Synchronous by contract: the in-memory half of the cleanup must not be
+   * deferred behind an await the caller does not hold, and the DB half is
+   * fire-and-forget inside the callback.
+   */
+  onRunTerminalCleanup?: (runId: string) => void;
   /** Optional callback to forward step status to Platform. */
   onStepStatusForward?: (
     runId: string,
@@ -335,6 +414,16 @@ interface RunState {
   triggerActorUserId?: string | null;
   concurrency?: { cancelInProgress?: boolean; max?: number };
   failureReason?: string;
+  /**
+   * Resolved trust tier and lock-file branch of the run, mirroring the
+   * `execution_runs.trust_tier` / `lock_file_source` columns. Stamped by
+   * `setRunTrustContext` after the row is recorded — the same post-start
+   * mutation shape as `driftDetected` and `failureReason` — so the check-run
+   * reporter can name the reduced-privilege posture on a job's completion
+   * summary. Absent for a run whose trust never resolved.
+   */
+  trustTier?: string;
+  lockFileSource?: string;
   /** Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`). */
   checkMode?: string;
   /** Set true once any step reports a `dry-run` outcome (drift detected). */
@@ -379,6 +468,12 @@ interface TrackedJobRow {
   contexts?: string[];
   skippedContexts?: string[];
   envWarning?: string;
+  /** `gate` for an invoke gate, `proxy` for a summoned-run mirror. Defaults to `standard`. */
+  jobKind?: JobKind;
+  /** For a proxy job, the summoned run it mirrors. */
+  summonedRunId?: string;
+  /** For a gate job, its wall-clock timeout in ms (orchestrator-swept). */
+  timeoutMs?: number;
 }
 
 /**
@@ -406,6 +501,9 @@ function trackedJobMutableColumns(
       skipped_contexts: JSON.stringify(job.skippedContexts),
     }),
     ...(job.envWarning && { env_warning: job.envWarning }),
+    ...(job.jobKind && { job_kind: job.jobKind }),
+    ...(job.summonedRunId && { summoned_run_id: job.summonedRunId }),
+    ...(job.timeoutMs !== undefined && { timeout_ms: job.timeoutMs }),
     ...(dispatchedContexts?.length && {
       dispatched_contexts: JSON.stringify(dispatchedContexts),
     }),
@@ -416,6 +514,7 @@ export class ExecutionTracker {
   private readonly db: Kysely<Database>;
   private readonly observerRegistry?: ObserverRegistry;
   private readonly onExecutionComplete?: ExecutionTrackerDeps['onExecutionComplete'];
+  private readonly onRunTerminalCleanup?: ExecutionTrackerDeps['onRunTerminalCleanup'];
   private readonly onStepStatusForward?: ExecutionTrackerDeps['onStepStatusForward'];
   private readonly onRunPruned?: ExecutionTrackerDeps['onRunPruned'];
   private readonly onWorkflowComplete?: ExecutionTrackerDeps['onWorkflowComplete'];
@@ -466,6 +565,7 @@ export class ExecutionTracker {
     this.db = deps.db;
     this.observerRegistry = deps.observerRegistry;
     this.onExecutionComplete = deps.onExecutionComplete;
+    this.onRunTerminalCleanup = deps.onRunTerminalCleanup;
     this.onStepStatusForward = deps.onStepStatusForward;
     this.onRunPruned = deps.onRunPruned;
     this.onWorkflowComplete = deps.onWorkflowComplete;
@@ -827,6 +927,53 @@ export class ExecutionTracker {
   }
 
   /**
+   * Whether a rerouted job has visibly started, read from the shared
+   * `execution_jobs` row rather than from a relayed progress frame.
+   *
+   * The coordinator's spawn-window backstop learns about progress from
+   * `job.progress`, which only a WORKER peer sends — a worker has no database,
+   * so relaying is its only channel. A peer COORDINATOR writes the job's status
+   * straight into this table instead, so silence on the wire says nothing about
+   * whether the job is running, and the backstop would cancel a healthy job.
+   *
+   * False when no row exists yet (the peer has not started the job) and when the
+   * row is still `pending`; the `started_at` half covers a status that has
+   * already moved on to a terminal value.
+   */
+  async hasJobStarted(runId: string, jobId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('execution_jobs')
+      .select(['status', 'started_at'])
+      .where('run_id', '=', runId)
+      .where('job_id', '=', jobId)
+      .executeTakeFirst();
+    if (!row) return false;
+    return row.started_at !== null || row.status !== ExecutionJobStatus.enum.pending;
+  }
+
+  /**
+   * Whether a job has reached a terminal state in the shared `execution_jobs`
+   * row.
+   *
+   * The companion read to {@link hasJobStarted}: a peer COORDINATOR runs a
+   * rerouted job against this same table and relays no terminal `job.progress`,
+   * so the row is the only signal the routing coordinator gets that the job is
+   * over and its reroute tracking can be released.
+   *
+   * False when no row exists yet — an absent row is a job that has not started,
+   * never a finished one.
+   */
+  async isJobTerminal(runId: string, jobId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('execution_jobs')
+      .select(['status'])
+      .where('run_id', '=', runId)
+      .where('job_id', '=', jobId)
+      .executeTakeFirst();
+    return row ? TERMINAL_JOB_STATES.has(row.status) : false;
+  }
+
+  /**
    * Run `fn` while holding a per-run lock, serializing the run-mutating methods
    * (`onJobStatus`, `addJobsToRun`) so a status reply cannot interleave with the
    * synthetic→real job swap and wedge the run in `running`.
@@ -886,6 +1033,9 @@ export class ExecutionTracker {
       contexts?: string[];
       skippedContexts?: string[];
       envWarning?: string;
+      jobKind?: JobKind;
+      summonedRunId?: string;
+      timeoutMs?: number;
     }>,
     dispatchedContexts?: string[],
     /** Synthetic job ID to replace (e.g. needs-pending-deploy-{uuid}). */
@@ -912,6 +1062,9 @@ export class ExecutionTracker {
       contexts?: string[];
       skippedContexts?: string[];
       envWarning?: string;
+      jobKind?: JobKind;
+      summonedRunId?: string;
+      timeoutMs?: number;
     }>,
     dispatchedContexts?: string[],
     replaceSyntheticId?: string,
@@ -1195,6 +1348,7 @@ export class ExecutionTracker {
     if (TERMINAL_JOB_STATES.has(state) && job) {
       await this.runSchedulerHook(runId, jobId, job.name, state);
       await this.runWaveSchedulerHook(runId, jobId, state);
+      await this.runInvokeGateAggregationHook(runId, jobId);
     }
 
     // Check for run completion (with stuck-jobs invariant enforcement). The
@@ -1242,6 +1396,8 @@ export class ExecutionTracker {
         'check_mode',
         'local_working_tree',
         'workflow_repo_identifier',
+        'trust_tier',
+        'lock_file_source',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -1327,6 +1483,11 @@ export class ExecutionTracker {
       triggerActorUsername: dbRun.trigger_actor_username ?? undefined,
       triggerActorUserId: dbRun.trigger_actor_user_id ?? undefined,
       ...(dbRun.check_mode != null && { checkMode: dbRun.check_mode }),
+      // Recover the trust posture too: without it a job whose completion lands
+      // after a coord restart would drop the reduced-privilege note from its
+      // check summary while its siblings carry it.
+      ...(dbRun.trust_tier != null && { trustTier: dbRun.trust_tier }),
+      ...(dbRun.lock_file_source != null && { lockFileSource: dbRun.lock_file_source }),
       ...(recoveredDriftDetected && { driftDetected: true }),
       jobs: new Map(),
       startedAt: new Date(dbRun.started_at).getTime(),
@@ -1933,6 +2094,48 @@ export class ExecutionTracker {
   }
 
   /**
+   * When a proxy job of an invoke gate reaches terminal, aggregate the gate once
+   * every sibling proxy is terminal: the gate is set `failed` if any proxy
+   * failed, else `success`. Setting the gate terminal drives its own downstream
+   * `needs` release via the scheduler hook. A no-op for any non-proxy job.
+   */
+  private async runInvokeGateAggregationHook(runId: string, jobId: string): Promise<void> {
+    try {
+      const row = await this.db
+        .selectFrom('execution_jobs')
+        .select(['job_kind', 'base_job_name'])
+        .where('run_id', '=', runId)
+        .where('job_id', '=', jobId)
+        .executeTakeFirst();
+      if (row?.job_kind !== JobKind.Proxy || !row.base_job_name) return;
+
+      const gateName = row.base_job_name;
+      const siblings = await this.db
+        .selectFrom('execution_jobs')
+        .select('status')
+        .where('run_id', '=', runId)
+        .where('base_job_name', '=', gateName)
+        .where('job_kind', '=', JobKind.Proxy)
+        .execute();
+      const aggregate = aggregateGateStatus(siblings.map((s) => s.status));
+      if (!aggregate.allTerminal || !aggregate.status) return;
+
+      const gate = await this.db
+        .selectFrom('execution_jobs')
+        .select(['job_id', 'status'])
+        .where('run_id', '=', runId)
+        .where('job_name', '=', gateName)
+        .where('job_kind', '=', JobKind.Gate)
+        .executeTakeFirst();
+      if (!gate || TERMINAL_JOB_STATES.has(gate.status)) return;
+
+      await this.onJobStatus(runId, gate.job_id, aggregate.status, Date.now());
+    } catch (e) {
+      logger.error('Invoke-gate aggregation hook failed', { runId, jobId, error: e });
+    }
+  }
+
+  /**
    * Phase 9: stuck-jobs invariant check ( Layer 3).
    * Before declaring a run complete, verify no stuck jobs exist. If any are
    * found, fail them via recursive onJobStatus calls and signal the caller to
@@ -2139,7 +2342,178 @@ export class ExecutionTracker {
       });
     }
 
+    // If this run was summoned by an invoke gate, mirror its terminal status
+    // (and non-secret outputs) onto the gate's proxy job. Best-effort: a failure
+    // here must not break run completion.
+    await this.mirrorSummonedRunOntoProxy(runId, overallStatus, timestamp).catch((err) => {
+      logger.error('Failed to mirror summoned run onto its invoke-gate proxy', {
+        runId,
+        error: toErrorMessage(err),
+      });
+    });
+
     this.scheduleRunPrune(runId);
+  }
+
+  /**
+   * Map a terminal run status to the terminal job status a proxy should carry.
+   * A failure class collapses to `failed`; a cancel to `cancelled`; everything
+   * else (success) to `success`.
+   */
+  private mapRunStatusToProxyStatus(runStatus: string): ExecutionJobStatus {
+    if (runStatus === ExecutionRunStatus.enum.success) return ExecutionJobStatus.enum.success;
+    if (runStatus === ExecutionRunStatus.enum.cancelled) return ExecutionJobStatus.enum.cancelled;
+    return ExecutionJobStatus.enum.failed;
+  }
+
+  /**
+   * Read a summoned run's non-secret declared outputs — the merged `outputs`
+   * JSONB of its jobs. Secret-masked outputs live in `run_secret_outputs` and
+   * are deliberately NOT read here, so a repo's secret output never crosses into
+   * the summoning global run.
+   */
+  private async readNonSecretRunOutputs(spawnedRunId: string): Promise<Record<string, unknown>> {
+    const rows = await this.db
+      .selectFrom('execution_jobs')
+      .select('outputs')
+      .where('run_id', '=', spawnedRunId)
+      .execute();
+    const merged: Record<string, unknown> = {};
+    for (const row of rows) {
+      // The `outputs` column is JSONB: the driver hands it back already parsed
+      // as an object, while a string round-trips through JSON. Handle both —
+      // `JSON.parse` on the object form throws and would silently drop the
+      // outputs, which is exactly what stopped a summoned run's non-secret
+      // outputs from crossing to its gate's proxy.
+      const parsed = this.parseOutputsCell(row.outputs);
+      if (parsed) Object.assign(merged, parsed);
+    }
+    return merged;
+  }
+
+  /**
+   * Normalize an `outputs` JSONB cell to a plain object. The Postgres driver may
+   * return it already parsed (object) or as a JSON string; both are accepted. A
+   * null / empty / malformed cell yields `null`.
+   */
+  private parseOutputsCell(outputs: unknown): Record<string, unknown> | null {
+    if (!outputs) return null;
+    try {
+      const parsed = typeof outputs === 'string' ? JSON.parse(outputs) : outputs;
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * When `spawnedRunId` was summoned by an invoke gate, set the gate's proxy job
+   * to the run's mapped terminal status and attach its non-secret outputs. The
+   * proxy's terminal transition drives the summoning run's scheduler (release the
+   * next held proxy, and aggregate the gate once every proxy is terminal).
+   */
+  private async mirrorSummonedRunOntoProxy(
+    spawnedRunId: string,
+    runStatus: string,
+    timestamp: number,
+  ): Promise<void> {
+    const runRow = await this.db
+      .selectFrom('execution_runs')
+      .select(['summoned_by_run_id', 'summoned_by_proxy_job', 'started_at', 'completed_at'])
+      .where('run_id', '=', spawnedRunId)
+      .executeTakeFirst();
+    if (!runRow?.summoned_by_run_id || !runRow.summoned_by_proxy_job) return;
+
+    const summoningRunId = runRow.summoned_by_run_id;
+    const proxyRow = await this.db
+      .selectFrom('execution_jobs')
+      .select('job_id')
+      .where('run_id', '=', summoningRunId)
+      .where('job_name', '=', runRow.summoned_by_proxy_job)
+      .where('job_kind', '=', JobKind.Proxy)
+      .executeTakeFirst();
+    if (!proxyRow) {
+      logger.warn('Summoned run has no matching proxy job', {
+        spawnedRunId,
+        summoningRunId,
+        proxyJobName: runRow.summoned_by_proxy_job,
+      });
+      return;
+    }
+
+    const outputs = await this.readNonSecretRunOutputs(spawnedRunId);
+    await this.onJobStatus(
+      summoningRunId,
+      proxyRow.job_id,
+      this.mapRunStatusToProxyStatus(runStatus),
+      timestamp,
+      undefined,
+      Object.keys(outputs).length > 0 ? { outputs } : undefined,
+    );
+
+    // A proxy runs no steps of its own and never sends a `running` message, so
+    // onJobStatus sets only its completed_at and leaves started_at / duration_ms
+    // null — which renders as a zero-width, `-` duration row in the dashboard
+    // timeline. Mirror the summoned run's own execution span onto the proxy so it
+    // shows a real job-level bar whose duration matches the run it stands in for.
+    await this.mirrorSummonedRunSpanOntoProxy(
+      summoningRunId,
+      proxyRow.job_id,
+      runRow.started_at,
+      runRow.completed_at,
+      timestamp,
+    );
+  }
+
+  /**
+   * Set a proxy job's timeline span to the summoned run's own started_at /
+   * completed_at so its dashboard bar reflects the run it mirrors. A run rejected
+   * before executing any step has no start; fall back to its completion (and, for
+   * a run with no completion recorded, to the mirror timestamp) so the proxy
+   * still renders a point-width bar rather than a status-only placeholder.
+   */
+  private async mirrorSummonedRunSpanOntoProxy(
+    summoningRunId: string,
+    proxyJobId: string,
+    summonedStartedAt: Date | null,
+    summonedCompletedAt: Date | null,
+    fallbackCompletedAt: number,
+  ): Promise<void> {
+    const completedAt = summonedCompletedAt ?? new Date(fallbackCompletedAt);
+    const startedAt = summonedStartedAt ?? completedAt;
+    await this.db
+      .updateTable('execution_jobs')
+      .set({
+        started_at: startedAt,
+        completed_at: completedAt,
+        duration_ms: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+      })
+      .where('run_id', '=', summoningRunId)
+      .where('job_id', '=', proxyJobId)
+      .execute();
+  }
+
+  /**
+   * Reconcile a just-tagged summoned run against its proxy: if the run is already
+   * terminal, drive the mirror now. Closes the tag race — a run that finalizes
+   * before `summoned_by_run_id` lands (a synchronous all-jobs-rejected completion,
+   * or an HA peer finalizing it first) reads a null tag in `mirrorSummonedRunOntoProxy`
+   * and skips, so nothing else terminalizes its proxy and the gate hangs until
+   * its timeout. The invoke gate calls this after tagging each spawned run; the
+   * `onJobStatus` idempotency guard makes a double-fire with the normal finalize
+   * a no-op.
+   */
+  async reconcileSummonedRunIfTerminal(spawnedRunId: string): Promise<void> {
+    const row = await this.db
+      .selectFrom('execution_runs')
+      .select('status')
+      .where('run_id', '=', spawnedRunId)
+      .executeTakeFirst();
+    if (!row || !TERMINAL_RUN_STATES.has(row.status)) return;
+    await this.mirrorSummonedRunOntoProxy(spawnedRunId, row.status, Date.now());
   }
 
   /**
@@ -2230,6 +2604,13 @@ export class ExecutionTracker {
    *
    * Inserts a minimal execution_runs row with status='failed' directly so the E2E
    * test (and dashboard) can observe the failure instead of a missing run.
+   *
+   * The fifth pre-dispatch recording site, and the third that writes the row and
+   * returns. Its row is terminal with no resume path, so no invoke gate ever
+   * reads its `chain_depth` — the stamp is here for the same reason as on
+   * {@link ExecutionTracker.recordInitFailureRun}: this row is the run's ONLY
+   * record, and one that says `0` claims to have started the chain it actually
+   * died inside.
    */
   async onBuildFailedBeforeTracking(
     runId: string,
@@ -2245,6 +2626,13 @@ export class ExecutionTracker {
     commitMessage?: string,
     failureReason?: string,
     initFailure?: InitFailure,
+    /**
+     * Internal-trigger provenance, as one object rather than two more
+     * positional args on an already 13-wide signature. Shape matches
+     * `preDispatchRunProvenance` in `dispatch-matched-workflow.ts`, which is
+     * the only caller.
+     */
+    provenance?: { chainDepth?: number; dispatchedByFailureLifecycle?: boolean },
   ): Promise<void> {
     const now = new Date();
     const reason = failureReason ?? 'Build job timed out before execution tracking started';
@@ -2262,12 +2650,13 @@ export class ExecutionTracker {
         ref,
         sha,
         delivery_id: deliveryId,
-        trigger_decision: null,
+        trigger_decision: failureLifecycleTriggerDecision(provenance?.dispatchedByFailureLifecycle),
         provider_context: JSON.stringify(providerContext),
         started_at: now,
         completed_at: now,
         status: ExecutionRunStatus.enum.failed,
         failure_reason: reason,
+        ...inheritedChainDepth(provenance?.chainDepth),
         ...(initFailure && { init_failure: JSON.stringify(initFailure) }),
       })
       .execute();
@@ -2322,6 +2711,29 @@ export class ExecutionTracker {
      * and records nothing.
      */
     workflowRepoIdentifier: string;
+    /**
+     * Inherited invoke-chain depth for a run summoned by an invoke gate.
+     *
+     * An init failure is terminal, so unlike the hold on
+     * {@link ExecutionTracker.recordRunHeld} this run never fires a gate of its
+     * own and nothing reads the column back to bound recursion. It is recorded
+     * because this row is the run's ONLY record: one that says `0` claims to
+     * have started the chain it actually died inside.
+     */
+    chainDepth?: number;
+    /**
+     * True when a failure-lifecycle trigger dispatched this run, recorded as
+     * the run's `trigger_decision` marker
+     * (`EventRouter.isFailureLifecycleRun`).
+     *
+     * Consistency rather than a live reader: this path emits no
+     * `__workflow_complete`, so no accumulator reads the marker back today. It
+     * is recorded so the row does not disagree with the one
+     * {@link ExecutionTracker.recordRunHeld} writes for the same dispatch, and
+     * so adding an emit here later cannot silently re-open the self-retrigger
+     * loop.
+     */
+    dispatchedByFailureLifecycle?: boolean;
   }): Promise<void> {
     const now = new Date();
     const customerId = await this.resolveCustomerId(args.routingKey);
@@ -2338,7 +2750,7 @@ export class ExecutionTracker {
         ref: args.ref,
         sha: args.sha,
         delivery_id: args.deliveryId,
-        trigger_decision: null,
+        trigger_decision: failureLifecycleTriggerDecision(args.dispatchedByFailureLifecycle),
         provider_context: JSON.stringify(args.providerContext),
         started_at: now,
         completed_at: now,
@@ -2346,6 +2758,7 @@ export class ExecutionTracker {
         failure_reason: args.initFailure.message,
         failure_class: RunFailureClass.enum.never_started,
         init_failure: JSON.stringify(args.initFailure),
+        ...inheritedChainDepth(args.chainDepth),
         ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
@@ -2364,6 +2777,19 @@ export class ExecutionTracker {
             failure_reason: args.initFailure.message,
             failure_class: RunFailureClass.enum.never_started,
             init_failure: JSON.stringify(args.initFailure),
+            // Restate the depth on the conflicting row too — only ever set,
+            // never cleared. The dispatch that inserted the row stamps it, but
+            // a row written by any other path would keep the `0` default, and
+            // `0` reads as "starts a chain" rather than as "unknown".
+            //
+            // `trigger_decision` is deliberately NOT restated. The conflicting
+            // row was written by `recordRunStart`, whose blob is the full
+            // decision summary with the failure-lifecycle marker already
+            // merged onto it; this path's blob is the marker alone. Writing it
+            // would replace a superset with a subset for no gain — the one
+            // reader of the column (`EventRouter.isFailureLifecycleRun`) finds
+            // its key either way.
+            ...inheritedChainDepth(args.chainDepth),
             // Restate the marker on the conflicting row too. `onExecutionStarted`
             // narrows identically so a row it wrote already agrees, but a row
             // written by any other path would keep a null marker — and a null
@@ -2461,6 +2887,16 @@ export class ExecutionTracker {
     deliveryId: string | null;
     providerContext: Record<string, unknown>;
     routingKey: string;
+    /**
+     * The source `providerContext` was taken from, when a cross-provider
+     * lock-file fallback made it a different source from `routingKey`.
+     *
+     * Recorded because the two are a PAIR: a re-run of this round re-drives the
+     * organization-wide pass and must hand it the same bundle those credentials
+     * belong to. Pairing the stored context with the inbound routing key instead
+     * gives one source's credentials to another source's API client.
+     */
+    dispatchRoutingKey?: string;
     failureReason: string;
     triggerEvent?: string;
     /**
@@ -2494,6 +2930,18 @@ export class ExecutionTracker {
         failure_reason: args.failureReason,
         failure_class: RunFailureClass.enum.never_started,
         ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+        // Recorded only when the dispatch source differs from the inbound one,
+        // matching how `workflow_repo_identifier` narrows: NULL reads as "the
+        // same source the event arrived on", which every other run is.
+        ...(args.dispatchRoutingKey != null &&
+          args.dispatchRoutingKey !== args.routingKey && {
+            dispatch_routing_key: args.dispatchRoutingKey,
+          }),
+        // The structural marker the re-run path branches on. Stamped here
+        // because this is the only writer of a round's run row, and the round
+        // job's `__globaleval__` name prefix is a string a customer workflow may
+        // also carry.
+        is_global_eval_round: true,
       })
       .onConflict((oc) => oc.column('run_id').doNothing())
       .executeTakeFirst();
@@ -2515,6 +2963,7 @@ export class ExecutionTracker {
         provider: args.provider,
         repoIdentifier: args.repoIdentifier,
         ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
+        isGlobalEvalRound: true,
         sha: args.sha,
         routingKey: args.routingKey,
         ref: args.ref,
@@ -2576,6 +3025,20 @@ export class ExecutionTracker {
      * whole time it sits in the queue and for the run it resumes into.
      */
     workflowRepoIdentifier: string;
+    /**
+     * Inherited invoke-chain depth for a run summoned by an invoke gate.
+     * REQUIRED to be threaded by any caller that has one: a hold is resumable,
+     * so the resumed run can fire its own invoke gate, and the chain-depth
+     * circuit breaker reads this column back. Absent ⇒ the column's `0`
+     * default, which means "this run starts a chain".
+     */
+    chainDepth?: number;
+    /**
+     * True when a failure-lifecycle trigger dispatched this run, recorded as
+     * the run's `trigger_decision` marker so its eventual completion is
+     * excluded from batch accumulation (`EventRouter.isFailureLifecycleRun`).
+     */
+    dispatchedByFailureLifecycle?: boolean;
   }): Promise<void> {
     const now = new Date();
     // Populate customer_id here too: the resume path reuses this held row
@@ -2595,12 +3058,13 @@ export class ExecutionTracker {
         ref: args.ref,
         sha: args.sha,
         delivery_id: args.deliveryId,
-        trigger_decision: null,
+        trigger_decision: failureLifecycleTriggerDecision(args.dispatchedByFailureLifecycle),
         provider_context: JSON.stringify(args.providerContext),
         started_at: now,
         status: ExecutionRunStatus.enum.held,
         ...(args.contextName && { context: args.contextName }),
         ...(args.prNumber != null && { pr_number: args.prNumber }),
+        ...inheritedChainDepth(args.chainDepth),
         ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
       })
       // Overwrite a non-terminal row: dispatch may already have registered the
@@ -2614,6 +3078,11 @@ export class ExecutionTracker {
             status: ExecutionRunStatus.enum.held,
             ...(args.contextName && { context: args.contextName }),
             ...(args.prNumber != null && { pr_number: args.prNumber }),
+            // Restated for the same only-ever-set reason as on
+            // `recordInitFailureRun`; `trigger_decision` is likewise left
+            // alone so a conflicting row keeps the superset blob
+            // `recordRunStart` wrote.
+            ...inheritedChainDepth(args.chainDepth),
             // See the same restatement on `recordInitFailureRun`: a marker is
             // only ever set, never cleared, so the row cannot be left claiming
             // the workflow lives in the repository the run acted on.
@@ -2698,6 +3167,9 @@ export class ExecutionTracker {
       logger.warn('cancelHeldRun: no held run to cancel', { runId });
       return;
     }
+    // Terminal, and no `onExecutionComplete` fires on this arm — so the in-process
+    // state the run accumulated has to be dropped from here.
+    this.onRunTerminalCleanup?.(runId);
     this.onExecutionStatusChange?.(
       runId,
       ExecutionRunStatus.enum.cancelled,
@@ -2770,6 +3242,13 @@ export class ExecutionTracker {
 
     executionsTotal.add(1, { status: ExecutionRunStatus.enum.failed });
     executionDurationSeconds.record(durationMs / 1000);
+
+    // Outside the `if (run)` below: a run this instance never tracked in memory
+    // (a peer ingested the webhook, or this process restarted) still has DB rows
+    // in `pending_job_contexts` keyed on its id, and dropping those is the whole
+    // point. `cleanupPendingJobContexts` is keyed on runId alone, so it needs no
+    // in-memory run to do its work.
+    this.onRunTerminalCleanup?.(runId);
 
     // Clean up in-memory state and fire callbacks
     if (run) {
@@ -3157,7 +3636,37 @@ export class ExecutionTracker {
       concurrency: run.concurrency,
       triggerActorUsername: run.triggerActorUsername,
       triggerActorUserId: run.triggerActorUserId,
+      ...(run.trustTier !== undefined && { trustTier: run.trustTier }),
+      ...(run.lockFileSource !== undefined && { lockFileSource: run.lockFileSource }),
     };
+  }
+
+  /**
+   * Stamp the run's resolved trust tier and lock-file branch onto the in-memory
+   * state, after `onExecutionStarted` recorded the row.
+   *
+   * Separate from the start call because trust resolves on its own path and is
+   * written to `execution_runs` by its own update. The dispatch site that
+   * writes those two columns calls this with the same values, but the two
+   * writes are independent and either can be lost: the DB update is
+   * fire-and-forget with its own `.catch()`, and this call is wrapped in a
+   * `try`/`catch` there. Both are deliberate — the note is worth less than the
+   * run — so the in-memory copy and the row CAN disagree, and neither is
+   * authoritative for the other. `recoverRunFromDb` reconciles by reading the
+   * row, so the durable value is the one that survives.
+   *
+   * A run this tracker does not know is a no-op: a missing run means the status
+   * updates that would read the fields are not coming either.
+   *
+   * Keep this synchronous. Its one caller wraps it in `try`/`catch`, which
+   * catches a throw but not a rejected promise, so an async body would put the
+   * failure back outside the guard.
+   */
+  setRunTrustContext(runId: string, trustTier: string, lockFileSource?: string): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    run.trustTier = trustTier;
+    if (lockFileSource !== undefined) run.lockFileSource = lockFileSource;
   }
 
   /**

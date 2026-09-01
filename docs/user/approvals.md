@@ -141,6 +141,10 @@ Here `build-plan` runs, then the job pauses for a `dba` approval. On approval, `
 
 Because a step-level hold keeps an agent and its workspace occupied for the whole human wait, prefer job- or workflow-level gates when you do not need prior-step state, and keep step-level timeouts short. See the [operator note on agent occupancy](../operator/approvals.md#agent-occupancy-during-step-level-holds).
 
+### Not available on organization-wide workflows
+
+An `approval` gate applies to per-repository workflows only. A workflow whose trigger carries `repos:` — an [organization-wide workflow](global-workflows.md) — is dispatched by a path that never consults the gate, so the gate would not hold anything. `kici compile` refuses it with `error [E124]` at the workflow level and on any static job, rather than accepting a security control the workflow does not have. Drop the `approval`, or move the gated jobs into a workflow whose triggers carry no `repos:`. A job produced by a `dynamicJob` generator never passes through the compiler, so that one is caught at dispatch instead: the orchestrator logs an error naming the workflow and job, and runs it ungated.
+
 ## Drift gates (`when: 'drift'`)
 
 A `when: 'drift'` gate is **step-scope only** and requires a [check/apply step](idempotent-steps.md). Instead of pausing unconditionally, it fires **between the step's `check` and `run`, only when `check` finds drift in apply mode** — exactly Terraform's plan→apply, scoped to one step. When the step is already in sync (no drift), nothing pauses and the step skips.
@@ -173,7 +177,7 @@ A `when: 'drift'` gate on a step without a `check` facet, or at job/workflow sco
 
 ## Mandatory vs. explicit gates
 
-`approval` is the **explicit** gate — a deliberate "pause for a human here" written by the workflow author. It composes with the **mandatory** gate an operator can attach to a protected context via required reviewers (see [Contexts](contexts.md#required-reviewers)). When both apply to the same job, all clauses from both sources must be satisfied before the job is released. The two funnel into one held-element mechanism, so the dashboard queue and `kici approve` work the same way regardless of which source held the element.
+`approval` is the **explicit** gate — a deliberate "pause for a human here" written by the workflow author. It composes with the **mandatory** gate an operator can attach to a protected context via required reviewers (see [Contexts](contexts.md#required-reviewers)). When both apply to the same job, all clauses from both sources must be satisfied before the job is released. A workflow-level `approval` is one of those sources. It gates every root job, so a root job that also binds a context with required reviewers must satisfy the workflow clauses, its own job clauses, and the context's reviewers. The sources funnel into one held-element mechanism, so the dashboard queue and `kici approve` work the same way regardless of which source held the element.
 
 ## Approving from the CLI
 
@@ -194,6 +198,23 @@ kici reject <run-id> --job deploy-production --reason "Wrong release branch"
 ```
 
 You must be eligible for at least one unsatisfied clause — being a member of a named team or being a named user. The orchestrator verifies eligibility against the operator-defined teams, so naming a team in your workflow can never let an ineligible person release the gate. The command reports whether the element was released, how many clauses remain, or that it was rejected. See [`kici approve`](./cli/runs-and-approvals.md#kici-approve) for the full command reference.
+
+### When a job is held twice
+
+A job can carry an `approval` gate **and** a [security hold](contexts.md#security-approval-queue) at the same time. Two setups reach it: a fork pull request on an organization whose fork policy is `hold`, and a context that sets both required reviewers and `minimumTrust`.
+
+The two are separate holds and **both** must be released before the job runs. They take different permissions: the approval hold needs `contexts:write` plus clause eligibility, the security hold needs `ci_trust:write`.
+
+`--job` names both at once, so pick one with `--hold-type`:
+
+```bash
+kici approve <run-id> --job deploy --hold-type reviewer
+kici approve <run-id> --job deploy --hold-type security
+```
+
+Pass `--hold <id>` when the command's error lists two holds that `--hold-type` still cannot separate. The pull request's `KiCI Security` check stays pending until both holds have ended, and its description names the second gate and the permission that clears it.
+
+Each hold carries its own expiry, so the job is cancelled when the **first** one runs out.
 
 ### Inline approval and `--approve-all` in `kici run remote`
 
@@ -217,3 +238,4 @@ You can also approve from the dashboard approval queue. See [Dashboard](dashboar
 - [Contexts](contexts.md) — operator-required reviewers on protected contexts.
 - [Approval gates (operator guide)](../operator/approvals.md) — teams, the approval queue, expiry, and self-approval.
 - [Approval gates (architecture)](../architecture/approvals.md) — the unified hold model and the step-level round-trip.
+- [Organization-wide workflows](global-workflows.md) — why an approval gate is refused there.

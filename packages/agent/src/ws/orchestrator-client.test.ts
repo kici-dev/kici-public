@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { WS_MAX_PAYLOAD_BYTES, type AgentToOrchestratorMessage } from '@kici-dev/engine';
+import {
+  PROTOCOL_VERSION,
+  WS_MAX_PAYLOAD_BYTES,
+  type AgentToOrchestratorMessage,
+} from '@kici-dev/engine';
 import {
   MAX_COMPLETE_RESEND_ATTEMPTS,
   OrchestratorClient,
@@ -702,7 +706,7 @@ describe('OrchestratorClient', () => {
       expect(sent[0]).toMatchObject({
         type: 'auth.request',
         token: 'kat_test_token_abc',
-        protocolVersion: 1,
+        protocolVersion: PROTOCOL_VERSION,
       });
     });
 
@@ -1453,6 +1457,193 @@ describe('OrchestratorClient', () => {
         sizeBytes: 4096,
       });
       expect(response).toEqual({ type: 'cache.response', requestId: 'ipc-3' });
+    });
+  });
+
+  describe('scaler credential claim (sendClaimCredentials)', () => {
+    it('sends scaler.claim-credentials and resolves with the minted credentials', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      const promise = client.sendClaimCredentials('code-abc');
+
+      const sent = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'scaler.claim-credentials',
+      ) as { requestId: string; claimCode: string };
+      expect(sent).toMatchObject({ claimCode: 'code-abc' });
+
+      const credentials = {
+        agentToken: 'kat_secret',
+        agentId: 'a1',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      simulateMessage(mock, {
+        type: 'scaler.claim-credentials.response',
+        requestId: sent.requestId,
+        credentials,
+      });
+
+      await expect(promise).resolves.toEqual({ credentials, error: undefined });
+    });
+
+    it('resolves with an error field when the claim is rejected', async () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      const promise = client.sendClaimCredentials('bad-code');
+      const sent = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'scaler.claim-credentials',
+      ) as { requestId: string };
+
+      simulateMessage(mock, {
+        type: 'scaler.claim-credentials.response',
+        requestId: sent.requestId,
+        error: 'invalid claim code',
+      });
+
+      await expect(promise).resolves.toMatchObject({ error: 'invalid claim code' });
+    });
+  });
+
+  describe('self-bootstrap claim exchange (scalerClaimCode) on open', () => {
+    /** Flush pending microtasks (the awaited claim exchange continuation). */
+    async function flush(times = 5): Promise<void> {
+      for (let i = 0; i < times; i++) await Promise.resolve();
+    }
+
+    it('self-claims before registering, then registers with the minted identity', async () => {
+      const client = createClient({
+        scalerClaimCode: 'claim-abc',
+        agentId: 'boot-tmp',
+        labels: ['linux'],
+      });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+
+      // The claim frame goes out first — before any auth.request / agent.register.
+      const claim = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'scaler.claim-credentials',
+      ) as { requestId: string; claimCode: string };
+      expect(claim).toMatchObject({ claimCode: 'claim-abc' });
+      expect(
+        getSentMessages(mock).some((m) =>
+          ['auth.request', 'agent.register'].includes((m as { type?: string }).type ?? ''),
+        ),
+      ).toBe(false);
+
+      // Orchestrator mints ephemeral credentials.
+      const credentials = {
+        agentToken: 'kat_minted',
+        agentId: 'minted-agent',
+        orchestratorUrl: 'wss://h/ws',
+        labels: ['cloud=hetzner'],
+      };
+      simulateMessage(mock, {
+        type: 'scaler.claim-credentials.response',
+        requestId: claim.requestId,
+        credentials,
+      });
+      await flush();
+
+      // Now the client authenticates with the minted token.
+      const auth = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'auth.request',
+      ) as { token: string } | undefined;
+      expect(auth).toMatchObject({ token: 'kat_minted' });
+      expect(client.state).toBe('authenticating');
+
+      // Complete the handshake: register uses the minted agentId + merged labels.
+      simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-boot' });
+      await flush();
+      const register = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'agent.register',
+      ) as { agentId: string; labels: string[] } | undefined;
+      expect(register).toBeDefined();
+      expect(register!.agentId).toBe('minted-agent');
+      expect(register!.labels).toEqual(expect.arrayContaining(['linux', 'cloud=hetzner']));
+    });
+
+    it('fails fast on a rejected claim code: no register, no reconnect, terminates the process', async () => {
+      const client = createClient({ scalerClaimCode: 'expired-code', labels: ['linux'] });
+      // server.ts wires this to a non-zero graceful shutdown; a one-shot agent
+      // must terminate rather than let the health server hold it open.
+      const onClaimFailedPermanently = vi.fn();
+      client.onClaimFailedPermanently = onClaimFailedPermanently;
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+
+      const claim = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'scaler.claim-credentials',
+      ) as { requestId: string };
+
+      simulateMessage(mock, {
+        type: 'scaler.claim-credentials.response',
+        requestId: claim.requestId,
+        error: 'claim code expired',
+      });
+      await flush();
+
+      // The handshake never proceeds.
+      expect(
+        getSentMessages(mock).some((m) =>
+          ['auth.request', 'agent.register'].includes((m as { type?: string }).type ?? ''),
+        ),
+      ).toBe(false);
+      expect(client.state).toBe('disconnected');
+      expect(mock.closeCode).toBe(1000);
+
+      // The permanent-failure callback fires exactly once with the reason, so
+      // server.ts can exit the process non-zero.
+      expect(onClaimFailedPermanently).toHaveBeenCalledTimes(1);
+      expect(onClaimFailedPermanently).toHaveBeenCalledWith('claim code expired');
+
+      // And the client does not reconnect-storm against a dead claim code.
+      vi.advanceTimersByTime(300_000);
+      expect(mockInstances.length).toBe(1);
+    });
+
+    it('fails permanently when the claim exchange itself errors (times out)', async () => {
+      const client = createClient({ scalerClaimCode: 'lost-code', labels: ['linux'] });
+      const onClaimFailedPermanently = vi.fn();
+      client.onClaimFailedPermanently = onClaimFailedPermanently;
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+
+      // No response ever arrives — the 15s claim RPC timeout rejects the exchange.
+      vi.advanceTimersByTime(15_000);
+      await flush();
+
+      expect(
+        getSentMessages(mock).some((m) =>
+          ['auth.request', 'agent.register'].includes((m as { type?: string }).type ?? ''),
+        ),
+      ).toBe(false);
+      expect(client.state).toBe('disconnected');
+      expect(onClaimFailedPermanently).toHaveBeenCalledTimes(1);
+      expect(onClaimFailedPermanently.mock.calls[0]![0]).toMatch(/claim exchange failed/);
+    });
+
+    it('ignores scalerClaimCode when a static token is present (no claim frame)', () => {
+      const client = createClient({ scalerClaimCode: 'claim-abc', token: 'kat_static' });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+
+      // A static token wins: the client authenticates directly, no claim exchange.
+      expect(
+        getSentMessages(mock).some(
+          (m) => (m as { type?: string }).type === 'scaler.claim-credentials',
+        ),
+      ).toBe(false);
+      expect(client.state).toBe('authenticating');
+      const auth = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'auth.request',
+      ) as { token: string } | undefined;
+      expect(auth).toMatchObject({ token: 'kat_static' });
     });
   });
 

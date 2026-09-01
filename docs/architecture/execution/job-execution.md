@@ -17,9 +17,13 @@ flowchart TD
     DRAIN -->|Yes| NACK
     DRAIN -->|No| INIT{"Init-only job?"}
     INIT -->|Yes| INITJOB["Handle init job (in-process)"]
-    INIT -->|No| DYN{"DynamicJobFn eval?"}
+    INIT -->|No| GEVAL{"Global eval round?"}
+    GEVAL -->|Yes| GEVALJOB["Handle global eval round (in-process)"]
+    GEVAL -->|No| DYN{"DynamicJobFn eval?"}
     DYN -->|Yes| DYNJOB["Handle DynamicJobFn eval (in-process)"]
-    DYN -->|No| BUILD{"Build-only job?"}
+    DYN -->|No| BRINGUP{"Bring-up job?"}
+    BRINGUP -->|Yes| BRINGUPJOB["Handle bring-up job (in-process, SSH)"]
+    BRINGUP -->|No| BUILD{"Build-only job?"}
     BUILD -->|Yes| BUILDJOB["Handle build job (in-process)"]
     BUILD -->|No| RUN["Report job.status: running"]
     RUN --> MODE["Step 1: Determine execution mode"]
@@ -47,7 +51,9 @@ flowchart TD
     FLUSH --> REPORT["Step 6: Report final job.status"]
     REPORT --> CLEANUP["Step 7: Teardown sandbox + rm work dir"]
     INITJOB --> CLEANUP
+    GEVALJOB --> CLEANUP
     DYNJOB --> CLEANUP
+    BRINGUPJOB --> CLEANUP
     BUILDJOB --> CLEANUP
     CLEANUP --> DONE["Done"]
 
@@ -57,7 +63,17 @@ flowchart TD
     CANCELLED -.-> CLEANUP
 ```
 
-The agent checks for cancellation (via `AbortController`) before sandbox creation and before execution. If `job.cancel` is received at any point, the sandbox is aborted and the job transitions to the `cancelled` state. Build-only jobs (cache population), init-only jobs (dynamic field resolution), and DynamicJobFn evaluation jobs (runtime job generation) run in-process without a sandbox since they don't execute customer workflow steps.
+The agent checks for cancellation (via `AbortController`) before sandbox creation and before execution. If `job.cancel` is received at any point, the sandbox is aborted and the job transitions to the `cancelled` state.
+
+Five special job types run in-process without a sandbox, because they never execute customer workflow steps. The agent checks for them in this order:
+
+1. **Init-only jobs** -- dynamic field resolution.
+2. **Global-eval-round jobs** -- filters and generators for the candidate global workflows of one workflow repo, evaluated on one dual checkout.
+3. **DynamicJobFn evaluation jobs** -- runtime job generation.
+4. **Bring-up jobs** -- init-runner SSH bring-up. No clone, no sandbox.
+5. **Build-only jobs** -- cache population.
+
+Each converges on the same teardown path as a standard job.
 
 ## Agent-level steps
 

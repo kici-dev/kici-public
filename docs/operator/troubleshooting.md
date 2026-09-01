@@ -56,6 +56,8 @@ If you operate the orchestrator under systemd or a container runtime without a `
 
 `kici-admin debug-bundle` generates a ZIP with redacted config, system info, cluster health, metrics, and a window of recent logs — the single artifact to attach when escalating a failure you can't resolve from the surfaces above. `kici-admin inspect-bundle <path>` reads one back offline.
 
+There are two bundles, taken from two sides. The one above is the operator's, run on the orchestrator host. A workflow author runs [`kici report`](../user/getting-help.md) on their own machine instead: it carries their CLI and project state plus the failing run's logs, and `--upload` sends it to KiCI privately. Both write the same archive layout, so `kici-admin inspect-bundle` reads either one. When a problem could be either the workflow or the cluster, take both.
+
 ### Init failures — runs that never started
 
 A run can fail before any step executes. The dashboard surfaces these as a
@@ -154,6 +156,11 @@ status. A missing run maps to one of these terminal statuses:
   produce it: the routing key resolved to no provider, the provider does not map
   that event type to a trigger (a GitHub `check_suite` is the common one, and is
   normal), or the payload carried no repository the source's provider could read.
+- `failed` — the pipeline threw before it finished. The delivery was already
+  acknowledged to the sender, so this row and the orchestrator's own log line
+  are the only record of it. The row's `error_message` carries the cause. The
+  delivery is queued for retry, so a later attempt that succeeds replaces this
+  status with its own.
 
 ### Diagnose
 
@@ -179,6 +186,9 @@ delivery.
 - `received`: no action when the event type simply has no trigger. When a run
   WAS expected, check the source resolves — `kici-admin source list --org <orgId>`
   — and confirm the routing key in the delivery matches the source's own.
+- `failed`: read `error_message` and treat it as the fault it names. The retry
+  clears it on its own once the cause is gone; a status that stays `failed`
+  across retries is a real fault, not a blip.
 
 ## Agent won't connect or register
 

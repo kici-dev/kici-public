@@ -13,7 +13,8 @@
  *
  * Constraints:
  * - Generated jobs are limited to MAX_DYNAMIC_JOBS per DynamicJobFn invocation
- * - Generated job names must be unique within the same DynamicJobFn output
+ * - Generated job names must be unique within the same DynamicJobFn output, and
+ *   across a whole eval round when the caller threads a shared `seenNames` set
  */
 
 import type { $ as Shell } from 'zx';
@@ -95,6 +96,9 @@ export interface SerializerContext {
  *
  * @param jobs - Jobs returned by a DynamicJobFn
  * @param ctx - Eval-time context used to resolve dynamic fields on generated jobs
+ * @param seenNames - Optional accumulator of job names already emitted earlier
+ *   in the same eval round; when supplied, a name already present throws and
+ *   every generated name is added so later generators in the round see it
  * @returns Serialized LockJob array ready for orchestrator dispatch
  * @throws Error if validation fails (duplicates, limit exceeded) or if a user-supplied
  *   dynamic function throws / times out / returns an unsupported value
@@ -104,6 +108,7 @@ export async function serializeJobsToLock(
   ctx: SerializerContext,
   staticNames?: Set<string>,
   allowedGroups?: Set<string>,
+  seenNames?: Set<string>,
 ): Promise<LockJob[]> {
   if (jobs.length > MAX_DYNAMIC_JOBS) {
     throw new Error(
@@ -111,13 +116,17 @@ export async function serializeJobsToLock(
     );
   }
 
-  // Validate unique names
+  // Validate unique names — within this generator's output AND, when the caller
+  // threads a shared `seenNames` accumulator through a round of generators,
+  // across every generator's output in that round.
   const generatedNames = new Set<string>();
+  const roundNames = seenNames ?? new Set<string>();
   for (const job of jobs) {
-    if (generatedNames.has(job.name)) {
-      throw new Error(`Duplicate job name '${job.name}' in DynamicJobFn output`);
+    if (roundNames.has(job.name)) {
+      throw new Error(`Duplicate job name '${job.name}' in dynamic job output`);
     }
     generatedNames.add(job.name);
+    roundNames.add(job.name);
   }
 
   // Resolve sequentially to keep determinism (ordering + error attribution).
@@ -143,10 +152,12 @@ async function serializeJob(
   staticNames: Set<string>,
   allowedGroups: Set<string>,
 ): Promise<LockJob> {
-  const { include: runsOn, exclude: excludeLabels } = normalizeRunsOnToMatchers(
-    job.runsOn as never,
-    `generated job '${job.name}' runsOn`,
-  );
+  // An invoke gate never dispatches to an agent, so it names no target — skip
+  // runsOn normalization (which requires a selector) and emit empty matchers.
+  const { include: runsOn, exclude: excludeLabels } =
+    job.invoke && job.runsOn === undefined
+      ? { include: [] as LabelMatcher[], exclude: [] as LabelMatcher[] }
+      : normalizeRunsOnToMatchers(job.runsOn as never, `generated job '${job.name}' runsOn`);
 
   // Resolve dynamic context/env/concurrencyGroup against the eval context.
   // Either spelling (`context` or `contexts`) normalizes to an ordered
@@ -220,7 +231,8 @@ async function serializeJob(
   const lockJob: LockJob = {
     _type: 'static',
     name: job.name,
-    runsOn,
+    // A gate carries no runsOn; every other job always does.
+    ...(job.invoke && runsOn.length === 0 ? {} : { runsOn }),
     ...(excludeLabels.length > 0 ? { excludeLabels } : {}),
     needs: resolvedNeeds,
     ...(dependsOnGroups.length > 0 ? { dependsOnGroups } : {}),
@@ -233,6 +245,18 @@ async function serializeJob(
     ...(resolvedEnv !== undefined ? { env: resolvedEnv } : {}),
     ...(resolvedConcurrencyGroup !== undefined
       ? { concurrencyGroup: resolvedConcurrencyGroup }
+      : {}),
+    // A generated invoke gate carries its `invoke` action across the eval-round
+    // wire so the orchestrator executes it as a gate, exactly like a static one.
+    ...(job.invoke
+      ? {
+          invoke: {
+            event: job.invoke.event,
+            scope: job.invoke.scope,
+            ...(job.invoke.payload !== undefined ? { payload: job.invoke.payload } : {}),
+            ...(job.invoke.optional === true ? { optional: true } : {}),
+          },
+        }
       : {}),
   };
 

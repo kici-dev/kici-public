@@ -285,6 +285,55 @@ const baseSchema = z.object({
   // event-retry scanner) — not per-tenant behavior, so it is a cluster-wide
   // config default, not a per-org org_settings knob.
   scalerPendingSweepIntervalMs: z.coerce.number().int().min(1000).default(10_000),
+  // Cluster-wide defaults for the leader-gated event-scaler provision reaper.
+  // Each has a matching cluster_settings column read per sweep (kici-admin
+  // cluster-settings --scaler-reap-*), so an operator retunes a live cluster
+  // without a restart; a NULL column falls back to the value here.
+  //
+  // A cluster-singleton leader-gated infra sweeper, like the pending-scale
+  // sweeper above — one per orchestrator, no per-tenant meaning, so these are
+  // cluster-global knobs rather than per-org ones.
+  //
+  // Interval: the sweep is a table scan plus a delete, and it exists to catch a
+  // provision nothing else will, so once a minute is frequent enough.
+  scalerReapIntervalMs: z.coerce.number().int().min(5000).default(60_000),
+  // How long an adopted provision whose agent is registered on no coordinator
+  // may sit before teardown. Generous on purpose: "registered nowhere" is partly
+  // derived from peer heartbeats, so a peer that is connected but has not yet
+  // reported its agents must not read as a strand and get a live agent reaped.
+  scalerReapStrandedTimeoutMs: z.coerce.number().int().min(60_000).default(1_800_000),
+  // How long before a provision whose teardown did not clear its row is retried.
+  // The common cause is a row whose scaler names no provisioning targets on the
+  // coordinator that holds it, which the emit path deliberately answers by
+  // keeping the row — so the retry must be slow enough not to become a log loop.
+  scalerReapReattemptIntervalMs: z.coerce.number().int().min(60_000).default(600_000),
+  // How long an expired provisioning claim is kept before the same sweep deletes
+  // it. An expired claim can never be redeemed, so this only buys a late
+  // redeemer an "expired" diagnostic instead of "unknown code".
+  scalerClaimRetentionMs: z.coerce.number().int().min(0).default(3_600_000),
+  // Cluster-wide defaults for backing off a repeatedly failing external (event)
+  // scaler. Each has a matching cluster_settings column read per spawn request
+  // (kici-admin cluster-settings --scaler-provision-*), so an operator retunes a
+  // live cluster without a restart; a NULL column falls back to the value here.
+  //
+  // An external provision is dispatched to a customer workflow driving a cloud
+  // provider. When the provider is unavailable every dispatch fails the same
+  // way, and without a deferral the next one goes out as soon as the spawn
+  // timeout elapses — an unbounded dispatch loop against a provider that is
+  // already refusing work.
+  //
+  // Base: well under the 5-minute default spawn timeout above, so the first
+  // deferral is felt without making a one-off provider hiccup cost a job
+  // several minutes.
+  scalerProvisionBackoffBaseMs: z.coerce.number().int().min(1000).default(30_000),
+  // Ceiling on the doubling. 15 minutes is long enough that a multi-hour
+  // provider outage costs a handful of dispatches rather than one per spawn
+  // timeout, and short enough that recovery is noticed promptly.
+  scalerProvisionBackoffMaxMs: z.coerce.number().int().min(1000).default(900_000),
+  // How many consecutive failures before a refusal names repeated failure as
+  // the cause. Five keeps a couple of unlucky spawns from reading as an outage
+  // while still naming a real one well before an operator would notice by hand.
+  scalerProvisionMaxConsecutiveFailures: z.coerce.number().int().min(1).default(5),
   // Cache storage (for compiled bundle caching). Two backends:
   //   - s3:         pre-signed URLs, multi-host / production
   //   - filesystem: local files served via /api/v1/cache/blob/, single-host
@@ -520,58 +569,6 @@ const baseSchema = z.object({
   eventRouterRetryBaseBackoffMs: z.coerce.number().default(5_000),
   eventRouterRetryMaxBackoffMs: z.coerce.number().default(300_000),
   eventRouterRetryScanIntervalMs: z.coerce.number().default(10_000),
-  /**
-   * **Test-only.** Master switch for fault-injection knobs in the event
-   * dispatch pipeline. When `false` (default) the orchestrator ignores
-   * every test-only knob below, even if its env var is set. Pair with
-   * `KICI_TEST_EVENT_FAIL_FIRST_N` to drive the E2E retry / DLQ
-   * scenarios. Production deployments leave this at its default.
-   */
-  testMode: z
-    .string()
-    .default('0')
-    .transform((v) => v === '1' || v.toLowerCase() === 'true'),
-  /**
-   * **Test-only.** JSON map of `{ "<eventName>": <N> }` instructing the
-   * EventRouter to throw a synthetic dispatch error while
-   * `event.attempts <= N`. Ignored unless `KICI_TEST_MODE=1`.
-   */
-  testEventFailFirstN: z.string().optional(),
-  /**
-   * **Test-only.** When set (and `KICI_TEST_MODE=1`), the orchestrator forces
-   * the *initial* agent provenance mint to fail transiently (defer) for any job
-   * whose requested OIDC `audience` equals this value, so an E2E can exercise
-   * the deferred-attestation retry + per-run serve path with a REAL run. The
-   * retrier's re-mint uses a different call site and is unaffected. Ignored
-   * unless `KICI_TEST_MODE=1`. Production deployments leave this unset.
-   */
-  testMintDeferAudience: z.string().optional(),
-  /**
-   * **Test-only.** When set (and `KICI_TEST_MODE=1`), the orchestrator forces
-   * the *initial* agent provenance mint to DEFER for any job whose requested
-   * OIDC `audience` equals this value (same as `testMintDeferAudience`), AND the
-   * retrier's later re-mint to TERMINALLY REJECT it — so an E2E can exercise the
-   * `markRejected` → gauge-exclusion → `--include-rejected` re-arm cycle with a
-   * REAL run. Ignored unless `KICI_TEST_MODE=1`. Production leaves this unset.
-   */
-  testMintRejectAudience: z.string().optional(),
-  /**
-   * **Test-only.** When set (and `KICI_TEST_MODE=1`), `handleRerunRequest`
-   * sleeps this many milliseconds before invoking `onRerun`, so an HA E2E can
-   * make the first coordinator slow enough that the Platform relay fails over
-   * to a sibling — exercising the `requestId` idempotency claim. Ignored unless
-   * `KICI_TEST_MODE=1`. Production deployments leave this unset.
-   */
-  testRerunDelayMs: z.coerce.number().optional(),
-  /**
-   * **Test-only.** Comma-separated list of `dashboard.*` request types to drop
-   * from the capability manifest this orchestrator advertises to the Platform,
-   * so an integration test can reproduce an older / sourceless orchestrator that
-   * predates a given capability (e.g. `dashboard.contexts.list`). Only ever
-   * *removes* advertised types. Ignored unless `KICI_TEST_MODE=1`. Production
-   * deployments leave this unset.
-   */
-  testOmitDashboardRequestTypes: z.string().optional(),
   // Inbound webhook delivery log (event_log table). Default soft-cap 5MB.
   // Phase E retired the row TTL: rows are now archived to cold-store after
   // 30 days rather than hard-deleted. Oversized payloads are still recorded
@@ -599,6 +596,9 @@ const baseSchema = z.object({
     .min(1000)
     .default(24 * 60 * 60 * 1000),
   // Contributor-cache entry TTL (ms).
+  // @deprecated Nothing reads this value: trust is resolved from the ref a pull
+  // request pushes to, so no contributor-permission lookup is made and there is
+  // no cache to size. Accepted for compatibility; removed at v1.0.0.
   contributorCacheTtlMs: z.coerce
     .number()
     .int()
@@ -619,11 +619,6 @@ const baseSchema = z.object({
   // Agent recovery (used by Dispatcher to bound how long it waits for a
   // disconnected agent to come back before failing in-flight jobs).
   agentMaxReconnectDelayMs: z.coerce.number().default(60_000),
-  // S3 sentinel validation (escape hatch for E2E fault-injection tests).
-  skipS3SentinelValidation: z
-    .string()
-    .default('false')
-    .transform((v) => v === 'true'),
   // OpenTelemetry exporter endpoint (consumed by initTelemetry).
   otelExporterOtlpEndpoint: z.string().optional(),
   // Optional first-boot seed for the orchestrator's cluster_name (the
@@ -765,6 +760,23 @@ function refineStorageShape(data: ConfigData, ctx: z.RefinementCtx): void {
  */
 function refineRuntimeRequirements(data: ConfigData, ctx: z.RefinementCtx): void {
   const isWorker = data.cluster.role === 'worker';
+
+  // The external-provision backoff is `min(base * 2^(n-1), ceiling)`, so a
+  // ceiling below the base collapses it to a constant from the very first
+  // failure: the growth the two knobs exist to express never happens, and
+  // nothing at runtime reports that it did not. The admin route rejects the
+  // same pair with a 400; refusing it here too means the env path and the
+  // cluster-settings path cannot disagree about what is a valid pair.
+  if (data.scalerProvisionBackoffMaxMs < data.scalerProvisionBackoffBaseMs) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        `KICI_SCALER_PROVISION_BACKOFF_MAX_MS (${data.scalerProvisionBackoffMaxMs}) must be at ` +
+        `least KICI_SCALER_PROVISION_BACKOFF_BASE_MS (${data.scalerProvisionBackoffBaseMs}): a ` +
+        'ceiling below the base collapses the backoff to a constant from the first failure',
+      path: ['scalerProvisionBackoffMaxMs'],
+    });
+  }
 
   // Workers require at least one coordinator URL (singular or plural form).
   if (
@@ -966,6 +978,13 @@ export const envDef = defineEnv({
     scalerSpawnTimeoutMs: 'KICI_SCALER_SPAWN_TIMEOUT_MS',
     backupStalenessWarnHours: 'KICI_BACKUP_STALENESS_WARN_HOURS',
     scalerPendingSweepIntervalMs: 'KICI_SCALER_PENDING_SWEEP_INTERVAL_MS',
+    scalerReapIntervalMs: 'KICI_SCALER_REAP_INTERVAL_MS',
+    scalerReapStrandedTimeoutMs: 'KICI_SCALER_REAP_STRANDED_TIMEOUT_MS',
+    scalerReapReattemptIntervalMs: 'KICI_SCALER_REAP_REATTEMPT_INTERVAL_MS',
+    scalerClaimRetentionMs: 'KICI_SCALER_CLAIM_RETENTION_MS',
+    scalerProvisionBackoffBaseMs: 'KICI_SCALER_PROVISION_BACKOFF_BASE_MS',
+    scalerProvisionBackoffMaxMs: 'KICI_SCALER_PROVISION_BACKOFF_MAX_MS',
+    scalerProvisionMaxConsecutiveFailures: 'KICI_SCALER_PROVISION_MAX_CONSECUTIVE_FAILURES',
     webhookPayloadDir: 'KICI_WEBHOOK_PAYLOAD_DIR',
     dataDir: 'KICI_DATA_DIR',
     scalerConfigPath: 'KICI_SCALER_CONFIG_PATH',
@@ -1001,12 +1020,6 @@ export const envDef = defineEnv({
     eventRouterRetryBaseBackoffMs: 'KICI_EVENT_ROUTER_RETRY_BASE_BACKOFF_MS',
     eventRouterRetryMaxBackoffMs: 'KICI_EVENT_ROUTER_RETRY_MAX_BACKOFF_MS',
     eventRouterRetryScanIntervalMs: 'KICI_EVENT_ROUTER_RETRY_SCAN_INTERVAL_MS',
-    testMode: 'KICI_TEST_MODE',
-    testEventFailFirstN: 'KICI_TEST_EVENT_FAIL_FIRST_N',
-    testMintDeferAudience: 'KICI_TEST_MINT_DEFER_AUDIENCE',
-    testMintRejectAudience: 'KICI_TEST_MINT_REJECT_AUDIENCE',
-    testRerunDelayMs: 'KICI_TEST_RERUN_DELAY_MS',
-    testOmitDashboardRequestTypes: 'KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES',
     eventLogMaxPayloadBytes: 'KICI_EVENT_LOG_MAX_PAYLOAD_BYTES',
     maxGithubPayloadBytes: 'KICI_MAX_GITHUB_PAYLOAD_BYTES',
     lockFileMaxBytes: 'KICI_LOCK_FILE_MAX_BYTES',
@@ -1017,7 +1030,6 @@ export const envDef = defineEnv({
     nodeEnv: 'NODE_ENV',
     autoMigrate: 'KICI_AUTO_MIGRATE',
     agentMaxReconnectDelayMs: 'KICI_AGENT_MAX_RECONNECT_DELAY_MS',
-    skipS3SentinelValidation: 'KICI_SKIP_S3_SENTINEL_VALIDATION',
     otelExporterOtlpEndpoint: 'OTEL_EXPORTER_OTLP_ENDPOINT',
     clusterName: 'KICI_CLUSTER_NAME',
     cluster: {
@@ -1121,6 +1133,27 @@ const DEPLOY_IDENTITY_ENV_VARS = [
   'KICI_DEPLOY_CONTAINER_RUNTIME',
 ];
 
+/**
+ * Env vars the boot-time unknown-KICI_* validator tolerates **only** under
+ * `NODE_ENV=test`. None of these are service config: the `KICI_TEST_*` names are
+ * fault-injection knobs read exclusively by the test-only `server-test`
+ * entrypoint (via `src/testing/`), and the two `KICI_SKIP_*` names gate the
+ * vitest Postgres harness. Under any other NODE_ENV the allowance is empty, so a
+ * production `server.js` boot with a stray `KICI_TEST_*` or
+ * `KICI_SKIP_S3_SENTINEL_VALIDATION` fails the validator (defense in depth).
+ */
+const TEST_ONLY_ENV_VARS = [
+  'KICI_TEST_MODE',
+  'KICI_TEST_EVENT_FAIL_FIRST_N',
+  'KICI_TEST_MINT_DEFER_AUDIENCE',
+  'KICI_TEST_MINT_REJECT_AUDIENCE',
+  'KICI_TEST_RERUN_DELAY_MS',
+  'KICI_TEST_OMIT_DASHBOARD_REQUEST_TYPES',
+  'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
+  'KICI_SKIP_S3_SENTINEL_VALIDATION', // split-brain sentinel fault-injection (test double only)
+  'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres
+];
+
 export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppConfig {
   const packaging = scope === ConfigScope.enum.packaging;
   const data = packaging ? envDef.parse(process.env, packagingConfigSchema) : envDef.parse();
@@ -1138,8 +1171,10 @@ export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppCo
       ...LOGGER_ENV_VARS,
       ...COLD_STORE_ENV_VARS,
       ...DEPLOY_IDENTITY_ENV_VARS,
-      'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
-      'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres
+      // Test-only fault-injection / harness vars are tolerated ONLY under
+      // NODE_ENV=test; every other NODE_ENV rejects a stray one (defense in
+      // depth for the shipped server.js).
+      ...(data.nodeEnv === 'test' ? TEST_ONLY_ENV_VARS : []),
     ]);
   }
 

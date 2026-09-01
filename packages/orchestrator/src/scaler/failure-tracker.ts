@@ -12,7 +12,7 @@
 export interface ScalerFailureRecord {
   /** Scaler instance name (the configured scaler `name`); the diagnose row key. */
   backendName: string;
-  /** Backend type: 'container' | 'bare-metal' | 'firecracker' | 'unknown'. */
+  /** Backend type: 'container' | 'bare-metal' | 'firecracker' | 'event' | 'unknown'. */
   backendType: string;
   /** True when the failed spawn was bound to a queued job (a run was affected). */
   bound: boolean;

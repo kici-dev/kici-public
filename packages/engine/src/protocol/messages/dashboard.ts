@@ -14,6 +14,7 @@ import {
   initFailureSchema,
   StepConcurrencyKind,
   stateReplayRunSchema,
+  JobKind,
 } from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
 import { SourceOrigin } from '../source-origin.js';
@@ -159,6 +160,19 @@ export const dashboardJobDetailSchema = z.object({
   variantKind: z.string().nullable().optional(),
   /** Fan-out label for a child: matrix suffix or hostname; null for non-fanned jobs. */
   variantLabel: z.string().nullable().optional(),
+  /**
+   * Job kind: `standard` runs steps on an agent, `gate` is an invoke gate, and
+   * `proxy` mirrors a summoned source-repo run. Absent/null for a standard job.
+   *
+   * OPTIONAL, and must stay optional: the wire protocol is compatibility-
+   * protected, so an orchestrator that predates invoke gates omits it.
+   */
+  jobKind: JobKind.nullable().optional(),
+  /**
+   * For a `proxy` job, the summoned source-repo run this job mirrors; the
+   * dashboard links the proxy node through to it. null/absent otherwise.
+   */
+  summonedRunId: z.string().nullable().optional(),
   startedAt: z.number().nullable(),
   completedAt: z.number().nullable(),
   durationMs: z.number().nullable(),
@@ -171,7 +185,7 @@ export const dashboardJobDetailSchema = z.object({
    * a matching agent or scaler backend appears.
    *
    * OPTIONAL, and must stay optional: the wire protocol is compatibility-
-   * protected, so an orchestrator that predates the unroutable probe simply
+   * protected, so an orchestrator that predates the unroutable probe
    * omits it.
    */
   routingReason: z.string().nullable().optional(),
@@ -190,8 +204,22 @@ export const dashboardJobDetailSchema = z.object({
   skippedContexts: z.array(z.string()).nullable().optional(),
   /** User-visible warning naming the skipped test-run contexts. null/absent when none. */
   envWarning: z.string().nullable().optional(),
-  /** Aggregated step outputs (step-keyed map). Present when job completed successfully with outputs. */
-  outputs: z.record(z.string(), z.record(z.string(), z.unknown())).nullable().optional(),
+  /**
+   * A job's non-secret outputs. Present when the job completed successfully with
+   * outputs.
+   *
+   * The value is intentionally `z.record(z.string(), z.unknown())` — the same
+   * loose shape the wire (`job.status.data.outputs`) and `InvokeResult.outputs`
+   * use — because two job kinds populate it with two different shapes:
+   * - a **standard** job carries the agent's step-keyed map
+   *   (`{ <stepName>: { <outputKey>: value } }`), so each value is itself a map;
+   * - a **proxy** job mirrors a summoned run, and a run's outputs are FLAT
+   *   (`{ <outputKey>: value }`, values scalar), matching `InvokeResult.outputs`.
+   *
+   * A stricter step-keyed record type rejected the flat proxy shape and failed
+   * the whole run-detail response, so the schema accepts either.
+   */
+  outputs: z.record(z.string(), z.unknown()).nullable().optional(),
   /** Secret output key names produced by this job (values are NOT included -- display masked). */
   secretOutputKeys: z.array(z.string()).nullable().optional(),
   /**
@@ -3156,12 +3184,20 @@ export const runEventSchema = z.object({
 
 export type RunEvent = z.infer<typeof runEventSchema>;
 
-/** Trust policy response (from trust_policies table). */
+/**
+ * Trust policy response (from trust_policies table).
+ *
+ * `approvalExpirySeconds` is the authoritative window and `approvalExpiryHours`
+ * its coarse, rounded-up view, so a client reading only the older field still
+ * gets a usable number. Both are always sent by this build; the seconds field is
+ * optional so a dashboard build reading an older Platform still parses.
+ */
 export const trustPolicyResponseSchema = z.object({
   forkPolicy: z.string(),
   unknownContributorPolicy: z.string(),
   workflowChangePolicy: z.string(),
   approvalExpiryHours: z.number(),
+  approvalExpirySeconds: z.number().optional(),
 });
 
 export type TrustPolicy = z.infer<typeof trustPolicyResponseSchema>;
@@ -3206,6 +3242,20 @@ export const orgMemberSchema = z.object({
   suspendedAt: z.coerce.string().nullable(),
   joinedAt: z.coerce.string(),
   ciTrustLevel: z.string(),
+  /**
+   * The per-member `ci_trust` override, when one is stored, or `null` when the
+   * member's level is entirely role-derived.
+   *
+   * Carried beside `ciTrustLevel` rather than folded into it, because the two
+   * answer different questions. `ciTrustLevel` is the effective level the CI
+   * trust gate decides with — the role-derived level with any override applied
+   * on top — so it cannot say which half produced it. An override OUTRANKS the
+   * roles, so an org that lowered a member by override has no way to see that,
+   * and no way to undo it, from a payload that reports only the result.
+   *
+   * Optional so an older client keeps parsing the response.
+   */
+  ciTrustOverride: z.string().nullable().optional(),
   identityLinks: z.array(memberIdentityLinkSchema),
 });
 

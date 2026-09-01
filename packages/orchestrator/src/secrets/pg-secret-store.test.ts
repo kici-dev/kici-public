@@ -671,6 +671,96 @@ describe('PgSecretStore', () => {
       expect(db.updateTable).not.toHaveBeenCalled();
     });
 
+    it('renameScope records the key version of the key it re-encrypted under', async () => {
+      // Generation 1 = old key, generation 2 = the current key after a rotation.
+      const oldKey = deriveKey('b'.repeat(64));
+      const newKey = testKey;
+      const orgId = 'org-001';
+      const oldScope = 'aws/old';
+      const newScope = 'aws/new';
+      const plaintext = 'value-a';
+
+      // The row as it sits before the rename: written under generation 1.
+      const rowEnc = encrypt(plaintext, oldKey, 1, `${orgId}:${oldScope}:KEY_A`);
+      const row = {
+        id: 'sec-0',
+        org_id: orgId,
+        scope: oldScope,
+        key: 'KEY_A',
+        encrypted_value: rowEnc.data,
+        key_version: 1,
+      };
+
+      // The store is post-rotation: it encrypts under generation 2 and can only
+      // read generation 1 through the old-key fallback.
+      const { db, mocks } = _createMockDb({ selectRows: [row] });
+      const store = new PgSecretStore(db as any, newKey, 2, auditLogger, oldKey);
+
+      await store.renameScope(orgId, oldScope, newScope);
+
+      // renameScope issues two updates (scoped_secrets and context_bindings);
+      // the secrets one is the payload carrying encrypted_value.
+      const written = mocks.updateSet.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .find((arg) => 'encrypted_value' in arg);
+      expect(written).toBeDefined();
+
+      // The version the row ends up carrying: what `.set()` writes, or the
+      // pre-existing column value when `.set()` leaves it alone.
+      const recordedVersion = (written!.key_version as number | undefined) ?? row.key_version;
+
+      // What key_version is supposed to mean.
+      const keysByVersion = new Map<number, Buffer>([
+        [1, oldKey],
+        [2, newKey],
+      ]);
+      const keyForRecordedVersion = keysByVersion.get(recordedVersion);
+      expect(keyForRecordedVersion).toBeDefined();
+
+      const stored = {
+        data: written!.encrypted_value as string,
+        keyVersion: recordedVersion,
+      };
+      const newAad = `${orgId}:${newScope}:KEY_A`;
+
+      // The assertion that matters: the recorded version must name the key the
+      // bytes are actually under. Decrypting with THAT key — not through the
+      // store's fallback chain — is what proves it.
+      expect(decrypt(stored, keyForRecordedVersion!, newAad)).toBe(plaintext);
+
+      // Positive control for the assertion's discriminating power: the two keys
+      // are genuinely different, so a wrong label cannot pass by coincidence.
+      expect(() => decrypt(stored, oldKey, newAad)).toThrow();
+    });
+
+    it('renameScope stamps the current key version, not the row original', async () => {
+      const orgId = 'org-001';
+      const oldScope = 'aws/old';
+      const enc = encrypt('value-a', testKey, 1, `${orgId}:${oldScope}:KEY_A`);
+      const { db, mocks } = _createMockDb({
+        selectRows: [
+          {
+            id: 'sec-0',
+            org_id: orgId,
+            scope: oldScope,
+            key: 'KEY_A',
+            encrypted_value: enc.data,
+            key_version: 1,
+          },
+        ],
+      });
+      // Same master key, later generation — the same-key version bump a
+      // `rotate-key` without KICI_SECRET_KEY_OLD produces.
+      const store = new PgSecretStore(db as any, testKey, 5, auditLogger);
+
+      await store.renameScope(orgId, oldScope, 'aws/new');
+
+      const written = mocks.updateSet.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .find((arg) => 'encrypted_value' in arg);
+      expect(written?.key_version).toBe(5);
+    });
+
     it('deleteScope uses a transaction', async () => {
       const db = createMockDb({});
       const store = new PgSecretStore(db as any, testKey, testKeyVersion, auditLogger);

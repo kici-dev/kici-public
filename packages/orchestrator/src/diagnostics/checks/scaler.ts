@@ -40,17 +40,27 @@ export async function checkScalerProvisioning(deps: DiagnosticDeps): Promise<Dia
   return backends.map((backend) => {
     const summary = recent.get(backend.name);
     const durationMs = Date.now() - start;
+    // A scaler removed from the config drains before it disappears. Say so on
+    // its row, so an operator can tell a winding-down scaler from a configured one.
+    // The marker LEADS the message: the diagnose table truncates each message to
+    // a fixed width, so a trailing marker is cut off on exactly the rows that
+    // carry failure text. `details` keeps the untruncated values.
+    const retiringPrefix = backend.retiring
+      ? `retiring (${backend.activeCount} agent(s) left) — `
+      : '';
 
     if (!summary || summary.boundCount + summary.unboundCount === 0) {
       return {
         name: `scaler:${backend.name}`,
         status: 'pass' as const,
-        message: '0 spawn failures in last 5m',
+        message: `${retiringPrefix}0 spawn failures in last 5m`,
         details: {
           windowMs: SCALER_FAILURE_WINDOW_MS,
           backendType: backend.type,
           boundCount: 0,
           unboundCount: 0,
+          retiring: backend.retiring,
+          activeCount: backend.activeCount,
         },
         durationMs,
       };
@@ -58,7 +68,7 @@ export async function checkScalerProvisioning(deps: DiagnosticDeps): Promise<Dia
 
     const total = summary.boundCount + summary.unboundCount;
     const status: 'warn' | 'fail' = summary.boundCount > 0 ? 'fail' : 'warn';
-    const message = `${total} spawn failures in last 5m (${summary.boundCount} bound, ${summary.unboundCount} warm-pool; last: ${truncate(summary.lastError)})`;
+    const message = `${retiringPrefix}${total} spawn failures in last 5m (${summary.boundCount} bound, ${summary.unboundCount} warm-pool; last: ${truncate(summary.lastError)})`;
 
     return {
       name: `scaler:${backend.name}`,
@@ -71,6 +81,8 @@ export async function checkScalerProvisioning(deps: DiagnosticDeps): Promise<Dia
         unboundCount: summary.unboundCount,
         lastError: summary.lastError,
         lastAtMs: summary.lastAtMs,
+        retiring: backend.retiring,
+        activeCount: backend.activeCount,
       },
       durationMs,
     };

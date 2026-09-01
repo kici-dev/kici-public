@@ -29,7 +29,8 @@ function makeDeps(overrides: Partial<FleetHandlerDeps> = {}): FleetHandlerDeps {
   const rosterStore = {
     queryInventory: vi.fn().mockResolvedValue([]),
     getInventory: vi.fn().mockResolvedValue(null),
-    findMatching: vi.fn().mockResolvedValue([]),
+    get: vi.fn().mockResolvedValue(null),
+    findFanoutTargets: vi.fn().mockResolvedValue([]),
   } as unknown as FleetHandlerDeps['rosterStore'];
   // Minimal Kysely stub: returns an empty pinned-runs result.
   const db = {
@@ -135,7 +136,7 @@ describe('handleFleetPreviewRequest', () => {
       { agentId: 'stale1', status: HostStatus.stale, lifecycleClass: 'ephemeral' as const },
     ];
     const deps = makeDeps({ resolveRunsOnAll: vi.fn().mockResolvedValue(predicate) });
-    (deps.rosterStore.findMatching as ReturnType<typeof vi.fn>).mockResolvedValue(matched);
+    (deps.rosterStore.findFanoutTargets as ReturnType<typeof vi.fn>).mockResolvedValue(matched);
     (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockImplementation(
       async (id: string) =>
         entry(id, id === 'ready1' ? 'ready' : id === 'absent1' ? 'unreachable' : 'stale'),
@@ -160,7 +161,7 @@ describe('handleFleetPreviewRequest', () => {
       { agentId: 'absent1', status: HostStatus.unreachable, lifecycleClass: 'static' as const },
     ];
     const deps = makeDeps({ resolveRunsOnAll: vi.fn().mockResolvedValue(predicate) });
-    (deps.rosterStore.findMatching as ReturnType<typeof vi.fn>).mockResolvedValue(matched);
+    (deps.rosterStore.findFanoutTargets as ReturnType<typeof vi.fn>).mockResolvedValue(matched);
     (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockImplementation(
       async (id: string) => entry(id, id === 'ready1' ? 'ready' : 'unreachable'),
     );
@@ -188,9 +189,16 @@ describe('handleFleetWorkflowsForHostRequest', () => {
       },
     }) as unknown;
 
-  function depsFor(host: HostInventoryEntry | null, regs: unknown[]): FleetHandlerDeps {
+  function depsFor(
+    host: HostInventoryEntry | null,
+    regs: unknown[],
+    scalerManaged = false,
+  ): FleetHandlerDeps {
     const deps = makeDeps();
     (deps.rosterStore.getInventory as ReturnType<typeof vi.fn>).mockResolvedValue(host);
+    (deps.rosterStore.get as ReturnType<typeof vi.fn>).mockResolvedValue(
+      host ? { agent_id: host.agentId, scaler_managed: scalerManaged } : null,
+    );
     (deps.registrationStore.getAll as ReturnType<typeof vi.fn>).mockResolvedValue(regs);
     return deps;
   }
@@ -246,6 +254,22 @@ describe('handleFleetWorkflowsForHostRequest', () => {
     const skipRes = await handleFleetWorkflowsForHostRequest(depsFor(host, skip), 'r6', 'h1');
     expect(skipRes.workflows[0].disposition).toBe('unreachable-durable');
     expect(skipRes.workflows[0].onUnreachable).toBe('skip');
+  });
+
+  it('a scaler-managed host lists NO fan-outs, though the same host otherwise would', async () => {
+    // The inverse of the preview must agree with it. `findFanoutTargets` keeps
+    // an auto-scaler-spawned agent out of the target set, so this host-centric
+    // view must not claim a workflow fans out to it. Asserting BOTH directions
+    // on one host + one registration is what makes this non-vacuous: the only
+    // difference between the two calls is `scaler_managed`.
+    const host = { ...entry('h1', 'ready'), labels: ['role:web'] };
+    const regs = [reg('deploy-web', { include: [[exact('role:web')]], exclude: [] })];
+
+    const fleet = await handleFleetWorkflowsForHostRequest(depsFor(host, regs, false), 'r8', 'h1');
+    expect(fleet.workflows.map((w) => w.workflowName)).toEqual(['deploy-web']);
+
+    const scaler = await handleFleetWorkflowsForHostRequest(depsFor(host, regs, true), 'r9', 'h1');
+    expect(scaler.workflows).toEqual([]);
   });
 
   it('ephemeral non-ready host: disposition skipped-ephemeral', async () => {
