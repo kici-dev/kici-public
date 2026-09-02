@@ -287,7 +287,7 @@ kici docs llm sdk | claude -- "Read this and help me author a deploy workflow"
 kici docs llm --out kici-llms-index.txt
 ```
 
-Bundles are regenerated from `docs/` every time `@kici-dev/compiler` is built, so they always match your installed CLI version. The index lists each task bundle — `getting-started`, `sdk`, `sdk-runtime`, `cli`, `patterns`, `features`, `features-execution`, `providers`, `architecture` — with its size and a one-line purpose; pass the bundle id as the topic. Every cross-reference link inside a bundle is an absolute `docs.kici.dev` URL. The same files are published online following the [llms.txt convention](https://llmstxt.org/).
+Bundles are regenerated from `docs/` every time `@kici-dev/compiler` is built, so they always match your installed CLI version. The index lists each task bundle — `getting-started`, `sdk`, `sdk-runtime`, `cli`, `cli-remote`, `patterns`, `features`, `features-execution`, `providers`, `architecture` — with its size and a one-line purpose; pass the bundle id as the topic. Every cross-reference link inside a bundle is an absolute `docs.kici.dev` URL. The same files are published online following the [llms.txt convention](https://llmstxt.org/).
 
 ## Reference
 
@@ -322,7 +322,7 @@ Synopsis: `kici docs [options]`
 
 ### `kici docs llm`
 
-Print KiCI LLM docs bundles. No topic prints the llms.txt index; <topic> prints a task bundle (e.g. sdk, cli, patterns, features, providers, architecture, getting-started); "full" prints the complete bundle.
+Print KiCI LLM docs bundles. No topic prints the llms.txt index; <topic> prints a task bundle (e.g. sdk, cli, cli-remote, patterns, features, providers, architecture, getting-started); "full" prints the complete bundle.
 
 Synopsis: `kici docs llm [topic] [options]`
 

@@ -2,6 +2,16 @@
 
 Release notes for the public KiCI packages.
 
+## v0.6.1 — 2026-09-02
+
+### Fixes
+
+- Dashboard marks global workflows and no longer hides them behind the git-only filter
+
+### Documentation
+
+- Document all seven global-workflow environment variables and correct the **default** org guidance
+
 ## v0.6.0 — 2026-09-01
 
 ### Features

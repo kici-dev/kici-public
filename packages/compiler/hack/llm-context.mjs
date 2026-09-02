@@ -55,6 +55,7 @@ export const SCOPE_GROUPS = [
       'migrating-from-github-actions.md',
       'why-kici.md',
       'getting-help.md',
+      'reporting-discrepancies.md',
       'execution-model.md',
       'README.md',
       'README-public.md',
@@ -102,27 +103,49 @@ export const SCOPE_GROUPS = [
       'wait-for.md',
     ],
   },
+  // The CLI guides are split across two bundles because together they pass
+  // MAX_BUNDLE_BYTES. The line between them is where the command runs: `cli`
+  // covers what an author does on their own machine (compile, test, run local,
+  // hooks, lock-file drift), `cli-remote` covers driving a deployed
+  // orchestrator (auth, org selection, runs, approvals, notifications,
+  // diagnostics, and the MCP server an agent connects to).
+  //
+  // The full kici command reference lives in the co-located child pages under
+  // docs/user/cli/ (cli-reference.md is their thin index). The children are
+  // named explicitly across the two bundles rather than pulled in by a
+  // directory extra, so every one of them lands in exactly one bundle and the
+  // docs/user coverage check stays satisfied.
   {
     id: 'cli',
-    label: 'CLI and authoring',
-    purpose: 'Running the CLI: compile, test, run local/remote, auth, hooks, lock-file drift',
+    label: 'CLI: authoring on your own machine',
+    purpose:
+      'Running the CLI locally: compile, test, run local, hooks, lock-file drift, common failures',
     dir: 'docs/user',
     recurse: false,
     only: [
       'cli-reference.md',
-      'cli-auth.md',
-      'ai-agents.md',
       'testing-guide.md',
       'common-failures.md',
       'hooks.md',
       'lock-file-and-drift.md',
       'workflow-patterns.md',
     ],
-    // The full kici command reference lives in the co-located child pages under
-    // docs/user/cli/ (cli-reference.md is their thin index). Bundle every child
-    // so the CLI task bundle carries the command reference an authoring agent
-    // needs, and so the docs/user coverage check stays satisfied.
-    extras: [{ dir: 'docs/user/cli' }],
+    extras: [{ dir: 'docs/user/cli', only: ['authoring-and-local.md'] }],
+  },
+  {
+    id: 'cli-remote',
+    label: 'CLI: driving a deployed orchestrator',
+    purpose:
+      'Auth, org and orchestrator selection, runs, approvals, notifications, diagnostics, and the MCP server a coding agent connects to',
+    dir: 'docs/user',
+    recurse: false,
+    only: ['cli-auth.md', 'ai-agents.md'],
+    extras: [
+      {
+        dir: 'docs/user/cli',
+        only: ['account-and-org.md', 'runs-and-approvals.md', 'notifications-and-diagnostics.md'],
+      },
+    ],
   },
   // The feature guides are split across two bundles because together they pass
   // MAX_BUNDLE_BYTES. The line between them is what the reader is doing: `features`
@@ -439,6 +462,10 @@ function renderIndex(groups, siteBaseUrl, bundles) {
   lines.push('');
   lines.push(
     `The full markdown bundle of every page indexed here is available at ${docsUrl('llms-full.txt', siteBaseUrl)}.`,
+  );
+  lines.push('');
+  lines.push(
+    `Found a mismatch between what these docs advertise and what KiCI does? Read ${docsUrl('user/reporting-discrepancies/', siteBaseUrl)} (or run \`kici feedback\`) before reporting it: a report needs a reproduction, and you draft it but a human decides to file it.`,
   );
   lines.push('');
   lines.push('## Bundles');

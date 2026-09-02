@@ -17,6 +17,7 @@ import {
   type AccessLogTargetType,
   type ActorPrincipal,
   type LockTrigger,
+  type LockBranchPattern,
 } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { RegistrationStore, RegistrationRow } from '../registration/registration-store.js';
@@ -655,6 +656,7 @@ export class DashboardRegistrationsHandler {
           commitSha: reg.commitSha ?? undefined,
           sourceFile: reg.sourceFile ?? undefined,
           source: buildRegistrationSource(reg.routing_key, sourceMetaMap),
+          isGlobal: reg.isGlobal,
         };
       });
 
@@ -717,13 +719,29 @@ function buildRegistrationSource(
   return { routingKey, name: null, subtype: null, provider };
 }
 
+/** Render one repo pattern for display: a regex keeps its delimiters, a glob is literal. */
+function formatRepoPattern(pattern: LockBranchPattern): string {
+  return pattern.type === 'regex' ? `/${pattern.pattern}/${pattern.flags ?? ''}` : pattern.pattern;
+}
+
 /**
  * Extract source repos from triggers that reference external repos.
  * kici_event triggers have a `source` field, lifecycle triggers have `sources`.
+ *
+ * A global workflow's `repos:` patterns join the same set. Both answer the one
+ * question the column asks — which repos' events feed this workflow — so a glob
+ * (`myorg/*`) and a literal identifier can share it. Exclusions (`!myorg/old-*`)
+ * are carried through verbatim, since which repos are carved out is as much a
+ * part of the answer as which are matched.
  */
 function extractSourceRepos(triggers: readonly LockTrigger[]): string[] {
   const repos = new Set<string>();
   for (const trigger of triggers) {
+    if ('repos' in trigger && trigger.repos) {
+      for (const pattern of trigger.repos) {
+        repos.add(formatRepoPattern(pattern));
+      }
+    }
     if (trigger._type === 'kici_event' && trigger.source) {
       repos.add(trigger.source);
     }

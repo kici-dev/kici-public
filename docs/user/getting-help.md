@@ -78,6 +78,10 @@ Reports contain your data, so there is no public tracker for them. Add
 kici report --run <run-id> --upload --message "matrix job hangs on macOS"
 ```
 
+A defect in KiCI itself is different: if you can reproduce it without your own
+data — the docs promise something the tool does not do — it belongs in the
+public tracker instead. See [Reporting a discrepancy](./reporting-discrepancies.md).
+
 The command prints a reference id. Quote it in any conversation about the
 problem. The bundle goes straight from your machine to KiCI storage over a
 one-time upload link — it never passes through the dashboard.
@@ -106,7 +110,7 @@ someone who has left.
 ## Reporting a security issue
 
 Do not use `kici report` for a suspected vulnerability. Follow the disclosure
-process in [SECURITY.md](https://github.com/kici-dev/kici/blob/master/SECURITY.md)
+process in [SECURITY.md](https://github.com/kici-dev/kici-public/blob/main/SECURITY.md)
 instead.
 
 ## See also

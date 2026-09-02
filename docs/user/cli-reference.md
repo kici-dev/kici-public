@@ -1,6 +1,6 @@
 ---
 title: CLI reference
-description: 'All CLI commands: compile, preview, local, fixture, types, workflows, hook, docs, run, runs, approve, reject, login, logout, init, org, pat, secrets, admin, orchestrators, endpoints, notifications, verify-attestation, diagnostics, doctor, report'
+description: 'All CLI commands: compile, preview, local, fixture, types, workflows, hook, docs, run, runs, approve, reject, login, logout, init, org, pat, secrets, admin, orchestrators, endpoints, notifications, verify-attestation, diagnostics, doctor, report, feedback'
 ---
 
 The `@kici-dev/compiler` package provides the `kici` CLI for compiling, testing, and managing workflows.
@@ -31,7 +31,7 @@ The full command reference is split by area:
 - [Authoring & local dev](./cli/authoring-and-local.md) — `compile`, `preview`, `local`, `fixture`, `types`, `workflows`, `hook`, `docs`
 - [Runs & approvals](./cli/runs-and-approvals.md) — `run`, `runs`, `reject`, `approve`
 - [Account & org](./cli/account-and-org.md) — `login`, `logout`, `init`, `org`, `pat`, `secrets`, `admin`, `orchestrators`, `endpoints`
-- [Notifications & diagnostics](./cli/notifications-and-diagnostics.md) — `notifications`, `verify-attestation`, `diagnostics`, `doctor`, `report`
+- [Notifications & diagnostics](./cli/notifications-and-diagnostics.md) — `notifications`, `verify-attestation`, `diagnostics`, `doctor`, `report`, `feedback`
 
 Each area page carries a `## Guide` section (worked examples and command-by-command narrative) and a `## Reference` section (the always-current generated signature list for that area's commands).
 

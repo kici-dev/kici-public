@@ -2267,6 +2267,17 @@ export const registrationItemSchema = z.object({
    * summaries so the dashboard can reuse the same icon/label helpers.
    */
   source: registrationSourceSchema.nullable().optional(),
+  /**
+   * True when this registration is a global workflow — one whose trigger
+   * carries `repos:`, so it fires on events from other repos in the org.
+   *
+   * Optional because an orchestrator predating this field omits it. A reader
+   * that needs a value for such a row derives one from `triggers[].repos`,
+   * which is the same signal the orchestrator classifies on at registration
+   * time. Prefer this field when present: it mirrors the `is_global` column
+   * the dispatcher itself reads, so it cannot drift from dispatch behaviour.
+   */
+  isGlobal: z.boolean().optional(),
 });
 
 /** Response with workflow registrations. */

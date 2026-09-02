@@ -297,13 +297,26 @@ The agent clones both repositories into a workspace directory:
 
 ### Environment variables
 
-| Variable                  | Value                 | Description                         |
-| ------------------------- | --------------------- | ----------------------------------- |
-| `KICI_IS_GLOBAL_WORKFLOW` | `true`                | Indicates global workflow execution |
-| `KICI_WORKFLOW_REPO_PATH` | `/workspace/workflow` | Path to workflow repo clone         |
-| `KICI_SOURCE_REPO_PATH`   | `/workspace/source`   | Path to source repo clone           |
-| `KICI_WORKFLOW_REPO`      | `owner/repo`          | Workflow repo identifier            |
-| `KICI_SOURCE_REPO`        | `owner/repo`          | Source repo identifier              |
+One writer sets all seven, so the pre-dispatch evaluation round and the sandbox
+present the same ambient environment to a job generator. A generator that saw a
+key on one call and not the other would be a determinism failure.
+
+| Variable                  | Value                | Description                                           |
+| ------------------------- | -------------------- | ----------------------------------------------------- |
+| `KICI_IS_GLOBAL_WORKFLOW` | `true`               | Indicates global workflow execution                   |
+| `KICI_WORKFLOW_REPO_PATH` | `<workdir>/workflow` | Path to workflow repo clone                           |
+| `KICI_SOURCE_REPO_PATH`   | `<workdir>/source`   | Path to source repo clone                             |
+| `KICI_WORKFLOW_REPO`      | `owner/repo`         | Workflow repo identifier                              |
+| `KICI_SOURCE_REPO`        | `owner/repo`         | Source repo identifier                                |
+| `KICI_SOURCE_BRANCH`      | ref, or `""`         | Source repo ref; empty when the event carries no ref  |
+| `KICI_SOURCE_SHA`         | sha, or `""`         | Source repo commit; empty when the event carries none |
+
+`<workdir>` is a per-job temporary directory, not a fixed path — read the
+variable rather than reconstructing it.
+
+A missing ref or sha writes an empty string rather than leaving the key unset:
+assigning `undefined` to a `process.env` key stringifies to `"undefined"`, which
+is worse than either.
 
 ## Configuration
 
@@ -313,24 +326,24 @@ Global workflows are disabled by default. To enable them:
 
 1. Turn the fleet-wide master switch on (operator, once per cluster):
 
-```sql
-INSERT INTO cluster_settings (id, global_workflows_enabled)
-VALUES ('default', true)
-ON CONFLICT (id) DO UPDATE SET global_workflows_enabled = EXCLUDED.global_workflows_enabled;
+```bash
+kici-admin cluster-settings set --global-workflows-enabled true
+kici-admin cluster-settings show   # confirm: Global workflows enabled: true
 ```
 
-2. Optionally restrict which repos can register global workflows. The
-   list elements are jsonb objects — pass `routingKey` to pin an entry to
-   one source, or omit it for "any source in the org":
+2. Optionally restrict which repos can register global workflows. Pass
+   `--source` to pin an entry to one webhook source, or omit it for "any
+   source in the org":
 
-```sql
-UPDATE org_settings
-SET global_workflow_allowed_repos = ARRAY[
-  '{"pattern":"myorg/ci-*"}'::jsonb,
-  '{"routingKey":"github:42","pattern":"myorg/automation"}'::jsonb
-]
-WHERE customer_id = 'kiciStg00001';
+```bash
+kici-admin org-settings global-workflows allow-add 'myorg/ci-*' --org <customerId>
+kici-admin org-settings global-workflows allow-add 'myorg/automation' \
+  --org <customerId> --source github:42
+kici-admin org-settings global-workflows show --org <customerId>
 ```
+
+Both are also reachable from the dashboard tab below, except the master
+switch, which is operator-only by design.
 
 ### Dashboard settings
 

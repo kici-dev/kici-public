@@ -346,7 +346,7 @@ For coding agents that want the entire documentation set up front, KiCI follows 
 
 - `https://kici.dev/llms.txt` — curated link index grouped by SDK / patterns / CLI / architecture.
 - `https://kici.dev/llms-full.txt` — concatenated markdown of every page indexed above.
-- `kici docs llm` — print the same curated `llms.txt` index to stdout, offline, straight from the installed `@kici-dev/compiler` package. `kici docs llm <topic>` prints one task bundle (`getting-started`, `patterns`, `sdk`, `sdk-runtime`, `cli`, `features`, `features-execution`, `providers`, `architecture`), and `kici docs llm full` prints the whole `llms-full.txt`. Add `--out <path>` to write to a file. The agent can pipe the output into its own context buffer with no network call.
+- `kici docs llm` — print the same curated `llms.txt` index to stdout, offline, straight from the installed `@kici-dev/compiler` package. `kici docs llm <topic>` prints one task bundle (`getting-started`, `patterns`, `sdk`, `sdk-runtime`, `cli`, `cli-remote`, `features`, `features-execution`, `providers`, `architecture`), and `kici docs llm full` prints the whole `llms-full.txt`. Add `--out <path>` to write to a file. The agent can pipe the output into its own context buffer with no network call.
 - `kici docs` — open the docs site in your browser.
 
 The offline bundle is regenerated from `docs/` every time the package is built, so it always matches the version of KiCI you've installed.

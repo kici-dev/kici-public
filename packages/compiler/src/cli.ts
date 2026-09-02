@@ -1017,12 +1017,27 @@ Environment variables:
   docsCommandGroup
     .command('llm [topic]')
     .description(
-      'Print KiCI LLM docs bundles. No topic prints the llms.txt index; <topic> prints a task bundle (e.g. sdk, cli, patterns, features, providers, architecture, getting-started); "full" prints the complete bundle.',
+      'Print KiCI LLM docs bundles. No topic prints the llms.txt index; <topic> prints a task bundle (e.g. sdk, cli, cli-remote, patterns, features, providers, architecture, getting-started); "full" prints the complete bundle.',
     )
     .option('--out <path>', 'Write the bundle to a file instead of stdout')
     .action(async (topic, options) => {
       const { docsLlmCommand } = await import('./commands/index.js');
       const success = await docsLlmCommand({ topic, out: options.out });
+      process.exit(success ? 0 : 1);
+    });
+
+  // --- kici feedback (report a docs/behaviour discrepancy) ---
+
+  program
+    .command('feedback')
+    .description(
+      'Print how to report a discrepancy between what KiCI advertises and what it does. Files nothing.',
+    )
+    .option('--open', 'Open the prefilled issue form in the default browser')
+    .option('--json', 'Emit the reporting contract as JSON')
+    .action(async (options) => {
+      const { feedbackCommand } = await import('./commands/index.js');
+      const success = await feedbackCommand({ open: options.open, json: options.json });
       process.exit(success ? 0 : 1);
     });
 

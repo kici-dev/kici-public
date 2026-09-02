@@ -9,7 +9,9 @@ The workflows page (`/orgs/:customerId/workflows`) shows permanently registered 
 
 Each row is expandable to show trigger configuration details. Rows include action controls: a "Run now" button for manual triggering, a toggle switch to enable/disable the workflow, and a delete button with a confirmation modal (optionally cancelling active runs). Stale workflows (no triggers in the last 30 days) show a yellow "Stale" badge. Registry health indicators (version, sync status, last updated) appear above the table.
 
-Filters include trigger type, repository, and workflow name.
+A [global workflow](../global-workflows.md) — one whose trigger carries `repos:`, so it runs on events from other repos in the org — shows a "Global" badge. Its "Source repos" column lists the `repos:` patterns it matches, exclusions included.
+
+Filters include trigger type, repository, and workflow name, plus a **Hide git-only** toggle that is **on by default**. It hides workflows whose every trigger is a git event (push, pull request, tag, and so on), which is what makes the page useful for finding event-driven and scheduled workflows. Global workflows are never hidden by it: their triggers are ordinarily git ones, so hiding them would conceal the workflows with the widest reach in the org.
 
 ## Infrastructure
 

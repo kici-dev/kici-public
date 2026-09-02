@@ -35,6 +35,7 @@ function makeRegistrationRow(overrides: Partial<RegistrationRow> = {}): Registra
     routing_key: 'github:42',
     provider_context: {},
     disabled: false,
+    isGlobal: false,
     commitSha: null,
     sourceFile: null,
     created_at: new Date('2026-01-01'),
@@ -361,6 +362,97 @@ describe('DashboardRegistrationsHandler', () => {
     const response = send.mock.calls[0][0];
     expect(response.registrations).toHaveLength(1);
     expect(response.registrations[0].workflowName).toBe('deploy');
+  });
+
+  it('surfaces isGlobal and renders repos globs into sourceRepos', async () => {
+    // A global workflow's only trigger is an ordinary push, so nothing else in
+    // the payload distinguishes it. Both fields below are what let the
+    // dashboard tell it apart from a same-repo push workflow.
+    registrationStore.getAll.mockResolvedValue([
+      makeRegistrationRow({
+        isGlobal: true,
+        trigger_types: ['push'],
+        lock_entry: makeLockWorkflow({
+          triggers: [
+            {
+              _type: 'push',
+              branches: [{ type: 'glob', pattern: 'main' }],
+              paths: [],
+              repos: [
+                { type: 'glob', pattern: 'myorg/*' },
+                { type: 'glob', pattern: '!myorg/archived-*' },
+              ],
+            } as any,
+          ],
+        }),
+      }),
+    ]);
+
+    const queryChain = {
+      select: vi.fn().mockReturnThis(),
+      selectAll: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      groupBy: vi.fn().mockReturnThis(),
+      execute: vi.fn().mockResolvedValue([]),
+      executeTakeFirst: vi.fn().mockResolvedValue({
+        version: 1,
+        updated_at: new Date('2026-01-01'),
+      }),
+    };
+    db.selectFrom = vi.fn().mockReturnValue(queryChain);
+
+    await handler.handle({
+      type: 'dashboard.registrations.list',
+      requestId: 'req-global',
+      actor: { type: 'user', sub: 'zsub-test' },
+    });
+
+    const item = send.mock.calls[0][0].registrations[0];
+    expect(item.isGlobal).toBe(true);
+    // The exclusion is carried through: which repos are carved out is as much
+    // part of the answer as which are matched.
+    expect(item.sourceRepos).toEqual(['myorg/*', '!myorg/archived-*']);
+  });
+
+  it('reports isGlobal false and no sourceRepos for a same-repo workflow', async () => {
+    registrationStore.getAll.mockResolvedValue([
+      makeRegistrationRow({
+        isGlobal: false,
+        trigger_types: ['push'],
+        lock_entry: makeLockWorkflow({
+          triggers: [
+            {
+              _type: 'push',
+              branches: [{ type: 'glob', pattern: 'main' }],
+              paths: [],
+            } as any,
+          ],
+        }),
+      }),
+    ]);
+
+    const queryChain = {
+      select: vi.fn().mockReturnThis(),
+      selectAll: vi.fn().mockReturnThis(),
+      where: vi.fn().mockReturnThis(),
+      groupBy: vi.fn().mockReturnThis(),
+      execute: vi.fn().mockResolvedValue([]),
+      executeTakeFirst: vi.fn().mockResolvedValue({
+        version: 1,
+        updated_at: new Date('2026-01-01'),
+      }),
+    };
+    db.selectFrom = vi.fn().mockReturnValue(queryChain);
+
+    await handler.handle({
+      type: 'dashboard.registrations.list',
+      requestId: 'req-same-repo',
+      actor: { type: 'user', sub: 'zsub-test' },
+    });
+
+    const item = send.mock.calls[0][0].registrations[0];
+    expect(item.isGlobal).toBe(false);
+    expect(item.sourceRepos).toEqual([]);
   });
 
   it('filters by repoIdentifier when provided', async () => {

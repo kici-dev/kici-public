@@ -258,6 +258,37 @@ Anyone in your organization can upload a report. By default you see and
 withdraw your own; a member with the `support:admin` permission can manage
 every report in the organization.
 
+### kici feedback
+
+`kici report` sends a problem with **your own runs** to KiCI privately. `kici
+feedback` covers the other case: a defect in KiCI itself that reproduces
+without your data, such as a documented flag that does not exist.
+
+```bash
+kici feedback
+```
+
+It prints what qualifies as a reportable discrepancy, what a report must
+carry, what must never appear in a public issue, and where to file it. The
+command reaches no network and files nothing.
+
+```bash
+# Open the prefilled issue form in your browser
+kici feedback --open
+
+# Read the same contract as structured data
+kici feedback --json
+```
+
+`--json` exists for coding agents: KiCI is built to be driven by an LLM, and
+an agent can read the rules without parsing prose. One of those rules is that
+an agent drafts a report and a **person** decides to file it.
+
+The full guide is [Reporting a discrepancy](../reporting-discrepancies.md).
+A suspected vulnerability never goes in a public issue — follow the
+disclosure process in
+[SECURITY.md](https://github.com/kici-dev/kici-public/blob/main/SECURITY.md).
+
 ## Reference
 
 <!-- BEGIN GENERATED: kici-notifications-and-diagnostics (do not edit; run the doc generator) -->
@@ -288,6 +319,19 @@ Synopsis: `kici doctor [options]`
 | ------------------- | ------- | ---------------------------------- |
 | `--json`            | `false` | Output raw JSON instead of a table |
 | `--kici-dir <path>` | `.kici` | Path to the .kici directory        |
+
+### `kici feedback`
+
+Print how to report a discrepancy between what KiCI advertises and what it does. Files nothing.
+
+Synopsis: `kici feedback [options]`
+
+**Options**
+
+| Option   | Default | Description                                          |
+| -------- | ------- | ---------------------------------------------------- |
+| `--open` |         | Open the prefilled issue form in the default browser |
+| `--json` |         | Emit the reporting contract as JSON                  |
 
 ### `kici notifications`
 
